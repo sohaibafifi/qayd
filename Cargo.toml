@@ -1,0 +1,22 @@
+[package]
+name = "qayd"
+version = "0.1.0"
+edition = "2021"
+description = "Yet another constraint-programming solver."
+license = "MIT"
+
+[lib]
+name = "qayd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qayd"
+path = "src/bin/qayd.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[dependencies]
+lzma-rs = "0.3.0"
+quick-xml = "0.40.1"

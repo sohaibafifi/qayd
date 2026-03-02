@@ -1,0 +1,268 @@
+//! Depth-first search with backtracking.
+//!
+//! Phase 0: DFS with first-fail variable selection (smallest domain) and
+//! min-value branching. Each node tries `var = val` (left) then `var != val`
+//! (right), propagating to a fixpoint after each and backtracking on failure.
+//! `dom/wdeg`, restarts, and branch-and-bound for COP arrive in later phases.
+
+use crate::ids::VarId;
+use crate::propagator::Inconsistency;
+use crate::store::Solver;
+
+/// Whether to keep enumerating after a solution.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SearchControl {
+    /// Keep searching for more solutions.
+    Continue,
+    /// Stop the search now.
+    Stop,
+}
+
+/// Counters gathered during a search.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SolveStats {
+    /// Number of solutions visited.
+    pub solutions: u64,
+    /// Number of internal (branching) nodes explored.
+    pub nodes: u64,
+    /// Number of dead ends (propagation failures).
+    pub failures: u64,
+}
+
+/// Enumerate solutions over `vars` by DFS. `on_solution` is invoked for every
+/// full assignment; return [`SearchControl::Stop`] to halt early. The solver is
+/// restored to its pre-call state on return.
+pub fn solve<F>(solver: &mut Solver, vars: &[VarId], mut on_solution: F) -> SolveStats
+where
+    F: FnMut(&Solver) -> SearchControl,
+{
+    let mut stats = SolveStats::default();
+    solver.store.push_level();
+    solver.enqueue_all();
+    match solver.propagate() {
+        Ok(()) => {
+            dfs(solver, vars, &mut stats, &mut on_solution);
+        }
+        Err(Inconsistency) => {
+            stats.failures += 1;
+        }
+    }
+    solver.store.pop_level();
+    stats
+}
+
+/// Find the first solution, returning the values of `vars`.
+pub fn first_solution(solver: &mut Solver, vars: &[VarId]) -> Option<Vec<i32>> {
+    let mut found = None;
+    solve(solver, vars, |s| {
+        found = Some(vars.iter().map(|&v| s.store.value(v)).collect());
+        SearchControl::Stop
+    });
+    found
+}
+
+/// Count all solutions over `vars`.
+pub fn count_solutions(solver: &mut Solver, vars: &[VarId]) -> u64 {
+    solve(solver, vars, |_| SearchControl::Continue).solutions
+}
+
+/// In-search branch-and-bound: a single DFS that keeps the best objective value
+/// found so far as a (non-trailed) incumbent and, at every node, prunes the
+/// objective to demand a strictly better value. Unlike restart B&B this never
+/// re-searches an explored prefix. `on_improve` fires for each improving bound.
+/// Returns the best `(assignment, objective value)` and search stats. `obj`
+/// must be among `vars` (so search fixes it).
+pub fn optimize_with(
+    solver: &mut Solver,
+    vars: &[VarId],
+    obj: VarId,
+    minimizing: bool,
+    mut on_improve: impl FnMut(i32),
+) -> (Option<(Vec<i32>, i32)>, SolveStats) {
+    let mut stats = SolveStats::default();
+    let mut incumbent: Option<i32> = None;
+    let mut best: Option<(Vec<i32>, i32)> = None;
+
+    solver.store.push_level();
+    solver.enqueue_all();
+    bnb(
+        solver,
+        vars,
+        obj,
+        minimizing,
+        &mut incumbent,
+        &mut best,
+        &mut stats,
+        &mut on_improve,
+    );
+    solver.store.pop_level();
+
+    (best, stats)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bnb<F: FnMut(i32)>(
+    solver: &mut Solver,
+    vars: &[VarId],
+    obj: VarId,
+    minimizing: bool,
+    incumbent: &mut Option<i32>,
+    best: &mut Option<(Vec<i32>, i32)>,
+    stats: &mut SolveStats,
+    on_improve: &mut F,
+) {
+    // Reach the node's fixpoint (drains the decision that led here, or the
+    // initial enqueue at the root).
+    if solver.propagate().is_err() {
+        stats.failures += 1;
+        return;
+    }
+    // Enforce the incumbent bound here, then re-propagate. The incumbent is not
+    // trailed, so re-applying it at each node makes the bound global.
+    if let Some(inc) = *incumbent {
+        let bounded = if minimizing {
+            solver.store.remove_above(obj, inc - 1)
+        } else {
+            solver.store.remove_below(obj, inc + 1)
+        };
+        if bounded.is_err() || solver.propagate().is_err() {
+            stats.failures += 1;
+            return;
+        }
+    }
+
+    let var = match select(solver, vars) {
+        None => {
+            // Full assignment: a new (strictly better) incumbent.
+            let value = solver.store.value(obj);
+            *incumbent = Some(value);
+            *best = Some((vars.iter().map(|&v| solver.store.value(v)).collect(), value));
+            stats.solutions += 1;
+            on_improve(value);
+            return;
+        }
+        Some(v) => v,
+    };
+    let val = solver.store.min(var);
+    stats.nodes += 1;
+
+    for apply in [Decision::Eq, Decision::Ne] {
+        let level = solver.store.level();
+        solver.store.push_level();
+        let ok = match apply {
+            Decision::Eq => solver.store.fix(var, val),
+            Decision::Ne => solver.store.remove(var, val),
+        };
+        if ok.is_ok() {
+            bnb(
+                solver, vars, obj, minimizing, incumbent, best, stats, on_improve,
+            );
+        } else {
+            stats.failures += 1;
+        }
+        solver.store.pop_level();
+        debug_assert_eq!(solver.store.level(), level, "trail level mismatch in bnb");
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Decision {
+    Eq,
+    Ne,
+}
+
+/// Minimise `obj`. Returns the best `(assignment of vars, obj value)`.
+pub fn minimize(solver: &mut Solver, vars: &[VarId], obj: VarId) -> Option<(Vec<i32>, i32)> {
+    optimize_with(solver, vars, obj, true, |_| {}).0
+}
+
+/// Maximise `obj`. Returns the best `(assignment of vars, obj value)`.
+pub fn maximize(solver: &mut Solver, vars: &[VarId], obj: VarId) -> Option<(Vec<i32>, i32)> {
+    optimize_with(solver, vars, obj, false, |_| {}).0
+}
+
+/// First-fail: pick the unfixed variable with the smallest domain.
+fn select(solver: &Solver, vars: &[VarId]) -> Option<VarId> {
+    let mut best: Option<VarId> = None;
+    let mut best_size = usize::MAX;
+    for &v in vars {
+        let s = solver.store.size(v);
+        if s > 1 && s < best_size {
+            best_size = s;
+            best = Some(v);
+        }
+    }
+    best
+}
+
+fn dfs<F>(
+    solver: &mut Solver,
+    vars: &[VarId],
+    stats: &mut SolveStats,
+    on_solution: &mut F,
+) -> SearchControl
+where
+    F: FnMut(&Solver) -> SearchControl,
+{
+    let var = match select(solver, vars) {
+        None => {
+            // No unfixed variable left: a full assignment.
+            stats.solutions += 1;
+            return on_solution(solver);
+        }
+        Some(v) => v,
+    };
+    let val = solver.store.min(var);
+    stats.nodes += 1;
+
+    // Left branch: var = val.
+    if let SearchControl::Stop = branch(solver, vars, stats, on_solution, |s| s.store.fix(var, val))
+    {
+        return SearchControl::Stop;
+    }
+    // Right branch: var != val.
+    if let SearchControl::Stop = branch(solver, vars, stats, on_solution, |s| {
+        s.store.remove(var, val)
+    }) {
+        return SearchControl::Stop;
+    }
+
+    SearchControl::Continue
+}
+
+/// Run one branch: open a level, apply `decision`, propagate, recurse, then
+/// restore the level. Trail depth is asserted to round-trip in debug builds.
+fn branch<F, D>(
+    solver: &mut Solver,
+    vars: &[VarId],
+    stats: &mut SolveStats,
+    on_solution: &mut F,
+    decision: D,
+) -> SearchControl
+where
+    F: FnMut(&Solver) -> SearchControl,
+    D: FnOnce(&mut Solver) -> Result<(), Inconsistency>,
+{
+    let level = solver.store.level();
+    solver.store.push_level();
+
+    let outcome = match decision(solver) {
+        Ok(()) => solver.propagate(),
+        Err(e) => Err(e),
+    };
+    let ctrl = match outcome {
+        Ok(()) => dfs(solver, vars, stats, on_solution),
+        Err(Inconsistency) => {
+            stats.failures += 1;
+            SearchControl::Continue
+        }
+    };
+
+    solver.store.pop_level();
+    debug_assert_eq!(
+        solver.store.level(),
+        level,
+        "trail level mismatch after branch"
+    );
+    ctrl
+}
