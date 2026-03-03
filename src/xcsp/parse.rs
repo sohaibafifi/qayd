@@ -72,25 +72,21 @@ fn parse_brackets(tok: &str) -> Result<(String, Vec<Idx>), String> {
     Ok((name, specs))
 }
 
-/// Expand a bracketed reference into the variables it selects (row-major).
-fn expand(info: &ArrayInfo, specs: &[Idx]) -> Result<Vec<VarId>, String> {
-    if specs.len() != info.dims.len() {
-        return Err(format!(
-            "expected {} indices, got {}",
-            info.dims.len(),
-            specs.len()
-        ));
+/// The flat (row-major) indices selected by `specs` over `dims`.
+fn flat_indices(dims: &[usize], specs: &[Idx]) -> Result<Vec<usize>, String> {
+    if specs.len() != dims.len() {
+        return Err(format!("expected {} indices, got {}", dims.len(), specs.len()));
     }
-    let st = strides(&info.dims);
+    let st = strides(dims);
     let mut lo = Vec::with_capacity(specs.len());
     let mut sizes = Vec::with_capacity(specs.len());
     for (d, spec) in specs.iter().enumerate() {
         let (l, h) = match *spec {
             Idx::One(k) => (k, k),
-            Idx::All => (0, info.dims[d].saturating_sub(1)),
+            Idx::All => (0, dims[d].saturating_sub(1)),
             Idx::Range(a, b) => (a, b),
         };
-        if h >= info.dims[d] || l > h {
+        if h >= dims[d] || l > h {
             return Err("array index out of range".to_string());
         }
         lo.push(l);
@@ -106,9 +102,25 @@ fn expand(info: &ArrayInfo, specs: &[Idx]) -> Result<Vec<VarId>, String> {
             rem /= sizes[d];
             flat += c * st[d];
         }
-        out.push(info.flat[flat]);
+        out.push(flat);
     }
     Ok(out)
+}
+
+/// Expand a bracketed reference into the variables it selects (row-major).
+fn expand(info: &ArrayInfo, specs: &[Idx]) -> Result<Vec<VarId>, String> {
+    Ok(flat_indices(&info.dims, specs)?
+        .into_iter()
+        .map(|i| info.flat[i])
+        .collect())
+}
+
+/// Flat indices selected by a reference token (e.g. `a[3]`, `a[1..4]`) over an
+/// array of the given dimensions. Used while *declaring* an array (before it is
+/// in the symbol table) to apply per-element `<domain for="...">` specs.
+pub fn expand_indices(dims: &[usize], tok: &str) -> Result<Vec<usize>, String> {
+    let (_name, specs) = parse_brackets(tok)?;
+    flat_indices(dims, &specs)
 }
 
 impl SymTab {

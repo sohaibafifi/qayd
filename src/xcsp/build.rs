@@ -10,15 +10,15 @@ use crate::constraints::linear::{linear, Relation};
 use crate::constraints::primitives::{
     all_different, all_equal, element, instantiation, maximum, minimum, ordered,
 };
-use crate::constraints::scheduling::no_overlap;
+use crate::constraints::scheduling::{cumulative, no_overlap};
 use crate::constraints::table::extension;
 use crate::expr::Expr;
 use crate::ids::VarId;
 use crate::store::Solver;
 use crate::xcsp::dom::Node;
 use crate::xcsp::parse::{
-    interval_values, parse_condition, parse_expr, parse_intervals, parse_rel, parse_var_refs,
-    ArrayInfo, Condition, Operand, SymTab,
+    expand_indices, interval_values, parse_condition, parse_expr, parse_intervals, parse_rel,
+    parse_var_refs, ArrayInfo, Condition, Operand, SymTab,
 };
 
 /// A model built from an XCSP3 instance.
@@ -39,6 +39,56 @@ fn create_var(solver: &mut Solver, intervals: &[(i32, i32)]) -> VarId {
     }
 }
 
+/// Create an array's element variables. Domain is taken either from the
+/// `<array>` element's own text (one domain for all) or from `<domain for=...>`
+/// children (a per-element domain, with an optional `for="others"` default).
+fn build_array_vars(
+    solver: &mut Solver,
+    c: &Node,
+    dims: &[usize],
+    total: usize,
+) -> Result<Vec<VarId>, String> {
+    let text = c.trimmed();
+    if !text.is_empty() {
+        let intervals = parse_intervals(text)?;
+        return Ok((0..total).map(|_| create_var(solver, &intervals)).collect());
+    }
+
+    let mut doms: Vec<Option<Vec<(i32, i32)>>> = vec![None; total];
+    let mut default: Option<Vec<(i32, i32)>> = None;
+    for d in c.children_named("domain") {
+        let intervals = parse_intervals(d.trimmed())?;
+        match d.attr("for") {
+            None => default = Some(intervals),
+            Some(f) if f.trim() == "others" => default = Some(intervals),
+            Some(f) => {
+                for tok in f.split_whitespace() {
+                    if tok.contains('[') {
+                        for idx in expand_indices(dims, tok)? {
+                            doms[idx] = Some(intervals.clone());
+                        }
+                    } else {
+                        // A bare array name: applies to every element.
+                        for slot in doms.iter_mut() {
+                            *slot = Some(intervals.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut flat = Vec::with_capacity(total);
+    for (i, slot) in doms.iter().enumerate() {
+        let intervals = slot
+            .as_ref()
+            .or(default.as_ref())
+            .ok_or_else(|| format!("array element {i} has no domain"))?;
+        flat.push(create_var(solver, intervals));
+    }
+    Ok(flat)
+}
+
 fn parse_ints(s: &str) -> Result<Vec<i64>, String> {
     s.split_whitespace()
         .map(|t| t.parse::<i64>().map_err(|_| format!("bad int `{t}`")))
@@ -46,11 +96,16 @@ fn parse_ints(s: &str) -> Result<Vec<i64>, String> {
 }
 
 fn list_refs(node: &Node, sym: &SymTab) -> Result<Vec<VarId>, String> {
-    let list = node.child("list").ok_or("missing <list>")?;
-    if list.attr("startIndex").is_some_and(|s| s.trim() != "0") {
+    // Most constraints wrap their scope in <list>; some (e.g. circuit) put the
+    // references directly in the element text.
+    let (src, start_index) = match node.child("list") {
+        Some(l) => (l, l.attr("startIndex")),
+        None => (node, node.attr("startIndex")),
+    };
+    if start_index.is_some_and(|s| s.trim() != "0") {
         return Err("non-zero startIndex unsupported".to_string());
     }
-    parse_var_refs(list.trimmed(), sym)
+    parse_var_refs(src.trimmed(), sym)
 }
 
 /// Build the model from the root `<instance>` node.
@@ -84,13 +139,8 @@ pub fn build(root: &Node) -> Result<Built, String> {
                         })
                         .collect::<Result<_, _>>()?;
                     let total: usize = dims.iter().product();
-                    let intervals = parse_intervals(c.trimmed())?;
-                    let mut flat = Vec::with_capacity(total);
-                    for _ in 0..total {
-                        let v = create_var(&mut solver, &intervals);
-                        flat.push(v);
-                        order.push(v);
-                    }
+                    let flat = build_array_vars(&mut solver, c, &dims, total)?;
+                    order.extend(flat.iter().copied());
                     sym.arrays.insert(id, ArrayInfo { dims, flat });
                 }
                 _ => {}
@@ -172,7 +222,13 @@ fn build_constraint(solver: &mut Solver, sym: &SymTab, c: &Node) -> Result<(), S
         }
         "cardinality" => build_cardinality(solver, sym, c)?,
         "noOverlap" => build_no_overlap(solver, sym, c)?,
+        "cumulative" => build_cumulative(solver, sym, c)?,
         "group" => build_group(solver, sym, c)?,
+        "block" => {
+            for child in &c.children {
+                build_constraint(solver, sym, child)?;
+            }
+        }
         other => return Err(format!("unsupported constraint <{other}>")),
     }
     Ok(())
@@ -350,6 +406,28 @@ fn build_cardinality(solver: &mut Solver, sym: &SymTab, c: &Node) -> Result<(), 
     }
     let closed = c.attr("closed") == Some("true");
     cardinality(solver, &vars, &values, &low, &high, closed);
+    Ok(())
+}
+
+fn build_cumulative(solver: &mut Solver, sym: &SymTab, c: &Node) -> Result<(), String> {
+    let origins = c.child("origins").ok_or("cumulative without <origins>")?;
+    let starts = parse_var_refs(origins.trimmed(), sym)?;
+    let lengths = c.child("lengths").ok_or("cumulative without <lengths>")?;
+    let durations = parse_ints(lengths.trimmed())?;
+    let heights_node = c.child("heights").ok_or("cumulative without <heights>")?;
+    let heights = parse_ints(heights_node.trimmed())?;
+    let cond = condition_of(c, sym)?;
+    if cond.rel != Relation::Le {
+        return Err("cumulative condition must be <=".to_string());
+    }
+    let cap = match cond.operand {
+        Operand::Const(k) => k,
+        Operand::Var(_) => return Err("cumulative with variable capacity unsupported".to_string()),
+    };
+    if durations.len() != starts.len() || heights.len() != starts.len() {
+        return Err("cumulative origins/lengths/heights mismatch".to_string());
+    }
+    cumulative(solver, &starts, &durations, &heights, cap);
     Ok(())
 }
 
