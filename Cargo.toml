@@ -15,7 +15,11 @@ path = "src/bin/qayd.rs"
 
 [profile.release]
 lto = true
+strip = true
 codegen-units = 1
+opt-level = "z"
+panic = "abort"
+
 
 [dependencies]
 lzma-rs = "0.3.0"
