@@ -1,55 +1,11 @@
 //! `qayd` CLI.
 //!
 //! - `qayd [-v] <instance.xml[.lzma|.xz]>` — parse and solve an XCSP3 instance.
-//! - `qayd [-v] [n]` — demo: solve N-Queens for board size `n` (default 8).
 //!
 //! `-v` / `--verbose` adds `c` comment lines: model size, improving bounds,
 //! search statistics, and wall-clock time.
 
 use std::path::Path;
-
-use qayd::constraints::primitives::not_equal_offset;
-use qayd::{count_solutions, solve, SearchControl, Solver, VarId};
-
-fn build_queens(solver: &mut Solver, n: i32) -> Vec<VarId> {
-    let q: Vec<VarId> = (0..n).map(|_| solver.new_var_range(0, n - 1)).collect();
-    for i in 0..n as usize {
-        for j in (i + 1)..n as usize {
-            let (di, dj) = (i as i32, j as i32);
-            not_equal_offset(solver, q[i], q[j], 0);
-            not_equal_offset(solver, q[i], q[j], di - dj);
-            not_equal_offset(solver, q[i], q[j], dj - di);
-        }
-    }
-    q
-}
-
-fn run_queens(n: i32, verbose: bool) {
-    if n < 1 {
-        eprintln!("board size must be >= 1");
-        std::process::exit(1);
-    }
-    let mut solver = Solver::new();
-    let q = build_queens(&mut solver, n);
-
-    let mut first = None;
-    let stats = solve(&mut solver, &q, |s| {
-        first = Some(q.iter().map(|&v| s.store.value(v)).collect::<Vec<_>>());
-        SearchControl::Stop
-    });
-    match first {
-        Some(sol) => println!("{n}-queens: first solution = {sol:?}"),
-        None => println!("{n}-queens: UNSAT"),
-    }
-    if verbose {
-        eprintln!(
-            "c first-solution search: nodes {} failures {}",
-            stats.nodes, stats.failures
-        );
-    }
-    let total = count_solutions(&mut solver, &q);
-    println!("{n}-queens: {total} solution(s)");
-}
 
 /// Read an instance, transparently decompressing `.lzma` / `.xz`.
 fn read_instance(path: &str) -> Result<String, String> {
@@ -95,16 +51,11 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
     let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
-
     match positional.first() {
         Some(arg) if is_instance(arg) => run_instance(arg, verbose),
-        Some(arg) => match arg.parse::<i32>() {
-            Ok(n) => run_queens(n, verbose),
-            Err(_) => {
-                eprintln!("usage: qayd [-v] <instance.xml[.lzma|.xz]> | qayd [-v] <board-size>");
-                std::process::exit(1);
-            }
-        },
-        None => run_queens(8, verbose),
+        Some(_) | None => {
+            eprintln!("usage: qayd [-v] <instance.xml[.lzma|.xz]>");
+            std::process::exit(1);
+        }
     }
 }
