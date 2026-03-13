@@ -75,7 +75,11 @@ fn parse_brackets(tok: &str) -> Result<(String, Vec<Idx>), String> {
 /// The flat (row-major) indices selected by `specs` over `dims`.
 fn flat_indices(dims: &[usize], specs: &[Idx]) -> Result<Vec<usize>, String> {
     if specs.len() != dims.len() {
-        return Err(format!("expected {} indices, got {}", dims.len(), specs.len()));
+        return Err(format!(
+            "expected {} indices, got {}",
+            dims.len(),
+            specs.len()
+        ));
     }
     let st = strides(dims);
     let mut lo = Vec::with_capacity(specs.len());

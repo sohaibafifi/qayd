@@ -89,10 +89,21 @@ fn build_array_vars(
     Ok(flat)
 }
 
+/// Parse a whitespace-separated integer list, expanding XCSP `value×count`
+/// repetition written as `vxk` (e.g. `0x20` = twenty zeros).
 fn parse_ints(s: &str) -> Result<Vec<i64>, String> {
-    s.split_whitespace()
-        .map(|t| t.parse::<i64>().map_err(|_| format!("bad int `{t}`")))
-        .collect()
+    let mut out = Vec::new();
+    for tok in s.split_whitespace() {
+        match tok.split_once('x') {
+            Some((v, k)) => {
+                let val: i64 = v.parse().map_err(|_| format!("bad int `{tok}`"))?;
+                let count: usize = k.parse().map_err(|_| format!("bad count `{tok}`"))?;
+                out.extend(std::iter::repeat_n(val, count));
+            }
+            None => out.push(tok.parse().map_err(|_| format!("bad int `{tok}`"))?),
+        }
+    }
+    Ok(out)
 }
 
 fn list_refs(node: &Node, sym: &SymTab) -> Result<Vec<VarId>, String> {
@@ -213,11 +224,10 @@ fn build_constraint(solver: &mut Solver, sym: &SymTab, c: &Node) -> Result<(), S
         "instantiation" => {
             let vars = list_refs(c, sym)?;
             let values = c.child("values").ok_or("instantiation without <values>")?;
-            let vals: Vec<i32> = values
-                .trimmed()
-                .split_whitespace()
-                .map(|t| t.parse().map_err(|_| "bad value"))
-                .collect::<Result<_, _>>()?;
+            let vals: Vec<i32> = parse_ints(values.trimmed())?
+                .into_iter()
+                .map(|v| v as i32)
+                .collect();
             instantiation(solver, &vars, &vals);
         }
         "cardinality" => build_cardinality(solver, sym, c)?,
@@ -310,8 +320,25 @@ fn build_count(solver: &mut Solver, sym: &SymTab, c: &Node) -> Result<(), String
     Ok(())
 }
 
+/// Expand a list whose tokens may be variable references *or* integer
+/// constants (constants become fixed singleton variables).
+fn refs_or_consts(solver: &mut Solver, sym: &SymTab, s: &str) -> Result<Vec<VarId>, String> {
+    let mut out = Vec::new();
+    for tok in s.split_whitespace() {
+        if let Ok(n) = tok.parse::<i32>() {
+            out.push(solver.new_var_set(&[n]));
+        } else {
+            out.extend(parse_var_refs(tok, sym)?);
+        }
+    }
+    Ok(out)
+}
+
 fn build_element(solver: &mut Solver, sym: &SymTab, c: &Node) -> Result<(), String> {
-    let array = list_refs(c, sym)?;
+    let list_src = c
+        .child("list")
+        .map_or_else(|| c.trimmed().to_string(), |l| l.trimmed().to_string());
+    let array = refs_or_consts(solver, sym, &list_src)?;
     let index = c.child("index").ok_or("element without <index>")?;
     let idx = sym.resolve_one(index.trimmed())?;
     let value = if let Some(v) = c.child("value") {
@@ -487,12 +514,10 @@ fn build_objective(
     // type="sum" with <list> (+ optional <coeffs>): introduce an objective var
     // equal to the weighted sum.
     if node.attr("type") == Some("sum") {
-        let vars = parse_var_refs(
-            node.child("list")
-                .ok_or("objective sum without <list>")?
-                .trimmed(),
-            sym,
-        )?;
+        let list_src = node
+            .child("list")
+            .map_or_else(|| node.trimmed().to_string(), |l| l.trimmed().to_string());
+        let vars = parse_var_refs(&list_src, sym)?;
         let coeffs = match node.child("coeffs") {
             Some(n) => parse_ints(n.trimmed())?,
             None => vec![1; vars.len()],
