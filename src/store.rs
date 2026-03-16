@@ -319,6 +319,17 @@ impl Store {
         }
     }
 
+    /// Sum of `weights` over the propagators constraining `var` (its weighted
+    /// degree, for `dom/wdeg`). At least 1 so it is safe as a divisor.
+    pub fn var_weight(&self, var: VarId, weights: &[u64]) -> u64 {
+        let s = &self.subs[var.index()];
+        let mut w = 0u64;
+        for &p in s.on_dom.iter().chain(&s.on_bnd).chain(&s.on_fix) {
+            w += weights[p.index()];
+        }
+        w.max(1)
+    }
+
     // --- search levels (delegated to the trail) ---
 
     /// Open a search level.
@@ -346,6 +357,8 @@ pub struct Solver {
     /// Propagator objects, indexed by `PropId`. `Option` so one can be taken
     /// out to run while still owning its slot.
     propagators: Vec<Option<Box<dyn Propagator>>>,
+    /// `dom/wdeg` weights, indexed by `PropId`; bumped when a propagator fails.
+    weights: Vec<u64>,
 }
 
 impl Solver {
@@ -371,6 +384,7 @@ impl Solver {
         debug_assert_eq!(id.index(), self.propagators.len());
         prop.register(&mut self.store, id);
         self.propagators.push(Some(prop));
+        self.weights.push(1);
         self.store.enqueue(id);
         id
     }
@@ -378,6 +392,11 @@ impl Solver {
     /// Number of posted propagators.
     pub fn num_propagators(&self) -> usize {
         self.propagators.len()
+    }
+
+    /// The `dom/wdeg` weights, indexed by `PropId`.
+    pub fn weights(&self) -> &[u64] {
+        &self.weights
     }
 
     /// Enqueue every propagator. Called at the start of each search so a solve
@@ -403,6 +422,8 @@ impl Solver {
             self.propagators[id.index()] = Some(prop);
 
             if let Err(e) = result {
+                // dom/wdeg: blame the propagator that wiped out a domain.
+                self.weights[id.index()] += 1;
                 self.store.clear_queue();
                 return Err(e);
             }

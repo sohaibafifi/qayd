@@ -5,9 +5,19 @@
 //! (right), propagating to a fixpoint after each and backtracking on failure.
 //! `dom/wdeg`, restarts, and branch-and-bound for COP arrive in later phases.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::ids::VarId;
 use crate::propagator::Inconsistency;
 use crate::store::Solver;
+
+/// A stop flag that is never set — used by the non-interruptible entry points.
+static NEVER_STOP: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+fn stopped(flag: &AtomicBool) -> bool {
+    flag.load(Ordering::Relaxed)
+}
 
 /// Whether to keep enumerating after a solution.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -32,7 +42,20 @@ pub struct SolveStats {
 /// Enumerate solutions over `vars` by DFS. `on_solution` is invoked for every
 /// full assignment; return [`SearchControl::Stop`] to halt early. The solver is
 /// restored to its pre-call state on return.
-pub fn solve<F>(solver: &mut Solver, vars: &[VarId], mut on_solution: F) -> SolveStats
+pub fn solve<F>(solver: &mut Solver, vars: &[VarId], on_solution: F) -> SolveStats
+where
+    F: FnMut(&Solver) -> SearchControl,
+{
+    solve_interruptible(solver, vars, on_solution, &NEVER_STOP)
+}
+
+/// Like [`solve`], but halts as soon as `stop` is set (time limit / Ctrl+C).
+pub fn solve_interruptible<F>(
+    solver: &mut Solver,
+    vars: &[VarId],
+    mut on_solution: F,
+    stop: &AtomicBool,
+) -> SolveStats
 where
     F: FnMut(&Solver) -> SearchControl,
 {
@@ -41,7 +64,7 @@ where
     solver.enqueue_all();
     match solver.propagate() {
         Ok(()) => {
-            dfs(solver, vars, &mut stats, &mut on_solution);
+            dfs(solver, vars, &mut stats, &mut on_solution, stop);
         }
         Err(Inconsistency) => {
             stats.failures += 1;
@@ -83,21 +106,44 @@ pub fn optimize_with(
     let mut incumbent: Option<i32> = None;
     let mut best: Option<(Vec<i32>, i32)> = None;
 
+    // Geometric restarts. dom/wdeg weights accumulate across runs (failures bump
+    // them), so each restart searches differently and escapes early bad choices.
+    let mut limit: u64 = 128;
     solver.store.push_level();
-    solver.enqueue_all();
-    bnb(
-        solver,
-        vars,
-        obj,
-        minimizing,
-        &mut incumbent,
-        &mut best,
-        &mut stats,
-        &mut on_improve,
-    );
+    loop {
+        solver.store.clear_queue();
+        solver.enqueue_all();
+        let mut ctx = Bnb {
+            run_failures: 0,
+            limit,
+            aborted: false,
+        };
+        bnb(
+            solver,
+            vars,
+            obj,
+            minimizing,
+            &mut incumbent,
+            &mut best,
+            &mut stats,
+            &mut ctx,
+            &mut on_improve,
+        );
+        if !ctx.aborted {
+            break; // a full traversal completed: best is optimal
+        }
+        limit = limit.saturating_mul(2);
+    }
     solver.store.pop_level();
 
     (best, stats)
+}
+
+/// Per-run restart state for [`bnb`].
+struct Bnb {
+    run_failures: u64,
+    limit: u64,
+    aborted: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -109,12 +155,22 @@ fn bnb<F: FnMut(i32)>(
     incumbent: &mut Option<i32>,
     best: &mut Option<(Vec<i32>, i32)>,
     stats: &mut SolveStats,
+    ctx: &mut Bnb,
     on_improve: &mut F,
 ) {
+    if ctx.aborted {
+        return;
+    }
+    if ctx.run_failures >= ctx.limit {
+        ctx.aborted = true; // restart budget exhausted
+        return;
+    }
+
     // Reach the node's fixpoint (drains the decision that led here, or the
     // initial enqueue at the root).
     if solver.propagate().is_err() {
         stats.failures += 1;
+        ctx.run_failures += 1;
         return;
     }
     // Enforce the incumbent bound here, then re-propagate. The incumbent is not
@@ -127,6 +183,7 @@ fn bnb<F: FnMut(i32)>(
         };
         if bounded.is_err() || solver.propagate().is_err() {
             stats.failures += 1;
+            ctx.run_failures += 1;
             return;
         }
     }
@@ -155,13 +212,17 @@ fn bnb<F: FnMut(i32)>(
         };
         if ok.is_ok() {
             bnb(
-                solver, vars, obj, minimizing, incumbent, best, stats, on_improve,
+                solver, vars, obj, minimizing, incumbent, best, stats, ctx, on_improve,
             );
         } else {
             stats.failures += 1;
+            ctx.run_failures += 1;
         }
         solver.store.pop_level();
         debug_assert_eq!(solver.store.level(), level, "trail level mismatch in bnb");
+        if ctx.aborted {
+            return;
+        }
     }
 }
 
@@ -181,15 +242,22 @@ pub fn maximize(solver: &mut Solver, vars: &[VarId], obj: VarId) -> Option<(Vec<
     optimize_with(solver, vars, obj, false, |_| {}).0
 }
 
-/// First-fail: pick the unfixed variable with the smallest domain.
+/// `dom/wdeg`: pick the unfixed variable minimising domain-size / weighted
+/// degree. Falls back to first-fail before any constraint has failed (all
+/// weights 1, so the ratio is just the domain size).
 fn select(solver: &Solver, vars: &[VarId]) -> Option<VarId> {
+    let weights = solver.weights();
     let mut best: Option<VarId> = None;
-    let mut best_size = usize::MAX;
+    let mut best_score = f64::INFINITY;
     for &v in vars {
-        let s = solver.store.size(v);
-        if s > 1 && s < best_size {
-            best_size = s;
-            best = Some(v);
+        let size = solver.store.size(v);
+        if size > 1 {
+            let wdeg = solver.store.var_weight(v, weights);
+            let score = size as f64 / wdeg as f64;
+            if score < best_score {
+                best_score = score;
+                best = Some(v);
+            }
         }
     }
     best
