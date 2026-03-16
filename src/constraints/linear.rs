@@ -5,7 +5,8 @@
 //! else is built from it:
 //!
 //! - `≥` / `>` / `<` are sign/offset rewrites of `≤`.
-//! - `=` posts the constraint and its negation (`≤ c` and `≥ c`).
+//! - `=` has a dedicated both-sided `LinearEq` propagator (tighter per call than
+//!   posting `≤ c` and `≥ c` separately).
 //! - `≠` gets its own (weak) propagator that only fires near a full assignment.
 //!
 //! All arithmetic is done in `i64` so sums of `i32` terms cannot overflow.
@@ -109,6 +110,84 @@ impl Propagator for LinearLeq {
                 }
             }
 
+            if !changed {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// `Σ aᵢ·xᵢ = c`, with both-sided bounds propagation run to a local fixpoint.
+/// Stronger per call than posting `≤ c` and `≥ c` separately (one pass tightens
+/// from both directions instead of waking two propagators in turn).
+struct LinearEq {
+    coeffs: Vec<i64>,
+    vars: Vec<VarId>,
+    c: i64,
+    term_min: Vec<i64>,
+    term_max: Vec<i64>,
+}
+
+impl LinearEq {
+    fn new(coeffs: &[i64], vars: &[VarId], c: i64) -> Self {
+        debug_assert_eq!(coeffs.len(), vars.len());
+        Self {
+            coeffs: coeffs.to_vec(),
+            vars: vars.to_vec(),
+            c,
+            term_min: vec![0; vars.len()],
+            term_max: vec![0; vars.len()],
+        }
+    }
+}
+
+impl Propagator for LinearEq {
+    fn register(&mut self, store: &mut Store, me: PropId) {
+        for &v in &self.vars {
+            store.subscribe(v, me, Event::BoundChange);
+        }
+    }
+
+    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+        loop {
+            let mut sum_min: i64 = 0;
+            let mut sum_max: i64 = 0;
+            for (i, (&a, &v)) in self.coeffs.iter().zip(&self.vars).enumerate() {
+                let lo = store.min(v) as i64;
+                let hi = store.max(v) as i64;
+                let (tmin, tmax) = if a >= 0 {
+                    (a * lo, a * hi)
+                } else {
+                    (a * hi, a * lo)
+                };
+                self.term_min[i] = tmin;
+                self.term_max[i] = tmax;
+                sum_min += tmin;
+                sum_max += tmax;
+            }
+            if sum_min > self.c || sum_max < self.c {
+                return Err(Inconsistency);
+            }
+
+            let mut changed = false;
+            for (i, (&a, &v)) in self.coeffs.iter().zip(&self.vars).enumerate() {
+                if a == 0 {
+                    continue;
+                }
+                // aᵢ·xᵢ must lie in [tlo, thi].
+                let tlo = self.c - (sum_max - self.term_max[i]);
+                let thi = self.c - (sum_min - self.term_min[i]);
+                let (lo, hi) = if a > 0 {
+                    (ceil_div(tlo, a), floor_div(thi, a))
+                } else {
+                    (ceil_div(thi, a), floor_div(tlo, a))
+                };
+                let before_min = store.min(v);
+                let before_max = store.max(v);
+                store.remove_below(v, clamp_i32(lo))?;
+                store.remove_above(v, clamp_i32(hi))?;
+                changed |= store.min(v) != before_min || store.max(v) != before_max;
+            }
             if !changed {
                 return Ok(());
             }
@@ -228,8 +307,7 @@ pub fn linear(solver: &mut Solver, coeffs: &[i64], vars: &[VarId], rel: Relation
         Relation::Ge => post_leq(solver, &neg(coeffs), vars, -rhs),
         Relation::Gt => post_leq(solver, &neg(coeffs), vars, -(rhs + 1)),
         Relation::Eq => {
-            post_leq(solver, coeffs, vars, rhs);
-            post_leq(solver, &neg(coeffs), vars, -rhs);
+            solver.post(Box::new(LinearEq::new(coeffs, vars, rhs)));
         }
         Relation::Ne => {
             solver.post(Box::new(LinearNeq::new(coeffs, vars, rhs)));

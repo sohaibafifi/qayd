@@ -109,10 +109,16 @@ pub fn optimize_with(
     let mut incumbent: Option<i32> = None;
     let mut best: Option<(Vec<i32>, i32)> = None;
 
-    // Geometric restarts. dom/wdeg weights accumulate across runs (failures bump
-    // them), so each restart searches differently and escapes early bad choices.
-    let mut limit: u64 = 128;
     solver.store.push_level();
+
+    // Phase 1 — complete restart branch-and-bound. Geometric restarts; dom/wdeg
+    // weights accumulate across runs so each searches differently. Proves the
+    // optimum on tractable instances. Hands off to LNS if it gets too expensive.
+    // Run inside a nested level: its objective-bound prunes (obj < incumbent) are
+    // discarded before LNS, so LNS can fix variables back to incumbent values.
+    solver.store.push_level();
+    let mut limit: u64 = 128;
+    let mut proved = false;
     loop {
         solver.store.clear_queue();
         solver.enqueue_all();
@@ -134,16 +140,81 @@ pub fn optimize_with(
             &mut on_improve,
         );
         if stopped(stop) {
-            break; // interrupted / timed out: return the best found so far
+            break;
         }
         if !ctx.aborted {
-            break; // a full traversal completed: best is optimal
+            proved = true; // a full traversal completed: best is optimal (or UNSAT)
+            break;
         }
         limit = limit.saturating_mul(2);
+        if stats.failures >= LNS_THRESHOLD {
+            break; // give up on proving; switch to large-neighbourhood search
+        }
     }
-    solver.store.pop_level();
+    solver.store.pop_level(); // discard Phase 1's objective-bound prunes
 
+    // Phase 2 — LNS. Repeatedly fix a random part of the incumbent and re-optimise
+    // the rest. Anytime: improves the incumbent until interrupted. Never claims a
+    // proof (the caller reports `s SATISFIABLE`, not `s OPTIMUM FOUND`).
+    if !proved && !stopped(stop) && best.is_some() {
+        let mut rng = Rng::new(0x9E37_79B9_7F4A_7C15 ^ vars.len() as u64);
+        let base = (vars.len() / 10).max(1);
+        let mut relax = base;
+        while !stopped(stop) {
+            let improved = lns_iteration(
+                solver,
+                vars,
+                obj,
+                minimizing,
+                &mut incumbent,
+                &mut best,
+                &mut stats,
+                stop,
+                &mut rng,
+                relax,
+                &mut on_improve,
+            );
+            if improved {
+                relax = base; // intensify around the new incumbent
+            } else {
+                relax = (relax + base).min(vars.len().max(1) - 1).max(base); // diversify
+            }
+        }
+    }
+
+    solver.store.pop_level();
     (best, stats)
+}
+
+/// Total failures Phase 1 may spend before conceding the proof and switching to
+/// LNS. Set well above what tractable instances need so they still prove optimal.
+const LNS_THRESHOLD: u64 = 100_000;
+
+/// Per-neighbourhood failure budget in Phase 2.
+const LNS_BUDGET: u64 = 500;
+
+/// A tiny xorshift64 PRNG (deterministic — reproducible runs, no dependency).
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(seed | 1)
+    }
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    fn below(&mut self, n: usize) -> usize {
+        if n == 0 {
+            0
+        } else {
+            (self.next_u64() % n as u64) as usize
+        }
+    }
 }
 
 /// Per-run restart state for [`bnb`].
@@ -242,6 +313,77 @@ fn bnb<F: FnMut(i32)>(
 enum Decision {
     Eq,
     Ne,
+}
+
+/// One LNS move: fix all but a random `relax`-sized subset of the variables to
+/// the incumbent (leaving the objective free), demand a strictly better
+/// objective, and re-optimise the freed part within a small failure budget.
+/// Returns whether the incumbent improved. Trail-neutral (its level round-trips).
+#[allow(clippy::too_many_arguments)]
+fn lns_iteration<F: FnMut(i32)>(
+    solver: &mut Solver,
+    vars: &[VarId],
+    obj: VarId,
+    minimizing: bool,
+    incumbent: &mut Option<i32>,
+    best: &mut Option<(Vec<i32>, i32)>,
+    stats: &mut SolveStats,
+    stop: &AtomicBool,
+    rng: &mut Rng,
+    relax: usize,
+    on_improve: &mut F,
+) -> bool {
+    let (assignment, before) = match best {
+        Some((a, v)) => (a.clone(), *v),
+        None => return false,
+    };
+    let n = vars.len();
+
+    solver.store.push_level();
+    solver.store.clear_queue();
+
+    // Fix the complement of a random relaxed subset to the incumbent; never fix
+    // the objective variable (it must stay free to be re-derived).
+    let mut feasible = true;
+    for (k, &v) in vars.iter().enumerate() {
+        if v == obj {
+            continue;
+        }
+        let relaxed = rng.below(n) < relax;
+        if !relaxed && solver.store.fix(v, assignment[k]).is_err() {
+            feasible = false;
+            break;
+        }
+    }
+    // Demand strict improvement.
+    if feasible {
+        let bounded = if minimizing {
+            solver.store.remove_above(obj, before - 1)
+        } else {
+            solver.store.remove_below(obj, before + 1)
+        };
+        feasible = bounded.is_ok();
+    }
+
+    if feasible {
+        solver.enqueue_all();
+        let mut ctx = Bnb {
+            run_failures: 0,
+            limit: LNS_BUDGET,
+            aborted: false,
+        };
+        bnb(
+            solver, vars, obj, minimizing, incumbent, best, stats, &mut ctx, stop, on_improve,
+        );
+    }
+
+    solver.store.pop_level();
+
+    match best {
+        Some((_, v)) if minimizing => *v < before,
+        Some((_, v)) => *v > before,
+        None => false,
+    }
 }
 
 /// Minimise `obj`. Returns the best `(assignment of vars, obj value)`.
