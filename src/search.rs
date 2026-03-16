@@ -1,9 +1,11 @@
 //! Depth-first search with backtracking.
 //!
-//! Phase 0: DFS with first-fail variable selection (smallest domain) and
-//! min-value branching. Each node tries `var = val` (left) then `var != val`
-//! (right), propagating to a fixpoint after each and backtracking on failure.
-//! `dom/wdeg`, restarts, and branch-and-bound for COP arrive in later phases.
+//! Each node tries `var = val` (left) then `var != val` (right), propagating to
+//! a fixpoint after each and backtracking on failure. Variable selection is
+//! `dom/wdeg`; value selection is min-value. The COP optimiser ([`optimize_with`])
+//! is in-search branch-and-bound with geometric restarts. All entry points have
+//! an interruptible variant that halts when a shared stop flag is set (used for
+//! the CLI time limit and Ctrl+C).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -100,6 +102,7 @@ pub fn optimize_with(
     vars: &[VarId],
     obj: VarId,
     minimizing: bool,
+    stop: &AtomicBool,
     mut on_improve: impl FnMut(i32),
 ) -> (Option<(Vec<i32>, i32)>, SolveStats) {
     let mut stats = SolveStats::default();
@@ -127,8 +130,12 @@ pub fn optimize_with(
             &mut best,
             &mut stats,
             &mut ctx,
+            stop,
             &mut on_improve,
         );
+        if stopped(stop) {
+            break; // interrupted / timed out: return the best found so far
+        }
         if !ctx.aborted {
             break; // a full traversal completed: best is optimal
         }
@@ -156,9 +163,14 @@ fn bnb<F: FnMut(i32)>(
     best: &mut Option<(Vec<i32>, i32)>,
     stats: &mut SolveStats,
     ctx: &mut Bnb,
+    stop: &AtomicBool,
     on_improve: &mut F,
 ) {
     if ctx.aborted {
+        return;
+    }
+    if stopped(stop) {
+        ctx.aborted = true; // interrupted / timed out
         return;
     }
     if ctx.run_failures >= ctx.limit {
@@ -212,7 +224,7 @@ fn bnb<F: FnMut(i32)>(
         };
         if ok.is_ok() {
             bnb(
-                solver, vars, obj, minimizing, incumbent, best, stats, ctx, on_improve,
+                solver, vars, obj, minimizing, incumbent, best, stats, ctx, stop, on_improve,
             );
         } else {
             stats.failures += 1;
@@ -234,12 +246,12 @@ enum Decision {
 
 /// Minimise `obj`. Returns the best `(assignment of vars, obj value)`.
 pub fn minimize(solver: &mut Solver, vars: &[VarId], obj: VarId) -> Option<(Vec<i32>, i32)> {
-    optimize_with(solver, vars, obj, true, |_| {}).0
+    optimize_with(solver, vars, obj, true, &NEVER_STOP, |_| {}).0
 }
 
 /// Maximise `obj`. Returns the best `(assignment of vars, obj value)`.
 pub fn maximize(solver: &mut Solver, vars: &[VarId], obj: VarId) -> Option<(Vec<i32>, i32)> {
-    optimize_with(solver, vars, obj, false, |_| {}).0
+    optimize_with(solver, vars, obj, false, &NEVER_STOP, |_| {}).0
 }
 
 /// `dom/wdeg`: pick the unfixed variable minimising domain-size / weighted
@@ -268,10 +280,14 @@ fn dfs<F>(
     vars: &[VarId],
     stats: &mut SolveStats,
     on_solution: &mut F,
+    stop: &AtomicBool,
 ) -> SearchControl
 where
     F: FnMut(&Solver) -> SearchControl,
 {
+    if stopped(stop) {
+        return SearchControl::Stop;
+    }
     let var = match select(solver, vars) {
         None => {
             // No unfixed variable left: a full assignment.
@@ -284,12 +300,13 @@ where
     stats.nodes += 1;
 
     // Left branch: var = val.
-    if let SearchControl::Stop = branch(solver, vars, stats, on_solution, |s| s.store.fix(var, val))
-    {
+    if let SearchControl::Stop = branch(solver, vars, stats, on_solution, stop, |s| {
+        s.store.fix(var, val)
+    }) {
         return SearchControl::Stop;
     }
     // Right branch: var != val.
-    if let SearchControl::Stop = branch(solver, vars, stats, on_solution, |s| {
+    if let SearchControl::Stop = branch(solver, vars, stats, on_solution, stop, |s| {
         s.store.remove(var, val)
     }) {
         return SearchControl::Stop;
@@ -305,6 +322,7 @@ fn branch<F, D>(
     vars: &[VarId],
     stats: &mut SolveStats,
     on_solution: &mut F,
+    stop: &AtomicBool,
     decision: D,
 ) -> SearchControl
 where
@@ -319,7 +337,7 @@ where
         Err(e) => Err(e),
     };
     let ctrl = match outcome {
-        Ok(()) => dfs(solver, vars, stats, on_solution),
+        Ok(()) => dfs(solver, vars, stats, on_solution, stop),
         Err(Inconsistency) => {
             stats.failures += 1;
             SearchControl::Continue

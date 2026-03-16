@@ -1,11 +1,16 @@
 //! `qayd` CLI.
 //!
-//! - `qayd [-v] <instance.xml[.lzma|.xz]>` — parse and solve an XCSP3 instance.
+//! `qayd [-v] [-t SECONDS] <instance.xml[.lzma|.xz]>`
 //!
-//! `-v` / `--verbose` adds `c` comment lines: model size, improving bounds,
-//! search statistics, and wall-clock time.
+//! - `-v` / `--verbose` — emit `c` comment lines (model size, improving bounds,
+//!   search statistics, wall-clock time).
+//! - `-t` / `--time SECONDS` — stop after a time budget, reporting the best
+//!   solution found so far. Ctrl+C does the same on demand.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Read an instance, transparently decompressing `.lzma` / `.xz`.
 fn read_instance(path: &str) -> Result<String, String> {
@@ -24,7 +29,7 @@ fn read_instance(path: &str) -> Result<String, String> {
     Ok(xml)
 }
 
-fn run_instance(path: &str, verbose: bool) {
+fn run_instance(path: &str, verbose: bool, stop: &AtomicBool) {
     let xml = match read_instance(path) {
         Ok(x) => x,
         Err(e) => {
@@ -34,7 +39,7 @@ fn run_instance(path: &str, verbose: bool) {
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    if let Err(e) = qayd::xcsp::run_to(&xml, verbose, &mut lock) {
+    if let Err(e) = qayd::xcsp::run_to(&xml, verbose, stop, &mut lock) {
         eprintln!("error: {e}");
         std::process::exit(2);
     }
@@ -47,15 +52,55 @@ fn is_instance(arg: &str) -> bool {
         || arg.ends_with(".xz")
 }
 
+fn usage() -> ! {
+    eprintln!("usage: qayd [-v] [-t SECONDS] <instance.xml[.lzma|.xz]>");
+    std::process::exit(1);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
-    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
-    match positional.first() {
-        Some(arg) if is_instance(arg) => run_instance(arg, verbose),
-        Some(_) | None => {
-            eprintln!("usage: qayd [-v] <instance.xml[.lzma|.xz]>");
-            std::process::exit(1);
+    let mut verbose = false;
+    let mut time_limit: Option<u64> = None;
+    let mut path: Option<String> = None;
+
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-v" | "--verbose" => verbose = true,
+            "-t" | "--time" => match it.next().and_then(|s| s.parse::<u64>().ok()) {
+                Some(secs) => time_limit = Some(secs),
+                None => {
+                    eprintln!("-t/--time needs a number of seconds");
+                    std::process::exit(1);
+                }
+            },
+            other if other.starts_with('-') => {
+                eprintln!("unknown option {other}");
+                usage();
+            }
+            other if path.is_none() => path = Some(other.to_string()),
+            _ => usage(),
         }
     }
+
+    let Some(path) = path else { usage() };
+    if !is_instance(&path) {
+        usage();
+    }
+
+    // Shared stop flag, set by Ctrl+C and (optionally) the time-limit thread.
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let s = stop.clone();
+        let _ = ctrlc::set_handler(move || s.store(true, Ordering::SeqCst));
+    }
+    if let Some(secs) = time_limit {
+        let s = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(secs));
+            s.store(true, Ordering::SeqCst);
+        });
+    }
+
+    run_instance(&path, verbose, &stop);
 }

@@ -22,5 +22,6 @@ panic = "abort"
 
 
 [dependencies]
+ctrlc = "3.5.2"
 lzma-rs = "0.3.0"
 quick-xml = "0.40.1"

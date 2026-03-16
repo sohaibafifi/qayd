@@ -8,9 +8,10 @@ pub mod dom;
 pub mod parse;
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::search::{optimize_with, solve, SearchControl};
+use crate::search::{optimize_with, solve_interruptible, SearchControl};
 
 fn write_values<W: Write>(w: &mut W, sol: &[i32]) -> std::io::Result<()> {
     write!(w, "v")?;
@@ -24,14 +25,24 @@ fn write_values<W: Write>(w: &mut W, sol: &[i32]) -> std::io::Result<()> {
 /// output lines (`s ...`, `o ...`, `v ...`) as a string. No `c` comments.
 pub fn run(xml: &str) -> Result<String, String> {
     let mut buf = Vec::new();
-    run_to(xml, false, &mut buf)?;
+    let never = AtomicBool::new(false);
+    run_to(xml, false, &never, &mut buf)?;
     String::from_utf8(buf).map_err(|e| e.to_string())
 }
 
 /// Solve an XCSP3 instance, **streaming** output to `w` as it is produced. When
 /// `verbose`, emits `c` comment lines (model size, search stats, time) and an
 /// `o` line per improving bound, flushing after each so progress is live.
-pub fn run_to<W: Write>(xml: &str, verbose: bool, w: &mut W) -> Result<(), String> {
+///
+/// Search halts as soon as `stop` is set (time limit / Ctrl+C), reporting the
+/// best solution found so far (`s SATISFIABLE` / `s UNKNOWN` instead of
+/// `s OPTIMUM FOUND` / `s UNSATISFIABLE`).
+pub fn run_to<W: Write>(
+    xml: &str,
+    verbose: bool,
+    stop: &AtomicBool,
+    w: &mut W,
+) -> Result<(), String> {
     let start = Instant::now();
     let root = dom::parse(xml)?;
     let built = build::build(&root)?;
@@ -58,10 +69,15 @@ pub fn run_to<W: Write>(xml: &str, verbose: bool, w: &mut W) -> Result<(), Strin
     match built.objective {
         None => {
             let mut sol = None;
-            let stats = solve(&mut solver, &vars, |s| {
-                sol = Some(vars.iter().map(|&v| s.store.value(v)).collect::<Vec<_>>());
-                SearchControl::Stop
-            });
+            let stats = solve_interruptible(
+                &mut solver,
+                &vars,
+                |s| {
+                    sol = Some(vars.iter().map(|&v| s.store.value(v)).collect::<Vec<_>>());
+                    SearchControl::Stop
+                },
+                stop,
+            );
             if verbose {
                 writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures)
                     .map_err(to_err)?;
@@ -71,13 +87,14 @@ pub fn run_to<W: Write>(xml: &str, verbose: bool, w: &mut W) -> Result<(), Strin
                     writeln!(w, "s SATISFIABLE").map_err(to_err)?;
                     write_values(w, &s).map_err(to_err)?;
                 }
+                None if stop.load(Ordering::Relaxed) => writeln!(w, "s UNKNOWN").map_err(to_err)?,
                 None => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
             }
         }
         Some((minimizing, obj)) => {
             // Stream each improving bound live.
             let mut io_err: Option<std::io::Error> = None;
-            let (best, stats) = optimize_with(&mut solver, &vars, obj, minimizing, |v| {
+            let (best, stats) = optimize_with(&mut solver, &vars, obj, minimizing, stop, |v| {
                 if verbose && io_err.is_none() {
                     if let Err(e) = writeln!(w, "o {v}").and_then(|_| w.flush()) {
                         io_err = Some(e);
@@ -91,18 +108,29 @@ pub fn run_to<W: Write>(xml: &str, verbose: bool, w: &mut W) -> Result<(), Strin
                 writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures)
                     .map_err(to_err)?;
             }
+            let interrupted = stop.load(Ordering::Relaxed);
             match best {
                 Some((sol, value)) => {
-                    writeln!(w, "s OPTIMUM FOUND").map_err(to_err)?;
+                    // Proven optimal only if search finished without interruption.
+                    let status = if interrupted {
+                        "s SATISFIABLE"
+                    } else {
+                        "s OPTIMUM FOUND"
+                    };
+                    writeln!(w, "{status}").map_err(to_err)?;
                     writeln!(w, "o {value}").map_err(to_err)?;
                     write_values(w, &sol).map_err(to_err)?;
                 }
+                None if interrupted => writeln!(w, "s UNKNOWN").map_err(to_err)?,
                 None => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
             }
         }
     }
 
     if verbose {
+        if stop.load(Ordering::Relaxed) {
+            writeln!(w, "c interrupted").map_err(to_err)?;
+        }
         writeln!(w, "c time {:.3}s", start.elapsed().as_secs_f64()).map_err(to_err)?;
     }
     w.flush().map_err(to_err)?;
