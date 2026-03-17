@@ -61,7 +61,7 @@ pub fn not_equal(solver: &mut Solver, x: VarId, y: VarId) -> PropId {
 // Ordering: x + k <= y
 // ---------------------------------------------------------------------------
 
-/// `x + k ≤ y`. Bounds propagation; one pass is a fixpoint for two variables.
+/// \( x + k \le y \). Bounds propagation; one pass is a fixpoint for two variables.
 struct LessOrEqual {
     x: VarId,
     y: VarId,
@@ -75,15 +75,15 @@ impl Propagator for LessOrEqual {
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
-        // x ≤ max(y) − k
+        // x <= max(y) - k
         store.remove_above(self.x, store.max(self.y).saturating_sub(self.k))?;
-        // y ≥ min(x) + k
+        // y >= min(x) + k
         store.remove_below(self.y, store.min(self.x).saturating_add(self.k))?;
         Ok(())
     }
 }
 
-/// Post `x ≤ y`.
+/// Post \( x \le y \).
 pub fn less_or_equal(solver: &mut Solver, x: VarId, y: VarId) -> PropId {
     solver.post(Box::new(LessOrEqual { x, y, k: 0 }))
 }
@@ -231,7 +231,7 @@ impl Propagator for Minimum {
         }
         store.remove_below(self.y, lb)?;
         store.remove_above(self.y, ub)?;
-        // Every x ≥ y.
+        // Every x >= y.
         let ymin = store.min(self.y);
         for &x in &self.xs {
             store.remove_below(x, ymin)?;
@@ -263,7 +263,7 @@ impl Propagator for Maximum {
         }
         store.remove_below(self.y, lb)?;
         store.remove_above(self.y, ub)?;
-        // Every x ≤ y.
+        // Every x <= y.
         let ymax = store.max(self.y);
         for &x in &self.xs {
             store.remove_above(x, ymax)?;

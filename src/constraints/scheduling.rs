@@ -259,8 +259,9 @@ pub fn bin_packing(solver: &mut Solver, items: &[VarId], sizes: &[i64], capaciti
 // knapsack (two linear constraints)
 // ===========================================================================
 
-/// Post `knapsack`: `Σ weights·vars  weight_rel  weight_limit` and
-/// `Σ profits·vars  profit_rel  profit_limit`. Reuses linear bounds propagation.
+/// Post `knapsack`: \( \sum_i \texttt{weights}[i] \cdot \texttt{vars}[i] \;\texttt{weight\_rel}\; \texttt{weight\_limit} \)
+/// and \( \sum_i \texttt{profits}[i] \cdot \texttt{vars}[i] \;\texttt{profit\_rel}\; \texttt{profit\_limit} \).
+/// Reuses linear bounds propagation.
 #[allow(clippy::too_many_arguments)]
 pub fn knapsack(
     solver: &mut Solver,

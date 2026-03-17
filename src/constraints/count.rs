@@ -36,7 +36,7 @@ impl Count {
         (lb, ub)
     }
 
-    /// Enforce `count ≤ k`: if the floor already reaches `k`, no other variable
+    /// Enforce \( \texttt{count} \le k \): if the floor already reaches `k`, no other variable
     /// may take the value.
     fn enforce_le(&self, store: &mut Store, k: i64) -> Result<(), Inconsistency> {
         let (lb, _) = self.counts(store);
@@ -53,7 +53,7 @@ impl Count {
         Ok(())
     }
 
-    /// Enforce `count ≥ k`: if the ceiling only just reaches `k`, every variable
+    /// Enforce \( \texttt{count} \ge k \): if the ceiling only just reaches `k`, every variable
     /// that can take the value must.
     fn enforce_ge(&self, store: &mut Store, k: i64) -> Result<(), Inconsistency> {
         let (_, ub) = self.counts(store);
@@ -210,7 +210,7 @@ impl Propagator for NValues {
         self.union.dedup();
 
         let n = self.vars.len();
-        let lb = self.fixed.len() as i64; // ≥ this many distinct values for sure
+        let lb = self.fixed.len() as i64; // >= this many distinct values for sure
         let ub = (n.min(self.union.len())) as i64; // at most this many
 
         let infeasible = match self.rel {

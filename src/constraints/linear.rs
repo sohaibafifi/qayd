@@ -1,13 +1,14 @@
 //! Linear (weighted-sum) constraints — the workhorse, reused throughout the
 //! catalogue.
 //!
-//! The core propagator is `Σ aᵢ·xᵢ ≤ c` with bounds propagation. Everything
-//! else is built from it:
+//! The core propagator is \( \sum_i a_i x_i \le c \) with bounds propagation.
+//! Everything else is built from it:
 //!
-//! - `≥` / `>` / `<` are sign/offset rewrites of `≤`.
-//! - `=` has a dedicated both-sided `LinearEq` propagator (tighter per call than
-//!   posting `≤ c` and `≥ c` separately).
-//! - `≠` gets its own (weak) propagator that only fires near a full assignment.
+//! - \( \ge \) / \( > \) / \( < \) are sign/offset rewrites of \( \le \).
+//! - \( = \) has a dedicated both-sided `LinearEq` propagator (tighter per call
+//!   than posting \( \le c \) and \( \ge c \) separately).
+//! - \( \ne \) gets its own (weak) propagator that only fires near a full
+//!   assignment.
 //!
 //! All arithmetic is done in `i64` so sums of `i32` terms cannot overflow.
 
@@ -18,21 +19,21 @@ use crate::store::{Solver, Store};
 /// Comparison operator for a linear constraint.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Relation {
-    /// `Σ aᵢ·xᵢ = rhs`
+    /// \( \sum_i a_i x_i = \texttt{rhs} \)
     Eq,
-    /// `Σ aᵢ·xᵢ ≠ rhs`
+    /// \( \sum_i a_i x_i \ne \texttt{rhs} \)
     Ne,
-    /// `Σ aᵢ·xᵢ ≤ rhs`
+    /// \( \sum_i a_i x_i \le \texttt{rhs} \)
     Le,
-    /// `Σ aᵢ·xᵢ < rhs`
+    /// \( \sum_i a_i x_i < \texttt{rhs} \)
     Lt,
-    /// `Σ aᵢ·xᵢ ≥ rhs`
+    /// \( \sum_i a_i x_i \ge \texttt{rhs} \)
     Ge,
-    /// `Σ aᵢ·xᵢ > rhs`
+    /// \( \sum_i a_i x_i > \texttt{rhs} \)
     Gt,
 }
 
-/// `Σ aᵢ·xᵢ ≤ c`, with bounds propagation run to a local fixpoint per call.
+/// \( \sum_i a_i x_i \le c \), with bounds propagation run to a local fixpoint per call.
 struct LinearLeq {
     coeffs: Vec<i64>,
     vars: Vec<VarId>,
@@ -95,7 +96,7 @@ impl Propagator for LinearLeq {
                 if a == 0 {
                     continue;
                 }
-                // aᵢ·xᵢ ≤ c − (sum_min − term_minᵢ)
+                // a_i*x_i <= c - (sum_min - term_min_i)
                 let allowed = self.c - (sum_min - self.term_min[idx]);
                 if a > 0 {
                     let bound = clamp_i32(floor_div(allowed, a));
@@ -117,9 +118,10 @@ impl Propagator for LinearLeq {
     }
 }
 
-/// `Σ aᵢ·xᵢ = c`, with both-sided bounds propagation run to a local fixpoint.
-/// Stronger per call than posting `≤ c` and `≥ c` separately (one pass tightens
-/// from both directions instead of waking two propagators in turn).
+/// \( \sum_i a_i x_i = c \), with both-sided bounds propagation run to a local
+/// fixpoint. Stronger per call than posting \( \le c \) and \( \ge c \) separately
+/// (one pass tightens from both directions instead of waking two propagators in
+/// turn).
 struct LinearEq {
     coeffs: Vec<i64>,
     vars: Vec<VarId>,
@@ -174,7 +176,7 @@ impl Propagator for LinearEq {
                 if a == 0 {
                     continue;
                 }
-                // aᵢ·xᵢ must lie in [tlo, thi].
+                // a_i*x_i must lie in [tlo, thi].
                 let tlo = self.c - (sum_max - self.term_max[i]);
                 let thi = self.c - (sum_min - self.term_min[i]);
                 let (lo, hi) = if a > 0 {
@@ -195,7 +197,7 @@ impl Propagator for LinearEq {
     }
 }
 
-/// `Σ aᵢ·xᵢ ≠ c`. Weak: only filters when at most one variable is still free.
+/// \( \sum_i a_i x_i \ne c \). Weak: only filters when at most one variable is still free.
 struct LinearNeq {
     coeffs: Vec<i64>,
     vars: Vec<VarId>,
@@ -243,7 +245,7 @@ impl Propagator for LinearNeq {
                 let idx = free.unwrap();
                 let a = self.coeffs[idx];
                 if a != 0 {
-                    // a·x = c − fixed_sum  =>  x forbidden only if it is integral.
+                    // a*x = c - fixed_sum  =>  x forbidden only if it is integral.
                     let rem = self.c - fixed_sum;
                     if rem % a == 0 {
                         let forbidden = rem / a;
@@ -294,7 +296,7 @@ fn post_leq(solver: &mut Solver, coeffs: &[i64], vars: &[VarId], c: i64) {
     solver.post(Box::new(LinearLeq::new(coeffs, vars, c)));
 }
 
-/// Post `Σ coeffs[i]·vars[i]  rel  rhs`.
+/// Post \( \sum_i \texttt{coeffs}[i] \cdot \texttt{vars}[i] \;\texttt{rel}\; \texttt{rhs} \).
 pub fn linear(solver: &mut Solver, coeffs: &[i64], vars: &[VarId], rel: Relation, rhs: i64) {
     assert_eq!(
         coeffs.len(),
@@ -315,7 +317,7 @@ pub fn linear(solver: &mut Solver, coeffs: &[i64], vars: &[VarId], rel: Relation
     }
 }
 
-/// Post `Σ vars[i]  rel  rhs` (all coefficients 1).
+/// Post \( \sum_i \texttt{vars}[i] \;\texttt{rel}\; \texttt{rhs} \) (all coefficients 1).
 pub fn sum(solver: &mut Solver, vars: &[VarId], rel: Relation, rhs: i64) {
     let coeffs = vec![1i64; vars.len()];
     linear(solver, &coeffs, vars, rel, rhs);

@@ -296,7 +296,7 @@ fn build_sum(solver: &mut Solver, sym: &SymTab, c: &Node) -> Result<(), String> 
     match cond.operand {
         Operand::Const(k) => linear(solver, &coeffs, &vars, cond.rel, k),
         Operand::Var(y) => {
-            // Σ coeffs·vars  rel  y   <=>   Σ coeffs·vars − y  rel  0
+            // sum(coeffs*vars) rel y  <=>  sum(coeffs*vars) - y rel 0
             coeffs.push(-1);
             vars.push(y);
             linear(solver, &coeffs, &vars, cond.rel, 0);
@@ -524,7 +524,7 @@ fn build_objective(
         };
         let (lo, hi) = sum_bounds(solver, &coeffs, &vars);
         let obj = solver.new_var_range(lo, hi);
-        // Σ coeffs·vars − obj = 0
+        // sum(coeffs*vars) - obj = 0
         let mut cc = coeffs;
         cc.push(-1);
         let mut vv = vars;
