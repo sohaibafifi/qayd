@@ -380,31 +380,194 @@ pub fn element(solver: &mut Solver, array: &[VarId], idx: VarId, value: VarId) {
 }
 
 // ---------------------------------------------------------------------------
-// allDifferent (forward checking)
+// allDifferent (Régin, domain-consistent)
 // ---------------------------------------------------------------------------
 
-/// All variables take distinct values. Forward-checking: when a variable is
-/// fixed, its value is pruned from the others. (Régin's matching/SCC algorithm
-/// for full domain consistency is a later upgrade.)
+/// All variables take distinct values. Régin's algorithm achieves domain
+/// consistency: build the variable-value bipartite graph, find a maximum
+/// matching (infeasible if it cannot cover every variable), then remove every
+/// (var, value) edge that lies in no maximum matching. The latter are the
+/// non-matching edges whose endpoints are in different strongly-connected
+/// components of the oriented graph and not reachable from a free value.
+///
+/// Graph orientation: matching edges `var -> value`, non-matching edges
+/// `value -> var`; a directed path then follows an alternating path.
 struct AllDifferent {
     vars: Vec<VarId>,
+    /// Reused scratch: snapshot of one variable's values.
+    buf: Vec<i32>,
+}
+
+/// Kuhn augmenting step for the bipartite matching.
+fn augment(
+    u: usize,
+    adj: &[Vec<usize>],
+    val_to_var: &mut [i32],
+    var_to_val: &mut [i32],
+    seen: &mut [bool],
+) -> bool {
+    for &v in &adj[u] {
+        if !seen[v] {
+            seen[v] = true;
+            let w = val_to_var[v];
+            if w < 0 || augment(w as usize, adj, val_to_var, var_to_val, seen) {
+                val_to_var[v] = u as i32;
+                var_to_val[u] = v as i32;
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Tarjan strongly-connected-components DFS over the oriented graph.
+#[allow(clippy::too_many_arguments)]
+fn scc_dfs(
+    u: usize,
+    g: &[Vec<usize>],
+    index: &mut [i64],
+    low: &mut [i64],
+    on_stack: &mut [bool],
+    stack: &mut Vec<usize>,
+    comp: &mut [usize],
+    counter: &mut i64,
+    ncomp: &mut usize,
+) {
+    index[u] = *counter;
+    low[u] = *counter;
+    *counter += 1;
+    stack.push(u);
+    on_stack[u] = true;
+    for &v in &g[u] {
+        if index[v] < 0 {
+            scc_dfs(v, g, index, low, on_stack, stack, comp, counter, ncomp);
+            low[u] = low[u].min(low[v]);
+        } else if on_stack[v] {
+            low[u] = low[u].min(index[v]);
+        }
+    }
+    if low[u] == index[u] {
+        loop {
+            let w = stack.pop().unwrap();
+            on_stack[w] = false;
+            comp[w] = *ncomp;
+            if w == u {
+                break;
+            }
+        }
+        *ncomp += 1;
+    }
 }
 
 impl Propagator for AllDifferent {
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &v in &self.vars {
-            store.subscribe(v, me, Event::Fix);
+            store.subscribe(v, me, Event::DomainChange);
         }
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
-        for i in 0..self.vars.len() {
-            if store.is_fixed(self.vars[i]) {
-                let val = store.value(self.vars[i]);
-                for (j, &other) in self.vars.iter().enumerate() {
-                    if j != i {
-                        store.remove(other, val)?;
-                    }
+        let n = self.vars.len();
+        if n == 0 {
+            return Ok(());
+        }
+
+        // Value universe (sorted, de-duplicated); value index = position.
+        let mut values: Vec<i32> = Vec::new();
+        for &v in &self.vars {
+            values.extend(store.values(v));
+        }
+        values.sort_unstable();
+        values.dedup();
+        let m = values.len();
+        if m < n {
+            return Err(Inconsistency); // pigeonhole
+        }
+        let index_of = |val: i32| values.binary_search(&val).unwrap();
+
+        // Variable -> value-index adjacency.
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (i, &v) in self.vars.iter().enumerate() {
+            adj[i] = store.values(v).map(&index_of).collect();
+        }
+
+        // Maximum matching (Kuhn).
+        let mut var_to_val = vec![-1i32; n];
+        let mut val_to_var = vec![-1i32; m];
+        for i in 0..n {
+            let mut seen = vec![false; m];
+            if !augment(i, &adj, &mut val_to_var, &mut var_to_val, &mut seen) {
+                return Err(Inconsistency); // no matching covers variable i
+            }
+        }
+
+        // Oriented graph: nodes 0..n vars, n..n+m values.
+        let total = n + m;
+        let mut g: Vec<Vec<usize>> = vec![Vec::new(); total];
+        for i in 0..n {
+            let mv = var_to_val[i] as usize;
+            g[i].push(n + mv); // matching: var -> value
+            for &vidx in &adj[i] {
+                if vidx != mv {
+                    g[n + vidx].push(i); // non-matching: value -> var
+                }
+            }
+        }
+
+        // Reachable from free (unmatched) values.
+        let mut reachable = vec![false; total];
+        let mut stack: Vec<usize> = Vec::new();
+        for vidx in 0..m {
+            if val_to_var[vidx] < 0 {
+                reachable[n + vidx] = true;
+                stack.push(n + vidx);
+            }
+        }
+        while let Some(u) = stack.pop() {
+            for &w in &g[u] {
+                if !reachable[w] {
+                    reachable[w] = true;
+                    stack.push(w);
+                }
+            }
+        }
+
+        // Strongly-connected components.
+        let mut comp = vec![usize::MAX; total];
+        let mut index = vec![-1i64; total];
+        let mut low = vec![0i64; total];
+        let mut on_stack = vec![false; total];
+        let mut tj_stack = Vec::new();
+        let mut counter = 0i64;
+        let mut ncomp = 0usize;
+        for s in 0..total {
+            if index[s] < 0 {
+                scc_dfs(
+                    s,
+                    &g,
+                    &mut index,
+                    &mut low,
+                    &mut on_stack,
+                    &mut tj_stack,
+                    &mut comp,
+                    &mut counter,
+                    &mut ncomp,
+                );
+            }
+        }
+
+        // Remove every non-matching edge that lies in no maximum matching.
+        for (i, &var) in self.vars.iter().enumerate() {
+            let matched = var_to_val[i] as usize;
+            self.buf.clear();
+            self.buf.extend(store.values(var));
+            for &val in &self.buf {
+                let vidx = index_of(val);
+                if vidx == matched {
+                    continue; // matching edge is always supported
+                }
+                if comp[i] != comp[n + vidx] && !reachable[n + vidx] {
+                    store.remove(var, val)?;
                 }
             }
         }
@@ -412,10 +575,11 @@ impl Propagator for AllDifferent {
     }
 }
 
-/// Post `allDifferent(vars)`.
+/// Post `allDifferent(vars)` with Régin domain-consistent filtering.
 pub fn all_different(solver: &mut Solver, vars: &[VarId]) {
     solver.post(Box::new(AllDifferent {
         vars: vars.to_vec(),
+        buf: Vec::new(),
     }));
 }
 
