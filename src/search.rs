@@ -108,6 +108,9 @@ pub fn optimize_with(
     let mut stats = SolveStats::default();
     let mut incumbent: Option<i32> = None;
     let mut best: Option<(Vec<i32>, i32)> = None;
+    // Solution-guided phase saving: branch each variable toward its value in the
+    // best solution so far. Indexed by `VarId`.
+    let mut phase: Vec<Option<i32>> = vec![None; solver.store.num_vars()];
 
     solver.store.push_level();
 
@@ -137,6 +140,7 @@ pub fn optimize_with(
             &mut stats,
             &mut ctx,
             stop,
+            &mut phase,
             &mut on_improve,
         );
         if stopped(stop) {
@@ -170,6 +174,7 @@ pub fn optimize_with(
                 &mut best,
                 &mut stats,
                 stop,
+                &mut phase,
                 &mut rng,
                 relax,
                 &mut on_improve,
@@ -235,6 +240,7 @@ fn bnb<F: FnMut(i32)>(
     stats: &mut SolveStats,
     ctx: &mut Bnb,
     stop: &AtomicBool,
+    phase: &mut [Option<i32>],
     on_improve: &mut F,
 ) {
     if ctx.aborted {
@@ -277,13 +283,20 @@ fn bnb<F: FnMut(i32)>(
             let value = solver.store.value(obj);
             *incumbent = Some(value);
             *best = Some((vars.iter().map(|&v| solver.store.value(v)).collect(), value));
+            for &v in vars {
+                phase[v.index()] = Some(solver.store.value(v));
+            }
             stats.solutions += 1;
             on_improve(value);
             return;
         }
         Some(v) => v,
     };
-    let val = solver.store.min(var);
+    // Solution-guided value selection: try the incumbent's value first.
+    let val = match phase[var.index()] {
+        Some(p) if solver.store.contains(var, p) => p,
+        _ => solver.store.min(var),
+    };
     stats.nodes += 1;
 
     for apply in [Decision::Eq, Decision::Ne] {
@@ -295,7 +308,7 @@ fn bnb<F: FnMut(i32)>(
         };
         if ok.is_ok() {
             bnb(
-                solver, vars, obj, minimizing, incumbent, best, stats, ctx, stop, on_improve,
+                solver, vars, obj, minimizing, incumbent, best, stats, ctx, stop, phase, on_improve,
             );
         } else {
             stats.failures += 1;
@@ -329,6 +342,7 @@ fn lns_iteration<F: FnMut(i32)>(
     best: &mut Option<(Vec<i32>, i32)>,
     stats: &mut SolveStats,
     stop: &AtomicBool,
+    phase: &mut [Option<i32>],
     rng: &mut Rng,
     relax: usize,
     on_improve: &mut F,
@@ -373,7 +387,8 @@ fn lns_iteration<F: FnMut(i32)>(
             aborted: false,
         };
         bnb(
-            solver, vars, obj, minimizing, incumbent, best, stats, &mut ctx, stop, on_improve,
+            solver, vars, obj, minimizing, incumbent, best, stats, &mut ctx, stop, phase,
+            on_improve,
         );
     }
 
