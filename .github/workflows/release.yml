@@ -1,0 +1,45 @@
+name: Release
+
+# Build the `qayd` binary for every supported target and publish a GitHub
+# Release with the archives attached. Fires on version tags, e.g. `v0.1.0`.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # needed to create the release and upload assets
+
+jobs:
+  release:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Builds `--release --target <target>` (using `cross` for the Linux ARM
+      # target), archives the binary as .tar.gz / .zip, writes a .sha256, and
+      # uploads everything to the Release for the pushed tag (creating it if
+      # absent). All jobs upsert into the same Release.
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: qayd
+          target: ${{ matrix.target }}
+          archive: qayd-$tag-$target
+          include: README.md,LICENSE
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}
