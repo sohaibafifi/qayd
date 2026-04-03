@@ -356,14 +356,24 @@ fn lns_iteration<F: FnMut(i32)>(
     solver.store.push_level();
     solver.store.clear_queue();
 
-    // Fix the complement of a random relaxed subset to the incumbent; never fix
-    // the objective variable (it must stay free to be re-derived).
+    // Pick a neighbourhood: half the time a scattered random subset, half the
+    // time a contiguous window (rows, time-adjacent tasks, and route segments
+    // tend to be consecutive in declaration order). Both leave ~`relax` free.
+    let contiguous = rng.below(2) == 0;
+    let window_start = if contiguous { rng.below(n) } else { 0 };
+
+    // Fix the complement of the relaxed set to the incumbent; never fix the
+    // objective variable (it must stay free to be re-derived).
     let mut feasible = true;
     for (k, &v) in vars.iter().enumerate() {
         if v == obj {
             continue;
         }
-        let relaxed = rng.below(n) < relax;
+        let relaxed = if contiguous {
+            (k + n - window_start) % n < relax
+        } else {
+            rng.below(n) < relax
+        };
         if !relaxed && solver.store.fix(v, assignment[k]).is_err() {
             feasible = false;
             break;
