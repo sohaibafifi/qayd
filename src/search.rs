@@ -151,8 +151,8 @@ pub fn optimize_with(
             break;
         }
         limit = limit.saturating_mul(2);
-        if stats.failures >= LNS_THRESHOLD {
-            break; // give up on proving; switch to large-neighbourhood search
+        if best.is_some() && stats.failures >= LNS_THRESHOLD {
+            break; // have an incumbent and proving is expensive: switch to LNS
         }
     }
     solver.store.pop_level(); // discard Phase 1's objective-bound prunes

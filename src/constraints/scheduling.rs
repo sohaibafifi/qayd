@@ -83,8 +83,10 @@ pub fn no_overlap(solver: &mut Solver, starts: &[VarId], durations: &[i64]) {
 // ===========================================================================
 
 /// At every time point the total height of running tasks must not exceed
-/// `capacity`. Time-tabling: build the profile of mandatory parts and forbid
-/// starts that would push any covered time over capacity.
+/// `capacity`. Two filters: energetic overload checking (sound failure
+/// detection over windows) and time-tabling (build the mandatory-part profile
+/// and forbid starts that would push any covered time over capacity). Full
+/// edge-finding bound adjustment remains a future upgrade.
 struct Cumulative {
     starts: Vec<VarId>,
     dur: Vec<i64>,
@@ -92,6 +94,10 @@ struct Cumulative {
     capacity: i64,
     profile: Vec<i64>,
     buf: Vec<i32>,
+    /// Reused scratch for energetic overload checking.
+    est: Vec<i64>,
+    lct: Vec<i64>,
+    energy: Vec<i64>,
 }
 
 impl Propagator for Cumulative {
@@ -106,6 +112,34 @@ impl Propagator for Cumulative {
         if n == 0 {
             return Ok(());
         }
+
+        // Energetic overload checking (sound, O(n^2)): if the tasks confined to a
+        // window [L, U) carry more energy than capacity*(U-L), it is infeasible.
+        // Failure detection only — never removes a feasible value.
+        self.est.clear();
+        self.lct.clear();
+        self.energy.clear();
+        for i in 0..n {
+            self.est.push(store.min(self.starts[i]) as i64);
+            self.lct
+                .push(store.max(self.starts[i]) as i64 + self.dur[i]);
+            self.energy.push(self.height[i] * self.dur[i]);
+        }
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_unstable_by(|&a, &b| self.est[b].cmp(&self.est[a])); // est descending
+        for u in 0..n {
+            let ub = self.lct[u];
+            let mut e = 0i64;
+            for &k in &order {
+                if self.lct[k] <= ub {
+                    e += self.energy[k];
+                    if e > self.capacity * (ub - self.est[k]) {
+                        return Err(Inconsistency);
+                    }
+                }
+            }
+        }
+
         let hmin = (0..n)
             .map(|i| store.min(self.starts[i]) as i64)
             .min()
@@ -180,6 +214,9 @@ pub fn cumulative(
         capacity,
         profile: Vec::new(),
         buf: Vec::new(),
+        est: Vec::new(),
+        lct: Vec::new(),
+        energy: Vec::new(),
     }));
 }
 
