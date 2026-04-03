@@ -2,10 +2,12 @@
 //!
 //! Each node tries `var = val` (left) then `var != val` (right), propagating to
 //! a fixpoint after each and backtracking on failure. Variable selection is
-//! `dom/wdeg`; value selection is min-value. The COP optimiser ([`optimize_with`])
-//! is in-search branch-and-bound with geometric restarts. All entry points have
-//! an interruptible variant that halts when a shared stop flag is set (used for
-//! the CLI time limit and Ctrl+C).
+//! `dom/wdeg`; value selection is solution-guided (toward the incumbent, else
+//! min-value). The COP optimiser ([`optimize_with`]) interleaves complete
+//! restart branch-and-bound (which proves optimality) with bursts of large
+//! neighbourhood search (which drives the incumbent down). All entry points
+//! have an interruptible variant that halts when a shared stop flag is set
+//! (used for the CLI time limit and Ctrl+C).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -114,15 +116,22 @@ pub fn optimize_with(
 
     solver.store.push_level();
 
-    // Phase 1 — complete restart branch-and-bound. Geometric restarts; dom/wdeg
-    // weights accumulate across runs so each searches differently. Proves the
-    // optimum on tractable instances. Hands off to LNS if it gets too expensive.
-    // Run inside a nested level: its objective-bound prunes (obj < incumbent) are
-    // discarded before LNS, so LNS can fix variables back to incumbent values.
-    solver.store.push_level();
+    // Interleave a complete restart branch-and-bound (the *prover*) with bursts
+    // of LNS (the *improver*), sharing one incumbent. Each complete run, with the
+    // current incumbent bound, searches for a strictly better solution; if it
+    // exhausts without aborting, the incumbent is proven optimal. LNS drives the
+    // incumbent down fast so that proof tree collapses. Every run is sandboxed in
+    // a nested level so its `obj < incumbent` prunes are discarded afterwards
+    // (letting LNS fix variables back to incumbent values). `stop` is checked at
+    // every node, so even a huge complete run honours the time limit.
+    let mut rng = Rng::new(0x9E37_79B9_7F4A_7C15 ^ vars.len() as u64);
+    let base = (vars.len() / 10).max(1);
+    let mut relax = base;
     let mut limit: u64 = 128;
-    let mut proved = false;
-    loop {
+
+    while !stopped(stop) {
+        // Complete run.
+        solver.store.push_level();
         solver.store.clear_queue();
         solver.enqueue_all();
         let mut ctx = Bnb {
@@ -143,46 +152,43 @@ pub fn optimize_with(
             &mut phase,
             &mut on_improve,
         );
+        let aborted = ctx.aborted;
+        solver.store.pop_level();
+
         if stopped(stop) {
             break;
         }
-        if !ctx.aborted {
-            proved = true; // a full traversal completed: best is optimal (or UNSAT)
-            break;
+        if !aborted {
+            break; // tree exhausted under the incumbent bound: optimal/UNSAT
         }
         limit = limit.saturating_mul(2);
-        if best.is_some() && stats.failures >= LNS_THRESHOLD {
-            break; // have an incumbent and proving is expensive: switch to LNS
-        }
-    }
-    solver.store.pop_level(); // discard Phase 1's objective-bound prunes
 
-    // Phase 2 — LNS. Repeatedly fix a random part of the incumbent and re-optimise
-    // the rest. Anytime: improves the incumbent until interrupted. Never claims a
-    // proof (the caller reports `s SATISFIABLE`, not `s OPTIMUM FOUND`).
-    if !proved && !stopped(stop) && best.is_some() {
-        let mut rng = Rng::new(0x9E37_79B9_7F4A_7C15 ^ vars.len() as u64);
-        let base = (vars.len() / 10).max(1);
-        let mut relax = base;
-        while !stopped(stop) {
-            let improved = lns_iteration(
-                solver,
-                vars,
-                obj,
-                minimizing,
-                &mut incumbent,
-                &mut best,
-                &mut stats,
-                stop,
-                &mut phase,
-                &mut rng,
-                relax,
-                &mut on_improve,
-            );
-            if improved {
-                relax = base; // intensify around the new incumbent
-            } else {
-                relax = (relax + base).min(vars.len().max(1) - 1).max(base); // diversify
+        // LNS bursts to improve the incumbent before the next proof attempt.
+        if best.is_some() {
+            for _ in 0..LNS_BURST {
+                if stopped(stop) {
+                    break;
+                }
+                let improved = lns_iteration(
+                    solver,
+                    vars,
+                    obj,
+                    minimizing,
+                    &mut incumbent,
+                    &mut best,
+                    &mut stats,
+                    stop,
+                    &mut phase,
+                    &mut rng,
+                    relax,
+                    &mut on_improve,
+                );
+                if improved {
+                    relax = base; // intensify around the new incumbent
+                } else {
+                    relax = (relax + base).min(vars.len().max(1) - 1).max(base);
+                    // diversify
+                }
             }
         }
     }
@@ -191,12 +197,11 @@ pub fn optimize_with(
     (best, stats)
 }
 
-/// Total failures Phase 1 may spend before conceding the proof and switching to
-/// LNS. Set well above what tractable instances need so they still prove optimal.
-const LNS_THRESHOLD: u64 = 100_000;
-
-/// Per-neighbourhood failure budget in Phase 2.
+/// Per-neighbourhood failure budget for an LNS move.
 const LNS_BUDGET: u64 = 500;
+
+/// LNS moves attempted between successive complete (proving) runs.
+const LNS_BURST: usize = 4;
 
 /// A tiny xorshift64 PRNG (deterministic — reproducible runs, no dependency).
 struct Rng(u64);
