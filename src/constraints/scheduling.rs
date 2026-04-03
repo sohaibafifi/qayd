@@ -15,6 +15,11 @@ fn clamp_i32(x: i64) -> i32 {
     x.clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
+/// Ceiling of `a / b` for `a >= 0`, `b > 0`.
+fn ceil_div_pos(a: i64, b: i64) -> i64 {
+    (a + b - 1) / b
+}
+
 // ===========================================================================
 // noOverlap (disjunctive, pairwise)
 // ===========================================================================
@@ -113,84 +118,124 @@ impl Propagator for Cumulative {
             return Ok(());
         }
 
-        // Energetic overload checking (sound, O(n^2)): if the tasks confined to a
-        // window [L, U) carry more energy than capacity*(U-L), it is infeasible.
-        // Failure detection only — never removes a feasible value.
-        self.est.clear();
-        self.lct.clear();
-        self.energy.clear();
-        for i in 0..n {
-            self.est.push(store.min(self.starts[i]) as i64);
-            self.lct
-                .push(store.max(self.starts[i]) as i64 + self.dur[i]);
-            self.energy.push(self.height[i] * self.dur[i]);
-        }
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_unstable_by(|&a, &b| self.est[b].cmp(&self.est[a])); // est descending
-        for u in 0..n {
-            let ub = self.lct[u];
-            let mut e = 0i64;
-            for &k in &order {
-                if self.lct[k] <= ub {
-                    e += self.energy[k];
-                    if e > self.capacity * (ub - self.est[k]) {
-                        return Err(Inconsistency);
+        // Iterate to a local fixpoint: this propagator's own filtering can fix
+        // tasks, and self-changes do not re-enqueue it, so a single pass over a
+        // once-built profile would miss overloads involving a just-fixed task.
+        loop {
+            let before: usize = (0..n).map(|i| store.size(self.starts[i])).sum();
+
+            // Snapshot earliest start, latest completion, and energy.
+            self.est.clear();
+            self.lct.clear();
+            self.energy.clear();
+            for i in 0..n {
+                self.est.push(store.min(self.starts[i]) as i64);
+                self.lct
+                    .push(store.max(self.starts[i]) as i64 + self.dur[i]);
+                self.energy.push(self.height[i] * self.dur[i]);
+            }
+
+            // Energetic overload checking (sound, O(n^2)): if the tasks confined
+            // to a window [L, U) carry more energy than capacity*(U-L), fail.
+            let mut by_est: Vec<usize> = (0..n).collect();
+            by_est.sort_unstable_by(|&a, &b| self.est[b].cmp(&self.est[a]));
+            for u in 0..n {
+                let ub = self.lct[u];
+                let mut e = 0i64;
+                for &k in &by_est {
+                    if self.lct[k] <= ub {
+                        e += self.energy[k];
+                        if e > self.capacity * (ub - self.est[k]) {
+                            return Err(Inconsistency);
+                        }
                     }
                 }
             }
-        }
 
-        let hmin = (0..n)
-            .map(|i| store.min(self.starts[i]) as i64)
-            .min()
-            .unwrap();
-        let hmax = (0..n)
-            .map(|i| store.max(self.starts[i]) as i64 + self.dur[i])
-            .max()
-            .unwrap();
-        if hmax <= hmin {
-            return Ok(());
-        }
-        let horizon = (hmax - hmin) as usize;
-
-        // Mandatory-part profile: task i mandatorily runs on [max start, min end).
-        self.profile.clear();
-        self.profile.resize(horizon, 0);
-        for i in 0..n {
-            let mand_start = store.max(self.starts[i]) as i64;
-            let mand_end = store.min(self.starts[i]) as i64 + self.dur[i];
-            for t in mand_start..mand_end {
-                self.profile[(t - hmin) as usize] += self.height[i];
-            }
-        }
-        for &p in &self.profile {
-            if p > self.capacity {
-                return Err(Inconsistency);
-            }
-        }
-
-        // For each task, forbid starts whose execution window would exceed
-        // capacity against the other tasks' mandatory parts.
-        for i in 0..n {
-            let hi = self.height[i];
-            let mand_start = store.max(self.starts[i]) as i64;
-            let mand_end = store.min(self.starts[i]) as i64 + self.dur[i];
-            self.buf.clear();
-            self.buf.extend(store.values(self.starts[i]));
-            for &s in &self.buf {
-                let s = s as i64;
-                let conflict = (s..s + self.dur[i]).any(|t| {
-                    let idx = (t - hmin) as usize;
-                    let own = if t >= mand_start && t < mand_end {
-                        hi
-                    } else {
-                        0
-                    };
-                    self.profile[idx] - own + hi > self.capacity
-                });
-                if conflict {
-                    store.remove(self.starts[i], clamp_i32(s))?;
+            // Edge-finding: if Omega ∪ {i} cannot fit in [est, U] then i must end
+            // after Omega, so it cannot start until Omega's non-parallelisable
+            // "rest" energy is done. Sound (overload ruled out); oracle-validated.
+            let mut by_lct: Vec<usize> = (0..n).collect();
+            by_lct.sort_unstable_by(|&a, &b| self.lct[a].cmp(&self.lct[b]));
+            let mut lb = self.est.clone();
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..n {
+                let hi = self.height[i];
+                if hi == 0 {
+                    continue;
                 }
+                let mut e_omega = 0i64;
+                let mut est_omega = i64::MAX;
+                for &j in &by_lct {
+                    if j == i {
+                        continue;
+                    }
+                    e_omega += self.energy[j];
+                    est_omega = est_omega.min(self.est[j]);
+                    let u = self.lct[j];
+                    if e_omega + self.energy[i] > self.capacity * (u - est_omega.min(self.est[i])) {
+                        let rest = e_omega - (self.capacity - hi) * (u - est_omega);
+                        if rest > 0 {
+                            lb[i] = lb[i].max(est_omega + ceil_div_pos(rest, hi));
+                        }
+                    }
+                }
+            }
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..n {
+                if lb[i] > self.est[i] {
+                    store.remove_below(self.starts[i], clamp_i32(lb[i]))?;
+                }
+            }
+
+            // Time-tabling over the mandatory-part profile.
+            let hmin = self.est.iter().copied().min().unwrap();
+            let hmax = self.lct.iter().copied().max().unwrap();
+            if hmax > hmin {
+                let horizon = (hmax - hmin) as usize;
+                self.profile.clear();
+                self.profile.resize(horizon, 0);
+                for i in 0..n {
+                    let mand_start = store.max(self.starts[i]) as i64;
+                    let mand_end = store.min(self.starts[i]) as i64 + self.dur[i];
+                    for t in mand_start..mand_end {
+                        self.profile[(t - hmin) as usize] += self.height[i];
+                    }
+                }
+                for &p in &self.profile {
+                    if p > self.capacity {
+                        return Err(Inconsistency);
+                    }
+                }
+                // Forbid starts whose window would exceed capacity against the
+                // other tasks' mandatory parts.
+                for i in 0..n {
+                    let hi = self.height[i];
+                    let mand_start = store.max(self.starts[i]) as i64;
+                    let mand_end = store.min(self.starts[i]) as i64 + self.dur[i];
+                    self.buf.clear();
+                    self.buf.extend(store.values(self.starts[i]));
+                    for &start in &self.buf {
+                        let s = start as i64;
+                        let conflict = (s..s + self.dur[i]).any(|t| {
+                            let idx = (t - hmin) as usize;
+                            let own = if t >= mand_start && t < mand_end {
+                                hi
+                            } else {
+                                0
+                            };
+                            self.profile[idx] - own + hi > self.capacity
+                        });
+                        if conflict {
+                            store.remove(self.starts[i], start)?;
+                        }
+                    }
+                }
+            }
+
+            let after: usize = (0..n).map(|i| store.size(self.starts[i])).sum();
+            if after == before {
+                break; // no domain changed: fixpoint reached
             }
         }
         Ok(())
