@@ -11,8 +11,25 @@ permissions:
   contents: write # needed to create the release and upload assets
 
 jobs:
-  release:
+  # The upload step below attaches assets to an existing Release; it does not
+  # create one. Pushing a tag doesn't auto-create a Release, so make it here
+  # first. Idempotent so re-runs don't fail.
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create release for tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" \
+                 --repo "$GITHUB_REPOSITORY" \
+                 --title "$GITHUB_REF_NAME" \
+                 --generate-notes
+
+  upload-assets:
     name: ${{ matrix.target }}
+    needs: create-release
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -33,8 +50,8 @@ jobs:
 
       # Builds `--release --target <target>` (using `cross` for the Linux ARM
       # target), archives the binary as .tar.gz / .zip, writes a .sha256, and
-      # uploads everything to the Release for the pushed tag (creating it if
-      # absent). All jobs upsert into the same Release.
+      # uploads everything to the Release created above. All jobs upsert into
+      # the same Release.
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: qayd
