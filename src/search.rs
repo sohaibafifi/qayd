@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ids::VarId;
 use crate::propagator::Inconsistency;
-use crate::store::Solver;
+use crate::store::{Solver, Store};
 
 /// A stop flag that is never set — used by the non-interruptible entry points.
 static NEVER_STOP: AtomicBool = AtomicBool::new(false);
@@ -113,6 +113,10 @@ pub fn optimize_with(
     // Solution-guided phase saving: branch each variable toward its value in the
     // best solution so far. Indexed by `VarId`.
     let mut phase: Vec<Option<i32>> = vec![None; solver.store.num_vars()];
+    // Nogoods learned from restarts (only from complete runs), and the current
+    // decision path used to extract them.
+    let mut nogoods: Vec<Nogood> = Vec::new();
+    let mut path: Vec<(VarId, i32, bool)> = Vec::new();
 
     solver.store.push_level();
 
@@ -139,6 +143,7 @@ pub fn optimize_with(
             limit,
             aborted: false,
         };
+        path.clear();
         bnb(
             solver,
             vars,
@@ -150,6 +155,9 @@ pub fn optimize_with(
             &mut ctx,
             stop,
             &mut phase,
+            &mut path,
+            &mut nogoods,
+            true, // record nogoods (this is a complete run)
             &mut on_improve,
         );
         let aborted = ctx.aborted;
@@ -179,6 +187,8 @@ pub fn optimize_with(
                     &mut stats,
                     stop,
                     &mut phase,
+                    &mut path,
+                    &mut nogoods,
                     &mut rng,
                     relax,
                     &mut on_improve,
@@ -227,6 +237,71 @@ impl Rng {
     }
 }
 
+/// Cap on stored nogoods and their length (keeps the per-node scan cheap).
+const MAX_NOGOODS: usize = 4000;
+const MAX_NOGOOD_LEN: usize = 8;
+
+/// A nogood: a set of `(var = val)` literals that cannot all hold at once.
+type Nogood = Vec<(VarId, i32)>;
+
+/// Extract negative-last-decision nogoods from the current branch (called when a
+/// restart aborts). Each refuted decision `x = v` on the path, together with the
+/// positive decisions preceding it, is a proven-failed combination.
+fn record_nogoods(path: &[(VarId, i32, bool)], nogoods: &mut Vec<Nogood>) {
+    let mut positives: Nogood = Vec::new();
+    for &(var, val, is_positive) in path {
+        if is_positive {
+            positives.push((var, val));
+        } else {
+            if nogoods.len() >= MAX_NOGOODS {
+                return;
+            }
+            if positives.len() < MAX_NOGOOD_LEN {
+                let mut ng = positives.clone();
+                ng.push((var, val));
+                nogoods.push(ng);
+            }
+        }
+    }
+}
+
+/// Clause-style unit propagation over the recorded nogoods. A nogood
+/// `{x1=v1, ..., xk=vk}` is the clause `(x1≠v1 ∨ ... ∨ xk≠vk)`: violated if every
+/// `xi` is fixed to `vi`; unit (force `xj≠vj`) if all but one literal is falsified.
+/// Returns whether any domain changed; `Err` on a violated nogood.
+fn propagate_nogoods(store: &mut Store, nogoods: &[Nogood]) -> Result<bool, Inconsistency> {
+    let mut changed = false;
+    for ng in nogoods {
+        let mut falsified = 0usize; // literals (xi≠vi) that are false, i.e. xi fixed to vi
+        let mut unit: Option<(VarId, i32)> = None;
+        let mut satisfied = false;
+        for &(var, val) in ng {
+            if !store.contains(var, val) {
+                satisfied = true; // xi can't be vi: clause already satisfied
+                break;
+            } else if store.is_fixed(var) {
+                falsified += 1; // xi fixed to vi
+            } else {
+                unit = Some((var, val));
+            }
+        }
+        if satisfied {
+            continue;
+        }
+        match ng.len() - falsified {
+            0 => return Err(Inconsistency), // all literals false: nogood violated
+            1 => {
+                let (var, val) = unit.unwrap();
+                let before = store.size(var);
+                store.remove(var, val)?;
+                changed |= store.size(var) != before;
+            }
+            _ => {}
+        }
+    }
+    Ok(changed)
+}
+
 /// Per-run restart state for [`bnb`].
 struct Bnb {
     run_failures: u64,
@@ -246,6 +321,9 @@ fn bnb<F: FnMut(i32)>(
     ctx: &mut Bnb,
     stop: &AtomicBool,
     phase: &mut [Option<i32>],
+    path: &mut Vec<(VarId, i32, bool)>,
+    nogoods: &mut Vec<Nogood>,
+    record: bool,
     on_improve: &mut F,
 ) {
     if ctx.aborted {
@@ -256,6 +334,9 @@ fn bnb<F: FnMut(i32)>(
         return;
     }
     if ctx.run_failures >= ctx.limit {
+        if record {
+            record_nogoods(path, nogoods); // harvest nogoods from this branch
+        }
         ctx.aborted = true; // restart budget exhausted
         return;
     }
@@ -279,6 +360,24 @@ fn bnb<F: FnMut(i32)>(
             stats.failures += 1;
             ctx.run_failures += 1;
             return;
+        }
+    }
+    // Learned-nogood unit propagation, to a joint fixpoint with the propagators.
+    while !nogoods.is_empty() {
+        match propagate_nogoods(&mut solver.store, nogoods) {
+            Ok(false) => break,
+            Ok(true) => {
+                if solver.propagate().is_err() {
+                    stats.failures += 1;
+                    ctx.run_failures += 1;
+                    return;
+                }
+            }
+            Err(Inconsistency) => {
+                stats.failures += 1;
+                ctx.run_failures += 1;
+                return;
+            }
         }
     }
 
@@ -307,18 +406,22 @@ fn bnb<F: FnMut(i32)>(
     for apply in [Decision::Eq, Decision::Ne] {
         let level = solver.store.level();
         solver.store.push_level();
+        let positive = matches!(apply, Decision::Eq);
         let ok = match apply {
             Decision::Eq => solver.store.fix(var, val),
             Decision::Ne => solver.store.remove(var, val),
         };
+        path.push((var, val, positive));
         if ok.is_ok() {
             bnb(
-                solver, vars, obj, minimizing, incumbent, best, stats, ctx, stop, phase, on_improve,
+                solver, vars, obj, minimizing, incumbent, best, stats, ctx, stop, phase, path,
+                nogoods, record, on_improve,
             );
         } else {
             stats.failures += 1;
             ctx.run_failures += 1;
         }
+        path.pop();
         solver.store.pop_level();
         debug_assert_eq!(solver.store.level(), level, "trail level mismatch in bnb");
         if ctx.aborted {
@@ -348,6 +451,8 @@ fn lns_iteration<F: FnMut(i32)>(
     stats: &mut SolveStats,
     stop: &AtomicBool,
     phase: &mut [Option<i32>],
+    path: &mut Vec<(VarId, i32, bool)>,
+    nogoods: &mut Vec<Nogood>,
     rng: &mut Rng,
     relax: usize,
     on_improve: &mut F,
@@ -401,8 +506,10 @@ fn lns_iteration<F: FnMut(i32)>(
             limit: LNS_BUDGET,
             aborted: false,
         };
+        path.clear();
         bnb(
-            solver, vars, obj, minimizing, incumbent, best, stats, &mut ctx, stop, phase,
+            solver, vars, obj, minimizing, incumbent, best, stats, &mut ctx, stop, phase, path,
+            nogoods, false, // do not record: nogoods under LNS fixings are not global
             on_improve,
         );
     }
