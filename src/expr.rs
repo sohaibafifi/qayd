@@ -15,6 +15,7 @@
 use crate::ids::VarId;
 
 /// A node in an `intension` expression tree.
+#[derive(Clone)]
 pub enum Expr {
     /// Integer constant.
     Const(i64),

@@ -40,17 +40,24 @@ fn ts_and_popcount(a: &[u64], b: &[u64]) -> u64 {
         .sum()
 }
 
+/// Sentinel for a table wildcard `*` (matches any value in its column).
+pub const STAR: i32 = i32::MIN;
+
 /// `extension`: the assignment must (positive) or must not (negative) match one
-/// of the listed tuples.
+/// of the listed tuples. A `*` (`STAR`) entry matches any value.
 struct Extension {
     vars: Vec<VarId>,
     positive: bool,
     /// `supports[c][value]` = bitset of tuples whose column `c` equals `value`.
     supports: Vec<HashMap<i32, Vec<u64>>>,
+    /// `star[c]` = bitset of tuples with a wildcard in column `c`.
+    star: Vec<Vec<u64>>,
     /// Bitset with exactly the `ntuples` low bits set.
     full: Vec<u64>,
     current: Vec<u64>,
     union: Vec<u64>,
+    /// Scratch: support bitset of one (column, value), including wildcards.
+    tmp: Vec<u64>,
     buf: Vec<i32>,
 }
 
@@ -59,10 +66,15 @@ impl Extension {
         let ntuples = tuples.len();
         let nwords = ntuples.div_ceil(64);
         let mut supports: Vec<HashMap<i32, Vec<u64>>> = vec![HashMap::new(); vars.len()];
+        let mut star: Vec<Vec<u64>> = vec![vec![0u64; nwords]; vars.len()];
         for (t, tuple) in tuples.iter().enumerate() {
             for (c, &val) in tuple.iter().enumerate() {
-                let bs = supports[c].entry(val).or_insert_with(|| vec![0u64; nwords]);
-                bs[t / 64] |= 1u64 << (t % 64);
+                if val == STAR {
+                    star[c][t / 64] |= 1u64 << (t % 64);
+                } else {
+                    let bs = supports[c].entry(val).or_insert_with(|| vec![0u64; nwords]);
+                    bs[t / 64] |= 1u64 << (t % 64);
+                }
             }
         }
         let mut full = vec![0u64; nwords];
@@ -73,8 +85,10 @@ impl Extension {
             vars: vars.to_vec(),
             positive,
             supports,
+            star,
             current: full.clone(),
             union: vec![0u64; nwords],
+            tmp: vec![0u64; nwords],
             full,
             buf: Vec::new(),
         }
@@ -93,16 +107,18 @@ impl Propagator for Extension {
             vars,
             positive,
             supports,
+            star,
             full,
             current,
             union,
+            tmp,
             buf,
         } = self;
 
-        // current = AND over columns of (OR over present values of supports).
+        // current = AND over columns of (wildcards OR (OR over present values)).
         current.copy_from_slice(full);
         for (c, &v) in vars.iter().enumerate() {
-            union.fill(0);
+            union.copy_from_slice(&star[c]);
             for val in store.values(v) {
                 if let Some(bs) = supports[c].get(&val) {
                     ts_or(union, bs);
@@ -112,7 +128,6 @@ impl Propagator for Extension {
         }
 
         if ts_is_zero(current) {
-            // No consistent tuple remains.
             return if *positive {
                 Err(Inconsistency) // positive table: nothing allowed
             } else {
@@ -120,16 +135,22 @@ impl Propagator for Extension {
             };
         }
 
+        // Support bitset of (column c, value val) = its own tuples plus wildcards.
+        let support_into =
+            |tmp: &mut Vec<u64>, supports: &[HashMap<i32, Vec<u64>>], c: usize, val: i32| {
+                tmp.copy_from_slice(&star[c]);
+                if let Some(bs) = supports[c].get(&val) {
+                    ts_or(tmp, bs);
+                }
+            };
+
         if *positive {
             for (c, &v) in vars.iter().enumerate() {
                 buf.clear();
                 buf.extend(store.values(v));
                 for &val in buf.iter() {
-                    let unsupported = match supports[c].get(&val) {
-                        Some(bs) => ts_and_popcount(current, bs) == 0,
-                        None => true,
-                    };
-                    if unsupported {
+                    support_into(tmp, supports, c, val);
+                    if ts_and_popcount(current, tmp) == 0 {
                         store.remove(v, val)?;
                     }
                 }
@@ -143,11 +164,8 @@ impl Propagator for Extension {
                 buf.clear();
                 buf.extend(store.values(v));
                 for &val in buf.iter() {
-                    let forbidden = match supports[c].get(&val) {
-                        Some(bs) => ts_and_popcount(current, bs) as u128,
-                        None => 0,
-                    };
-                    if forbidden == completions {
+                    support_into(tmp, supports, c, val);
+                    if ts_and_popcount(current, tmp) as u128 == completions {
                         store.remove(v, val)?;
                     }
                 }
@@ -158,7 +176,7 @@ impl Propagator for Extension {
 }
 
 /// Post a table constraint. `positive` = the tuple must be one of `tuples`;
-/// otherwise it must be none of them.
+/// otherwise it must be none of them. Use [`STAR`] for `*` wildcards.
 pub fn extension(solver: &mut Solver, vars: &[VarId], tuples: &[Vec<i32>], positive: bool) {
     assert!(
         tuples.iter().all(|t| t.len() == vars.len()),

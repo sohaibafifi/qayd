@@ -25,3 +25,4 @@ panic = "abort"
 ctrlc = "3.5.2"
 lzma-rs = "0.3.0"
 quick-xml = "0.40.1"
+xcsp3-rust-parser = { git = "https://github.com/xcsp3team/XCSP3-Rust-Parser", version = "0.1.0" }

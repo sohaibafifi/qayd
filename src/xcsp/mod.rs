@@ -1,17 +1,20 @@
-//! XCSP3-core front-end: parse an instance, build the model, solve, and report.
+//! XCSP3-core front-end.
 //!
-//! A useful subset of XCSP3-core is supported. Unhandled features produce a
-//! clear error rather than a wrong answer.
+//! Parsing is delegated to the `xcsp3-rust-parser` crate (callback interface);
+//! [`callback::Model`] maps each callback onto the solver. This module wires
+//! parsing to search and reports competition-style output.
 
-pub mod build;
-pub mod dom;
-pub mod parse;
+mod callback;
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+use xcsp3_rust_parser::xcsp_runner::XcspRunner;
+
 use crate::search::{optimize_with, solve_interruptible, SearchControl};
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn write_values<W: Write>(w: &mut W, sol: &[i32]) -> std::io::Result<()> {
     write!(w, "v")?;
@@ -22,7 +25,7 @@ fn write_values<W: Write>(w: &mut W, sol: &[i32]) -> std::io::Result<()> {
 }
 
 /// Parse, build, and solve an XCSP3 instance, returning competition-style
-/// output lines (`s ...`, `o ...`, `v ...`) as a string. No `c` comments.
+/// output lines as a string. No `c` comments.
 pub fn run(xml: &str) -> Result<String, String> {
     let mut buf = Vec::new();
     let never = AtomicBool::new(false);
@@ -30,13 +33,8 @@ pub fn run(xml: &str) -> Result<String, String> {
     String::from_utf8(buf).map_err(|e| e.to_string())
 }
 
-/// Solve an XCSP3 instance, **streaming** output to `w` as it is produced. When
-/// `verbose`, emits `c` comment lines (model size, search stats, time) and an
-/// `o` line per improving bound, flushing after each so progress is live.
-///
-/// Search halts as soon as `stop` is set (time limit / Ctrl+C), reporting the
-/// best solution found so far (`s SATISFIABLE` / `s UNKNOWN` instead of
-/// `s OPTIMUM FOUND` / `s UNSATISFIABLE`).
+/// Solve an XCSP3 instance, streaming output to `w`. When `verbose`, emits `c`
+/// comment lines. Search halts as soon as `stop` is set (time limit / Ctrl+C).
 pub fn run_to<W: Write>(
     xml: &str,
     verbose: bool,
@@ -44,16 +42,41 @@ pub fn run_to<W: Write>(
     w: &mut W,
 ) -> Result<(), String> {
     let start = Instant::now();
-    let root = dom::parse(xml)?;
-    let built = build::build(&root)?;
-    let mut solver = built.solver;
-    let vars = built.vars;
 
+    // The parser reads from a path; stage the (already decompressed) XML.
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("qayd-{}-{}.xml", std::process::id(), n));
+    std::fs::write(&path, xml).map_err(|e| e.to_string())?;
+
+    let mut model = callback::Model::new();
+    let path_str = path.to_str().ok_or("bad temp path")?.to_string();
+    // The parser `panic!`s on constraints it doesn't implement; contain that so
+    // an unsupported instance reports a clean error instead of aborting.
+    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        XcspRunner::run(&path_str, &mut model)
+    }));
+    let _ = std::fs::remove_file(&path);
+    match parsed {
+        Ok(r) => r.map_err(|e| e.to_string())?,
+        Err(p) => {
+            let msg = p
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "parser panic".to_string());
+            return Err(format!("unsupported by parser ({msg})"));
+        }
+    }
+    if let Some(e) = model.error.take() {
+        return Err(e);
+    }
+
+    let mut solver = model.solver;
+    let vars = model.order;
     let to_err = |e: std::io::Error| e.to_string();
 
     if verbose {
-        let n_cons = root.child("constraints").map_or(0, |c| c.children.len());
-        let kind = if built.objective.is_some() {
+        let kind = if model.objective.is_some() {
             "COP"
         } else {
             "CSP"
@@ -61,12 +84,11 @@ pub fn run_to<W: Write>(
         writeln!(w, "c qayd XCSP3").map_err(to_err)?;
         writeln!(w, "c type {kind}").map_err(to_err)?;
         writeln!(w, "c variables {}", solver.store.num_vars()).map_err(to_err)?;
-        writeln!(w, "c constraint elements {n_cons}").map_err(to_err)?;
         writeln!(w, "c propagators {}", solver.num_propagators()).map_err(to_err)?;
         w.flush().map_err(to_err)?;
     }
 
-    match built.objective {
+    match model.objective {
         None => {
             let mut sol = None;
             let stats = solve_interruptible(
@@ -92,7 +114,6 @@ pub fn run_to<W: Write>(
             }
         }
         Some((minimizing, obj)) => {
-            // Stream each improving bound live.
             let mut io_err: Option<std::io::Error> = None;
             let (best, stats) = optimize_with(&mut solver, &vars, obj, minimizing, stop, |v| {
                 if verbose && io_err.is_none() {
@@ -111,7 +132,6 @@ pub fn run_to<W: Write>(
             let interrupted = stop.load(Ordering::Relaxed);
             match best {
                 Some((sol, value)) => {
-                    // Proven optimal only if search finished without interruption.
                     let status = if interrupted {
                         "s SATISFIABLE"
                     } else {
