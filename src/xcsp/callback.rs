@@ -418,6 +418,25 @@ impl XcspCallback for Model {
         });
     }
 
+    fn on_constraint_all_different_except(&mut self, list: &[String], except: &[i32]) {
+        guard!(self, {
+            // Weak form: for every pair, they differ unless the first takes an
+            // exempt value (`x_i == x_j ⟹ x_i ∈ except`).
+            // TODO(strong): allDifferent-except via matching that ignores exempts.
+            let vars = self.scope(list)?;
+            for i in 0..vars.len() {
+                for j in (i + 1)..vars.len() {
+                    let mut terms = vec![expr::ne(expr::var(vars[i]), expr::var(vars[j]))];
+                    for &e in except {
+                        terms.push(expr::eq(expr::var(vars[i]), expr::int(e as i64)));
+                    }
+                    crate::constraints::intension::intension(&mut self.solver, expr::or(terms));
+                }
+            }
+            Ok(())
+        });
+    }
+
     fn on_constraint_all_equal_v1(&mut self, list: &[String]) {
         guard!(self, {
             let vars = self.scope(list)?;
@@ -500,19 +519,18 @@ impl XcspCallback for Model {
     ) {
         guard!(self, {
             let vars = self.scope(list)?;
-            let rel = Model::rel(operator)?;
-            match self.rhs(&operand)? {
-                // Single value vs a constant: the dedicated bounds propagator.
-                Rhs::Const(k) if values.len() == 1 => {
-                    count(&mut self.solver, &vars, values[0], rel, k)
+            // `(in, lo..hi)` condition: occurrences within an interval.
+            if matches!(operator, ROp::In) {
+                if let Operand::Interval(lo, hi) = operand {
+                    self.post_count(&vars, values, Relation::Ge, Rhs::Const(lo as i64));
+                    self.post_count(&vars, values, Relation::Le, Rhs::Const(hi as i64));
+                    return Ok(());
                 }
-                // Value sets or a variable bound: reified-indicator sum.
-                Rhs::Const(k) => {
-                    let y = self.constant(clamp(k));
-                    self.count_compare(&vars, values, rel, y);
-                }
-                Rhs::Var(y) => self.count_compare(&vars, values, rel, y),
+                return Err("count: in <set> condition".to_string());
             }
+            let rel = Model::rel(operator)?;
+            let rhs = self.rhs(&operand)?;
+            self.post_count(&vars, values, rel, rhs);
             Ok(())
         });
     }
@@ -569,6 +587,40 @@ impl XcspCallback for Model {
             let val = self.var_id(&value)?;
             element(&mut self.solver, &array, idx, val);
             Ok(())
+        });
+    }
+    fn on_constraint_element_v5(
+        &mut self,
+        list: &[String],
+        start_index: i32,
+        index: String,
+        operator: ROp,
+        operand: Operand,
+    ) {
+        guard!(self, {
+            if start_index != 0 {
+                return Err("element with non-zero startIndex".to_string());
+            }
+            let array = self.scope(list)?;
+            let idx = self.var_id(&index)?;
+            self.element_cond(array, idx, operator, operand)
+        });
+    }
+    fn on_constraint_element_v8(
+        &mut self,
+        list: &[i32],
+        start_index: i32,
+        index: String,
+        operator: ROp,
+        operand: Operand,
+    ) {
+        guard!(self, {
+            if start_index != 0 {
+                return Err("element with non-zero startIndex".to_string());
+            }
+            let array: Vec<VarId> = list.iter().map(|&c| self.constant(c)).collect();
+            let idx = self.var_id(&index)?;
+            self.element_cond(array, idx, operator, operand)
         });
     }
     fn on_constraint_element_v6(
@@ -652,6 +704,20 @@ impl XcspCallback for Model {
         });
     }
 
+    fn on_constraint_precedence_v1(&mut self, list: &[String], _covered: bool) {
+        guard!(self, {
+            // Default value order: the sorted distinct values across all domains.
+            let vars = self.scope(list)?;
+            let mut vals: Vec<i32> = Vec::new();
+            for &v in &vars {
+                vals.extend(self.solver.store.values(v));
+            }
+            vals.sort_unstable();
+            vals.dedup();
+            crate::constraints::primitives::precedence(&mut self.solver, &vars, &vals);
+            Ok(())
+        });
+    }
     fn on_constraint_precedence_v2(&mut self, list: &[String], values: &[i32], _covered: bool) {
         guard!(self, {
             let vars = self.scope(list)?;
@@ -932,6 +998,48 @@ impl Model {
             }
             linear(&mut self.solver, &[1, -1], &[aux, y], rel, 0);
         }
+        Ok(())
+    }
+
+    /// Post a count condition `#{i : vars[i] ∈ values}  rel  rhs`, choosing the
+    /// dedicated bounds propagator for the single-value/constant case.
+    fn post_count(&mut self, vars: &[VarId], values: &[i32], rel: Relation, rhs: Rhs) {
+        match rhs {
+            Rhs::Const(k) if values.len() == 1 => count(&mut self.solver, vars, values[0], rel, k),
+            Rhs::Const(k) => {
+                let y = self.constant(clamp(k));
+                self.count_compare(vars, values, rel, y);
+            }
+            Rhs::Var(y) => self.count_compare(vars, values, rel, y),
+        }
+    }
+
+    /// `aux = array[index]` then `aux  rel  operand`.
+    fn element_cond(
+        &mut self,
+        array: Vec<VarId>,
+        idx: VarId,
+        operator: ROp,
+        operand: Operand,
+    ) -> Result<(), String> {
+        let lo = array
+            .iter()
+            .map(|&v| self.solver.store.min(v))
+            .min()
+            .unwrap_or(0);
+        let hi = array
+            .iter()
+            .map(|&v| self.solver.store.max(v))
+            .max()
+            .unwrap_or(0);
+        let aux = self.solver.new_var_range(lo, hi);
+        element(&mut self.solver, &array, idx, aux);
+        let rel = Model::rel(operator)?;
+        let y = match self.rhs(&operand)? {
+            Rhs::Const(k) => self.constant(clamp(k)),
+            Rhs::Var(v) => v,
+        };
+        linear(&mut self.solver, &[1, -1], &[aux, y], rel, 0);
         Ok(())
     }
 
