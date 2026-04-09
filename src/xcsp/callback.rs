@@ -130,7 +130,16 @@ impl Model {
     }
 
     /// Post `Σ coeffs·vars  rel  rhs` (moving a variable rhs to the lhs).
-    fn post_linear(&mut self, mut coeffs: Vec<i64>, mut vars: Vec<VarId>, rel: Relation, rhs: Rhs) {
+    fn post_linear(
+        &mut self,
+        mut coeffs: Vec<i64>,
+        mut vars: Vec<VarId>,
+        rel: Relation,
+        rhs: Rhs,
+    ) -> Result<(), String> {
+        if coeffs.len() != vars.len() {
+            return Err("linear: coeffs/vars length mismatch".to_string());
+        }
         match rhs {
             Rhs::Const(k) => linear(&mut self.solver, &coeffs, &vars, rel, k),
             Rhs::Var(y) => {
@@ -139,6 +148,7 @@ impl Model {
                 linear(&mut self.solver, &coeffs, &vars, rel, 0);
             }
         }
+        Ok(())
     }
 
     /// Convert a parser expression tree to a solver [`Expr`].
@@ -437,7 +447,7 @@ impl XcspCallback for Model {
             let vars = self.scope(list)?;
             let coeffs = vec![1i64; vars.len()];
             let (rel, rhs) = (Model::rel(operator)?, self.rhs(&operand)?);
-            self.post_linear(coeffs, vars, rel, rhs);
+            self.post_linear(coeffs, vars, rel, rhs)?;
             Ok(())
         });
     }
@@ -452,7 +462,7 @@ impl XcspCallback for Model {
             let vars = self.scope(list)?;
             let coeffs: Vec<i64> = coeffs.iter().map(|&c| c as i64).collect();
             let (rel, rhs) = (Model::rel(operator)?, self.rhs(&operand)?);
-            self.post_linear(coeffs, vars, rel, rhs);
+            self.post_linear(coeffs, vars, rel, rhs)?;
             Ok(())
         });
     }
@@ -461,7 +471,7 @@ impl XcspCallback for Model {
             let vars = self.tree_vars(list)?;
             let coeffs = vec![1i64; vars.len()];
             let (rel, rhs) = (Model::rel(operator)?, self.rhs(&operand)?);
-            self.post_linear(coeffs, vars, rel, rhs);
+            self.post_linear(coeffs, vars, rel, rhs)?;
             Ok(())
         });
     }
@@ -476,7 +486,7 @@ impl XcspCallback for Model {
             let vars = self.tree_vars(list)?;
             let coeffs: Vec<i64> = coeffs.iter().map(|&c| c as i64).collect();
             let (rel, rhs) = (Model::rel(operator)?, self.rhs(&operand)?);
-            self.post_linear(coeffs, vars, rel, rhs);
+            self.post_linear(coeffs, vars, rel, rhs)?;
             Ok(())
         });
     }
@@ -760,8 +770,8 @@ impl XcspCallback for Model {
             let w: Vec<i64> = weights.iter().map(|&x| x as i64).collect();
             let p: Vec<i64> = profits.iter().map(|&x| x as i64).collect();
             // Σ w·x ≤ W and Σ p·x ≥ P (W, P may be variables).
-            self.post_linear(w, vars.clone(), Relation::Le, self.rhs(&w_operand)?);
-            self.post_linear(p, vars, Relation::Ge, self.rhs(&p_operand)?);
+            self.post_linear(w, vars.clone(), Relation::Le, self.rhs(&w_operand)?)?;
+            self.post_linear(p, vars, Relation::Ge, self.rhs(&p_operand)?)?;
             Ok(())
         });
     }
@@ -983,6 +993,9 @@ impl Model {
         minimize: bool,
     ) -> Result<(), String> {
         use XElementOperator::*;
+        if coeffs.len() != vars.len() {
+            return Err("objective: coeffs/terms length mismatch".to_string());
+        }
         let obj = match t {
             Sum => {
                 let (mut lo, mut hi) = (0i64, 0i64);
