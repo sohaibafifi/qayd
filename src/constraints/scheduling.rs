@@ -265,6 +265,160 @@ pub fn cumulative(
     }));
 }
 
+// ---------------------------------------------------------------------------
+// cumulative with variable heights and/or a variable capacity.
+//
+// Weak-but-correct time-tabling: the profile sums the *minimum* heights of
+// mandatory parts. Reasoning uses the loosest capacity (`cap.max`) for pruning
+// and the peak min-usage to raise `cap.min`. Sound; strictly weaker than the
+// fixed-height edge-finder above.
+// TODO(strong): variable-height edge-finding / energetic reasoning.
+
+struct CumulativeVar {
+    starts: Vec<VarId>,
+    dur: Vec<i64>,
+    height: Vec<VarId>,
+    capacity: VarId,
+    profile: Vec<i64>,
+    buf: Vec<i32>,
+}
+
+impl CumulativeVar {
+    fn state(&self, store: &Store) -> usize {
+        let n = self.starts.len();
+        let mut s = store.size(self.capacity);
+        for i in 0..n {
+            s += store.size(self.starts[i]) + store.size(self.height[i]);
+        }
+        s
+    }
+}
+
+impl Propagator for CumulativeVar {
+    fn register(&mut self, store: &mut Store, me: PropId) {
+        for &s in &self.starts {
+            store.subscribe(s, me, Event::BoundChange);
+        }
+        for &h in &self.height {
+            store.subscribe(h, me, Event::BoundChange);
+        }
+        store.subscribe(self.capacity, me, Event::BoundChange);
+    }
+
+    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+        let n = self.starts.len();
+        if n == 0 {
+            return Ok(());
+        }
+        loop {
+            let before = self.state(store);
+            let cap_max = store.max(self.capacity) as i64;
+
+            // Time horizon over all tasks.
+            let mut hmin = i64::MAX;
+            let mut hmax = i64::MIN;
+            for i in 0..n {
+                hmin = hmin.min(store.min(self.starts[i]) as i64);
+                hmax = hmax.max(store.max(self.starts[i]) as i64 + self.dur[i]);
+            }
+            if hmax <= hmin {
+                break;
+            }
+            let horizon = (hmax - hmin) as usize;
+            self.profile.clear();
+            self.profile.resize(horizon, 0);
+
+            // Profile of minimum heights over mandatory parts
+            // [latest_start, earliest_end).
+            for i in 0..n {
+                let h_lo = store.min(self.height[i]) as i64;
+                if h_lo == 0 {
+                    continue;
+                }
+                let mand_start = store.max(self.starts[i]) as i64;
+                let mand_end = store.min(self.starts[i]) as i64 + self.dur[i];
+                for t in mand_start..mand_end {
+                    self.profile[(t - hmin) as usize] += h_lo;
+                }
+            }
+
+            // Overload, and tighten the capacity lower bound to the peak.
+            let peak = self.profile.iter().copied().max().unwrap_or(0);
+            if peak > cap_max {
+                return Err(Inconsistency);
+            }
+            if peak > store.min(self.capacity) as i64 {
+                store.remove_below(self.capacity, clamp_i32(peak))?;
+            }
+
+            for i in 0..n {
+                let h_lo = store.min(self.height[i]) as i64;
+                let mand_start = store.max(self.starts[i]) as i64;
+                let mand_end = store.min(self.starts[i]) as i64 + self.dur[i];
+
+                // During its mandatory part, h_i ≤ cap_max − (others' min usage).
+                if mand_end > mand_start {
+                    let mut slack = i64::MAX;
+                    for t in mand_start..mand_end {
+                        let others = self.profile[(t - hmin) as usize] - h_lo;
+                        slack = slack.min(cap_max - others);
+                    }
+                    if slack < store.max(self.height[i]) as i64 {
+                        store.remove_above(self.height[i], clamp_i32(slack))?;
+                    }
+                }
+
+                // Forbid starts whose least usage would still exceed cap_max.
+                if h_lo > 0 {
+                    self.buf.clear();
+                    self.buf.extend(store.values(self.starts[i]));
+                    for &start in &self.buf {
+                        let s = start as i64;
+                        let conflict = (s..s + self.dur[i]).any(|t| {
+                            let idx = (t - hmin) as usize;
+                            let own = if t >= mand_start && t < mand_end {
+                                h_lo
+                            } else {
+                                0
+                            };
+                            self.profile[idx] - own + h_lo > cap_max
+                        });
+                        if conflict {
+                            store.remove(self.starts[i], start)?;
+                        }
+                    }
+                }
+            }
+
+            if self.state(store) == before {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Post `cumulative` with variable task heights and a (possibly variable)
+/// `capacity`.
+pub fn cumulative_var(
+    solver: &mut Solver,
+    starts: &[VarId],
+    durations: &[i64],
+    heights: &[VarId],
+    capacity: VarId,
+) {
+    assert_eq!(starts.len(), durations.len(), "cumulative: length mismatch");
+    assert_eq!(starts.len(), heights.len(), "cumulative: length mismatch");
+    solver.post(Box::new(CumulativeVar {
+        starts: starts.to_vec(),
+        dur: durations.to_vec(),
+        height: heights.to_vec(),
+        capacity,
+        profile: Vec::new(),
+        buf: Vec::new(),
+    }));
+}
+
 // ===========================================================================
 // binPacking (Shaw, load-based)
 // ===========================================================================

@@ -23,7 +23,7 @@ use crate::constraints::linear::{linear, Relation};
 use crate::constraints::primitives::{
     all_different, all_equal, element, instantiation, maximum, minimum, ordered,
 };
-use crate::constraints::scheduling::{bin_packing, cumulative, no_overlap};
+use crate::constraints::scheduling::{bin_packing, cumulative, cumulative_var, no_overlap};
 use crate::constraints::table::{extension, mdd, regular, Dfa, Mdd, MddArc, STAR};
 use crate::expr::{self, Expr};
 use crate::ids::VarId;
@@ -672,14 +672,43 @@ impl XcspCallback for Model {
             if !matches!(operator, ROp::Le) {
                 return Err("cumulative condition must be <=".to_string());
             }
-            let cap = match self.rhs(&operand)? {
-                Rhs::Const(k) => k,
-                Rhs::Var(_) => return Err("cumulative with variable capacity".to_string()),
-            };
             let starts = self.scope(origins)?;
             let d: Vec<i64> = lengths.iter().map(|&x| x as i64).collect();
-            let h: Vec<i64> = heights.iter().map(|&x| x as i64).collect();
-            cumulative(&mut self.solver, &starts, &d, &h, cap);
+            match self.rhs(&operand)? {
+                // Fixed heights + constant capacity: the strong edge-finder.
+                Rhs::Const(k) => {
+                    let h: Vec<i64> = heights.iter().map(|&x| x as i64).collect();
+                    cumulative(&mut self.solver, &starts, &d, &h, k);
+                }
+                // Variable capacity: the weaker variable-resource propagator.
+                Rhs::Var(cap) => {
+                    let h: Vec<VarId> = heights.iter().map(|&x| self.constant(x)).collect();
+                    cumulative_var(&mut self.solver, &starts, &d, &h, cap);
+                }
+            }
+            Ok(())
+        });
+    }
+    fn on_constraint_cumulative_v2(
+        &mut self,
+        origins: &[String],
+        lengths: &[i32],
+        heights: &[String],
+        operator: ROp,
+        operand: Operand,
+    ) {
+        guard!(self, {
+            if !matches!(operator, ROp::Le) {
+                return Err("cumulative condition must be <=".to_string());
+            }
+            let starts = self.scope(origins)?;
+            let d: Vec<i64> = lengths.iter().map(|&x| x as i64).collect();
+            let h = self.scope(heights)?;
+            let cap = match self.rhs(&operand)? {
+                Rhs::Const(k) => self.constant(clamp(k)),
+                Rhs::Var(v) => v,
+            };
+            cumulative_var(&mut self.solver, &starts, &d, &h, cap);
             Ok(())
         });
     }
