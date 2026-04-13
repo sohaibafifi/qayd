@@ -452,6 +452,28 @@ impl XcspCallback for Model {
             Ok(())
         });
     }
+    fn on_constraint_ordered_v3(&mut self, list: &[String], lengths: &[String], operator: ROp) {
+        guard!(self, {
+            // XCSP gives either n lengths (last unused) or n-1.
+            if lengths.len() + 1 < list.len() {
+                return Err("ordered: too few lengths".to_string());
+            }
+            let vars = self.scope(list)?;
+            let lens = self.scope(lengths)?;
+            let rel = Model::rel(operator)?;
+            // Chain: x[i] + len[i]  rel  x[i+1].
+            for i in 0..vars.len().saturating_sub(1) {
+                linear(
+                    &mut self.solver,
+                    &[1, 1, -1],
+                    &[vars[i], lens[i], vars[i + 1]],
+                    rel,
+                    0,
+                );
+            }
+            Ok(())
+        });
+    }
 
     fn on_constraint_instantiation(&mut self, list: &[String], values: &[i32]) {
         guard!(self, {
@@ -884,6 +906,69 @@ impl XcspCallback for Model {
             Ok(())
         });
     }
+    fn on_constraint_no_overlap_v2(&mut self, list: &[String], lengths: &[String], zero: bool) {
+        guard!(self, {
+            if list.len() != lengths.len() {
+                return Err("noOverlap: list/lengths length mismatch".to_string());
+            }
+            let mut org = Vec::with_capacity(list.len());
+            let mut len = Vec::with_capacity(list.len());
+            for (s, l) in list.iter().zip(lengths) {
+                org.push(vec![self.var_id(s)?]);
+                len.push(vec![expr::var(self.var_id(l)?)]);
+            }
+            self.post_diffn(org, len, zero)
+        });
+    }
+    fn on_constraint_no_overlap_k_dim_v1(
+        &mut self,
+        origins: &Vec<Vec<String>>,
+        lengths: &Vec<Vec<i32>>,
+        zero: bool,
+    ) {
+        guard!(self, {
+            let org = self.origins_to_ids(origins)?;
+            let len: Vec<Vec<Expr>> = lengths
+                .iter()
+                .map(|b| b.iter().map(|&l| expr::int(l as i64)).collect())
+                .collect();
+            self.post_diffn(org, len, zero)
+        });
+    }
+    fn on_constraint_no_overlap_k_dim_v2(
+        &mut self,
+        origins: &Vec<Vec<String>>,
+        lengths: &Vec<Vec<String>>,
+        zero: bool,
+    ) {
+        guard!(self, {
+            let org = self.origins_to_ids(origins)?;
+            let mut len = Vec::with_capacity(lengths.len());
+            for b in lengths {
+                let mut row = Vec::with_capacity(b.len());
+                for s in b {
+                    row.push(expr::var(self.var_id(s)?));
+                }
+                len.push(row);
+            }
+            self.post_diffn(org, len, zero)
+        });
+    }
+    fn on_constraint_no_overlap_k_dim_v3(
+        &mut self,
+        origins: &Vec<Vec<String>>,
+        lengths: &Vec<(String, i32)>,
+        zero: bool,
+    ) {
+        guard!(self, {
+            let org = self.origins_to_ids(origins)?;
+            let mut len = Vec::with_capacity(lengths.len());
+            for &(ref s, l) in lengths {
+                len.push(vec![expr::var(self.var_id(s)?), expr::int(l as i64)]);
+            }
+            self.post_diffn(org, len, zero)
+        });
+    }
 
     fn on_constraint_regular(
         &mut self,
@@ -1041,6 +1126,62 @@ impl Model {
             }
             Rhs::Var(y) => self.count_compare(vars, values, rel, y),
         }
+    }
+
+    fn origins_to_ids(&self, origins: &[Vec<String>]) -> Result<Vec<Vec<VarId>>, String> {
+        origins
+            .iter()
+            .map(|b| b.iter().map(|s| self.var_id(s)).collect())
+            .collect()
+    }
+
+    /// Post k-dimensional `noOverlap` (diffn): every pair of boxes is separated
+    /// in at least one dimension. Weak-but-correct pairwise decomposition; with
+    /// `zero_ignored`, a box that is degenerate (length 0 in some dimension)
+    /// imposes no separation. TODO(strong): sweep-based diffn.
+    fn post_diffn(
+        &mut self,
+        origins: Vec<Vec<VarId>>,
+        lengths: Vec<Vec<Expr>>,
+        zero_ignored: bool,
+    ) -> Result<(), String> {
+        let nb = origins.len();
+        if nb != lengths.len() {
+            return Err("noOverlap: origins/lengths length mismatch".to_string());
+        }
+        for i in 0..nb {
+            if origins[i].len() != lengths[i].len() {
+                return Err("noOverlap: box origin/length arity mismatch".to_string());
+            }
+        }
+        for i in 0..nb {
+            for j in (i + 1)..nb {
+                let k = origins[i].len();
+                let mut terms: Vec<Expr> = Vec::with_capacity(2 * k);
+                for d in 0..k {
+                    // i ends before j starts, in dimension d.
+                    terms.push(expr::le(
+                        expr::add(vec![expr::var(origins[i][d]), lengths[i][d].clone()]),
+                        expr::var(origins[j][d]),
+                    ));
+                    // j ends before i starts, in dimension d.
+                    terms.push(expr::le(
+                        expr::add(vec![expr::var(origins[j][d]), lengths[j][d].clone()]),
+                        expr::var(origins[i][d]),
+                    ));
+                }
+                if zero_ignored {
+                    for l in &lengths[i] {
+                        terms.push(expr::eq(l.clone(), expr::int(0)));
+                    }
+                    for l in &lengths[j] {
+                        terms.push(expr::eq(l.clone(), expr::int(0)));
+                    }
+                }
+                crate::constraints::intension::intension(&mut self.solver, expr::or(terms));
+            }
+        }
+        Ok(())
     }
 
     /// `aux = array[index]` then `aux  rel  operand`.
