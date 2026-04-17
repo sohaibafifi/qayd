@@ -266,17 +266,18 @@ pub fn cumulative(
 }
 
 // ---------------------------------------------------------------------------
-// cumulative with variable heights and/or a variable capacity.
+// cumulative with variable durations, heights, and/or a variable capacity.
 //
-// Weak-but-correct time-tabling: the profile sums the *minimum* heights of
-// mandatory parts. Reasoning uses the loosest capacity (`cap.max`) for pruning
-// and the peak min-usage to raise `cap.min`. Sound; strictly weaker than the
-// fixed-height edge-finder above.
-// TODO(strong): variable-height edge-finding / energetic reasoning.
+// Weak-but-correct time-tabling: the profile sums the *minimum* heights over
+// mandatory parts `[latest_start, earliest_start + min_dur)`. Pruning uses the
+// loosest capacity (`cap.max`) and the least occupation (`min_dur`); the peak
+// min-usage raises `cap.min`. Sound; strictly weaker than the fixed-height
+// edge-finder above.
+// TODO(strong): variable-resource edge-finding / energetic reasoning.
 
 struct CumulativeVar {
     starts: Vec<VarId>,
-    dur: Vec<i64>,
+    dur: Vec<VarId>,
     height: Vec<VarId>,
     capacity: VarId,
     profile: Vec<i64>,
@@ -288,7 +289,7 @@ impl CumulativeVar {
         let n = self.starts.len();
         let mut s = store.size(self.capacity);
         for i in 0..n {
-            s += store.size(self.starts[i]) + store.size(self.height[i]);
+            s += store.size(self.starts[i]) + store.size(self.dur[i]) + store.size(self.height[i]);
         }
         s
     }
@@ -298,6 +299,9 @@ impl Propagator for CumulativeVar {
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &s in &self.starts {
             store.subscribe(s, me, Event::BoundChange);
+        }
+        for &d in &self.dur {
+            store.subscribe(d, me, Event::BoundChange);
         }
         for &h in &self.height {
             store.subscribe(h, me, Event::BoundChange);
@@ -314,12 +318,12 @@ impl Propagator for CumulativeVar {
             let before = self.state(store);
             let cap_max = store.max(self.capacity) as i64;
 
-            // Time horizon over all tasks.
+            // Time horizon over all tasks (using the longest possible durations).
             let mut hmin = i64::MAX;
             let mut hmax = i64::MIN;
             for i in 0..n {
                 hmin = hmin.min(store.min(self.starts[i]) as i64);
-                hmax = hmax.max(store.max(self.starts[i]) as i64 + self.dur[i]);
+                hmax = hmax.max(store.max(self.starts[i]) as i64 + store.max(self.dur[i]) as i64);
             }
             if hmax <= hmin {
                 break;
@@ -329,14 +333,14 @@ impl Propagator for CumulativeVar {
             self.profile.resize(horizon, 0);
 
             // Profile of minimum heights over mandatory parts
-            // [latest_start, earliest_end).
+            // [latest_start, earliest_start + min_dur).
             for i in 0..n {
                 let h_lo = store.min(self.height[i]) as i64;
                 if h_lo == 0 {
                     continue;
                 }
                 let mand_start = store.max(self.starts[i]) as i64;
-                let mand_end = store.min(self.starts[i]) as i64 + self.dur[i];
+                let mand_end = store.min(self.starts[i]) as i64 + store.min(self.dur[i]) as i64;
                 for t in mand_start..mand_end {
                     self.profile[(t - hmin) as usize] += h_lo;
                 }
@@ -353,8 +357,9 @@ impl Propagator for CumulativeVar {
 
             for i in 0..n {
                 let h_lo = store.min(self.height[i]) as i64;
+                let d_lo = store.min(self.dur[i]) as i64;
                 let mand_start = store.max(self.starts[i]) as i64;
-                let mand_end = store.min(self.starts[i]) as i64 + self.dur[i];
+                let mand_end = store.min(self.starts[i]) as i64 + d_lo;
 
                 // During its mandatory part, h_i ≤ cap_max − (others' min usage).
                 if mand_end > mand_start {
@@ -368,13 +373,14 @@ impl Propagator for CumulativeVar {
                     }
                 }
 
-                // Forbid starts whose least usage would still exceed cap_max.
-                if h_lo > 0 {
+                // Forbid starts whose least occupation `[s, s+min_dur)` would
+                // still exceed cap_max against the others' mandatory minimums.
+                if h_lo > 0 && d_lo > 0 {
                     self.buf.clear();
                     self.buf.extend(store.values(self.starts[i]));
                     for &start in &self.buf {
                         let s = start as i64;
-                        let conflict = (s..s + self.dur[i]).any(|t| {
+                        let conflict = (s..s + d_lo).any(|t| {
                             let idx = (t - hmin) as usize;
                             let own = if t >= mand_start && t < mand_end {
                                 h_lo
@@ -398,12 +404,12 @@ impl Propagator for CumulativeVar {
     }
 }
 
-/// Post `cumulative` with variable task heights and a (possibly variable)
-/// `capacity`.
+/// Post `cumulative` with variable task durations and heights and a (possibly
+/// variable) `capacity`.
 pub fn cumulative_var(
     solver: &mut Solver,
     starts: &[VarId],
-    durations: &[i64],
+    durations: &[VarId],
     heights: &[VarId],
     capacity: VarId,
 ) {

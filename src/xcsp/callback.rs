@@ -109,6 +109,11 @@ impl Model {
         self.solver.new_var_set(&[value])
     }
 
+    /// Fresh fixed variables, one per integer (for slots that take variables).
+    fn consts(&mut self, values: &[i32]) -> Vec<VarId> {
+        values.iter().map(|&x| self.constant(x)).collect()
+    }
+
     fn rel(op: ROp) -> Result<Relation, String> {
         Ok(match op {
             ROp::Lt => Relation::Lt,
@@ -704,8 +709,9 @@ impl XcspCallback for Model {
                 }
                 // Variable capacity: the weaker variable-resource propagator.
                 Rhs::Var(cap) => {
-                    let h: Vec<VarId> = heights.iter().map(|&x| self.constant(x)).collect();
-                    cumulative_var(&mut self.solver, &starts, &d, &h, cap);
+                    let dv = self.consts(lengths);
+                    let h = self.consts(heights);
+                    cumulative_var(&mut self.solver, &starts, &dv, &h, cap);
                 }
             }
             Ok(())
@@ -724,13 +730,59 @@ impl XcspCallback for Model {
                 return Err("cumulative condition must be <=".to_string());
             }
             let starts = self.scope(origins)?;
-            let d: Vec<i64> = lengths.iter().map(|&x| x as i64).collect();
+            let dv = self.consts(lengths);
             let h = self.scope(heights)?;
             let cap = match self.rhs(&operand)? {
                 Rhs::Const(k) => self.constant(clamp(k)),
                 Rhs::Var(v) => v,
             };
-            cumulative_var(&mut self.solver, &starts, &d, &h, cap);
+            cumulative_var(&mut self.solver, &starts, &dv, &h, cap);
+            Ok(())
+        });
+    }
+    fn on_constraint_cumulative_v3(
+        &mut self,
+        origins: &[String],
+        lengths: &[String],
+        heights: &[i32],
+        operator: ROp,
+        operand: Operand,
+    ) {
+        guard!(self, {
+            if !matches!(operator, ROp::Le) {
+                return Err("cumulative condition must be <=".to_string());
+            }
+            let starts = self.scope(origins)?;
+            let dv = self.scope(lengths)?;
+            let h = self.consts(heights);
+            let cap = match self.rhs(&operand)? {
+                Rhs::Const(k) => self.constant(clamp(k)),
+                Rhs::Var(v) => v,
+            };
+            cumulative_var(&mut self.solver, &starts, &dv, &h, cap);
+            Ok(())
+        });
+    }
+    fn on_constraint_cumulative_v4(
+        &mut self,
+        origins: &[String],
+        lengths: &[String],
+        heights: &[String],
+        operator: ROp,
+        operand: Operand,
+    ) {
+        guard!(self, {
+            if !matches!(operator, ROp::Le) {
+                return Err("cumulative condition must be <=".to_string());
+            }
+            let starts = self.scope(origins)?;
+            let dv = self.scope(lengths)?;
+            let h = self.scope(heights)?;
+            let cap = match self.rhs(&operand)? {
+                Rhs::Const(k) => self.constant(clamp(k)),
+                Rhs::Var(v) => v,
+            };
+            cumulative_var(&mut self.solver, &starts, &dv, &h, cap);
             Ok(())
         });
     }
