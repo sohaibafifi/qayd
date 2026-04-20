@@ -66,7 +66,7 @@ where
     let mut stats = SolveStats::default();
     solver.store.push_level();
     solver.enqueue_all();
-    match solver.propagate() {
+    match solver.propagate_until(|| stopped(stop)) {
         Ok(()) => {
             dfs(solver, vars, &mut stats, &mut on_solution, stop);
         }
@@ -343,7 +343,7 @@ fn bnb<F: FnMut(i32)>(
 
     // Reach the node's fixpoint (drains the decision that led here, or the
     // initial enqueue at the root).
-    if solver.propagate().is_err() {
+    if solver.propagate_until(|| stopped(stop)).is_err() {
         stats.failures += 1;
         ctx.run_failures += 1;
         return;
@@ -356,7 +356,7 @@ fn bnb<F: FnMut(i32)>(
         } else {
             solver.store.remove_below(obj, inc + 1)
         };
-        if bounded.is_err() || solver.propagate().is_err() {
+        if bounded.is_err() || solver.propagate_until(|| stopped(stop)).is_err() {
             stats.failures += 1;
             ctx.run_failures += 1;
             return;
@@ -367,7 +367,7 @@ fn bnb<F: FnMut(i32)>(
         match propagate_nogoods(&mut solver.store, nogoods) {
             Ok(false) => break,
             Ok(true) => {
-                if solver.propagate().is_err() {
+                if solver.propagate_until(|| stopped(stop)).is_err() {
                     stats.failures += 1;
                     ctx.run_failures += 1;
                     return;
@@ -612,7 +612,7 @@ where
     solver.store.push_level();
 
     let outcome = match decision(solver) {
-        Ok(()) => solver.propagate(),
+        Ok(()) => solver.propagate_until(|| stopped(stop)),
         Err(e) => Err(e),
     };
     let ctrl = match outcome {

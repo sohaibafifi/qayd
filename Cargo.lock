@@ -262,7 +262,7 @@ dependencies = [
 [[package]]
 name = "xcsp3-rust-parser"
 version = "0.1.0"
-source = "git+https://github.com/xcsp3team/XCSP3-Rust-Parser#0b4449bad35bbff841ed6001a512ca8b8e6d97d2"
+source = "git+https://github.com/sohaibafifi/XCSP3-Rust-Parser?rev=37c9b7dba7690b702ed188e778876fa712083e7c#37c9b7dba7690b702ed188e778876fa712083e7c"
 dependencies = [
  "quick-xml",
  "regex",

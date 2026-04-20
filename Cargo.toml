@@ -24,4 +24,6 @@ panic = "abort"
 [dependencies]
 ctrlc = "3.5.2"
 lzma-rs = "0.3.0"
-xcsp3-rust-parser = { git = "https://github.com/xcsp3team/XCSP3-Rust-Parser", version = "0.1.0" }
+# Patched fork: cardinality mixed occurs, %N group injection, notin, stray stdout
+# prints. Rev-pinned for reproducibility.
+xcsp3-rust-parser = { git = "https://github.com/sohaibafifi/XCSP3-Rust-Parser", rev = "37c9b7dba7690b702ed188e778876fa712083e7c" }

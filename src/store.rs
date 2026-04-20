@@ -410,7 +410,24 @@ impl Solver {
     /// Run the propagation fixpoint until the queue empties (consistent) or a
     /// propagator reports `Inconsistency`.
     pub fn propagate(&mut self) -> Result<(), Inconsistency> {
+        self.propagate_until(|| false)
+    }
+
+    /// Run the propagation fixpoint, periodically polling `should_stop`. When it
+    /// fires (e.g. a time limit during a very large root propagation), the queue
+    /// is cleared and `Ok` is returned — the caller must then observe the stop
+    /// and abandon the search (never treat this as a consistent fixpoint).
+    pub fn propagate_until<F: Fn() -> bool>(
+        &mut self,
+        should_stop: F,
+    ) -> Result<(), Inconsistency> {
         while let Some(id) = self.store.dequeue() {
+            // Poll on every dequeue: a single propagator call can be slow on huge
+            // instances, so a coarser interval would blow well past the limit.
+            if should_stop() {
+                self.store.clear_queue();
+                return Ok(());
+            }
             // Take the propagator out to satisfy the borrow checker, run it,
             // then put it straight back.
             let mut prop = self.propagators[id.index()]
