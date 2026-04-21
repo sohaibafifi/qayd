@@ -49,24 +49,10 @@ pub fn run_to<W: Write>(
     std::fs::write(&path, xml).map_err(|e| e.to_string())?;
 
     let mut model = callback::Model::new();
-    let path_str = path.to_str().ok_or("bad temp path")?.to_string();
-    // The parser `panic!`s on constraints it doesn't implement; contain that so
-    // an unsupported instance reports a clean error instead of aborting.
-    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        XcspRunner::run(&path_str, &mut model)
-    }));
+    let path_str = path.to_str().ok_or("bad temp path")?;
+    let parsed = XcspRunner::run(path_str, &mut model);
     let _ = std::fs::remove_file(&path);
-    match parsed {
-        Ok(r) => r.map_err(|e| e.to_string())?,
-        Err(p) => {
-            let msg = p
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_else(|| "parser panic".to_string());
-            return Err(format!("unsupported by parser ({msg})"));
-        }
-    }
+    parsed.map_err(|e| e.to_string())?;
     if let Some(e) = model.error.take() {
         return Err(e);
     }
