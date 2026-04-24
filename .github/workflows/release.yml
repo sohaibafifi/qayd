@@ -60,3 +60,66 @@ jobs:
           include: README.md,LICENSE
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
+
+
+  compress-assets:
+    name: upx ${{ matrix.target }}
+    needs: upload-assets
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-pc-windows-msvc
+    steps:
+      - name: Install UPX
+        run: sudo apt-get update && sudo apt-get install -y upx-ucl
+
+      - name: UPX-compress the released binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          base="qayd-${tag}-${{ matrix.target }}"
+
+          # Discover the actual asset (taiki-e ships .zip for Windows, .tar.gz
+          # otherwise) rather than assuming an extension.
+          asset=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+                    --json assets --jq '.assets[].name' \
+                  | grep -E "^${base}\.(tar\.gz|zip)$" | head -n1)
+          if [ -z "${asset:-}" ]; then
+            echo "No archive found for ${base}; nothing to compress." >&2
+            exit 0
+          fi
+          echo "Compressing asset: $asset"
+
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$asset" --dir dl
+          mkdir ex
+          case "$asset" in
+            *.tar.gz) tar -xzf "dl/$asset" -C ex ;;
+            *.zip)    unzip -q "dl/$asset" -d ex ;;
+          esac
+
+          # Round-tripping the archive means we reproduce taiki-e's exact member
+          # layout; we only mutate the binary itself.
+          binfile=$(find ex -type f \( -name qayd -o -name qayd.exe \) | head -n1)
+          before=$(stat -c%s "$binfile")
+          upx --best --lzma "$binfile"
+          after=$(stat -c%s "$binfile")
+          echo "Binary: ${before} -> ${after} bytes"
+
+          # Re-archive with the same members and the same name, then refresh the
+          # sha256 sidecar in taiki-e's "<hash>  <name>" format.
+          rm -f "$asset"
+          ( cd ex && case "$asset" in
+              *.tar.gz) tar -czf "../$asset" * ;;
+              *.zip)    zip -qr "../$asset" * ;;
+            esac )
+          sha256sum "$asset" > "$asset.sha256"
+
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" \
+            "$asset" "$asset.sha256" --clobber

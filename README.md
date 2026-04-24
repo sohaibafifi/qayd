@@ -8,27 +8,19 @@
 
 ---
 
-`qayd` solves CSP and COP instances over **integer variables with finite domains**,
-using a propagation engine and backtracking search. The target constraint catalogue
-is [XCSP3-core](https://xcsp.org).
+`qayd` solves CSP and COP instances over **integer variables with finite domains**.
+It pairs a finite-domain propagation engine with a CDCL search that learns from
+conflicts. The target constraint catalogue is [XCSP3-core](https://xcsp.org).
 
-Priorities, in order: **correct → simple → fast.**
+Priorities, in order: **correct, then simple, then fast.**
 
-## Features
-
-- Sparse-set trailed domains, event-driven propagation to fixpoint.
-- DFS with `dom/wdeg` branching, geometric restarts, branch-and-bound for optimization.
-- Constraints: `intension`, `extension`, `regular`, `mdd`, `allDifferent`, `allEqual`,
-  `ordered`, `lex`, `precedence`, `sum`, `count`, `nValues`, `cardinality`, `minimum`,
-  `maximum`, `element`, `channel`, `slide`, `noOverlap`, `cumulative`, `binPacking`,
-  `knapsack`, `circuit`, `instantiation`.
-- XCSP3-core reader (`.xml`, `.lzma`, `.xz`), with time limit and Ctrl+C handling.
+About 6,600 lines of code (LCG / CDCL engine: 1,617; constraint catalogue: 1,927; XCSP3 bridge: 1,635; core kernel: 1,386).
 
 ## Build
 
 ```bash
 cargo build --release
-cargo test            # 86 tests: unit, integration, brute-force oracle
+cargo test
 ```
 
 ## Solve an instance
@@ -37,8 +29,8 @@ cargo test            # 86 tests: unit, integration, brute-force oracle
 qayd [-v] [-t SECONDS] <instance.xml[.lzma|.xz]>
 ```
 
-- `-v` — emit `c` comment lines (model size, bounds, search stats, wall time).
-- `-t SECONDS` — stop after a time budget, reporting the best solution so far.
+- `-v` emits `c` comment lines (model size, search stats, wall time).
+- `-t SECONDS` stops after a time budget, reporting the best solution so far.
 
 ## As a library
 

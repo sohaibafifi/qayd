@@ -1,8 +1,5 @@
 //! `qayd` — yet another constraint-programming solver.
 //!
-//! `qayd` solves CSP and COP instances over integer variables with finite
-//! domains, with a propagation engine and backtracking search.
-//!
 //! # Phase 0 — the kernel
 //!
 //! This phase provides the foundation everything else builds on:
@@ -40,6 +37,7 @@ pub mod constraints;
 pub mod domain;
 pub mod expr;
 pub mod ids;
+pub mod lcg;
 pub mod oracle;
 pub mod propagator;
 pub mod search;
