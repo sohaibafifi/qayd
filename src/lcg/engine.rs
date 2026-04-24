@@ -99,15 +99,12 @@ impl Cdcl<'_> {
         }
     }
 
-    /// The blocking clause for the current full assignment of `vars`: at least
-    /// one variable must differ from its value (`⋁ ¬[v = value(v)]`).
-    fn blocking_clause(&self, vars: &[VarId]) -> Vec<Lit> {
-        vars.iter()
-            .filter_map(|&v| match self.atoms.eq(v, self.solver.store.value(v)) {
-                LitOrConst::Lit(l) => Some(l.negate()),
-                _ => None,
-            })
-            .collect()
+    /// The blocking clause for the current solution: the negation of the
+    /// decisions that led here (see [`Cdcl::decision_blocking`]). Over decisions
+    /// only, so its 1-UIP analysis stays specific to this solution rather than
+    /// generalizing through propagator reasons and dropping feasible solutions.
+    fn blocking_clause(&self, _vars: &[VarId]) -> Vec<Lit> {
+        self.decision_blocking()
     }
 
     /// Enumerate solutions over `vars` by CDCL, invoking `on_solution` for each
@@ -296,8 +293,8 @@ impl Cdcl<'_> {
                 }
             }
             self.backjump_to(0); // discard the partial proving tree
-            // Grow the proving budget, but cap it so LNS keeps getting turns on
-            // instances the prover cannot close.
+                                 // Grow the proving budget, but cap it so LNS keeps getting turns on
+                                 // instances the prover cannot close.
             epoch_budget = (epoch_budget + epoch_budget / 2).min(8000);
 
             // --- LNS bursts to improve the incumbent before the next epoch ---
@@ -323,7 +320,8 @@ impl Cdcl<'_> {
                     relax = if improved {
                         base // intensify around the new incumbent
                     } else {
-                        (relax + base).min(vars.len().saturating_sub(1)).max(base) // diversify
+                        (relax + base).min(vars.len().saturating_sub(1)).max(base)
+                        // diversify
                     };
                 }
             }

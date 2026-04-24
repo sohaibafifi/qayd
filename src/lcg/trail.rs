@@ -383,6 +383,22 @@ impl<'s> Cdcl<'s> {
         &self.atom_reason[atom as usize]
     }
 
+    /// A blocking clause over the current decisions: `⋁ ¬d` for each decision
+    /// literal `d` on the trail. The decisions plus deterministic propagation
+    /// reach a unique assignment, so this excludes exactly the current solution.
+    /// Because every literal is a decision (an implication-graph root with no
+    /// antecedents), 1-UIP analysis cannot generalize it through propagator
+    /// reasons — which is what keeps all-solutions search complete (generalizing
+    /// would drop feasible solutions that merely share a propagated consequence).
+    /// Empty when the solution was forced at the root (the lone solution).
+    pub(crate) fn decision_blocking(&self) -> Vec<Lit> {
+        self.trail
+            .iter()
+            .filter(|l| matches!(self.atom_reason[l.atom() as usize], Reason::Decision))
+            .map(|l| l.negate())
+            .collect()
+    }
+
     /// The current truth of `lit` in the **domain view**.
     #[inline]
     pub fn value(&self, lit: Lit) -> Tri {
@@ -440,7 +456,7 @@ impl<'s> Cdcl<'s> {
     fn ds_recorded(&self, var: VarId) -> Vec<Lit> {
         let (lo, hi) = self.atoms.var_span(var);
         let mut lits = Vec::new();
-        let mut push_if_recorded = |loc: LitOrConst, out: &mut Vec<Lit>| {
+        let push_if_recorded = |loc: LitOrConst, out: &mut Vec<Lit>| {
             if let LitOrConst::Lit(l) = loc {
                 match self.tval[l.atom() as usize] {
                     Tri::True => out.push(Lit::positive(l.atom())),
@@ -519,6 +535,8 @@ impl<'s> Cdcl<'s> {
                 self.record(el, reason.clone());
             }
         }
+        let var = self.atoms.var_of(lit.atom());
+        self.sync_var(var);
         Ok(())
     }
 
@@ -536,9 +554,10 @@ impl<'s> Cdcl<'s> {
         }
         view::apply(&mut self.solver.store, &self.atoms, lit)?;
         self.record(lit, reason);
-        // The op's own primary event names `lit`, already recorded; secondary
-        // flips are recovered by channeling unit propagation, not from events.
+        // The op's own primary event names `lit`, already recorded.
         self.solver.store.events.clear();
+        let var = self.atoms.var_of(lit.atom());
+        self.sync_var(var);
         Ok(())
     }
 
@@ -662,7 +681,10 @@ impl<'s> Cdcl<'s> {
                 StepOutcome::Ran(_) => self.record_prop_events()?,
                 StepOutcome::Failed(_) => {
                     self.solver.store.events.clear();
-                    return Err(Conflict::Generic(build_ds(&self.atoms, &self.conflict_scope)));
+                    return Err(Conflict::Generic(build_ds(
+                        &self.atoms,
+                        &self.conflict_scope,
+                    )));
                 }
             }
         }
