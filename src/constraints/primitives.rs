@@ -11,7 +11,7 @@ use crate::constraints::linear::Relation;
 use crate::expr::{eq, imp, int, or, var};
 use crate::ids::{PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Propagator};
-use crate::store::{Solver, Store};
+use crate::store::{Premise, Solver, Store};
 
 /// The constraint `x != y + c`.
 ///
@@ -33,15 +33,17 @@ impl Propagator for NotEqualOffset {
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
-        // x = v  =>  y != v - c
+        // x = v  =>  y != v - c. Reason: just [x = v].
         if store.is_fixed(self.x) {
-            let forbidden = store.value(self.x) - self.c;
-            store.remove(self.y, forbidden)?;
+            let v = store.value(self.x);
+            let why = vec![Premise::Eq { var: self.x, val: v }];
+            store.remove_because(self.y, v - self.c, why)?;
         }
-        // y = w  =>  x != w + c
+        // y = w  =>  x != w + c. Reason: just [y = w].
         if store.is_fixed(self.y) {
-            let forbidden = store.value(self.y) + self.c;
-            store.remove(self.x, forbidden)?;
+            let w = store.value(self.y);
+            let why = vec![Premise::Eq { var: self.y, val: w }];
+            store.remove_because(self.x, w + self.c, why)?;
         }
         Ok(())
     }
@@ -75,10 +77,20 @@ impl Propagator for LessOrEqual {
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
-        // x <= max(y) - k
-        store.remove_above(self.x, store.max(self.y).saturating_sub(self.k))?;
-        // y >= min(x) + k
-        store.remove_below(self.y, store.min(self.x).saturating_add(self.k))?;
+        // x <= max(y) - k. Reason: just [y <= max(y)].
+        let my = store.max(self.y);
+        let why = vec![Premise::Le {
+            var: self.y,
+            bound: my,
+        }];
+        store.remove_above_because(self.x, my.saturating_sub(self.k), why)?;
+        // y >= min(x) + k. Reason: just [x >= min(x)].
+        let mx = store.min(self.x);
+        let why = vec![Premise::Ge {
+            var: self.x,
+            bound: mx,
+        }];
+        store.remove_below_because(self.y, mx.saturating_add(self.k), why)?;
         Ok(())
     }
 }
@@ -601,5 +613,32 @@ pub fn precedence(solver: &mut Solver, list: &[VarId], values: &[i32]) {
             let earlier_s: Vec<_> = (0..i).map(|p| eq(var(list[p]), int(s as i64))).collect();
             intension(solver, imp(eq(var(list[i]), int(t as i64)), or(earlier_s)));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::count_solutions;
+
+    /// Tight explanations must not change a solution count the engine gets
+    /// right. 8-queens has exactly 92 solutions and is built purely from
+    /// `not_equal_offset`, whose tight reason is a single equality premise —
+    /// the case that, expressed as a positive equality atom, would back-jump too
+    /// far and silently drop solutions (here it must stay sound).
+    #[test]
+    fn queens_8_tight_reasons_stay_sound() {
+        let n = 8;
+        let mut s = Solver::new();
+        let q: Vec<VarId> = (0..n).map(|_| s.new_var_range(0, n - 1)).collect();
+        for i in 0..n as usize {
+            for j in (i + 1)..n as usize {
+                let (di, dj) = (i as i32, j as i32);
+                not_equal_offset(&mut s, q[i], q[j], 0);
+                not_equal_offset(&mut s, q[i], q[j], di - dj);
+                not_equal_offset(&mut s, q[i], q[j], dj - di);
+            }
+        }
+        assert_eq!(count_solutions(&mut s, &q), 92);
     }
 }

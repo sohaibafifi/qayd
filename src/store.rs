@@ -59,6 +59,26 @@ pub enum DomEvent {
     EqTrue { var: VarId, val: i32 },
 }
 
+/// An atomic domain fact a propagator can cite as a *premise* in its
+/// explanation — the domain-layer mirror of an LCG literal. A propagator
+/// justifies a prune by the conjunction of premises that entail it (each one
+/// true at the time of the prune); the engine translates them to literals.
+///
+/// This is how a propagator gives a *tight* reason instead of leaning on the
+/// generic whole-scope snapshot: e.g. `x ≤ max(y) - k` is entailed by the
+/// single premise `[y ≤ max(y)]`, not by both variables' full domains.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Premise {
+    /// `[var ≥ bound]`.
+    Ge { var: VarId, bound: i32 },
+    /// `[var ≤ bound]`.
+    Le { var: VarId, bound: i32 },
+    /// `[var = val]`.
+    Eq { var: VarId, val: i32 },
+    /// `[var ≠ val]`.
+    Ne { var: VarId, val: i32 },
+}
+
 /// A scope variable's domain, snapshotted *just before* a propagator's mutation.
 ///
 /// This is the raw material for that propagator's explanation: a correct
@@ -74,13 +94,23 @@ pub struct ScopeVar {
     pub holes: Vec<i32>,
 }
 
-/// A primary domain change plus, when a propagator caused it, the pre-op
-/// snapshot of that propagator's scope. `scope` is empty for engine-driven
-/// changes (decisions, unit propagation) — those carry their own reason.
+/// Why a domain change happened — the raw material for its LCG explanation.
+#[derive(Clone, Debug)]
+pub enum Cause {
+    /// The generic fallback: a pre-op snapshot of the running propagator's whole
+    /// scope. Always sound, but wide. Empty for engine-driven changes
+    /// (decisions, unit propagation), which carry their own reason.
+    Scope(Vec<ScopeVar>),
+    /// A tight, propagator-supplied conjunction of premises that entail the
+    /// change (each true at the time). Set via the `*_because` mutators.
+    Premises(Vec<Premise>),
+}
+
+/// A primary domain change plus why it happened ([`Cause`]).
 #[derive(Clone, Debug)]
 pub struct EngineEvent {
     pub primary: DomEvent,
-    pub scope: Vec<ScopeVar>,
+    pub cause: Cause,
 }
 
 /// Outcome of running a single propagator via [`Solver::propagate_step`].
@@ -115,6 +145,16 @@ pub struct Store {
     scope: Vec<Vec<VarId>>,
     /// Primary domain-change events since the last drain (LCG layer only).
     pub(crate) events: Vec<EngineEvent>,
+    /// A tight reason staged by a `*_because` mutator for its next real change,
+    /// consumed by that one mutation (else it falls back to a scope snapshot).
+    pending_premises: Option<Vec<Premise>>,
+    /// A tight reason staged by [`fail_because`](Store::fail_because) for the
+    /// propagator's imminent failure; drained by the LCG layer on a conflict.
+    pending_conflict: Option<Vec<Premise>>,
+    /// Ablation switch: when set, ignore propagator-supplied premises and always
+    /// explain with the whole-scope snapshot (the pre-tight-explanation
+    /// behaviour). For measuring the effect of tight reasons, off in normal use.
+    force_scope_reasons: bool,
 }
 
 impl Store {
@@ -191,9 +231,9 @@ impl Store {
     /// Remove `val` from `var`. `Err` on wipeout.
     pub fn remove(&mut self, var: VarId, val: i32) -> Result<(), Inconsistency> {
         let i = var.index();
-        // Snapshot the explanation scope only when the op will actually change
-        // the domain — idempotent re-derivations (very common) skip the alloc.
-        let cause = self.snapshot_if(self.domains[i].contains(val, &self.trail));
+        // Pick the reason only when the op will actually change the domain —
+        // idempotent re-derivations (very common) skip the work.
+        let cause = self.cause_for(self.domains[i].contains(val, &self.trail));
         let (old_min, old_max) = self.bounds(i);
         let changed = self.domains[i].remove(val, &mut self.trail);
         if changed {
@@ -210,7 +250,7 @@ impl Store {
             let dom = &self.domains[i];
             dom.contains(val, &self.trail) && !dom.is_fixed(&self.trail)
         };
-        let cause = self.snapshot_if(will_change);
+        let cause = self.cause_for(will_change);
         let (old_min, old_max) = self.bounds(i);
         let changed = self.domains[i].fix(val, &mut self.trail)?;
         if changed {
@@ -223,7 +263,7 @@ impl Store {
     /// Remove all values `< bound` from `var`. `Err` on wipeout.
     pub fn remove_below(&mut self, var: VarId, bound: i32) -> Result<(), Inconsistency> {
         let i = var.index();
-        let cause = self.snapshot_if(bound > self.domains[i].min(&self.trail));
+        let cause = self.cause_for(bound > self.domains[i].min(&self.trail));
         let (old_min, old_max) = self.bounds(i);
         let changed = self.domains[i].remove_below(bound, &mut self.trail);
         if changed {
@@ -236,7 +276,7 @@ impl Store {
     /// Remove all values `> bound` from `var`. `Err` on wipeout.
     pub fn remove_above(&mut self, var: VarId, bound: i32) -> Result<(), Inconsistency> {
         let i = var.index();
-        let cause = self.snapshot_if(bound < self.domains[i].max(&self.trail));
+        let cause = self.cause_for(bound < self.domains[i].max(&self.trail));
         let (old_min, old_max) = self.bounds(i);
         let changed = self.domains[i].remove_above(bound, &mut self.trail);
         if changed {
@@ -244,6 +284,104 @@ impl Store {
             self.emit(DomEvent::LeTrue { var, bound }, cause);
         }
         Ok(())
+    }
+
+    /// The reason for an imminent change: a propagator-staged tight conjunction
+    /// of premises if one is pending, otherwise a pre-op scope snapshot. Always
+    /// clears the pending premises, so they bind to exactly one mutation (a
+    /// no-op `will_change == false` discards them — nothing is emitted).
+    fn cause_for(&mut self, will_change: bool) -> Cause {
+        let pending = self.pending_premises.take();
+        match pending {
+            Some(p) if !self.force_scope_reasons => {
+                Cause::Premises(if will_change { p } else { Vec::new() })
+            }
+            _ => Cause::Scope(self.snapshot_if(will_change)),
+        }
+    }
+
+    /// Set the [`force_scope_reasons`](Store::force_scope_reasons) ablation switch.
+    pub(crate) fn set_force_scope_reasons(&mut self, on: bool) {
+        self.force_scope_reasons = on;
+    }
+
+    // --- domain mutations with a tight, propagator-supplied reason ---
+    //
+    // Each stages `why` as the reason for the *next* real change and then calls
+    // the plain mutator. `why` must be a conjunction of premises that are true
+    // now and entail the change; the LCG layer records it in place of the
+    // generic whole-scope snapshot, yielding far smaller learned clauses.
+
+    /// [`remove`](Store::remove), explained by `why`.
+    pub fn remove_because(
+        &mut self,
+        var: VarId,
+        val: i32,
+        why: Vec<Premise>,
+    ) -> Result<(), Inconsistency> {
+        self.pending_premises = Some(why);
+        self.remove(var, val)
+    }
+
+    /// [`fix`](Store::fix), explained by `why`.
+    pub fn fix_because(
+        &mut self,
+        var: VarId,
+        val: i32,
+        why: Vec<Premise>,
+    ) -> Result<(), Inconsistency> {
+        self.pending_premises = Some(why);
+        self.fix(var, val)
+    }
+
+    /// [`remove_below`](Store::remove_below), explained by `why`.
+    pub fn remove_below_because(
+        &mut self,
+        var: VarId,
+        bound: i32,
+        why: Vec<Premise>,
+    ) -> Result<(), Inconsistency> {
+        self.pending_premises = Some(why);
+        self.remove_below(var, bound)
+    }
+
+    /// [`remove_above`](Store::remove_above), explained by `why`.
+    pub fn remove_above_because(
+        &mut self,
+        var: VarId,
+        bound: i32,
+        why: Vec<Premise>,
+    ) -> Result<(), Inconsistency> {
+        self.pending_premises = Some(why);
+        self.remove_above(var, bound)
+    }
+
+    /// Report inconsistency with a tight conflict reason: `why` is a conjunction
+    /// of premises, true now, that are jointly infeasible. The LCG layer uses it
+    /// as the conflict's reason in place of the whole-scope snapshot; plain FD
+    /// search ignores it. Return its value: `return Err(store.fail_because(..))`.
+    pub fn fail_because(&mut self, why: Vec<Premise>) -> Inconsistency {
+        self.pending_conflict = Some(why);
+        Inconsistency
+    }
+
+    /// Take any tight conflict reason staged by [`fail_because`](Store::fail_because).
+    /// Yields `None` under the [`force_scope_reasons`](Store::force_scope_reasons)
+    /// ablation, so the conflict falls back to the whole-scope snapshot.
+    pub(crate) fn take_pending_conflict(&mut self) -> Option<Vec<Premise>> {
+        let p = self.pending_conflict.take();
+        if self.force_scope_reasons {
+            None
+        } else {
+            p
+        }
+    }
+
+    /// Clear any reason staged but not consumed (between propagator runs), so a
+    /// `*_because`/`fail_because` call never leaks into an unrelated change.
+    pub(crate) fn clear_pending(&mut self) {
+        self.pending_premises = None;
+        self.pending_conflict = None;
     }
 
     /// Snapshot the running propagator's scope only when `will_change` — so a
@@ -292,8 +430,8 @@ impl Store {
     }
 
     /// Append an engine event for a real domain change.
-    fn emit(&mut self, primary: DomEvent, scope: Vec<ScopeVar>) {
-        self.events.push(EngineEvent { primary, scope });
+    fn emit(&mut self, primary: DomEvent, cause: Cause) {
+        self.events.push(EngineEvent { primary, cause });
     }
 
     /// `(min, max)` of variable index `i`.
@@ -578,6 +716,7 @@ impl Solver {
             let mut prop = self.propagators[id.index()]
                 .take()
                 .expect("running a propagator that is not present");
+            self.store.clear_pending();
             self.store.current = Some(id);
             let result = prop.propagate(&mut self.store);
             self.store.current = None;
@@ -604,6 +743,7 @@ impl Solver {
         let mut prop = self.propagators[id.index()]
             .take()
             .expect("running a propagator that is not present");
+        self.store.clear_pending();
         self.store.current = Some(id);
         let result = prop.propagate(&mut self.store);
         self.store.current = None;
@@ -651,8 +791,11 @@ mod tests {
                 DomEvent::NeTrue { var: x, val: 5 },
             ]
         );
-        // No propagator running: events carry no scope snapshot.
-        assert!(store.events.iter().all(|e| e.scope.is_empty()));
+        // No propagator running: events carry an empty scope snapshot.
+        assert!(store
+            .events
+            .iter()
+            .all(|e| matches!(&e.cause, Cause::Scope(s) if s.is_empty())));
 
         store.events.clear();
         store.fix(x, 4).unwrap();

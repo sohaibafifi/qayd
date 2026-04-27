@@ -99,12 +99,13 @@ impl Cdcl<'_> {
         }
     }
 
-    /// The blocking clause for the current solution: the negation of the
-    /// decisions that led here (see [`Cdcl::decision_blocking`]). Over decisions
-    /// only, so its 1-UIP analysis stays specific to this solution rather than
-    /// generalizing through propagator reasons and dropping feasible solutions.
-    fn blocking_clause(&self, _vars: &[VarId]) -> Vec<Lit> {
-        self.decision_blocking()
+    fn blocking_clause(&self, vars: &[VarId]) -> Vec<Lit> {
+        vars.iter()
+            .filter_map(|&v| match self.atoms.eq(v, self.solver.store.value(v)) {
+                LitOrConst::Lit(l) => Some(l.negate()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Enumerate solutions over `vars` by CDCL, invoking `on_solution` for each
@@ -122,16 +123,18 @@ impl Cdcl<'_> {
         let mut stats = SolveStats::default();
         if !self.init() {
             stats.failures = self.conflicts;
+            stats.learned_lits = self.learned_lits;
             return stats; // root is unsatisfiable
         }
         let mut phase: Vec<Option<i32>> = vec![None; self.solver.store.num_vars()];
-        let (mut last_restart, mut restart_limit) = (0u64, 100u64);
-
+        // No restarts during exhaustive enumeration: a restart-to-root combined
+        // with persistent blocking clauses drops solutions (it can jump the
+        // search past an unexplored region), and restarts buy nothing when the
+        // whole space must be visited anyway.
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            self.maybe_restart(&mut last_restart, &mut restart_limit);
             match self.select_var(vars) {
                 None => {
                     // Full assignment: record the phase, report it, then block it.
@@ -166,6 +169,7 @@ impl Cdcl<'_> {
             }
         }
         stats.failures = self.conflicts;
+            stats.learned_lits = self.learned_lits;
         stats
     }
 
@@ -245,6 +249,7 @@ impl Cdcl<'_> {
         let mut best: Option<(Vec<i32>, i32)> = None;
         if !self.init() {
             stats.failures = self.conflicts;
+            stats.learned_lits = self.learned_lits;
             return (best, stats); // root unsatisfiable
         }
         let mut phase: Vec<Option<i32>> = vec![None; self.solver.store.num_vars()];
@@ -293,8 +298,8 @@ impl Cdcl<'_> {
                 }
             }
             self.backjump_to(0); // discard the partial proving tree
-                                 // Grow the proving budget, but cap it so LNS keeps getting turns on
-                                 // instances the prover cannot close.
+            // Grow the proving budget, but cap it so LNS keeps getting turns on
+            // instances the prover cannot close.
             epoch_budget = (epoch_budget + epoch_budget / 2).min(8000);
 
             // --- LNS bursts to improve the incumbent before the next epoch ---
@@ -320,13 +325,13 @@ impl Cdcl<'_> {
                     relax = if improved {
                         base // intensify around the new incumbent
                     } else {
-                        (relax + base).min(vars.len().saturating_sub(1)).max(base)
-                        // diversify
+                        (relax + base).min(vars.len().saturating_sub(1)).max(base) // diversify
                     };
                 }
             }
         }
         stats.failures = self.conflicts;
+            stats.learned_lits = self.learned_lits;
         (best, stats)
     }
 

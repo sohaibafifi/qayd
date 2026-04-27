@@ -14,7 +14,11 @@
 
 use crate::ids::{PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Propagator};
-use crate::store::{Solver, Store};
+use crate::store::{Premise, Solver, Store};
+
+/// Index sentinel for "exclude no term" when building a whole-constraint reason
+/// (i.e. a conflict, where every term contributes).
+const NO_SKIP: usize = usize::MAX;
 
 /// Comparison operator for a linear constraint.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -52,6 +56,34 @@ impl LinearLeq {
             term_min: vec![0; vars.len()],
         }
     }
+
+    /// The premises that fix the *minimum* of `∑ a_j x_j` over every term but
+    /// `skip`: each term's near bound (`[x_j ≥ min]` for `a_j > 0`, `[x_j ≤ max]`
+    /// for `a_j < 0`). Their conjunction entails `∑_{j≠skip} a_j x_j ≥ sum_min −
+    /// term_min[skip]` — the reason a positive term's upper bound (or a negative
+    /// term's lower bound) is forced, and the reason `sum_min > c` is a conflict
+    /// (with `skip = NO_SKIP`). Tight: only the binding side of the other terms,
+    /// never `skip`'s own bound and never interior holes.
+    fn min_side(&self, store: &Store, skip: usize) -> Vec<Premise> {
+        let mut why = Vec::new();
+        for (j, (&a, &v)) in self.coeffs.iter().zip(&self.vars).enumerate() {
+            if j == skip || a == 0 {
+                continue;
+            }
+            why.push(if a > 0 {
+                Premise::Ge {
+                    var: v,
+                    bound: store.min(v),
+                }
+            } else {
+                Premise::Le {
+                    var: v,
+                    bound: store.max(v),
+                }
+            });
+        }
+        why
+    }
 }
 
 impl Propagator for LinearLeq {
@@ -85,7 +117,8 @@ impl Propagator for LinearLeq {
             }
 
             if sum_min > self.c {
-                return Err(Inconsistency);
+                // The near bounds of every term already overshoot c.
+                return Err(store.fail_because(self.min_side(store, NO_SKIP)));
             }
             if sum_max <= self.c {
                 return Ok(()); // entailed: no value can violate the bound
@@ -96,17 +129,20 @@ impl Propagator for LinearLeq {
                 if a == 0 {
                     continue;
                 }
-                // a_i*x_i <= c - (sum_min - term_min_i)
+                // a_i*x_i <= c - (sum_min - term_min_i), explained by the near
+                // bounds of the *other* terms (sum_min minus this term's share).
                 let allowed = self.c - (sum_min - self.term_min[idx]);
                 if a > 0 {
                     let bound = clamp_i32(floor_div(allowed, a));
                     let before = store.max(v);
-                    store.remove_above(v, bound)?;
+                    let why = self.min_side(store, idx);
+                    store.remove_above_because(v, bound, why)?;
                     changed |= store.max(v) != before;
                 } else {
                     let bound = clamp_i32(ceil_div(allowed, a));
                     let before = store.min(v);
-                    store.remove_below(v, bound)?;
+                    let why = self.min_side(store, idx);
+                    store.remove_below_because(v, bound, why)?;
                     changed |= store.min(v) != before;
                 }
             }
@@ -141,6 +177,54 @@ impl LinearEq {
             term_max: vec![0; vars.len()],
         }
     }
+
+    /// Premises fixing the *minimum* of the other terms (near bound of each):
+    /// entail `∑_{j≠skip} a_j x_j ≥ sum_min − term_min[skip]`, the reason for an
+    /// upper limit on `a_skip·x_skip` and for the `sum_min > c` conflict.
+    fn min_side(&self, store: &Store, skip: usize) -> Vec<Premise> {
+        let mut why = Vec::new();
+        for (j, (&a, &v)) in self.coeffs.iter().zip(&self.vars).enumerate() {
+            if j == skip || a == 0 {
+                continue;
+            }
+            why.push(if a > 0 {
+                Premise::Ge {
+                    var: v,
+                    bound: store.min(v),
+                }
+            } else {
+                Premise::Le {
+                    var: v,
+                    bound: store.max(v),
+                }
+            });
+        }
+        why
+    }
+
+    /// Premises fixing the *maximum* of the other terms (far bound of each):
+    /// entail `∑_{j≠skip} a_j x_j ≤ sum_max − term_max[skip]`, the reason for a
+    /// lower limit on `a_skip·x_skip` and for the `sum_max < c` conflict.
+    fn max_side(&self, store: &Store, skip: usize) -> Vec<Premise> {
+        let mut why = Vec::new();
+        for (j, (&a, &v)) in self.coeffs.iter().zip(&self.vars).enumerate() {
+            if j == skip || a == 0 {
+                continue;
+            }
+            why.push(if a > 0 {
+                Premise::Le {
+                    var: v,
+                    bound: store.max(v),
+                }
+            } else {
+                Premise::Ge {
+                    var: v,
+                    bound: store.min(v),
+                }
+            });
+        }
+        why
+    }
 }
 
 impl Propagator for LinearEq {
@@ -167,8 +251,11 @@ impl Propagator for LinearEq {
                 sum_min += tmin;
                 sum_max += tmax;
             }
-            if sum_min > self.c || sum_max < self.c {
-                return Err(Inconsistency);
+            if sum_min > self.c {
+                return Err(store.fail_because(self.min_side(store, NO_SKIP)));
+            }
+            if sum_max < self.c {
+                return Err(store.fail_because(self.max_side(store, NO_SKIP)));
             }
 
             let mut changed = false;
@@ -176,7 +263,9 @@ impl Propagator for LinearEq {
                 if a == 0 {
                     continue;
                 }
-                // a_i*x_i must lie in [tlo, thi].
+                // a_i*x_i must lie in [tlo, thi]: tlo comes from the other terms'
+                // maximum (max_side), thi from their minimum (min_side). The sign
+                // of a_i decides which becomes x_i's lower vs upper bound.
                 let tlo = self.c - (sum_max - self.term_max[i]);
                 let thi = self.c - (sum_min - self.term_min[i]);
                 let (lo, hi) = if a > 0 {
@@ -184,10 +273,16 @@ impl Propagator for LinearEq {
                 } else {
                     (ceil_div(thi, a), floor_div(tlo, a))
                 };
+                // Pair each applied bound with the side that derived it.
+                let (lo_why, hi_why) = if a > 0 {
+                    (self.max_side(store, i), self.min_side(store, i))
+                } else {
+                    (self.min_side(store, i), self.max_side(store, i))
+                };
                 let before_min = store.min(v);
                 let before_max = store.max(v);
-                store.remove_below(v, clamp_i32(lo))?;
-                store.remove_above(v, clamp_i32(hi))?;
+                store.remove_below_because(v, clamp_i32(lo), lo_why)?;
+                store.remove_above_because(v, clamp_i32(hi), hi_why)?;
                 changed |= store.min(v) != before_min || store.max(v) != before_max;
             }
             if !changed {
@@ -317,8 +412,47 @@ pub fn linear(solver: &mut Solver, coeffs: &[i64], vars: &[VarId], rel: Relation
     }
 }
 
+/// A deterministic 0/1 knapsack instance, shared by the test below.
+#[cfg(test)]
+fn knapsack_instance(n: usize) -> (Vec<i64>, Vec<i64>, i64) {
+    let w: Vec<i64> = (0..n).map(|i| 1 + (i as i64 * 7) % 13).collect();
+    let val: Vec<i64> = (0..n).map(|i| 1 + (i as i64 * 11) % 17).collect();
+    let cap = w.iter().sum::<i64>() / 2;
+    (w, val, cap)
+}
+
 /// Post \( \sum_i \texttt{vars}[i] \;\texttt{rel}\; \texttt{rhs} \) (all coefficients 1).
 pub fn sum(solver: &mut Solver, vars: &[VarId], rel: Relation, rhs: i64) {
     let coeffs = vec![1i64; vars.len()];
     linear(solver, &coeffs, vars, rel, rhs);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::maximize;
+
+    /// Tight linear reasons must preserve a *proven* optimum: optimisation
+    /// proves optimality by driving the bounded problem to UNSAT, so a wrong
+    /// (too-strong) reason would either prune the optimum or fail the proof.
+    /// This 18-item 0/1 knapsack has brute-forced optimum 122.
+    #[test]
+    fn knapsack_18_tight_reasons_stay_optimal() {
+        let n = 18usize;
+        let (w, val, cap) = knapsack_instance(n);
+        let mut s = Solver::new();
+        let x: Vec<VarId> = (0..n).map(|_| s.new_var_range(0, 1)).collect();
+        linear(&mut s, &w, &x, Relation::Le, cap);
+
+        let vsum: i64 = val.iter().sum();
+        let obj = s.new_var_range(0, vsum as i32);
+        let mut coeffs = val.clone();
+        coeffs.push(-1);
+        let mut vars = x.clone();
+        vars.push(obj);
+        linear(&mut s, &coeffs, &vars, Relation::Eq, 0);
+
+        let (_, best) = maximize(&mut s, &vars, obj).expect("knapsack is satisfiable");
+        assert_eq!(best, 122);
+    }
 }

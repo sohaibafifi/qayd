@@ -38,6 +38,10 @@ pub struct SolveStats {
     pub nodes: u64,
     /// Number of dead ends (propagation failures).
     pub failures: u64,
+    /// Total literals across all learned clauses (CDCL search only). Divided by
+    /// `failures` it is the average learned-clause size — smaller means tighter
+    /// explanations.
+    pub learned_lits: u64,
 }
 
 /// Enumerate solutions over `vars`. `on_solution` is invoked for every full

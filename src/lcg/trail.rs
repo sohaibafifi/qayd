@@ -21,7 +21,7 @@ use crate::lcg::clause::{ClauseDb, ClauseRef};
 use crate::lcg::lit::{Atom, AtomTable, Lit, LitOrConst};
 use crate::lcg::view::{self, Tri};
 use crate::propagator::Inconsistency;
-use crate::store::{DomEvent, ScopeVar, Solver, StepOutcome};
+use crate::store::{Cause, DomEvent, Premise, ScopeVar, Solver, StepOutcome};
 
 /// A stop flag that is never set — the default until [`Cdcl::set_stop`] supplies
 /// the search's real one. Lets the engine poll a flag without an `Option`.
@@ -79,6 +79,47 @@ fn build_ds(atoms: &AtomTable, scope: &[ScopeVar]) -> Vec<Lit> {
         }
     }
     lits
+}
+
+/// Translate a propagator's tight [`Premise`] conjunction into the true
+/// literals that entail its inference — the [`build_ds`] of a hand-cut reason.
+/// Each premise is true now, so it maps to a literal known true (constants,
+/// which carry no information, fold away). Their conjunction is the antecedent
+/// of the reason clause `(consequent ∨ ⋁ ¬premise)`.
+fn translate_premises(atoms: &AtomTable, premises: &[Premise]) -> Vec<Lit> {
+    let mut lits = Vec::with_capacity(premises.len());
+    let push = |loc: LitOrConst, out: &mut Vec<Lit>| {
+        if let LitOrConst::Lit(l) = loc {
+            out.push(l);
+        }
+    };
+    for &p in premises {
+        match p {
+            Premise::Ge { var, bound } => push(atoms.ge(var, bound), &mut lits),
+            Premise::Le { var, bound } => push(neg(atoms.ge(var, bound + 1)), &mut lits),
+            // Express `[x = v]` as the *order* atoms `[x ≥ v] ∧ [x ≤ v]`, never
+            // the positive equality atom: the equality atom is recorded when the
+            // variable's bounds finally pinch, which can be a deeper level than
+            // where each bound was determined, and citing that deeper level makes
+            // 1-UIP backjump too far and prune feasible solutions. The order
+            // atoms carry the correct, finer levels (this mirrors `build_ds`).
+            Premise::Eq { var, val } => {
+                push(atoms.ge(var, val), &mut lits);
+                push(neg(atoms.ge(var, val + 1)), &mut lits);
+            }
+            Premise::Ne { var, val } => push(neg(atoms.eq(var, val)), &mut lits),
+        }
+    }
+    lits
+}
+
+/// Build the antecedent literals for an event's [`Cause`] — a tight premise
+/// conjunction when the propagator supplied one, else the whole-scope snapshot.
+fn cause_lits(atoms: &AtomTable, cause: &Cause) -> Vec<Lit> {
+    match cause {
+        Cause::Premises(p) => translate_premises(atoms, p),
+        Cause::Scope(s) => build_ds(atoms, s),
+    }
 }
 
 /// Negate a possibly-constant literal.
@@ -163,12 +204,20 @@ pub struct Cdcl<'s> {
     max_learned: usize,
     /// Running count of conflicts analysed (for search statistics and restarts).
     pub(crate) conflicts: u64,
+    /// Total literals across all learned clauses — the numerator of the average
+    /// learned-clause size, a direct measure of explanation tightness.
+    pub(crate) learned_lits: u64,
 }
 
 impl<'s> Cdcl<'s> {
     /// Build the engine over `solver`, allocating atoms from the current (root)
     /// domains. Call before any decision.
     pub fn new(solver: &'s mut Solver) -> Self {
+        // Ablation hook: `QAYD_SCOPE_REASONS` forces whole-scope explanations,
+        // so a single build can compare tight vs generic reasons.
+        solver
+            .store
+            .set_force_scope_reasons(std::env::var_os("QAYD_SCOPE_REASONS").is_some());
         let nvars = solver.store.num_vars();
         let atoms = AtomTable::build(nvars, |v: VarId| (solver.store.min(v), solver.store.max(v)));
         let n = atoms.num_atoms();
@@ -191,6 +240,7 @@ impl<'s> Cdcl<'s> {
             num_learned: 0,
             max_learned: 2000,
             conflicts: 0,
+            learned_lits: 0,
         }
     }
 
@@ -383,22 +433,6 @@ impl<'s> Cdcl<'s> {
         &self.atom_reason[atom as usize]
     }
 
-    /// A blocking clause over the current decisions: `⋁ ¬d` for each decision
-    /// literal `d` on the trail. The decisions plus deterministic propagation
-    /// reach a unique assignment, so this excludes exactly the current solution.
-    /// Because every literal is a decision (an implication-graph root with no
-    /// antecedents), 1-UIP analysis cannot generalize it through propagator
-    /// reasons — which is what keeps all-solutions search complete (generalizing
-    /// would drop feasible solutions that merely share a propagated consequence).
-    /// Empty when the solution was forced at the root (the lone solution).
-    pub(crate) fn decision_blocking(&self) -> Vec<Lit> {
-        self.trail
-            .iter()
-            .filter(|l| matches!(self.atom_reason[l.atom() as usize], Reason::Decision))
-            .map(|l| l.negate())
-            .collect()
-    }
-
     /// The current truth of `lit` in the **domain view**.
     #[inline]
     pub fn value(&self, lit: Lit) -> Tri {
@@ -535,8 +569,6 @@ impl<'s> Cdcl<'s> {
                 self.record(el, reason.clone());
             }
         }
-        let var = self.atoms.var_of(lit.atom());
-        self.sync_var(var);
         Ok(())
     }
 
@@ -554,10 +586,9 @@ impl<'s> Cdcl<'s> {
         }
         view::apply(&mut self.solver.store, &self.atoms, lit)?;
         self.record(lit, reason);
-        // The op's own primary event names `lit`, already recorded.
+        // The op's own primary event names `lit`, already recorded; secondary
+        // flips are recovered by channeling unit propagation, not from events.
         self.solver.store.events.clear();
-        let var = self.atoms.var_of(lit.atom());
-        self.sync_var(var);
         Ok(())
     }
 
@@ -681,10 +712,13 @@ impl<'s> Cdcl<'s> {
                 StepOutcome::Ran(_) => self.record_prop_events()?,
                 StepOutcome::Failed(_) => {
                     self.solver.store.events.clear();
-                    return Err(Conflict::Generic(build_ds(
-                        &self.atoms,
-                        &self.conflict_scope,
-                    )));
+                    // Prefer a propagator's tight conflict reason; fall back to
+                    // the pre-op whole-scope snapshot taken above.
+                    let ds = match self.solver.store.take_pending_conflict() {
+                        Some(p) => translate_premises(&self.atoms, &p),
+                        None => build_ds(&self.atoms, &self.conflict_scope),
+                    };
+                    return Err(Conflict::Generic(ds));
                 }
             }
         }
@@ -709,7 +743,7 @@ impl<'s> Cdcl<'s> {
             };
             if let Some(lit) = translate(&self.atoms, &ev.primary) {
                 if !self.is_assigned(lit.atom()) {
-                    let ds = build_ds(&self.atoms, &ev.scope);
+                    let ds = cause_lits(&self.atoms, &ev.cause);
                     self.record(lit, Reason::Generic(ds));
                 }
             }
@@ -746,6 +780,7 @@ impl<'s> Cdcl<'s> {
         let Some((learnt, btlevel)) = self.analyze(conflict) else {
             return false; // conflict independent of all decisions: UNSAT
         };
+        self.learned_lits += learnt.len() as u64;
         // LBD is measured at learn time, while every literal is still assigned.
         let lbd = self.lbd_of(&learnt);
         let deletable = learnt.len() >= 2;
