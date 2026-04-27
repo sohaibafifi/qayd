@@ -36,13 +36,19 @@ impl Propagator for NotEqualOffset {
         // x = v  =>  y != v - c. Reason: just [x = v].
         if store.is_fixed(self.x) {
             let v = store.value(self.x);
-            let why = vec![Premise::Eq { var: self.x, val: v }];
+            let why = vec![Premise::Eq {
+                var: self.x,
+                val: v,
+            }];
             store.remove_because(self.y, v - self.c, why)?;
         }
         // y = w  =>  x != w + c. Reason: just [y = w].
         if store.is_fixed(self.y) {
             let w = store.value(self.y);
-            let why = vec![Premise::Eq { var: self.y, val: w }];
+            let why = vec![Premise::Eq {
+                var: self.y,
+                val: w,
+            }];
             store.remove_because(self.x, w + self.c, why)?;
         }
         Ok(())

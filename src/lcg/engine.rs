@@ -1,9 +1,12 @@
 //! CDCL search drivers — the loops the public search entry points are built on.
 //!
-//! [`Cdcl::enumerate`] is the CSP driver: decide a variable (dom/wdeg, with
-//! solution-guided phase saving), propagate-and-learn, and on a full assignment
-//! report it and continue by adding a **blocking clause** (the negation of the
-//! assignment) until the search space is exhausted. [`Cdcl::optimize`] is the COP
+//! [`Cdcl::enumerate`] is the CSP driver: a depth-first search with
+//! **chronological** backtracking — decide a variable (dom/wdeg, with
+//! solution-guided phase saving), propagate to a fixpoint, and on a full
+//! assignment report it then undo the deepest decision and forbid the value
+//! just tried, until the search space is exhausted. It deliberately forgoes
+//! clause learning, which is unsound for *enumerating* every solution.
+//! [`Cdcl::optimize`] is the COP
 //! driver: it interleaves complete proving epochs (which assert a tighter
 //! objective bound after each incumbent and ultimately prove optimality) with
 //! large-neighbourhood-search bursts (which drive the incumbent down fast).
@@ -12,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ids::VarId;
 use crate::lcg::lit::{Lit, LitOrConst};
-use crate::lcg::trail::{Cdcl, Conflict, Reason};
+use crate::lcg::trail::{Cdcl, Reason};
 use crate::lcg::view::Tri;
 use crate::search::{SearchControl, SolveStats};
 use crate::store::Solver;
@@ -99,18 +102,25 @@ impl Cdcl<'_> {
         }
     }
 
-    fn blocking_clause(&self, vars: &[VarId]) -> Vec<Lit> {
-        vars.iter()
-            .filter_map(|&v| match self.atoms.eq(v, self.solver.store.value(v)) {
-                LitOrConst::Lit(l) => Some(l.negate()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Enumerate solutions over `vars` by CDCL, invoking `on_solution` for each
-    /// full assignment and stopping early on [`SearchControl::Stop`] or when
-    /// `stop` is set. Returns the search statistics.
+    /// Enumerate solutions over `vars`, invoking `on_solution` for each full
+    /// assignment and stopping early on [`SearchControl::Stop`] or when `stop`
+    /// is set. Returns the search statistics.
+    ///
+    /// Enumeration uses plain depth-first search with **chronological**
+    /// backtracking: propagate to a fixpoint, branch on the smallest domain
+    /// (toward the saved phase), and on a dead end or a reported solution undo
+    /// the deepest decision `x = v` and forbid `v` for `x`. Clause learning and
+    /// non-chronological backjumping — the core of the optimization driver — are
+    /// deliberately *not* used here. A 1-UIP backjump is sound for finding *one*
+    /// solution (it may leap over a region a learned clause proves infeasible)
+    /// but drops solutions when *enumerating*: the clauses learned while blocking
+    /// already-found assignments are not entailed by the constraints, so
+    /// resolving against them can jump past sibling branches that still hold
+    /// unseen solutions (queens-7 counted 32, not 40). Propagation still prunes
+    /// every dead end; only the cross-solution learning is dropped.
+    // TODO(strong): a sound CDCL enumeration (e.g. restart-per-solution with
+    // blocking clauses kept out of conflict analysis, or dual reasoning) would
+    // prune harder than chronological DFS.
     pub fn enumerate<F>(
         &mut self,
         vars: &[VarId],
@@ -127,50 +137,70 @@ impl Cdcl<'_> {
             return stats; // root is unsatisfiable
         }
         let mut phase: Vec<Option<i32>> = vec![None; self.solver.store.num_vars()];
-        // No restarts during exhaustive enumeration: a restart-to-root combined
-        // with persistent blocking clauses drops solutions (it can jump the
-        // search past an unexplored region), and restarts buy nothing when the
-        // whole space must be visited anyway.
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            match self.select_var(vars) {
-                None => {
-                    // Full assignment: record the phase, report it, then block it.
-                    for &v in vars {
-                        phase[v.index()] = Some(self.solver.store.value(v));
+            match self.propagate() {
+                Ok(()) => match self.select_var(vars) {
+                    None => {
+                        // Full assignment: record the phase and report it.
+                        for &v in vars {
+                            phase[v.index()] = Some(self.solver.store.value(v));
+                        }
+                        stats.solutions += 1;
+                        if matches!(on_solution(&*self.solver), SearchControl::Stop) {
+                            break;
+                        }
+                        if !self.backtrack_and_forbid() {
+                            break; // whole search space explored
+                        }
                     }
-                    stats.solutions += 1;
-                    if matches!(on_solution(&*self.solver), SearchControl::Stop) {
-                        break;
+                    Some(v) => {
+                        stats.nodes += 1;
+                        let lit = self.decision_lit(v, &phase);
+                        self.decide(lit).expect("in-domain decision cannot fail");
                     }
-                    let blocking = self.blocking_clause(vars);
-                    if blocking.is_empty() {
-                        break; // no variables to constrain: the lone solution
-                    }
-                    // The blocking clause is falsified by the current solution;
-                    // analyse it as a conflict to backjump, then continue. It must
-                    // persist (never deleted) or solutions could be re-enumerated.
-                    let cref = self.add_clause(blocking, false, 0);
-                    if !self.resolve_conflict(Conflict::Clause(cref)) || !self.propagate_and_learn()
-                    {
-                        break; // search space exhausted
-                    }
-                }
-                Some(v) => {
-                    stats.nodes += 1;
-                    let lit = self.decision_lit(v, &phase);
-                    self.decide(lit).expect("in-domain decision cannot fail");
-                    if !self.propagate_and_learn() {
-                        break;
+                },
+                Err(_) => {
+                    stats.failures += 1;
+                    if !self.backtrack_and_forbid() {
+                        break; // dead end at the root: search exhausted
                     }
                 }
             }
         }
-        stats.failures = self.conflicts;
-            stats.learned_lits = self.learned_lits;
+        stats.learned_lits = self.learned_lits;
         stats
+    }
+
+    /// Undo the deepest decision `x = v` and forbid `v` for `x` at the now-current
+    /// level (the chronological DFS "try the next value"). If removing `v` empties
+    /// `x`, there is nothing left to try at this level, so keep climbing. Returns
+    /// `false` once every decision has been undone — the search space is
+    /// exhausted.
+    fn backtrack_and_forbid(&mut self) -> bool {
+        loop {
+            let d = self.decision_level();
+            if d == 0 {
+                return false;
+            }
+            let dec = self.deepest_decision();
+            self.backjump_to(d - 1);
+            // Forbid the explored value at the shallower level by asserting the
+            // decision's negation. Going through `assign` (rather than mutating
+            // the domain directly) records it on the trail at this level *and*
+            // drains the resulting event, so the next decision is not mistaken
+            // for this forced literal. The assignment is trailed, so it is undone
+            // only if the search later backtracks above this level — exactly the
+            // DFS sibling-pruning we want.
+            match self.assign(dec.negate(), Reason::Decision) {
+                Ok(()) => return true,
+                // Forbidding the value emptied the variable: nothing else to try
+                // at this level, so climb and try the next level up.
+                Err(_) => continue,
+            }
+        }
     }
 
     /// The literal that demands a strictly better objective than `value`:
@@ -298,8 +328,8 @@ impl Cdcl<'_> {
                 }
             }
             self.backjump_to(0); // discard the partial proving tree
-            // Grow the proving budget, but cap it so LNS keeps getting turns on
-            // instances the prover cannot close.
+                                 // Grow the proving budget, but cap it so LNS keeps getting turns on
+                                 // instances the prover cannot close.
             epoch_budget = (epoch_budget + epoch_budget / 2).min(8000);
 
             // --- LNS bursts to improve the incumbent before the next epoch ---
@@ -325,13 +355,14 @@ impl Cdcl<'_> {
                     relax = if improved {
                         base // intensify around the new incumbent
                     } else {
-                        (relax + base).min(vars.len().saturating_sub(1)).max(base) // diversify
+                        (relax + base).min(vars.len().saturating_sub(1)).max(base)
+                        // diversify
                     };
                 }
             }
         }
         stats.failures = self.conflicts;
-            stats.learned_lits = self.learned_lits;
+        stats.learned_lits = self.learned_lits;
         (best, stats)
     }
 

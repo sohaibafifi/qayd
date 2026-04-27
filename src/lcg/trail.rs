@@ -415,6 +415,14 @@ impl<'s> Cdcl<'s> {
         self.trail.len()
     }
 
+    /// The literal decided at the deepest open level — the first literal recorded
+    /// after [`open_level`], which [`decide`] assigns before any propagation.
+    /// Panics at the root.
+    pub(crate) fn deepest_decision(&self) -> Lit {
+        let d = self.decision_level();
+        self.trail[self.level_starts[d]]
+    }
+
     /// Whether `atom` is currently assigned.
     #[inline]
     pub fn is_assigned(&self, atom: Atom) -> bool {
