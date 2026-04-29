@@ -1,8 +1,5 @@
-//! XCSP3-core front-end.
-//!
-//! Parsing is delegated to the `xcsp3-rust-parser` crate (callback interface);
-//! [`callback::Model`] maps each callback onto the solver. This module wires
-//! parsing to search and reports competition-style output.
+//! XCSP3-core front-end: parse via `xcsp3-rust-parser`, build through
+//! [`callback::Model`], solve, and report competition-style output.
 
 mod callback;
 
@@ -43,7 +40,7 @@ pub fn run_to<W: Write>(
 ) -> Result<(), String> {
     let start = Instant::now();
 
-    // The parser reads from a path; stage the (already decompressed) XML.
+    // The parser reads from a path; stage the decompressed XML.
     let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!("qayd-{}-{}.xml", std::process::id(), n));
     std::fs::write(&path, xml).map_err(|e| e.to_string())?;

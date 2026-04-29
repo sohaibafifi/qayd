@@ -1,9 +1,6 @@
 //! Bridge from the `xcsp3-rust-parser` callback interface to the solver.
 //!
-//! The parser handles all the XCSP3 surface syntax (arrays, ranges, groups,
-//! slides, compact tables, …) and calls these methods with structured data;
-//! each maps onto a posting helper. Unsupported forms set `error` so the caller
-//! reports a clear failure instead of silently mis-modelling.
+//! Each callback maps onto a posting helper. Unsupported forms set `error`.
 
 use std::collections::HashMap;
 

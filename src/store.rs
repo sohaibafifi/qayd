@@ -1,25 +1,6 @@
-//! The solver core.
-//!
-//! [`Store`] owns every domain and the [`Trail`], plus the variable→propagator
-//! subscription lists and the propagation queue. Every domain mutation that
-//! actually changes a domain wakes the subscribed propagators. [`Solver`] adds
-//! the propagator *objects* on top of the store and drives the fixpoint.
-//!
-//! Why the split: a propagator needs `&mut Store` while it runs, but the store
-//! cannot also lend out the boxed propagator it owns. So [`Solver`] keeps the
-//! `Box<dyn Propagator>` objects, takes one out to run it, and hands it the
-//! store — clean borrows, no `RefCell`.
-//!
-//! Scheduling is event-driven. A propagator subscribes to each variable at one
-//! granularity:
-//!
-//! - [`Event::Fix`] — wake only when the variable becomes fixed.
-//! - [`Event::BoundChange`] — wake when `min`/`max` moves (fixing counts, since
-//!   it collapses the bounds).
-//! - [`Event::DomainChange`] — wake on any value removal.
-//!
-//! A domain change fires the set of events it satisfies, and every subscriber
-//! whose chosen granularity is in that set is enqueued.
+//! Solver core. [`Store`] owns domains, trail, subscriptions, and the
+//! propagation queue; [`Solver`] holds the propagator objects and drives the
+//! event-driven fixpoint.
 
 use std::collections::VecDeque;
 
@@ -39,14 +20,8 @@ struct VarSubs {
     on_fix: Vec<PropId>,
 }
 
-/// A *primary* domain change, in domain terms, for the LCG layer to pick up.
-///
-/// The four [`Store`] mutators each emit one of these on a real change. They
-/// name only the literal the op directly asserts (`remove_below(b)` asserts
-/// `[x ≥ b]`, and so on); the engine translates it to a [`Lit`](crate::lcg::lit::Lit)
-/// and records it. Secondary atom flips are left to channeling unit propagation,
-/// so no per-value enumeration happens here. The buffer is inert unless an LCG
-/// engine drains it — the plain FD solver never reads it.
+/// A primary domain change, in domain terms, for the LCG layer to pick up.
+/// Inert unless an LCG engine drains it; plain FD search never reads it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DomEvent {
     /// `remove_below(var, bound)` — asserts `[var ≥ bound]`.
@@ -59,14 +34,8 @@ pub enum DomEvent {
     EqTrue { var: VarId, val: i32 },
 }
 
-/// An atomic domain fact a propagator can cite as a *premise* in its
-/// explanation — the domain-layer mirror of an LCG literal. A propagator
-/// justifies a prune by the conjunction of premises that entail it (each one
-/// true at the time of the prune); the engine translates them to literals.
-///
-/// This is how a propagator gives a *tight* reason instead of leaning on the
-/// generic whole-scope snapshot: e.g. `x ≤ max(y) - k` is entailed by the
-/// single premise `[y ≤ max(y)]`, not by both variables' full domains.
+/// An atomic domain fact a propagator can cite as a premise in its tight
+/// explanation — the domain-layer mirror of an LCG literal.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Premise {
     /// `[var ≥ bound]`.
@@ -79,13 +48,9 @@ pub enum Premise {
     Ne { var: VarId, val: i32 },
 }
 
-/// A scope variable's domain, snapshotted *just before* a propagator's mutation.
-///
-/// This is the raw material for that propagator's explanation: a correct
-/// propagator's inference is entailed by its scope domains at the time, so
-/// recording them (per op, pre-op) gives a sound, hole-safe reason. `holes` are
-/// the absent values strictly inside `(min, max)` — empty for a contiguous
-/// range, so bounds-only propagators pay nothing extra.
+/// A scope variable's domain, snapshotted just before a propagator's mutation.
+/// `holes` are the absent values strictly inside `(min, max)` — empty for a
+/// contiguous range.
 #[derive(Clone, Debug)]
 pub struct ScopeVar {
     pub var: VarId,
@@ -97,12 +62,11 @@ pub struct ScopeVar {
 /// Why a domain change happened — the raw material for its LCG explanation.
 #[derive(Clone, Debug)]
 pub enum Cause {
-    /// The generic fallback: a pre-op snapshot of the running propagator's whole
-    /// scope. Always sound, but wide. Empty for engine-driven changes
-    /// (decisions, unit propagation), which carry their own reason.
+    /// Generic fallback: pre-op snapshot of the running propagator's whole
+    /// scope. Empty for engine-driven changes, which carry their own reason.
     Scope(Vec<ScopeVar>),
-    /// A tight, propagator-supplied conjunction of premises that entail the
-    /// change (each true at the time). Set via the `*_because` mutators.
+    /// Tight propagator-supplied premises that entail the change; set via the
+    /// `*_because` mutators.
     Premises(Vec<Premise>),
 }
 
@@ -135,25 +99,22 @@ pub struct Store {
     queue: VecDeque<PropId>,
     /// `enqueued[prop]` guards against queuing a propagator twice.
     enqueued: Vec<bool>,
-    /// The propagator currently running, if any (so it is not re-woken by its
-    /// own filtering). The LCG layer also reads it to attribute a domain change
-    /// to the propagator that caused it (for explanations).
+    /// The propagator currently running, if any, so it is not re-woken by its
+    /// own filtering. The LCG layer reads it to attribute changes.
     pub(crate) current: Option<PropId>,
-    /// Variables each propagator constrains, indexed by `PropId` — the
-    /// propagator's *scope*, gathered from its subscriptions. Used by the LCG
-    /// layer to build a propagator's explanation; unused by plain FD search.
+    /// Each propagator's scope (constrained variables), gathered from
+    /// subscriptions; indexed by `PropId`. LCG only.
     scope: Vec<Vec<VarId>>,
     /// Primary domain-change events since the last drain (LCG layer only).
     pub(crate) events: Vec<EngineEvent>,
-    /// A tight reason staged by a `*_because` mutator for its next real change,
-    /// consumed by that one mutation (else it falls back to a scope snapshot).
+    /// Tight reason staged by a `*_because` mutator; bound to its next real
+    /// change, else falls back to a scope snapshot.
     pending_premises: Option<Vec<Premise>>,
-    /// A tight reason staged by [`fail_because`](Store::fail_because) for the
-    /// propagator's imminent failure; drained by the LCG layer on a conflict.
+    /// Tight reason staged by [`fail_because`](Store::fail_because); drained by
+    /// the LCG layer on a conflict.
     pending_conflict: Option<Vec<Premise>>,
-    /// Ablation switch: when set, ignore propagator-supplied premises and always
-    /// explain with the whole-scope snapshot (the pre-tight-explanation
-    /// behaviour). For measuring the effect of tight reasons, off in normal use.
+    /// Ablation switch: always explain with the whole-scope snapshot, ignoring
+    /// propagator-supplied premises. Off in normal use.
     force_scope_reasons: bool,
 }
 
@@ -231,8 +192,7 @@ impl Store {
     /// Remove `val` from `var`. `Err` on wipeout.
     pub fn remove(&mut self, var: VarId, val: i32) -> Result<(), Inconsistency> {
         let i = var.index();
-        // Pick the reason only when the op will actually change the domain —
-        // idempotent re-derivations (very common) skip the work.
+        // Pick the reason only when the op will actually change the domain.
         let cause = self.cause_for(self.domains[i].contains(val, &self.trail));
         let (old_min, old_max) = self.bounds(i);
         let changed = self.domains[i].remove(val, &mut self.trail);
@@ -286,10 +246,8 @@ impl Store {
         Ok(())
     }
 
-    /// The reason for an imminent change: a propagator-staged tight conjunction
-    /// of premises if one is pending, otherwise a pre-op scope snapshot. Always
-    /// clears the pending premises, so they bind to exactly one mutation (a
-    /// no-op `will_change == false` discards them — nothing is emitted).
+    /// Reason for an imminent change: staged premises if pending, else a pre-op
+    /// scope snapshot. Always clears the pending premises (bound to one mutation).
     fn cause_for(&mut self, will_change: bool) -> Cause {
         let pending = self.pending_premises.take();
         match pending {
@@ -307,10 +265,8 @@ impl Store {
 
     // --- domain mutations with a tight, propagator-supplied reason ---
     //
-    // Each stages `why` as the reason for the *next* real change and then calls
-    // the plain mutator. `why` must be a conjunction of premises that are true
-    // now and entail the change; the LCG layer records it in place of the
-    // generic whole-scope snapshot, yielding far smaller learned clauses.
+    // Each stages `why` (premises true now that entail the change) for the next
+    // real change, then calls the plain mutator.
 
     /// [`remove`](Store::remove), explained by `why`.
     pub fn remove_because(
@@ -356,18 +312,15 @@ impl Store {
         self.remove_above(var, bound)
     }
 
-    /// Report inconsistency with a tight conflict reason: `why` is a conjunction
-    /// of premises, true now, that are jointly infeasible. The LCG layer uses it
-    /// as the conflict's reason in place of the whole-scope snapshot; plain FD
-    /// search ignores it. Return its value: `return Err(store.fail_because(..))`.
+    /// Report inconsistency with a tight conflict reason (`why`: premises true
+    /// now that are jointly infeasible). Use as `return Err(store.fail_because(..))`.
     pub fn fail_because(&mut self, why: Vec<Premise>) -> Inconsistency {
         self.pending_conflict = Some(why);
         Inconsistency
     }
 
-    /// Take any tight conflict reason staged by [`fail_because`](Store::fail_because).
-    /// Yields `None` under the [`force_scope_reasons`](Store::force_scope_reasons)
-    /// ablation, so the conflict falls back to the whole-scope snapshot.
+    /// Take any conflict reason staged by [`fail_because`](Store::fail_because).
+    /// `None` under the `force_scope_reasons` ablation.
     pub(crate) fn take_pending_conflict(&mut self) -> Option<Vec<Premise>> {
         let p = self.pending_conflict.take();
         if self.force_scope_reasons {
@@ -377,16 +330,13 @@ impl Store {
         }
     }
 
-    /// Clear any reason staged but not consumed (between propagator runs), so a
-    /// `*_because`/`fail_because` call never leaks into an unrelated change.
+    /// Clear any staged-but-unconsumed reason so it never leaks across runs.
     pub(crate) fn clear_pending(&mut self) {
         self.pending_premises = None;
         self.pending_conflict = None;
     }
 
-    /// Snapshot the running propagator's scope only when `will_change` — so a
-    /// no-op mutation pays nothing, and engine-driven changes (no propagator)
-    /// stay snapshot-free.
+    /// Snapshot the running propagator's scope only when `will_change`.
     fn snapshot_if(&self, will_change: bool) -> Vec<ScopeVar> {
         if will_change && self.current.is_some() {
             self.snapshot_cause()
@@ -395,8 +345,8 @@ impl Store {
         }
     }
 
-    /// Snapshot the running propagator's scope domains (pre-op), or an empty
-    /// vector when no propagator is running (engine-driven change).
+    /// Snapshot the running propagator's scope domains (pre-op), or empty when
+    /// no propagator is running.
     fn snapshot_cause(&self) -> Vec<ScopeVar> {
         match self.current {
             None => Vec::new(),
@@ -413,7 +363,7 @@ impl Store {
         let min = dom.min(&self.trail);
         let max = dom.max(&self.trail);
         let size = dom.size(&self.trail) as i64;
-        // Only enumerate holes when the domain is not a contiguous range.
+        // Enumerate holes only when the domain is not a contiguous range.
         let holes = if size == max as i64 - min as i64 + 1 {
             Vec::new()
         } else {
@@ -461,9 +411,7 @@ impl Store {
 
     // --- propagator-owned reversible state ---
     //
-    // Some propagators (e.g. circuit) keep incremental state that must be
-    // restored on backtrack. Allocate it as reversible ints at registration
-    // time (the root level), then read/write it during propagation.
+    // Incremental propagator state that must be restored on backtrack.
 
     /// Allocate a reversible int (at the current/root level) for a propagator.
     pub fn new_rev_int(&mut self, v: i32) -> ReversibleInt {
@@ -505,9 +453,8 @@ impl Store {
         &self.scope[prop.index()]
     }
 
-    /// Reserve a scheduling slot for a new propagator and return its id. The
-    /// returned id equals the number of propagators allocated so far, so the
-    /// [`Solver`] can keep its `Box<dyn Propagator>` vector in lockstep.
+    /// Reserve a scheduling slot for a new propagator and return its id.
+    /// The id equals the count of propagators allocated so far.
     pub(crate) fn alloc_prop(&mut self) -> PropId {
         let id = PropId(self.enqueued.len() as u32);
         self.enqueued.push(false);
@@ -540,10 +487,8 @@ impl Store {
         self.queue.is_empty()
     }
 
-    /// Snapshot `prop`'s scope domains as they stand now into `buf` (reusing its
-    /// capacity) — for building its explanation, e.g. a conflict reason captured
-    /// before the propagator runs. Reused every step, so this allocates nothing
-    /// for range domains.
+    /// Snapshot `prop`'s current scope domains into `buf` (reusing its capacity;
+    /// no allocation for range domains).
     pub fn snapshot_scope_into(&self, prop: PropId, buf: &mut Vec<ScopeVar>) {
         buf.clear();
         for &v in &self.scope[prop.index()] {
@@ -551,8 +496,8 @@ impl Store {
         }
     }
 
-    /// Drop every queued propagator (used after a failure so stale entries do
-    /// not leak into the sibling search branch).
+    /// Drop every queued propagator (after a failure, so stale entries do not
+    /// leak into the sibling branch).
     pub(crate) fn clear_queue(&mut self) {
         while let Some(p) = self.queue.pop_front() {
             self.enqueued[p.index()] = false;
@@ -561,8 +506,8 @@ impl Store {
 
     /// Wake the appropriate subscribers of `var` (except the running one).
     fn notify(&mut self, var: VarId, bounds_moved: bool, fixed: bool) {
-        // Split the borrow so subscription lists can be read while the queue and
-        // flags are mutated. Subscription lists never change during propagation.
+        // Split the borrow: read subscription lists while mutating queue/flags.
+        // Subscription lists never change during propagation.
         let Store {
             subs,
             queue,
@@ -631,8 +576,7 @@ impl Store {
     }
 }
 
-/// The solver: a [`Store`] plus the propagator objects, with the propagation
-/// fixpoint.
+/// A [`Store`] plus the propagator objects, with the propagation fixpoint.
 #[derive(Default)]
 pub struct Solver {
     /// All mutable state. Public so search and tests can read/branch on domains.
@@ -682,8 +626,8 @@ impl Solver {
         &self.weights
     }
 
-    /// Enqueue every propagator. Called at the start of each search so a solve
-    /// is self-contained even when the solver is reused.
+    /// Enqueue every propagator (at the start of each search, so a reused
+    /// solver still produces a self-contained solve).
     pub fn enqueue_all(&mut self) {
         for i in 0..self.propagators.len() {
             self.store.enqueue(PropId(i as u32));
@@ -696,23 +640,20 @@ impl Solver {
         self.propagate_until(|| false)
     }
 
-    /// Run the propagation fixpoint, periodically polling `should_stop`. When it
-    /// fires (e.g. a time limit during a very large root propagation), the queue
-    /// is cleared and `Ok` is returned — the caller must then observe the stop
-    /// and abandon the search (never treat this as a consistent fixpoint).
+    /// Run the propagation fixpoint, polling `should_stop`. On stop, clears the
+    /// queue and returns `Ok` — the caller must abandon the search, never treat
+    /// this as a consistent fixpoint.
     pub fn propagate_until<F: Fn() -> bool>(
         &mut self,
         should_stop: F,
     ) -> Result<(), Inconsistency> {
         while let Some(id) = self.store.dequeue() {
-            // Poll on every dequeue: a single propagator call can be slow on huge
-            // instances, so a coarser interval would blow well past the limit.
+            // Poll every dequeue: one propagator call can be slow on huge instances.
             if should_stop() {
                 self.store.clear_queue();
                 return Ok(());
             }
-            // Take the propagator out to satisfy the borrow checker, run it,
-            // then put it straight back.
+            // Take the propagator out to satisfy the borrow checker, then put back.
             let mut prop = self.propagators[id.index()]
                 .take()
                 .expect("running a propagator that is not present");
@@ -732,10 +673,9 @@ impl Solver {
         Ok(())
     }
 
-    /// Run the next queued propagator, if any, leaving its primary events in the
-    /// store buffer for the LCG layer to drain. Unlike [`propagate`](Self::propagate)
-    /// this returns after a single propagator so the engine can attribute the
-    /// events (and a conflict) to it.
+    /// Run the next queued propagator (if any), leaving its primary events in
+    /// the store buffer. Returns after one propagator so the LCG engine can
+    /// attribute the events and any conflict to it.
     pub fn propagate_step(&mut self) -> StepOutcome {
         let Some(id) = self.store.dequeue() else {
             return StepOutcome::Empty;
@@ -791,7 +731,7 @@ mod tests {
                 DomEvent::NeTrue { var: x, val: 5 },
             ]
         );
-        // No propagator running: events carry an empty scope snapshot.
+        // No propagator running: empty scope snapshot.
         assert!(store
             .events
             .iter()
@@ -807,9 +747,9 @@ mod tests {
     fn no_op_mutations_emit_nothing() {
         let mut store = Store::new();
         let x = store.new_var_range(0, 9);
-        store.remove_below(x, 0).unwrap(); // already the min
-        store.remove_above(x, 9).unwrap(); // already the max
-        store.remove(x, 100).unwrap(); // absent
+        store.remove_below(x, 0).unwrap();
+        store.remove_above(x, 9).unwrap();
+        store.remove(x, 100).unwrap();
         assert!(store.events.is_empty());
     }
 
@@ -818,7 +758,7 @@ mod tests {
         let mut solver = Solver::new();
         let x = solver.new_var_range(0, 5);
         let y = solver.new_var_range(0, 5);
-        let p = less_or_equal(&mut solver, x, y); // subscribes to both x and y
+        let p = less_or_equal(&mut solver, x, y);
         let mut scope = solver.store.scope(p).to_vec();
         scope.sort();
         assert_eq!(scope, vec![x, y]);

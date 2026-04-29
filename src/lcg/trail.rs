@@ -1,18 +1,8 @@
-//! The SAT trail and the [`Cdcl`] engine state.
+//! The SAT trail and [`Cdcl`] engine state layered on the FD store.
 //!
-//! [`Cdcl`] borrows the [`Solver`] for the duration of a solve and layers the
-//! CDCL bookkeeping on top of the FD store:
-//!
-//! - the **SAT trail** — the literals assigned so far, in order, partitioned
-//!   into decision levels by `level_starts`;
-//! - per-atom side tables `atom_level` / `atom_reason` that the domain view
-//!   cannot reconstruct (which level an atom was set at, and *why*).
-//!
-//! Atom *truth* is never stored here — it is read from the domain via
-//! [`view`](crate::lcg::view). The trail only records the order and the reasons,
-//! so on a backjump we truncate the trail and clear those side tables, then pop
-//! the matching number of [`Trail`](crate::trail::Trail) levels; the domain
-//! (hence every atom's truth) rolls back with it.
+//! Atom truth is read from the domain via [`view`](crate::lcg::view); the trail
+//! records only assignment order and reasons. Backjump truncates the trail and
+//! pops the matching domain-trail levels, rolling truth back with it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -23,69 +13,60 @@ use crate::lcg::view::{self, Tri};
 use crate::propagator::Inconsistency;
 use crate::store::{Cause, DomEvent, Premise, ScopeVar, Solver, StepOutcome};
 
-/// A stop flag that is never set — the default until [`Cdcl::set_stop`] supplies
-/// the search's real one. Lets the engine poll a flag without an `Option`.
+/// Stop flag that is never set; default until [`Cdcl::set_stop`] supplies the real one.
 pub(crate) static NEVER_STOP: AtomicBool = AtomicBool::new(false);
 
 /// Sentinel `atom_level` for an unassigned atom.
 pub const UNSET: u32 = u32::MAX;
 
-/// Why an atom became assigned. Drives 1-UIP conflict analysis: each kind
-/// expands to the clause that forced the literal (the [`Reason::Generic`]
-/// propagator explanation lands in a later milestone).
+/// Why an atom became assigned. Drives 1-UIP conflict analysis.
 #[derive(Clone)]
 pub enum Reason {
-    /// The atom is not currently assigned.
+    /// Not currently assigned.
     Unset,
-    /// True at the root (level 0) with no antecedent; dropped during analysis.
+    /// Level-0 fact, no antecedent; dropped during analysis.
     Fact,
-    /// A branching decision — a root of the implication graph; analysis stops.
+    /// A branching decision; analysis stops here.
     Decision,
-    /// Forced as the last open literal of a clause (channeling axiom, learned,
-    /// or constraint clause).
+    /// Forced as the last open literal of a clause.
     Clause(ClauseRef),
-    /// Inferred by a propagator. The literals are `D_S`: the (true) literals
-    /// describing the propagator's scope domains at the time, which entail the
-    /// inferred literal. The reason clause is `(consequent ∨ ⋁ ¬D_S)`.
+    /// Propagator inference. Literals are `D_S` (true scope literals entailing
+    /// the inference); reason clause is `(consequent ∨ ⋁ ¬D_S)`.
     Generic(Vec<Lit>),
 }
 
 /// A detected conflict, before analysis turns it into a learned clause.
 #[derive(Clone, Debug)]
 pub enum Conflict {
-    /// A clause is fully falsified (every literal false on the trail).
+    /// A fully falsified clause.
     Clause(ClauseRef),
-    /// A propagator failed: these scope literals (`D_S`, all currently true)
-    /// are jointly infeasible. The conflict clause is `⋁ ¬D_S`.
+    /// Propagator failure: these `D_S` literals (all true) are jointly
+    /// infeasible; conflict clause is `⋁ ¬D_S`.
     Generic(Vec<Lit>),
 }
 
-/// Build `D_S`: the true literals describing a snapshotted scope's domains
-/// (`[x≥min]`, `¬[x≥max+1]`, and `¬[x=v]` per hole). Their conjunction entails
-/// whatever the propagator inferred from this scope.
+/// Build `D_S`: the true literals describing a scope's domains
+/// (`[x≥min]`, `¬[x≥max+1]`, `¬[x=v]` per hole).
 fn build_ds(atoms: &AtomTable, scope: &[ScopeVar]) -> Vec<Lit> {
     let mut lits = Vec::new();
     for sv in scope {
         if let LitOrConst::Lit(l) = atoms.ge(sv.var, sv.min) {
-            lits.push(l); // [x ≥ min]
+            lits.push(l);
         }
         if let LitOrConst::Lit(l) = atoms.ge(sv.var, sv.max + 1) {
-            lits.push(l.negate()); // ¬[x ≥ max+1]
+            lits.push(l.negate());
         }
         for &h in &sv.holes {
             if let LitOrConst::Lit(l) = atoms.eq(sv.var, h) {
-                lits.push(l.negate()); // ¬[x = h]
+                lits.push(l.negate());
             }
         }
     }
     lits
 }
 
-/// Translate a propagator's tight [`Premise`] conjunction into the true
-/// literals that entail its inference — the [`build_ds`] of a hand-cut reason.
-/// Each premise is true now, so it maps to a literal known true (constants,
-/// which carry no information, fold away). Their conjunction is the antecedent
-/// of the reason clause `(consequent ∨ ⋁ ¬premise)`.
+/// Translate a tight [`Premise`] conjunction into the true literals that entail
+/// the inference (constants fold away).
 fn translate_premises(atoms: &AtomTable, premises: &[Premise]) -> Vec<Lit> {
     let mut lits = Vec::with_capacity(premises.len());
     let push = |loc: LitOrConst, out: &mut Vec<Lit>| {
@@ -97,12 +78,9 @@ fn translate_premises(atoms: &AtomTable, premises: &[Premise]) -> Vec<Lit> {
         match p {
             Premise::Ge { var, bound } => push(atoms.ge(var, bound), &mut lits),
             Premise::Le { var, bound } => push(neg(atoms.ge(var, bound + 1)), &mut lits),
-            // Express `[x = v]` as the *order* atoms `[x ≥ v] ∧ [x ≤ v]`, never
-            // the positive equality atom: the equality atom is recorded when the
-            // variable's bounds finally pinch, which can be a deeper level than
-            // where each bound was determined, and citing that deeper level makes
-            // 1-UIP backjump too far and prune feasible solutions. The order
-            // atoms carry the correct, finer levels (this mirrors `build_ds`).
+            // Express `[x = v]` as order atoms `[x ≥ v] ∧ [x ≤ v]`, never the
+            // positive equality atom: the eq atom may carry a deeper level, which
+            // would make 1-UIP backjump too far and prune feasible solutions.
             Premise::Eq { var, val } => {
                 push(atoms.ge(var, val), &mut lits);
                 push(neg(atoms.ge(var, val + 1)), &mut lits);
@@ -113,8 +91,8 @@ fn translate_premises(atoms: &AtomTable, premises: &[Premise]) -> Vec<Lit> {
     lits
 }
 
-/// Build the antecedent literals for an event's [`Cause`] — a tight premise
-/// conjunction when the propagator supplied one, else the whole-scope snapshot.
+/// Antecedent literals for an event's [`Cause`]: tight premises if supplied,
+/// else the whole-scope snapshot.
 fn cause_lits(atoms: &AtomTable, cause: &Cause) -> Vec<Lit> {
     match cause {
         Cause::Premises(p) => translate_premises(atoms, p),
@@ -132,8 +110,7 @@ fn neg(loc: LitOrConst) -> LitOrConst {
 }
 
 /// Translate a primary [`DomEvent`] to the literal it asserts, or `None` if it
-/// carries no information (folds to a constant — e.g. `remove_above` at the
-/// current upper bound).
+/// folds to a constant.
 fn translate(atoms: &AtomTable, ev: &DomEvent) -> Option<Lit> {
     match *ev {
         DomEvent::GeTrue { var, bound } => match atoms.ge(var, bound) {
@@ -157,64 +134,52 @@ fn translate(atoms: &AtomTable, ev: &DomEvent) -> Option<Lit> {
 
 /// The CDCL engine: the FD solver plus the SAT trail and learning state.
 pub struct Cdcl<'s> {
-    /// The finite-domain solver (domains, trail, propagators). Ground truth.
+    /// The FD solver (domains, trail, propagators); ground truth.
     pub(crate) solver: &'s mut Solver,
-    /// The Boolean atom numbering over the solver's variables.
+    /// Boolean atom numbering over the solver's variables.
     pub(crate) atoms: AtomTable,
-    /// Assigned literals in chronological order (each literal is *true*).
+    /// Assigned literals in chronological order (each is true).
     trail: Vec<Lit>,
-    /// `level_starts[d]` is the `trail` index where decision level `d` begins.
-    /// Always non-empty: `level_starts[0] == 0` is the root.
+    /// `level_starts[d]` = `trail` index where level `d` begins. Always non-empty;
+    /// `level_starts[0] == 0` is the root.
     level_starts: Vec<usize>,
-    /// Decision level at which each atom was assigned, or [`UNSET`].
+    /// Assignment level per atom, or [`UNSET`].
     atom_level: Vec<u32>,
-    /// Why each atom was assigned (meaningful only while assigned).
+    /// Assignment reason per atom (meaningful only while assigned).
     atom_reason: Vec<Reason>,
-    /// Per-atom **trail** truth: what the recorded assignment says, which lags
-    /// the domain view during propagation. Unit propagation reads this (not the
-    /// view) so it still *records* atoms the domain already determined en masse.
+    /// Per-atom trail truth (the recorded assignment), which lags the domain view
+    /// during propagation; unit propagation reads this, not the view.
     tval: Vec<Tri>,
-    /// Scratch "seen" marks for 1-UIP analysis, indexed by atom; always cleared
-    /// back to all-false at the end of each analysis.
+    /// Scratch "seen" marks for 1-UIP analysis; always cleared after each analysis.
     seen: Vec<bool>,
     /// Clause database: channeling axioms, learned, and constraint clauses.
     pub(crate) clauses: ClauseDb,
-    /// Two-watched-literal occurrence lists, indexed by literal code. A clause
-    /// appears under each of its two watched literals; it is re-examined only
-    /// when one of them becomes false.
+    /// Two-watched-literal occurrence lists, indexed by literal code.
     watches: Vec<Vec<ClauseRef>>,
-    /// Reusable scratch for the pre-step scope snapshot used to build a
-    /// propagator's conflict reason (kept across steps to avoid per-step allocs).
+    /// Reusable scratch for the pre-step scope snapshot of a conflict reason.
     conflict_scope: Vec<ScopeVar>,
     /// Index into `trail` of the next literal whose watches need processing.
     qhead: usize,
-    /// VSIDS-style per-variable activity (indexed by `VarId`), bumped for every
-    /// variable involved in a conflict so branching is conflict-driven (not just
-    /// FD-failure-driven like plain dom/wdeg). Read by the branching heuristic.
+    /// VSIDS per-variable activity (indexed by `VarId`); read by the branching heuristic.
     pub(crate) activity: Vec<f64>,
-    /// Current activity bump increment (grows each conflict to emulate decay).
+    /// Activity bump increment (grows each conflict to emulate decay).
     var_inc: f64,
-    /// Stop flag polled during propagation so a time limit / Ctrl+C bounds even
-    /// a huge root fixpoint (defaults to [`NEVER_STOP`]; set by the driver).
+    /// Stop flag polled during propagation (defaults to [`NEVER_STOP`]).
     stop: &'s AtomicBool,
-    /// Number of live (non-tombstone) deletable learned clauses.
+    /// Live (non-tombstone) deletable learned clauses.
     num_learned: usize,
-    /// Soft cap on live learned clauses; reduction triggers above it, then it
-    /// grows so the database is allowed to expand over time.
+    /// Soft cap on live learned clauses; grows after each reduction.
     max_learned: usize,
-    /// Running count of conflicts analysed (for search statistics and restarts).
+    /// Conflicts analysed (statistics and restarts).
     pub(crate) conflicts: u64,
-    /// Total literals across all learned clauses — the numerator of the average
-    /// learned-clause size, a direct measure of explanation tightness.
+    /// Total literals across all learned clauses (numerator of avg learned size).
     pub(crate) learned_lits: u64,
 }
 
 impl<'s> Cdcl<'s> {
-    /// Build the engine over `solver`, allocating atoms from the current (root)
-    /// domains. Call before any decision.
+    /// Build the engine over `solver`, allocating atoms from the root domains.
     pub fn new(solver: &'s mut Solver) -> Self {
-        // Ablation hook: `QAYD_SCOPE_REASONS` forces whole-scope explanations,
-        // so a single build can compare tight vs generic reasons.
+        // Ablation hook: `QAYD_SCOPE_REASONS` forces whole-scope explanations.
         solver
             .store
             .set_force_scope_reasons(std::env::var_os("QAYD_SCOPE_REASONS").is_some());
@@ -244,8 +209,7 @@ impl<'s> Cdcl<'s> {
         }
     }
 
-    /// Set the stop flag polled during propagation (the search time limit /
-    /// Ctrl+C). Call before solving.
+    /// Set the stop flag polled during propagation. Call before solving.
     pub(crate) fn set_stop(&mut self, stop: &'s AtomicBool) {
         self.stop = stop;
     }
@@ -256,12 +220,9 @@ impl<'s> Cdcl<'s> {
         self.stop.load(Ordering::Relaxed)
     }
 
-    /// Drop the worst (highest-LBD) deletable learned clauses once they exceed
-    /// the soft cap, keeping "glue" clauses (LBD ≤ 2). Must be called at the root
-    /// (decision level 0): there, the only assigned atoms are level-0 facts whose
-    /// reasons conflict analysis never consults, so a deleted clause can never be
-    /// a needed reason. Deletion is by tombstone (clear `lits`, drop from watch
-    /// lists), keeping every [`ClauseRef`] valid.
+    /// Drop the worst (highest-LBD) deletable learned clauses above the soft cap,
+    /// keeping glue clauses (LBD ≤ 2). Must run at the root (level 0), where no
+    /// deleted clause can be a needed reason. Deletion is by tombstone.
     pub(crate) fn maybe_reduce_db(&mut self) {
         if self.num_learned <= self.max_learned {
             return;
@@ -283,18 +244,17 @@ impl<'s> Cdcl<'s> {
                 break;
             }
             if self.clauses.get(c).lbd <= 2 {
-                continue; // keep glue clauses
+                continue;
             }
             self.delete_clause(c);
             removed += 1;
         }
         self.num_learned -= removed;
-        self.max_learned += 500; // let the database grow over time
+        self.max_learned += 500;
     }
 
-    /// Tombstone a clause: unwatch it and free its literals. Its slot remains so
-    /// outstanding [`ClauseRef`]s stay valid (the dead clause is in no watch list,
-    /// so propagation never reaches it).
+    /// Tombstone a clause: unwatch it and free its literals; its slot remains so
+    /// outstanding [`ClauseRef`]s stay valid.
     fn delete_clause(&mut self, c: ClauseRef) {
         let (w0, w1) = {
             let lits = &self.clauses.get(c).lits;
@@ -305,8 +265,7 @@ impl<'s> Cdcl<'s> {
         self.clauses.get_mut(c).lits.clear();
     }
 
-    /// The Literal Block Distance of a clause: the number of distinct decision
-    /// levels among its assigned literals.
+    /// Literal Block Distance: distinct decision levels among assigned literals.
     fn lbd_of(&self, lits: &[Lit]) -> u32 {
         let mut levels: Vec<u32> = lits
             .iter()
@@ -318,11 +277,9 @@ impl<'s> Cdcl<'s> {
         levels.len() as u32
     }
 
-    /// Add a clause to the database and set up its two watched literals (the
-    /// first two literals). Clauses with fewer than two literals are not watched
-    /// — callers assert their single literal directly. `deletable` marks a 1-UIP
-    /// learned clause (eligible for reduction); `lbd` is its Literal Block
-    /// Distance (only meaningful when deletable).
+    /// Add a clause and watch its first two literals. Clauses with fewer than two
+    /// literals are not watched — callers assert the single literal directly.
+    /// `deletable` marks a reduction-eligible learned clause; `lbd` meaningful only then.
     pub(crate) fn add_clause(&mut self, lits: Vec<Lit>, deletable: bool, lbd: u32) -> ClauseRef {
         let (w0, w1) = if lits.len() >= 2 {
             (Some(lits[0]), Some(lits[1]))
@@ -340,55 +297,48 @@ impl<'s> Cdcl<'s> {
         cref
     }
 
-    /// Post the order-encoding consistency (channeling) clauses for every
-    /// variable, and seed root facts. Run once, at the root, before search.
+    /// Post order-encoding channeling clauses for every variable and seed root
+    /// facts. Run once, at the root, before search.
     ///
-    /// For each value `v` of `x` over its initial span `[lo, hi]`:
-    /// `[x=v] → [x≥v]`, `[x=v] → ¬[x≥v+1]`, `([x≥v] ∧ ¬[x≥v+1]) → [x=v]`, and
-    /// the monotonic `[x≥v+1] → [x≥v]`. Constant atoms fold away, so a range
-    /// variable gets only the genuinely informative clauses.
+    /// Per value `v` over span `[lo, hi]`: `[x=v] → [x≥v]`, `[x=v] → ¬[x≥v+1]`,
+    /// `([x≥v] ∧ ¬[x≥v+1]) → [x=v]`, and monotonic `[x≥v+1] → [x≥v]`. Constant
+    /// atoms fold away.
     pub fn post_channeling(&mut self) {
         for i in 0..self.solver.store.num_vars() {
             let x = VarId(i as u32);
             let lo = self.solver.store.min(x);
             let hi = self.solver.store.max(x);
-            // Bounds-only variables (the objective) get only the monotonic order
-            // chain — their equality atoms are never used, so the eq-channel is
-            // dead weight (and, for a wide domain, the bulk of the clauses).
             for v in lo..=hi {
                 let eqv = self.atoms.eq(x, v);
                 let gev = self.atoms.ge(x, v);
                 let gev1 = self.atoms.ge(x, v + 1);
-                self.post_clause(&[neg(eqv), gev]); // [x=v] → [x≥v]
-                self.post_clause(&[neg(eqv), neg(gev1)]); // [x=v] → ¬[x≥v+1]
-                self.post_clause(&[neg(gev), gev1, eqv]); // [x≥v] ∧ ¬[x≥v+1] → [x=v]
-                self.post_clause(&[neg(gev1), gev]); // [x≥v+1] → [x≥v]
+                self.post_clause(&[neg(eqv), gev]);
+                self.post_clause(&[neg(eqv), neg(gev1)]);
+                self.post_clause(&[neg(gev), gev1, eqv]);
+                self.post_clause(&[neg(gev1), gev]);
             }
         }
         self.seed_facts();
     }
 
-    /// Post a clause from possibly-constant terms: skip if it is a tautology
-    /// (contains `⊤`), drop `⊥` terms, and add the rest. Returns the handle, or
-    /// `None` if the clause folded away.
+    /// Post a clause from possibly-constant terms: skip tautologies (`⊤`), drop
+    /// `⊥`, add the rest. `None` if it folds away.
     fn post_clause(&mut self, terms: &[LitOrConst]) -> Option<ClauseRef> {
         let mut lits = Vec::with_capacity(terms.len());
         for &t in terms {
             match t {
-                LitOrConst::True => return None, // tautology
-                LitOrConst::False => {}          // drop
+                LitOrConst::True => return None,
+                LitOrConst::False => {}
                 LitOrConst::Lit(l) => lits.push(l),
             }
         }
         if lits.is_empty() {
             return None;
         }
-        Some(self.add_clause(lits, false, 0)) // channeling axiom: not deletable
+        Some(self.add_clause(lits, false, 0))
     }
 
-    /// Record every atom whose truth is already fixed at the root as a level-0
-    /// [`Fact`](Reason::Fact) (e.g. holes in an explicit-set domain). Keeps the
-    /// trail a faithful mirror of the domain from the very start.
+    /// Record every atom already fixed at the root as a level-0 [`Fact`](Reason::Fact).
     fn seed_facts(&mut self) {
         debug_assert_eq!(self.decision_level(), 0);
         for a in 0..self.atoms.num_atoms() as u32 {
@@ -415,9 +365,7 @@ impl<'s> Cdcl<'s> {
         self.trail.len()
     }
 
-    /// The literal decided at the deepest open level — the first literal recorded
-    /// after [`open_level`], which [`decide`] assigns before any propagation.
-    /// Panics at the root.
+    /// The literal decided at the deepest open level. Panics at the root.
     pub(crate) fn deepest_decision(&self) -> Lit {
         let d = self.decision_level();
         self.trail[self.level_starts[d]]
@@ -441,14 +389,14 @@ impl<'s> Cdcl<'s> {
         &self.atom_reason[atom as usize]
     }
 
-    /// The current truth of `lit` in the **domain view**.
+    /// The current truth of `lit` in the domain view.
     #[inline]
     pub fn value(&self, lit: Lit) -> Tri {
         view::lit_value(&self.solver.store, &self.atoms, lit)
     }
 
-    /// The current truth of `lit` on the **trail** (recorded assignment). Lags
-    /// the view during propagation; equal to it at a fixpoint (invariant T2).
+    /// The current truth of `lit` on the trail. Lags the view during propagation;
+    /// equal at a fixpoint (invariant T2).
     #[inline]
     pub fn tvalue(&self, lit: Lit) -> Tri {
         let t = self.tval[lit.atom() as usize];
@@ -467,8 +415,8 @@ impl<'s> Cdcl<'s> {
         self.level_starts.push(self.trail.len());
     }
 
-    /// Record a literal that just became true in the domain, with `reason`, at
-    /// the current decision level. No-op if its atom is already assigned.
+    /// Record a literal now true in the domain, with `reason`, at the current
+    /// level. No-op if its atom is already assigned.
     fn record(&mut self, lit: Lit, reason: Reason) {
         let a = lit.atom() as usize;
         if self.atom_level[a] != UNSET {
@@ -490,11 +438,8 @@ impl<'s> Cdcl<'s> {
     }
 
     /// The currently-recorded atoms of `var`, each as the literal matching its
-    /// trail truth. This conjunction is the full *recorded* knowledge of `var`;
-    /// since the recorded atoms are the primaries of every op applied to it, they
-    /// entail every value the domain determines — so they make a sound antecedent
-    /// for any of `var`'s determined-but-unrecorded atoms, and (being recorded)
-    /// they bottom out 1-UIP analysis.
+    /// trail truth. This conjunction is a sound, recorded antecedent for any of
+    /// `var`'s determined-but-unrecorded atoms, and bottoms out 1-UIP analysis.
     fn ds_recorded(&self, var: VarId) -> Vec<Lit> {
         let (lo, hi) = self.atoms.var_span(var);
         let mut lits = Vec::new();
@@ -517,15 +462,10 @@ impl<'s> Cdcl<'s> {
     }
 
     /// Record every atom of `var` the domain now determines but the trail has
-    /// not — keeping the SAT trail a faithful mirror of the domain (invariant
-    /// T2) instead of letting it lag. Called eagerly, right after each op changes
-    /// `var`, so each atom is recorded at the level it is actually determined
-    /// (recording it later, at a deeper level, would let 1-UIP assert its
-    /// negation at too low a backjump level and prune feasible solutions).
-    ///
-    /// The reason is the variable's already-recorded atoms ([`ds_recorded`]),
-    /// which entail every determination and are themselves recorded, so analysis
-    /// resolves through them soundly.
+    /// not (invariant T2). Called eagerly after each op so each atom is recorded
+    /// at its determination level — recording later, at a deeper level, would let
+    /// 1-UIP backjump too far and prune feasible solutions. The reason is
+    /// [`ds_recorded`], which entails every determination and is itself recorded.
     fn sync_var(&mut self, var: VarId) {
         let (lo, hi) = self.atoms.var_span(var);
         let mut todo: Vec<Lit> = Vec::new();
@@ -561,9 +501,8 @@ impl<'s> Cdcl<'s> {
     }
 
     /// Push `lit` into the domain and record the primary it asserts with
-    /// `reason`. Returns `Err` on wipeout (nothing recorded). Secondary atoms
-    /// that also flip are recorded later by channeling unit propagation, not
-    /// here — an op emits only its primary event.
+    /// `reason`. `Err` on wipeout (nothing recorded). Secondary flips are
+    /// recorded later by channeling, not here.
     pub fn apply_lit(&mut self, lit: Lit, reason: Reason) -> Result<(), Inconsistency> {
         view::apply(&mut self.solver.store, &self.atoms, lit)?;
         let events = std::mem::take(&mut self.solver.store.events);
@@ -586,28 +525,25 @@ impl<'s> Cdcl<'s> {
         self.apply_lit(lit, Reason::Decision)
     }
 
-    /// Force `lit` true (clause/unit propagation): enforce it on the domain and
-    /// record it with `reason`. `Err` if it conflicts with the domain.
+    /// Force `lit` true (unit propagation): enforce on the domain and record it.
+    /// `Err` if it conflicts with the domain.
     pub fn assign(&mut self, lit: Lit, reason: Reason) -> Result<(), Inconsistency> {
         if self.tvalue(lit) == Tri::True {
             return Ok(());
         }
         view::apply(&mut self.solver.store, &self.atoms, lit)?;
         self.record(lit, reason);
-        // The op's own primary event names `lit`, already recorded; secondary
-        // flips are recovered by channeling unit propagation, not from events.
+        // Primary event names `lit` (already recorded); secondary flips come from
+        // channeling, not events.
         self.solver.store.events.clear();
         Ok(())
     }
 
-    /// Unit-propagate the clause database with the two-watched-literal scheme,
-    /// processing newly-assigned trail literals from `qhead`. Forces the last
-    /// open literal of every clause that becomes unit (recording channeled and
-    /// learned consequences), and returns the conflicting clause if one is fully
-    /// falsified.
+    /// Unit-propagate the clause database (two-watched-literal scheme) over trail
+    /// literals from `qhead`. Forces the last open literal of each unit clause and
+    /// returns the conflicting clause if one is fully falsified.
     pub fn propagate_clauses(&mut self) -> Result<(), ClauseRef> {
         while self.qhead < self.trail.len() {
-            // Bound a huge root channeling pass against the time limit.
             if self.stopped() {
                 return Ok(());
             }
@@ -616,7 +552,7 @@ impl<'s> Cdcl<'s> {
             // Clauses watching `neg` (now false) may need a new watch or to fire.
             let neg = q.negate();
             let mut ws = std::mem::take(&mut self.watches[neg.code() as usize]);
-            let mut keep = 0usize; // clauses that still watch `neg`
+            let mut keep = 0usize;
             let mut read = 0usize;
             let mut conflict: Option<ClauseRef> = None;
 
@@ -632,7 +568,7 @@ impl<'s> Cdcl<'s> {
                 }
                 let other = self.clauses.get(cref).lits[0];
                 if self.tvalue(other) == Tri::True {
-                    ws[keep] = cref; // clause already satisfied; keep watching `neg`
+                    ws[keep] = cref;
                     keep += 1;
                     continue;
                 }
@@ -651,15 +587,14 @@ impl<'s> Cdcl<'s> {
                 if let Some((k, wl)) = new_watch {
                     self.clauses.get_mut(cref).lits.swap(1, k);
                     self.watches[wl.code() as usize].push(cref);
-                    continue; // no longer watching `neg`
+                    continue;
                 }
                 // No replacement: the clause is unit on `other` (or a conflict).
-                ws[keep] = cref; // still watching `neg`
+                ws[keep] = cref;
                 keep += 1;
                 if self.tvalue(other) == Tri::False
                     || self.assign(other, Reason::Clause(cref)).is_err()
                 {
-                    // Falsified clause (or asserting `other` wiped a domain).
                     while read < ws.len() {
                         ws[keep] = ws[read];
                         keep += 1;
@@ -679,34 +614,26 @@ impl<'s> Cdcl<'s> {
         Ok(())
     }
 
-    /// Propagate to a joint fixpoint of channeling/clause unit propagation and
-    /// the FD propagators, in lockstep: clause propagation records channeled and
-    /// learned consequences, FD propagation records each propagator's inferences
-    /// (with [`Generic`](Reason::Generic) reasons), and forced domain changes on
-    /// either side feed the other until nothing new is derived. Returns the
+    /// Propagate to a joint fixpoint of clause unit propagation and the FD
+    /// propagators, in lockstep, recording each side's consequences. Returns the
     /// first [`Conflict`] found.
     pub fn propagate(&mut self) -> Result<(), Conflict> {
         loop {
-            // Honour the stop flag even mid-fixpoint: a huge root propagation
-            // must not blow past the time limit. Abandon as a (non-)fixpoint —
-            // the driver's own stop check then ends the search at once.
             if self.stopped() {
                 self.solver.store.clear_queue();
                 return Ok(());
             }
-            // Channel + clause unit propagation to a fixpoint *first*, so every
-            // earlier change (including the previous propagator's) is fully
+            // Clause propagation to a fixpoint *first*, so every earlier change is
             // recorded on the trail before the next propagator is snapshotted —
-            // this keeps a propagator's `D_S` antecedents all trail-recorded.
+            // keeping its `D_S` antecedents all trail-recorded.
             if let Err(c) = self.propagate_clauses() {
                 return Err(Conflict::Clause(c));
             }
             // Then run a single FD propagator and record its inferences.
             let Some(pid) = self.solver.peek_prop() else {
-                return Ok(()); // FD queue drained and clauses at fixpoint
+                return Ok(());
             };
-            // Snapshot its scope first (into the reused buffer), so a failure
-            // has a sound (trail-consistent) conflict reason.
+            // Snapshot its scope first so a failure has a trail-consistent reason.
             {
                 let Cdcl {
                     solver,
@@ -720,8 +647,7 @@ impl<'s> Cdcl<'s> {
                 StepOutcome::Ran(_) => self.record_prop_events()?,
                 StepOutcome::Failed(_) => {
                     self.solver.store.events.clear();
-                    // Prefer a propagator's tight conflict reason; fall back to
-                    // the pre-op whole-scope snapshot taken above.
+                    // Prefer a propagator's tight conflict reason; else the snapshot.
                     let ds = match self.solver.store.take_pending_conflict() {
                         Some(p) => translate_premises(&self.atoms, &p),
                         None => build_ds(&self.atoms, &self.conflict_scope),
@@ -733,13 +659,9 @@ impl<'s> Cdcl<'s> {
     }
 
     /// Drain a just-run propagator's primary events, recording each inferred
-    /// literal with a [`Generic`](Reason::Generic) reason built from the pre-op
-    /// scope snapshot the store captured.
-    ///
-    /// Channeling is run after *each* event so that an op's secondary atom flips
-    /// (e.g. a bound shift) are recorded before the next op's reason is built —
-    /// keeping every `D_S` antecedent strictly earlier on the trail than the
-    /// literal it explains (the invariant 1-UIP analysis relies on).
+    /// literal with a [`Generic`](Reason::Generic) reason from the store's scope
+    /// snapshot. Channeling runs after *each* event so every `D_S` antecedent is
+    /// strictly earlier on the trail than the literal it explains (a 1-UIP invariant).
     fn record_prop_events(&mut self) -> Result<(), Conflict> {
         let events = std::mem::take(&mut self.solver.store.events);
         for ev in &events {
@@ -755,17 +677,16 @@ impl<'s> Cdcl<'s> {
                     self.record(lit, Reason::Generic(ds));
                 }
             }
-            // Mirror the rest of this variable's bulk domain change onto the
-            // trail at this (its determination) level before moving on.
+            // Mirror the rest of this variable's bulk change onto the trail at
+            // its determination level before moving on.
             self.sync_var(var);
             self.propagate_clauses().map_err(Conflict::Clause)?;
         }
         Ok(())
     }
 
-    /// Propagate; on each conflict, learn a 1-UIP clause, backjump, and assert
-    /// it. Repeats until a clean fixpoint (`true`) or a conflict at the root
-    /// proving the problem unsatisfiable (`false`).
+    /// Propagate; on each conflict, learn a 1-UIP clause, backjump, assert it.
+    /// `true` at a clean fixpoint, `false` if a root conflict proves UNSAT.
     pub fn propagate_and_learn(&mut self) -> bool {
         loop {
             match self.propagate() {
@@ -779,38 +700,31 @@ impl<'s> Cdcl<'s> {
         }
     }
 
-    /// Analyse `conflict`, backjump, learn the 1-UIP clause and assert it.
-    /// Returns `false` if the conflict proves unsatisfiability. Used both by the
-    /// propagation loop and to inject an externally-detected conflict (a fully
-    /// falsified blocking clause after enumerating a solution).
+    /// Analyse `conflict`, backjump, learn the 1-UIP clause and assert it. `false`
+    /// if the conflict proves UNSAT. Also used to inject an externally-detected
+    /// conflict (a falsified blocking clause after enumerating a solution).
     pub(crate) fn resolve_conflict(&mut self, conflict: Conflict) -> bool {
         self.conflicts += 1;
         let Some((learnt, btlevel)) = self.analyze(conflict) else {
-            return false; // conflict independent of all decisions: UNSAT
+            return false;
         };
         self.learned_lits += learnt.len() as u64;
-        // LBD is measured at learn time, while every literal is still assigned.
+        // LBD measured at learn time, while every literal is still assigned.
         let lbd = self.lbd_of(&learnt);
         let deletable = learnt.len() >= 2;
         self.backjump_to(btlevel);
         let asserting = learnt[0];
         let cref = self.add_clause(learnt, deletable, lbd);
-        // After backjumping, the asserting literal is the clause's only open
-        // literal; asserting it cannot wipe out a domain.
+        // Post-backjump, the asserting literal is the only open one; it cannot wipe a domain.
         !(self.assign(asserting, Reason::Clause(cref)).is_err() && btlevel == 0)
     }
 
-    /// First-UIP conflict analysis. Returns the learned clause (its asserting
-    /// literal first) and the level to backjump to (the second-highest level in
-    /// the clause, or 0 for a unit clause).
+    /// First-UIP conflict analysis. Returns the learned clause (asserting literal
+    /// first) and the backjump level (second-highest in the clause, 0 if unit).
     fn analyze(&mut self, conflict: Conflict) -> Option<(Vec<Lit>, usize)> {
         let mut clause_lits = self.conflict_lits(&conflict);
-        // Analyse at the conflict's deepest decision level. This is usually the
-        // current level, but a propagator can fail on literals all below it (a
-        // late-detected conflict) — resolving at the deepest level still yields
-        // a valid 1-UIP clause and a sound (possibly far) backjump. If every
-        // literal is at the root (level 0), the conflict holds unconditionally:
-        // the problem is unsatisfiable.
+        // Analyse at the conflict's deepest level (a propagator may fail on
+        // literals all below the current level). All at level 0 means UNSAT.
         let level = clause_lits
             .iter()
             .map(|l| self.level_of(l.atom()))
@@ -822,7 +736,7 @@ impl<'s> Cdcl<'s> {
         }
         let mut learnt: Vec<Lit> = vec![Lit::positive(0)]; // slot 0 = asserting lit
         let mut touched: Vec<u32> = Vec::new();
-        let mut counter = 0usize; // level-`level` literals not yet resolved
+        let mut counter = 0usize; // unresolved level-`level` literals
         let mut index = self.trail.len();
         let mut uip;
 
@@ -833,15 +747,15 @@ impl<'s> Cdcl<'s> {
                 if !self.seen[a as usize] && lv != UNSET && lv > 0 {
                     self.seen[a as usize] = true;
                     touched.push(a);
-                    self.bump_var(self.atoms.var_of(a)); // VSIDS: this var is conflict-active
+                    self.bump_var(self.atoms.var_of(a)); // VSIDS: conflict-active
                     if lv == level {
                         counter += 1;
                     } else {
-                        learnt.push(q); // a lower-level literal of the learned clause
+                        learnt.push(q); // lower-level literal of the learned clause
                     }
                 }
             }
-            // The latest still-seen trail literal at the current level is next.
+            // Next: the latest still-seen trail literal at the current level.
             loop {
                 index -= 1;
                 if self.seen[self.trail[index].atom() as usize] {
@@ -852,12 +766,12 @@ impl<'s> Cdcl<'s> {
             self.seen[uip.atom() as usize] = false;
             counter -= 1;
             if counter == 0 {
-                break; // single remaining current-level literal: the UIP
+                break; // sole remaining current-level literal: the UIP
             }
             clause_lits = self.reason_lits(uip);
         }
 
-        learnt[0] = uip.negate(); // the asserting literal
+        learnt[0] = uip.negate(); // asserting literal
         let btlevel = learnt[1..]
             .iter()
             .map(|l| self.level_of(l.atom()) as usize)
@@ -870,7 +784,7 @@ impl<'s> Cdcl<'s> {
         Some((learnt, btlevel))
     }
 
-    /// Bump a variable's VSIDS activity, rescaling all activities if it overflows.
+    /// Bump a variable's VSIDS activity, rescaling all if it overflows.
     fn bump_var(&mut self, var: VarId) {
         self.activity[var.index()] += self.var_inc;
         if self.activity[var.index()] > 1e100 {
@@ -886,18 +800,16 @@ impl<'s> Cdcl<'s> {
         self.var_inc *= 1.0 / 0.95;
     }
 
-    /// Set up the root: post channeling clauses, enqueue every propagator, and
-    /// propagate to the root fixpoint. Returns `false` if the root is already
-    /// unsatisfiable.
+    /// Set up the root: post channeling, enqueue every propagator, propagate to
+    /// fixpoint. `false` if the root is already unsatisfiable.
     pub fn init(&mut self) -> bool {
         self.post_channeling();
         self.solver.enqueue_all();
         self.propagate_and_learn()
     }
 
-    /// A decision literal `[x = min(x)]` for the first unfixed variable in
-    /// `vars`, or `None` if all are fixed. (A simple heuristic; the real driver
-    /// uses dom/wdeg.)
+    /// Decision literal `[x = min(x)]` for the first unfixed var in `vars`, or
+    /// `None` if all fixed. (Simple heuristic; the real driver uses dom/wdeg.)
     fn pick_decision(&self, vars: &[VarId]) -> Option<Lit> {
         for &v in vars {
             if !self.solver.store.is_fixed(v) {
@@ -910,8 +822,8 @@ impl<'s> Cdcl<'s> {
         None
     }
 
-    /// Find one solution over `vars` by CDCL, or `None` if unsatisfiable.
-    /// Assumes [`init`](Self::init) already succeeded.
+    /// One solution over `vars` by CDCL, or `None` if UNSAT. Assumes
+    /// [`init`](Self::init) succeeded.
     pub fn solve_first(&mut self, vars: &[VarId]) -> Option<Vec<i32>> {
         loop {
             match self.pick_decision(vars) {
@@ -928,7 +840,7 @@ impl<'s> Cdcl<'s> {
         }
     }
 
-    /// The literals of the initial conflict clause (all currently false).
+    /// Literals of the initial conflict clause (all currently false).
     fn conflict_lits(&self, conflict: &Conflict) -> Vec<Lit> {
         match conflict {
             Conflict::Clause(c) => self.clauses.get(*c).lits.clone(),
@@ -936,8 +848,8 @@ impl<'s> Cdcl<'s> {
         }
     }
 
-    /// The literals of `p`'s reason clause other than `p` (all currently false),
-    /// i.e. the antecedents to resolve against in analysis.
+    /// The antecedents to resolve against: `p`'s reason-clause literals other
+    /// than `p` (all currently false).
     fn reason_lits(&self, p: Lit) -> Vec<Lit> {
         match self.reason_of(p.atom()) {
             Reason::Clause(c) => {
@@ -950,17 +862,15 @@ impl<'s> Cdcl<'s> {
                     .filter(|&l| l != p)
                     .collect()
             }
-            // Reason clause is (p ∨ ⋁ ¬D_S); the antecedents are ¬D_S.
+            // Reason clause (p ∨ ⋁ ¬D_S); antecedents are ¬D_S.
             Reason::Generic(ds) => ds.iter().map(|l| l.negate()).collect(),
-            // Decisions/facts have no antecedents (and are never resolved here).
+            // No antecedents (never resolved here).
             Reason::Decision | Reason::Fact | Reason::Unset => Vec::new(),
         }
     }
 
-    /// Backjump to decision level `d`, undoing every assignment above it. Clears
-    /// the side tables for the popped atoms and pops the matching number of
-    /// domain-trail levels, so the domain (and thus every atom's truth) is
-    /// restored to its level-`d` state.
+    /// Backjump to level `d`, undoing every assignment above it: clear side
+    /// tables for popped atoms and pop the matching domain-trail levels.
     pub fn backjump_to(&mut self, d: usize) {
         let cur = self.decision_level();
         if d >= cur {
@@ -977,7 +887,7 @@ impl<'s> Cdcl<'s> {
         for _ in 0..(cur - d) {
             self.solver.store.pop_level();
         }
-        // Everything still on the trail was propagated before the backjump.
+        // Everything still on the trail was already propagated.
         self.qhead = self.trail.len();
     }
 }
@@ -1066,8 +976,7 @@ mod tests {
 
     #[test]
     fn apply_lit_records_translated_primary() {
-        // Each op kind round-trips on its own variable: the literal applied is
-        // exactly the one recorded (from draining the store's primary event).
+        // Each op kind round-trips: the literal applied is the one recorded.
         let mut solver = Solver::new();
         let a = solver.new_var_range(0, 9);
         let b = solver.new_var_range(0, 9);
@@ -1111,8 +1020,7 @@ mod tests {
         assert!(cdcl.apply_lit(eq5.negate(), Reason::Decision).is_err());
     }
 
-    /// T2: the SAT trail mirrors the domain — an atom is recorded iff its view
-    /// truth is determined.
+    /// T2: an atom is recorded iff its view truth is determined.
     fn assert_t2(cdcl: &Cdcl) {
         for a in 0..cdcl.atoms.num_atoms() as u32 {
             let determined =

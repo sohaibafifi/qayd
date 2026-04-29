@@ -1,14 +1,6 @@
 //! Table-family constraints: `extension` (Compact-Table-style), `regular`
-//! (layered-DFA, Pesant), and `mdd` (layered DAG).
-//!
-//! All three share the same skeleton: a value is kept only if it participates
-//! in at least one globally-consistent tuple/path. `extension` tracks the set of
-//! still-valid tuples with bitsets; `regular`/`mdd` track forward/backward
-//! reachability across the layered graph.
-//!
-//! The bitset / reachability buffers are recomputed each call. That is correct
-//! and idempotent; incremental (reversible sparse-bitset) Compact-Table is a
-//! Phase 6 performance upgrade.
+//! (layered DFA), `mdd` (layered DAG). A value is kept only if it participates
+//! in some consistent tuple/path. All buffers recomputed each call.
 
 use std::collections::HashMap;
 
@@ -40,11 +32,11 @@ fn ts_and_popcount(a: &[u64], b: &[u64]) -> u64 {
         .sum()
 }
 
-/// Sentinel for a table wildcard `*` (matches any value in its column).
+/// Table wildcard `*`: matches any value in its column.
 pub const STAR: i32 = i32::MIN;
 
-/// `extension`: the assignment must (positive) or must not (negative) match one
-/// of the listed tuples. A `*` (`STAR`) entry matches any value.
+/// `extension`: assignment must (positive) or must not (negative) match a listed
+/// tuple. A `STAR` entry matches any value.
 struct Extension {
     vars: Vec<VarId>,
     positive: bool,
@@ -56,7 +48,7 @@ struct Extension {
     full: Vec<u64>,
     current: Vec<u64>,
     union: Vec<u64>,
-    /// Scratch: support bitset of one (column, value), including wildcards.
+    /// Scratch: support bitset of one (column, value), incl. wildcards.
     tmp: Vec<u64>,
     buf: Vec<i32>,
 }
@@ -129,13 +121,13 @@ impl Propagator for Extension {
 
         if ts_is_zero(current) {
             return if *positive {
-                Err(Inconsistency) // positive table: nothing allowed
+                Err(Inconsistency)
             } else {
-                Ok(()) // negative table: no forbidden tuple reachable
+                Ok(()) // no forbidden tuple reachable
             };
         }
 
-        // Support bitset of (column c, value val) = its own tuples plus wildcards.
+        // Support of (column c, value val) = its own tuples plus wildcards.
         let support_into =
             |tmp: &mut Vec<u64>, supports: &[HashMap<i32, Vec<u64>>], c: usize, val: i32| {
                 tmp.copy_from_slice(&star[c]);
@@ -156,8 +148,7 @@ impl Propagator for Extension {
                 }
             }
         } else {
-            // A value is impossible only if every consistent completion holding
-            // it is forbidden.
+            // Remove a value only if every consistent completion holding it is forbidden.
             let total: u128 = vars.iter().map(|&v| store.size(v) as u128).product();
             for (c, &v) in vars.iter().enumerate() {
                 let completions = total / store.size(v) as u128;
@@ -175,8 +166,8 @@ impl Propagator for Extension {
     }
 }
 
-/// Post a table constraint. `positive` = the tuple must be one of `tuples`;
-/// otherwise it must be none of them. Use [`STAR`] for `*` wildcards.
+/// Post a table constraint. `positive`: tuple must be one of `tuples`; else none.
+/// Use [`STAR`] for `*` wildcards.
 pub fn extension(solver: &mut Solver, vars: &[VarId], tuples: &[Vec<i32>], positive: bool) {
     assert!(
         tuples.iter().all(|t| t.len() == vars.len()),
@@ -280,7 +271,7 @@ impl Propagator for Regular {
             }
         }
 
-        // Filter each layer to values backed by a forward-and-backward arc.
+        // Keep values backed by a forward-and-backward arc.
         for i in 0..n {
             self.buf.clear();
             self.buf.extend(store.values(self.vars[i]));
@@ -323,9 +314,8 @@ pub struct MddArc {
     pub to: usize,
 }
 
-/// A layered MDD: `layers[i]` holds the arcs from layer `i` to layer `i+1`, and
-/// `nodes_per_layer` has `vars.len() + 1` entries. Layer `0` holds the single
-/// root; every node in the final layer is accepting.
+/// A layered MDD: `layers[i]` = arcs from layer `i` to `i+1`; `nodes_per_layer`
+/// has `n+1` entries. Layer 0 is the single root; every final-layer node accepts.
 pub struct Mdd {
     /// Arc lists, one per variable layer.
     pub layers: Vec<Vec<MddArc>>,

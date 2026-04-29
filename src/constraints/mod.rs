@@ -1,9 +1,5 @@
-//! The constraint catalogue.
-//!
-//! Each constraint is a [`Propagator`](crate::Propagator) plus a posting helper
-//! that builds it and registers it with the [`Solver`](crate::Solver). The
-//! catalogue grows phase by phase; Phase 0
-//! ships only the binary disequality needed for the N-Queens milestone.
+//! The constraint catalogue: each constraint is a
+//! [`Propagator`](crate::Propagator) plus a posting helper.
 
 pub mod count;
 pub mod graph;

@@ -1,5 +1,4 @@
-//! Lexicographic ordering (`lex`), inverse channelling (`channel`), and the
-//! `slide` meta-constraint.
+//! `lex` ordering, inverse `channel`, and the `slide` meta-constraint.
 
 use crate::ids::{PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Propagator};
@@ -9,12 +8,8 @@ use crate::store::{Solver, Store};
 // lex
 // ===========================================================================
 
-/// `x <=lex y` (or `<lex y` when `strict`).
-///
-/// Sound, leaf-correct filtering: skip the fixed-and-equal prefix, then at the
-/// first undecided position enforce `x[i] <= y[i]`. Full equality is rejected
-/// for the strict variant once everything is fixed. (Full GAC `lex` with the
-/// α/β pointers is a later upgrade.)
+/// `x <=lex y` (or `<lex y` when `strict`). Sound, leaf-correct: skip the
+/// fixed-equal prefix, enforce `x[i] <= y[i]` at the first undecided position.
 struct Lex {
     x: Vec<VarId>,
     y: Vec<VarId>,
@@ -36,16 +31,14 @@ impl Propagator for Lex {
                 && store.is_fixed(self.y[i])
                 && store.value(self.x[i]) == store.value(self.y[i])
         };
-        // Run to a local fixpoint: enforcing `x[i] <= y[i]` may itself force the
-        // pair equal and extend the settled prefix, and self-changes do not
-        // re-enqueue this propagator.
+        // Local fixpoint: forcing a pair equal can extend the settled prefix.
         let mut i = 0;
         loop {
             while i < n && fixed_equal(store, i) {
                 i += 1;
             }
             if i == n {
-                // Equal on a fully-fixed prefix: only `<=` accepts it.
+                // Fully equal: only `<=` accepts it.
                 return if self.strict {
                     Err(Inconsistency)
                 } else {
@@ -57,11 +50,11 @@ impl Propagator for Lex {
             store.remove_below(self.y[i], store.min(self.x[i]))?;
 
             if fixed_equal(store, i) {
-                i += 1; // forced equal here; the prefix grew, keep going
+                i += 1; // forced equal; prefix grew
             } else if store.max(self.x[i]) < store.min(self.y[i]) {
-                return Ok(()); // strictly less here: entailed regardless of suffix
+                return Ok(()); // strictly less: entailed
             } else {
-                return Ok(()); // still undecided; nothing more to deduce this pass
+                return Ok(()); // still undecided
             }
         }
     }
@@ -112,7 +105,7 @@ impl Propagator for Channel {
             store.remove_above(v, hi)?;
         }
 
-        // x[i] = j requires i in dom(y[j]); symmetrically for y.
+        // x[i] = j requires i in dom(y[j]), and symmetrically.
         for i in 0..n {
             self.buf.clear();
             self.buf.extend(store.values(self.x[i]));

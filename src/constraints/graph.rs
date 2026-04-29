@@ -1,17 +1,13 @@
-//! Graph constraints. Phase 4 ships `circuit`.
+//! Graph constraints: `circuit`.
 
 use crate::ids::{PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::store::{Solver, Store};
 use crate::trail::ReversibleInt;
 
-/// `circuit(succ)`: `succ[i]` is the successor of node `i`, and the successor
-/// relation must form a single Hamiltonian circuit over `0..n`.
-///
-/// Weak-but-correct: forward-checking distinctness (a permutation) plus subtour
-/// elimination via trailed path endpoints. When fixing arc `i -> j` joins the
-/// path ending at `i` with the path starting at `j`, the arc that would close
-/// the combined path early (before it spans all `n` nodes) is forbidden.
+/// `circuit(succ)`: `succ[i]` is node `i`'s successor; the relation must form a
+/// single Hamiltonian circuit over `0..n`. Weak-but-correct: forward-checking
+/// distinctness plus subtour elimination via trailed path endpoints.
 struct Circuit {
     succ: Vec<VarId>,
     /// End node of the path that currently starts at node `i`.
@@ -70,7 +66,7 @@ impl Propagator for Circuit {
             store.remove(self.succ[i], i as i32)?;
         }
 
-        // Forward-checking distinctness (a successor permutation).
+        // Forward-checking distinctness.
         for i in 0..n {
             if store.is_fixed(self.succ[i]) {
                 let val = store.value(self.succ[i]);
@@ -96,7 +92,7 @@ impl Propagator for Circuit {
                 store.rev_set(self.linked[i], 1);
 
                 if combined < n as i32 {
-                    // Closing d -> o now would make a subtour: forbid it.
+                    // Closing d -> o now would make a subtour.
                     store.remove(self.succ[d], o as i32)?;
                 }
             }

@@ -1,17 +1,4 @@
-//! `qayd` — yet another constraint-programming solver.
-//!
-//! # Phase 0 — the kernel
-//!
-//! This phase provides the foundation everything else builds on:
-//!
-//! - [`ids`] — `VarId`, `PropId`, `ValId` newtypes.
-//! - [`trail`] — the trailed state manager and `ReversibleInt`.
-//! - [`domain`] — the trailed sparse-set integer domain.
-//! - [`store`] — the [`Store`] (domains + trail + scheduling) and [`Solver`].
-//! - [`propagator`] — the [`Propagator`] trait and the [`Inconsistency`] type.
-//! - [`search`] — DFS with first-fail branching.
-//! - [`oracle`] — a brute-force satisfaction oracle for testing.
-//! - [`constraints`] — the constraint catalogue (binary disequality so far).
+//! `qayd` — a constraint-programming solver.
 //!
 //! ## Example: count the solutions of 4-Queens
 //!

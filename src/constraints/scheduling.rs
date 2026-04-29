@@ -1,10 +1,5 @@
-//! Scheduling constraints (Phase 4, weak-but-correct): `noOverlap`,
-//! `cumulative` (time-tabling), `binPacking` (Shaw load pruning), and
-//! `knapsack` (a pair of linear constraints).
-//!
-//! Durations, heights, sizes, and capacities are fixed integers here; variable
-//! durations and the stronger filters (edge-finding, Shaw's full bound) are
-//! Phase 6 upgrades.
+//! Scheduling constraints: `noOverlap`, `cumulative` (time-tabling),
+//! `binPacking` (Shaw load pruning), `knapsack` (two linear constraints).
 
 use crate::constraints::linear::{linear, Relation};
 use crate::ids::{PropId, VarId};
@@ -87,11 +82,7 @@ pub fn no_overlap(solver: &mut Solver, starts: &[VarId], durations: &[i64]) {
 // cumulative (time-tabling)
 // ===========================================================================
 
-/// At every time point the total height of running tasks must not exceed
-/// `capacity`. Two filters: energetic overload checking (sound failure
-/// detection over windows) and time-tabling (build the mandatory-part profile
-/// and forbid starts that would push any covered time over capacity). Full
-/// edge-finding bound adjustment remains a future upgrade.
+/// At every time point the total height of running tasks must not exceed `capacity`.
 struct Cumulative {
     starts: Vec<VarId>,
     dur: Vec<i64>,
@@ -118,13 +109,12 @@ impl Propagator for Cumulative {
             return Ok(());
         }
 
-        // Iterate to a local fixpoint: this propagator's own filtering can fix
-        // tasks, and self-changes do not re-enqueue it, so a single pass over a
-        // once-built profile would miss overloads involving a just-fixed task.
+        // Local fixpoint: self-changes don't re-enqueue, so one pass could miss
+        // overloads involving a just-fixed task.
         loop {
             let before: usize = (0..n).map(|i| store.size(self.starts[i])).sum();
 
-            // Snapshot earliest start, latest completion, and energy.
+            // Snapshot est, lct, energy.
             self.est.clear();
             self.lct.clear();
             self.energy.clear();
@@ -135,8 +125,7 @@ impl Propagator for Cumulative {
                 self.energy.push(self.height[i] * self.dur[i]);
             }
 
-            // Energetic overload checking (sound, O(n^2)): if the tasks confined
-            // to a window [L, U) carry more energy than capacity*(U-L), fail.
+            // Energetic overload check: window [L, U) energy > capacity*(U-L) fails.
             let mut by_est: Vec<usize> = (0..n).collect();
             by_est.sort_unstable_by(|&a, &b| self.est[b].cmp(&self.est[a]));
             for u in 0..n {
@@ -152,9 +141,8 @@ impl Propagator for Cumulative {
                 }
             }
 
-            // Edge-finding: if Omega ∪ {i} cannot fit in [est, U] then i must end
-            // after Omega, so it cannot start until Omega's non-parallelisable
-            // "rest" energy is done. Sound (overload ruled out); oracle-validated.
+            // Edge-finding: if Omega ∪ {i} can't fit in [est, U], i ends after Omega,
+            // so it can't start until Omega's non-parallelisable rest energy is done.
             let mut by_lct: Vec<usize> = (0..n).collect();
             by_lct.sort_unstable_by(|&a, &b| self.lct[a].cmp(&self.lct[b]));
             let mut lb = self.est.clone();
@@ -207,8 +195,7 @@ impl Propagator for Cumulative {
                         return Err(Inconsistency);
                     }
                 }
-                // Forbid starts whose window would exceed capacity against the
-                // other tasks' mandatory parts.
+                // Forbid starts whose window exceeds capacity vs others' mandatory parts.
                 for i in 0..n {
                     let hi = self.height[i];
                     let mand_start = store.max(self.starts[i]) as i64;
@@ -235,7 +222,7 @@ impl Propagator for Cumulative {
 
             let after: usize = (0..n).map(|i| store.size(self.starts[i])).sum();
             if after == before {
-                break; // no domain changed: fixpoint reached
+                break;
             }
         }
         Ok(())
@@ -265,14 +252,10 @@ pub fn cumulative(
     }));
 }
 
-// ---------------------------------------------------------------------------
-// cumulative with variable durations, heights, and/or a variable capacity.
-//
-// Weak-but-correct time-tabling: the profile sums the *minimum* heights over
-// mandatory parts `[latest_start, earliest_start + min_dur)`. Pruning uses the
-// loosest capacity (`cap.max`) and the least occupation (`min_dur`); the peak
-// min-usage raises `cap.min`. Sound; strictly weaker than the fixed-height
-// edge-finder above.
+// cumulative with variable durations, heights, and/or capacity.
+// Time-tabling: profile sums min heights over mandatory parts
+// [latest_start, earliest_start + min_dur); pruning uses cap.max and min_dur,
+// peak min-usage raises cap.min. Weaker than the fixed-height edge-finder above.
 // TODO(strong): variable-resource edge-finding / energetic reasoning.
 
 struct CumulativeVar {
@@ -318,7 +301,7 @@ impl Propagator for CumulativeVar {
             let before = self.state(store);
             let cap_max = store.max(self.capacity) as i64;
 
-            // Time horizon over all tasks (using the longest possible durations).
+            // Time horizon over all tasks (longest possible durations).
             let mut hmin = i64::MAX;
             let mut hmax = i64::MIN;
             for i in 0..n {
@@ -332,8 +315,7 @@ impl Propagator for CumulativeVar {
             self.profile.clear();
             self.profile.resize(horizon, 0);
 
-            // Profile of minimum heights over mandatory parts
-            // [latest_start, earliest_start + min_dur).
+            // Profile of min heights over mandatory parts.
             for i in 0..n {
                 let h_lo = store.min(self.height[i]) as i64;
                 if h_lo == 0 {
@@ -346,7 +328,7 @@ impl Propagator for CumulativeVar {
                 }
             }
 
-            // Overload, and tighten the capacity lower bound to the peak.
+            // Overload check; tighten cap.min up to the peak.
             let peak = self.profile.iter().copied().max().unwrap_or(0);
             if peak > cap_max {
                 return Err(Inconsistency);
@@ -361,7 +343,7 @@ impl Propagator for CumulativeVar {
                 let mand_start = store.max(self.starts[i]) as i64;
                 let mand_end = store.min(self.starts[i]) as i64 + d_lo;
 
-                // During its mandatory part, h_i ≤ cap_max − (others' min usage).
+                // During mandatory part, h_i ≤ cap_max − others' min usage.
                 if mand_end > mand_start {
                     let mut slack = i64::MAX;
                     for t in mand_start..mand_end {
@@ -373,8 +355,7 @@ impl Propagator for CumulativeVar {
                     }
                 }
 
-                // Forbid starts whose least occupation `[s, s+min_dur)` would
-                // still exceed cap_max against the others' mandatory minimums.
+                // Forbid starts whose least occupation [s, s+min_dur) exceeds cap_max.
                 if h_lo > 0 && d_lo > 0 {
                     self.buf.clear();
                     self.buf.extend(store.values(self.starts[i]));
@@ -429,8 +410,7 @@ pub fn cumulative_var(
 // binPacking (Shaw, load-based)
 // ===========================================================================
 
-/// Each item is assigned to a bin (`items[i]` = bin index); the total size in
-/// each bin must not exceed its capacity.
+/// `items[i]` = bin index; total size per bin must not exceed its capacity.
 struct BinPacking {
     items: Vec<VarId>,
     sizes: Vec<i64>,
@@ -453,7 +433,7 @@ impl Propagator for BinPacking {
             store.remove_above(it, (nbins - 1) as i32)?;
         }
 
-        // Committed load = sizes of items already fixed to each bin.
+        // Committed load = sizes of items fixed to each bin.
         self.load.clear();
         self.load.resize(nbins, 0);
         for (i, &it) in self.items.iter().enumerate() {
@@ -503,7 +483,6 @@ pub fn bin_packing(solver: &mut Solver, items: &[VarId], sizes: &[i64], capaciti
 
 /// Post `knapsack`: \( \sum_i \texttt{weights}[i] \cdot \texttt{vars}[i] \;\texttt{weight\_rel}\; \texttt{weight\_limit} \)
 /// and \( \sum_i \texttt{profits}[i] \cdot \texttt{vars}[i] \;\texttt{profit\_rel}\; \texttt{profit\_limit} \).
-/// Reuses linear bounds propagation.
 #[allow(clippy::too_many_arguments)]
 pub fn knapsack(
     solver: &mut Solver,

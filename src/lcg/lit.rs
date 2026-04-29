@@ -1,29 +1,17 @@
-//! Boolean atoms and literals over integer variables (the LCG literal layer).
+//! Boolean atom numbering and literal packing for the LCG layer.
 //!
-//! Each integer variable `x` with initial domain `[l, u]` is given two eager
-//! families of Boolean atoms:
-//!
-//! - **order atoms** `[x ≥ k]` for `k ∈ (l, u]` — bounds,
-//! - **equality atoms** `[x = v]` for `v ∈ [l, u]` — membership (holes).
-//!
-//! The endpoints fold to constants: `[x ≥ l] ≡ ⊤` and `[x ≥ u+1] ≡ ⊥`, and an
-//! equality outside `[l, u]` is `⊥`. Atoms are never *stored* as truth values —
-//! their truth is a pure view over the trailed [`Domain`](crate::domain::Domain)
-//! (see [`view`](crate::lcg::view)) — this module only owns the *naming*: a flat,
-//! contiguous numbering of atoms and the maps in both directions.
-//!
-//! A [`Lit`] is an atom plus a sign, packed into a `u32` (atom in the high bits,
-//! sign in bit 0) so it can index watch lists directly.
+//! Per variable `x` over `[l, u]`: order atoms `[x ≥ k]` (`k ∈ (l, u]`) and
+//! equality atoms `[x = v]` (`v ∈ [l, u]`). Endpoints fold to constants. Atom
+//! truth is a view over the domain (see [`view`](crate::lcg::view)); this module
+//! owns only the naming.
 
 use crate::ids::VarId;
 
 /// A Boolean atom, identified by a flat index assigned by [`AtomTable`].
 pub type Atom = u32;
 
-/// A Boolean literal: an [`Atom`] with a sign. Positive means "the atom holds".
-///
-/// Packed as `atom << 1 | sign`, with `sign == 0` for positive. The packing
-/// keeps `lit` and `¬lit` adjacent, so `code()` is a dense key for watch arrays.
+/// A Boolean literal: an [`Atom`] with a sign, packed as `atom << 1 | sign`
+/// (`sign == 0` positive). `lit` and `¬lit` are adjacent, so `code()` keys watch arrays.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Lit(u32);
 
@@ -102,18 +90,16 @@ struct VarAtoms {
 
 /// Owns the atom numbering: var → atom ranges, and atom → [`AtomKind`].
 ///
-/// Built once from the store's *initial* domains, before search. Atoms are
-/// allocated over the full integer span `[min, max]` of each variable (holes in
-/// a `new_var_set` domain still get equality atoms — permanently false from the
-/// start, which the view reports correctly via `contains`).
+/// Built once from initial domains over the full span `[min, max]`; holes still
+/// get (permanently false) equality atoms.
 pub struct AtomTable {
     vars: Vec<VarAtoms>,
     decode: Vec<AtomKind>,
 }
 
 impl AtomTable {
-    /// Allocate atoms for every variable, reading initial bounds from `bounds`
-    /// (`bounds(var) == (min, max)` of the variable's starting domain).
+    /// Allocate atoms for every variable; `bounds(var) == (min, max)` of its
+    /// starting domain.
     pub fn build(num_vars: usize, bounds: impl Fn(VarId) -> (i32, i32)) -> AtomTable {
         let mut vars = Vec::with_capacity(num_vars);
         let mut decode = Vec::new();

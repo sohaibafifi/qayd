@@ -1,18 +1,14 @@
-//! Trail-based state manager.
+//! Trail-based state manager: reversible ints + undo log + per-level marks.
 //!
-//! A flat arena of reversible integers plus an undo log and per-level marks.
-//! Every piece of mutable solver state that must be restored on backtrack is a
-//! [`ReversibleInt`] living here. No `unsafe`, no boxed closures: undoing a
-//! level just replays `(index, old_value)` entries in reverse.
+//! Mutable solver state that must survive backtrack lives here as a
+//! [`ReversibleInt`]; `pop_level` replays `(index, old_value)` entries.
 
-/// Handle to a reversible integer stored in a [`Trail`].
-///
-/// Cheap to copy; it is only an index into [`Trail::values`].
+/// Handle to a reversible integer in a [`Trail`] (an index into `values`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ReversibleInt(u32);
 
 impl ReversibleInt {
-    /// The underlying arena index. Exposed for debugging/assertions only.
+    /// The underlying arena index (debugging/assertions only).
     #[inline]
     pub fn raw(self) -> u32 {
         self.0
@@ -22,7 +18,6 @@ impl ReversibleInt {
 /// State manager: reversible ints + undo log + level marks.
 #[derive(Default)]
 pub struct Trail {
-    /// Current value of every reversible int, indexed by `ReversibleInt`.
     values: Vec<i32>,
     /// `(index, old_value)` entries to replay on `pop_level`.
     log: Vec<(u32, i32)>,
@@ -36,8 +31,8 @@ impl Trail {
         Self::default()
     }
 
-    /// Allocate a new reversible int initialised to `v`. Allocation is *not*
-    /// reversible — do it at the root, before search begins.
+    /// Allocate a reversible int set to `v`. Not reversible — do it at the
+    /// root, before search.
     pub fn new_int(&mut self, v: i32) -> ReversibleInt {
         let i = self.values.len() as u32;
         self.values.push(v);
@@ -50,8 +45,7 @@ impl Trail {
         self.values[r.0 as usize]
     }
 
-    /// Write a value, logging the previous one so it can be undone. A write
-    /// that does not change the value is not logged (keeps the log tight).
+    /// Write a value, logging the old one. No-op writes are not logged.
     #[inline]
     pub fn set(&mut self, r: ReversibleInt, v: i32) {
         let i = r.0 as usize;
@@ -78,8 +72,7 @@ impl Trail {
         }
     }
 
-    /// Current search depth (number of open levels). Used by trail-integrity
-    /// assertions in search and tests.
+    /// Current search depth (number of open levels).
     #[inline]
     pub fn level(&self) -> usize {
         self.levels.len()

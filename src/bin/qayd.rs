@@ -1,11 +1,4 @@
-//! `qayd` CLI.
-//!
-//! `qayd [-v] [-t SECONDS] <instance.xml[.lzma|.xz]>`
-//!
-//! - `-v` / `--verbose` — emit `c` comment lines (model size, improving bounds,
-//!   search statistics, wall-clock time).
-//! - `-t` / `--time SECONDS` — stop after a time budget, reporting the best
-//!   solution found so far. Ctrl+C does the same on demand.
+//! `qayd` CLI: `qayd [-v] [-t SECONDS] <instance.xml[.lzma|.xz]>`.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -88,7 +81,6 @@ fn main() {
         usage();
     }
 
-    // Shared stop flag, set by Ctrl+C and (optionally) the time-limit thread.
     let stop = Arc::new(AtomicBool::new(false));
     {
         let s = stop.clone();

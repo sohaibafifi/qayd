@@ -1,10 +1,8 @@
-//! Trailed sparse-set integer domain (MiniCP design).
+//! Trailed sparse-set integer domain.
 //!
-//! Values are offset-shifted into `[0, capacity)`. Membership is "the value's
-//! position in `dense` is `< size`". The elegant part: the `dense`/`sparse`
-//! permutation is **never undone** — restoring the trailed `size` (plus `min`
-//! and `max`) on backtrack restores membership regardless of how elements were
-//! swapped during removals. Only `size`, `min`, `max` live on the trail.
+//! Membership is "position in `dense` < size". The `dense`/`sparse` permutation
+//! is never undone; only `size`/`min`/`max` are trailed, and restoring them
+//! restores membership.
 
 use crate::propagator::Inconsistency;
 use crate::trail::{ReversibleInt, Trail};
@@ -13,16 +11,12 @@ use crate::trail::{ReversibleInt, Trail};
 pub struct Domain {
     /// Value `v` maps to internal index `(v - offset) as u32`.
     offset: i32,
-    /// `dense[p]` is the internal index of the value at position `p`. Present
-    /// iff `p < size`.
+    /// Internal index at each position; present iff position `< size`.
     dense: Vec<u32>,
-    /// `sparse[i]` is the position of internal index `i` in `dense`.
+    /// Position of each internal index in `dense`.
     sparse: Vec<u32>,
-    /// Number of present values.
     size: ReversibleInt,
-    /// Current minimum present value.
     min: ReversibleInt,
-    /// Current maximum present value.
     max: ReversibleInt,
 }
 
@@ -43,8 +37,7 @@ impl Domain {
         }
     }
 
-    /// Domain over an explicit set of values. Duplicates are ignored; the set
-    /// must be non-empty. Holes between `min` and `max` are simply absent.
+    /// Domain over an explicit non-empty value set; duplicates ignored.
     pub fn new_set(values: &[i32], trail: &mut Trail) -> Self {
         assert!(!values.is_empty(), "empty domain set");
         let mut vals: Vec<i32> = values.to_vec();
@@ -60,7 +53,6 @@ impl Domain {
             present[(v - lo) as usize] = true;
         }
 
-        // Present internal indices fill positions `[0, size)`, absent ones the rest.
         let mut dense = vec![0u32; cap];
         let mut front = 0usize;
         let mut back = size;
@@ -123,8 +115,7 @@ impl Domain {
         i < self.dense.len() && (self.sparse[i] as usize) < self.size(trail)
     }
 
-    /// Iterate the present values (in arbitrary order). Borrows only the
-    /// domain; `size`/`offset` are copied out, so it does not hold the trail.
+    /// Iterate present values in arbitrary order.
     pub fn values<'a>(&'a self, trail: &Trail) -> impl Iterator<Item = i32> + 'a {
         let size = self.size(trail);
         let offset = self.offset;
@@ -141,8 +132,8 @@ impl Domain {
         self.sparse[ib as usize] = a as u32;
     }
 
-    /// Remove `val`. Returns whether the domain changed. Removing an absent
-    /// value is a no-op. The caller checks for wipeout via [`Domain::size`].
+    /// Remove `val`; returns whether the domain changed. Absent value is a
+    /// no-op. Caller detects wipeout via [`Domain::size`].
     pub fn remove(&mut self, val: i32, trail: &mut Trail) -> bool {
         if !self.contains(val, trail) {
             return false;
@@ -150,8 +141,6 @@ impl Domain {
         let i = (val - self.offset) as usize;
         let pos = self.sparse[i] as usize;
         let last = self.size(trail) - 1;
-        // Move `val` to the last present slot and shrink: it leaves the set,
-        // but the permutation itself is never undone.
         self.swap(pos, last);
         trail.set(self.size, last as i32);
         if last > 0 {
@@ -183,7 +172,6 @@ impl Domain {
     /// Remove every value `< bound`. Returns whether the domain changed.
     pub fn remove_below(&mut self, bound: i32, trail: &mut Trail) -> bool {
         let mut changed = false;
-        // Walk the value range; `remove` is a no-op for absent values.
         let mut v = self.min(trail);
         while v < bound {
             if self.remove(v, trail) {

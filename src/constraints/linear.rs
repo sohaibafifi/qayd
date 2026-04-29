@@ -1,23 +1,11 @@
-//! Linear (weighted-sum) constraints — the workhorse, reused throughout the
-//! catalogue.
-//!
-//! The core propagator is \( \sum_i a_i x_i \le c \) with bounds propagation.
-//! Everything else is built from it:
-//!
-//! - \( \ge \) / \( > \) / \( < \) are sign/offset rewrites of \( \le \).
-//! - \( = \) has a dedicated both-sided `LinearEq` propagator (tighter per call
-//!   than posting \( \le c \) and \( \ge c \) separately).
-//! - \( \ne \) gets its own (weak) propagator that only fires near a full
-//!   assignment.
-//!
-//! All arithmetic is done in `i64` so sums of `i32` terms cannot overflow.
+//! Linear (weighted-sum) constraints. All arithmetic in `i64` so sums of `i32`
+//! terms cannot overflow.
 
 use crate::ids::{PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::store::{Premise, Solver, Store};
 
-/// Index sentinel for "exclude no term" when building a whole-constraint reason
-/// (i.e. a conflict, where every term contributes).
+/// Sentinel for "exclude no term" (conflict reason: every term contributes).
 const NO_SKIP: usize = usize::MAX;
 
 /// Comparison operator for a linear constraint.
@@ -37,12 +25,12 @@ pub enum Relation {
     Gt,
 }
 
-/// \( \sum_i a_i x_i \le c \), with bounds propagation run to a local fixpoint per call.
+/// \( \sum_i a_i x_i \le c \), bounds propagation to a local fixpoint per call.
 struct LinearLeq {
     coeffs: Vec<i64>,
     vars: Vec<VarId>,
     c: i64,
-    /// Reused scratch for per-term minimum contributions (no per-call alloc).
+    /// Reused scratch for per-term minimum contributions.
     term_min: Vec<i64>,
 }
 
@@ -57,13 +45,8 @@ impl LinearLeq {
         }
     }
 
-    /// The premises that fix the *minimum* of `∑ a_j x_j` over every term but
-    /// `skip`: each term's near bound (`[x_j ≥ min]` for `a_j > 0`, `[x_j ≤ max]`
-    /// for `a_j < 0`). Their conjunction entails `∑_{j≠skip} a_j x_j ≥ sum_min −
-    /// term_min[skip]` — the reason a positive term's upper bound (or a negative
-    /// term's lower bound) is forced, and the reason `sum_min > c` is a conflict
-    /// (with `skip = NO_SKIP`). Tight: only the binding side of the other terms,
-    /// never `skip`'s own bound and never interior holes.
+    /// Near bound of every term but `skip` (`x_j ≥ min` if `a_j > 0`, else
+    /// `x_j ≤ max`); entails `∑_{j≠skip} a_j x_j ≥ sum_min − term_min[skip]`.
     fn min_side(&self, store: &Store, skip: usize) -> Vec<Premise> {
         let mut why = Vec::new();
         for (j, (&a, &v)) in self.coeffs.iter().zip(&self.vars).enumerate() {
@@ -94,8 +77,6 @@ impl Propagator for LinearLeq {
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
-        // Iterate to a local fixpoint: pruning one variable tightens the slack
-        // for the others, and self-changes do not re-enqueue this propagator.
         loop {
             let mut sum_min: i64 = 0;
             let mut sum_max: i64 = 0;
@@ -117,11 +98,10 @@ impl Propagator for LinearLeq {
             }
 
             if sum_min > self.c {
-                // The near bounds of every term already overshoot c.
                 return Err(store.fail_because(self.min_side(store, NO_SKIP)));
             }
             if sum_max <= self.c {
-                return Ok(()); // entailed: no value can violate the bound
+                return Ok(()); // entailed
             }
 
             let mut changed = false;
@@ -129,8 +109,6 @@ impl Propagator for LinearLeq {
                 if a == 0 {
                     continue;
                 }
-                // a_i*x_i <= c - (sum_min - term_min_i), explained by the near
-                // bounds of the *other* terms (sum_min minus this term's share).
                 let allowed = self.c - (sum_min - self.term_min[idx]);
                 if a > 0 {
                     let bound = clamp_i32(floor_div(allowed, a));
@@ -154,10 +132,7 @@ impl Propagator for LinearLeq {
     }
 }
 
-/// \( \sum_i a_i x_i = c \), with both-sided bounds propagation run to a local
-/// fixpoint. Stronger per call than posting \( \le c \) and \( \ge c \) separately
-/// (one pass tightens from both directions instead of waking two propagators in
-/// turn).
+/// \( \sum_i a_i x_i = c \), both-sided bounds propagation to a local fixpoint.
 struct LinearEq {
     coeffs: Vec<i64>,
     vars: Vec<VarId>,
@@ -178,9 +153,8 @@ impl LinearEq {
         }
     }
 
-    /// Premises fixing the *minimum* of the other terms (near bound of each):
-    /// entail `∑_{j≠skip} a_j x_j ≥ sum_min − term_min[skip]`, the reason for an
-    /// upper limit on `a_skip·x_skip` and for the `sum_min > c` conflict.
+    /// Near bound of every term but `skip`; entails
+    /// `∑_{j≠skip} a_j x_j ≥ sum_min − term_min[skip]`.
     fn min_side(&self, store: &Store, skip: usize) -> Vec<Premise> {
         let mut why = Vec::new();
         for (j, (&a, &v)) in self.coeffs.iter().zip(&self.vars).enumerate() {
@@ -202,9 +176,8 @@ impl LinearEq {
         why
     }
 
-    /// Premises fixing the *maximum* of the other terms (far bound of each):
-    /// entail `∑_{j≠skip} a_j x_j ≤ sum_max − term_max[skip]`, the reason for a
-    /// lower limit on `a_skip·x_skip` and for the `sum_max < c` conflict.
+    /// Far bound of every term but `skip`; entails
+    /// `∑_{j≠skip} a_j x_j ≤ sum_max − term_max[skip]`.
     fn max_side(&self, store: &Store, skip: usize) -> Vec<Premise> {
         let mut why = Vec::new();
         for (j, (&a, &v)) in self.coeffs.iter().zip(&self.vars).enumerate() {
@@ -263,9 +236,7 @@ impl Propagator for LinearEq {
                 if a == 0 {
                     continue;
                 }
-                // a_i*x_i must lie in [tlo, thi]: tlo comes from the other terms'
-                // maximum (max_side), thi from their minimum (min_side). The sign
-                // of a_i decides which becomes x_i's lower vs upper bound.
+                // a_i*x_i in [tlo, thi]; sign of a_i decides x_i's lo vs hi bound.
                 let tlo = self.c - (sum_max - self.term_max[i]);
                 let thi = self.c - (sum_min - self.term_min[i]);
                 let (lo, hi) = if a > 0 {
@@ -273,7 +244,6 @@ impl Propagator for LinearEq {
                 } else {
                     (ceil_div(thi, a), floor_div(tlo, a))
                 };
-                // Pair each applied bound with the side that derived it.
                 let (lo_why, hi_why) = if a > 0 {
                     (self.max_side(store, i), self.min_side(store, i))
                 } else {
@@ -340,7 +310,7 @@ impl Propagator for LinearNeq {
                 let idx = free.unwrap();
                 let a = self.coeffs[idx];
                 if a != 0 {
-                    // a*x = c - fixed_sum  =>  x forbidden only if it is integral.
+                    // a*x = c - fixed_sum: forbid x only if the quotient is integral.
                     let rem = self.c - fixed_sum;
                     if rem % a == 0 {
                         let forbidden = rem / a;
@@ -412,7 +382,7 @@ pub fn linear(solver: &mut Solver, coeffs: &[i64], vars: &[VarId], rel: Relation
     }
 }
 
-/// A deterministic 0/1 knapsack instance, shared by the test below.
+/// Deterministic 0/1 knapsack instance for the test.
 #[cfg(test)]
 fn knapsack_instance(n: usize) -> (Vec<i64>, Vec<i64>, i64) {
     let w: Vec<i64> = (0..n).map(|i| 1 + (i as i64 * 7) % 13).collect();
@@ -432,10 +402,7 @@ mod tests {
     use super::*;
     use crate::maximize;
 
-    /// Tight linear reasons must preserve a *proven* optimum: optimisation
-    /// proves optimality by driving the bounded problem to UNSAT, so a wrong
-    /// (too-strong) reason would either prune the optimum or fail the proof.
-    /// This 18-item 0/1 knapsack has brute-forced optimum 122.
+    /// Tight reasons must preserve a proven optimum. 18-item knapsack, optimum 122.
     #[test]
     fn knapsack_18_tight_reasons_stay_optimal() {
         let n = 18usize;

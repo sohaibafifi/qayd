@@ -1,8 +1,5 @@
-//! Brute-force satisfaction oracle for testing.
-//!
-//! Enumerate the full Cartesian product of small per-variable domains and keep
-//! the assignments a predicate accepts. The solver's solution set must match
-//! this exactly — the single most valuable correctness tool in the project.
+//! Brute-force satisfaction oracle for testing: enumerate the Cartesian
+//! product of small domains and keep the assignments a predicate accepts.
 
 /// Every assignment in the Cartesian product of `domains` that satisfies `pred`.
 pub fn solutions(domains: &[Vec<i32>], mut pred: impl FnMut(&[i32]) -> bool) -> Vec<Vec<i32>> {

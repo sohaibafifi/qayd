@@ -1,15 +1,9 @@
-//! CDCL search drivers — the loops the public search entry points are built on.
+//! CDCL search drivers.
 //!
-//! [`Cdcl::enumerate`] is the CSP driver: a depth-first search with
-//! **chronological** backtracking — decide a variable (dom/wdeg, with
-//! solution-guided phase saving), propagate to a fixpoint, and on a full
-//! assignment report it then undo the deepest decision and forbid the value
-//! just tried, until the search space is exhausted. It deliberately forgoes
-//! clause learning, which is unsound for *enumerating* every solution.
-//! [`Cdcl::optimize`] is the COP
-//! driver: it interleaves complete proving epochs (which assert a tighter
-//! objective bound after each incumbent and ultimately prove optimality) with
-//! large-neighbourhood-search bursts (which drive the incumbent down fast).
+//! [`Cdcl::enumerate`] is the CSP driver: chronological-backtracking DFS, no
+//! clause learning (which is unsound for enumerating every solution).
+//! [`Cdcl::optimize`] is the COP driver: complete proving epochs interleaved
+//! with large-neighbourhood-search bursts.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -25,7 +19,7 @@ const LNS_BURST: usize = 8;
 /// Per-move conflict budget for an LNS neighbourhood search.
 const LNS_BUDGET: u64 = 500;
 
-/// A tiny deterministic xorshift64 PRNG (reproducible runs, no dependency).
+/// Deterministic xorshift64 PRNG.
 struct Rng(u64);
 
 impl Rng {
@@ -50,10 +44,8 @@ impl Rng {
 }
 
 impl Cdcl<'_> {
-    /// Branching heuristic: the unfixed variable in `vars` minimising
-    /// `size / (wdeg + activity)`, or `None` if all are fixed. Combines dom/wdeg
-    /// (FD-failure signal) with VSIDS activity (clause-conflict signal), so
-    /// learned-clause conflicts — the bulk under CDCL — steer branching too.
+    /// Branching heuristic: unfixed variable minimising `size / (wdeg + activity)`
+    /// (dom/wdeg combined with VSIDS activity), or `None` if all fixed.
     fn select_var(&self, vars: &[VarId]) -> Option<VarId> {
         let weights = self.solver.weights();
         let mut best: Option<VarId> = None;
@@ -87,40 +79,25 @@ impl Cdcl<'_> {
         }
     }
 
-    /// Restart (backjump to the root) once the conflicts since the last restart
-    /// reach `limit`, then grow `limit` geometrically. Learned clauses and saved
-    /// phases survive, so the re-search reuses everything learned while escaping
-    /// an unproductive region. The level-0 objective bound (if any) also
-    /// survives, since it lives at the root.
+    /// Restart to the root once conflicts since the last restart reach `limit`,
+    /// then grow `limit` by ×1.5. Learned clauses and saved phases survive.
     fn maybe_restart(&mut self, last: &mut u64, limit: &mut u64) {
         if self.conflicts - *last >= *limit {
             self.backjump_to(0);
-            // At the root: a safe point to forget the worst learned clauses.
             self.maybe_reduce_db();
             *last = self.conflicts;
-            *limit += *limit / 2; // geometric ×1.5
+            *limit += *limit / 2;
         }
     }
 
-    /// Enumerate solutions over `vars`, invoking `on_solution` for each full
-    /// assignment and stopping early on [`SearchControl::Stop`] or when `stop`
-    /// is set. Returns the search statistics.
+    /// Enumerate solutions over `vars`, invoking `on_solution` per full
+    /// assignment and stopping early on [`SearchControl::Stop`] or when `stop` is set.
     ///
-    /// Enumeration uses plain depth-first search with **chronological**
-    /// backtracking: propagate to a fixpoint, branch on the smallest domain
-    /// (toward the saved phase), and on a dead end or a reported solution undo
-    /// the deepest decision `x = v` and forbid `v` for `x`. Clause learning and
-    /// non-chronological backjumping — the core of the optimization driver — are
-    /// deliberately *not* used here. A 1-UIP backjump is sound for finding *one*
-    /// solution (it may leap over a region a learned clause proves infeasible)
-    /// but drops solutions when *enumerating*: the clauses learned while blocking
-    /// already-found assignments are not entailed by the constraints, so
-    /// resolving against them can jump past sibling branches that still hold
-    /// unseen solutions (queens-7 counted 32, not 40). Propagation still prunes
-    /// every dead end; only the cross-solution learning is dropped.
-    // TODO(strong): a sound CDCL enumeration (e.g. restart-per-solution with
-    // blocking clauses kept out of conflict analysis, or dual reasoning) would
-    // prune harder than chronological DFS.
+    /// Plain chronological-backtracking DFS. Clause learning is deliberately not
+    /// used: resolving against the blocking clauses (not entailed by the
+    /// constraints) can drop sibling solutions when enumerating.
+    // TODO(strong): a sound CDCL enumeration (restart-per-solution with blocking
+    // clauses kept out of analysis, or dual reasoning) would prune harder.
     pub fn enumerate<F>(
         &mut self,
         vars: &[VarId],
@@ -134,7 +111,7 @@ impl Cdcl<'_> {
         if !self.init() {
             stats.failures = self.conflicts;
             stats.learned_lits = self.learned_lits;
-            return stats; // root is unsatisfiable
+            return stats; // root unsatisfiable
         }
         let mut phase: Vec<Option<i32>> = vec![None; self.solver.store.num_vars()];
         loop {
@@ -144,7 +121,7 @@ impl Cdcl<'_> {
             match self.propagate() {
                 Ok(()) => match self.select_var(vars) {
                     None => {
-                        // Full assignment: record the phase and report it.
+                        // Full assignment.
                         for &v in vars {
                             phase[v.index()] = Some(self.solver.store.value(v));
                         }
@@ -174,11 +151,8 @@ impl Cdcl<'_> {
         stats
     }
 
-    /// Undo the deepest decision `x = v` and forbid `v` for `x` at the now-current
-    /// level (the chronological DFS "try the next value"). If removing `v` empties
-    /// `x`, there is nothing left to try at this level, so keep climbing. Returns
-    /// `false` once every decision has been undone — the search space is
-    /// exhausted.
+    /// Undo the deepest decision `x = v` and forbid `v` for `x` (DFS "try the next
+    /// value"); climb if that empties `x`. Returns `false` once the space is exhausted.
     fn backtrack_and_forbid(&mut self) -> bool {
         loop {
             let d = self.decision_level();
@@ -187,18 +161,11 @@ impl Cdcl<'_> {
             }
             let dec = self.deepest_decision();
             self.backjump_to(d - 1);
-            // Forbid the explored value at the shallower level by asserting the
-            // decision's negation. Going through `assign` (rather than mutating
-            // the domain directly) records it on the trail at this level *and*
-            // drains the resulting event, so the next decision is not mistaken
-            // for this forced literal. The assignment is trailed, so it is undone
-            // only if the search later backtracks above this level — exactly the
-            // DFS sibling-pruning we want.
+            // Assert the decision's negation via `assign` (not a direct domain
+            // edit) so it is trailed at this level and its event is drained.
             match self.assign(dec.negate(), Reason::Decision) {
                 Ok(()) => return true,
-                // Forbidding the value emptied the variable: nothing else to try
-                // at this level, so climb and try the next level up.
-                Err(_) => continue,
+                Err(_) => continue, // emptied the variable: climb
             }
         }
     }
@@ -222,10 +189,8 @@ impl Cdcl<'_> {
         }
     }
 
-    /// Record a full assignment as the new incumbent, save its phase, report it,
-    /// and assert a strictly-better objective bound globally (a level-0 clause).
-    /// Returns `false` when no better value is possible — the incumbent is then
-    /// proven optimal and search should stop. Backjumps to the root.
+    /// Record a new incumbent, report it, and assert a strictly-better objective
+    /// bound at level 0. Returns `false` when the incumbent is proven optimal.
     #[allow(clippy::too_many_arguments)]
     fn accept_solution<F: FnMut(i32)>(
         &mut self,
@@ -249,24 +214,17 @@ impl Cdcl<'_> {
         on_improve(value);
 
         let Some(bound) = self.improvement_lit(obj, value, minimizing) else {
-            return false; // no better value possible: optimal
+            return false; // optimal
         };
         self.backjump_to(0);
-        // The objective bound must persist (never deleted) to stay enforced.
+        // Non-deletable so the bound stays enforced.
         let cref = self.add_clause(vec![bound], false, 0);
-        // A wipeout or root conflict from the tighter bound means it is optimal.
         self.assign(bound, Reason::Clause(cref)).is_ok() && self.propagate_and_learn()
     }
 
-    /// Branch-and-bound by CDCL, interleaving a complete *prover* with large
-    /// neighbourhood search (the *improver*). Each complete epoch searches under
-    /// the current objective bound (asserted as a level-0 clause) until it finds
-    /// a better incumbent, proves optimality (the bounded problem is
-    /// unsatisfiable), or burns its conflict budget; between epochs, LNS bursts
-    /// fix most variables to the incumbent and re-optimise a relaxed subset to
-    /// drive the incumbent down fast. `obj` must be among `vars`. Returns the
-    /// best `(assignment, value)`; the result is proven optimal unless `stop`
-    /// was set.
+    /// CDCL branch-and-bound: complete proving epochs (bounded by a conflict
+    /// budget) interleaved with LNS bursts. `obj` must be among `vars`. Returns the
+    /// best `(assignment, value)`, proven optimal unless `stop` was set.
     pub fn optimize<F: FnMut(i32)>(
         &mut self,
         vars: &[VarId],
@@ -280,7 +238,7 @@ impl Cdcl<'_> {
         if !self.init() {
             stats.failures = self.conflicts;
             stats.learned_lits = self.learned_lits;
-            return (best, stats); // root unsatisfiable
+            return (best, stats);
         }
         let mut phase: Vec<Option<i32>> = vec![None; self.solver.store.num_vars()];
         let mut rng = Rng::new(0x9E37_79B9_7F4A_7C15 ^ vars.len() as u64);
@@ -292,7 +250,7 @@ impl Cdcl<'_> {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            // --- complete proving epoch, bounded by a conflict budget ---
+            // --- proving epoch ---
             let epoch_start = self.conflicts;
             let (mut last_restart, mut restart_limit) = (self.conflicts, 100u64);
             loop {
@@ -328,11 +286,10 @@ impl Cdcl<'_> {
                 }
             }
             self.backjump_to(0); // discard the partial proving tree
-                                 // Grow the proving budget, but cap it so LNS keeps getting turns on
-                                 // instances the prover cannot close.
+                                 // Grow the budget, capped so LNS keeps getting turns.
             epoch_budget = (epoch_budget + epoch_budget / 2).min(8000);
 
-            // --- LNS bursts to improve the incumbent before the next epoch ---
+            // --- LNS bursts ---
             if best.is_some() {
                 for _ in 0..LNS_BURST {
                     if stop.load(Ordering::Relaxed) {
@@ -366,11 +323,10 @@ impl Cdcl<'_> {
         (best, stats)
     }
 
-    /// One LNS move: fix all but a random `relax`-sized subset of `vars` to the
-    /// incumbent (the objective stays free), then re-optimise the freed part
-    /// within a conflict budget. A scattered subset or a contiguous window is
-    /// chosen at random. Returns `(improved, optimal)`. Trail-neutral: it
-    /// backjumps to the root before returning.
+    /// One LNS move: fix all but a random `relax`-sized subset of `vars` (a
+    /// scattered set or contiguous window) to the incumbent, leaving `obj` free,
+    /// then re-optimise the freed part within a budget. Returns `(improved,
+    /// optimal)`. Trail-neutral: backjumps to the root before returning.
     #[allow(clippy::too_many_arguments)]
     fn lns_move<F: FnMut(i32)>(
         &mut self,
@@ -391,8 +347,7 @@ impl Cdcl<'_> {
         debug_assert_eq!(self.decision_level(), 0);
         let n = vars.len();
         let start = self.conflicts;
-        // Half the time a scattered subset, half a contiguous window (rows,
-        // time-adjacent tasks and route segments tend to be consecutive).
+        // Half scattered, half a contiguous window.
         let contiguous = rng.below(2) == 0;
         let window = if contiguous { rng.below(n) } else { 0 };
 
@@ -400,7 +355,7 @@ impl Cdcl<'_> {
         let mut feasible = true;
         for (k, &v) in vars.iter().enumerate() {
             if v == obj {
-                continue; // the objective must stay free to be re-derived
+                continue; // keep the objective free
             }
             let relaxed = if contiguous {
                 (k + n - window) % n < relax
@@ -440,7 +395,7 @@ impl Cdcl<'_> {
         if feasible {
             loop {
                 if self.stopped() || self.conflicts - start > LNS_BUDGET {
-                    break; // time limit, or budget exhausted: abandon this move
+                    break; // out of time/budget
                 }
                 match self.select_var(vars) {
                     None => {

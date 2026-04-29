@@ -1,16 +1,6 @@
 //! Expression trees for `intension` constraints.
-//!
-//! An [`Expr`] is an arithmetic/relational/logical tree over variables. Two
-//! interpretations drive the `intension` propagator:
-//!
-//! - [`Expr::eval`] — exact evaluation under a full assignment. Returns `None`
-//!   for an undefined result (division/modulo by zero), so the solver never
-//!   panics on the search path. Relational and logical nodes return `0`/`1`.
-//! - [`Expr::bounds`] — a *sound* interval `[lo, hi]` of the possible values
-//!   given current variable bounds. "Sound" means it never excludes a feasible
-//!   value, so it is safe to use for disentailment: an arithmetic-tree bound may
-//!   be wider than reality (division/modulo are widened conservatively), but it
-//!   is never narrower. A boolean node's interval is a subset of `[0, 1]`.
+//! [`Expr::eval`] = exact value (`None` if undefined); [`Expr::bounds`] = sound
+//! interval (never narrower than reality), safe for disentailment.
 
 use crate::ids::VarId;
 
@@ -56,7 +46,7 @@ pub enum Expr {
     /// `a >= b`.
     Ge(Box<Expr>, Box<Expr>),
 
-    // logical (operands and result are 0/1; non-zero counts as true)
+    // logical (0/1; non-zero is true)
     /// Logical negation.
     Not(Box<Expr>),
     /// Conjunction.
@@ -205,8 +195,7 @@ impl Expr {
         })
     }
 
-    /// A sound interval `[lo, hi]` for the value of the expression given the
-    /// per-variable bounds returned by `dom`.
+    /// Sound interval `[lo, hi]` given per-variable bounds from `dom`.
     pub fn bounds(&self, dom: &impl Fn(VarId) -> (i64, i64)) -> (i64, i64) {
         match self {
             Expr::Const(c) => (*c, *c),
@@ -255,8 +244,7 @@ impl Expr {
                 let (al, ah) = a.bounds(dom);
                 let (bl, bh) = b.bounds(dom);
                 if bl <= 0 && bh >= 0 {
-                    // Divisor range straddles zero: |a / b| <= |a| for any
-                    // non-zero integer divisor.
+                    // Divisor straddles zero: |a / b| <= |a|.
                     let m = al.abs().max(ah.abs());
                     (-m, m)
                 } else {

@@ -1,15 +1,8 @@
-//! Search entry points, built on the Lazy Clause Generation engine.
+//! Search entry points over the Lazy Clause Generation engine ([`crate::lcg`]).
 //!
-//! Every entry point drives a CDCL search ([`crate::lcg`]) over the Boolean view
-//! of the integer domains: decide a variable (dom/wdeg, with solution-guided
-//! phase saving), propagate FD constraints and channeling clauses to a joint
-//! fixpoint, and on a conflict learn a 1-UIP clause and backjump
-//! non-chronologically. Enumeration adds a blocking clause per solution;
-//! optimization ([`optimize_with`]) asserts a tighter objective bound as a
-//! level-0 clause after each incumbent and re-searches until the bounded
-//! problem is unsatisfiable (proving optimality). Each entry point has an
-//! interruptible variant that halts when a shared stop flag is set (the CLI time
-//! limit and Ctrl+C).
+//! Enumeration adds a blocking clause per solution; optimization asserts a
+//! tighter objective bound after each incumbent. Each entry point has an
+//! interruptible variant that halts when a shared stop flag is set.
 
 use std::sync::atomic::AtomicBool;
 
@@ -38,16 +31,12 @@ pub struct SolveStats {
     pub nodes: u64,
     /// Number of dead ends (propagation failures).
     pub failures: u64,
-    /// Total literals across all learned clauses (CDCL search only). Divided by
-    /// `failures` it is the average learned-clause size — smaller means tighter
-    /// explanations.
+    /// Total literals across all learned clauses (CDCL search only).
     pub learned_lits: u64,
 }
 
-/// Enumerate solutions over `vars`. `on_solution` is invoked for every full
-/// assignment; return [`SearchControl::Stop`] to halt early. Consumes a fresh
-/// search over `solver` (which it mutates: it posts learning clauses and leaves
-/// the domains at the search's end state).
+/// Enumerate solutions over `vars`; `on_solution` returns [`SearchControl::Stop`]
+/// to halt early. Mutates `solver` (posts learnt clauses, leaves end state).
 pub fn solve<F>(solver: &mut Solver, vars: &[VarId], on_solution: F) -> SolveStats
 where
     F: FnMut(&Solver) -> SearchControl,
@@ -56,11 +45,6 @@ where
 }
 
 /// Like [`solve`], but halts as soon as `stop` is set (time limit / Ctrl+C).
-///
-/// Runs the Lazy Clause Generation engine: a CDCL search with clause learning
-/// and non-chronological backjumping over the Boolean view of the integer
-/// domains. Enumerating multiple solutions is done by adding a blocking clause
-/// per solution.
 pub fn solve_interruptible<F>(
     solver: &mut Solver,
     vars: &[VarId],
@@ -90,12 +74,9 @@ pub fn count_solutions(solver: &mut Solver, vars: &[VarId]) -> u64 {
     solve(solver, vars, |_| SearchControl::Continue).solutions
 }
 
-/// Optimise `obj` by CDCL branch-and-bound: find a solution, assert a strictly
-/// better objective bound, and re-search until the bounded problem is
-/// unsatisfiable (proving optimality) or `stop` is set (returning the best found
-/// so far). `on_improve` fires for each improving bound. Returns the best
-/// `(assignment, objective value)` and search statistics. `obj` must be among
-/// `vars` (so search fixes it).
+/// Optimise `obj` by CDCL branch-and-bound; `on_improve` fires per improving
+/// bound. Returns best `(assignment, objective value)` and stats. `obj` must be
+/// among `vars`.
 pub fn optimize_with(
     solver: &mut Solver,
     vars: &[VarId],

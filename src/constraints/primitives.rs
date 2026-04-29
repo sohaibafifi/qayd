@@ -1,10 +1,5 @@
-//! Primitive constraints.
-//!
-//! Phase 0 ships the binary disequality `x != y + c` with forward checking,
-//! which is enough to model N-Queens (column, and the two diagonal offsets).
-//! The remaining primitives — `instantiation`, `allEqual`, `ordered`,
-//! `precedence`, `minimum`, `maximum`, `element`, `count` — land in Phase 1
-//! alongside `intension` and `sum`.
+//! Primitive constraints: disequality, ordering, instantiation, allEqual,
+//! min/max, element, allDifferent, precedence.
 
 use crate::constraints::intension::intension;
 use crate::constraints::linear::Relation;
@@ -13,12 +8,7 @@ use crate::ids::{PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::store::{Premise, Solver, Store};
 
-/// The constraint `x != y + c`.
-///
-/// Forward checking: when one side is fixed, the single forbidden value is
-/// pruned from the other. For binary disequality this is value-consistent, and
-/// it is trivially idempotent — once the forbidden value is gone, re-running
-/// removes nothing.
+/// The constraint `x != y + c` (forward checking).
 pub struct NotEqualOffset {
     x: VarId,
     y: VarId,
@@ -27,13 +17,12 @@ pub struct NotEqualOffset {
 
 impl Propagator for NotEqualOffset {
     fn register(&mut self, store: &mut Store, me: PropId) {
-        // Forward checking only fires once a side is fixed.
         store.subscribe(self.x, me, Event::Fix);
         store.subscribe(self.y, me, Event::Fix);
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
-        // x = v  =>  y != v - c. Reason: just [x = v].
+        // x = v  =>  y != v - c.
         if store.is_fixed(self.x) {
             let v = store.value(self.x);
             let why = vec![Premise::Eq {
@@ -42,7 +31,7 @@ impl Propagator for NotEqualOffset {
             }];
             store.remove_because(self.y, v - self.c, why)?;
         }
-        // y = w  =>  x != w + c. Reason: just [y = w].
+        // y = w  =>  x != w + c.
         if store.is_fixed(self.y) {
             let w = store.value(self.y);
             let why = vec![Premise::Eq {
@@ -69,7 +58,7 @@ pub fn not_equal(solver: &mut Solver, x: VarId, y: VarId) -> PropId {
 // Ordering: x + k <= y
 // ---------------------------------------------------------------------------
 
-/// \( x + k \le y \). Bounds propagation; one pass is a fixpoint for two variables.
+/// \( x + k \le y \) (bounds propagation).
 struct LessOrEqual {
     x: VarId,
     y: VarId,
@@ -83,14 +72,14 @@ impl Propagator for LessOrEqual {
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
-        // x <= max(y) - k. Reason: just [y <= max(y)].
+        // x <= max(y) - k.
         let my = store.max(self.y);
         let why = vec![Premise::Le {
             var: self.y,
             bound: my,
         }];
         store.remove_above_because(self.x, my.saturating_sub(self.k), why)?;
-        // y >= min(x) + k. Reason: just [x >= min(x)].
+        // y >= min(x) + k.
         let mx = store.min(self.x);
         let why = vec![Premise::Ge {
             var: self.x,
@@ -145,9 +134,7 @@ struct Instantiation {
 }
 
 impl Propagator for Instantiation {
-    fn register(&mut self, _store: &mut Store, _me: PropId) {
-        // Nothing to subscribe: it fixes everything on its single run.
-    }
+    fn register(&mut self, _store: &mut Store, _me: PropId) {}
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
         for (&v, &val) in self.vars.iter().zip(&self.vals) {
@@ -170,13 +157,10 @@ pub fn instantiation(solver: &mut Solver, vars: &[VarId], vals: &[i32]) {
 // allEqual (domain-consistent via intersection)
 // ---------------------------------------------------------------------------
 
-/// All variables take the same value. Filters every variable to the common
-/// domain (the intersection), which is domain-consistent for equality.
+/// All variables take the same value; prunes each to the common domain.
 struct AllEqual {
     vars: Vec<VarId>,
-    /// Reused scratch: the running intersection.
     common: Vec<i32>,
-    /// Reused scratch: a snapshot of one variable's values.
     buf: Vec<i32>,
 }
 
@@ -198,7 +182,6 @@ impl Propagator for AllEqual {
         common.extend(store.values(vars[0]));
         common.retain(|&v| vars[1..].iter().all(|&u| store.contains(u, v)));
 
-        // Prune each variable down to `common` (empty intersection => wipeout).
         for &v in vars.iter() {
             buf.clear();
             buf.extend(store.values(v));
@@ -225,7 +208,7 @@ pub fn all_equal(solver: &mut Solver, vars: &[VarId]) {
 // minimum / maximum
 // ---------------------------------------------------------------------------
 
-/// `y = min(xs)`. Sound bounds reasoning, exact at a full assignment.
+/// `y = min(xs)` (bounds reasoning).
 struct Minimum {
     y: VarId,
     xs: Vec<VarId>,
@@ -240,7 +223,7 @@ impl Propagator for Minimum {
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
-        // min(xs) lies in [min of the lower bounds, min of the upper bounds].
+        // min(xs) in [min of lower bounds, min of upper bounds].
         let mut lb = i32::MAX;
         let mut ub = i32::MAX;
         for &x in &self.xs {
@@ -306,14 +289,11 @@ pub fn maximum(solver: &mut Solver, y: VarId, xs: &[VarId]) {
 // element: value = array[idx]   (idx is 0-based)
 // ---------------------------------------------------------------------------
 
-/// `value = array[idx]`, 0-based. Domain-consistent filtering: prunes unusable
-/// indices, unsupported values, and (when the index is fixed) equates `value`
-/// with the selected entry.
+/// `value = array[idx]`, 0-based; domain-consistent filtering.
 struct Element {
     array: Vec<VarId>,
     idx: VarId,
     value: VarId,
-    /// Reused scratch for domain snapshots.
     buf: Vec<i32>,
 }
 
@@ -352,7 +332,7 @@ impl Propagator for Element {
         store.remove_below(self.idx, 0)?;
         store.remove_above(self.idx, n - 1)?;
 
-        // Prune the index: i is impossible if array[i] and value share no value.
+        // Prune index: i impossible if array[i] and value share no value.
         self.buf.clear();
         self.buf.extend(store.values(self.idx));
         for &i in &self.buf {
@@ -369,8 +349,7 @@ impl Propagator for Element {
             let ai = self.array[i];
             self.equate(store, self.value, ai)?;
         } else {
-            // Prune value: v is impossible if no live index selects an entry
-            // whose domain contains v.
+            // Prune value: v impossible if no live index selects an entry containing v.
             self.buf.clear();
             self.buf.extend(store.values(self.value));
             for &v in &self.buf {
@@ -401,18 +380,12 @@ pub fn element(solver: &mut Solver, array: &[VarId], idx: VarId, value: VarId) {
 // allDifferent (Régin, domain-consistent)
 // ---------------------------------------------------------------------------
 
-/// All variables take distinct values. Régin's algorithm achieves domain
-/// consistency: build the variable-value bipartite graph, find a maximum
-/// matching (infeasible if it cannot cover every variable), then remove every
-/// (var, value) edge that lies in no maximum matching. The latter are the
-/// non-matching edges whose endpoints are in different strongly-connected
-/// components of the oriented graph and not reachable from a free value.
+/// All variables take distinct values (Régin, domain-consistent).
 ///
-/// Graph orientation: matching edges `var -> value`, non-matching edges
-/// `value -> var`; a directed path then follows an alternating path.
+/// Orientation: matching edges `var -> value`, non-matching `value -> var`,
+/// so a directed path is an alternating path.
 struct AllDifferent {
     vars: Vec<VarId>,
-    /// Reused scratch: snapshot of one variable's values.
     buf: Vec<i32>,
 }
 
@@ -490,7 +463,7 @@ impl Propagator for AllDifferent {
             return Ok(());
         }
 
-        // Value universe (sorted, de-duplicated); value index = position.
+        // Value universe (sorted, deduped); value index = position.
         let mut values: Vec<i32> = Vec::new();
         for &v in &self.vars {
             values.extend(store.values(v));
@@ -515,7 +488,7 @@ impl Propagator for AllDifferent {
         for i in 0..n {
             let mut seen = vec![false; m];
             if !augment(i, &adj, &mut val_to_var, &mut var_to_val, &mut seen) {
-                return Err(Inconsistency); // no matching covers variable i
+                return Err(Inconsistency); // variable i uncoverable
             }
         }
 
@@ -605,13 +578,8 @@ pub fn all_different(solver: &mut Solver, vars: &[VarId]) {
 // precedence (value precedence)
 // ---------------------------------------------------------------------------
 
-/// Value precedence over `list` for the sequence `values`: for each consecutive
-/// pair `(s, t)`, the first occurrence of `s` must precede the first occurrence
-/// of `t` (and `t` may not appear unless `s` already has).
-///
-/// Decomposed through `intension`: for every position `i`, `list[i] = t` implies
-/// some earlier position holds `s`. At `i = 0` the disjunction is empty, so the
-/// later value cannot occupy the first slot.
+/// Value precedence: for each consecutive pair `(s, t)`, the first `s` must
+/// precede the first `t`. Decomposed through `intension`.
 pub fn precedence(solver: &mut Solver, list: &[VarId], values: &[i32]) {
     for w in values.windows(2) {
         let (s, t) = (w[0], w[1]);
@@ -627,11 +595,8 @@ mod tests {
     use super::*;
     use crate::count_solutions;
 
-    /// Tight explanations must not change a solution count the engine gets
-    /// right. 8-queens has exactly 92 solutions and is built purely from
-    /// `not_equal_offset`, whose tight reason is a single equality premise —
-    /// the case that, expressed as a positive equality atom, would back-jump too
-    /// far and silently drop solutions (here it must stay sound).
+    /// 8-queens (built from `not_equal_offset`) has exactly 92 solutions;
+    /// guards that tight single-equality reasons stay sound.
     #[test]
     fn queens_8_tight_reasons_stay_sound() {
         let n = 8;

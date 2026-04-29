@@ -1,10 +1,4 @@
-//! Counting constraints.
-//!
-//! Phase 1 ships `count`: the number of variables equal to a target value,
-//! compared against `k`. The reasoning is the bounds form of a single-value
-//! cardinality: `lb` variables are already pinned to the value, `ub` could
-//! still take it. `nValues` and the full Régin-flow `cardinality` (GCC) land in
-//! Phase 3.
+//! Counting constraints: `count`, `cardinality` (GCC bounds), `nValues`.
 
 use crate::constraints::linear::Relation;
 use crate::ids::{PropId, VarId};
@@ -20,8 +14,7 @@ struct Count {
 }
 
 impl Count {
-    /// `(lb, ub)`: variables definitely equal to `value`, and variables that
-    /// could still equal it.
+    /// `(lb, ub)`: variables definitely equal to `value`, and those that could be.
     fn counts(&self, store: &Store) -> (i64, i64) {
         let mut lb = 0;
         let mut ub = 0;
@@ -36,8 +29,7 @@ impl Count {
         (lb, ub)
     }
 
-    /// Enforce \( \texttt{count} \le k \): if the floor already reaches `k`, no other variable
-    /// may take the value.
+    /// Enforce \( \texttt{count} \le k \): at `lb == k`, no other variable may take the value.
     fn enforce_le(&self, store: &mut Store, k: i64) -> Result<(), Inconsistency> {
         let (lb, _) = self.counts(store);
         if lb > k {
@@ -53,8 +45,7 @@ impl Count {
         Ok(())
     }
 
-    /// Enforce \( \texttt{count} \ge k \): if the ceiling only just reaches `k`, every variable
-    /// that can take the value must.
+    /// Enforce \( \texttt{count} \ge k \): at `ub == k`, every variable that can take the value must.
     fn enforce_ge(&self, store: &mut Store, k: i64) -> Result<(), Inconsistency> {
         let (_, ub) = self.counts(store);
         if ub < k {
@@ -137,12 +128,9 @@ impl Propagator for InSet {
     }
 }
 
-/// Post `cardinality`: for each `values[j]`, the number of variables equal to it
-/// lies in `[low[j], high[j]]`. When `closed`, every variable must take a value
-/// from `values`.
-///
-/// This is the bounds form, decomposed into independent `count` ranges (correct;
-/// the Régin-flow GCC is a Phase 6 upgrade).
+/// Post `cardinality`: count of variables equal to `values[j]` lies in
+/// `[low[j], high[j]]`. When `closed`, every variable must take a value from
+/// `values`. Bounds form, decomposed into independent `count` ranges.
 pub fn cardinality(
     solver: &mut Solver,
     vars: &[VarId],
@@ -174,12 +162,8 @@ pub fn cardinality(
 // nValues
 // ===========================================================================
 
-/// `#{ distinct values among vars }  rel  k`.
-///
-/// Sound bounds only (full filtering is genuinely hard): `lb` = distinct values
-/// among the fixed variables, `ub` = `min(n, |union of domains|)`. At a full
-/// assignment `lb = ub` = the exact count, so the disentailment check is also
-/// the leaf check.
+/// `#{ distinct values among vars }  rel  k`. Sound bounds only: `lb` = distinct
+/// fixed values, `ub` = `min(n, |union of domains|)`.
 struct NValues {
     vars: Vec<VarId>,
     rel: Relation,
@@ -210,8 +194,8 @@ impl Propagator for NValues {
         self.union.dedup();
 
         let n = self.vars.len();
-        let lb = self.fixed.len() as i64; // >= this many distinct values for sure
-        let ub = (n.min(self.union.len())) as i64; // at most this many
+        let lb = self.fixed.len() as i64;
+        let ub = (n.min(self.union.len())) as i64;
 
         let infeasible = match self.rel {
             Relation::Ge => ub < self.k,

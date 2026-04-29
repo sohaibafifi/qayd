@@ -1,14 +1,8 @@
-//! The bridge between Boolean atoms and the integer domain.
+//! Bridge between Boolean atoms and the integer domain.
 //!
-//! Atom truth is **not stored**: it is a pure function of the trailed
-//! [`Domain`](crate::domain::Domain), read through the [`Store`]. This is the
-//! load-bearing simplification of the whole engine — backtracking the trail
-//! restores every atom's truth for free, and the order/equality atoms of one
-//! variable can never disagree because they read one domain.
-//!
-//! - [`atom_value`] / [`lit_value`] — read truth from the domain.
-//! - [`apply`] — push a literal *into* the domain (the inverse direction): the
-//!   single point where a forced/decided literal becomes a domain mutation.
+//! Atom truth is not stored — it is a pure function of the trailed domain, so
+//! backtracking the trail restores every atom's truth for free. [`apply`] is
+//! the inverse: it pushes a literal into the domain.
 
 use crate::lcg::lit::{AtomKind, AtomTable, Lit};
 use crate::propagator::Inconsistency;
@@ -35,10 +29,6 @@ impl Tri {
 }
 
 /// The truth of `kind` under the current domain.
-///
-/// `[x ≥ k]` is `True` once `min(x) ≥ k`, `False` once `max(x) < k`. `[x = v]`
-/// is `False` as soon as `v` leaves the domain, and `True` only when `x` is
-/// fixed (and still contains `v`, so the fixed value *is* `v`).
 #[inline]
 pub fn atom_value(store: &Store, kind: AtomKind) -> Tri {
     match kind {
@@ -74,16 +64,8 @@ pub fn lit_value(store: &Store, atoms: &AtomTable, lit: Lit) -> Tri {
     }
 }
 
-/// Enforce `lit` on the domain. The inverse of [`atom_value`]:
-///
-/// | literal      | domain op                |
-/// |--------------|--------------------------|
-/// | `[x ≥ k]`    | `remove_below(x, k)`     |
-/// | `¬[x ≥ k]`   | `remove_above(x, k-1)`   |
-/// | `[x = v]`    | `fix(x, v)`              |
-/// | `¬[x = v]`   | `remove(x, v)`           |
-///
-/// Returns `Err(Inconsistency)` if the mutation empties the domain.
+/// Enforce `lit` on the domain (inverse of [`atom_value`]).
+/// `Err(Inconsistency)` if the mutation empties the domain.
 #[inline]
 pub fn apply(store: &mut Store, atoms: &AtomTable, lit: Lit) -> Result<(), Inconsistency> {
     match atoms.decode(lit.atom()) {
