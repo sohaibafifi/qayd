@@ -34,34 +34,40 @@ impl Propagator for NoOverlap {
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
         let n = self.starts.len();
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let (di, dj) = (self.durations[i], self.durations[j]);
-                let si_min = store.min(self.starts[i]) as i64;
-                let si_max = store.max(self.starts[i]) as i64;
-                let sj_min = store.min(self.starts[j]) as i64;
-                let sj_max = store.max(self.starts[j]) as i64;
+        loop {
+            let before: usize = self.starts.iter().map(|&s| store.size(s)).sum();
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let (di, dj) = (self.durations[i], self.durations[j]);
+                    let si_min = store.min(self.starts[i]) as i64;
+                    let si_max = store.max(self.starts[i]) as i64;
+                    let sj_min = store.min(self.starts[j]) as i64;
+                    let sj_max = store.max(self.starts[j]) as i64;
 
-                let i_before_j = si_min + di <= sj_max;
-                let j_before_i = sj_min + dj <= si_max;
+                    let i_before_j = si_min + di <= sj_max;
+                    let j_before_i = sj_min + dj <= si_max;
 
-                match (i_before_j, j_before_i) {
-                    (false, false) => return Err(Inconsistency),
-                    (true, false) => {
-                        // i must precede j.
-                        store.remove_below(self.starts[j], clamp_i32(si_min + di))?;
-                        store.remove_above(self.starts[i], clamp_i32(sj_max - di))?;
+                    match (i_before_j, j_before_i) {
+                        (false, false) => return Err(Inconsistency),
+                        (true, false) => {
+                            // i must precede j.
+                            store.remove_below(self.starts[j], clamp_i32(si_min + di))?;
+                            store.remove_above(self.starts[i], clamp_i32(sj_max - di))?;
+                        }
+                        (false, true) => {
+                            // j must precede i.
+                            store.remove_below(self.starts[i], clamp_i32(sj_min + dj))?;
+                            store.remove_above(self.starts[j], clamp_i32(si_max - dj))?;
+                        }
+                        (true, true) => {}
                     }
-                    (false, true) => {
-                        // j must precede i.
-                        store.remove_below(self.starts[i], clamp_i32(sj_min + dj))?;
-                        store.remove_above(self.starts[j], clamp_i32(si_max - dj))?;
-                    }
-                    (true, true) => {}
                 }
             }
+            let after: usize = self.starts.iter().map(|&s| store.size(s)).sum();
+            if after == before {
+                return Ok(());
+            }
         }
-        Ok(())
     }
 }
 
@@ -428,39 +434,45 @@ impl Propagator for BinPacking {
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
         let nbins = self.capacities.len();
-        for &it in &self.items {
-            store.remove_below(it, 0)?;
-            store.remove_above(it, (nbins - 1) as i32)?;
-        }
+        loop {
+            let before: usize = self.items.iter().map(|&it| store.size(it)).sum();
+            for &it in &self.items {
+                store.remove_below(it, 0)?;
+                store.remove_above(it, (nbins - 1) as i32)?;
+            }
 
-        // Committed load = sizes of items fixed to each bin.
-        self.load.clear();
-        self.load.resize(nbins, 0);
-        for (i, &it) in self.items.iter().enumerate() {
-            if store.is_fixed(it) {
-                self.load[store.value(it) as usize] += self.sizes[i];
-            }
-        }
-        for b in 0..nbins {
-            if self.load[b] > self.capacities[b] {
-                return Err(Inconsistency);
-            }
-        }
-
-        // An unfixed item cannot go in a bin that can no longer hold it.
-        for i in 0..self.items.len() {
-            if store.is_fixed(self.items[i]) {
-                continue;
-            }
-            self.buf.clear();
-            self.buf.extend(store.values(self.items[i]));
-            for &b in &self.buf {
-                if self.load[b as usize] + self.sizes[i] > self.capacities[b as usize] {
-                    store.remove(self.items[i], b)?;
+            // Committed load = sizes of items fixed to each bin.
+            self.load.clear();
+            self.load.resize(nbins, 0);
+            for (i, &it) in self.items.iter().enumerate() {
+                if store.is_fixed(it) {
+                    self.load[store.value(it) as usize] += self.sizes[i];
                 }
             }
+            for b in 0..nbins {
+                if self.load[b] > self.capacities[b] {
+                    return Err(Inconsistency);
+                }
+            }
+
+            // An unfixed item cannot go in a bin that can no longer hold it.
+            for i in 0..self.items.len() {
+                if store.is_fixed(self.items[i]) {
+                    continue;
+                }
+                self.buf.clear();
+                self.buf.extend(store.values(self.items[i]));
+                for &b in &self.buf {
+                    if self.load[b as usize] + self.sizes[i] > self.capacities[b as usize] {
+                        store.remove(self.items[i], b)?;
+                    }
+                }
+            }
+            let after: usize = self.items.iter().map(|&it| store.size(it)).sum();
+            if after == before {
+                return Ok(());
+            }
         }
-        Ok(())
     }
 }
 
