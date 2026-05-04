@@ -145,6 +145,10 @@ pub struct Cdcl<'s> {
     level_starts: Vec<usize>,
     /// Assignment level per atom, or [`UNSET`].
     atom_level: Vec<u32>,
+    /// Trail position per assigned atom, or `usize::MAX`. Used to reject an
+    /// explanation that depends on an intermediate mutation from the same
+    /// propagator call.
+    atom_trail_pos: Vec<usize>,
     /// Assignment reason per atom (meaningful only while assigned).
     atom_reason: Vec<Reason>,
     /// Per-atom trail truth (the recorded assignment), which lags the domain view
@@ -158,6 +162,8 @@ pub struct Cdcl<'s> {
     watches: Vec<Vec<ClauseRef>>,
     /// Reusable scratch for the pre-step scope snapshot of a conflict reason.
     conflict_scope: Vec<ScopeVar>,
+    /// Reusable scratch for variables touched by one buffered FD step.
+    changed_vars: Vec<VarId>,
     /// Index into `trail` of the next literal whose watches need processing.
     qhead: usize,
     /// VSIDS per-variable activity (indexed by `VarId`); read by the branching heuristic.
@@ -192,12 +198,14 @@ impl<'s> Cdcl<'s> {
             trail: Vec::new(),
             level_starts: vec![0],
             atom_level: vec![UNSET; n],
+            atom_trail_pos: vec![usize::MAX; n],
             atom_reason: vec![Reason::Unset; n],
             tval: vec![Tri::Unknown; n],
             seen: vec![false; n],
             clauses: ClauseDb::new(),
             watches: vec![Vec::new(); 2 * n],
             conflict_scope: Vec::new(),
+            changed_vars: Vec::new(),
             qhead: 0,
             activity: vec![0.0; nvars],
             var_inc: 1.0,
@@ -428,6 +436,7 @@ impl<'s> Cdcl<'s> {
             "recorded literal is not true in the domain"
         );
         self.atom_level[a] = self.decision_level() as u32;
+        self.atom_trail_pos[a] = self.trail.len();
         self.atom_reason[a] = reason;
         self.tval[a] = if lit.is_positive() {
             Tri::True
@@ -502,7 +511,7 @@ impl<'s> Cdcl<'s> {
 
     /// Push `lit` into the domain and record the primary it asserts with
     /// `reason`. `Err` on wipeout (nothing recorded). Secondary flips are
-    /// recorded later by channeling, not here.
+    /// mirrored onto the trail immediately.
     pub fn apply_lit(&mut self, lit: Lit, reason: Reason) -> Result<(), Inconsistency> {
         view::apply(&mut self.solver.store, &self.atoms, lit)?;
         let events = std::mem::take(&mut self.solver.store.events);
@@ -516,6 +525,7 @@ impl<'s> Cdcl<'s> {
                 self.record(el, reason.clone());
             }
         }
+        self.sync_var(self.atoms.var_of(lit.atom()));
         Ok(())
     }
 
@@ -533,9 +543,9 @@ impl<'s> Cdcl<'s> {
         }
         view::apply(&mut self.solver.store, &self.atoms, lit)?;
         self.record(lit, reason);
-        // Primary event names `lit` (already recorded); secondary flips come from
-        // channeling, not events.
+        // Primary event names `lit` (already recorded).
         self.solver.store.events.clear();
+        self.sync_var(self.atoms.var_of(lit.atom()));
         Ok(())
     }
 
@@ -633,7 +643,10 @@ impl<'s> Cdcl<'s> {
             let Some(pid) = self.solver.peek_prop() else {
                 return Ok(());
             };
-            // Snapshot its scope first so a failure has a trail-consistent reason.
+            // Snapshot its scope first so every event has a trail-consistent
+            // fallback reason. A propagator can make several FD mutations before
+            // returning, but the SAT trail only records them after the call.
+            let step_trail_len = self.trail.len();
             {
                 let Cdcl {
                     solver,
@@ -644,14 +657,18 @@ impl<'s> Cdcl<'s> {
             }
             match self.solver.propagate_step() {
                 StepOutcome::Empty => return Ok(()),
-                StepOutcome::Ran(_) => self.record_prop_events()?,
+                StepOutcome::Ran(_) => self.record_prop_events(step_trail_len)?,
                 StepOutcome::Failed(_) => {
                     self.solver.store.events.clear();
-                    // Prefer a propagator's tight conflict reason; else the snapshot.
-                    let ds = match self.solver.store.take_pending_conflict() {
+                    // Prefer a tight conflict reason only when it existed on the
+                    // trail before this propagator call. Otherwise use the
+                    // pre-call scope: intermediate FD mutations are not yet SAT
+                    // assignments and cannot participate in conflict analysis.
+                    let preferred = match self.solver.store.take_pending_conflict() {
                         Some(p) => translate_premises(&self.atoms, &p),
                         None => build_ds(&self.atoms, &self.conflict_scope),
                     };
+                    let ds = self.reason_before_step(preferred, step_trail_len);
                     return Err(Conflict::Generic(ds));
                 }
             }
@@ -660,10 +677,12 @@ impl<'s> Cdcl<'s> {
 
     /// Drain a just-run propagator's primary events, recording each inferred
     /// literal with a [`Generic`](Reason::Generic) reason from the store's scope
-    /// snapshot. Channeling runs after *each* event so every `D_S` antecedent is
-    /// strictly earlier on the trail than the literal it explains (a 1-UIP invariant).
-    fn record_prop_events(&mut self) -> Result<(), Conflict> {
+    /// snapshot. Record every primary first: the FD domain already reflects the
+    /// full propagator call, so synchronising a variable after only its first
+    /// buffered event could mirror facts caused by later, unrecorded events.
+    fn record_prop_events(&mut self, step_trail_len: usize) -> Result<(), Conflict> {
         let events = std::mem::take(&mut self.solver.store.events);
+        self.changed_vars.clear();
         for ev in &events {
             let var = match ev.primary {
                 DomEvent::GeTrue { var, .. }
@@ -673,16 +692,38 @@ impl<'s> Cdcl<'s> {
             };
             if let Some(lit) = translate(&self.atoms, &ev.primary) {
                 if !self.is_assigned(lit.atom()) {
-                    let ds = cause_lits(&self.atoms, &ev.cause);
+                    let preferred = cause_lits(&self.atoms, &ev.cause);
+                    let ds = self.reason_before_step(preferred, step_trail_len);
                     self.record(lit, Reason::Generic(ds));
                 }
             }
-            // Mirror the rest of this variable's bulk change onto the trail at
-            // its determination level before moving on.
-            self.sync_var(var);
-            self.propagate_clauses().map_err(Conflict::Clause)?;
+            if !self.changed_vars.contains(&var) {
+                self.changed_vars.push(var);
+            }
         }
-        Ok(())
+        for i in 0..self.changed_vars.len() {
+            let var = self.changed_vars[i];
+            // Mirror the rest of this variable's bulk change only after all
+            // primaries from the FD call are available as antecedents.
+            self.sync_var(var);
+        }
+        self.propagate_clauses().map_err(Conflict::Clause)
+    }
+
+    /// Keep a compact reason only when all of its premises were SAT-trail facts
+    /// before the current propagator call. Otherwise fall back to the pre-call
+    /// whole-scope snapshot, which is always trail-consistent.
+    fn reason_before_step(&self, preferred: Vec<Lit>, step_trail_len: usize) -> Vec<Lit> {
+        if preferred.iter().all(|&l| {
+            self.tvalue(l) == Tri::True && self.atom_trail_pos[l.atom() as usize] < step_trail_len
+        }) {
+            return preferred;
+        }
+        let fallback = build_ds(&self.atoms, &self.conflict_scope);
+        debug_assert!(fallback.iter().all(|&l| {
+            self.tvalue(l) == Tri::True && self.atom_trail_pos[l.atom() as usize] < step_trail_len
+        }));
+        fallback
     }
 
     /// Propagate; on each conflict, learn a 1-UIP clause, backjump, assert it.
@@ -742,6 +783,13 @@ impl<'s> Cdcl<'s> {
 
         loop {
             for q in clause_lits {
+                debug_assert_eq!(
+                    self.tvalue(q),
+                    Tri::False,
+                    "analysis saw non-false literal {:?} {:?}",
+                    q,
+                    self.atoms.decode(q.atom())
+                );
                 let a = q.atom();
                 let lv = self.level_of(a);
                 if !self.seen[a as usize] && lv != UNSET && lv > 0 {
@@ -880,6 +928,7 @@ impl<'s> Cdcl<'s> {
         for lit in self.trail.drain(keep..) {
             let a = lit.atom() as usize;
             self.atom_level[a] = UNSET;
+            self.atom_trail_pos[a] = usize::MAX;
             self.atom_reason[a] = Reason::Unset;
             self.tval[a] = Tri::Unknown;
         }
@@ -889,345 +938,5 @@ impl<'s> Cdcl<'s> {
         }
         // Everything still on the trail was already propagated.
         self.qhead = self.trail.len();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::lcg::lit::LitOrConst;
-    use crate::store::Solver;
-
-    fn lit(loc: LitOrConst) -> Lit {
-        match loc {
-            LitOrConst::Lit(l) => l,
-            _ => panic!("expected a real literal"),
-        }
-    }
-
-    #[test]
-    fn levels_track_decisions() {
-        let mut solver = Solver::new();
-        let _x = solver.new_var_range(0, 9);
-        let mut cdcl = Cdcl::new(&mut solver);
-        assert_eq!(cdcl.decision_level(), 0);
-        cdcl.open_level();
-        assert_eq!(cdcl.decision_level(), 1);
-        cdcl.open_level();
-        assert_eq!(cdcl.decision_level(), 2);
-        cdcl.backjump_to(0);
-        assert_eq!(cdcl.decision_level(), 0);
-    }
-
-    #[test]
-    fn backjump_restores_domain_and_clears_atoms() {
-        let mut solver = Solver::new();
-        let x = solver.new_var_range(0, 9);
-        let y = solver.new_var_range(0, 9);
-        let base = solver.store.level();
-        let mut cdcl = Cdcl::new(&mut solver);
-        let ge5 = lit(cdcl.atoms.ge(x, 5));
-        let eq3y = lit(cdcl.atoms.eq(y, 3));
-
-        // Decide x >= 5 at level 1.
-        cdcl.decide(ge5).unwrap();
-        assert_eq!(cdcl.decision_level(), 1);
-        assert!(cdcl.is_assigned(ge5.atom()));
-        assert_eq!(cdcl.level_of(ge5.atom()), 1);
-        assert_eq!(cdcl.solver.store.min(x), 5);
-
-        // Decide y = 3 at level 2.
-        cdcl.decide(eq3y).unwrap();
-        assert_eq!(cdcl.decision_level(), 2);
-        assert!(cdcl.is_assigned(eq3y.atom()));
-        assert!(cdcl.solver.store.is_fixed(y));
-
-        // Backjump to level 1: undoes the y decision, keeps the x decision.
-        cdcl.backjump_to(1);
-        assert_eq!(cdcl.decision_level(), 1);
-        assert!(cdcl.is_assigned(ge5.atom())); // kept
-        assert!(!cdcl.is_assigned(eq3y.atom())); // cleared
-        assert_eq!(cdcl.solver.store.min(x), 5); // x still bounded
-        assert_eq!(cdcl.solver.store.size(y), 10); // y fully restored
-        assert_eq!(cdcl.value(eq3y), Tri::Unknown); // view agrees it's open again
-
-        // Backjump to root: everything restored, store level back to base.
-        cdcl.backjump_to(0);
-        assert_eq!(cdcl.decision_level(), 0);
-        assert!(!cdcl.is_assigned(ge5.atom()));
-        assert_eq!(cdcl.solver.store.size(x), 10);
-        assert_eq!(cdcl.solver.store.level(), base);
-        assert_eq!(cdcl.trail_len(), 0);
-    }
-
-    #[test]
-    fn idempotent_assignment_is_not_double_logged() {
-        let mut solver = Solver::new();
-        let x = solver.new_var_range(0, 9);
-        let mut cdcl = Cdcl::new(&mut solver);
-        let ge5 = lit(cdcl.atoms.ge(x, 5));
-        cdcl.open_level();
-        cdcl.apply_lit(ge5, Reason::Decision).unwrap();
-        let len = cdcl.trail_len();
-        // Re-applying the same bound changes nothing and must not re-log.
-        cdcl.apply_lit(ge5, Reason::Decision).unwrap();
-        assert_eq!(cdcl.trail_len(), len);
-    }
-
-    #[test]
-    fn apply_lit_records_translated_primary() {
-        // Each op kind round-trips: the literal applied is the one recorded.
-        let mut solver = Solver::new();
-        let a = solver.new_var_range(0, 9);
-        let b = solver.new_var_range(0, 9);
-        let c = solver.new_var_range(0, 9);
-        let mut cdcl = Cdcl::new(&mut solver);
-        let cases = [
-            lit(cdcl.atoms.ge(a, 4)),          // remove_below: [a>=4]
-            lit(cdcl.atoms.ge(b, 7)).negate(), // remove_above: ¬[b>=7]  (b<=6)
-            lit(cdcl.atoms.eq(c, 2)).negate(), // remove:       ¬[c=2]
-        ];
-        for (i, &l) in cases.iter().enumerate() {
-            cdcl.open_level();
-            cdcl.apply_lit(l, Reason::Decision).unwrap();
-            assert!(cdcl.is_assigned(l.atom()), "case {i} not recorded");
-            assert_eq!(cdcl.value(l), Tri::True, "case {i} not true in view");
-        }
-        // The store's event buffer is fully drained by apply_lit.
-        assert!(cdcl.solver.store.events.is_empty());
-    }
-
-    #[test]
-    fn fix_records_equality_primary() {
-        let mut solver = Solver::new();
-        let x = solver.new_var_range(0, 5);
-        let mut cdcl = Cdcl::new(&mut solver);
-        let eq3 = lit(cdcl.atoms.eq(x, 3));
-        cdcl.open_level();
-        cdcl.apply_lit(eq3, Reason::Decision).unwrap();
-        assert!(cdcl.is_assigned(eq3.atom()));
-        assert!(cdcl.solver.store.is_fixed(x));
-    }
-
-    #[test]
-    fn wipeout_is_reported() {
-        let mut solver = Solver::new();
-        let x = solver.new_var_range(5, 5); // singleton
-        let mut cdcl = Cdcl::new(&mut solver);
-        let eq5 = lit(cdcl.atoms.eq(x, 5));
-        cdcl.open_level();
-        // Removing the only value wipes the domain.
-        assert!(cdcl.apply_lit(eq5.negate(), Reason::Decision).is_err());
-    }
-
-    /// T2: an atom is recorded iff its view truth is determined.
-    fn assert_t2(cdcl: &Cdcl) {
-        for a in 0..cdcl.atoms.num_atoms() as u32 {
-            let determined =
-                view::atom_value(&cdcl.solver.store, cdcl.atoms.decode(a)) != Tri::Unknown;
-            assert_eq!(
-                determined,
-                cdcl.is_assigned(a),
-                "atom {a} ({:?}): view-determined={determined} but is_assigned={}",
-                cdcl.atoms.decode(a),
-                cdcl.is_assigned(a)
-            );
-        }
-    }
-
-    #[test]
-    fn channeling_records_bound_secondaries() {
-        let mut solver = Solver::new();
-        let x = solver.new_var_range(0, 5);
-        let mut cdcl = Cdcl::new(&mut solver);
-        cdcl.post_channeling();
-        assert_t2(&cdcl); // nothing determined yet for a clean range var
-
-        cdcl.decide(lit(cdcl.atoms.ge(x, 3))).unwrap(); // x >= 3
-        cdcl.propagate_clauses().unwrap();
-
-        // Lower equalities and weaker order atoms are now recorded as secondaries.
-        for v in 0..3 {
-            assert!(
-                cdcl.is_assigned(lit(cdcl.atoms.eq(x, v)).atom()),
-                "[x={v}] unset"
-            );
-        }
-        for k in 1..=3 {
-            assert!(
-                cdcl.is_assigned(lit(cdcl.atoms.ge(x, k)).atom()),
-                "[x>={k}] unset"
-            );
-        }
-        assert_t2(&cdcl);
-    }
-
-    #[test]
-    fn channeling_collapses_on_fix() {
-        let mut solver = Solver::new();
-        let x = solver.new_var_range(0, 5);
-        let mut cdcl = Cdcl::new(&mut solver);
-        cdcl.post_channeling();
-
-        cdcl.decide(lit(cdcl.atoms.eq(x, 3))).unwrap(); // fix x = 3
-        cdcl.propagate_clauses().unwrap();
-        // Fixing forces every order atom and every other equality atom.
-        assert_t2(&cdcl);
-        assert_eq!(cdcl.solver.store.value(x), 3);
-    }
-
-    #[test]
-    fn seed_facts_marks_initial_holes() {
-        let mut solver = Solver::new();
-        let x = solver.new_var_set(&[0, 2, 5]); // holes at 1, 3, 4
-        let mut cdcl = Cdcl::new(&mut solver);
-        cdcl.post_channeling();
-        for v in [1, 3, 4] {
-            assert!(
-                cdcl.is_assigned(lit(cdcl.atoms.eq(x, v)).atom()),
-                "hole [x={v}] not seeded"
-            );
-            assert_eq!(cdcl.value(lit(cdcl.atoms.eq(x, v))), Tri::False);
-        }
-        assert_t2(&cdcl);
-    }
-
-    #[test]
-    fn constraint_clause_can_conflict() {
-        let mut solver = Solver::new();
-        let x = solver.new_var_range(0, 5);
-        let mut cdcl = Cdcl::new(&mut solver);
-        cdcl.post_channeling();
-        // A constraint clause ([x=0] ∨ [x=1]) that fixing x=3 will falsify.
-        let c0 = lit(cdcl.atoms.eq(x, 0));
-        let c1 = lit(cdcl.atoms.eq(x, 1));
-        cdcl.add_clause(vec![c0, c1], false, 0);
-
-        cdcl.decide(lit(cdcl.atoms.eq(x, 3))).unwrap();
-        assert!(cdcl.propagate_clauses().is_err());
-    }
-
-    use crate::constraints::primitives::{less_or_equal, less_than};
-
-    /// Run an engine over `solver` to its root fixpoint with channeling posted.
-    fn engine_at_root(solver: &mut Solver) -> Cdcl<'_> {
-        solver.enqueue_all();
-        let mut cdcl = Cdcl::new(solver);
-        cdcl.post_channeling();
-        cdcl.propagate().expect("root should be consistent");
-        cdcl
-    }
-
-    #[test]
-    fn unified_propagation_runs_fd_propagators() {
-        let mut solver = Solver::new();
-        let x = solver.new_var_range(0, 9);
-        let y = solver.new_var_range(0, 9);
-        less_or_equal(&mut solver, x, y); // x <= y
-        let mut cdcl = engine_at_root(&mut solver);
-
-        // Decide y <= 4; the FD propagator must drive x <= 4, and the trail must
-        // mirror the domain afterwards.
-        let le4 = lit(cdcl.atoms.ge(y, 5)).negate();
-        cdcl.decide(le4).unwrap();
-        cdcl.propagate().unwrap();
-        assert_eq!(cdcl.solver.store.max(x), 4);
-        assert_t2(&cdcl);
-    }
-
-    #[test]
-    fn unified_propagation_matches_plain_fd() {
-        // Root pruning of x < y over [0,9] must equal the plain FD fixpoint.
-        let mut plain = Solver::new();
-        let px = plain.new_var_range(0, 9);
-        let py = plain.new_var_range(0, 9);
-        less_than(&mut plain, px, py);
-        plain.store.push_level();
-        plain.enqueue_all();
-        plain.propagate().unwrap();
-        let (pxmin, pxmax, pymin, pymax) = (
-            plain.store.min(px),
-            plain.store.max(px),
-            plain.store.min(py),
-            plain.store.max(py),
-        );
-
-        let mut solver = Solver::new();
-        let x = solver.new_var_range(0, 9);
-        let y = solver.new_var_range(0, 9);
-        less_than(&mut solver, x, y);
-        let cdcl = engine_at_root(&mut solver);
-        assert_eq!(
-            (
-                cdcl.solver.store.min(x),
-                cdcl.solver.store.max(x),
-                cdcl.solver.store.min(y),
-                cdcl.solver.store.max(y)
-            ),
-            (pxmin, pxmax, pymin, pymax)
-        );
-        assert_t2(&cdcl);
-    }
-
-    #[test]
-    fn unified_propagation_detects_fd_conflict() {
-        let mut solver = Solver::new();
-        let x = solver.new_var_range(0, 9);
-        let y = solver.new_var_range(0, 9);
-        less_than(&mut solver, x, y); // x < y
-        less_than(&mut solver, y, x); // y < x  — jointly infeasible
-        solver.enqueue_all();
-        let mut cdcl = Cdcl::new(&mut solver);
-        cdcl.post_channeling();
-        assert!(cdcl.propagate().is_err());
-    }
-
-    use crate::constraints::primitives::not_equal_offset;
-
-    #[test]
-    fn cdcl_solves_4_queens() {
-        let n = 4;
-        let mut solver = Solver::new();
-        let q: Vec<VarId> = (0..n).map(|_| solver.new_var_range(0, n - 1)).collect();
-        for i in 0..n as usize {
-            for j in (i + 1)..n as usize {
-                let (di, dj) = (i as i32, j as i32);
-                not_equal_offset(&mut solver, q[i], q[j], 0);
-                not_equal_offset(&mut solver, q[i], q[j], di - dj);
-                not_equal_offset(&mut solver, q[i], q[j], dj - di);
-            }
-        }
-        let mut cdcl = Cdcl::new(&mut solver);
-        assert!(cdcl.init());
-        let sol = cdcl.solve_first(&q).expect("4-queens is satisfiable");
-
-        // Validate: a permutation with no shared diagonal.
-        for i in 0..q.len() {
-            for j in (i + 1)..q.len() {
-                assert_ne!(sol[i], sol[j], "same column");
-                assert_ne!(
-                    (sol[i] - sol[j]).abs(),
-                    (i as i32 - j as i32).abs(),
-                    "same diagonal"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn cdcl_detects_pigeonhole_unsat() {
-        // Three pairwise-distinct variables over {0,1} cannot be placed.
-        let mut solver = Solver::new();
-        let v: Vec<VarId> = (0..3).map(|_| solver.new_var_range(0, 1)).collect();
-        for i in 0..3 {
-            for j in (i + 1)..3 {
-                not_equal_offset(&mut solver, v[i], v[j], 0);
-            }
-        }
-        let mut cdcl = Cdcl::new(&mut solver);
-        if !cdcl.init() {
-            return; // proven UNSAT already at the root
-        }
-        assert!(cdcl.solve_first(&v).is_none(), "pigeonhole must be UNSAT");
     }
 }

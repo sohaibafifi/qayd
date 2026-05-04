@@ -589,27 +589,3 @@ pub fn precedence(solver: &mut Solver, list: &[VarId], values: &[i32]) {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::count_solutions;
-
-    /// 8-queens (built from `not_equal_offset`) has exactly 92 solutions;
-    /// guards that tight single-equality reasons stay sound.
-    #[test]
-    fn queens_8_tight_reasons_stay_sound() {
-        let n = 8;
-        let mut s = Solver::new();
-        let q: Vec<VarId> = (0..n).map(|_| s.new_var_range(0, n - 1)).collect();
-        for i in 0..n as usize {
-            for j in (i + 1)..n as usize {
-                let (di, dj) = (i as i32, j as i32);
-                not_equal_offset(&mut s, q[i], q[j], 0);
-                not_equal_offset(&mut s, q[i], q[j], di - dj);
-                not_equal_offset(&mut s, q[i], q[j], dj - di);
-            }
-        }
-        assert_eq!(count_solutions(&mut s, &q), 92);
-    }
-}

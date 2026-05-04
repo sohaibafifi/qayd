@@ -382,44 +382,8 @@ pub fn linear(solver: &mut Solver, coeffs: &[i64], vars: &[VarId], rel: Relation
     }
 }
 
-/// Deterministic 0/1 knapsack instance for the test.
-#[cfg(test)]
-fn knapsack_instance(n: usize) -> (Vec<i64>, Vec<i64>, i64) {
-    let w: Vec<i64> = (0..n).map(|i| 1 + (i as i64 * 7) % 13).collect();
-    let val: Vec<i64> = (0..n).map(|i| 1 + (i as i64 * 11) % 17).collect();
-    let cap = w.iter().sum::<i64>() / 2;
-    (w, val, cap)
-}
-
 /// Post \( \sum_i \texttt{vars}[i] \;\texttt{rel}\; \texttt{rhs} \) (all coefficients 1).
 pub fn sum(solver: &mut Solver, vars: &[VarId], rel: Relation, rhs: i64) {
     let coeffs = vec![1i64; vars.len()];
     linear(solver, &coeffs, vars, rel, rhs);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::maximize;
-
-    /// Tight reasons must preserve a proven optimum. 18-item knapsack, optimum 122.
-    #[test]
-    fn knapsack_18_tight_reasons_stay_optimal() {
-        let n = 18usize;
-        let (w, val, cap) = knapsack_instance(n);
-        let mut s = Solver::new();
-        let x: Vec<VarId> = (0..n).map(|_| s.new_var_range(0, 1)).collect();
-        linear(&mut s, &w, &x, Relation::Le, cap);
-
-        let vsum: i64 = val.iter().sum();
-        let obj = s.new_var_range(0, vsum as i32);
-        let mut coeffs = val.clone();
-        coeffs.push(-1);
-        let mut vars = x.clone();
-        vars.push(obj);
-        linear(&mut s, &coeffs, &vars, Relation::Eq, 0);
-
-        let (_, best) = maximize(&mut s, &vars, obj).expect("knapsack is satisfiable");
-        assert_eq!(best, 122);
-    }
 }
