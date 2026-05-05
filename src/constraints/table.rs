@@ -31,6 +31,56 @@ fn ts_and_popcount(a: &[u64], b: &[u64]) -> u64 {
         .map(|(x, y)| (x & y).count_ones() as u64)
         .sum()
 }
+fn ts_intersects(a: &[u64], b: &[u64]) -> bool {
+    a.iter().zip(b).any(|(x, y)| x & y != 0)
+}
+fn ts_and_match(dst: &mut [u64], star: &[u64], exact: Option<&Vec<u64>>) {
+    match exact {
+        Some(exact) => {
+            for ((d, s), e) in dst.iter_mut().zip(star).zip(exact) {
+                *d &= s | e;
+            }
+        }
+        None => ts_and(dst, star),
+    }
+}
+
+struct NegativeSearch<'a> {
+    store: &'a Store,
+    vars: &'a [VarId],
+    supports: &'a [HashMap<i32, Vec<u64>>],
+    star: &'a [Vec<u64>],
+    cover: &'a [Vec<u64>],
+    fixed_col: usize,
+}
+
+fn negative_has_support(ctx: &NegativeSearch<'_>, search: &mut [Vec<u64>], col: usize) -> bool {
+    if ts_is_zero(&search[col]) {
+        return true;
+    }
+    if ts_intersects(&search[col], &ctx.cover[col]) {
+        return false;
+    }
+
+    let next = col + 1;
+    if col == ctx.fixed_col {
+        let (prefix, suffix) = search.split_at_mut(next);
+        suffix[0].copy_from_slice(&prefix[col]);
+        return negative_has_support(ctx, search, next);
+    }
+
+    for val in ctx.store.values(ctx.vars[col]) {
+        {
+            let (prefix, suffix) = search.split_at_mut(next);
+            suffix[0].copy_from_slice(&prefix[col]);
+            ts_and_match(&mut suffix[0], &ctx.star[col], ctx.supports[col].get(&val));
+        }
+        if negative_has_support(ctx, search, next) {
+            return true;
+        }
+    }
+    false
+}
 
 /// Table wildcard `*`: matches any value in its column.
 pub const STAR: i32 = i32::MIN;
@@ -50,6 +100,10 @@ struct Extension {
     union: Vec<u64>,
     /// Scratch: support bitset of one (column, value), incl. wildcards.
     tmp: Vec<u64>,
+    /// Scratch stack for negative-table completion search.
+    search: Vec<Vec<u64>>,
+    /// Scratch: patterns wildcarding every remaining unfixed column.
+    cover: Vec<Vec<u64>>,
     buf: Vec<i32>,
 }
 
@@ -81,6 +135,8 @@ impl Extension {
             current: full.clone(),
             union: vec![0u64; nwords],
             tmp: vec![0u64; nwords],
+            search: vec![vec![0u64; nwords]; vars.len() + 1],
+            cover: vec![vec![0u64; nwords]; vars.len() + 1],
             full,
             buf: Vec::new(),
         }
@@ -104,59 +160,68 @@ impl Propagator for Extension {
             current,
             union,
             tmp,
+            search,
+            cover,
             buf,
         } = self;
 
-        // current = AND over columns of (wildcards OR (OR over present values)).
-        current.copy_from_slice(full);
-        for (c, &v) in vars.iter().enumerate() {
-            union.copy_from_slice(&star[c]);
-            for val in store.values(v) {
-                if let Some(bs) = supports[c].get(&val) {
-                    ts_or(union, bs);
-                }
-            }
-            ts_and(current, union);
-        }
-
-        if ts_is_zero(current) {
-            return if *positive {
-                Err(Inconsistency)
-            } else {
-                Ok(()) // no forbidden tuple reachable
-            };
-        }
-
-        // Support of (column c, value val) = its own tuples plus wildcards.
-        let support_into =
-            |tmp: &mut Vec<u64>, supports: &[HashMap<i32, Vec<u64>>], c: usize, val: i32| {
-                tmp.copy_from_slice(&star[c]);
-                if let Some(bs) = supports[c].get(&val) {
-                    ts_or(tmp, bs);
-                }
-            };
-
         if *positive {
+            // current = AND over columns of (wildcards OR (OR over present values)).
+            current.copy_from_slice(full);
+            for (c, &v) in vars.iter().enumerate() {
+                union.copy_from_slice(&star[c]);
+                for val in store.values(v) {
+                    if let Some(bs) = supports[c].get(&val) {
+                        ts_or(union, bs);
+                    }
+                }
+                ts_and(current, union);
+            }
+
+            if ts_is_zero(current) {
+                return Err(Inconsistency);
+            }
+
+            // Support of (column c, value val) = its own tuples plus wildcards.
             for (c, &v) in vars.iter().enumerate() {
                 buf.clear();
                 buf.extend(store.values(v));
                 for &val in buf.iter() {
-                    support_into(tmp, supports, c, val);
+                    tmp.copy_from_slice(&star[c]);
+                    if let Some(bs) = supports[c].get(&val) {
+                        ts_or(tmp, bs);
+                    }
                     if ts_and_popcount(current, tmp) == 0 {
                         store.remove(v, val)?;
                     }
                 }
             }
         } else {
-            // Remove a value only if every consistent completion holding it is forbidden.
-            let total: u128 = vars.iter().map(|&v| store.size(v) as u128).product();
+            // Remove a value only when no completion avoids every forbidden pattern.
             for (c, &v) in vars.iter().enumerate() {
-                let completions = total / store.size(v) as u128;
+                cover[vars.len()].copy_from_slice(full);
+                for d in (0..vars.len()).rev() {
+                    let (prefix, suffix) = cover.split_at_mut(d + 1);
+                    prefix[d].copy_from_slice(&suffix[0]);
+                    if d != c {
+                        ts_and(&mut prefix[d], &star[d]);
+                    }
+                }
+
                 buf.clear();
                 buf.extend(store.values(v));
                 for &val in buf.iter() {
-                    support_into(tmp, supports, c, val);
-                    if ts_and_popcount(current, tmp) as u128 == completions {
+                    search[0].copy_from_slice(full);
+                    ts_and_match(&mut search[0], &star[c], supports[c].get(&val));
+                    let ctx = NegativeSearch {
+                        store,
+                        vars,
+                        supports,
+                        star,
+                        cover,
+                        fixed_col: c,
+                    };
+                    if !negative_has_support(&ctx, search, 0) {
                         store.remove(v, val)?;
                     }
                 }
