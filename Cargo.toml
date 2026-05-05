@@ -17,7 +17,8 @@ path = "src/bin/qayd.rs"
 lto = true
 strip = true
 codegen-units = 1
-opt-level = "z"
+opt-level = 3
+overflow-checks = false
 panic = "abort"
 
 
