@@ -19,7 +19,7 @@ pub enum Event {
 }
 
 /// A filtering algorithm attached to a set of variables.
-pub trait Propagator {
+pub trait Propagator: Send {
     /// Subscribe to the variables/events this propagator reacts to. `me` is its own id.
     fn register(&mut self, store: &mut Store, me: PropId);
 

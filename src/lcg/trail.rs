@@ -172,6 +172,8 @@ pub struct Cdcl<'s> {
     var_inc: f64,
     /// Stop flag polled during propagation (defaults to [`NEVER_STOP`]).
     stop: &'s AtomicBool,
+    /// Reproducible search diversification seed.
+    pub(crate) seed: u64,
     /// Live (non-tombstone) deletable learned clauses.
     num_learned: usize,
     /// Soft cap on live learned clauses; grows after each reduction.
@@ -210,6 +212,7 @@ impl<'s> Cdcl<'s> {
             activity: vec![0.0; nvars],
             var_inc: 1.0,
             stop: &NEVER_STOP,
+            seed: 0,
             num_learned: 0,
             max_learned: 2000,
             conflicts: 0,
@@ -220,6 +223,11 @@ impl<'s> Cdcl<'s> {
     /// Set the stop flag polled during propagation. Call before solving.
     pub(crate) fn set_stop(&mut self, stop: &'s AtomicBool) {
         self.stop = stop;
+    }
+
+    /// Set the reproducible search diversification seed.
+    pub(crate) fn set_seed(&mut self, seed: u64) {
+        self.seed = seed;
     }
 
     /// Whether the stop flag has fired.

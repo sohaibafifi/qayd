@@ -5,7 +5,7 @@
 //! [`Cdcl::optimize`] is the COP driver: complete proving epochs interleaved
 //! with large-neighbourhood-search bursts.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use crate::ids::VarId;
 use crate::lcg::lit::{Lit, LitOrConst};
@@ -43,6 +43,14 @@ impl Rng {
     }
 }
 
+fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
 impl Cdcl<'_> {
     /// Branching heuristic: unfixed variable minimising `size / (wdeg + activity)`
     /// (dom/wdeg combined with VSIDS activity), or `None` if all fixed.
@@ -65,10 +73,13 @@ impl Cdcl<'_> {
     }
 
     /// The decision literal for `v`: `[v = p]` toward the saved phase `p` when
-    /// it is still in the domain, else `[v = min(v)]`.
+    /// it is still in the domain, else a seed-dependent endpoint.
     fn decision_lit(&self, v: VarId, phase: &[Option<i32>]) -> Lit {
         let val = match phase[v.index()] {
             Some(p) if self.solver.store.contains(v, p) => p,
+            _ if self.seed != 0 && mix64(self.seed ^ v.0 as u64) & 1 != 0 => {
+                self.solver.store.max(v)
+            }
             _ => self.solver.store.min(v),
         };
         match self.atoms.eq(v, val) {
@@ -181,7 +192,8 @@ impl Cdcl<'_> {
                 LitOrConst::False => unreachable!("found objective value below its own minimum"),
             }
         } else {
-            match self.atoms.ge(obj, value + 1) {
+            let next = value.checked_add(1)?;
+            match self.atoms.ge(obj, next) {
                 LitOrConst::Lit(l) => Some(l), // obj > value
                 LitOrConst::False => None,     // obj ≤ value always: optimal
                 LitOrConst::True => unreachable!("found objective value above its own maximum"),
@@ -189,72 +201,104 @@ impl Cdcl<'_> {
         }
     }
 
+    /// Assert that the objective must improve on `incumbent`. Returns `false`
+    /// when no better value exists under the imported bound.
+    fn tighten_bound(&mut self, obj: VarId, minimizing: bool, incumbent: i32) -> bool {
+        let Some(bound) = self.improvement_lit(obj, incumbent, minimizing) else {
+            return false;
+        };
+        self.backjump_to(0);
+        // Non-deletable so an imported incumbent stays enforced.
+        let cref = self.add_clause(vec![bound], false, 0);
+        self.assign(bound, Reason::Clause(cref)).is_ok() && self.propagate_and_learn()
+    }
+
     /// Record a new incumbent, report it, and assert a strictly-better objective
     /// bound at level 0. Returns `false` when the incumbent is proven optimal.
     #[allow(clippy::too_many_arguments)]
-    fn accept_solution<F: FnMut(i32)>(
+    fn accept_solution<F: FnMut(i32, &[i32])>(
         &mut self,
         vars: &[VarId],
         obj: VarId,
         minimizing: bool,
         best: &mut Option<(Vec<i32>, i32)>,
+        enforced: &mut Option<i32>,
         phase: &mut [Option<i32>],
         stats: &mut SolveStats,
         on_improve: &mut F,
     ) -> bool {
         let value = self.solver.store.value(obj);
-        *best = Some((
-            vars.iter().map(|&v| self.solver.store.value(v)).collect(),
-            value,
-        ));
+        let assignment: Vec<i32> = vars.iter().map(|&v| self.solver.store.value(v)).collect();
         for &v in vars {
             phase[v.index()] = Some(self.solver.store.value(v));
         }
         stats.solutions += 1;
-        on_improve(value);
-
-        let Some(bound) = self.improvement_lit(obj, value, minimizing) else {
-            return false; // optimal
-        };
-        self.backjump_to(0);
-        // Non-deletable so the bound stays enforced.
-        let cref = self.add_clause(vec![bound], false, 0);
-        self.assign(bound, Reason::Clause(cref)).is_ok() && self.propagate_and_learn()
+        on_improve(value, &assignment);
+        *best = Some((assignment, value));
+        *enforced = Some(value);
+        self.tighten_bound(obj, minimizing, value)
     }
 
     /// CDCL branch-and-bound: complete proving epochs (bounded by a conflict
     /// budget) interleaved with LNS bursts. `obj` must be among `vars`. Returns the
     /// best `(assignment, value)`, proven optimal unless `stop` was set.
-    pub fn optimize<F: FnMut(i32)>(
+    pub fn optimize<F: FnMut(i32, &[i32])>(
         &mut self,
         vars: &[VarId],
         obj: VarId,
         minimizing: bool,
         stop: &AtomicBool,
+        shared_bound: Option<&AtomicI64>,
         mut on_improve: F,
-    ) -> (Option<(Vec<i32>, i32)>, SolveStats) {
+    ) -> (Option<(Vec<i32>, i32)>, SolveStats, bool) {
         let mut stats = SolveStats::default();
         let mut best: Option<(Vec<i32>, i32)> = None;
         if !self.init() {
             stats.failures = self.conflicts;
             stats.learned_lits = self.learned_lits;
-            return (best, stats);
+            return (best, stats, true);
         }
         let mut phase: Vec<Option<i32>> = vec![None; self.solver.store.num_vars()];
-        let mut rng = Rng::new(0x9E37_79B9_7F4A_7C15 ^ vars.len() as u64);
+        let mut rng = Rng::new(0x9E37_79B9_7F4A_7C15 ^ self.seed ^ vars.len() as u64);
         let base = (vars.len() / 10).max(1);
         let mut relax = base;
         let mut epoch_budget: u64 = 1000;
+        let mut enforced = None;
+        let mut complete = true;
 
         'search: loop {
             if stop.load(Ordering::Relaxed) {
+                complete = false;
                 break;
+            }
+            if let Some(shared) = shared_bound {
+                let value = shared.load(Ordering::Relaxed);
+                if value != i64::MAX && value != i64::MIN {
+                    let value = value as i32;
+                    let stronger =
+                        enforced.is_none_or(
+                            |old| {
+                                if minimizing {
+                                    value < old
+                                } else {
+                                    value > old
+                                }
+                            },
+                        );
+                    if stronger {
+                        enforced = Some(value);
+                        if !self.tighten_bound(obj, minimizing, value) {
+                            break;
+                        }
+                    }
+                }
             }
             // --- proving epoch ---
             let epoch_start = self.conflicts;
             let (mut last_restart, mut restart_limit) = (self.conflicts, 100u64);
             loop {
                 if stop.load(Ordering::Relaxed) {
+                    complete = false;
                     break 'search;
                 }
                 self.maybe_restart(&mut last_restart, &mut restart_limit);
@@ -265,6 +309,7 @@ impl Cdcl<'_> {
                             obj,
                             minimizing,
                             &mut best,
+                            &mut enforced,
                             &mut phase,
                             &mut stats,
                             &mut on_improve,
@@ -293,6 +338,7 @@ impl Cdcl<'_> {
             if best.is_some() {
                 for _ in 0..LNS_BURST {
                     if stop.load(Ordering::Relaxed) {
+                        complete = false;
                         break 'search;
                     }
                     let (improved, optimal) = self.lns_move(
@@ -302,6 +348,7 @@ impl Cdcl<'_> {
                         relax,
                         &mut rng,
                         &mut best,
+                        &mut enforced,
                         &mut phase,
                         &mut stats,
                         &mut on_improve,
@@ -320,7 +367,7 @@ impl Cdcl<'_> {
         }
         stats.failures = self.conflicts;
         stats.learned_lits = self.learned_lits;
-        (best, stats)
+        (best, stats, complete)
     }
 
     /// One LNS move: fix all but a random `relax`-sized subset of `vars` (a
@@ -328,7 +375,7 @@ impl Cdcl<'_> {
     /// then re-optimise the freed part within a budget. Returns `(improved,
     /// optimal)`. Trail-neutral: backjumps to the root before returning.
     #[allow(clippy::too_many_arguments)]
-    fn lns_move<F: FnMut(i32)>(
+    fn lns_move<F: FnMut(i32, &[i32])>(
         &mut self,
         vars: &[VarId],
         obj: VarId,
@@ -336,6 +383,7 @@ impl Cdcl<'_> {
         relax: usize,
         rng: &mut Rng,
         best: &mut Option<(Vec<i32>, i32)>,
+        enforced: &mut Option<i32>,
         phase: &mut [Option<i32>],
         stats: &mut SolveStats,
         on_improve: &mut F,
@@ -400,8 +448,9 @@ impl Cdcl<'_> {
                 match self.select_var(vars) {
                     None => {
                         improved = true;
-                        optimal = !self
-                            .accept_solution(vars, obj, minimizing, best, phase, stats, on_improve);
+                        optimal = !self.accept_solution(
+                            vars, obj, minimizing, best, enforced, phase, stats, on_improve,
+                        );
                         break;
                     }
                     Some(v) => {

@@ -588,6 +588,12 @@ pub struct Solver {
     weights: Vec<u64>,
 }
 
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<Store>();
+    assert_send::<Solver>();
+};
+
 impl Solver {
     /// An empty solver.
     pub fn new() -> Self {

@@ -1,4 +1,4 @@
-//! `qayd` CLI: `qayd [-v] [-t SECONDS] <instance.xml[.lzma|.xz]>`.
+//! `qayd` CLI: `qayd [-v] [-t SECONDS] [--seed SEED] [-p THREADS] <instance.xml[.lzma|.xz]>`.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +22,7 @@ fn read_instance(path: &str) -> Result<String, String> {
     Ok(xml)
 }
 
-fn run_instance(path: &str, verbose: bool, stop: &AtomicBool) {
+fn run_instance(path: &str, verbose: bool, stop: &AtomicBool, seed: u64, workers: usize) {
     let xml = match read_instance(path) {
         Ok(x) => x,
         Err(e) => {
@@ -32,7 +32,8 @@ fn run_instance(path: &str, verbose: bool, stop: &AtomicBool) {
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    if let Err(e) = qayd::xcsp::run_to(&xml, verbose, stop, &mut lock) {
+    let options = qayd::xcsp::RunOptions { seed, workers };
+    if let Err(e) = qayd::xcsp::run_to_with_options(&xml, verbose, stop, &mut lock, options) {
         eprintln!("error: {e}");
         std::process::exit(2);
     }
@@ -46,7 +47,7 @@ fn is_instance(arg: &str) -> bool {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: qayd [-v] [-t SECONDS] <instance.xml[.lzma|.xz]>");
+    eprintln!("usage: qayd [-v] [-t SECONDS] [--seed SEED] [-p THREADS] <instance.xml[.lzma|.xz]>");
     std::process::exit(1);
 }
 
@@ -54,6 +55,8 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut verbose = false;
     let mut time_limit: Option<u64> = None;
+    let mut seed: Option<u64> = None;
+    let mut workers: Option<usize> = None;
     let mut path: Option<String> = None;
 
     let mut it = args.iter();
@@ -64,6 +67,20 @@ fn main() {
                 Some(secs) => time_limit = Some(secs),
                 None => {
                     eprintln!("-t/--time needs a number of seconds");
+                    std::process::exit(1);
+                }
+            },
+            "--seed" => match it.next().and_then(|s| s.parse::<u64>().ok()) {
+                Some(value) => seed = Some(value),
+                None => {
+                    eprintln!("--seed needs an unsigned integer");
+                    std::process::exit(1);
+                }
+            },
+            "-p" | "--threads" => match it.next().and_then(|s| s.parse::<usize>().ok()) {
+                Some(value) if value > 0 => workers = Some(value),
+                _ => {
+                    eprintln!("-p/--threads needs a positive integer");
                     std::process::exit(1);
                 }
             },
@@ -80,6 +97,22 @@ fn main() {
     if !is_instance(&path) {
         usage();
     }
+    let seed = seed.unwrap_or_else(|| {
+        std::env::var("RANDOMSEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    });
+    let workers = workers.unwrap_or_else(|| match std::env::var("NBCORE") {
+        Ok(s) => match s.parse::<usize>() {
+            Ok(0) | Err(_) => {
+                eprintln!("NBCORE needs a positive integer");
+                std::process::exit(1);
+            }
+            Ok(n) => n,
+        },
+        Err(_) => 1,
+    });
 
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -94,5 +127,5 @@ fn main() {
         });
     }
 
-    run_instance(&path, verbose, &stop);
+    run_instance(&path, verbose, &stop, seed, workers);
 }
