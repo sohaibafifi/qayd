@@ -765,7 +765,11 @@ impl<'s> Cdcl<'s> {
         let asserting = learnt[0];
         let cref = self.add_clause(learnt, deletable, lbd);
         // Post-backjump, the asserting literal is the only open one; it cannot wipe a domain.
-        !(self.assign(asserting, Reason::Clause(cref)).is_err() && btlevel == 0)
+        match self.assign(asserting, Reason::Clause(cref)) {
+            Ok(()) => true,
+            Err(_) if btlevel == 0 => false,
+            Err(_) => panic!("learned asserting literal wiped a domain above the root"),
+        }
     }
 
     /// First-UIP conflict analysis. Returns the learned clause (asserting literal

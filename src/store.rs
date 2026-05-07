@@ -176,9 +176,9 @@ impl Store {
         self.domains[var.index()].contains(val, &self.trail)
     }
 
-    /// The single value of a fixed variable. Debug-asserts `var` is fixed.
+    /// The single value of a fixed variable. Panics if `var` is not fixed.
     pub fn value(&self, var: VarId) -> i32 {
-        debug_assert!(self.is_fixed(var), "value() called on unfixed {var:?}");
+        assert!(self.is_fixed(var), "value() called on unfixed {var:?}");
         self.domains[var.index()].min(&self.trail)
     }
 
