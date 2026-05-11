@@ -3,6 +3,7 @@
 //! Each callback maps onto a posting helper. Unsupported forms set `error`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use xcsp3_rust_parser::data_structs::expression_tree::xcsp3_utils::{
     ExpressionTree, Operator as EOp, TreeNode,
@@ -21,7 +22,10 @@ use crate::constraints::primitives::{
     all_different, all_equal, element, instantiation, maximum, minimum, ordered,
 };
 use crate::constraints::scheduling::{bin_packing, cumulative, cumulative_var, no_overlap};
-use crate::constraints::table::{extension, mdd, regular, Dfa, Mdd, MddArc, STAR};
+use crate::constraints::table::{
+    extension_from_template, extension_template as compile_extension_template, mdd, regular, Dfa,
+    ExtensionTemplate, Mdd, MddArc, STAR,
+};
 use crate::expr::{self, Expr};
 use crate::ids::VarId;
 use crate::store::Solver;
@@ -36,6 +40,8 @@ pub struct Model {
     /// Declared variables in declaration order, for expanding whole-array
     /// scope references like `x[]` / `x[][]` that the parser leaves un-expanded.
     decls: Vec<(String, VarId)>,
+    share_extension_template: bool,
+    extension_template: Option<Arc<ExtensionTemplate>>,
 }
 
 /// Right-hand side of a condition.
@@ -53,7 +59,25 @@ impl Model {
             error: None,
             ids: HashMap::new(),
             decls: Vec::new(),
+            share_extension_template: false,
+            extension_template: None,
         }
+    }
+
+    fn extension_template(
+        &mut self,
+        arity: usize,
+        tuples: impl FnOnce() -> Vec<Vec<i32>>,
+    ) -> Arc<ExtensionTemplate> {
+        if let Some(template) = &self.extension_template {
+            return Arc::clone(template);
+        }
+        let tuples = tuples();
+        let template = compile_extension_template(arity, &tuples);
+        if self.share_extension_template {
+            self.extension_template = Some(Arc::clone(&template));
+        }
+        template
     }
 
     fn fail(&mut self, msg: impl Into<String>) {
@@ -435,6 +459,24 @@ macro_rules! guard {
 impl XcspCallback for Model {
     fn begin_instance(&mut self, _t: &InstanceType) {}
 
+    fn begin_group(&mut self) {
+        self.share_extension_template = true;
+        self.extension_template = None;
+    }
+
+    fn end_group(&mut self) {
+        self.share_extension_template = false;
+        self.extension_template = None;
+    }
+
+    fn begin_slide(&mut self) {
+        self.begin_group();
+    }
+
+    fn end_slide(&mut self) {
+        self.end_group();
+    }
+
     // --- variables ---
     fn on_variable_interval(&mut self, id: String, min: i32, max: i32) {
         let v = self.solver.new_var_range(min, max);
@@ -459,15 +501,17 @@ impl XcspCallback for Model {
     ) {
         guard!(self, {
             let vars = self.scope(list)?;
-            let tuples: Vec<Vec<i32>> = tuples
-                .iter()
-                .map(|t| {
-                    t.iter()
-                        .map(|&v| if v == i32::MAX { STAR } else { v })
-                        .collect()
-                })
-                .collect();
-            extension(&mut self.solver, &vars, &tuples, is_support);
+            let template = self.extension_template(vars.len(), || {
+                tuples
+                    .iter()
+                    .map(|t| {
+                        t.iter()
+                            .map(|&v| if v == i32::MAX { STAR } else { v })
+                            .collect()
+                    })
+                    .collect()
+            });
+            extension_from_template(&mut self.solver, &vars, template, is_support);
             Ok(())
         });
     }
@@ -475,8 +519,8 @@ impl XcspCallback for Model {
     fn on_constraint_unary(&mut self, list: &String, values: &[i32], is_support: bool) {
         guard!(self, {
             let v = self.var_id(list)?;
-            let tuples: Vec<Vec<i32>> = values.iter().map(|&x| vec![x]).collect();
-            extension(&mut self.solver, &[v], &tuples, is_support);
+            let template = self.extension_template(1, || values.iter().map(|&x| vec![x]).collect());
+            extension_from_template(&mut self.solver, &[v], template, is_support);
             Ok(())
         });
     }

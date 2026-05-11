@@ -3,6 +3,7 @@
 //! in some consistent tuple/path. All buffers recomputed each call.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::ids::{PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Propagator};
@@ -85,17 +86,23 @@ fn negative_has_support(ctx: &NegativeSearch<'_>, search: &mut [Vec<u64>], col: 
 /// Table wildcard `*`: matches any value in its column.
 pub const STAR: i32 = i32::MIN;
 
-/// `extension`: assignment must (positive) or must not (negative) match a listed
-/// tuple. A `STAR` entry matches any value.
-struct Extension {
-    vars: Vec<VarId>,
-    positive: bool,
+/// Immutable bitsets compiled from an extension table's tuple body.
+pub struct ExtensionTemplate {
+    arity: usize,
     /// `supports[c][value]` = bitset of tuples whose column `c` equals `value`.
     supports: Vec<HashMap<i32, Vec<u64>>>,
     /// `star[c]` = bitset of tuples with a wildcard in column `c`.
     star: Vec<Vec<u64>>,
     /// Bitset with exactly the `ntuples` low bits set.
     full: Vec<u64>,
+}
+
+/// `extension`: assignment must (positive) or must not (negative) match a listed
+/// tuple. A `STAR` entry matches any value.
+struct Extension {
+    vars: Vec<VarId>,
+    positive: bool,
+    template: Arc<ExtensionTemplate>,
     current: Vec<u64>,
     union: Vec<u64>,
     /// Scratch: support bitset of one (column, value), incl. wildcards.
@@ -108,11 +115,33 @@ struct Extension {
 }
 
 impl Extension {
-    fn new(vars: &[VarId], tuples: &[Vec<i32>], positive: bool) -> Self {
+    fn new(vars: &[VarId], template: Arc<ExtensionTemplate>, positive: bool) -> Self {
+        assert_eq!(template.arity, vars.len(), "extension: arity mismatch");
+        let nwords = template.full.len();
+        Self {
+            vars: vars.to_vec(),
+            positive,
+            current: template.full.clone(),
+            union: vec![0u64; nwords],
+            tmp: vec![0u64; nwords],
+            search: vec![vec![0u64; nwords]; vars.len() + 1],
+            cover: vec![vec![0u64; nwords]; vars.len() + 1],
+            template,
+            buf: Vec::new(),
+        }
+    }
+}
+
+impl ExtensionTemplate {
+    fn new(arity: usize, tuples: &[Vec<i32>]) -> Self {
+        assert!(
+            tuples.iter().all(|t| t.len() == arity),
+            "extension: tuple arity mismatch"
+        );
         let ntuples = tuples.len();
         let nwords = ntuples.div_ceil(64);
-        let mut supports: Vec<HashMap<i32, Vec<u64>>> = vec![HashMap::new(); vars.len()];
-        let mut star: Vec<Vec<u64>> = vec![vec![0u64; nwords]; vars.len()];
+        let mut supports: Vec<HashMap<i32, Vec<u64>>> = vec![HashMap::new(); arity];
+        let mut star: Vec<Vec<u64>> = vec![vec![0u64; nwords]; arity];
         for (t, tuple) in tuples.iter().enumerate() {
             for (c, &val) in tuple.iter().enumerate() {
                 if val == STAR {
@@ -128,17 +157,10 @@ impl Extension {
             full[t / 64] |= 1u64 << (t % 64);
         }
         Self {
-            vars: vars.to_vec(),
-            positive,
+            arity,
             supports,
             star,
-            current: full.clone(),
-            union: vec![0u64; nwords],
-            tmp: vec![0u64; nwords],
-            search: vec![vec![0u64; nwords]; vars.len() + 1],
-            cover: vec![vec![0u64; nwords]; vars.len() + 1],
             full,
-            buf: Vec::new(),
         }
     }
 }
@@ -154,9 +176,7 @@ impl Propagator for Extension {
         let Extension {
             vars,
             positive,
-            supports,
-            star,
-            full,
+            template,
             current,
             union,
             tmp,
@@ -164,6 +184,12 @@ impl Propagator for Extension {
             cover,
             buf,
         } = self;
+        let ExtensionTemplate {
+            supports,
+            star,
+            full,
+            ..
+        } = &**template;
 
         if *positive {
             // current = AND over columns of (wildcards OR (OR over present values)).
@@ -234,11 +260,27 @@ impl Propagator for Extension {
 /// Post a table constraint. `positive`: tuple must be one of `tuples`; else none.
 /// Use [`STAR`] for `*` wildcards.
 pub fn extension(solver: &mut Solver, vars: &[VarId], tuples: &[Vec<i32>], positive: bool) {
-    assert!(
-        tuples.iter().all(|t| t.len() == vars.len()),
-        "extension: tuple arity mismatch"
+    extension_from_template(
+        solver,
+        vars,
+        extension_template(vars.len(), tuples),
+        positive,
     );
-    solver.post(Box::new(Extension::new(vars, tuples, positive)));
+}
+
+/// Compile an extension table's immutable tuple bitsets.
+pub fn extension_template(arity: usize, tuples: &[Vec<i32>]) -> Arc<ExtensionTemplate> {
+    Arc::new(ExtensionTemplate::new(arity, tuples))
+}
+
+/// Post an extension constraint backed by a shared immutable template.
+pub fn extension_from_template(
+    solver: &mut Solver,
+    vars: &[VarId],
+    template: Arc<ExtensionTemplate>,
+    positive: bool,
+) {
+    solver.post(Box::new(Extension::new(vars, template, positive)));
 }
 
 // ===========================================================================
