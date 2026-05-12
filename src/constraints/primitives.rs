@@ -9,6 +9,7 @@ use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::store::{Premise, Solver, Store};
 
 /// The constraint `x != y + c` (forward checking).
+#[derive(Clone)]
 pub struct NotEqualOffset {
     x: VarId,
     y: VarId,
@@ -59,6 +60,7 @@ pub fn not_equal(solver: &mut Solver, x: VarId, y: VarId) -> PropId {
 // ---------------------------------------------------------------------------
 
 /// \( x + k \le y \) (bounds propagation).
+#[derive(Clone)]
 struct LessOrEqual {
     x: VarId,
     y: VarId,
@@ -128,6 +130,7 @@ pub fn ordered(solver: &mut Solver, vars: &[VarId], rel: Relation) {
 // ---------------------------------------------------------------------------
 
 /// Fixes each variable to a prescribed value.
+#[derive(Clone)]
 struct Instantiation {
     vars: Vec<VarId>,
     vals: Vec<i32>,
@@ -158,6 +161,7 @@ pub fn instantiation(solver: &mut Solver, vars: &[VarId], vals: &[i32]) {
 // ---------------------------------------------------------------------------
 
 /// All variables take the same value; prunes each to the common domain.
+#[derive(Clone)]
 struct AllEqual {
     vars: Vec<VarId>,
     common: Vec<i32>,
@@ -209,6 +213,7 @@ pub fn all_equal(solver: &mut Solver, vars: &[VarId]) {
 // ---------------------------------------------------------------------------
 
 /// `y = min(xs)` (bounds reasoning).
+#[derive(Clone)]
 struct Minimum {
     y: VarId,
     xs: Vec<VarId>,
@@ -242,6 +247,7 @@ impl Propagator for Minimum {
 }
 
 /// `y = max(xs)`.
+#[derive(Clone)]
 struct Maximum {
     y: VarId,
     xs: Vec<VarId>,
@@ -290,6 +296,7 @@ pub fn maximum(solver: &mut Solver, y: VarId, xs: &[VarId]) {
 // ---------------------------------------------------------------------------
 
 /// `value = array[idx]`, 0-based; domain-consistent filtering.
+#[derive(Clone)]
 struct Element {
     array: Vec<VarId>,
     idx: VarId,
@@ -384,6 +391,7 @@ pub fn element(solver: &mut Solver, array: &[VarId], idx: VarId, value: VarId) {
 ///
 /// Orientation: matching edges `var -> value`, non-matching `value -> var`,
 /// so a directed path is an alternating path.
+#[derive(Clone)]
 struct AllDifferent {
     vars: Vec<VarId>,
     buf: Vec<i32>,

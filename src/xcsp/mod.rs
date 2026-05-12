@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 use xcsp3_rust_parser::xcsp_runner::XcspRunner;
 
+use crate::ids::VarId;
 use crate::search::{optimize_seeded, solve_interruptible_seeded, SearchControl, SolveStats};
+use crate::store::Solver;
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -56,7 +58,15 @@ fn stage_xml(xml: &str) -> Result<StagedXml, String> {
     Ok(StagedXml(path))
 }
 
-fn build_model(path: &Path) -> Result<callback::Model, String> {
+/// Immutable root model. Portfolio workers clone it instead of reparsing XML.
+#[derive(Clone)]
+struct Problem {
+    solver: Solver,
+    order: Vec<VarId>,
+    objective: Option<(bool, VarId)>,
+}
+
+fn parse_problem(path: &Path) -> Result<Problem, String> {
     let mut model = callback::Model::new();
     let path_str = path.to_str().ok_or("bad temp path")?;
     let parsed = XcspRunner::run(path_str, &mut model);
@@ -64,7 +74,11 @@ fn build_model(path: &Path) -> Result<callback::Model, String> {
     if let Some(e) = model.error.take() {
         return Err(e);
     }
-    Ok(model)
+    Ok(Problem {
+        solver: model.solver,
+        order: model.order,
+        objective: model.objective,
+    })
 }
 
 struct CopShared {
@@ -143,9 +157,9 @@ pub fn run_to_with_options<W: Write>(
         ..options
     };
     let path = stage_xml(xml)?;
-    let model = build_model(&path.0)?;
+    let problem = parse_problem(&path.0)?;
     let options = RunOptions {
-        workers: if model.objective.is_some() {
+        workers: if problem.objective.is_some() {
             options.workers
         } else {
             1
@@ -155,25 +169,25 @@ pub fn run_to_with_options<W: Write>(
     let to_err = |e: std::io::Error| e.to_string();
 
     if verbose {
-        let kind = if model.objective.is_some() {
+        let kind = if problem.objective.is_some() {
             "COP"
         } else {
             "CSP"
         };
         writeln!(w, "c qayd XCSP3").map_err(to_err)?;
         writeln!(w, "c type {kind}").map_err(to_err)?;
-        writeln!(w, "c variables {}", model.solver.store.num_vars()).map_err(to_err)?;
-        writeln!(w, "c propagators {}", model.solver.num_propagators()).map_err(to_err)?;
+        writeln!(w, "c variables {}", problem.solver.store.num_vars()).map_err(to_err)?;
+        writeln!(w, "c propagators {}", problem.solver.num_propagators()).map_err(to_err)?;
         writeln!(w, "c seed {}", options.seed).map_err(to_err)?;
         writeln!(w, "c workers {}", options.workers).map_err(to_err)?;
         w.flush().map_err(to_err)?;
     }
 
-    if options.workers == 1 || model.objective.is_none() {
-        solve_single(model, verbose, stop, w, options.seed)?;
+    if options.workers == 1 || problem.objective.is_none() {
+        solve_single(problem, verbose, stop, w, options.seed)?;
     } else {
-        let minimizing = model.objective.unwrap().0;
-        solve_parallel_cop(&path.0, model, minimizing, verbose, stop, w, options)?;
+        let minimizing = problem.objective.unwrap().0;
+        solve_parallel_cop(problem, minimizing, verbose, stop, w, options)?;
     }
 
     if verbose {
@@ -187,17 +201,17 @@ pub fn run_to_with_options<W: Write>(
 }
 
 fn solve_single<W: Write>(
-    model: callback::Model,
+    problem: Problem,
     verbose: bool,
     stop: &AtomicBool,
     w: &mut W,
     seed: u64,
 ) -> Result<(), String> {
-    let mut solver = model.solver;
-    let vars = model.order;
+    let mut solver = problem.solver;
+    let vars = problem.order;
     let to_err = |e: std::io::Error| e.to_string();
 
-    match model.objective {
+    match problem.objective {
         None => {
             let mut sol = None;
             let stats = solve_interruptible_seeded(
@@ -270,8 +284,7 @@ fn solve_single<W: Write>(
 }
 
 fn solve_parallel_cop<W: Write>(
-    path: &Path,
-    model: callback::Model,
+    problem: Problem,
     minimizing: bool,
     verbose: bool,
     stop: &AtomicBool,
@@ -290,9 +303,9 @@ fn solve_parallel_cop<W: Write>(
     let mut printed = None;
     let mut error = None;
     let mut models = Vec::with_capacity(options.workers);
-    models.push(model);
+    models.push(problem);
     for _ in 1..options.workers {
-        models.push(build_model(path)?);
+        models.push(models[0].clone());
     }
 
     std::thread::scope(|scope| {

@@ -18,8 +18,28 @@ pub enum Event {
     DomainChange,
 }
 
+/// Clone support for boxed propagators in immutable solver templates.
+pub trait PropagatorClone {
+    fn clone_box(&self) -> Box<dyn Propagator>;
+}
+
+impl<T> PropagatorClone for T
+where
+    T: 'static + Propagator + Clone,
+{
+    fn clone_box(&self) -> Box<dyn Propagator> {
+        Box::new(self.clone())
+    }
+}
+
+impl Clone for Box<dyn Propagator> {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
+}
+
 /// A filtering algorithm attached to a set of variables.
-pub trait Propagator: Send {
+pub trait Propagator: PropagatorClone + Send {
     /// Subscribe to the variables/events this propagator reacts to. `me` is its own id.
     fn register(&mut self, store: &mut Store, me: PropId);
 

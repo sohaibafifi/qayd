@@ -6,6 +6,7 @@ use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::store::{Solver, Store};
 
 /// `#{ i : vars[i] = value }  rel  k`.
+#[derive(Clone)]
 struct Count {
     vars: Vec<VarId>,
     value: i32,
@@ -105,6 +106,7 @@ pub fn count(solver: &mut Solver, vars: &[VarId], value: i32, rel: Relation, k: 
 // ===========================================================================
 
 /// Restrict every variable's domain to a fixed set of values (for closed GCC).
+#[derive(Clone)]
 struct InSet {
     vars: Vec<VarId>,
     set: Vec<i32>,
@@ -164,6 +166,7 @@ pub fn cardinality(
 
 /// `#{ distinct values among vars }  rel  k`. Sound bounds only: `lb` = distinct
 /// fixed values, `ub` = `min(n, |union of domains|)`.
+#[derive(Clone)]
 struct NValues {
     vars: Vec<VarId>,
     rel: Relation,

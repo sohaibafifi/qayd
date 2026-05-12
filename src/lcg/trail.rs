@@ -92,11 +92,11 @@ fn translate_premises(atoms: &AtomTable, premises: &[Premise]) -> Vec<Lit> {
 }
 
 /// Antecedent literals for an event's [`Cause`]: tight premises if supplied,
-/// else the whole-scope snapshot.
-fn cause_lits(atoms: &AtomTable, cause: &Cause) -> Vec<Lit> {
+/// else the pre-propagator whole-scope snapshot.
+fn cause_lits(atoms: &AtomTable, cause: &Cause, fallback: &[ScopeVar]) -> Vec<Lit> {
     match cause {
         Cause::Premises(p) => translate_premises(atoms, p),
-        Cause::Scope(s) => build_ds(atoms, s),
+        Cause::Scope => build_ds(atoms, fallback),
     }
 }
 
@@ -700,7 +700,7 @@ impl<'s> Cdcl<'s> {
             };
             if let Some(lit) = translate(&self.atoms, &ev.primary) {
                 if !self.is_assigned(lit.atom()) {
-                    let preferred = cause_lits(&self.atoms, &ev.cause);
+                    let preferred = cause_lits(&self.atoms, &ev.cause, &self.conflict_scope);
                     let ds = self.reason_before_step(preferred, step_trail_len);
                     self.record(lit, Reason::Generic(ds));
                 }

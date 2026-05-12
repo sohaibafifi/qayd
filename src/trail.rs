@@ -16,7 +16,7 @@ impl ReversibleInt {
 }
 
 /// State manager: reversible ints + undo log + level marks.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Trail {
     values: Vec<i32>,
     /// `(index, old_value)` entries to replay on `pop_level`.

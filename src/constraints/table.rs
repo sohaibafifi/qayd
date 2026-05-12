@@ -26,14 +26,27 @@ fn ts_or(dst: &mut [u64], src: &[u64]) {
 fn ts_is_zero(bs: &[u64]) -> bool {
     bs.iter().all(|&w| w == 0)
 }
-fn ts_and_popcount(a: &[u64], b: &[u64]) -> u64 {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| (x & y).count_ones() as u64)
-        .sum()
-}
 fn ts_intersects(a: &[u64], b: &[u64]) -> bool {
     a.iter().zip(b).any(|(x, y)| x & y != 0)
+}
+fn ts_has_match(
+    current: &[u64],
+    star: &[u64],
+    exact: Option<&Vec<u64>>,
+    residue: &mut usize,
+) -> bool {
+    if current.is_empty() {
+        return false;
+    }
+    for offset in 0..current.len() {
+        let word = (*residue + offset) % current.len();
+        let exact = exact.map_or(0, |bits| bits[word]);
+        if current[word] & (star[word] | exact) != 0 {
+            *residue = word;
+            return true;
+        }
+    }
+    false
 }
 fn ts_and_match(dst: &mut [u64], star: &[u64], exact: Option<&Vec<u64>>) {
     match exact {
@@ -87,6 +100,7 @@ fn negative_has_support(ctx: &NegativeSearch<'_>, search: &mut [Vec<u64>], col: 
 pub const STAR: i32 = i32::MIN;
 
 /// Immutable bitsets compiled from an extension table's tuple body.
+#[derive(Clone)]
 pub struct ExtensionTemplate {
     arity: usize,
     /// `supports[c][value]` = bitset of tuples whose column `c` equals `value`.
@@ -99,14 +113,15 @@ pub struct ExtensionTemplate {
 
 /// `extension`: assignment must (positive) or must not (negative) match a listed
 /// tuple. A `STAR` entry matches any value.
+#[derive(Clone)]
 struct Extension {
     vars: Vec<VarId>,
     positive: bool,
     template: Arc<ExtensionTemplate>,
     current: Vec<u64>,
     union: Vec<u64>,
-    /// Scratch: support bitset of one (column, value), incl. wildcards.
-    tmp: Vec<u64>,
+    /// Last supporting word per `(column, value)` for positive tables.
+    residues: Vec<HashMap<i32, usize>>,
     /// Scratch stack for negative-table completion search.
     search: Vec<Vec<u64>>,
     /// Scratch: patterns wildcarding every remaining unfixed column.
@@ -115,15 +130,27 @@ struct Extension {
 }
 
 impl Extension {
-    fn new(vars: &[VarId], template: Arc<ExtensionTemplate>, positive: bool) -> Self {
+    fn new(
+        store: &Store,
+        vars: &[VarId],
+        template: Arc<ExtensionTemplate>,
+        positive: bool,
+    ) -> Self {
         assert_eq!(template.arity, vars.len(), "extension: arity mismatch");
         let nwords = template.full.len();
+        let residues = if positive {
+            vars.iter()
+                .map(|&var| store.values(var).map(|value| (value, 0)).collect())
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
             vars: vars.to_vec(),
             positive,
             current: template.full.clone(),
             union: vec![0u64; nwords],
-            tmp: vec![0u64; nwords],
+            residues,
             search: vec![vec![0u64; nwords]; vars.len() + 1],
             cover: vec![vec![0u64; nwords]; vars.len() + 1],
             template,
@@ -179,7 +206,7 @@ impl Propagator for Extension {
             template,
             current,
             union,
-            tmp,
+            residues,
             search,
             cover,
             buf,
@@ -208,16 +235,15 @@ impl Propagator for Extension {
                 return Err(Inconsistency);
             }
 
-            // Support of (column c, value val) = its own tuples plus wildcards.
+            // Keep a residue word for each value and scan only when it went stale.
             for (c, &v) in vars.iter().enumerate() {
                 buf.clear();
                 buf.extend(store.values(v));
                 for &val in buf.iter() {
-                    tmp.copy_from_slice(&star[c]);
-                    if let Some(bs) = supports[c].get(&val) {
-                        ts_or(tmp, bs);
-                    }
-                    if ts_and_popcount(current, tmp) == 0 {
+                    let residue = residues[c]
+                        .get_mut(&val)
+                        .expect("extension residue missing root-domain value");
+                    if !ts_has_match(current, &star[c], supports[c].get(&val), residue) {
                         store.remove(v, val)?;
                     }
                 }
@@ -280,7 +306,8 @@ pub fn extension_from_template(
     template: Arc<ExtensionTemplate>,
     positive: bool,
 ) {
-    solver.post(Box::new(Extension::new(vars, template, positive)));
+    let prop = Extension::new(&solver.store, vars, template, positive);
+    solver.post(Box::new(prop));
 }
 
 // ===========================================================================
@@ -288,6 +315,7 @@ pub fn extension_from_template(
 // ===========================================================================
 
 /// A deterministic finite automaton for `regular`.
+#[derive(Clone)]
 pub struct Dfa {
     /// Number of states (ids `0..n_states`).
     pub n_states: usize,
@@ -299,6 +327,7 @@ pub struct Dfa {
     pub transitions: Vec<(usize, i32, usize)>,
 }
 
+#[derive(Clone)]
 struct Regular {
     vars: Vec<VarId>,
     n_states: usize,
@@ -412,6 +441,7 @@ pub fn regular(solver: &mut Solver, vars: &[VarId], dfa: Dfa) {
 // ===========================================================================
 
 /// An arc in a layered MDD, from a node in one layer to a node in the next.
+#[derive(Clone)]
 pub struct MddArc {
     /// Source node index within its layer.
     pub from: usize,
@@ -423,6 +453,7 @@ pub struct MddArc {
 
 /// A layered MDD: `layers[i]` = arcs from layer `i` to `i+1`; `nodes_per_layer`
 /// has `n+1` entries. Layer 0 is the single root; every final-layer node accepts.
+#[derive(Clone)]
 pub struct Mdd {
     /// Arc lists, one per variable layer.
     pub layers: Vec<Vec<MddArc>>,
@@ -430,6 +461,7 @@ pub struct Mdd {
     pub nodes_per_layer: Vec<usize>,
 }
 
+#[derive(Clone)]
 struct MddProp {
     vars: Vec<VarId>,
     layers: Vec<Vec<MddArc>>,

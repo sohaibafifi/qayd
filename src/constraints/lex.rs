@@ -10,6 +10,7 @@ use crate::store::{Solver, Store};
 
 /// `x <=lex y` (or `<lex y` when `strict`). Sound, leaf-correct: skip the
 /// fixed-equal prefix, enforce `x[i] <= y[i]` at the first undecided position.
+#[derive(Clone)]
 struct Lex {
     x: Vec<VarId>,
     y: Vec<VarId>,
@@ -83,6 +84,7 @@ pub fn lex_chain(solver: &mut Solver, rows: &[Vec<VarId>], strict: bool) {
 // ===========================================================================
 
 /// `x` and `y` are inverse permutations of `0..n`: `x[i] = j  <=>  y[j] = i`.
+#[derive(Clone)]
 struct Channel {
     x: Vec<VarId>,
     y: Vec<VarId>,

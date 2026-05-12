@@ -7,6 +7,7 @@ use crate::ids::{PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::store::{Solver, Store};
 
+#[derive(Clone)]
 struct Intension {
     expr: Expr,
     vars: Vec<VarId>,

@@ -20,6 +20,7 @@ fn ceil_div_pos(a: i64, b: i64) -> i64 {
 // ===========================================================================
 
 /// Tasks `[start_i, start_i + duration_i)` must be pairwise non-overlapping.
+#[derive(Clone)]
 struct NoOverlap {
     starts: Vec<VarId>,
     durations: Vec<i64>,
@@ -89,6 +90,7 @@ pub fn no_overlap(solver: &mut Solver, starts: &[VarId], durations: &[i64]) {
 // ===========================================================================
 
 /// At every time point the total height of running tasks must not exceed `capacity`.
+#[derive(Clone)]
 struct Cumulative {
     starts: Vec<VarId>,
     dur: Vec<i64>,
@@ -100,6 +102,9 @@ struct Cumulative {
     est: Vec<i64>,
     lct: Vec<i64>,
     energy: Vec<i64>,
+    by_est: Vec<usize>,
+    by_lct: Vec<usize>,
+    lb: Vec<i64>,
 }
 
 impl Propagator for Cumulative {
@@ -121,23 +126,19 @@ impl Propagator for Cumulative {
             let before: usize = (0..n).map(|i| store.size(self.starts[i])).sum();
 
             // Snapshot est, lct, energy.
-            self.est.clear();
-            self.lct.clear();
-            self.energy.clear();
             for i in 0..n {
-                self.est.push(store.min(self.starts[i]) as i64);
-                self.lct
-                    .push(store.max(self.starts[i]) as i64 + self.dur[i]);
-                self.energy.push(self.height[i] * self.dur[i]);
+                self.est[i] = store.min(self.starts[i]) as i64;
+                self.lct[i] = store.max(self.starts[i]) as i64 + self.dur[i];
+                self.energy[i] = self.height[i] * self.dur[i];
             }
 
             // Energetic overload check: window [L, U) energy > capacity*(U-L) fails.
-            let mut by_est: Vec<usize> = (0..n).collect();
-            by_est.sort_unstable_by(|&a, &b| self.est[b].cmp(&self.est[a]));
+            self.by_est
+                .sort_unstable_by(|&a, &b| self.est[b].cmp(&self.est[a]));
             for u in 0..n {
                 let ub = self.lct[u];
                 let mut e = 0i64;
-                for &k in &by_est {
+                for &k in &self.by_est {
                     if self.lct[k] <= ub {
                         e += self.energy[k];
                         if e > self.capacity * (ub - self.est[k]) {
@@ -149,9 +150,9 @@ impl Propagator for Cumulative {
 
             // Edge-finding: if Omega ∪ {i} can't fit in [est, U], i ends after Omega,
             // so it can't start until Omega's non-parallelisable rest energy is done.
-            let mut by_lct: Vec<usize> = (0..n).collect();
-            by_lct.sort_unstable_by(|&a, &b| self.lct[a].cmp(&self.lct[b]));
-            let mut lb = self.est.clone();
+            self.by_lct
+                .sort_unstable_by(|&a, &b| self.lct[a].cmp(&self.lct[b]));
+            self.lb.copy_from_slice(&self.est);
             #[allow(clippy::needless_range_loop)]
             for i in 0..n {
                 let hi = self.height[i];
@@ -160,7 +161,7 @@ impl Propagator for Cumulative {
                 }
                 let mut e_omega = 0i64;
                 let mut est_omega = i64::MAX;
-                for &j in &by_lct {
+                for &j in &self.by_lct {
                     if j == i {
                         continue;
                     }
@@ -170,15 +171,15 @@ impl Propagator for Cumulative {
                     if e_omega + self.energy[i] > self.capacity * (u - est_omega.min(self.est[i])) {
                         let rest = e_omega - (self.capacity - hi) * (u - est_omega);
                         if rest > 0 {
-                            lb[i] = lb[i].max(est_omega + ceil_div_pos(rest, hi));
+                            self.lb[i] = self.lb[i].max(est_omega + ceil_div_pos(rest, hi));
                         }
                     }
                 }
             }
             #[allow(clippy::needless_range_loop)]
             for i in 0..n {
-                if lb[i] > self.est[i] {
-                    store.remove_below(self.starts[i], clamp_i32(lb[i]))?;
+                if self.lb[i] > self.est[i] {
+                    store.remove_below(self.starts[i], clamp_i32(self.lb[i]))?;
                 }
             }
 
@@ -245,6 +246,7 @@ pub fn cumulative(
 ) {
     assert_eq!(starts.len(), durations.len(), "cumulative: length mismatch");
     assert_eq!(starts.len(), heights.len(), "cumulative: length mismatch");
+    let n = starts.len();
     solver.post(Box::new(Cumulative {
         starts: starts.to_vec(),
         dur: durations.to_vec(),
@@ -252,9 +254,12 @@ pub fn cumulative(
         capacity,
         profile: Vec::new(),
         buf: Vec::new(),
-        est: Vec::new(),
-        lct: Vec::new(),
-        energy: Vec::new(),
+        est: vec![0; n],
+        lct: vec![0; n],
+        energy: vec![0; n],
+        by_est: (0..n).collect(),
+        by_lct: (0..n).collect(),
+        lb: vec![0; n],
     }));
 }
 
@@ -264,6 +269,7 @@ pub fn cumulative(
 // peak min-usage raises cap.min. Weaker than the fixed-height edge-finder above.
 // TODO(strong): variable-resource edge-finding / energetic reasoning.
 
+#[derive(Clone)]
 struct CumulativeVar {
     starts: Vec<VarId>,
     dur: Vec<VarId>,
@@ -417,6 +423,7 @@ pub fn cumulative_var(
 // ===========================================================================
 
 /// `items[i]` = bin index; total size per bin must not exceed its capacity.
+#[derive(Clone)]
 struct BinPacking {
     items: Vec<VarId>,
     sizes: Vec<i64>,

@@ -8,6 +8,7 @@ use crate::trail::ReversibleInt;
 /// `circuit(succ)`: `succ[i]` is node `i`'s successor; the relation must form a
 /// single Hamiltonian circuit over `0..n`. Weak-but-correct: forward-checking
 /// distinctness plus subtour elimination via trailed path endpoints.
+#[derive(Clone)]
 struct Circuit {
     succ: Vec<VarId>,
     /// End node of the path that currently starts at node `i`.

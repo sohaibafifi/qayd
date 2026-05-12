@@ -8,6 +8,7 @@ use crate::propagator::Inconsistency;
 use crate::trail::{ReversibleInt, Trail};
 
 /// A finite-integer domain backed by a trailed sparse set.
+#[derive(Clone)]
 pub struct Domain {
     /// Value `v` maps to internal index `(v - offset) as u32`.
     offset: i32,

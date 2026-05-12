@@ -26,6 +26,7 @@ pub enum Relation {
 }
 
 /// \( \sum_i a_i x_i \le c \), bounds propagation to a local fixpoint per call.
+#[derive(Clone)]
 struct LinearLeq {
     coeffs: Vec<i64>,
     vars: Vec<VarId>,
@@ -133,6 +134,7 @@ impl Propagator for LinearLeq {
 }
 
 /// \( \sum_i a_i x_i = c \), both-sided bounds propagation to a local fixpoint.
+#[derive(Clone)]
 struct LinearEq {
     coeffs: Vec<i64>,
     vars: Vec<VarId>,
@@ -263,6 +265,7 @@ impl Propagator for LinearEq {
 }
 
 /// \( \sum_i a_i x_i \ne c \). Weak: only filters when at most one variable is still free.
+#[derive(Clone)]
 struct LinearNeq {
     coeffs: Vec<i64>,
     vars: Vec<VarId>,

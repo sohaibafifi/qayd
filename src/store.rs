@@ -10,7 +10,7 @@ use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::trail::{ReversibleInt, Trail};
 
 /// Per-variable subscription lists, one per event granularity.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct VarSubs {
     /// Woken on any value removal.
     on_dom: Vec<PropId>,
@@ -62,9 +62,8 @@ pub struct ScopeVar {
 /// Why a domain change happened — the raw material for its LCG explanation.
 #[derive(Clone, Debug)]
 pub enum Cause {
-    /// Generic fallback: pre-op snapshot of the running propagator's whole
-    /// scope. Empty for engine-driven changes, which carry their own reason.
-    Scope(Vec<ScopeVar>),
+    /// Generic fallback: use the LCG engine's pre-propagator scope snapshot.
+    Scope,
     /// Tight propagator-supplied premises that entail the change; set via the
     /// `*_because` mutators.
     Premises(Vec<Premise>),
@@ -90,7 +89,7 @@ pub enum StepOutcome {
 
 /// Owns all mutable solver state: domains, trail, subscriptions, and the
 /// propagation queue.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Store {
     domains: Vec<Domain>,
     trail: Trail,
@@ -246,15 +245,15 @@ impl Store {
         Ok(())
     }
 
-    /// Reason for an imminent change: staged premises if pending, else a pre-op
-    /// scope snapshot. Always clears the pending premises (bound to one mutation).
+    /// Reason for an imminent change: staged premises if pending, else the
+    /// pre-propagator scope fallback. Always clears the pending premises.
     fn cause_for(&mut self, will_change: bool) -> Cause {
         let pending = self.pending_premises.take();
         match pending {
             Some(p) if !self.force_scope_reasons => {
                 Cause::Premises(if will_change { p } else { Vec::new() })
             }
-            _ => Cause::Scope(self.snapshot_if(will_change)),
+            _ => Cause::Scope,
         }
     }
 
@@ -334,27 +333,6 @@ impl Store {
     pub(crate) fn clear_pending(&mut self) {
         self.pending_premises = None;
         self.pending_conflict = None;
-    }
-
-    /// Snapshot the running propagator's scope only when `will_change`.
-    fn snapshot_if(&self, will_change: bool) -> Vec<ScopeVar> {
-        if will_change && self.current.is_some() {
-            self.snapshot_cause()
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Snapshot the running propagator's scope domains (pre-op), or empty when
-    /// no propagator is running.
-    fn snapshot_cause(&self) -> Vec<ScopeVar> {
-        match self.current {
-            None => Vec::new(),
-            Some(p) => self.scope[p.index()]
-                .iter()
-                .map(|&v| self.scope_var(v))
-                .collect(),
-        }
     }
 
     /// Snapshot one variable's current domain as a [`ScopeVar`].
@@ -577,7 +555,7 @@ impl Store {
 }
 
 /// A [`Store`] plus the propagator objects, with the propagation fixpoint.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Solver {
     /// All mutable state. Public so search and tests can read/branch on domains.
     pub store: Store,
