@@ -1,4 +1,4 @@
-//! `qayd` CLI: `qayd [-v] [-t SECONDS] [--seed SEED] [-p THREADS] <instance.xml[.lzma|.xz]>`.
+//! `qayd` CLI: `qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] <instance.xml[.lzma|.xz]>`.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,9 +46,17 @@ fn is_instance(arg: &str) -> bool {
         || arg.ends_with(".xz")
 }
 
+const USAGE: &str =
+    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] <instance.xml[.lzma|.xz]>";
+
 fn usage() -> ! {
-    eprintln!("usage: qayd [-v] [-t SECONDS] [--seed SEED] [-p THREADS] <instance.xml[.lzma|.xz]>");
+    eprintln!("{USAGE}");
     std::process::exit(1);
+}
+
+fn help() -> ! {
+    println!("{USAGE}");
+    std::process::exit(0);
 }
 
 fn main() {
@@ -62,6 +70,7 @@ fn main() {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "-h" | "--help" => help(),
             "-v" | "--verbose" => verbose = true,
             "-t" | "--time" => match it.next().and_then(|s| s.parse::<u64>().ok()) {
                 Some(secs) => time_limit = Some(secs),

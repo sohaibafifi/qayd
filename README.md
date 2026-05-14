@@ -14,8 +14,6 @@ conflicts. The target constraint catalogue is [XCSP3-core](https://xcsp.org).
 
 Priorities, in order: **correct, then simple, then fast.**
 
-About 6,600 lines of code (LCG / CDCL engine: 1,617; constraint catalogue: 1,927; XCSP3 bridge: 1,635; core kernel: 1,386).
-
 ## Build
 
 ```bash
@@ -26,11 +24,14 @@ cargo test
 ## Solve an instance
 
 ```bash
-qayd [-v] [-t SECONDS] <instance.xml[.lzma|.xz]>
+qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] <instance.xml[.lzma|.xz]>
 ```
 
-- `-v` emits `c` comment lines (model size, search stats, wall time).
-- `-t SECONDS` stops after a time budget, reporting the best solution so far.
+- `-h`, `--help` prints the usage.
+- `-v`, `--verbose` emits `c` comment lines (model size, search stats, wall time).
+- `-t SECONDS`, `--time SECONDS` stops after a time budget, reporting the best solution so far.
+- `--seed SEED` sets the reproducible search seed. It defaults to `RANDOMSEED`, then `0`.
+- `-p THREADS`, `--threads THREADS` sets the COP portfolio worker count. It defaults to `NBCORE`, then `1`.
 
 ## As a library
 
