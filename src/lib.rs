@@ -1,4 +1,4 @@
-//! `qayd` — a constraint-programming solver.
+//! `qayd`: a constraint-programming solver.
 //!
 //! ## Example: count the solutions of 4-Queens
 //!

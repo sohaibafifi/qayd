@@ -31,7 +31,7 @@ impl Trail {
         Self::default()
     }
 
-    /// Allocate a reversible int set to `v`. Not reversible — do it at the
+    /// Allocate a reversible int set to `v`. Not reversible; do it at the
     /// root, before search.
     pub fn new_int(&mut self, v: i32) -> ReversibleInt {
         let i = self.values.len() as u32;

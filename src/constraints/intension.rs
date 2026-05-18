@@ -1,4 +1,4 @@
-//! `intension` — universal fallback for any relational/logical [`Expr`].
+//! `intension`: universal fallback for any relational/logical [`Expr`].
 //! Filtering: disentailment by bounds, probing each unfixed value, then an exact
 //! check once all vars are fixed (the correctness safety net for weak bounds).
 

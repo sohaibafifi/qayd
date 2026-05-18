@@ -61,13 +61,15 @@ impl Cdcl<'_> {
 
     /// Restart to the root once conflicts since the last restart reach `limit`,
     /// then grow `limit` by ×1.5. Learned clauses and saved phases survive.
-    fn maybe_restart(&mut self, last: &mut u64, limit: &mut u64) {
+    fn maybe_restart(&mut self, last: &mut u64, limit: &mut u64) -> bool {
         if self.conflicts - *last >= *limit {
             self.backjump_to(0);
             self.maybe_reduce_db();
             *last = self.conflicts;
             *limit += *limit / 2;
+            return self.sync_shared_clauses();
         }
+        true
     }
 
     /// Enumerate solutions over `vars`, invoking `on_solution` per full
@@ -152,7 +154,7 @@ impl Cdcl<'_> {
 
     /// The literal that demands a strictly better objective than `value`:
     /// `¬[obj ≥ value]` when minimizing, `[obj ≥ value+1]` when maximizing.
-    /// `None` means no better value is representable — `value` is optimal.
+    /// `None` means no better value is representable; `value` is optimal.
     fn improvement_lit(&self, obj: VarId, value: i32, minimizing: bool) -> Option<Lit> {
         if minimizing {
             match self.atoms.ge(obj, value) {
@@ -230,6 +232,11 @@ impl Cdcl<'_> {
         let mut enforced = None;
         let mut complete = true;
         let (mut last_restart, mut restart_limit) = (self.conflicts, 100u64);
+        if !self.sync_shared_clauses() {
+            stats.failures = self.conflicts;
+            stats.learned_lits = self.learned_lits;
+            return (best, stats, true);
+        }
 
         loop {
             if stop.load(Ordering::Relaxed) {
@@ -258,7 +265,9 @@ impl Cdcl<'_> {
                     }
                 }
             }
-            self.maybe_restart(&mut last_restart, &mut restart_limit);
+            if !self.maybe_restart(&mut last_restart, &mut restart_limit) {
+                break;
+            }
             match self.select_var(vars) {
                 None => {
                     if !self.accept_solution(

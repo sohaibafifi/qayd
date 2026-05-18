@@ -102,7 +102,7 @@ pub fn count(solver: &mut Solver, vars: &[VarId], value: i32, rel: Relation, k: 
 }
 
 // ===========================================================================
-// cardinality (GCC, bounds — decomposed into per-value count ranges)
+// cardinality (GCC bounds, decomposed into per-value count ranges)
 // ===========================================================================
 
 /// Restrict every variable's domain to a fixed set of values (for closed GCC).

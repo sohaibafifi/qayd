@@ -1,6 +1,6 @@
 //! Bridge between Boolean atoms and the integer domain.
 //!
-//! Atom truth is not stored — it is a pure function of the trailed domain, so
+//! Atom truth is not stored; it is a pure function of the trailed domain, so
 //! backtracking the trail restores every atom's truth for free. [`apply`] is
 //! the inverse: it pushes a literal into the domain.
 

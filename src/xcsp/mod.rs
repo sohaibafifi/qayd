@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use xcsp3_rust_parser::xcsp_runner::XcspRunner;
 
 use crate::ids::VarId;
+use crate::lcg::clause::{ClauseSharing, SharedClausePool};
 use crate::search::{optimize_seeded, solve_interruptible_seeded, SearchControl, SolveStats};
 use crate::store::Solver;
 
@@ -86,6 +87,7 @@ struct CopShared {
     proved: AtomicBool,
     best: AtomicI64,
     solution: Mutex<Option<(Vec<i32>, i32)>>,
+    clauses: Arc<SharedClausePool>,
     minimizing: bool,
 }
 
@@ -247,6 +249,7 @@ fn solve_single<W: Write>(
                 stop,
                 seed,
                 None,
+                None,
                 |v, _| {
                     if verbose && io_err.is_none() {
                         if let Err(e) = writeln!(w, "o {v}").and_then(|_| w.flush()) {
@@ -296,6 +299,7 @@ fn solve_parallel_cop<W: Write>(
         proved: AtomicBool::new(false),
         best: AtomicI64::new(if minimizing { i64::MAX } else { i64::MIN }),
         solution: Mutex::new(None),
+        clauses: Arc::new(SharedClausePool::default()),
         minimizing,
     });
     let (tx, rx) = mpsc::channel();
@@ -336,6 +340,7 @@ fn solve_parallel_cop<W: Write>(
                     &shared.cancel,
                     options.seed.wrapping_add(worker as u64),
                     Some(&shared.best),
+                    Some(ClauseSharing::new(Arc::clone(&shared.clauses), worker)),
                     |value, solution| {
                         if shared.improve(value, solution) {
                             let _ = tx.send(WorkerMsg::Improved(value));
@@ -389,6 +394,13 @@ fn solve_parallel_cop<W: Write>(
     let to_err = |e: std::io::Error| e.to_string();
     if verbose {
         writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(to_err)?;
+        writeln!(
+            w,
+            "c shared clauses {} imported {}",
+            shared.clauses.len(),
+            shared.clauses.imported()
+        )
+        .map_err(to_err)?;
     }
     let interrupted = stop.load(Ordering::Relaxed);
     let proved = shared.proved.load(Ordering::Relaxed);

@@ -5,9 +5,10 @@
 //! pops the matching domain-trail levels, rolling truth back with it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::ids::VarId;
-use crate::lcg::clause::{ClauseDb, ClauseRef};
+use crate::lcg::clause::{ClauseDb, ClauseRef, ClauseSharing, SharedClause};
 use crate::lcg::lit::{Atom, AtomTable, Lit, LitOrConst};
 use crate::lcg::view::{self, Tri};
 use crate::propagator::Inconsistency;
@@ -182,6 +183,10 @@ pub struct Cdcl<'s> {
     pub(crate) conflicts: u64,
     /// Total literals across all learned clauses (numerator of avg learned size).
     pub(crate) learned_lits: u64,
+    /// Optional portfolio clause exchange.
+    clause_sharing: Option<ClauseSharing>,
+    /// Reused buffer for newly published clauses.
+    shared_scratch: Vec<SharedClause>,
 }
 
 impl<'s> Cdcl<'s> {
@@ -217,6 +222,8 @@ impl<'s> Cdcl<'s> {
             max_learned: 2000,
             conflicts: 0,
             learned_lits: 0,
+            clause_sharing: None,
+            shared_scratch: Vec::new(),
         }
     }
 
@@ -228,6 +235,11 @@ impl<'s> Cdcl<'s> {
     /// Set the reproducible search diversification seed.
     pub(crate) fn set_seed(&mut self, seed: u64) {
         self.seed = seed;
+    }
+
+    /// Enable learned-clause exchange for one portfolio worker.
+    pub(crate) fn set_clause_sharing(&mut self, sharing: ClauseSharing) {
+        self.clause_sharing = Some(sharing);
     }
 
     /// Whether the stop flag has fired.
@@ -273,12 +285,12 @@ impl<'s> Cdcl<'s> {
     /// outstanding [`ClauseRef`]s stay valid.
     fn delete_clause(&mut self, c: ClauseRef) {
         let (w0, w1) = {
-            let lits = &self.clauses.get(c).lits;
-            (lits[0], lits[1])
+            let clause = self.clauses.get(c);
+            (clause.lits[clause.watch[0]], clause.lits[clause.watch[1]])
         };
         self.watches[w0.code() as usize].retain(|&x| x != c);
         self.watches[w1.code() as usize].retain(|&x| x != c);
-        self.clauses.get_mut(c).lits.clear();
+        self.clauses.get_mut(c).lits = Arc::from([]);
     }
 
     /// Literal Block Distance: distinct decision levels among assigned literals.
@@ -293,16 +305,21 @@ impl<'s> Cdcl<'s> {
         levels.len() as u32
     }
 
-    /// Add a clause and watch its first two literals. Clauses with fewer than two
-    /// literals are not watched — callers assert the single literal directly.
+    /// Add a clause and watch two non-false literals when possible. Clauses with
+    /// fewer than two literals are not watched; callers assert units directly.
     /// `deletable` marks a reduction-eligible learned clause; `lbd` meaningful only then.
     pub(crate) fn add_clause(&mut self, lits: Vec<Lit>, deletable: bool, lbd: u32) -> ClauseRef {
+        self.add_shared_clause(Arc::from(lits), deletable, lbd)
+    }
+
+    fn add_shared_clause(&mut self, lits: Arc<[Lit]>, deletable: bool, lbd: u32) -> ClauseRef {
+        let watch = self.initial_watches(&lits);
         let (w0, w1) = if lits.len() >= 2 {
-            (Some(lits[0]), Some(lits[1]))
+            (Some(lits[watch[0]]), Some(lits[watch[1]]))
         } else {
             (None, None)
         };
-        let cref = self.clauses.add(lits, deletable, lbd);
+        let cref = self.clauses.add(lits, watch, deletable, lbd);
         if let (Some(a), Some(b)) = (w0, w1) {
             self.watches[a.code() as usize].push(cref);
             self.watches[b.code() as usize].push(cref);
@@ -311,6 +328,30 @@ impl<'s> Cdcl<'s> {
             self.num_learned += 1;
         }
         cref
+    }
+
+    fn initial_watches(&self, lits: &[Lit]) -> [usize; 2] {
+        let mut watch = [0, 0];
+        let mut found = 0;
+        for (i, &lit) in lits.iter().enumerate() {
+            if self.tvalue(lit) != Tri::False {
+                watch[found] = i;
+                found += 1;
+                if found == 2 {
+                    return watch;
+                }
+            }
+        }
+        for i in 0..lits.len() {
+            if found == 0 || i != watch[0] {
+                watch[found] = i;
+                found += 1;
+                if found == 2 {
+                    break;
+                }
+            }
+        }
+        watch
     }
 
     /// Post order-encoding channeling clauses for every variable and seed root
@@ -480,7 +521,7 @@ impl<'s> Cdcl<'s> {
 
     /// Record every atom of `var` the domain now determines but the trail has
     /// not (invariant T2). Called eagerly after each op so each atom is recorded
-    /// at its determination level — recording later, at a deeper level, would let
+    /// at its determination level; recording later, at a deeper level, would let
     /// 1-UIP backjump too far and prune feasible solutions. The reason is
     /// [`ds_recorded`], which entails every determination and is itself recorded.
     fn sync_var(&mut self, var: VarId) {
@@ -577,14 +618,15 @@ impl<'s> Cdcl<'s> {
             while read < ws.len() {
                 let cref = ws[read];
                 read += 1;
-                // Keep the watched literal we are updating in slot 1.
-                {
-                    let lits = &mut self.clauses.get_mut(cref).lits;
-                    if lits[0] == neg {
-                        lits.swap(0, 1);
+                let (slot, other) = {
+                    let clause = self.clauses.get(cref);
+                    if clause.lits[clause.watch[0]] == neg {
+                        (0, clause.lits[clause.watch[1]])
+                    } else {
+                        debug_assert_eq!(clause.lits[clause.watch[1]], neg);
+                        (1, clause.lits[clause.watch[0]])
                     }
-                }
-                let other = self.clauses.get(cref).lits[0];
+                };
                 if self.tvalue(other) == Tri::True {
                     ws[keep] = cref;
                     keep += 1;
@@ -593,17 +635,19 @@ impl<'s> Cdcl<'s> {
                 // Hunt for a non-false literal to watch instead of `neg`.
                 let mut new_watch: Option<(usize, Lit)> = None;
                 {
-                    let lits = &self.clauses.get(cref).lits;
-                    #[allow(clippy::needless_range_loop)] // need the index `k` for the swap below
-                    for k in 2..lits.len() {
-                        if self.tvalue(lits[k]) != Tri::False {
-                            new_watch = Some((k, lits[k]));
+                    let clause = self.clauses.get(cref);
+                    for (k, &lit) in clause.lits.iter().enumerate() {
+                        if k != clause.watch[0]
+                            && k != clause.watch[1]
+                            && self.tvalue(lit) != Tri::False
+                        {
+                            new_watch = Some((k, lit));
                             break;
                         }
                     }
                 }
                 if let Some((k, wl)) = new_watch {
-                    self.clauses.get_mut(cref).lits.swap(1, k);
+                    self.clauses.get_mut(cref).watch[slot] = k;
                     self.watches[wl.code() as usize].push(cref);
                     continue;
                 }
@@ -642,7 +686,7 @@ impl<'s> Cdcl<'s> {
                 return Ok(());
             }
             // Clause propagation to a fixpoint *first*, so every earlier change is
-            // recorded on the trail before the next propagator is snapshotted —
+            // recorded on the trail before the next propagator is snapshotted;
             // keeping its `D_S` antecedents all trail-recorded.
             if let Err(c) = self.propagate_clauses() {
                 return Err(Conflict::Clause(c));
@@ -749,6 +793,52 @@ impl<'s> Cdcl<'s> {
         }
     }
 
+    /// Import clauses published by other workers and propagate their effects.
+    pub(crate) fn sync_shared_clauses(&mut self) -> bool {
+        let Some(sharing) = &mut self.clause_sharing else {
+            return true;
+        };
+        sharing.copy_new_into(&mut self.shared_scratch);
+        let mut imported = false;
+        while let Some(clause) = self.shared_scratch.pop() {
+            let sharing = self.clause_sharing.as_ref().unwrap();
+            if sharing.is_own(&clause) {
+                continue;
+            }
+            sharing.record_import();
+            imported = true;
+            if !self.import_shared_clause(clause) {
+                return false;
+            }
+        }
+        !imported || self.propagate_and_learn()
+    }
+
+    fn import_shared_clause(&mut self, clause: SharedClause) -> bool {
+        let mut open = None;
+        let mut num_open = 0;
+        let mut satisfied = false;
+        for &lit in clause.lits.iter() {
+            match self.tvalue(lit) {
+                Tri::True => satisfied = true,
+                Tri::Unknown => {
+                    open.get_or_insert(lit);
+                    num_open += 1;
+                }
+                Tri::False => {}
+            }
+        }
+        let cref = self.add_shared_clause(clause.lits, true, clause.lbd);
+        if satisfied || num_open >= 2 {
+            return true;
+        }
+        if let Some(lit) = open {
+            return self.assign(lit, Reason::Clause(cref)).is_ok()
+                || self.resolve_conflict(Conflict::Clause(cref));
+        }
+        self.resolve_conflict(Conflict::Clause(cref))
+    }
+
     /// Analyse `conflict`, backjump, learn the 1-UIP clause and assert it. `false`
     /// if the conflict proves UNSAT. Also used to inject an externally-detected
     /// conflict (a falsified blocking clause after enumerating a solution).
@@ -761,9 +851,13 @@ impl<'s> Cdcl<'s> {
         // LBD measured at learn time, while every literal is still assigned.
         let lbd = self.lbd_of(&learnt);
         let deletable = learnt.len() >= 2;
+        let learnt: Arc<[Lit]> = Arc::from(learnt);
+        if let Some(sharing) = &self.clause_sharing {
+            sharing.publish(Arc::clone(&learnt), lbd);
+        }
         self.backjump_to(btlevel);
         let asserting = learnt[0];
-        let cref = self.add_clause(learnt, deletable, lbd);
+        let cref = self.add_shared_clause(learnt, deletable, lbd);
         // Post-backjump, the asserting literal is the only open one; it cannot wipe a domain.
         match self.assign(asserting, Reason::Clause(cref)) {
             Ok(()) => true,
@@ -903,7 +997,7 @@ impl<'s> Cdcl<'s> {
     /// Literals of the initial conflict clause (all currently false).
     fn conflict_lits(&self, conflict: &Conflict) -> Vec<Lit> {
         match conflict {
-            Conflict::Clause(c) => self.clauses.get(*c).lits.clone(),
+            Conflict::Clause(c) => self.clauses.get(*c).lits.to_vec(),
             Conflict::Generic(ds) => ds.iter().map(|l| l.negate()).collect(),
         }
     }

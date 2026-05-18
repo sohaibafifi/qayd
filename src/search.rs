@@ -7,10 +7,11 @@
 use std::sync::atomic::{AtomicBool, AtomicI64};
 
 use crate::ids::VarId;
+use crate::lcg::clause::ClauseSharing;
 use crate::lcg::trail::Cdcl;
 use crate::store::Solver;
 
-/// A stop flag that is never set — used by the non-interruptible entry points.
+/// A stop flag that is never set; used by the non-interruptible entry points.
 static NEVER_STOP: AtomicBool = AtomicBool::new(false);
 
 /// Whether to keep enumerating after a solution.
@@ -101,10 +102,17 @@ pub fn optimize_with(
     on_improve: impl FnMut(i32),
 ) -> (Option<(Vec<i32>, i32)>, SolveStats) {
     let mut on_improve = on_improve;
-    let (best, stats, _) =
-        optimize_seeded(solver, vars, obj, minimizing, stop, 0, None, |value, _| {
-            on_improve(value)
-        });
+    let (best, stats, _) = optimize_seeded(
+        solver,
+        vars,
+        obj,
+        minimizing,
+        stop,
+        0,
+        None,
+        None,
+        |value, _| on_improve(value),
+    );
     (best, stats)
 }
 
@@ -119,11 +127,15 @@ pub(crate) fn optimize_seeded(
     stop: &AtomicBool,
     seed: u64,
     shared_bound: Option<&AtomicI64>,
+    clause_sharing: Option<ClauseSharing>,
     on_improve: impl FnMut(i32, &[i32]),
 ) -> (Option<(Vec<i32>, i32)>, SolveStats, bool) {
     let mut cdcl = Cdcl::new(solver);
     cdcl.set_stop(stop);
     cdcl.set_seed(seed);
+    if let Some(sharing) = clause_sharing {
+        cdcl.set_clause_sharing(sharing);
+    }
     cdcl.optimize(vars, obj, minimizing, stop, shared_bound, on_improve)
 }
 

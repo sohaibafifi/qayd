@@ -24,18 +24,18 @@ struct VarSubs {
 /// Inert unless an LCG engine drains it; plain FD search never reads it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DomEvent {
-    /// `remove_below(var, bound)` — asserts `[var ≥ bound]`.
+    /// `remove_below(var, bound)` asserts `[var ≥ bound]`.
     GeTrue { var: VarId, bound: i32 },
-    /// `remove_above(var, bound)` — asserts `var ≤ bound`, i.e. `¬[var ≥ bound+1]`.
+    /// `remove_above(var, bound)` asserts `var ≤ bound`, i.e. `¬[var ≥ bound+1]`.
     LeTrue { var: VarId, bound: i32 },
-    /// `remove(var, val)` — asserts `¬[var = val]`.
+    /// `remove(var, val)` asserts `¬[var = val]`.
     NeTrue { var: VarId, val: i32 },
-    /// `fix(var, val)` — asserts `[var = val]`.
+    /// `fix(var, val)` asserts `[var = val]`.
     EqTrue { var: VarId, val: i32 },
 }
 
 /// An atomic domain fact a propagator can cite as a premise in its tight
-/// explanation — the domain-layer mirror of an LCG literal.
+/// explanation: the domain-layer mirror of an LCG literal.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Premise {
     /// `[var ≥ bound]`.
@@ -49,7 +49,7 @@ pub enum Premise {
 }
 
 /// A scope variable's domain, snapshotted just before a propagator's mutation.
-/// `holes` are the absent values strictly inside `(min, max)` — empty for a
+/// `holes` are the absent values strictly inside `(min, max)`, empty for a
 /// contiguous range.
 #[derive(Clone, Debug)]
 pub struct ScopeVar {
@@ -59,7 +59,7 @@ pub struct ScopeVar {
     pub holes: Vec<i32>,
 }
 
-/// Why a domain change happened — the raw material for its LCG explanation.
+/// Why a domain change happened: the raw material for its LCG explanation.
 #[derive(Clone, Debug)]
 pub enum Cause {
     /// Generic fallback: use the LCG engine's pre-propagator scope snapshot.
@@ -625,7 +625,7 @@ impl Solver {
     }
 
     /// Run the propagation fixpoint, polling `should_stop`. On stop, clears the
-    /// queue and returns `Ok` — the caller must abandon the search, never treat
+    /// queue and returns `Ok`; the caller must abandon the search, never treat
     /// this as a consistent fixpoint.
     pub fn propagate_until<F: Fn() -> bool>(
         &mut self,
