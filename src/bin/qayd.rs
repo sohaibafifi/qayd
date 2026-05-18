@@ -1,4 +1,4 @@
-//! `qayd` CLI: `qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] <instance.xml[.lzma|.xz]>`.
+//! `qayd` CLI: `qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] [--probe N] <instance.xml[.lzma|.xz]>`.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,6 +29,7 @@ fn run_instance(
     seed: u64,
     workers: usize,
     split: bool,
+    probes: usize,
 ) {
     let xml = match read_instance(path) {
         Ok(x) => x,
@@ -43,6 +44,7 @@ fn run_instance(
         seed,
         workers,
         split,
+        probes,
     };
     if let Err(e) = qayd::xcsp::run_to_with_options(&xml, verbose, stop, &mut lock, options) {
         eprintln!("error: {e}");
@@ -58,7 +60,7 @@ fn is_instance(arg: &str) -> bool {
 }
 
 const USAGE: &str =
-    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] <instance.xml[.lzma|.xz]>";
+    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] [--probe N] <instance.xml[.lzma|.xz]>";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
@@ -77,6 +79,7 @@ fn main() {
     let mut seed: Option<u64> = None;
     let mut workers: Option<usize> = None;
     let mut split = false;
+    let mut probes = 0;
     let mut path: Option<String> = None;
 
     let mut it = args.iter();
@@ -106,6 +109,13 @@ fn main() {
                 }
             },
             "--split" => split = true,
+            "--probe" => match it.next().and_then(|s| s.parse::<usize>().ok()) {
+                Some(value) if value > 0 => probes = value,
+                _ => {
+                    eprintln!("--probe needs a positive integer");
+                    std::process::exit(1);
+                }
+            },
             other if other.starts_with('-') => {
                 eprintln!("unknown option {other}");
                 usage();
@@ -149,5 +159,5 @@ fn main() {
         });
     }
 
-    run_instance(&path, verbose, &stop, seed, workers, split);
+    run_instance(&path, verbose, &stop, seed, workers, split, probes);
 }

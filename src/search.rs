@@ -156,6 +156,27 @@ pub(crate) fn split_cube_seeded(
     cdcl.split_cube(vars, cube)
 }
 
+/// Find one solution under an optimistic objective bound.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn probe_seeded(
+    solver: &mut Solver,
+    vars: &[VarId],
+    obj: VarId,
+    minimizing: bool,
+    target: i32,
+    stop: &AtomicBool,
+    seed: u64,
+    clause_sharing: Option<ClauseSharing>,
+) -> (Option<(Vec<i32>, i32)>, SolveStats, bool) {
+    let mut cdcl = Cdcl::new(solver);
+    cdcl.set_stop(stop);
+    cdcl.set_seed(seed);
+    if let Some(sharing) = clause_sharing {
+        cdcl.set_clause_sharing(sharing);
+    }
+    cdcl.probe(vars, obj, minimizing, target, stop)
+}
+
 /// Minimise `obj`. Returns the best `(assignment of vars, obj value)`.
 pub fn minimize(solver: &mut Solver, vars: &[VarId], obj: VarId) -> Option<(Vec<i32>, i32)> {
     optimize_with(solver, vars, obj, true, &NEVER_STOP, |_| {}).0

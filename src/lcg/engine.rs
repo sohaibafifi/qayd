@@ -196,6 +196,28 @@ impl Cdcl<'_> {
         cube.iter().copied().all(|lit| self.assert_root(lit))
     }
 
+    /// Assert `obj <= target` when minimizing or `obj >= target` when maximizing.
+    fn assume_objective_bound(&mut self, obj: VarId, target: i32, minimizing: bool) -> bool {
+        let bound = if minimizing {
+            let Some(next) = target.checked_add(1) else {
+                return true;
+            };
+            match self.atoms.ge(obj, next) {
+                LitOrConst::True => return false,
+                LitOrConst::False => return true,
+                LitOrConst::Lit(l) => l.negate(),
+            }
+        } else {
+            match self.atoms.ge(obj, target) {
+                LitOrConst::True => return true,
+                LitOrConst::False => return false,
+                LitOrConst::Lit(l) => l,
+            }
+        };
+        self.set_bound_scope(bound);
+        self.assert_root(bound)
+    }
+
     /// Pick one binary split for a cube, or `None` when it is already terminal.
     pub(crate) fn split_cube(&mut self, vars: &[VarId], cube: &[Lit]) -> Option<Lit> {
         if self.stopped() || !self.init() || !self.assume_cube(cube) || self.stopped() {
@@ -203,6 +225,57 @@ impl Cdcl<'_> {
         }
         let phase = vec![None; self.solver.store.num_vars()];
         self.select_var(vars).map(|v| self.decision_lit(v, &phase))
+    }
+
+    /// Find one solution under an optimistic objective bound.
+    pub(crate) fn probe(
+        &mut self,
+        vars: &[VarId],
+        obj: VarId,
+        minimizing: bool,
+        target: i32,
+        stop: &AtomicBool,
+    ) -> (Option<(Vec<i32>, i32)>, SolveStats, bool) {
+        let mut stats = SolveStats::default();
+        if !self.init()
+            || !self.assume_objective_bound(obj, target, minimizing)
+            || !self.sync_shared_clauses()
+        {
+            stats.failures = self.conflicts;
+            stats.learned_lits = self.learned_lits;
+            return (None, stats, true);
+        }
+        let phase = vec![None; self.solver.store.num_vars()];
+        let mut complete = true;
+        let (mut last_restart, mut restart_limit) = (self.conflicts, 100u64);
+        let found = loop {
+            if stop.load(Ordering::Relaxed) {
+                complete = false;
+                break None;
+            }
+            if !self.maybe_restart(&mut last_restart, &mut restart_limit) {
+                break None;
+            }
+            match self.select_var(vars) {
+                None => {
+                    stats.solutions += 1;
+                    let value = self.solver.store.value(obj);
+                    let assignment = vars.iter().map(|&v| self.solver.store.value(v)).collect();
+                    break Some((assignment, value));
+                }
+                Some(v) => {
+                    stats.nodes += 1;
+                    let lit = self.decision_lit(v, &phase);
+                    self.decide(lit).expect("in-domain decision cannot fail");
+                    if !self.propagate_and_learn() {
+                        break None;
+                    }
+                }
+            }
+        };
+        stats.failures = self.conflicts;
+        stats.learned_lits = self.learned_lits;
+        (found, stats, complete)
     }
 
     /// Record a new incumbent, report it, and assert a strictly-better objective

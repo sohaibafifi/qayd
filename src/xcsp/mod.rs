@@ -16,7 +16,8 @@ use crate::ids::VarId;
 use crate::lcg::clause::{ClauseSharing, SharedClausePool};
 use crate::lcg::lit::Lit;
 use crate::search::{
-    optimize_seeded, solve_interruptible_seeded, split_cube_seeded, SearchControl, SolveStats,
+    optimize_seeded, probe_seeded, solve_interruptible_seeded, split_cube_seeded, SearchControl,
+    SolveStats,
 };
 use crate::store::Solver;
 
@@ -39,6 +40,8 @@ pub struct RunOptions {
     pub workers: usize,
     /// Split the search space into disjoint proof jobs.
     pub split: bool,
+    /// Number of workers dedicated to optimistic objective probes.
+    pub probes: usize,
 }
 
 impl Default for RunOptions {
@@ -47,6 +50,7 @@ impl Default for RunOptions {
             seed: 0,
             workers: 1,
             split: false,
+            probes: 0,
         }
     }
 }
@@ -176,6 +180,10 @@ struct CopShared {
     clauses: Arc<SharedClausePool>,
     work: WorkQueue,
     minimizing: bool,
+    probe_lower: AtomicI64,
+    probe_upper: AtomicI64,
+    probe_attempts: AtomicU64,
+    probe_unsat: AtomicU64,
 }
 
 impl CopShared {
@@ -209,6 +217,51 @@ impl CopShared {
             }
         }
         false
+    }
+
+    fn next_probe(&self) -> Option<i32> {
+        let best = self.best.load(Ordering::Relaxed);
+        let lower = self.probe_lower.load(Ordering::Relaxed);
+        let upper = self.probe_upper.load(Ordering::Relaxed);
+        let (lo, hi) = if self.minimizing {
+            (lower, if best == i64::MAX { upper } else { best - 1 })
+        } else {
+            (if best == i64::MIN { lower } else { best + 1 }, upper)
+        };
+        (lo <= hi).then(|| (lo + (hi - lo) / 2) as i32)
+    }
+
+    fn record_probe_unsat(&self, target: i32) {
+        if self.minimizing {
+            self.probe_lower
+                .fetch_max(target as i64 + 1, Ordering::Relaxed);
+        } else {
+            self.probe_upper
+                .fetch_min(target as i64 - 1, Ordering::Relaxed);
+        }
+        self.probe_unsat.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn finish_if_probed(&self) -> bool {
+        let best = self.best.load(Ordering::Relaxed);
+        let lower = self.probe_lower.load(Ordering::Relaxed);
+        let upper = self.probe_upper.load(Ordering::Relaxed);
+        let proved = if self.minimizing {
+            if best == i64::MAX {
+                lower > upper
+            } else {
+                lower >= best
+            }
+        } else if best == i64::MIN {
+            upper < lower
+        } else {
+            upper <= best
+        };
+        if proved {
+            self.proved.store(true, Ordering::Relaxed);
+            self.stop();
+        }
+        proved
     }
 }
 
@@ -259,11 +312,17 @@ pub fn run_to_with_options<W: Write>(
     };
     let path = stage_xml(xml)?;
     let problem = parse_problem(&path.0)?;
+    let workers = if problem.objective.is_some() {
+        options.workers
+    } else {
+        1
+    };
     let options = RunOptions {
-        workers: if problem.objective.is_some() {
-            options.workers
+        workers,
+        probes: if problem.objective.is_some() {
+            options.probes.min(workers.saturating_sub(1))
         } else {
-            1
+            0
         },
         ..options
     };
@@ -282,6 +341,7 @@ pub fn run_to_with_options<W: Write>(
         writeln!(w, "c seed {}", options.seed).map_err(to_err)?;
         writeln!(w, "c workers {}", options.workers).map_err(to_err)?;
         writeln!(w, "c split {}", options.split).map_err(to_err)?;
+        writeln!(w, "c probes {}", options.probes).map_err(to_err)?;
         w.flush().map_err(to_err)?;
     }
 
@@ -387,6 +447,56 @@ fn solve_single<W: Write>(
     Ok(())
 }
 
+fn run_probe_worker(
+    model: Problem,
+    worker: usize,
+    minimizing: bool,
+    seed: u64,
+    shared: &CopShared,
+    tx: &mpsc::Sender<WorkerMsg>,
+) {
+    let vars = &model.order;
+    let (worker_minimizing, obj) = model.objective.expect("COP probe lost its objective");
+    assert_eq!(worker_minimizing, minimizing, "COP direction mismatch");
+    let mut stats = SolveStats::default();
+    let mut attempt = 0;
+    while !shared.cancel.load(Ordering::Relaxed) {
+        if shared.finish_if_probed() {
+            break;
+        }
+        let Some(target) = shared.next_probe() else {
+            break;
+        };
+        shared.probe_attempts.fetch_add(1, Ordering::Relaxed);
+        let mut solver = model.solver.clone();
+        let (found, part, complete) = probe_seeded(
+            &mut solver,
+            vars,
+            obj,
+            minimizing,
+            target,
+            &shared.cancel,
+            seed.wrapping_add(attempt),
+            Some(ClauseSharing::new(Arc::clone(&shared.clauses), worker)),
+        );
+        attempt += 1;
+        merge_stats(&mut stats, part);
+        if !complete {
+            break;
+        }
+        match found {
+            Some((solution, value)) => {
+                if shared.improve(value, &solution) {
+                    let _ = tx.send(WorkerMsg::Improved(value));
+                }
+            }
+            None => shared.record_probe_unsat(target),
+        }
+    }
+    shared.finish_if_probed();
+    let _ = tx.send(WorkerMsg::Done(stats));
+}
+
 fn solve_parallel_cop<W: Write>(
     problem: Problem,
     minimizing: bool,
@@ -395,6 +505,9 @@ fn solve_parallel_cop<W: Write>(
     w: &mut W,
     options: RunOptions,
 ) -> Result<(), String> {
+    let obj = problem.objective.expect("COP lost its objective").1;
+    let probe_lower = problem.solver.store.min(obj) as i64;
+    let probe_upper = problem.solver.store.max(obj) as i64;
     let shared = Arc::new(CopShared {
         cancel: AtomicBool::new(false),
         proved: AtomicBool::new(false),
@@ -403,6 +516,10 @@ fn solve_parallel_cop<W: Write>(
         clauses: Arc::new(SharedClausePool::default()),
         work: WorkQueue::new(),
         minimizing,
+        probe_lower: AtomicI64::new(probe_lower),
+        probe_upper: AtomicI64::new(probe_upper),
+        probe_attempts: AtomicU64::new(0),
+        probe_unsat: AtomicU64::new(0),
     });
     let (tx, rx) = mpsc::channel();
     let mut stats = SolveStats::default();
@@ -413,6 +530,7 @@ fn solve_parallel_cop<W: Write>(
     for _ in 1..options.workers {
         models.push(models[0].clone());
     }
+    let regular_workers = options.workers - options.probes;
 
     std::thread::scope(|scope| {
         let monitor = Arc::clone(&shared);
@@ -429,11 +547,15 @@ fn solve_parallel_cop<W: Write>(
             let shared = Arc::clone(&shared);
             let tx = tx.clone();
             scope.spawn(move || {
+                let seed = options.seed.wrapping_add(worker as u64);
+                if worker >= regular_workers {
+                    run_probe_worker(model, worker, minimizing, seed, &shared, &tx);
+                    return;
+                }
                 let vars = &model.order;
                 let (worker_minimizing, obj) =
                     model.objective.expect("COP worker lost its objective");
                 assert_eq!(worker_minimizing, minimizing, "COP direction mismatch");
-                let seed = options.seed.wrapping_add(worker as u64);
                 if !options.split {
                     let mut solver = model.solver;
                     let (_, worker_stats, complete) = optimize_seeded(
@@ -459,8 +581,8 @@ fn solve_parallel_cop<W: Write>(
                     let _ = tx.send(WorkerMsg::Done(worker_stats));
                     return;
                 }
-                let split_target = 2 * options.workers;
-                let split_limit = 4 * options.workers as u64;
+                let split_target = 2 * regular_workers;
+                let split_limit = 4 * regular_workers as u64;
                 let mut worker_stats = SolveStats::default();
                 while let Some(mut cube) = shared.work.take(&shared.cancel) {
                     while shared.work.needs_split(split_target, split_limit) {
@@ -564,6 +686,15 @@ fn solve_parallel_cop<W: Write>(
         if options.split {
             let (split, completed) = shared.work.stats();
             writeln!(w, "c split jobs {split} completed {completed}").map_err(to_err)?;
+        }
+        if options.probes > 0 {
+            writeln!(
+                w,
+                "c probes attempts {} unsat {}",
+                shared.probe_attempts.load(Ordering::Relaxed),
+                shared.probe_unsat.load(Ordering::Relaxed)
+            )
+            .map_err(to_err)?;
         }
     }
     let interrupted = stop.load(Ordering::Relaxed);
