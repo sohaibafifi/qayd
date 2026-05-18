@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64};
 
 use crate::ids::VarId;
 use crate::lcg::clause::ClauseSharing;
+use crate::lcg::lit::Lit;
 use crate::lcg::trail::Cdcl;
 use crate::store::Solver;
 
@@ -111,6 +112,7 @@ pub fn optimize_with(
         0,
         None,
         None,
+        &[],
         |value, _| on_improve(value),
     );
     (best, stats)
@@ -128,6 +130,7 @@ pub(crate) fn optimize_seeded(
     seed: u64,
     shared_bound: Option<&AtomicI64>,
     clause_sharing: Option<ClauseSharing>,
+    cube: &[Lit],
     on_improve: impl FnMut(i32, &[i32]),
 ) -> (Option<(Vec<i32>, i32)>, SolveStats, bool) {
     let mut cdcl = Cdcl::new(solver);
@@ -136,7 +139,21 @@ pub(crate) fn optimize_seeded(
     if let Some(sharing) = clause_sharing {
         cdcl.set_clause_sharing(sharing);
     }
-    cdcl.optimize(vars, obj, minimizing, stop, shared_bound, on_improve)
+    cdcl.optimize(vars, obj, minimizing, stop, shared_bound, cube, on_improve)
+}
+
+/// Pick a binary split for one root cube.
+pub(crate) fn split_cube_seeded(
+    solver: &mut Solver,
+    vars: &[VarId],
+    cube: &[Lit],
+    stop: &AtomicBool,
+    seed: u64,
+) -> Option<Lit> {
+    let mut cdcl = Cdcl::new(solver);
+    cdcl.set_stop(stop);
+    cdcl.set_seed(seed);
+    cdcl.split_cube(vars, cube)
 }
 
 /// Minimise `obj`. Returns the best `(assignment of vars, obj value)`.

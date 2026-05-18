@@ -3,17 +3,21 @@
 
 mod callback;
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use xcsp3_rust_parser::xcsp_runner::XcspRunner;
 
 use crate::ids::VarId;
 use crate::lcg::clause::{ClauseSharing, SharedClausePool};
-use crate::search::{optimize_seeded, solve_interruptible_seeded, SearchControl, SolveStats};
+use crate::lcg::lit::Lit;
+use crate::search::{
+    optimize_seeded, solve_interruptible_seeded, split_cube_seeded, SearchControl, SolveStats,
+};
 use crate::store::Solver;
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -33,6 +37,8 @@ pub struct RunOptions {
     pub seed: u64,
     /// Number of independent portfolio workers.
     pub workers: usize,
+    /// Split the search space into disjoint proof jobs.
+    pub split: bool,
 }
 
 impl Default for RunOptions {
@@ -40,6 +46,7 @@ impl Default for RunOptions {
         Self {
             seed: 0,
             workers: 1,
+            split: false,
         }
     }
 }
@@ -67,6 +74,85 @@ struct Problem {
     objective: Option<(bool, VarId)>,
 }
 
+type Cube = Vec<Lit>;
+
+struct WorkState {
+    jobs: VecDeque<Cube>,
+    active: usize,
+    split: u64,
+    completed: u64,
+}
+
+struct WorkQueue {
+    state: Mutex<WorkState>,
+    ready: Condvar,
+}
+
+impl WorkQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(WorkState {
+                jobs: VecDeque::from([Vec::new()]),
+                active: 0,
+                split: 0,
+                completed: 0,
+            }),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn take(&self, cancel: &AtomicBool) -> Option<Cube> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            if let Some(job) = state.jobs.pop_front() {
+                state.active += 1;
+                return Some(job);
+            }
+            if state.active == 0 {
+                return None;
+            }
+            state = self.ready.wait(state).unwrap();
+        }
+    }
+
+    fn needs_split(&self, target: usize, limit: u64) -> bool {
+        let state = self.state.lock().unwrap();
+        state.jobs.len() < target && state.split < limit
+    }
+
+    fn try_push_split(&self, sibling: Cube, target: usize, limit: u64) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.jobs.len() >= target || state.split >= limit {
+            return false;
+        }
+        state.jobs.push_back(sibling);
+        state.split += 1;
+        self.ready.notify_one();
+        true
+    }
+
+    fn finish(&self, completed: bool) -> bool {
+        let mut state = self.state.lock().unwrap();
+        state.active -= 1;
+        state.completed += u64::from(completed);
+        let finished = completed && state.active == 0 && state.jobs.is_empty();
+        self.ready.notify_all();
+        finished
+    }
+
+    fn wake_all(&self) {
+        self.ready.notify_all();
+    }
+
+    fn stats(&self) -> (u64, u64) {
+        let state = self.state.lock().unwrap();
+        (state.split, state.completed)
+    }
+}
+
 fn parse_problem(path: &Path) -> Result<Problem, String> {
     let mut model = callback::Model::new();
     let path_str = path.to_str().ok_or("bad temp path")?;
@@ -88,10 +174,16 @@ struct CopShared {
     best: AtomicI64,
     solution: Mutex<Option<(Vec<i32>, i32)>>,
     clauses: Arc<SharedClausePool>,
+    work: WorkQueue,
     minimizing: bool,
 }
 
 impl CopShared {
+    fn stop(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.work.wake_all();
+    }
+
     fn improve(&self, value: i32, solution: &[i32]) -> bool {
         let value64 = value as i64;
         let mut current = self.best.load(Ordering::Relaxed);
@@ -123,6 +215,13 @@ impl CopShared {
 enum WorkerMsg {
     Improved(i32),
     Done(SolveStats),
+}
+
+fn merge_stats(total: &mut SolveStats, part: SolveStats) {
+    total.solutions += part.solutions;
+    total.nodes += part.nodes;
+    total.failures += part.failures;
+    total.learned_lits += part.learned_lits;
 }
 
 /// Parse, build, and solve an XCSP3 instance, returning competition-style
@@ -182,6 +281,7 @@ pub fn run_to_with_options<W: Write>(
         writeln!(w, "c propagators {}", problem.solver.num_propagators()).map_err(to_err)?;
         writeln!(w, "c seed {}", options.seed).map_err(to_err)?;
         writeln!(w, "c workers {}", options.workers).map_err(to_err)?;
+        writeln!(w, "c split {}", options.split).map_err(to_err)?;
         w.flush().map_err(to_err)?;
     }
 
@@ -250,6 +350,7 @@ fn solve_single<W: Write>(
                 seed,
                 None,
                 None,
+                &[],
                 |v, _| {
                     if verbose && io_err.is_none() {
                         if let Err(e) = writeln!(w, "o {v}").and_then(|_| w.flush()) {
@@ -300,6 +401,7 @@ fn solve_parallel_cop<W: Write>(
         best: AtomicI64::new(if minimizing { i64::MAX } else { i64::MIN }),
         solution: Mutex::new(None),
         clauses: Arc::new(SharedClausePool::default()),
+        work: WorkQueue::new(),
         minimizing,
     });
     let (tx, rx) = mpsc::channel();
@@ -317,7 +419,7 @@ fn solve_parallel_cop<W: Write>(
         scope.spawn(move || {
             while !monitor.cancel.load(Ordering::Relaxed) {
                 if stop.load(Ordering::Relaxed) {
-                    monitor.cancel.store(true, Ordering::Relaxed);
+                    monitor.stop();
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(5));
@@ -327,29 +429,90 @@ fn solve_parallel_cop<W: Write>(
             let shared = Arc::clone(&shared);
             let tx = tx.clone();
             scope.spawn(move || {
-                let mut solver = model.solver;
-                let vars = model.order;
+                let vars = &model.order;
                 let (worker_minimizing, obj) =
                     model.objective.expect("COP worker lost its objective");
                 assert_eq!(worker_minimizing, minimizing, "COP direction mismatch");
-                let (_, worker_stats, complete) = optimize_seeded(
-                    &mut solver,
-                    &vars,
-                    obj,
-                    minimizing,
-                    &shared.cancel,
-                    options.seed.wrapping_add(worker as u64),
-                    Some(&shared.best),
-                    Some(ClauseSharing::new(Arc::clone(&shared.clauses), worker)),
-                    |value, solution| {
-                        if shared.improve(value, solution) {
-                            let _ = tx.send(WorkerMsg::Improved(value));
+                let seed = options.seed.wrapping_add(worker as u64);
+                if !options.split {
+                    let mut solver = model.solver;
+                    let (_, worker_stats, complete) = optimize_seeded(
+                        &mut solver,
+                        vars,
+                        obj,
+                        minimizing,
+                        &shared.cancel,
+                        seed,
+                        Some(&shared.best),
+                        Some(ClauseSharing::new(Arc::clone(&shared.clauses), worker)),
+                        &[],
+                        |value, solution| {
+                            if shared.improve(value, solution) {
+                                let _ = tx.send(WorkerMsg::Improved(value));
+                            }
+                        },
+                    );
+                    if complete {
+                        shared.proved.store(true, Ordering::Relaxed);
+                        shared.stop();
+                    }
+                    let _ = tx.send(WorkerMsg::Done(worker_stats));
+                    return;
+                }
+                let split_target = 2 * options.workers;
+                let split_limit = 4 * options.workers as u64;
+                let mut worker_stats = SolveStats::default();
+                while let Some(mut cube) = shared.work.take(&shared.cancel) {
+                    while shared.work.needs_split(split_target, split_limit) {
+                        let mut probe = model.solver.clone();
+                        let Some(lit) =
+                            split_cube_seeded(&mut probe, vars, &cube, &shared.cancel, seed)
+                        else {
+                            break;
+                        };
+                        let mut sibling = cube.clone();
+                        sibling.push(lit.negate());
+                        if !shared
+                            .work
+                            .try_push_split(sibling, split_target, split_limit)
+                        {
+                            break;
                         }
-                    },
-                );
-                if complete {
-                    shared.proved.store(true, Ordering::Relaxed);
-                    shared.cancel.store(true, Ordering::Relaxed);
+                        cube.push(lit);
+                    }
+                    let (job_stats, complete) = if shared.cancel.load(Ordering::Relaxed) {
+                        (SolveStats::default(), false)
+                    } else {
+                        let mut solver = model.solver.clone();
+                        let (_, job_stats, complete) = optimize_seeded(
+                            &mut solver,
+                            vars,
+                            obj,
+                            minimizing,
+                            &shared.cancel,
+                            seed,
+                            Some(&shared.best),
+                            Some(ClauseSharing::new(Arc::clone(&shared.clauses), worker)),
+                            &cube,
+                            |value, solution| {
+                                if shared.improve(value, solution) {
+                                    let _ = tx.send(WorkerMsg::Improved(value));
+                                }
+                            },
+                        );
+                        (job_stats, complete)
+                    };
+                    merge_stats(&mut worker_stats, job_stats);
+                    if shared.work.finish(complete) {
+                        shared.proved.store(true, Ordering::Relaxed);
+                        shared.stop();
+                    }
+                    if !complete {
+                        break;
+                    }
+                    if shared.proved.load(Ordering::Relaxed) {
+                        break;
+                    }
                 }
                 let _ = tx.send(WorkerMsg::Done(worker_stats));
             });
@@ -372,20 +535,17 @@ fn solve_parallel_cop<W: Write>(
                     if verbose && error.is_none() {
                         if let Err(e) = writeln!(w, "o {value}").and_then(|_| w.flush()) {
                             error = Some(e.to_string());
-                            shared.cancel.store(true, Ordering::Relaxed);
+                            shared.stop();
                         }
                     }
                 }
                 WorkerMsg::Improved(_) => {}
                 WorkerMsg::Done(worker_stats) => {
-                    stats.solutions += worker_stats.solutions;
-                    stats.nodes += worker_stats.nodes;
-                    stats.failures += worker_stats.failures;
-                    stats.learned_lits += worker_stats.learned_lits;
+                    merge_stats(&mut stats, worker_stats);
                 }
             }
         }
-        shared.cancel.store(true, Ordering::Relaxed);
+        shared.stop();
     });
 
     if let Some(e) = error {
@@ -401,6 +561,10 @@ fn solve_parallel_cop<W: Write>(
             shared.clauses.imported()
         )
         .map_err(to_err)?;
+        if options.split {
+            let (split, completed) = shared.work.stats();
+            writeln!(w, "c split jobs {split} completed {completed}").map_err(to_err)?;
+        }
     }
     let interrupted = stop.load(Ordering::Relaxed);
     let proved = shared.proved.load(Ordering::Relaxed);

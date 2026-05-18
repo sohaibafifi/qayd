@@ -187,6 +187,10 @@ pub struct Cdcl<'s> {
     clause_sharing: Option<ClauseSharing>,
     /// Reused buffer for newly published clauses.
     shared_scratch: Vec<SharedClause>,
+    /// Negated job assumptions prepended to exported learned clauses.
+    cube_scope: Vec<Lit>,
+    /// Negated objective bound prepended to exported learned clauses.
+    bound_scope: Option<Lit>,
 }
 
 impl<'s> Cdcl<'s> {
@@ -224,6 +228,8 @@ impl<'s> Cdcl<'s> {
             learned_lits: 0,
             clause_sharing: None,
             shared_scratch: Vec::new(),
+            cube_scope: Vec::new(),
+            bound_scope: None,
         }
     }
 
@@ -240,6 +246,18 @@ impl<'s> Cdcl<'s> {
     /// Enable learned-clause exchange for one portfolio worker.
     pub(crate) fn set_clause_sharing(&mut self, sharing: ClauseSharing) {
         self.clause_sharing = Some(sharing);
+    }
+
+    /// Scope exported clauses to the current search cube.
+    pub(crate) fn set_cube_scope(&mut self, cube: &[Lit]) {
+        self.cube_scope.clear();
+        self.cube_scope
+            .extend(cube.iter().map(|assumption| assumption.negate()));
+    }
+
+    /// Scope exported clauses to the current objective bound.
+    pub(crate) fn set_bound_scope(&mut self, bound: Lit) {
+        self.bound_scope = Some(bound.negate());
     }
 
     /// Whether the stop flag has fired.
@@ -853,7 +871,17 @@ impl<'s> Cdcl<'s> {
         let deletable = learnt.len() >= 2;
         let learnt: Arc<[Lit]> = Arc::from(learnt);
         if let Some(sharing) = &self.clause_sharing {
-            sharing.publish(Arc::clone(&learnt), lbd);
+            if self.cube_scope.is_empty() && self.bound_scope.is_none() {
+                sharing.publish(Arc::clone(&learnt), lbd);
+            } else {
+                let mut exported = Vec::with_capacity(
+                    self.cube_scope.len() + usize::from(self.bound_scope.is_some()) + learnt.len(),
+                );
+                exported.extend_from_slice(&self.cube_scope);
+                exported.extend(self.bound_scope);
+                exported.extend_from_slice(&learnt);
+                sharing.publish(Arc::from(exported), lbd);
+            }
         }
         self.backjump_to(btlevel);
         let asserting = learnt[0];

@@ -179,9 +179,30 @@ impl Cdcl<'_> {
             return false;
         };
         self.backjump_to(0);
-        // Non-deletable so an imported incumbent stays enforced.
-        let cref = self.add_clause(vec![bound], false, 0);
-        self.assign(bound, Reason::Clause(cref)).is_ok() && self.propagate_and_learn()
+        self.set_bound_scope(bound);
+        self.assert_root(bound)
+    }
+
+    /// Assert a non-deletable root unit and propagate it.
+    fn assert_root(&mut self, lit: Lit) -> bool {
+        debug_assert_eq!(self.decision_level(), 0);
+        let cref = self.add_clause(vec![lit], false, 0);
+        self.assign(lit, Reason::Clause(cref)).is_ok() && self.propagate_and_learn()
+    }
+
+    /// Assert the root units defining one disjoint search cube.
+    fn assume_cube(&mut self, cube: &[Lit]) -> bool {
+        self.set_cube_scope(cube);
+        cube.iter().copied().all(|lit| self.assert_root(lit))
+    }
+
+    /// Pick one binary split for a cube, or `None` when it is already terminal.
+    pub(crate) fn split_cube(&mut self, vars: &[VarId], cube: &[Lit]) -> Option<Lit> {
+        if self.stopped() || !self.init() || !self.assume_cube(cube) || self.stopped() {
+            return None;
+        }
+        let phase = vec![None; self.solver.store.num_vars()];
+        self.select_var(vars).map(|v| self.decision_lit(v, &phase))
     }
 
     /// Record a new incumbent, report it, and assert a strictly-better objective
@@ -212,6 +233,7 @@ impl Cdcl<'_> {
 
     /// CDCL branch-and-bound with restarts. `obj` must be among `vars`. Returns
     /// the best `(assignment, value)`, proven optimal unless `stop` was set.
+    #[allow(clippy::too_many_arguments)]
     pub fn optimize<F: FnMut(i32, &[i32])>(
         &mut self,
         vars: &[VarId],
@@ -219,11 +241,17 @@ impl Cdcl<'_> {
         minimizing: bool,
         stop: &AtomicBool,
         shared_bound: Option<&AtomicI64>,
+        cube: &[Lit],
         mut on_improve: F,
     ) -> (Option<(Vec<i32>, i32)>, SolveStats, bool) {
         let mut stats = SolveStats::default();
         let mut best: Option<(Vec<i32>, i32)> = None;
         if !self.init() {
+            stats.failures = self.conflicts;
+            stats.learned_lits = self.learned_lits;
+            return (best, stats, true);
+        }
+        if !self.assume_cube(cube) {
             stats.failures = self.conflicts;
             stats.learned_lits = self.learned_lits;
             return (best, stats, true);

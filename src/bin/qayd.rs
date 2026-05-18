@@ -1,4 +1,4 @@
-//! `qayd` CLI: `qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] <instance.xml[.lzma|.xz]>`.
+//! `qayd` CLI: `qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] <instance.xml[.lzma|.xz]>`.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +22,14 @@ fn read_instance(path: &str) -> Result<String, String> {
     Ok(xml)
 }
 
-fn run_instance(path: &str, verbose: bool, stop: &AtomicBool, seed: u64, workers: usize) {
+fn run_instance(
+    path: &str,
+    verbose: bool,
+    stop: &AtomicBool,
+    seed: u64,
+    workers: usize,
+    split: bool,
+) {
     let xml = match read_instance(path) {
         Ok(x) => x,
         Err(e) => {
@@ -32,7 +39,11 @@ fn run_instance(path: &str, verbose: bool, stop: &AtomicBool, seed: u64, workers
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    let options = qayd::xcsp::RunOptions { seed, workers };
+    let options = qayd::xcsp::RunOptions {
+        seed,
+        workers,
+        split,
+    };
     if let Err(e) = qayd::xcsp::run_to_with_options(&xml, verbose, stop, &mut lock, options) {
         eprintln!("error: {e}");
         std::process::exit(2);
@@ -47,7 +58,7 @@ fn is_instance(arg: &str) -> bool {
 }
 
 const USAGE: &str =
-    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] <instance.xml[.lzma|.xz]>";
+    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] <instance.xml[.lzma|.xz]>";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
@@ -65,6 +76,7 @@ fn main() {
     let mut time_limit: Option<u64> = None;
     let mut seed: Option<u64> = None;
     let mut workers: Option<usize> = None;
+    let mut split = false;
     let mut path: Option<String> = None;
 
     let mut it = args.iter();
@@ -93,6 +105,7 @@ fn main() {
                     std::process::exit(1);
                 }
             },
+            "--split" => split = true,
             other if other.starts_with('-') => {
                 eprintln!("unknown option {other}");
                 usage();
@@ -136,5 +149,5 @@ fn main() {
         });
     }
 
-    run_instance(&path, verbose, &stop, seed, workers);
+    run_instance(&path, verbose, &stop, seed, workers, split);
 }
