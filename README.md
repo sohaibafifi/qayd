@@ -24,7 +24,7 @@ cargo test
 ## Solve an instance
 
 ```bash
-qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] <instance.xml[.lzma|.xz]>
+qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] [--probe N] <instance.xml[.lzma|.xz]>
 ```
 
 - `-h`, `--help` prints the usage.
@@ -32,6 +32,8 @@ qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] <instance.xml[.lzma|.xz]>
 - `-t SECONDS`, `--time SECONDS` stops after a time budget, reporting the best solution so far.
 - `--seed SEED` sets the reproducible search seed. It defaults to `RANDOMSEED`, then `0`.
 - `-p THREADS`, `--threads THREADS` sets the COP portfolio worker count. It defaults to `NBCORE`, then `1`.
+- `--split` divides COP proof search into disjoint jobs for worker stealing.
+- `--probe N` dedicates up to `N` COP workers to optimistic objective probes.
 
 ## As a library
 
