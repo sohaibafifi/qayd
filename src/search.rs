@@ -142,6 +142,24 @@ pub(crate) fn optimize_seeded(
     cdcl.optimize(vars, obj, minimizing, stop, shared_bound, cube, on_improve)
 }
 
+/// Optimise a symbolic weighted sum without materializing its potentially huge domain.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn optimize_linear_seeded(
+    solver: &mut Solver,
+    vars: &[VarId],
+    coeffs: &[i64],
+    terms: &[VarId],
+    minimizing: bool,
+    stop: &AtomicBool,
+    seed: u64,
+    on_improve: impl FnMut(i64, &[i32]),
+) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
+    let mut cdcl = Cdcl::new(solver);
+    cdcl.set_stop(stop);
+    cdcl.set_seed(seed);
+    cdcl.optimize_linear(vars, coeffs, terms, minimizing, stop, on_improve)
+}
+
 /// Pick a binary split for one root cube.
 pub(crate) fn split_cube_seeded(
     solver: &mut Solver,

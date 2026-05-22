@@ -12,13 +12,12 @@ use std::time::{Duration, Instant};
 
 use xcsp3_rust_parser::xcsp_runner::XcspRunner;
 
-use crate::constraints::linear::{linear, Relation};
 use crate::ids::VarId;
 use crate::lcg::clause::{ClauseSharing, SharedClausePool};
 use crate::lcg::lit::Lit;
 use crate::search::{
-    optimize_seeded, probe_seeded, solve_interruptible_seeded, split_cube_seeded, SearchControl,
-    SolveStats,
+    optimize_linear_seeded, optimize_seeded, probe_seeded, solve_interruptible_seeded,
+    split_cube_seeded, SearchControl, SolveStats,
 };
 use crate::store::Solver;
 
@@ -459,7 +458,7 @@ fn solve_single<W: Write>(
 
 #[allow(clippy::too_many_arguments)]
 fn solve_linear_objective<W: Write>(
-    root: Solver,
+    mut solver: Solver,
     vars: Vec<VarId>,
     coeffs: Vec<i64>,
     terms: Vec<VarId>,
@@ -470,69 +469,25 @@ fn solve_linear_objective<W: Write>(
     seed: u64,
 ) -> Result<(), String> {
     let to_err = |e: std::io::Error| e.to_string();
-    let mut stats = SolveStats::default();
-    let mut best: Option<(Vec<i32>, i64)> = None;
-    let mut complete = false;
-
-    loop {
-        let mut solver = root.clone();
-        if let Some((_, value)) = &best {
-            let bound = if minimizing {
-                value.checked_sub(1)
-            } else {
-                value.checked_add(1)
-            };
-            let Some(bound) = bound else {
-                complete = true;
-                break;
-            };
-            linear(
-                &mut solver,
-                &coeffs,
-                &terms,
-                if minimizing {
-                    Relation::Le
-                } else {
-                    Relation::Ge
-                },
-                bound,
-            );
-        }
-
-        let mut found = None;
-        let part = solve_interruptible_seeded(
-            &mut solver,
-            &vars,
-            |s| {
-                let value = coeffs
-                    .iter()
-                    .zip(&terms)
-                    .map(|(&coeff, &var)| coeff * s.store.value(var) as i64)
-                    .sum();
-                let solution = vars.iter().map(|&var| s.store.value(var)).collect();
-                found = Some((solution, value));
-                SearchControl::Stop
-            },
-            stop,
-            seed,
-        );
-        merge_stats(&mut stats, part);
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-        match found {
-            Some(solution) => {
-                if verbose {
-                    writeln!(w, "o {}", solution.1).map_err(to_err)?;
-                    w.flush().map_err(to_err)?;
+    let mut io_err: Option<std::io::Error> = None;
+    let (best, stats, complete) = optimize_linear_seeded(
+        &mut solver,
+        &vars,
+        &coeffs,
+        &terms,
+        minimizing,
+        stop,
+        seed,
+        |value, _| {
+            if verbose && io_err.is_none() {
+                if let Err(e) = writeln!(w, "o {value}").and_then(|_| w.flush()) {
+                    io_err = Some(e);
                 }
-                best = Some(solution);
             }
-            None => {
-                complete = true;
-                break;
-            }
-        }
+        },
+    );
+    if let Some(e) = io_err {
+        return Err(e.to_string());
     }
 
     if verbose {

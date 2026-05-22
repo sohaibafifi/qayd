@@ -6,6 +6,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
+use crate::constraints::linear::{linear, Relation};
 use crate::ids::VarId;
 use crate::lcg::lit::{Lit, LitOrConst};
 use crate::lcg::trail::{Cdcl, Reason};
@@ -18,6 +19,28 @@ fn mix64(mut x: u64) -> u64 {
     x ^= x >> 27;
     x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
     x ^ (x >> 31)
+}
+
+#[derive(Clone, Copy)]
+enum Objective<'a> {
+    Var(VarId),
+    Linear {
+        coeffs: &'a [i64],
+        vars: &'a [VarId],
+    },
+}
+
+impl Objective<'_> {
+    fn value(self, solver: &Solver) -> i64 {
+        match self {
+            Self::Var(obj) => solver.store.value(obj) as i64,
+            Self::Linear { coeffs, vars } => coeffs
+                .iter()
+                .zip(vars)
+                .map(|(&coeff, &var)| coeff * solver.store.value(var) as i64)
+                .sum(),
+        }
+    }
 }
 
 impl Cdcl<'_> {
@@ -183,6 +206,41 @@ impl Cdcl<'_> {
         self.assert_root(bound)
     }
 
+    /// Assert a strict improvement on a materialized or symbolic objective.
+    fn tighten_objective(
+        &mut self,
+        objective: Objective<'_>,
+        minimizing: bool,
+        incumbent: i64,
+    ) -> bool {
+        match objective {
+            Objective::Var(obj) => self.tighten_bound(obj, minimizing, incumbent as i32),
+            Objective::Linear { coeffs, vars } => {
+                let bound = if minimizing {
+                    incumbent.checked_sub(1)
+                } else {
+                    incumbent.checked_add(1)
+                };
+                let Some(bound) = bound else {
+                    return false;
+                };
+                self.backjump_to(0);
+                linear(
+                    self.solver,
+                    coeffs,
+                    vars,
+                    if minimizing {
+                        Relation::Le
+                    } else {
+                        Relation::Ge
+                    },
+                    bound,
+                );
+                self.propagate_and_learn()
+            }
+        }
+    }
+
     /// Assert a non-deletable root unit and propagate it.
     fn assert_root(&mut self, lit: Lit) -> bool {
         debug_assert_eq!(self.decision_level(), 0);
@@ -281,18 +339,18 @@ impl Cdcl<'_> {
     /// Record a new incumbent, report it, and assert a strictly-better objective
     /// bound at level 0. Returns `false` when the incumbent is proven optimal.
     #[allow(clippy::too_many_arguments)]
-    fn accept_solution<F: FnMut(i32, &[i32])>(
+    fn accept_solution<F: FnMut(i64, &[i32])>(
         &mut self,
         vars: &[VarId],
-        obj: VarId,
+        objective: Objective<'_>,
         minimizing: bool,
-        best: &mut Option<(Vec<i32>, i32)>,
-        enforced: &mut Option<i32>,
+        best: &mut Option<(Vec<i32>, i64)>,
+        enforced: &mut Option<i64>,
         phase: &mut [Option<i32>],
         stats: &mut SolveStats,
         on_improve: &mut F,
     ) -> bool {
-        let value = self.solver.store.value(obj);
+        let value = objective.value(self.solver);
         let assignment: Vec<i32> = vars.iter().map(|&v| self.solver.store.value(v)).collect();
         for &v in vars {
             phase[v.index()] = Some(self.solver.store.value(v));
@@ -301,7 +359,7 @@ impl Cdcl<'_> {
         on_improve(value, &assignment);
         *best = Some((assignment, value));
         *enforced = Some(value);
-        self.tighten_bound(obj, minimizing, value)
+        self.tighten_objective(objective, minimizing, value)
     }
 
     /// CDCL branch-and-bound with restarts. `obj` must be among `vars`. Returns
@@ -317,8 +375,64 @@ impl Cdcl<'_> {
         cube: &[Lit],
         mut on_improve: F,
     ) -> (Option<(Vec<i32>, i32)>, SolveStats, bool) {
+        let (best, stats, complete) = self.optimize_objective(
+            vars,
+            Objective::Var(obj),
+            minimizing,
+            stop,
+            shared_bound,
+            cube,
+            |value, solution| on_improve(value as i32, solution),
+        );
+        (
+            best.map(|(solution, value)| (solution, value as i32)),
+            stats,
+            complete,
+        )
+    }
+
+    /// CDCL branch-and-bound over a symbolic weighted sum.
+    pub(crate) fn optimize_linear<F: FnMut(i64, &[i32])>(
+        &mut self,
+        vars: &[VarId],
+        coeffs: &[i64],
+        terms: &[VarId],
+        minimizing: bool,
+        stop: &AtomicBool,
+        on_improve: F,
+    ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
+        assert_eq!(
+            coeffs.len(),
+            terms.len(),
+            "linear objective: coeffs/terms length mismatch"
+        );
+        self.optimize_objective(
+            vars,
+            Objective::Linear {
+                coeffs,
+                vars: terms,
+            },
+            minimizing,
+            stop,
+            None,
+            &[],
+            on_improve,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn optimize_objective<F: FnMut(i64, &[i32])>(
+        &mut self,
+        vars: &[VarId],
+        objective: Objective<'_>,
+        minimizing: bool,
+        stop: &AtomicBool,
+        shared_bound: Option<&AtomicI64>,
+        cube: &[Lit],
+        mut on_improve: F,
+    ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
         let mut stats = SolveStats::default();
-        let mut best: Option<(Vec<i32>, i32)> = None;
+        let mut best: Option<(Vec<i32>, i64)> = None;
         if !self.init() {
             stats.failures = self.conflicts;
             stats.learned_lits = self.learned_lits;
@@ -347,7 +461,6 @@ impl Cdcl<'_> {
             if let Some(shared) = shared_bound {
                 let value = shared.load(Ordering::Relaxed);
                 if value != i64::MAX && value != i64::MIN {
-                    let value = value as i32;
                     let stronger =
                         enforced.is_none_or(
                             |old| {
@@ -360,7 +473,7 @@ impl Cdcl<'_> {
                         );
                     if stronger {
                         enforced = Some(value);
-                        if !self.tighten_bound(obj, minimizing, value) {
+                        if !self.tighten_objective(objective, minimizing, value) {
                             break;
                         }
                     }
@@ -373,7 +486,7 @@ impl Cdcl<'_> {
                 None => {
                     if !self.accept_solution(
                         vars,
-                        obj,
+                        objective,
                         minimizing,
                         &mut best,
                         &mut enforced,
