@@ -30,11 +30,14 @@ use crate::expr::{self, Expr};
 use crate::ids::VarId;
 use crate::store::Solver;
 
+const MAX_MATERIALIZED_OBJECTIVE_SPAN: i64 = 1_000_000;
+
 /// Accumulates the model as the parser walks the instance.
 pub struct Model {
     pub solver: Solver,
     pub order: Vec<VarId>,
     pub objective: Option<(bool, VarId)>,
+    pub linear_objective: Option<(bool, Vec<i64>, Vec<VarId>)>,
     pub error: Option<String>,
     ids: HashMap<String, VarId>,
     /// Declared variables in declaration order, for expanding whole-array
@@ -56,6 +59,7 @@ impl Model {
             solver: Solver::new(),
             order: Vec::new(),
             objective: None,
+            linear_objective: None,
             error: None,
             ids: HashMap::new(),
             decls: Vec::new(),
@@ -1587,6 +1591,10 @@ impl Model {
                     };
                     lo += a;
                     hi += b;
+                }
+                if hi - lo > MAX_MATERIALIZED_OBJECTIVE_SPAN {
+                    self.linear_objective = Some((minimize, coeffs, vars));
+                    return Ok(());
                 }
                 let obj = self.solver.new_var_range(clamp(lo), clamp(hi));
                 let mut cc = coeffs;

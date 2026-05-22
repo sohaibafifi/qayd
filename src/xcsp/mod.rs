@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use xcsp3_rust_parser::xcsp_runner::XcspRunner;
 
+use crate::constraints::linear::{linear, Relation};
 use crate::ids::VarId;
 use crate::lcg::clause::{ClauseSharing, SharedClausePool};
 use crate::lcg::lit::Lit;
@@ -76,6 +77,7 @@ struct Problem {
     solver: Solver,
     order: Vec<VarId>,
     objective: Option<(bool, VarId)>,
+    linear_objective: Option<(bool, Vec<i64>, Vec<VarId>)>,
 }
 
 type Cube = Vec<Lit>;
@@ -169,6 +171,7 @@ fn parse_problem(path: &Path) -> Result<Problem, String> {
         solver: model.solver,
         order: model.order,
         objective: model.objective,
+        linear_objective: model.linear_objective,
     })
 }
 
@@ -312,14 +315,15 @@ pub fn run_to_with_options<W: Write>(
     };
     let path = stage_xml(xml)?;
     let problem = parse_problem(&path.0)?;
-    let workers = if problem.objective.is_some() {
+    let parallel_objective = problem.objective.is_some();
+    let workers = if parallel_objective {
         options.workers
     } else {
         1
     };
     let options = RunOptions {
         workers,
-        probes: if problem.objective.is_some() {
+        probes: if parallel_objective {
             options.probes.min(workers.saturating_sub(1))
         } else {
             0
@@ -329,7 +333,7 @@ pub fn run_to_with_options<W: Write>(
     let to_err = |e: std::io::Error| e.to_string();
 
     if verbose {
-        let kind = if problem.objective.is_some() {
+        let kind = if problem.objective.is_some() || problem.linear_objective.is_some() {
             "COP"
         } else {
             "CSP"
@@ -372,6 +376,12 @@ fn solve_single<W: Write>(
     let mut solver = problem.solver;
     let vars = problem.order;
     let to_err = |e: std::io::Error| e.to_string();
+
+    if let Some((minimizing, coeffs, terms)) = problem.linear_objective {
+        return solve_linear_objective(
+            solver, vars, coeffs, terms, minimizing, verbose, stop, w, seed,
+        );
+    }
 
     match problem.objective {
         None => {
@@ -444,6 +454,104 @@ fn solve_single<W: Write>(
         }
     }
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_linear_objective<W: Write>(
+    root: Solver,
+    vars: Vec<VarId>,
+    coeffs: Vec<i64>,
+    terms: Vec<VarId>,
+    minimizing: bool,
+    verbose: bool,
+    stop: &AtomicBool,
+    w: &mut W,
+    seed: u64,
+) -> Result<(), String> {
+    let to_err = |e: std::io::Error| e.to_string();
+    let mut stats = SolveStats::default();
+    let mut best: Option<(Vec<i32>, i64)> = None;
+    let mut complete = false;
+
+    loop {
+        let mut solver = root.clone();
+        if let Some((_, value)) = &best {
+            let bound = if minimizing {
+                value.checked_sub(1)
+            } else {
+                value.checked_add(1)
+            };
+            let Some(bound) = bound else {
+                complete = true;
+                break;
+            };
+            linear(
+                &mut solver,
+                &coeffs,
+                &terms,
+                if minimizing {
+                    Relation::Le
+                } else {
+                    Relation::Ge
+                },
+                bound,
+            );
+        }
+
+        let mut found = None;
+        let part = solve_interruptible_seeded(
+            &mut solver,
+            &vars,
+            |s| {
+                let value = coeffs
+                    .iter()
+                    .zip(&terms)
+                    .map(|(&coeff, &var)| coeff * s.store.value(var) as i64)
+                    .sum();
+                let solution = vars.iter().map(|&var| s.store.value(var)).collect();
+                found = Some((solution, value));
+                SearchControl::Stop
+            },
+            stop,
+            seed,
+        );
+        merge_stats(&mut stats, part);
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        match found {
+            Some(solution) => {
+                if verbose {
+                    writeln!(w, "o {}", solution.1).map_err(to_err)?;
+                    w.flush().map_err(to_err)?;
+                }
+                best = Some(solution);
+            }
+            None => {
+                complete = true;
+                break;
+            }
+        }
+    }
+
+    if verbose {
+        writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(to_err)?;
+    }
+    match best {
+        Some((solution, value)) => {
+            let status = if complete {
+                "s OPTIMUM FOUND"
+            } else {
+                "s SATISFIABLE"
+            };
+            writeln!(w, "{status}").map_err(to_err)?;
+            writeln!(w, "o {value}").map_err(to_err)?;
+            write_values(w, &solution).map_err(to_err)?;
+        }
+        None if stop.load(Ordering::Relaxed) => writeln!(w, "s UNKNOWN").map_err(to_err)?,
+        None => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
+    }
     Ok(())
 }
 
