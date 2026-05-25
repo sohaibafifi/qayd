@@ -111,26 +111,22 @@ fn neg(loc: LitOrConst) -> LitOrConst {
     }
 }
 
+#[inline]
+fn lit(loc: LitOrConst) -> Option<Lit> {
+    match loc {
+        LitOrConst::Lit(l) => Some(l),
+        _ => None,
+    }
+}
+
 /// Translate a primary [`DomEvent`] to the literal it asserts, or `None` if it
 /// folds to a constant.
 fn translate(atoms: &AtomTable, ev: &DomEvent) -> Option<Lit> {
     match *ev {
-        DomEvent::GeTrue { var, bound } => match atoms.ge(var, bound) {
-            LitOrConst::Lit(l) => Some(l),
-            _ => None,
-        },
-        DomEvent::LeTrue { var, bound } => match atoms.ge(var, bound + 1) {
-            LitOrConst::Lit(l) => Some(l.negate()),
-            _ => None,
-        },
-        DomEvent::NeTrue { var, val } => match atoms.eq(var, val) {
-            LitOrConst::Lit(l) => Some(l.negate()),
-            _ => None,
-        },
-        DomEvent::EqTrue { var, val } => match atoms.eq(var, val) {
-            LitOrConst::Lit(l) => Some(l),
-            _ => None,
-        },
+        DomEvent::GeTrue { var, bound } => lit(atoms.ge(var, bound)),
+        DomEvent::LeTrue { var, bound } => lit(atoms.ge(var, bound + 1)).map(Lit::negate),
+        DomEvent::NeTrue { var, val } => lit(atoms.eq(var, val)).map(Lit::negate),
+        DomEvent::EqTrue { var, val } => lit(atoms.eq(var, val)),
     }
 }
 

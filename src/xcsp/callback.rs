@@ -32,6 +32,14 @@ use crate::store::Solver;
 
 const MAX_MATERIALIZED_OBJECTIVE_SPAN: i64 = 1_000_000;
 
+fn require(ok: bool, message: &str) -> Result<(), String> {
+    if ok {
+        Ok(())
+    } else {
+        Err(message.to_string())
+    }
+}
+
 struct ArrayDecl {
     shape: Vec<usize>,
     cells: Vec<VarId>,
@@ -198,6 +206,13 @@ impl Model {
             Operand::Variable(s) => Ok(Rhs::Var(self.var_id(s)?)),
             _ => Err("unsupported condition operand".to_string()),
         }
+    }
+
+    fn rhs_var(&mut self, operand: &Operand) -> Result<VarId, String> {
+        Ok(match self.rhs(operand)? {
+            Rhs::Const(k) => self.constant(clamp(k)),
+            Rhs::Var(v) => v,
+        })
     }
 
     /// Decode a condition `(operator, operand)` into the relations to post.
@@ -855,14 +870,10 @@ impl XcspCallback for Model {
         value: i32,
     ) {
         guard!(self, {
-            if start_index != 0 {
-                return Err("element with non-zero startIndex".to_string());
-            }
+            require(start_index == 0, "element with non-zero startIndex")?;
             let array = self.scope(list)?;
-            let idx = self.var_id(&index)?;
             let val = self.constant(value);
-            element(&mut self.solver, &array, idx, val);
-            Ok(())
+            self.post_element(array, &index, val)
         });
     }
     fn on_constraint_element_v3(
@@ -873,14 +884,10 @@ impl XcspCallback for Model {
         value: String,
     ) {
         guard!(self, {
-            if start_index != 0 {
-                return Err("element with non-zero startIndex".to_string());
-            }
+            require(start_index == 0, "element with non-zero startIndex")?;
             let array = self.scope(list)?;
-            let idx = self.var_id(&index)?;
             let val = self.var_id(&value)?;
-            element(&mut self.solver, &array, idx, val);
-            Ok(())
+            self.post_element(array, &index, val)
         });
     }
     fn on_constraint_element_v5(
@@ -892,12 +899,9 @@ impl XcspCallback for Model {
         operand: Operand,
     ) {
         guard!(self, {
-            if start_index != 0 {
-                return Err("element with non-zero startIndex".to_string());
-            }
+            require(start_index == 0, "element with non-zero startIndex")?;
             let array = self.scope(list)?;
-            let idx = self.var_id(&index)?;
-            self.element_cond(array, idx, operator, operand)
+            self.post_element_cond(array, &index, operator, operand)
         });
     }
     fn on_constraint_element_v8(
@@ -909,12 +913,9 @@ impl XcspCallback for Model {
         operand: Operand,
     ) {
         guard!(self, {
-            if start_index != 0 {
-                return Err("element with non-zero startIndex".to_string());
-            }
-            let array: Vec<VarId> = list.iter().map(|&c| self.constant(c)).collect();
-            let idx = self.var_id(&index)?;
-            self.element_cond(array, idx, operator, operand)
+            require(start_index == 0, "element with non-zero startIndex")?;
+            let array = self.consts(list);
+            self.post_element_cond(array, &index, operator, operand)
         });
     }
     fn on_constraint_element_v6(
@@ -925,14 +926,10 @@ impl XcspCallback for Model {
         value: String,
     ) {
         guard!(self, {
-            if start_index != 0 {
-                return Err("element with non-zero startIndex".to_string());
-            }
-            let array: Vec<VarId> = list.iter().map(|&c| self.constant(c)).collect();
-            let idx = self.var_id(&index)?;
+            require(start_index == 0, "element with non-zero startIndex")?;
+            let array = self.consts(list);
             let val = self.var_id(&value)?;
-            element(&mut self.solver, &array, idx, val);
-            Ok(())
+            self.post_element(array, &index, val)
         });
     }
     fn on_constraint_element_v7(
@@ -943,14 +940,10 @@ impl XcspCallback for Model {
         value: i32,
     ) {
         guard!(self, {
-            if start_index != 0 {
-                return Err("element with non-zero startIndex".to_string());
-            }
-            let array: Vec<VarId> = list.iter().map(|&c| self.constant(c)).collect();
-            let idx = self.var_id(&index)?;
+            require(start_index == 0, "element with non-zero startIndex")?;
+            let array = self.consts(list);
             let val = self.constant(value);
-            element(&mut self.solver, &array, idx, val);
-            Ok(())
+            self.post_element(array, &index, val)
         });
     }
 
@@ -963,9 +956,10 @@ impl XcspCallback for Model {
         operand: Operand,
     ) {
         guard!(self, {
-            if !matches!(operator, ROp::Le) {
-                return Err("cumulative condition must be <=".to_string());
-            }
+            require(
+                matches!(operator, ROp::Le),
+                "cumulative condition must be <=",
+            )?;
             let starts = self.scope(origins)?;
             let d: Vec<i64> = lengths.iter().map(|&x| x as i64).collect();
             match self.rhs(&operand)? {
@@ -993,18 +987,9 @@ impl XcspCallback for Model {
         operand: Operand,
     ) {
         guard!(self, {
-            if !matches!(operator, ROp::Le) {
-                return Err("cumulative condition must be <=".to_string());
-            }
-            let starts = self.scope(origins)?;
             let dv = self.consts(lengths);
             let h = self.scope(heights)?;
-            let cap = match self.rhs(&operand)? {
-                Rhs::Const(k) => self.constant(clamp(k)),
-                Rhs::Var(v) => v,
-            };
-            cumulative_var(&mut self.solver, &starts, &dv, &h, cap);
-            Ok(())
+            self.post_cumulative_var(origins, dv, h, operator, &operand)
         });
     }
     fn on_constraint_cumulative_v3(
@@ -1016,18 +1001,9 @@ impl XcspCallback for Model {
         operand: Operand,
     ) {
         guard!(self, {
-            if !matches!(operator, ROp::Le) {
-                return Err("cumulative condition must be <=".to_string());
-            }
-            let starts = self.scope(origins)?;
             let dv = self.scope(lengths)?;
             let h = self.consts(heights);
-            let cap = match self.rhs(&operand)? {
-                Rhs::Const(k) => self.constant(clamp(k)),
-                Rhs::Var(v) => v,
-            };
-            cumulative_var(&mut self.solver, &starts, &dv, &h, cap);
-            Ok(())
+            self.post_cumulative_var(origins, dv, h, operator, &operand)
         });
     }
     fn on_constraint_cumulative_v4(
@@ -1039,18 +1015,9 @@ impl XcspCallback for Model {
         operand: Operand,
     ) {
         guard!(self, {
-            if !matches!(operator, ROp::Le) {
-                return Err("cumulative condition must be <=".to_string());
-            }
-            let starts = self.scope(origins)?;
             let dv = self.scope(lengths)?;
             let h = self.scope(heights)?;
-            let cap = match self.rhs(&operand)? {
-                Rhs::Const(k) => self.constant(clamp(k)),
-                Rhs::Var(v) => v,
-            };
-            cumulative_var(&mut self.solver, &starts, &dv, &h, cap);
-            Ok(())
+            self.post_cumulative_var(origins, dv, h, operator, &operand)
         });
     }
 
@@ -1376,34 +1343,16 @@ impl XcspCallback for Model {
 
     // --- objectives ---
     fn on_minimize_var(&mut self, var: String) {
-        guard!(self, {
-            self.objective = Some(Objective::Var(true, self.var_id(&var)?));
-            Ok(())
-        });
+        guard!(self, { self.set_var_objective(&var, true) });
     }
     fn on_maximize_var(&mut self, var: String) {
-        guard!(self, {
-            self.objective = Some(Objective::Var(false, self.var_id(&var)?));
-            Ok(())
-        });
+        guard!(self, { self.set_var_objective(&var, false) });
     }
     fn on_minimize_expression(&mut self, e: &ExpressionTree) {
-        guard!(self, {
-            let expr = self.tree(e)?;
-            let aux = self.aux_for(expr);
-            self.order.push(aux);
-            self.objective = Some(Objective::Var(true, aux));
-            Ok(())
-        });
+        guard!(self, { self.set_expr_objective(e, true) });
     }
     fn on_maximize_expression(&mut self, e: &ExpressionTree) {
-        guard!(self, {
-            let expr = self.tree(e)?;
-            let aux = self.aux_for(expr);
-            self.order.push(aux);
-            self.objective = Some(Objective::Var(false, aux));
-            Ok(())
-        });
+        guard!(self, { self.set_expr_objective(e, false) });
     }
     fn on_minimize_v1(&mut self, t: XElementOperator, list: &[String], coefs: &[i32]) {
         guard!(self, { self.objective_sum(t, list, coefs, true) });
@@ -1456,10 +1405,7 @@ impl Model {
         is_min: bool,
     ) -> Result<(), String> {
         let rel = Model::rel(operator)?;
-        let y = match self.rhs(&operand)? {
-            Rhs::Const(k) => self.constant(k as i32),
-            Rhs::Var(v) => v,
-        };
+        let y = self.rhs_var(&operand)?;
         if matches!(rel, Relation::Eq) {
             if is_min {
                 minimum(&mut self.solver, y, &xs);
@@ -1558,6 +1504,41 @@ impl Model {
         Ok(())
     }
 
+    fn post_element(&mut self, array: Vec<VarId>, index: &str, value: VarId) -> Result<(), String> {
+        let idx = self.var_id(index)?;
+        element(&mut self.solver, &array, idx, value);
+        Ok(())
+    }
+
+    fn post_element_cond(
+        &mut self,
+        array: Vec<VarId>,
+        index: &str,
+        operator: ROp,
+        operand: Operand,
+    ) -> Result<(), String> {
+        let idx = self.var_id(index)?;
+        self.element_cond(array, idx, operator, operand)
+    }
+
+    fn post_cumulative_var(
+        &mut self,
+        origins: &[String],
+        durations: Vec<VarId>,
+        heights: Vec<VarId>,
+        operator: ROp,
+        operand: &Operand,
+    ) -> Result<(), String> {
+        require(
+            matches!(operator, ROp::Le),
+            "cumulative condition must be <=",
+        )?;
+        let starts = self.scope(origins)?;
+        let cap = self.rhs_var(operand)?;
+        cumulative_var(&mut self.solver, &starts, &durations, &heights, cap);
+        Ok(())
+    }
+
     /// `aux = array[index]` then `aux  rel  operand`.
     fn element_cond(
         &mut self,
@@ -1579,10 +1560,7 @@ impl Model {
         let aux = self.solver.new_var_range(lo, hi);
         element(&mut self.solver, &array, idx, aux);
         let rel = Model::rel(operator)?;
-        let y = match self.rhs(&operand)? {
-            Rhs::Const(k) => self.constant(clamp(k)),
-            Rhs::Var(v) => v,
-        };
+        let y = self.rhs_var(&operand)?;
         linear(&mut self.solver, &[1, -1], &[aux, y], rel, 0);
         Ok(())
     }
@@ -1636,6 +1614,18 @@ impl Model {
         coeffs.push(-1);
         terms.push(y);
         linear(&mut self.solver, &coeffs, &terms, rel, 0);
+    }
+
+    fn set_var_objective(&mut self, var: &str, minimize: bool) -> Result<(), String> {
+        self.objective = Some(Objective::Var(minimize, self.var_id(var)?));
+        Ok(())
+    }
+
+    fn set_expr_objective(&mut self, tree: &ExpressionTree, minimize: bool) -> Result<(), String> {
+        let aux = self.aux_for(self.tree(tree)?);
+        self.order.push(aux);
+        self.objective = Some(Objective::Var(minimize, aux));
+        Ok(())
     }
 
     /// Objective over named variables.

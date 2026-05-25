@@ -23,6 +23,14 @@ fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+fn strict_bound(incumbent: i64, minimizing: bool) -> Option<i64> {
+    if minimizing {
+        incumbent.checked_sub(1)
+    } else {
+        incumbent.checked_add(1)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Objective<'a> {
     Var(VarId),
@@ -222,12 +230,7 @@ impl Cdcl<'_> {
         match objective {
             Objective::Var(obj) => self.tighten_bound(obj, minimizing, incumbent as i32),
             Objective::Linear { coeffs, vars } => {
-                let bound = if minimizing {
-                    incumbent.checked_sub(1)
-                } else {
-                    incumbent.checked_add(1)
-                };
-                let Some(bound) = bound else {
+                let Some(bound) = strict_bound(incumbent, minimizing) else {
                     return false;
                 };
                 self.backjump_to(0);
@@ -245,12 +248,7 @@ impl Cdcl<'_> {
                 self.propagate_and_learn()
             }
             Objective::Expr(expr) => {
-                let bound = if minimizing {
-                    incumbent.checked_sub(1)
-                } else {
-                    incumbent.checked_add(1)
-                };
-                let Some(bound) = bound else {
+                let Some(bound) = strict_bound(incumbent, minimizing) else {
                     return false;
                 };
                 self.backjump_to(0);

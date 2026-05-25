@@ -202,20 +202,12 @@ pub fn ordered(solver: &mut Solver, vars: &[VarId], rel: Relation) {
     for w in vars.windows(2) {
         let (a, b) = (w[0], w[1]);
         match rel {
-            Relation::Le => {
-                less_or_equal(solver, a, b);
-            }
-            Relation::Lt => {
-                less_than(solver, a, b);
-            }
-            Relation::Ge => {
-                less_or_equal(solver, b, a);
-            }
-            Relation::Gt => {
-                less_than(solver, b, a);
-            }
+            Relation::Le => less_or_equal(solver, a, b),
+            Relation::Lt => less_than(solver, a, b),
+            Relation::Ge => less_or_equal(solver, b, a),
+            Relation::Gt => less_than(solver, b, a),
             _ => panic!("ordered: relation must be a comparison, got {rel:?}"),
-        }
+        };
     }
 }
 

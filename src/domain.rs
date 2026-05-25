@@ -27,7 +27,7 @@ impl Domain {
         assert!(lo <= hi, "empty domain range [{lo}, {hi}]");
         let n = (hi - lo + 1) as usize;
         let dense: Vec<u32> = (0..n as u32).collect();
-        let sparse: Vec<u32> = (0..n as u32).collect();
+        let sparse = dense.clone();
         Self {
             offset: lo,
             dense,

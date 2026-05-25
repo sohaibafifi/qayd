@@ -1,6 +1,7 @@
 //! `qayd` CLI: `qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] [--probe N] <instance.xml[.lzma|.xz]>`.
 
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,18 +9,18 @@ use std::time::Duration;
 /// Read an instance, transparently decompressing `.lzma` / `.xz`.
 fn read_instance(path: &str) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-    let xml = if path.ends_with(".lzma") {
+    let bytes = if path.ends_with(".lzma") {
         let mut out = Vec::new();
         lzma_rs::lzma_decompress(&mut &bytes[..], &mut out).map_err(|e| e.to_string())?;
-        String::from_utf8(out).map_err(|e| e.to_string())?
+        out
     } else if path.ends_with(".xz") {
         let mut out = Vec::new();
         lzma_rs::xz_decompress(&mut &bytes[..], &mut out).map_err(|e| e.to_string())?;
-        String::from_utf8(out).map_err(|e| e.to_string())?
+        out
     } else {
-        String::from_utf8(bytes).map_err(|e| e.to_string())?
+        bytes
     };
-    Ok(xml)
+    String::from_utf8(bytes).map_err(|e| e.to_string())
 }
 
 fn run_instance(
@@ -62,9 +63,27 @@ fn is_instance(arg: &str) -> bool {
 const USAGE: &str =
     "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] [--probe N] <instance.xml[.lzma|.xz]>";
 
-fn usage() -> ! {
-    eprintln!("{USAGE}");
+fn fail(message: &str) -> ! {
+    eprintln!("{message}");
     std::process::exit(1);
+}
+
+fn parse<T: FromStr>(value: Option<&str>, message: &str) -> T {
+    value
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| fail(message))
+}
+
+fn positive(value: Option<&str>, message: &str) -> usize {
+    let value = parse(value, message);
+    if value == 0 {
+        fail(message);
+    }
+    value
+}
+
+fn usage() -> ! {
+    fail(USAGE)
 }
 
 fn help() -> ! {
@@ -87,35 +106,31 @@ fn main() {
         match a.as_str() {
             "-h" | "--help" => help(),
             "-v" | "--verbose" => verbose = true,
-            "-t" | "--time" => match it.next().and_then(|s| s.parse::<u64>().ok()) {
-                Some(secs) => time_limit = Some(secs),
-                None => {
-                    eprintln!("-t/--time needs a number of seconds");
-                    std::process::exit(1);
-                }
-            },
-            "--seed" => match it.next().and_then(|s| s.parse::<u64>().ok()) {
-                Some(value) => seed = Some(value),
-                None => {
-                    eprintln!("--seed needs an unsigned integer");
-                    std::process::exit(1);
-                }
-            },
-            "-p" | "--threads" => match it.next().and_then(|s| s.parse::<usize>().ok()) {
-                Some(value) if value > 0 => workers = Some(value),
-                _ => {
-                    eprintln!("-p/--threads needs a positive integer");
-                    std::process::exit(1);
-                }
-            },
+            "-t" | "--time" => {
+                time_limit = Some(parse(
+                    it.next().map(String::as_str),
+                    "-t/--time needs a number of seconds",
+                ))
+            }
+            "--seed" => {
+                seed = Some(parse(
+                    it.next().map(String::as_str),
+                    "--seed needs an unsigned integer",
+                ))
+            }
+            "-p" | "--threads" => {
+                workers = Some(positive(
+                    it.next().map(String::as_str),
+                    "-p/--threads needs a positive integer",
+                ))
+            }
             "--split" => split = true,
-            "--probe" => match it.next().and_then(|s| s.parse::<usize>().ok()) {
-                Some(value) if value > 0 => probes = value,
-                _ => {
-                    eprintln!("--probe needs a positive integer");
-                    std::process::exit(1);
-                }
-            },
+            "--probe" => {
+                probes = positive(
+                    it.next().map(String::as_str),
+                    "--probe needs a positive integer",
+                )
+            }
             other if other.starts_with('-') => {
                 eprintln!("unknown option {other}");
                 usage();
@@ -136,13 +151,7 @@ fn main() {
             .unwrap_or(0)
     });
     let workers = workers.unwrap_or_else(|| match std::env::var("NBCORE") {
-        Ok(s) => match s.parse::<usize>() {
-            Ok(0) | Err(_) => {
-                eprintln!("NBCORE needs a positive integer");
-                std::process::exit(1);
-            }
-            Ok(n) => n,
-        },
+        Ok(s) => positive(Some(&s), "NBCORE needs a positive integer"),
         Err(_) => 1,
     });
 

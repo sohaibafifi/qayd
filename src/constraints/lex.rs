@@ -52,10 +52,8 @@ impl Propagator for Lex {
 
             if fixed_equal(store, i) {
                 i += 1; // forced equal; prefix grew
-            } else if store.max(self.x[i]) < store.min(self.y[i]) {
-                return Ok(()); // strictly less: entailed
             } else {
-                return Ok(()); // still undecided
+                return Ok(());
             }
         }
     }
