@@ -38,6 +38,22 @@ pub struct SolveStats {
     pub learned_lits: u64,
 }
 
+#[inline]
+fn seeded_cdcl<'a>(
+    solver: &'a mut Solver,
+    vars: &[VarId],
+    stop: &'a AtomicBool,
+    seed: u64,
+) -> Option<Cdcl<'a>> {
+    if stop.load(Ordering::Relaxed) {
+        return None;
+    }
+    let mut cdcl = Cdcl::new(solver, vars);
+    cdcl.set_stop(stop);
+    cdcl.set_seed(seed);
+    Some(cdcl)
+}
+
 /// Enumerate solutions over `vars`; `on_solution` returns [`SearchControl::Stop`]
 /// to halt early. Mutates `solver` (posts learnt clauses, leaves end state).
 pub fn solve<F>(solver: &mut Solver, vars: &[VarId], on_solution: F) -> SolveStats
@@ -71,12 +87,9 @@ pub(crate) fn solve_interruptible_seeded<F>(
 where
     F: FnMut(&Solver) -> SearchControl,
 {
-    if stop.load(Ordering::Relaxed) {
+    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed) else {
         return SolveStats::default();
-    }
-    let mut cdcl = Cdcl::new(solver, vars);
-    cdcl.set_stop(stop);
-    cdcl.set_seed(seed);
+    };
     cdcl.enumerate(vars, on_solution, stop)
 }
 
@@ -137,12 +150,9 @@ pub(crate) fn optimize_seeded(
     cube: &[Lit],
     on_improve: impl FnMut(i32, &[i32]),
 ) -> (Option<(Vec<i32>, i32)>, SolveStats, bool) {
-    if stop.load(Ordering::Relaxed) {
+    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed) else {
         return (None, SolveStats::default(), false);
-    }
-    let mut cdcl = Cdcl::new(solver, vars);
-    cdcl.set_stop(stop);
-    cdcl.set_seed(seed);
+    };
     if let Some(sharing) = clause_sharing {
         cdcl.set_clause_sharing(sharing);
     }
@@ -161,12 +171,9 @@ pub(crate) fn optimize_linear_seeded(
     seed: u64,
     on_improve: impl FnMut(i64, &[i32]),
 ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
-    if stop.load(Ordering::Relaxed) {
+    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed) else {
         return (None, SolveStats::default(), false);
-    }
-    let mut cdcl = Cdcl::new(solver, vars);
-    cdcl.set_stop(stop);
-    cdcl.set_seed(seed);
+    };
     cdcl.optimize_linear(vars, coeffs, terms, minimizing, stop, on_improve)
 }
 
@@ -181,12 +188,9 @@ pub(crate) fn optimize_expr_seeded(
     seed: u64,
     on_improve: impl FnMut(i64, &[i32]),
 ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
-    if stop.load(Ordering::Relaxed) {
+    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed) else {
         return (None, SolveStats::default(), false);
-    }
-    let mut cdcl = Cdcl::new(solver, vars);
-    cdcl.set_stop(stop);
-    cdcl.set_seed(seed);
+    };
     cdcl.optimize_expr(vars, expr, minimizing, stop, on_improve)
 }
 
@@ -198,12 +202,7 @@ pub(crate) fn split_cube_seeded(
     stop: &AtomicBool,
     seed: u64,
 ) -> Option<Lit> {
-    if stop.load(Ordering::Relaxed) {
-        return None;
-    }
-    let mut cdcl = Cdcl::new(solver, vars);
-    cdcl.set_stop(stop);
-    cdcl.set_seed(seed);
+    let mut cdcl = seeded_cdcl(solver, vars, stop, seed)?;
     cdcl.split_cube(vars, cube)
 }
 
@@ -219,12 +218,9 @@ pub(crate) fn probe_seeded(
     seed: u64,
     clause_sharing: Option<ClauseSharing>,
 ) -> (Option<(Vec<i32>, i32)>, SolveStats, bool) {
-    if stop.load(Ordering::Relaxed) {
+    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed) else {
         return (None, SolveStats::default(), false);
-    }
-    let mut cdcl = Cdcl::new(solver, vars);
-    cdcl.set_stop(stop);
-    cdcl.set_seed(seed);
+    };
     if let Some(sharing) = clause_sharing {
         cdcl.set_clause_sharing(sharing);
     }

@@ -4,6 +4,7 @@
 mod callback;
 
 use std::collections::VecDeque;
+use std::fmt::Display;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -21,6 +22,7 @@ use crate::search::{
     solve_interruptible_seeded, split_cube_seeded, SearchControl, SolveStats,
 };
 use crate::store::Solver;
+use callback::Objective;
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -64,6 +66,51 @@ fn write_values<W: Write>(w: &mut W, sol: &[i32]) -> std::io::Result<()> {
     writeln!(w)
 }
 
+fn write_improvement<W: Write>(
+    w: &mut W,
+    verbose: bool,
+    error: &mut Option<std::io::Error>,
+    value: impl Display,
+) {
+    if verbose && error.is_none() {
+        *error = writeln!(w, "o {value}").and_then(|_| w.flush()).err();
+    }
+}
+
+fn write_optimization_result<W: Write>(
+    w: &mut W,
+    output: &SolutionOutput,
+    best: Option<(Vec<i32>, impl Display)>,
+    stats: SolveStats,
+    complete: bool,
+    interrupted: bool,
+    verbose: bool,
+) -> Result<(), String> {
+    let to_err = |e: std::io::Error| e.to_string();
+    if verbose {
+        writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(to_err)?;
+    }
+    match best {
+        Some((solution, value)) => {
+            writeln!(
+                w,
+                "{}",
+                if complete {
+                    "s OPTIMUM FOUND"
+                } else {
+                    "s SATISFIABLE"
+                }
+            )
+            .map_err(to_err)?;
+            writeln!(w, "o {value}").map_err(to_err)?;
+            write_values(w, &output.expand(&solution)).map_err(to_err)?;
+        }
+        None if interrupted => writeln!(w, "s UNKNOWN").map_err(to_err)?,
+        None => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
+    }
+    Ok(())
+}
+
 fn stage_xml(xml: &str) -> Result<StagedXml, String> {
     let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!("qayd-{}-{}.xml", std::process::id(), n));
@@ -77,24 +124,29 @@ struct Problem {
     solver: Solver,
     search: Vec<VarId>,
     output: SolutionOutput,
-    objective: Option<(bool, VarId)>,
-    linear_objective: Option<(bool, Vec<i64>, Vec<VarId>)>,
-    expr_objective: Option<(bool, Expr)>,
+    objective: Option<Objective>,
 }
 
 #[derive(Clone)]
 struct SolutionOutput {
-    positions: Vec<Option<usize>>,
-    defaults: Vec<i32>,
+    entries: Vec<(Option<usize>, i32)>,
 }
 
 impl SolutionOutput {
     fn expand(&self, solution: &[i32]) -> Vec<i32> {
-        self.positions
+        self.entries
             .iter()
-            .zip(&self.defaults)
-            .map(|(&position, &default)| position.map_or(default, |i| solution[i]))
+            .map(|&(position, default)| position.map_or(default, |i| solution[i]))
             .collect()
+    }
+}
+
+impl Problem {
+    fn var_objective(&self) -> Option<(bool, VarId)> {
+        match self.objective {
+            Some(Objective::Var(minimizing, obj)) => Some((minimizing, obj)),
+            _ => None,
+        }
     }
 }
 
@@ -188,19 +240,21 @@ fn parse_problem(path: &Path) -> Result<Problem, String> {
     let mut relevant = (0..model.solver.store.num_vars())
         .map(|i| model.solver.store.is_relevant(VarId(i as u32)))
         .collect::<Vec<_>>();
-    if let Some((_, objective)) = model.objective {
-        relevant[objective.index()] = true;
-    }
-    if let Some((_, _, terms)) = &model.linear_objective {
-        for &var in terms {
-            relevant[var.index()] = true;
-        }
-    }
-    if let Some((_, expr)) = &model.expr_objective {
-        let mut vars = Vec::new();
-        expr.collect_vars(&mut vars);
-        for var in vars {
-            relevant[var.index()] = true;
+    if let Some(objective) = &model.objective {
+        match objective {
+            Objective::Var(_, var) => relevant[var.index()] = true,
+            Objective::Linear(_, _, vars) => {
+                for &var in vars {
+                    relevant[var.index()] = true;
+                }
+            }
+            Objective::Expr(_, expr) => {
+                let mut vars = Vec::new();
+                expr.collect_vars(&mut vars);
+                for var in vars {
+                    relevant[var.index()] = true;
+                }
+            }
         }
     }
     let search = relevant
@@ -213,15 +267,10 @@ fn parse_problem(path: &Path) -> Result<Problem, String> {
         positions[var.index()] = Some(i);
     }
     let output = SolutionOutput {
-        positions: model
+        entries: model
             .order
             .iter()
-            .map(|&var| positions[var.index()])
-            .collect(),
-        defaults: model
-            .order
-            .iter()
-            .map(|&var| model.solver.store.min(var))
+            .map(|&var| (positions[var.index()], model.solver.store.min(var)))
             .collect(),
     };
     Ok(Problem {
@@ -229,8 +278,6 @@ fn parse_problem(path: &Path) -> Result<Problem, String> {
         search,
         output,
         objective: model.objective,
-        linear_objective: model.linear_objective,
-        expr_objective: model.expr_objective,
     })
 }
 
@@ -374,7 +421,7 @@ pub fn run_to_with_options<W: Write>(
     };
     let path = stage_xml(xml)?;
     let problem = parse_problem(&path.0)?;
-    let parallel_objective = problem.objective.is_some();
+    let parallel_objective = problem.var_objective().is_some();
     let workers = if parallel_objective {
         options.workers
     } else {
@@ -392,10 +439,7 @@ pub fn run_to_with_options<W: Write>(
     let to_err = |e: std::io::Error| e.to_string();
 
     if verbose {
-        let kind = if problem.objective.is_some()
-            || problem.linear_objective.is_some()
-            || problem.expr_objective.is_some()
-        {
+        let kind = if problem.objective.is_some() {
             "COP"
         } else {
             "CSP"
@@ -412,11 +456,10 @@ pub fn run_to_with_options<W: Write>(
         w.flush().map_err(to_err)?;
     }
 
-    if options.workers == 1 || problem.objective.is_none() {
+    if options.workers == 1 || !parallel_objective {
         solve_single(problem, verbose, stop, w, options.seed)?;
     } else {
-        let minimizing = problem.objective.unwrap().0;
-        solve_parallel_cop(problem, minimizing, verbose, stop, w, options)?;
+        solve_parallel_cop(problem, verbose, stop, w, options)?;
     }
 
     if verbose {
@@ -441,18 +484,13 @@ fn solve_single<W: Write>(
     let output = problem.output;
     let to_err = |e: std::io::Error| e.to_string();
 
-    if let Some((minimizing, coeffs, terms)) = problem.linear_objective {
-        return solve_linear_objective(
-            solver, vars, output, coeffs, terms, minimizing, verbose, stop, w, seed,
-        );
-    }
-    if let Some((minimizing, expr)) = problem.expr_objective {
-        return solve_expr_objective(
-            solver, vars, output, expr, minimizing, verbose, stop, w, seed,
-        );
-    }
-
     match problem.objective {
+        Some(Objective::Linear(minimizing, coeffs, terms)) => solve_linear_objective(
+            solver, vars, output, coeffs, terms, minimizing, verbose, stop, w, seed,
+        ),
+        Some(Objective::Expr(minimizing, expr)) => solve_expr_objective(
+            solver, vars, output, expr, minimizing, verbose, stop, w, seed,
+        ),
         None => {
             let mut sol = None;
             let stats = solve_interruptible_seeded(
@@ -478,8 +516,9 @@ fn solve_single<W: Write>(
                 None if stop.load(Ordering::Relaxed) => writeln!(w, "s UNKNOWN").map_err(to_err)?,
                 None => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
             }
+            Ok(())
         }
-        Some((minimizing, obj)) => {
+        Some(Objective::Var(minimizing, obj)) => {
             let mut io_err: Option<std::io::Error> = None;
             let (best, stats, _) = optimize_seeded(
                 &mut solver,
@@ -491,40 +530,15 @@ fn solve_single<W: Write>(
                 None,
                 None,
                 &[],
-                |v, _| {
-                    if verbose && io_err.is_none() {
-                        if let Err(e) = writeln!(w, "o {v}").and_then(|_| w.flush()) {
-                            io_err = Some(e);
-                        }
-                    }
-                },
+                |v, _| write_improvement(w, verbose, &mut io_err, v),
             );
             if let Some(e) = io_err {
                 return Err(e.to_string());
             }
-            if verbose {
-                writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures)
-                    .map_err(to_err)?;
-            }
             let interrupted = stop.load(Ordering::Relaxed);
-            match best {
-                Some((sol, value)) => {
-                    let status = if interrupted {
-                        "s SATISFIABLE"
-                    } else {
-                        "s OPTIMUM FOUND"
-                    };
-                    writeln!(w, "{status}").map_err(to_err)?;
-                    writeln!(w, "o {value}").map_err(to_err)?;
-                    write_values(w, &output.expand(&sol)).map_err(to_err)?;
-                }
-                None if interrupted => writeln!(w, "s UNKNOWN").map_err(to_err)?,
-                None => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
-            }
+            write_optimization_result(w, &output, best, stats, !interrupted, interrupted, verbose)
         }
     }
-
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -540,7 +554,6 @@ fn solve_linear_objective<W: Write>(
     w: &mut W,
     seed: u64,
 ) -> Result<(), String> {
-    let to_err = |e: std::io::Error| e.to_string();
     let mut io_err: Option<std::io::Error> = None;
     let (best, stats, complete) = optimize_linear_seeded(
         &mut solver,
@@ -550,36 +563,20 @@ fn solve_linear_objective<W: Write>(
         minimizing,
         stop,
         seed,
-        |value, _| {
-            if verbose && io_err.is_none() {
-                if let Err(e) = writeln!(w, "o {value}").and_then(|_| w.flush()) {
-                    io_err = Some(e);
-                }
-            }
-        },
+        |value, _| write_improvement(w, verbose, &mut io_err, value),
     );
     if let Some(e) = io_err {
         return Err(e.to_string());
     }
-
-    if verbose {
-        writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(to_err)?;
-    }
-    match best {
-        Some((solution, value)) => {
-            let status = if complete {
-                "s OPTIMUM FOUND"
-            } else {
-                "s SATISFIABLE"
-            };
-            writeln!(w, "{status}").map_err(to_err)?;
-            writeln!(w, "o {value}").map_err(to_err)?;
-            write_values(w, &output.expand(&solution)).map_err(to_err)?;
-        }
-        None if stop.load(Ordering::Relaxed) => writeln!(w, "s UNKNOWN").map_err(to_err)?,
-        None => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
-    }
-    Ok(())
+    write_optimization_result(
+        w,
+        &output,
+        best,
+        stats,
+        complete,
+        stop.load(Ordering::Relaxed),
+        verbose,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -594,7 +591,6 @@ fn solve_expr_objective<W: Write>(
     w: &mut W,
     seed: u64,
 ) -> Result<(), String> {
-    let to_err = |e: std::io::Error| e.to_string();
     let mut io_err: Option<std::io::Error> = None;
     let (best, stats, complete) = optimize_expr_seeded(
         &mut solver,
@@ -603,49 +599,32 @@ fn solve_expr_objective<W: Write>(
         minimizing,
         stop,
         seed,
-        |value, _| {
-            if verbose && io_err.is_none() {
-                if let Err(e) = writeln!(w, "o {value}").and_then(|_| w.flush()) {
-                    io_err = Some(e);
-                }
-            }
-        },
+        |value, _| write_improvement(w, verbose, &mut io_err, value),
     );
     if let Some(e) = io_err {
         return Err(e.to_string());
     }
-
-    if verbose {
-        writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(to_err)?;
-    }
-    match best {
-        Some((solution, value)) => {
-            let status = if complete {
-                "s OPTIMUM FOUND"
-            } else {
-                "s SATISFIABLE"
-            };
-            writeln!(w, "{status}").map_err(to_err)?;
-            writeln!(w, "o {value}").map_err(to_err)?;
-            write_values(w, &output.expand(&solution)).map_err(to_err)?;
-        }
-        None if stop.load(Ordering::Relaxed) => writeln!(w, "s UNKNOWN").map_err(to_err)?,
-        None => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
-    }
-    Ok(())
+    write_optimization_result(
+        w,
+        &output,
+        best,
+        stats,
+        complete,
+        stop.load(Ordering::Relaxed),
+        verbose,
+    )
 }
 
 fn run_probe_worker(
     model: Problem,
     worker: usize,
+    obj: VarId,
     minimizing: bool,
     seed: u64,
     shared: &CopShared,
     tx: &mpsc::Sender<WorkerMsg>,
 ) {
     let vars = &model.search;
-    let (worker_minimizing, obj) = model.objective.expect("COP probe lost its objective");
-    assert_eq!(worker_minimizing, minimizing, "COP direction mismatch");
     let mut stats = SolveStats::default();
     let mut attempt = 0;
     while !shared.cancel.load(Ordering::Relaxed) {
@@ -687,13 +666,12 @@ fn run_probe_worker(
 
 fn solve_parallel_cop<W: Write>(
     problem: Problem,
-    minimizing: bool,
     verbose: bool,
     stop: &AtomicBool,
     w: &mut W,
     options: RunOptions,
 ) -> Result<(), String> {
-    let obj = problem.objective.expect("COP lost its objective").1;
+    let (minimizing, obj) = problem.var_objective().expect("COP lost its objective");
     let probe_lower = problem.solver.store.min(obj) as i64;
     let probe_upper = problem.solver.store.max(obj) as i64;
     let shared = Arc::new(CopShared {
@@ -737,13 +715,10 @@ fn solve_parallel_cop<W: Write>(
             scope.spawn(move || {
                 let seed = options.seed.wrapping_add(worker as u64);
                 if worker >= regular_workers {
-                    run_probe_worker(model, worker, minimizing, seed, &shared, &tx);
+                    run_probe_worker(model, worker, obj, minimizing, seed, &shared, &tx);
                     return;
                 }
                 let vars = &model.search;
-                let (worker_minimizing, obj) =
-                    model.objective.expect("COP worker lost its objective");
-                assert_eq!(worker_minimizing, minimizing, "COP direction mismatch");
                 if !options.split {
                     let mut solver = model.solver;
                     let (_, worker_stats, complete) = optimize_seeded(

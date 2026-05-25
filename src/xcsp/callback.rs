@@ -37,13 +37,18 @@ struct ArrayDecl {
     cells: Vec<VarId>,
 }
 
+#[derive(Clone)]
+pub(super) enum Objective {
+    Var(bool, VarId),
+    Linear(bool, Vec<i64>, Vec<VarId>),
+    Expr(bool, Expr),
+}
+
 /// Accumulates the model as the parser walks the instance.
 pub struct Model {
     pub solver: Solver,
     pub order: Vec<VarId>,
-    pub objective: Option<(bool, VarId)>,
-    pub linear_objective: Option<(bool, Vec<i64>, Vec<VarId>)>,
-    pub expr_objective: Option<(bool, Expr)>,
+    pub(super) objective: Option<Objective>,
     pub error: Option<String>,
     /// Scalar variables by name. Array cells use compact row-major storage.
     ids: HashMap<String, VarId>,
@@ -65,8 +70,6 @@ impl Model {
             solver: Solver::new(),
             order: Vec::new(),
             objective: None,
-            linear_objective: None,
-            expr_objective: None,
             error: None,
             ids: HashMap::new(),
             arrays: HashMap::new(),
@@ -1374,13 +1377,13 @@ impl XcspCallback for Model {
     // --- objectives ---
     fn on_minimize_var(&mut self, var: String) {
         guard!(self, {
-            self.objective = Some((true, self.var_id(&var)?));
+            self.objective = Some(Objective::Var(true, self.var_id(&var)?));
             Ok(())
         });
     }
     fn on_maximize_var(&mut self, var: String) {
         guard!(self, {
-            self.objective = Some((false, self.var_id(&var)?));
+            self.objective = Some(Objective::Var(false, self.var_id(&var)?));
             Ok(())
         });
     }
@@ -1389,7 +1392,7 @@ impl XcspCallback for Model {
             let expr = self.tree(e)?;
             let aux = self.aux_for(expr);
             self.order.push(aux);
-            self.objective = Some((true, aux));
+            self.objective = Some(Objective::Var(true, aux));
             Ok(())
         });
     }
@@ -1398,7 +1401,7 @@ impl XcspCallback for Model {
             let expr = self.tree(e)?;
             let aux = self.aux_for(expr);
             self.order.push(aux);
-            self.objective = Some((false, aux));
+            self.objective = Some(Objective::Var(false, aux));
             Ok(())
         });
     }
@@ -1673,7 +1676,7 @@ impl Model {
                     })
                 })
                 .collect::<Result<_, String>>()?;
-            self.expr_objective = Some((minimize, expr::add(terms)));
+            self.objective = Some(Objective::Expr(minimize, expr::add(terms)));
             return Ok(());
         }
         let vars = self.tree_vars(list)?;
@@ -1711,7 +1714,7 @@ impl Model {
                     hi += b;
                 }
                 if hi - lo > MAX_MATERIALIZED_OBJECTIVE_SPAN {
-                    self.linear_objective = Some((minimize, coeffs, vars));
+                    self.objective = Some(Objective::Linear(minimize, coeffs, vars));
                     return Ok(());
                 }
                 let obj = self.solver.new_var_range(clamp(lo), clamp(hi));
@@ -1757,7 +1760,7 @@ impl Model {
             _ => return Err("unsupported objective type (product/lex)".to_string()),
         };
         self.order.push(obj);
-        self.objective = Some((minimize, obj));
+        self.objective = Some(Objective::Var(minimize, obj));
         Ok(())
     }
 }
