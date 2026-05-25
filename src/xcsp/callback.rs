@@ -55,7 +55,7 @@ pub(super) enum Objective {
 /// Accumulates the model as the parser walks the instance.
 pub struct Model {
     pub solver: Solver,
-    pub order: Vec<VarId>,
+    pub declared: Vec<(String, VarId)>,
     pub(super) objective: Option<Objective>,
     pub error: Option<String>,
     /// Scalar variables by name. Array cells use compact row-major storage.
@@ -76,7 +76,7 @@ impl Model {
     pub fn new() -> Self {
         Self {
             solver: Solver::new(),
-            order: Vec::new(),
+            declared: Vec::new(),
             objective: None,
             error: None,
             ids: HashMap::new(),
@@ -594,12 +594,12 @@ impl XcspCallback for Model {
     // --- variables ---
     fn on_variable_interval(&mut self, id: String, min: i32, max: i32) {
         let v = self.solver.new_var_range(min, max);
-        self.order.push(v);
+        self.declared.push((id.clone(), v));
         self.remember_var(id, v);
     }
     fn on_variable_values(&mut self, id: String, values: &[i32]) {
         let v = self.solver.new_var_set(values);
-        self.order.push(v);
+        self.declared.push((id.clone(), v));
         self.remember_var(id, v);
     }
 
@@ -1623,7 +1623,6 @@ impl Model {
 
     fn set_expr_objective(&mut self, tree: &ExpressionTree, minimize: bool) -> Result<(), String> {
         let aux = self.aux_for(self.tree(tree)?);
-        self.order.push(aux);
         self.objective = Some(Objective::Var(minimize, aux));
         Ok(())
     }
@@ -1749,7 +1748,6 @@ impl Model {
             NValues => self.nvalues_var(&vars),
             _ => return Err("unsupported objective type (product/lex)".to_string()),
         };
-        self.order.push(obj);
         self.objective = Some(Objective::Var(minimize, obj));
         Ok(())
     }

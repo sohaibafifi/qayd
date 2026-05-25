@@ -58,12 +58,26 @@ impl Default for RunOptions {
     }
 }
 
-fn write_values<W: Write>(w: &mut W, sol: &[i32]) -> std::io::Result<()> {
-    write!(w, "v")?;
-    for v in sol {
-        write!(w, " {v}")?;
+const MAX_VALUE_LINE_LEN: usize = 4096;
+
+fn write_tokens<W: Write>(
+    w: &mut W,
+    tokens: impl IntoIterator<Item = impl Display>,
+) -> std::io::Result<()> {
+    let mut line = String::from("v");
+    for token in tokens {
+        let token = token.to_string();
+        if line.len() > 1 && line.len() + token.len() + 1 > MAX_VALUE_LINE_LEN {
+            writeln!(w, "{line}")?;
+            line.truncate(1);
+        }
+        line.push(' ');
+        line.push_str(&token);
     }
-    writeln!(w)
+    if line.len() > 1 {
+        writeln!(w, "{line}")?;
+    }
+    Ok(())
 }
 
 fn write_improvement<W: Write>(
@@ -103,7 +117,7 @@ fn write_optimization_result<W: Write>(
             )
             .map_err(to_err)?;
             writeln!(w, "o {value}").map_err(to_err)?;
-            write_values(w, &output.expand(&solution)).map_err(to_err)?;
+            output.write(w, &solution).map_err(to_err)?;
         }
         None if interrupted => writeln!(w, "s UNKNOWN").map_err(to_err)?,
         None => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
@@ -129,6 +143,7 @@ struct Problem {
 
 #[derive(Clone)]
 struct SolutionOutput {
+    names: Vec<String>,
     entries: Vec<(Option<usize>, i32)>,
 }
 
@@ -138,6 +153,17 @@ impl SolutionOutput {
             .iter()
             .map(|&(position, default)| position.map_or(default, |i| solution[i]))
             .collect()
+    }
+
+    fn write<W: Write>(&self, w: &mut W, solution: &[i32]) -> std::io::Result<()> {
+        writeln!(w, "v <instantiation>")?;
+        writeln!(w, "v <list>")?;
+        write_tokens(w, &self.names)?;
+        writeln!(w, "v </list>")?;
+        writeln!(w, "v <values>")?;
+        write_tokens(w, self.expand(solution))?;
+        writeln!(w, "v </values>")?;
+        writeln!(w, "v </instantiation>")
     }
 }
 
@@ -266,13 +292,17 @@ fn parse_problem(path: &Path) -> Result<Problem, String> {
     for (i, &var) in search.iter().enumerate() {
         positions[var.index()] = Some(i);
     }
-    let output = SolutionOutput {
-        entries: model
-            .order
-            .iter()
-            .map(|&var| (positions[var.index()], model.solver.store.min(var)))
-            .collect(),
-    };
+    let (names, entries) = model
+        .declared
+        .iter()
+        .map(|(name, var)| {
+            (
+                name.clone(),
+                (positions[var.index()], model.solver.store.min(*var)),
+            )
+        })
+        .unzip();
+    let output = SolutionOutput { names, entries };
     Ok(Problem {
         solver: model.solver,
         search,
@@ -511,7 +541,7 @@ fn solve_single<W: Write>(
             match sol {
                 Some(s) => {
                     writeln!(w, "s SATISFIABLE").map_err(to_err)?;
-                    write_values(w, &s).map_err(to_err)?;
+                    output.write(w, &s).map_err(to_err)?;
                 }
                 None if stop.load(Ordering::Relaxed) => writeln!(w, "s UNKNOWN").map_err(to_err)?,
                 None => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
@@ -691,6 +721,7 @@ fn solve_parallel_cop<W: Write>(
     let mut stats = SolveStats::default();
     let mut printed = None;
     let mut error = None;
+    let output = problem.output.clone();
     let mut models = Vec::with_capacity(options.workers);
     models.push(problem);
     for _ in 1..options.workers {
@@ -871,7 +902,7 @@ fn solve_parallel_cop<W: Write>(
             };
             writeln!(w, "{status}").map_err(to_err)?;
             writeln!(w, "o {value}").map_err(to_err)?;
-            write_values(w, &sol).map_err(to_err)?;
+            output.write(w, &sol).map_err(to_err)?;
         }
         None if interrupted => writeln!(w, "s UNKNOWN").map_err(to_err)?,
         None if proved => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
