@@ -56,6 +56,100 @@ pub fn not_equal(solver: &mut Solver, x: VarId, y: VarId) -> PropId {
 }
 
 // ---------------------------------------------------------------------------
+// sign products: y = x * z for {-1, 1} variables
+// ---------------------------------------------------------------------------
+
+const SIGN_PRODUCT_BATCH: usize = 64;
+
+/// A small batch of sign-product equalities. With `{-1, 1}` domains, fixing
+/// any two variables fixes the third.
+#[derive(Clone)]
+struct SignProducts {
+    terms: Vec<[VarId; 3]>,
+}
+
+impl Propagator for SignProducts {
+    fn register(&mut self, store: &mut Store, me: PropId) {
+        for &vars in &self.terms {
+            for var in vars {
+                store.subscribe(var, me, Event::Fix);
+            }
+        }
+    }
+
+    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+        loop {
+            let mut changed = false;
+            for &[y, x, z] in &self.terms {
+                let fixed = [y, x, z].map(|var| store.is_fixed(var));
+                match fixed {
+                    [true, true, true] => {
+                        let (yv, xv, zv) = (store.value(y), store.value(x), store.value(z));
+                        if yv != xv * zv {
+                            return Err(store.fail_because(vec![
+                                Premise::Eq { var: y, val: yv },
+                                Premise::Eq { var: x, val: xv },
+                                Premise::Eq { var: z, val: zv },
+                            ]));
+                        }
+                    }
+                    [false, true, true] => {
+                        changed |=
+                            fix_sign_product(store, y, store.value(x) * store.value(z), x, z)?;
+                    }
+                    [true, false, true] => {
+                        changed |=
+                            fix_sign_product(store, x, store.value(y) * store.value(z), y, z)?;
+                    }
+                    [true, true, false] => {
+                        changed |=
+                            fix_sign_product(store, z, store.value(y) * store.value(x), y, x)?;
+                    }
+                    _ => {}
+                }
+            }
+            if !changed {
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn fix_sign_product(
+    store: &mut Store,
+    target: VarId,
+    value: i32,
+    a: VarId,
+    b: VarId,
+) -> Result<bool, Inconsistency> {
+    let why = vec![
+        Premise::Eq {
+            var: a,
+            val: store.value(a),
+        },
+        Premise::Eq {
+            var: b,
+            val: store.value(b),
+        },
+    ];
+    if !store.contains(target, value) {
+        return Err(store.fail_because(why));
+    }
+    let changed = !store.is_fixed(target);
+    store.fix_because(target, value, why)?;
+    Ok(changed)
+}
+
+/// Post `y = x * z` equalities for distinct variables over `{-1, 1}`.
+pub fn sign_products(solver: &mut Solver, terms: &[[VarId; 3]]) {
+    for terms in terms.chunks(SIGN_PRODUCT_BATCH) {
+        solver.post(Box::new(SignProducts {
+            terms: terms.to_vec(),
+        }));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Ordering: x + k <= y
 // ---------------------------------------------------------------------------
 
@@ -137,7 +231,11 @@ struct Instantiation {
 }
 
 impl Propagator for Instantiation {
-    fn register(&mut self, _store: &mut Store, _me: PropId) {}
+    fn register(&mut self, store: &mut Store, _me: PropId) {
+        for &var in &self.vars {
+            store.mark_relevant(var);
+        }
+    }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
         for (&v, &val) in self.vars.iter().zip(&self.vals) {

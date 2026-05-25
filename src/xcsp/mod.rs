@@ -12,12 +12,13 @@ use std::time::{Duration, Instant};
 
 use xcsp3_rust_parser::xcsp_runner::XcspRunner;
 
+use crate::expr::Expr;
 use crate::ids::VarId;
 use crate::lcg::clause::{ClauseSharing, SharedClausePool};
 use crate::lcg::lit::Lit;
 use crate::search::{
-    optimize_linear_seeded, optimize_seeded, probe_seeded, solve_interruptible_seeded,
-    split_cube_seeded, SearchControl, SolveStats,
+    optimize_expr_seeded, optimize_linear_seeded, optimize_seeded, probe_seeded,
+    solve_interruptible_seeded, split_cube_seeded, SearchControl, SolveStats,
 };
 use crate::store::Solver;
 
@@ -74,9 +75,27 @@ fn stage_xml(xml: &str) -> Result<StagedXml, String> {
 #[derive(Clone)]
 struct Problem {
     solver: Solver,
-    order: Vec<VarId>,
+    search: Vec<VarId>,
+    output: SolutionOutput,
     objective: Option<(bool, VarId)>,
     linear_objective: Option<(bool, Vec<i64>, Vec<VarId>)>,
+    expr_objective: Option<(bool, Expr)>,
+}
+
+#[derive(Clone)]
+struct SolutionOutput {
+    positions: Vec<Option<usize>>,
+    defaults: Vec<i32>,
+}
+
+impl SolutionOutput {
+    fn expand(&self, solution: &[i32]) -> Vec<i32> {
+        self.positions
+            .iter()
+            .zip(&self.defaults)
+            .map(|(&position, &default)| position.map_or(default, |i| solution[i]))
+            .collect()
+    }
 }
 
 type Cube = Vec<Lit>;
@@ -166,11 +185,52 @@ fn parse_problem(path: &Path) -> Result<Problem, String> {
     if let Some(e) = model.error.take() {
         return Err(e);
     }
+    let mut relevant = (0..model.solver.store.num_vars())
+        .map(|i| model.solver.store.is_relevant(VarId(i as u32)))
+        .collect::<Vec<_>>();
+    if let Some((_, objective)) = model.objective {
+        relevant[objective.index()] = true;
+    }
+    if let Some((_, _, terms)) = &model.linear_objective {
+        for &var in terms {
+            relevant[var.index()] = true;
+        }
+    }
+    if let Some((_, expr)) = &model.expr_objective {
+        let mut vars = Vec::new();
+        expr.collect_vars(&mut vars);
+        for var in vars {
+            relevant[var.index()] = true;
+        }
+    }
+    let search = relevant
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &used)| used.then_some(VarId(i as u32)))
+        .collect::<Vec<_>>();
+    let mut positions = vec![None; model.solver.store.num_vars()];
+    for (i, &var) in search.iter().enumerate() {
+        positions[var.index()] = Some(i);
+    }
+    let output = SolutionOutput {
+        positions: model
+            .order
+            .iter()
+            .map(|&var| positions[var.index()])
+            .collect(),
+        defaults: model
+            .order
+            .iter()
+            .map(|&var| model.solver.store.min(var))
+            .collect(),
+    };
     Ok(Problem {
         solver: model.solver,
-        order: model.order,
+        search,
+        output,
         objective: model.objective,
         linear_objective: model.linear_objective,
+        expr_objective: model.expr_objective,
     })
 }
 
@@ -332,7 +392,10 @@ pub fn run_to_with_options<W: Write>(
     let to_err = |e: std::io::Error| e.to_string();
 
     if verbose {
-        let kind = if problem.objective.is_some() || problem.linear_objective.is_some() {
+        let kind = if problem.objective.is_some()
+            || problem.linear_objective.is_some()
+            || problem.expr_objective.is_some()
+        {
             "COP"
         } else {
             "CSP"
@@ -340,6 +403,7 @@ pub fn run_to_with_options<W: Write>(
         writeln!(w, "c qayd XCSP3").map_err(to_err)?;
         writeln!(w, "c type {kind}").map_err(to_err)?;
         writeln!(w, "c variables {}", problem.solver.store.num_vars()).map_err(to_err)?;
+        writeln!(w, "c search variables {}", problem.search.len()).map_err(to_err)?;
         writeln!(w, "c propagators {}", problem.solver.num_propagators()).map_err(to_err)?;
         writeln!(w, "c seed {}", options.seed).map_err(to_err)?;
         writeln!(w, "c workers {}", options.workers).map_err(to_err)?;
@@ -373,12 +437,18 @@ fn solve_single<W: Write>(
     seed: u64,
 ) -> Result<(), String> {
     let mut solver = problem.solver;
-    let vars = problem.order;
+    let vars = problem.search;
+    let output = problem.output;
     let to_err = |e: std::io::Error| e.to_string();
 
     if let Some((minimizing, coeffs, terms)) = problem.linear_objective {
         return solve_linear_objective(
-            solver, vars, coeffs, terms, minimizing, verbose, stop, w, seed,
+            solver, vars, output, coeffs, terms, minimizing, verbose, stop, w, seed,
+        );
+    }
+    if let Some((minimizing, expr)) = problem.expr_objective {
+        return solve_expr_objective(
+            solver, vars, output, expr, minimizing, verbose, stop, w, seed,
         );
     }
 
@@ -389,7 +459,8 @@ fn solve_single<W: Write>(
                 &mut solver,
                 &vars,
                 |s| {
-                    sol = Some(vars.iter().map(|&v| s.store.value(v)).collect::<Vec<_>>());
+                    let active = vars.iter().map(|&v| s.store.value(v)).collect::<Vec<_>>();
+                    sol = Some(output.expand(&active));
                     SearchControl::Stop
                 },
                 stop,
@@ -445,7 +516,7 @@ fn solve_single<W: Write>(
                     };
                     writeln!(w, "{status}").map_err(to_err)?;
                     writeln!(w, "o {value}").map_err(to_err)?;
-                    write_values(w, &sol).map_err(to_err)?;
+                    write_values(w, &output.expand(&sol)).map_err(to_err)?;
                 }
                 None if interrupted => writeln!(w, "s UNKNOWN").map_err(to_err)?,
                 None => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
@@ -460,6 +531,7 @@ fn solve_single<W: Write>(
 fn solve_linear_objective<W: Write>(
     mut solver: Solver,
     vars: Vec<VarId>,
+    output: SolutionOutput,
     coeffs: Vec<i64>,
     terms: Vec<VarId>,
     minimizing: bool,
@@ -502,7 +574,60 @@ fn solve_linear_objective<W: Write>(
             };
             writeln!(w, "{status}").map_err(to_err)?;
             writeln!(w, "o {value}").map_err(to_err)?;
-            write_values(w, &solution).map_err(to_err)?;
+            write_values(w, &output.expand(&solution)).map_err(to_err)?;
+        }
+        None if stop.load(Ordering::Relaxed) => writeln!(w, "s UNKNOWN").map_err(to_err)?,
+        None => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_expr_objective<W: Write>(
+    mut solver: Solver,
+    vars: Vec<VarId>,
+    output: SolutionOutput,
+    expr: Expr,
+    minimizing: bool,
+    verbose: bool,
+    stop: &AtomicBool,
+    w: &mut W,
+    seed: u64,
+) -> Result<(), String> {
+    let to_err = |e: std::io::Error| e.to_string();
+    let mut io_err: Option<std::io::Error> = None;
+    let (best, stats, complete) = optimize_expr_seeded(
+        &mut solver,
+        &vars,
+        &expr,
+        minimizing,
+        stop,
+        seed,
+        |value, _| {
+            if verbose && io_err.is_none() {
+                if let Err(e) = writeln!(w, "o {value}").and_then(|_| w.flush()) {
+                    io_err = Some(e);
+                }
+            }
+        },
+    );
+    if let Some(e) = io_err {
+        return Err(e.to_string());
+    }
+
+    if verbose {
+        writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(to_err)?;
+    }
+    match best {
+        Some((solution, value)) => {
+            let status = if complete {
+                "s OPTIMUM FOUND"
+            } else {
+                "s SATISFIABLE"
+            };
+            writeln!(w, "{status}").map_err(to_err)?;
+            writeln!(w, "o {value}").map_err(to_err)?;
+            write_values(w, &output.expand(&solution)).map_err(to_err)?;
         }
         None if stop.load(Ordering::Relaxed) => writeln!(w, "s UNKNOWN").map_err(to_err)?,
         None => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
@@ -518,7 +643,7 @@ fn run_probe_worker(
     shared: &CopShared,
     tx: &mpsc::Sender<WorkerMsg>,
 ) {
-    let vars = &model.order;
+    let vars = &model.search;
     let (worker_minimizing, obj) = model.objective.expect("COP probe lost its objective");
     assert_eq!(worker_minimizing, minimizing, "COP direction mismatch");
     let mut stats = SolveStats::default();
@@ -549,7 +674,7 @@ fn run_probe_worker(
         }
         match found {
             Some((solution, value)) => {
-                if shared.improve(value, &solution) {
+                if shared.improve(value, &model.output.expand(&solution)) {
                     let _ = tx.send(WorkerMsg::Improved(value));
                 }
             }
@@ -615,7 +740,7 @@ fn solve_parallel_cop<W: Write>(
                     run_probe_worker(model, worker, minimizing, seed, &shared, &tx);
                     return;
                 }
-                let vars = &model.order;
+                let vars = &model.search;
                 let (worker_minimizing, obj) =
                     model.objective.expect("COP worker lost its objective");
                 assert_eq!(worker_minimizing, minimizing, "COP direction mismatch");
@@ -632,7 +757,7 @@ fn solve_parallel_cop<W: Write>(
                         Some(ClauseSharing::new(Arc::clone(&shared.clauses), worker)),
                         &[],
                         |value, solution| {
-                            if shared.improve(value, solution) {
+                            if shared.improve(value, &model.output.expand(solution)) {
                                 let _ = tx.send(WorkerMsg::Improved(value));
                             }
                         },
@@ -680,7 +805,7 @@ fn solve_parallel_cop<W: Write>(
                             Some(ClauseSharing::new(Arc::clone(&shared.clauses), worker)),
                             &cube,
                             |value, solution| {
-                                if shared.improve(value, solution) {
+                                if shared.improve(value, &model.output.expand(solution)) {
                                     let _ = tx.send(WorkerMsg::Improved(value));
                                 }
                             },

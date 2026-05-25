@@ -4,6 +4,7 @@
 //! records only assignment order and reasons. Backjump truncates the trail and
 //! pops the matching domain-trail levels, rolling truth back with it.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -33,7 +34,7 @@ pub enum Reason {
     Clause(ClauseRef),
     /// Propagator inference. Literals are `D_S` (true scope literals entailing
     /// the inference); reason clause is `(consequent ∨ ⋁ ¬D_S)`.
-    Generic(Vec<Lit>),
+    Generic(Arc<[Lit]>),
 }
 
 /// A detected conflict, before analysis turns it into a learned clause.
@@ -157,10 +158,10 @@ pub struct Cdcl<'s> {
     tval: Vec<Tri>,
     /// Scratch "seen" marks for 1-UIP analysis; always cleared after each analysis.
     seen: Vec<bool>,
-    /// Clause database: channeling axioms, learned, and constraint clauses.
+    /// Clause database: learned and imported constraint clauses.
     pub(crate) clauses: ClauseDb,
     /// Two-watched-literal occurrence lists, indexed by literal code.
-    watches: Vec<Vec<ClauseRef>>,
+    watches: HashMap<u32, Vec<ClauseRef>>,
     /// Reusable scratch for the pre-step scope snapshot of a conflict reason.
     conflict_scope: Vec<ScopeVar>,
     /// Reusable scratch for variables touched by one buffered FD step.
@@ -195,13 +196,28 @@ pub struct Cdcl<'s> {
 
 impl<'s> Cdcl<'s> {
     /// Build the engine over `solver`, allocating atoms from the root domains.
-    pub fn new(solver: &'s mut Solver) -> Self {
+    pub fn new(solver: &'s mut Solver, vars: &[VarId]) -> Self {
         // Ablation hook: `QAYD_SCOPE_REASONS` forces whole-scope explanations.
         solver
             .store
             .set_force_scope_reasons(std::env::var_os("QAYD_SCOPE_REASONS").is_some());
         let nvars = solver.store.num_vars();
-        let atoms = AtomTable::build(nvars, |v: VarId| (solver.store.min(v), solver.store.max(v)));
+        let mut active = (0..nvars)
+            .map(|i| solver.store.is_relevant(VarId(i as u32)))
+            .collect::<Vec<_>>();
+        for &var in vars {
+            active[var.index()] = true;
+        }
+        let atoms = AtomTable::build_active(
+            nvars,
+            |v: VarId| active[v.index()],
+            |v: VarId| {
+                solver.store.size(v) == 2
+                    && solver.store.contains(v, -1)
+                    && solver.store.contains(v, 1)
+            },
+            |v: VarId| (solver.store.min(v), solver.store.max(v)),
+        );
         let n = atoms.num_atoms();
         Cdcl {
             solver,
@@ -214,7 +230,7 @@ impl<'s> Cdcl<'s> {
             tval: vec![Tri::Unknown; n],
             seen: vec![false; n],
             clauses: ClauseDb::new(),
-            watches: vec![Vec::new(); 2 * n],
+            watches: HashMap::new(),
             conflict_scope: Vec::new(),
             changed_vars: Vec::new(),
             qhead: 0,
@@ -306,9 +322,20 @@ impl<'s> Cdcl<'s> {
             let clause = self.clauses.get(c);
             (clause.lits[clause.watch[0]], clause.lits[clause.watch[1]])
         };
-        self.watches[w0.code() as usize].retain(|&x| x != c);
-        self.watches[w1.code() as usize].retain(|&x| x != c);
+        self.unwatch(w0, c);
+        self.unwatch(w1, c);
         self.clauses.get_mut(c).lits = Arc::from([]);
+    }
+
+    fn unwatch(&mut self, lit: Lit, clause: ClauseRef) {
+        if let std::collections::hash_map::Entry::Occupied(mut entry) =
+            self.watches.entry(lit.code())
+        {
+            entry.get_mut().retain(|&c| c != clause);
+            if entry.get().is_empty() {
+                entry.remove();
+            }
+        }
     }
 
     /// Literal Block Distance: distinct decision levels among assigned literals.
@@ -339,8 +366,8 @@ impl<'s> Cdcl<'s> {
         };
         let cref = self.clauses.add(lits, watch, deletable, lbd);
         if let (Some(a), Some(b)) = (w0, w1) {
-            self.watches[a.code() as usize].push(cref);
-            self.watches[b.code() as usize].push(cref);
+            self.watches.entry(a.code()).or_default().push(cref);
+            self.watches.entry(b.code()).or_default().push(cref);
         }
         if deletable {
             self.num_learned += 1;
@@ -370,47 +397,6 @@ impl<'s> Cdcl<'s> {
             }
         }
         watch
-    }
-
-    /// Post order-encoding channeling clauses for every variable and seed root
-    /// facts. Run once, at the root, before search.
-    ///
-    /// Per value `v` over span `[lo, hi]`: `[x=v] → [x≥v]`, `[x=v] → ¬[x≥v+1]`,
-    /// `([x≥v] ∧ ¬[x≥v+1]) → [x=v]`, and monotonic `[x≥v+1] → [x≥v]`. Constant
-    /// atoms fold away.
-    pub fn post_channeling(&mut self) {
-        for i in 0..self.solver.store.num_vars() {
-            let x = VarId(i as u32);
-            let lo = self.solver.store.min(x);
-            let hi = self.solver.store.max(x);
-            for v in lo..=hi {
-                let eqv = self.atoms.eq(x, v);
-                let gev = self.atoms.ge(x, v);
-                let gev1 = self.atoms.ge(x, v + 1);
-                self.post_clause(&[neg(eqv), gev]);
-                self.post_clause(&[neg(eqv), neg(gev1)]);
-                self.post_clause(&[neg(gev), gev1, eqv]);
-                self.post_clause(&[neg(gev1), gev]);
-            }
-        }
-        self.seed_facts();
-    }
-
-    /// Post a clause from possibly-constant terms: skip tautologies (`⊤`), drop
-    /// `⊥`, add the rest. `None` if it folds away.
-    fn post_clause(&mut self, terms: &[LitOrConst]) -> Option<ClauseRef> {
-        let mut lits = Vec::with_capacity(terms.len());
-        for &t in terms {
-            match t {
-                LitOrConst::True => return None,
-                LitOrConst::False => {}
-                LitOrConst::Lit(l) => lits.push(l),
-            }
-        }
-        if lits.is_empty() {
-            return None;
-        }
-        Some(self.add_clause(lits, false, 0))
     }
 
     /// Record every atom already fixed at the root as a level-0 [`Fact`](Reason::Fact).
@@ -528,6 +514,10 @@ impl<'s> Cdcl<'s> {
                 }
             }
         };
+        if self.atoms.is_sign(var) {
+            push_if_recorded(self.atoms.ge(var, 1), &mut lits);
+            return lits;
+        }
         for k in (lo + 1)..=hi {
             push_if_recorded(self.atoms.ge(var, k), &mut lits);
         }
@@ -544,6 +534,19 @@ impl<'s> Cdcl<'s> {
     /// [`ds_recorded`], which entails every determination and is itself recorded.
     fn sync_var(&mut self, var: VarId) {
         let (lo, hi) = self.atoms.var_span(var);
+        if self.atoms.is_sign(var) {
+            let LitOrConst::Lit(l) = self.atoms.ge(var, 1) else {
+                unreachable!("a sign variable has one real atom")
+            };
+            if !self.is_assigned(l.atom()) {
+                debug_assert_eq!(
+                    view::lit_value(&self.solver.store, &self.atoms, l),
+                    Tri::Unknown,
+                    "a determined sign atom must be recorded by its primary event"
+                );
+            }
+            return;
+        }
         let mut todo: Vec<Lit> = Vec::new();
         for k in (lo + 1)..=hi {
             if let LitOrConst::Lit(l) = self.atoms.ge(var, k) {
@@ -570,9 +573,9 @@ impl<'s> Cdcl<'s> {
         if todo.is_empty() {
             return;
         }
-        let ds = self.ds_recorded(var);
+        let ds: Arc<[Lit]> = Arc::from(self.ds_recorded(var));
         for l in todo {
-            self.record(l, Reason::Generic(ds.clone()));
+            self.record(l, Reason::Generic(Arc::clone(&ds)));
         }
     }
 
@@ -628,7 +631,7 @@ impl<'s> Cdcl<'s> {
             self.qhead += 1;
             // Clauses watching `neg` (now false) may need a new watch or to fire.
             let neg = q.negate();
-            let mut ws = std::mem::take(&mut self.watches[neg.code() as usize]);
+            let mut ws = self.watches.remove(&neg.code()).unwrap_or_default();
             let mut keep = 0usize;
             let mut read = 0usize;
             let mut conflict: Option<ClauseRef> = None;
@@ -666,7 +669,7 @@ impl<'s> Cdcl<'s> {
                 }
                 if let Some((k, wl)) = new_watch {
                     self.clauses.get_mut(cref).watch[slot] = k;
-                    self.watches[wl.code() as usize].push(cref);
+                    self.watches.entry(wl.code()).or_default().push(cref);
                     continue;
                 }
                 // No replacement: the clause is unit on `other` (or a conflict).
@@ -686,7 +689,9 @@ impl<'s> Cdcl<'s> {
             }
 
             ws.truncate(keep);
-            self.watches[neg.code() as usize] = ws;
+            if !ws.is_empty() {
+                self.watches.insert(neg.code(), ws);
+            }
             if let Some(c) = conflict {
                 return Err(c);
             }
@@ -764,7 +769,7 @@ impl<'s> Cdcl<'s> {
                 if !self.is_assigned(lit.atom()) {
                     let preferred = cause_lits(&self.atoms, &ev.cause, &self.conflict_scope);
                     let ds = self.reason_before_step(preferred, step_trail_len);
-                    self.record(lit, Reason::Generic(ds));
+                    self.record(lit, Reason::Generic(Arc::from(ds)));
                 }
             }
             if !self.changed_vars.contains(&var) {
@@ -982,10 +987,10 @@ impl<'s> Cdcl<'s> {
         self.var_inc *= 1.0 / 0.95;
     }
 
-    /// Set up the root: post channeling, enqueue every propagator, propagate to
+    /// Set up the root: seed atom facts, enqueue every propagator, propagate to
     /// fixpoint. `false` if the root is already unsatisfiable.
     pub fn init(&mut self) -> bool {
-        self.post_channeling();
+        self.seed_facts();
         self.solver.enqueue_all();
         self.propagate_and_learn()
     }

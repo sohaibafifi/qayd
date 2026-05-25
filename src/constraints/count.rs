@@ -114,7 +114,11 @@ struct InSet {
 }
 
 impl Propagator for InSet {
-    fn register(&mut self, _store: &mut Store, _me: PropId) {}
+    fn register(&mut self, store: &mut Store, _me: PropId) {
+        for &var in &self.vars {
+            store.mark_relevant(var);
+        }
+    }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
         for &v in &self.vars {

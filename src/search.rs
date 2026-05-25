@@ -4,8 +4,9 @@
 //! tighter objective bound after each incumbent. Each entry point has an
 //! interruptible variant that halts when a shared stop flag is set.
 
-use std::sync::atomic::{AtomicBool, AtomicI64};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
+use crate::expr::Expr;
 use crate::ids::VarId;
 use crate::lcg::clause::ClauseSharing;
 use crate::lcg::lit::Lit;
@@ -70,7 +71,10 @@ pub(crate) fn solve_interruptible_seeded<F>(
 where
     F: FnMut(&Solver) -> SearchControl,
 {
-    let mut cdcl = Cdcl::new(solver);
+    if stop.load(Ordering::Relaxed) {
+        return SolveStats::default();
+    }
+    let mut cdcl = Cdcl::new(solver, vars);
     cdcl.set_stop(stop);
     cdcl.set_seed(seed);
     cdcl.enumerate(vars, on_solution, stop)
@@ -133,7 +137,10 @@ pub(crate) fn optimize_seeded(
     cube: &[Lit],
     on_improve: impl FnMut(i32, &[i32]),
 ) -> (Option<(Vec<i32>, i32)>, SolveStats, bool) {
-    let mut cdcl = Cdcl::new(solver);
+    if stop.load(Ordering::Relaxed) {
+        return (None, SolveStats::default(), false);
+    }
+    let mut cdcl = Cdcl::new(solver, vars);
     cdcl.set_stop(stop);
     cdcl.set_seed(seed);
     if let Some(sharing) = clause_sharing {
@@ -154,10 +161,33 @@ pub(crate) fn optimize_linear_seeded(
     seed: u64,
     on_improve: impl FnMut(i64, &[i32]),
 ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
-    let mut cdcl = Cdcl::new(solver);
+    if stop.load(Ordering::Relaxed) {
+        return (None, SolveStats::default(), false);
+    }
+    let mut cdcl = Cdcl::new(solver, vars);
     cdcl.set_stop(stop);
     cdcl.set_seed(seed);
     cdcl.optimize_linear(vars, coeffs, terms, minimizing, stop, on_improve)
+}
+
+/// Optimise a symbolic expression without materializing auxiliary domains.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn optimize_expr_seeded(
+    solver: &mut Solver,
+    vars: &[VarId],
+    expr: &Expr,
+    minimizing: bool,
+    stop: &AtomicBool,
+    seed: u64,
+    on_improve: impl FnMut(i64, &[i32]),
+) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
+    if stop.load(Ordering::Relaxed) {
+        return (None, SolveStats::default(), false);
+    }
+    let mut cdcl = Cdcl::new(solver, vars);
+    cdcl.set_stop(stop);
+    cdcl.set_seed(seed);
+    cdcl.optimize_expr(vars, expr, minimizing, stop, on_improve)
 }
 
 /// Pick a binary split for one root cube.
@@ -168,7 +198,10 @@ pub(crate) fn split_cube_seeded(
     stop: &AtomicBool,
     seed: u64,
 ) -> Option<Lit> {
-    let mut cdcl = Cdcl::new(solver);
+    if stop.load(Ordering::Relaxed) {
+        return None;
+    }
+    let mut cdcl = Cdcl::new(solver, vars);
     cdcl.set_stop(stop);
     cdcl.set_seed(seed);
     cdcl.split_cube(vars, cube)
@@ -186,7 +219,10 @@ pub(crate) fn probe_seeded(
     seed: u64,
     clause_sharing: Option<ClauseSharing>,
 ) -> (Option<(Vec<i32>, i32)>, SolveStats, bool) {
-    let mut cdcl = Cdcl::new(solver);
+    if stop.load(Ordering::Relaxed) {
+        return (None, SolveStats::default(), false);
+    }
+    let mut cdcl = Cdcl::new(solver, vars);
     cdcl.set_stop(stop);
     cdcl.set_seed(seed);
     if let Some(sharing) = clause_sharing {

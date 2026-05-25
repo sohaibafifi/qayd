@@ -19,7 +19,7 @@ use crate::constraints::graph::circuit;
 use crate::constraints::lex::{channel, lex_chain};
 use crate::constraints::linear::{linear, Relation};
 use crate::constraints::primitives::{
-    all_different, all_equal, element, instantiation, maximum, minimum, ordered,
+    all_different, all_equal, element, instantiation, maximum, minimum, ordered, sign_products,
 };
 use crate::constraints::scheduling::{bin_packing, cumulative, cumulative_var, no_overlap};
 use crate::constraints::table::{
@@ -32,17 +32,23 @@ use crate::store::Solver;
 
 const MAX_MATERIALIZED_OBJECTIVE_SPAN: i64 = 1_000_000;
 
+struct ArrayDecl {
+    shape: Vec<usize>,
+    cells: Vec<VarId>,
+}
+
 /// Accumulates the model as the parser walks the instance.
 pub struct Model {
     pub solver: Solver,
     pub order: Vec<VarId>,
     pub objective: Option<(bool, VarId)>,
     pub linear_objective: Option<(bool, Vec<i64>, Vec<VarId>)>,
+    pub expr_objective: Option<(bool, Expr)>,
     pub error: Option<String>,
+    /// Scalar variables by name. Array cells use compact row-major storage.
     ids: HashMap<String, VarId>,
-    /// Declared variables in declaration order, for expanding whole-array
-    /// scope references like `x[]` / `x[][]` that the parser leaves un-expanded.
-    decls: Vec<(String, VarId)>,
+    arrays: HashMap<String, ArrayDecl>,
+    pending_sign_products: Vec<[VarId; 3]>,
     share_extension_template: bool,
     extension_template: Option<Arc<ExtensionTemplate>>,
 }
@@ -60,9 +66,11 @@ impl Model {
             order: Vec::new(),
             objective: None,
             linear_objective: None,
+            expr_objective: None,
             error: None,
             ids: HashMap::new(),
-            decls: Vec::new(),
+            arrays: HashMap::new(),
+            pending_sign_products: Vec::new(),
             share_extension_template: false,
             extension_template: None,
         }
@@ -91,6 +99,19 @@ impl Model {
     }
 
     fn var_id(&self, name: &str) -> Result<VarId, String> {
+        if let Some((base, indices)) = cell_ref(name) {
+            let array = self
+                .arrays
+                .get(base)
+                .ok_or_else(|| format!("unknown variable `{name}`"))?;
+            let index = flatten(&indices, &array.shape)
+                .ok_or_else(|| format!("unknown variable `{name}`"))?;
+            return array
+                .cells
+                .get(index)
+                .copied()
+                .ok_or_else(|| format!("unknown variable `{name}`"));
+        }
         self.ids
             .get(name)
             .copied()
@@ -119,14 +140,31 @@ impl Model {
         if depth == 0 || rest != "[]".repeat(depth) {
             return None;
         }
-        let prefix = format!("{base}[");
-        let cells: Vec<VarId> = self
-            .decls
-            .iter()
-            .filter(|(nm, _)| nm.starts_with(&prefix) && nm.matches('[').count() == depth)
-            .map(|(_, v)| *v)
-            .collect();
-        Some(cells)
+        self.arrays
+            .get(base)
+            .filter(|array| array.shape.len() == depth)
+            .map(|array| array.cells.clone())
+    }
+
+    fn remember_var(&mut self, id: String, var: VarId) {
+        let Some((base, indices)) = cell_ref(&id) else {
+            self.ids.insert(id, var);
+            return;
+        };
+        let array = self.arrays.entry(base.to_string()).or_insert(ArrayDecl {
+            shape: vec![0; indices.len()],
+            cells: Vec::new(),
+        });
+        debug_assert_eq!(array.shape.len(), indices.len(), "array rank changed");
+        for (size, &index) in array.shape.iter_mut().zip(&indices) {
+            *size = (*size).max(index + 1);
+        }
+        debug_assert_eq!(
+            flatten(&indices, &array.shape),
+            Some(array.cells.len()),
+            "array cells must be declared in row-major order"
+        );
+        array.cells.push(var);
     }
 
     /// A fresh fixed variable holding `value`.
@@ -210,6 +248,35 @@ impl Model {
             }
         }
         Ok(())
+    }
+
+    fn flush_sign_products(&mut self) {
+        sign_products(
+            &mut self.solver,
+            &std::mem::take(&mut self.pending_sign_products),
+        );
+    }
+
+    fn sign_product(&self, e: &Expr) -> Option<[VarId; 3]> {
+        let Expr::Eq(a, b) = e else {
+            return None;
+        };
+        let (Expr::Var(y), Expr::Mul(terms)) = (&**a, &**b) else {
+            return None;
+        };
+        let [Expr::Var(x), Expr::Var(z)] = terms.as_slice() else {
+            return None;
+        };
+        let vars = [*y, *x, *z];
+        (y != x
+            && y != z
+            && x != z
+            && vars.iter().all(|&v| {
+                self.solver.store.size(v) == 2
+                    && self.solver.store.contains(v, -1)
+                    && self.solver.store.contains(v, 1)
+            }))
+        .then_some(vars)
     }
 
     /// Convert a parser expression tree to a solver [`Expr`].
@@ -316,6 +383,30 @@ impl Model {
 
 fn clamp(x: i64) -> i32 {
     x.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+fn cell_ref(name: &str) -> Option<(&str, Vec<usize>)> {
+    let open = name.find('[')?;
+    let mut rest = &name[open..];
+    let mut indices = Vec::new();
+    while let Some(inner) = rest.strip_prefix('[') {
+        let close = inner.find(']')?;
+        indices.push(inner[..close].parse().ok()?);
+        rest = &inner[(close + 1)..];
+    }
+    (!indices.is_empty() && rest.is_empty()).then_some((&name[..open], indices))
+}
+
+fn flatten(indices: &[usize], shape: &[usize]) -> Option<usize> {
+    if indices.len() != shape.len() {
+        return None;
+    }
+    indices
+        .iter()
+        .zip(shape)
+        .try_fold(0usize, |flat, (&index, &size)| {
+            (index < size).then_some(flat.checked_mul(size)?.checked_add(index)?)
+        })
 }
 
 fn one(mut a: Vec<Expr>) -> Result<Expr, String> {
@@ -469,6 +560,7 @@ impl XcspCallback for Model {
     }
 
     fn end_group(&mut self) {
+        self.flush_sign_products();
         self.share_extension_template = false;
         self.extension_template = None;
     }
@@ -485,14 +577,12 @@ impl XcspCallback for Model {
     fn on_variable_interval(&mut self, id: String, min: i32, max: i32) {
         let v = self.solver.new_var_range(min, max);
         self.order.push(v);
-        self.decls.push((id.clone(), v));
-        self.ids.insert(id, v);
+        self.remember_var(id, v);
     }
     fn on_variable_values(&mut self, id: String, values: &[i32]) {
         let v = self.solver.new_var_set(values);
         self.order.push(v);
-        self.decls.push((id.clone(), v));
-        self.ids.insert(id, v);
+        self.remember_var(id, v);
     }
 
     // --- constraints ---
@@ -532,7 +622,15 @@ impl XcspCallback for Model {
     fn on_constraint_intention(&mut self, _list: &[String], tree: &ExpressionTree) {
         guard!(self, {
             let e = self.tree(tree)?;
-            crate::constraints::intension::intension(&mut self.solver, e);
+            if let Some(term) = self.sign_product(&e) {
+                if self.share_extension_template {
+                    self.pending_sign_products.push(term);
+                } else {
+                    sign_products(&mut self.solver, &[term]);
+                }
+            } else {
+                crate::constraints::intension::intension(&mut self.solver, e);
+            }
             Ok(())
         });
     }
@@ -1558,6 +1656,26 @@ impl Model {
         coefs: &[i32],
         minimize: bool,
     ) -> Result<(), String> {
+        use XElementOperator::*;
+        if matches!(t, Sum) {
+            if coefs.len() != list.len() {
+                return Err("objective: coeffs/terms length mismatch".to_string());
+            }
+            let terms = list
+                .iter()
+                .zip(coefs)
+                .map(|(tree, &coeff)| {
+                    let term = self.tree(tree)?;
+                    Ok(if coeff == 1 {
+                        term
+                    } else {
+                        expr::mul(vec![expr::int(coeff as i64), term])
+                    })
+                })
+                .collect::<Result<_, String>>()?;
+            self.expr_objective = Some((minimize, expr::add(terms)));
+            return Ok(());
+        }
         let vars = self.tree_vars(list)?;
         let coeffs: Vec<i64> = coefs.iter().map(|&c| c as i64).collect();
         self.objective_agg(t, vars, coeffs, minimize)

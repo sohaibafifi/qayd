@@ -9,15 +9,10 @@ use crate::ids::{PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::trail::{ReversibleInt, Trail};
 
-/// Per-variable subscription lists, one per event granularity.
+/// Per-variable subscriptions and their event granularity.
 #[derive(Clone, Default)]
 struct VarSubs {
-    /// Woken on any value removal.
-    on_dom: Vec<PropId>,
-    /// Woken when a bound moves (or the variable is fixed).
-    on_bnd: Vec<PropId>,
-    /// Woken only when the variable becomes fixed.
-    on_fix: Vec<PropId>,
+    entries: Vec<(Event, PropId)>,
 }
 
 /// A primary domain change, in domain terms, for the LCG layer to pick up.
@@ -94,6 +89,8 @@ pub struct Store {
     domains: Vec<Domain>,
     trail: Trail,
     subs: Vec<VarSubs>,
+    /// Variables used by at least one propagator, including root-only filters.
+    relevant: Vec<bool>,
     /// Propagators waiting to run.
     queue: VecDeque<PropId>,
     /// `enqueued[prop]` guards against queuing a propagator twice.
@@ -131,6 +128,7 @@ impl Store {
         let dom = Domain::new_range(lo, hi, &mut self.trail);
         self.domains.push(dom);
         self.subs.push(VarSubs::default());
+        self.relevant.push(false);
         id
     }
 
@@ -140,6 +138,7 @@ impl Store {
         let dom = Domain::new_set(values, &mut self.trail);
         self.domains.push(dom);
         self.subs.push(VarSubs::default());
+        self.relevant.push(false);
         id
     }
 
@@ -411,19 +410,25 @@ impl Store {
     /// Subscribe `prop` to changes on `var` at the given granularity.
     /// Idempotent per (var, prop, event).
     pub fn subscribe(&mut self, var: VarId, prop: PropId, event: Event) {
+        self.mark_relevant(var);
         let s = &mut self.subs[var.index()];
-        let list = match event {
-            Event::DomainChange => &mut s.on_dom,
-            Event::BoundChange => &mut s.on_bnd,
-            Event::Fix => &mut s.on_fix,
-        };
-        if !list.contains(&prop) {
-            list.push(prop);
+        if !s.entries.contains(&(event, prop)) {
+            s.entries.push((event, prop));
         }
         let scope = &mut self.scope[prop.index()];
         if !scope.contains(&var) {
             scope.push(var);
         }
+    }
+
+    /// Mark a variable as used by a propagator that does not need wakeups.
+    pub fn mark_relevant(&mut self, var: VarId) {
+        self.relevant[var.index()] = true;
+    }
+
+    /// Whether any posted propagator uses `var`.
+    pub fn is_relevant(&self, var: VarId) -> bool {
+        self.relevant[var.index()]
     }
 
     /// The variables `prop` constrains (its scope), gathered from subscriptions.
@@ -494,16 +499,11 @@ impl Store {
             ..
         } = self;
         let s = &subs[var.index()];
-        for &p in &s.on_dom {
-            Self::wake(queue, enqueued, *current, p);
-        }
-        if bounds_moved {
-            for &p in &s.on_bnd {
-                Self::wake(queue, enqueued, *current, p);
-            }
-        }
-        if fixed {
-            for &p in &s.on_fix {
+        for &(event, p) in &s.entries {
+            if event == Event::DomainChange
+                || (bounds_moved && event == Event::BoundChange)
+                || (fixed && event == Event::Fix)
+            {
                 Self::wake(queue, enqueued, *current, p);
             }
         }
@@ -530,7 +530,7 @@ impl Store {
     pub fn var_weight(&self, var: VarId, weights: &[u64]) -> u64 {
         let s = &self.subs[var.index()];
         let mut w = 0u64;
-        for &p in s.on_dom.iter().chain(&s.on_bnd).chain(&s.on_fix) {
+        for &(_, p) in &s.entries {
             w += weights[p.index()];
         }
         w.max(1)

@@ -79,9 +79,17 @@ pub enum LitOrConst {
 }
 
 /// Per-variable atom ranges (contiguous in the flat numbering).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VarLayout {
+    Span,
+    Sign,
+}
+
 struct VarAtoms {
     lo: i32,
     hi: i32,
+    active: bool,
+    layout: VarLayout,
     /// Atom of `[x ≥ lo+1]`; the order atoms run `ge_base .. ge_base+(hi-lo)`.
     ge_base: Atom,
     /// Atom of `[x = lo]`; the equality atoms run `eq_base .. eq_base+(hi-lo+1)`.
@@ -101,6 +109,16 @@ impl AtomTable {
     /// Allocate atoms for every variable; `bounds(var) == (min, max)` of its
     /// starting domain.
     pub fn build(num_vars: usize, bounds: impl Fn(VarId) -> (i32, i32)) -> AtomTable {
+        Self::build_active(num_vars, |_| true, |_| false, bounds)
+    }
+
+    /// Allocate atoms only for selected variables.
+    pub fn build_active(
+        num_vars: usize,
+        active: impl Fn(VarId) -> bool,
+        sign: impl Fn(VarId) -> bool,
+        bounds: impl Fn(VarId) -> (i32, i32),
+    ) -> AtomTable {
         let mut vars = Vec::with_capacity(num_vars);
         let mut decode = Vec::new();
         for i in 0..num_vars {
@@ -108,16 +126,33 @@ impl AtomTable {
             let (lo, hi) = bounds(var);
             debug_assert!(lo <= hi, "variable {var:?} has an empty initial domain");
             let ge_base = decode.len() as Atom;
-            for k in (lo + 1)..=hi {
-                decode.push(AtomKind::Ge { var, k });
+            let active = active(var);
+            let layout = if sign(var) {
+                VarLayout::Sign
+            } else {
+                VarLayout::Span
+            };
+            if active {
+                match layout {
+                    VarLayout::Span => {
+                        for k in (lo + 1)..=hi {
+                            decode.push(AtomKind::Ge { var, k });
+                        }
+                    }
+                    VarLayout::Sign => decode.push(AtomKind::Ge { var, k: 1 }),
+                }
             }
             let eq_base = decode.len() as Atom;
-            for v in lo..=hi {
-                decode.push(AtomKind::Eq { var, v });
+            if active && layout == VarLayout::Span {
+                for v in lo..=hi {
+                    decode.push(AtomKind::Eq { var, v });
+                }
             }
             vars.push(VarAtoms {
                 lo,
                 hi,
+                active,
+                layout,
                 ge_base,
                 eq_base,
             });
@@ -144,6 +179,12 @@ impl AtomTable {
         (a.lo, a.hi)
     }
 
+    /// Whether `x ∈ {-1, 1}` uses one signed order atom.
+    #[inline]
+    pub fn is_sign(&self, x: VarId) -> bool {
+        self.vars[x.index()].layout == VarLayout::Sign
+    }
+
     /// The variable an atom constrains.
     #[inline]
     pub fn var_of(&self, atom: Atom) -> VarId {
@@ -155,6 +196,16 @@ impl AtomTable {
     /// The literal `[x ≥ k]`, folding the constant endpoints.
     pub fn ge(&self, x: VarId, k: i32) -> LitOrConst {
         let a = &self.vars[x.index()];
+        assert!(a.active, "LCG literal requested for inactive {x:?}");
+        if a.layout == VarLayout::Sign {
+            return if k <= -1 {
+                LitOrConst::True
+            } else if k > 1 {
+                LitOrConst::False
+            } else {
+                LitOrConst::Lit(Lit::positive(a.ge_base))
+            };
+        }
         if k <= a.lo {
             LitOrConst::True
         } else if k > a.hi {
@@ -167,6 +218,14 @@ impl AtomTable {
     /// The literal `[x = v]`, folding to `⊥` outside the initial span.
     pub fn eq(&self, x: VarId, v: i32) -> LitOrConst {
         let a = &self.vars[x.index()];
+        assert!(a.active, "LCG literal requested for inactive {x:?}");
+        if a.layout == VarLayout::Sign {
+            return match v {
+                -1 => LitOrConst::Lit(Lit::negative(a.ge_base)),
+                1 => LitOrConst::Lit(Lit::positive(a.ge_base)),
+                _ => LitOrConst::False,
+            };
+        }
         if v < a.lo || v > a.hi {
             LitOrConst::False
         } else {

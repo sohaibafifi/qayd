@@ -6,7 +6,9 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
+use crate::constraints::intension::intension;
 use crate::constraints::linear::{linear, Relation};
+use crate::expr::{self, Expr};
 use crate::ids::VarId;
 use crate::lcg::lit::{Lit, LitOrConst};
 use crate::lcg::trail::{Cdcl, Reason};
@@ -28,6 +30,7 @@ enum Objective<'a> {
         coeffs: &'a [i64],
         vars: &'a [VarId],
     },
+    Expr(&'a Expr),
 }
 
 impl Objective<'_> {
@@ -39,6 +42,9 @@ impl Objective<'_> {
                 .zip(vars)
                 .map(|(&coeff, &var)| coeff * solver.store.value(var) as i64)
                 .sum(),
+            Self::Expr(expr) => expr
+                .eval(&|var| solver.store.value(var) as i64)
+                .expect("objective expression is undefined at a solution"),
         }
     }
 }
@@ -238,6 +244,26 @@ impl Cdcl<'_> {
                 );
                 self.propagate_and_learn()
             }
+            Objective::Expr(expr) => {
+                let bound = if minimizing {
+                    incumbent.checked_sub(1)
+                } else {
+                    incumbent.checked_add(1)
+                };
+                let Some(bound) = bound else {
+                    return false;
+                };
+                self.backjump_to(0);
+                intension(
+                    self.solver,
+                    if minimizing {
+                        expr::le(expr.clone(), expr::int(bound))
+                    } else {
+                        expr::ge(expr.clone(), expr::int(bound))
+                    },
+                );
+                self.propagate_and_learn()
+            }
         }
     }
 
@@ -412,6 +438,26 @@ impl Cdcl<'_> {
                 coeffs,
                 vars: terms,
             },
+            minimizing,
+            stop,
+            None,
+            &[],
+            on_improve,
+        )
+    }
+
+    /// CDCL branch-and-bound over a symbolic expression.
+    pub(crate) fn optimize_expr<F: FnMut(i64, &[i32])>(
+        &mut self,
+        vars: &[VarId],
+        expr: &Expr,
+        minimizing: bool,
+        stop: &AtomicBool,
+        on_improve: F,
+    ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
+        self.optimize_objective(
+            vars,
+            Objective::Expr(expr),
             minimizing,
             stop,
             None,
