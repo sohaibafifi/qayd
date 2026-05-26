@@ -3,6 +3,7 @@
 //! event-driven fixpoint.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use crate::domain::Domain;
 use crate::ids::{PropId, VarId};
@@ -44,8 +45,7 @@ pub enum Premise {
 }
 
 /// A scope variable's domain, snapshotted just before a propagator's mutation.
-/// `holes` are the absent values strictly inside `(min, max)`, empty for a
-/// contiguous range.
+/// `holes` are absent root-supported values strictly inside `(min, max)`.
 #[derive(Clone, Debug)]
 pub struct ScopeVar {
     pub var: VarId,
@@ -147,6 +147,11 @@ impl Store {
         self.domains.len()
     }
 
+    /// Number of domains using cardinality-sized sparse storage.
+    pub fn num_sparse_domains(&self) -> usize {
+        self.domains.iter().filter(|dom| dom.is_sparse()).count()
+    }
+
     // --- domain reads ---
 
     /// Minimum value in `var`'s domain.
@@ -183,6 +188,11 @@ impl Store {
     /// Iterate the present values of `var` (arbitrary order).
     pub fn values(&self, var: VarId) -> impl Iterator<Item = i32> + '_ {
         self.domains[var.index()].values(&self.trail)
+    }
+
+    /// Root support when `var` uses cardinality-sized sparse storage.
+    pub(crate) fn sparse_values(&self, var: VarId) -> Option<Arc<[i32]>> {
+        self.domains[var.index()].sparse_values()
     }
 
     // --- domain mutations (each wakes subscribers on a real change) ---
@@ -340,11 +350,12 @@ impl Store {
         let min = dom.min(&self.trail);
         let max = dom.max(&self.trail);
         let size = dom.size(&self.trail) as i64;
-        // Enumerate holes only when the domain is not a contiguous range.
+        // Enumerate only root-supported holes so sparse numeric gaps stay compact.
         let holes = if size == max as i64 - min as i64 + 1 {
             Vec::new()
         } else {
-            (min + 1..max)
+            dom.root_values()
+                .filter(|&v| min < v && v < max)
                 .filter(|&v| !dom.contains(v, &self.trail))
                 .collect()
         };

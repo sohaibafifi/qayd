@@ -1,11 +1,16 @@
 //! Boolean atom numbering and literal packing for the LCG layer.
 //!
 //! Per variable `x` over `[l, u]`: order atoms `[x ≥ k]` (`k ∈ (l, u]`) and
-//! equality atoms `[x = v]` (`v ∈ [l, u]`). Endpoints fold to constants. Atom
-//! truth is a view over the domain (see [`view`](crate::lcg::view)); this module
-//! owns only the naming.
+//! equality atoms `[x = v]` (`v ∈ [l, u]`). Sparse domains allocate atoms only
+//! for root-supported values. Endpoints fold to constants. Atom truth is a view
+//! over the domain (see [`view`](crate::lcg::view)); this module owns only the
+//! naming.
+
+use std::sync::Arc;
 
 use crate::ids::VarId;
+
+const MAX_EAGER_ATOMS: usize = 20_000_000;
 
 /// A Boolean atom, identified by a flat index assigned by [`AtomTable`].
 pub type Atom = u32;
@@ -82,6 +87,7 @@ pub enum LitOrConst {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VarLayout {
     Span,
+    Sparse,
     Sign,
 }
 
@@ -94,12 +100,16 @@ struct VarAtoms {
     ge_base: Atom,
     /// Atom of `[x = lo]`; the equality atoms run `eq_base .. eq_base+(hi-lo+1)`.
     eq_base: Atom,
+    /// First atom after this variable's contiguous atom range.
+    end: Atom,
+    /// Sorted root support for [`VarLayout::Sparse`].
+    sparse_values: Option<Arc<[i32]>>,
 }
 
 /// Owns the atom numbering: var → atom ranges, and atom → [`AtomKind`].
 ///
-/// Built once from initial domains over the full span `[min, max]`; holes still
-/// get (permanently false) equality atoms.
+/// Built once from initial domains. Compact ranges use their full span; sparse
+/// domains use only their root support.
 pub struct AtomTable {
     vars: Vec<VarAtoms>,
     decode: Vec<AtomKind>,
@@ -119,6 +129,19 @@ impl AtomTable {
         sign: impl Fn(VarId) -> bool,
         bounds: impl Fn(VarId) -> (i32, i32),
     ) -> AtomTable {
+        Self::build_active_sparse(num_vars, active, sign, |_| None, bounds)
+    }
+
+    /// Allocate atoms only for selected variables, using root support for sparse
+    /// domains. Sparse order literals are canonicalized to their next supported
+    /// threshold.
+    pub fn build_active_sparse(
+        num_vars: usize,
+        active: impl Fn(VarId) -> bool,
+        sign: impl Fn(VarId) -> bool,
+        sparse_values: impl Fn(VarId) -> Option<Arc<[i32]>>,
+        bounds: impl Fn(VarId) -> (i32, i32),
+    ) -> AtomTable {
         let mut vars = Vec::with_capacity(num_vars);
         let mut decode = Vec::new();
         for i in 0..num_vars {
@@ -127,15 +150,24 @@ impl AtomTable {
             debug_assert!(lo <= hi, "variable {var:?} has an empty initial domain");
             let ge_base = decode.len() as Atom;
             let active = active(var);
+            let sparse_values = sparse_values(var);
             let layout = if sign(var) {
                 VarLayout::Sign
+            } else if sparse_values.is_some() {
+                VarLayout::Sparse
             } else {
                 VarLayout::Span
             };
             if active {
+                reserve_atoms(&mut decode, var, atom_count(layout, lo, hi, &sparse_values));
                 match layout {
                     VarLayout::Span => {
-                        for k in (lo + 1)..=hi {
+                        for k in (i64::from(lo) + 1)..=i64::from(hi) {
+                            decode.push(AtomKind::Ge { var, k: k as i32 });
+                        }
+                    }
+                    VarLayout::Sparse => {
+                        for &k in sparse_values.as_deref().unwrap().iter().skip(1) {
                             decode.push(AtomKind::Ge { var, k });
                         }
                     }
@@ -143,9 +175,19 @@ impl AtomTable {
                 }
             }
             let eq_base = decode.len() as Atom;
-            if active && layout == VarLayout::Span {
-                for v in lo..=hi {
-                    decode.push(AtomKind::Eq { var, v });
+            if active {
+                match layout {
+                    VarLayout::Span => {
+                        for v in i64::from(lo)..=i64::from(hi) {
+                            decode.push(AtomKind::Eq { var, v: v as i32 });
+                        }
+                    }
+                    VarLayout::Sparse => {
+                        for &v in sparse_values.as_deref().unwrap() {
+                            decode.push(AtomKind::Eq { var, v });
+                        }
+                    }
+                    VarLayout::Sign => {}
                 }
             }
             vars.push(VarAtoms {
@@ -155,6 +197,8 @@ impl AtomTable {
                 layout,
                 ge_base,
                 eq_base,
+                end: decode.len() as Atom,
+                sparse_values,
             });
         }
         AtomTable { vars, decode }
@@ -179,6 +223,13 @@ impl AtomTable {
         (a.lo, a.hi)
     }
 
+    /// The atoms allocated for `x`.
+    #[inline]
+    pub fn atoms_of(&self, x: VarId) -> impl Iterator<Item = Atom> {
+        let a = &self.vars[x.index()];
+        a.ge_base..a.end
+    }
+
     /// Whether `x ∈ {-1, 1}` uses one signed order atom.
     #[inline]
     pub fn is_sign(&self, x: VarId) -> bool {
@@ -195,41 +246,103 @@ impl AtomTable {
 
     /// The literal `[x ≥ k]`, folding the constant endpoints.
     pub fn ge(&self, x: VarId, k: i32) -> LitOrConst {
+        self.ge_i64(x, i64::from(k))
+    }
+
+    /// The literal `[x ≥ k]`, accepting one-past-`i32` bounds for constant
+    /// folding.
+    pub fn ge_i64(&self, x: VarId, k: i64) -> LitOrConst {
         let a = &self.vars[x.index()];
         assert!(a.active, "LCG literal requested for inactive {x:?}");
-        if a.layout == VarLayout::Sign {
-            return if k <= -1 {
-                LitOrConst::True
-            } else if k > 1 {
-                LitOrConst::False
-            } else {
-                LitOrConst::Lit(Lit::positive(a.ge_base))
-            };
-        }
-        if k <= a.lo {
-            LitOrConst::True
-        } else if k > a.hi {
-            LitOrConst::False
-        } else {
-            LitOrConst::Lit(Lit::positive(a.ge_base + (k - (a.lo + 1)) as u32))
+        match a.layout {
+            VarLayout::Sign => {
+                if k <= -1 {
+                    LitOrConst::True
+                } else if k > 1 {
+                    LitOrConst::False
+                } else {
+                    LitOrConst::Lit(Lit::positive(a.ge_base))
+                }
+            }
+            VarLayout::Span => {
+                if k <= i64::from(a.lo) {
+                    LitOrConst::True
+                } else if k > i64::from(a.hi) {
+                    LitOrConst::False
+                } else {
+                    let offset = k - (i64::from(a.lo) + 1);
+                    LitOrConst::Lit(Lit::positive(a.ge_base + offset as u32))
+                }
+            }
+            VarLayout::Sparse => {
+                let values = a.sparse_values.as_deref().unwrap();
+                let i = values.partition_point(|&v| i64::from(v) < k);
+                if i == 0 {
+                    LitOrConst::True
+                } else if i == values.len() {
+                    LitOrConst::False
+                } else {
+                    LitOrConst::Lit(Lit::positive(a.ge_base + (i - 1) as u32))
+                }
+            }
         }
     }
 
-    /// The literal `[x = v]`, folding to `⊥` outside the initial span.
+    /// The literal `[x = v]`, folding to `⊥` outside the initial support.
     pub fn eq(&self, x: VarId, v: i32) -> LitOrConst {
         let a = &self.vars[x.index()];
         assert!(a.active, "LCG literal requested for inactive {x:?}");
-        if a.layout == VarLayout::Sign {
-            return match v {
+        match a.layout {
+            VarLayout::Sign => match v {
                 -1 => LitOrConst::Lit(Lit::negative(a.ge_base)),
                 1 => LitOrConst::Lit(Lit::positive(a.ge_base)),
                 _ => LitOrConst::False,
-            };
-        }
-        if v < a.lo || v > a.hi {
-            LitOrConst::False
-        } else {
-            LitOrConst::Lit(Lit::positive(a.eq_base + (v - a.lo) as u32))
+            },
+            VarLayout::Span => {
+                if v < a.lo || v > a.hi {
+                    LitOrConst::False
+                } else {
+                    let offset = i64::from(v) - i64::from(a.lo);
+                    LitOrConst::Lit(Lit::positive(a.eq_base + offset as u32))
+                }
+            }
+            VarLayout::Sparse => match a.sparse_values.as_deref().unwrap().binary_search(&v) {
+                Ok(i) => LitOrConst::Lit(Lit::positive(a.eq_base + i as u32)),
+                Err(_) => LitOrConst::False,
+            },
         }
     }
+}
+
+fn atom_count(layout: VarLayout, lo: i32, hi: i32, sparse_values: &Option<Arc<[i32]>>) -> usize {
+    match layout {
+        VarLayout::Span => span_len(lo, hi)
+            .checked_mul(2)
+            .and_then(|n| n.checked_sub(1))
+            .expect("LCG atom count overflow"),
+        VarLayout::Sparse => sparse_values
+            .as_deref()
+            .unwrap()
+            .len()
+            .checked_mul(2)
+            .and_then(|n| n.checked_sub(1))
+            .expect("LCG atom count overflow"),
+        VarLayout::Sign => 1,
+    }
+}
+
+fn reserve_atoms(decode: &mut Vec<AtomKind>, var: VarId, additional: usize) {
+    let total = decode
+        .len()
+        .checked_add(additional)
+        .expect("LCG atom count overflow");
+    assert!(
+        total <= MAX_EAGER_ATOMS,
+        "eager LCG allocation exceeds {MAX_EAGER_ATOMS} atoms at {var:?}; wide contiguous ranges require lazy atoms"
+    );
+    decode.reserve(additional);
+}
+
+fn span_len(lo: i32, hi: i32) -> usize {
+    (i64::from(hi) - i64::from(lo) + 1) as usize
 }

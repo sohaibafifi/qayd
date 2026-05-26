@@ -55,7 +55,7 @@ fn build_ds(atoms: &AtomTable, scope: &[ScopeVar]) -> Vec<Lit> {
         if let LitOrConst::Lit(l) = atoms.ge(sv.var, sv.min) {
             lits.push(l);
         }
-        if let LitOrConst::Lit(l) = atoms.ge(sv.var, sv.max + 1) {
+        if let LitOrConst::Lit(l) = atoms.ge_i64(sv.var, i64::from(sv.max) + 1) {
             lits.push(l.negate());
         }
         for &h in &sv.holes {
@@ -79,13 +79,15 @@ fn translate_premises(atoms: &AtomTable, premises: &[Premise]) -> Vec<Lit> {
     for &p in premises {
         match p {
             Premise::Ge { var, bound } => push(atoms.ge(var, bound), &mut lits),
-            Premise::Le { var, bound } => push(neg(atoms.ge(var, bound + 1)), &mut lits),
+            Premise::Le { var, bound } => {
+                push(neg(atoms.ge_i64(var, i64::from(bound) + 1)), &mut lits)
+            }
             // Express `[x = v]` as order atoms `[x ≥ v] ∧ [x ≤ v]`, never the
             // positive equality atom: the eq atom may carry a deeper level, which
             // would make 1-UIP backjump too far and prune feasible solutions.
             Premise::Eq { var, val } => {
                 push(atoms.ge(var, val), &mut lits);
-                push(neg(atoms.ge(var, val + 1)), &mut lits);
+                push(neg(atoms.ge_i64(var, i64::from(val) + 1)), &mut lits);
             }
             Premise::Ne { var, val } => push(neg(atoms.eq(var, val)), &mut lits),
         }
@@ -124,7 +126,9 @@ fn lit(loc: LitOrConst) -> Option<Lit> {
 fn translate(atoms: &AtomTable, ev: &DomEvent) -> Option<Lit> {
     match *ev {
         DomEvent::GeTrue { var, bound } => lit(atoms.ge(var, bound)),
-        DomEvent::LeTrue { var, bound } => lit(atoms.ge(var, bound + 1)).map(Lit::negate),
+        DomEvent::LeTrue { var, bound } => {
+            lit(atoms.ge_i64(var, i64::from(bound) + 1)).map(Lit::negate)
+        }
         DomEvent::NeTrue { var, val } => lit(atoms.eq(var, val)).map(Lit::negate),
         DomEvent::EqTrue { var, val } => lit(atoms.eq(var, val)),
     }
@@ -204,7 +208,7 @@ impl<'s> Cdcl<'s> {
         for &var in vars {
             active[var.index()] = true;
         }
-        let atoms = AtomTable::build_active(
+        let atoms = AtomTable::build_active_sparse(
             nvars,
             |v: VarId| active[v.index()],
             |v: VarId| {
@@ -212,6 +216,7 @@ impl<'s> Cdcl<'s> {
                     && solver.store.contains(v, -1)
                     && solver.store.contains(v, 1)
             },
+            |v: VarId| solver.store.sparse_values(v),
             |v: VarId| (solver.store.min(v), solver.store.max(v)),
         );
         let n = atoms.num_atoms();
@@ -499,7 +504,6 @@ impl<'s> Cdcl<'s> {
     /// trail truth. This conjunction is a sound, recorded antecedent for any of
     /// `var`'s determined-but-unrecorded atoms, and bottoms out 1-UIP analysis.
     fn ds_recorded(&self, var: VarId) -> Vec<Lit> {
-        let (lo, hi) = self.atoms.var_span(var);
         let mut lits = Vec::new();
         let push_if_recorded = |loc: LitOrConst, out: &mut Vec<Lit>| {
             if let LitOrConst::Lit(l) = loc {
@@ -514,11 +518,8 @@ impl<'s> Cdcl<'s> {
             push_if_recorded(self.atoms.ge(var, 1), &mut lits);
             return lits;
         }
-        for k in (lo + 1)..=hi {
-            push_if_recorded(self.atoms.ge(var, k), &mut lits);
-        }
-        for v in lo..=hi {
-            push_if_recorded(self.atoms.eq(var, v), &mut lits);
+        for atom in self.atoms.atoms_of(var) {
+            push_if_recorded(LitOrConst::Lit(Lit::positive(atom)), &mut lits);
         }
         lits
     }
@@ -529,7 +530,6 @@ impl<'s> Cdcl<'s> {
     /// 1-UIP backjump too far and prune feasible solutions. The reason is
     /// [`ds_recorded`], which entails every determination and is itself recorded.
     fn sync_var(&mut self, var: VarId) {
-        let (lo, hi) = self.atoms.var_span(var);
         if self.atoms.is_sign(var) {
             let LitOrConst::Lit(l) = self.atoms.ge(var, 1) else {
                 unreachable!("a sign variable has one real atom")
@@ -544,25 +544,13 @@ impl<'s> Cdcl<'s> {
             return;
         }
         let mut todo: Vec<Lit> = Vec::new();
-        for k in (lo + 1)..=hi {
-            if let LitOrConst::Lit(l) = self.atoms.ge(var, k) {
-                if !self.is_assigned(l.atom()) {
-                    match view::lit_value(&self.solver.store, &self.atoms, l) {
-                        Tri::True => todo.push(l),
-                        Tri::False => todo.push(l.negate()),
-                        Tri::Unknown => {}
-                    }
-                }
-            }
-        }
-        for v in lo..=hi {
-            if let LitOrConst::Lit(l) = self.atoms.eq(var, v) {
-                if !self.is_assigned(l.atom()) {
-                    match view::lit_value(&self.solver.store, &self.atoms, l) {
-                        Tri::True => todo.push(l),
-                        Tri::False => todo.push(l.negate()),
-                        Tri::Unknown => {}
-                    }
+        for atom in self.atoms.atoms_of(var) {
+            let l = Lit::positive(atom);
+            if !self.is_assigned(atom) {
+                match view::lit_value(&self.solver.store, &self.atoms, l) {
+                    Tri::True => todo.push(l),
+                    Tri::False => todo.push(l.negate()),
+                    Tri::Unknown => {}
                 }
             }
         }

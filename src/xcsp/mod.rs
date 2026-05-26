@@ -106,6 +106,9 @@ fn write_optimization_result<W: Write>(
     }
     match best {
         Some((solution, value)) => {
+            if !verbose {
+                writeln!(w, "o {value}").map_err(to_err)?;
+            }
             writeln!(
                 w,
                 "{}",
@@ -116,7 +119,6 @@ fn write_optimization_result<W: Write>(
                 }
             )
             .map_err(to_err)?;
-            writeln!(w, "o {value}").map_err(to_err)?;
             output.write(w, &solution).map_err(to_err)?;
         }
         None if interrupted => writeln!(w, "s UNKNOWN").map_err(to_err)?,
@@ -144,24 +146,22 @@ struct Problem {
 #[derive(Clone)]
 struct SolutionOutput {
     names: Vec<String>,
-    entries: Vec<(Option<usize>, i32)>,
+    entries: Vec<Option<usize>>,
 }
 
 impl SolutionOutput {
-    fn expand(&self, solution: &[i32]) -> Vec<i32> {
-        self.entries
-            .iter()
-            .map(|&(position, default)| position.map_or(default, |i| solution[i]))
-            .collect()
-    }
-
     fn write<W: Write>(&self, w: &mut W, solution: &[i32]) -> std::io::Result<()> {
         writeln!(w, "v <instantiation>")?;
         writeln!(w, "v <list>")?;
         write_tokens(w, &self.names)?;
         writeln!(w, "v </list>")?;
         writeln!(w, "v <values>")?;
-        write_tokens(w, self.expand(solution))?;
+        write_tokens(
+            w,
+            self.entries.iter().map(|&position| {
+                position.map_or_else(|| "*".to_string(), |i| solution[i].to_string())
+            }),
+        )?;
         writeln!(w, "v </values>")?;
         writeln!(w, "v </instantiation>")
     }
@@ -295,12 +295,7 @@ fn parse_problem(path: &Path) -> Result<Problem, String> {
     let (names, entries) = model
         .declared
         .iter()
-        .map(|(name, var)| {
-            (
-                name.clone(),
-                (positions[var.index()], model.solver.store.min(*var)),
-            )
-        })
+        .map(|(name, var)| (name.clone(), positions[var.index()]))
         .unzip();
     let output = SolutionOutput { names, entries };
     Ok(Problem {
@@ -477,6 +472,12 @@ pub fn run_to_with_options<W: Write>(
         writeln!(w, "c qayd XCSP3").map_err(to_err)?;
         writeln!(w, "c type {kind}").map_err(to_err)?;
         writeln!(w, "c variables {}", problem.solver.store.num_vars()).map_err(to_err)?;
+        writeln!(
+            w,
+            "c sparse domains {}",
+            problem.solver.store.num_sparse_domains()
+        )
+        .map_err(to_err)?;
         writeln!(w, "c search variables {}", problem.search.len()).map_err(to_err)?;
         writeln!(w, "c propagators {}", problem.solver.num_propagators()).map_err(to_err)?;
         writeln!(w, "c seed {}", options.seed).map_err(to_err)?;
@@ -528,7 +529,7 @@ fn solve_single<W: Write>(
                 &vars,
                 |s| {
                     let active = vars.iter().map(|&v| s.store.value(v)).collect::<Vec<_>>();
-                    sol = Some(output.expand(&active));
+                    sol = Some(active);
                     SearchControl::Stop
                 },
                 stop,
@@ -683,7 +684,7 @@ fn run_probe_worker(
         }
         match found {
             Some((solution, value)) => {
-                if shared.improve(value, &model.output.expand(&solution)) {
+                if shared.improve(value, &solution) {
                     let _ = tx.send(WorkerMsg::Improved(value));
                 }
             }
@@ -763,7 +764,7 @@ fn solve_parallel_cop<W: Write>(
                         Some(ClauseSharing::new(Arc::clone(&shared.clauses), worker)),
                         &[],
                         |value, solution| {
-                            if shared.improve(value, &model.output.expand(solution)) {
+                            if shared.improve(value, solution) {
                                 let _ = tx.send(WorkerMsg::Improved(value));
                             }
                         },
@@ -811,7 +812,7 @@ fn solve_parallel_cop<W: Write>(
                             Some(ClauseSharing::new(Arc::clone(&shared.clauses), worker)),
                             &cube,
                             |value, solution| {
-                                if shared.improve(value, &model.output.expand(solution)) {
+                                if shared.improve(value, solution) {
                                     let _ = tx.send(WorkerMsg::Improved(value));
                                 }
                             },
@@ -895,13 +896,15 @@ fn solve_parallel_cop<W: Write>(
     let proved = shared.proved.load(Ordering::Relaxed);
     match shared.solution.lock().unwrap().clone() {
         Some((sol, value)) => {
+            if !verbose {
+                writeln!(w, "o {value}").map_err(to_err)?;
+            }
             let status = if proved {
                 "s OPTIMUM FOUND"
             } else {
                 "s SATISFIABLE"
             };
             writeln!(w, "{status}").map_err(to_err)?;
-            writeln!(w, "o {value}").map_err(to_err)?;
             output.write(w, &sol).map_err(to_err)?;
         }
         None if interrupted => writeln!(w, "s UNKNOWN").map_err(to_err)?,
