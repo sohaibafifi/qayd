@@ -2,11 +2,12 @@
 //!
 //! Per variable `x` over `[l, u]`: order atoms `[x ≥ k]` (`k ∈ (l, u]`) and
 //! equality atoms `[x = v]` (`v ∈ [l, u]`). Sparse domains allocate atoms only
-//! for root-supported values. Endpoints fold to constants. Atom truth is a view
-//! over the domain (see [`view`](crate::lcg::view)); this module owns only the
-//! naming.
+//! for root-supported values. Wide domains allocate atoms on demand. Endpoints
+//! fold to constants. Atom truth is a view over the domain (see
+//! [`view`](crate::lcg::view)); this module owns only the naming.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::ids::VarId;
 
@@ -64,7 +65,7 @@ impl Lit {
 }
 
 /// What an [`Atom`] means, recovered from its index.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum AtomKind {
     /// `[var ≥ k]`.
     Ge { var: VarId, k: i32 },
@@ -89,6 +90,7 @@ enum VarLayout {
     Span,
     Sparse,
     Sign,
+    Lazy,
 }
 
 struct VarAtoms {
@@ -108,11 +110,80 @@ struct VarAtoms {
 
 /// Owns the atom numbering: var → atom ranges, and atom → [`AtomKind`].
 ///
-/// Built once from initial domains. Compact ranges use their full span; sparse
-/// domains use only their root support.
+/// Compact ranges use their full span, sparse domains use root support, and
+/// wide ranges use shared on-demand atoms.
 pub struct AtomTable {
     vars: Vec<VarAtoms>,
     decode: Vec<AtomKind>,
+    lazy: Arc<LazyAtomRegistry>,
+}
+
+#[derive(Default)]
+struct LazyAtoms {
+    base: Option<Atom>,
+    ids: HashMap<AtomKind, Atom>,
+    decode: Vec<AtomKind>,
+    by_var: HashMap<VarId, Vec<Atom>>,
+}
+
+/// Shared numbering for atoms created on demand by wide contiguous domains.
+#[derive(Default)]
+pub(crate) struct LazyAtomRegistry {
+    inner: Mutex<LazyAtoms>,
+}
+
+impl LazyAtomRegistry {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn set_base(&self, base: Atom) {
+        let mut lazy = self.inner.lock().unwrap();
+        match lazy.base {
+            Some(old) => assert_eq!(old, base, "inconsistent eager LCG atom layout"),
+            None => lazy.base = Some(base),
+        }
+    }
+
+    fn intern(&self, kind: AtomKind) -> Atom {
+        let mut lazy = self.inner.lock().unwrap();
+        if let Some(&atom) = lazy.ids.get(&kind) {
+            return atom;
+        }
+        let base = lazy.base.expect("lazy LCG atom registry has no eager base");
+        let atom = base
+            .checked_add(Atom::try_from(lazy.decode.len()).expect("LCG atom count overflow"))
+            .expect("LCG atom count overflow");
+        assert!(atom <= u32::MAX >> 1, "LCG literal count overflow");
+        lazy.ids.insert(kind, atom);
+        lazy.decode.push(kind);
+        lazy.by_var.entry(kind.var()).or_default().push(atom);
+        atom
+    }
+
+    fn decode(&self, atom: Atom) -> AtomKind {
+        let lazy = self.inner.lock().unwrap();
+        let base = lazy.base.expect("lazy LCG atom registry has no eager base");
+        lazy.decode[(atom - base) as usize]
+    }
+
+    fn append_atoms(&self, var: VarId, out: &mut Vec<Atom>) {
+        if let Some(atoms) = self.inner.lock().unwrap().by_var.get(&var) {
+            out.extend_from_slice(atoms);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.inner.lock().unwrap().decode.len()
+    }
+}
+
+impl AtomKind {
+    fn var(self) -> VarId {
+        match self {
+            AtomKind::Ge { var, .. } | AtomKind::Eq { var, .. } => var,
+        }
+    }
 }
 
 impl AtomTable {
@@ -142,6 +213,24 @@ impl AtomTable {
         sparse_values: impl Fn(VarId) -> Option<Arc<[i32]>>,
         bounds: impl Fn(VarId) -> (i32, i32),
     ) -> AtomTable {
+        Self::build_active_sparse_with_registry(
+            num_vars,
+            active,
+            sign,
+            sparse_values,
+            bounds,
+            LazyAtomRegistry::new(),
+        )
+    }
+
+    pub(crate) fn build_active_sparse_with_registry(
+        num_vars: usize,
+        active: impl Fn(VarId) -> bool,
+        sign: impl Fn(VarId) -> bool,
+        sparse_values: impl Fn(VarId) -> Option<Arc<[i32]>>,
+        bounds: impl Fn(VarId) -> (i32, i32),
+        lazy: Arc<LazyAtomRegistry>,
+    ) -> AtomTable {
         let mut vars = Vec::with_capacity(num_vars);
         let mut decode = Vec::new();
         for i in 0..num_vars {
@@ -155,6 +244,13 @@ impl AtomTable {
                 VarLayout::Sign
             } else if sparse_values.is_some() {
                 VarLayout::Sparse
+            } else if active
+                && decode
+                    .len()
+                    .saturating_add(atom_count(VarLayout::Span, lo, hi, &None))
+                    > MAX_EAGER_ATOMS
+            {
+                VarLayout::Lazy
             } else {
                 VarLayout::Span
             };
@@ -172,6 +268,7 @@ impl AtomTable {
                         }
                     }
                     VarLayout::Sign => decode.push(AtomKind::Ge { var, k: 1 }),
+                    VarLayout::Lazy => {}
                 }
             }
             let eq_base = decode.len() as Atom;
@@ -188,6 +285,7 @@ impl AtomTable {
                         }
                     }
                     VarLayout::Sign => {}
+                    VarLayout::Lazy => {}
                 }
             }
             vars.push(VarAtoms {
@@ -201,19 +299,23 @@ impl AtomTable {
                 sparse_values,
             });
         }
-        AtomTable { vars, decode }
+        lazy.set_base(decode.len() as Atom);
+        AtomTable { vars, decode, lazy }
     }
 
     /// Total number of atoms allocated.
     #[inline]
     pub fn num_atoms(&self) -> usize {
-        self.decode.len()
+        self.decode.len() + self.lazy.len()
     }
 
     /// What `atom` means.
     #[inline]
     pub fn decode(&self, atom: Atom) -> AtomKind {
-        self.decode[atom as usize]
+        self.decode
+            .get(atom as usize)
+            .copied()
+            .unwrap_or_else(|| self.lazy.decode(atom))
     }
 
     /// The initial integer span `[lo, hi]` a variable's atoms cover.
@@ -223,11 +325,15 @@ impl AtomTable {
         (a.lo, a.hi)
     }
 
-    /// The atoms allocated for `x`.
+    /// Append the atoms allocated for `x`.
     #[inline]
-    pub fn atoms_of(&self, x: VarId) -> impl Iterator<Item = Atom> {
+    pub(crate) fn append_atoms(&self, x: VarId, out: &mut Vec<Atom>) {
         let a = &self.vars[x.index()];
-        a.ge_base..a.end
+        if a.layout == VarLayout::Lazy {
+            self.lazy.append_atoms(x, out);
+        } else {
+            out.extend(a.ge_base..a.end);
+        }
     }
 
     /// Whether `x ∈ {-1, 1}` uses one signed order atom.
@@ -236,12 +342,16 @@ impl AtomTable {
         self.vars[x.index()].layout == VarLayout::Sign
     }
 
+    /// Whether `x` creates atoms on demand.
+    #[inline]
+    pub(crate) fn is_lazy(&self, x: VarId) -> bool {
+        self.vars[x.index()].layout == VarLayout::Lazy
+    }
+
     /// The variable an atom constrains.
     #[inline]
     pub fn var_of(&self, atom: Atom) -> VarId {
-        match self.decode[atom as usize] {
-            AtomKind::Ge { var, .. } | AtomKind::Eq { var, .. } => var,
-        }
+        self.decode(atom).var()
     }
 
     /// The literal `[x ≥ k]`, folding the constant endpoints.
@@ -285,6 +395,18 @@ impl AtomTable {
                     LitOrConst::Lit(Lit::positive(a.ge_base + (i - 1) as u32))
                 }
             }
+            VarLayout::Lazy => {
+                if k <= i64::from(a.lo) {
+                    LitOrConst::True
+                } else if k > i64::from(a.hi) {
+                    LitOrConst::False
+                } else {
+                    LitOrConst::Lit(Lit::positive(self.lazy.intern(AtomKind::Ge {
+                        var: x,
+                        k: k as i32,
+                    })))
+                }
+            }
         }
     }
 
@@ -310,6 +432,13 @@ impl AtomTable {
                 Ok(i) => LitOrConst::Lit(Lit::positive(a.eq_base + i as u32)),
                 Err(_) => LitOrConst::False,
             },
+            VarLayout::Lazy => {
+                if v < a.lo || v > a.hi {
+                    LitOrConst::False
+                } else {
+                    LitOrConst::Lit(Lit::positive(self.lazy.intern(AtomKind::Eq { var: x, v })))
+                }
+            }
         }
     }
 }
@@ -328,6 +457,7 @@ fn atom_count(layout: VarLayout, lo: i32, hi: i32, sparse_values: &Option<Arc<[i
             .and_then(|n| n.checked_sub(1))
             .expect("LCG atom count overflow"),
         VarLayout::Sign => 1,
+        VarLayout::Lazy => 0,
     }
 }
 

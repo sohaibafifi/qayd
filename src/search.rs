@@ -5,11 +5,12 @@
 //! interruptible variant that halts when a shared stop flag is set.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::Arc;
 
 use crate::expr::Expr;
 use crate::ids::VarId;
 use crate::lcg::clause::ClauseSharing;
-use crate::lcg::lit::Lit;
+use crate::lcg::lit::{LazyAtomRegistry, Lit};
 use crate::lcg::trail::Cdcl;
 use crate::store::Solver;
 
@@ -44,11 +45,15 @@ fn seeded_cdcl<'a>(
     vars: &[VarId],
     stop: &'a AtomicBool,
     seed: u64,
+    lazy_atoms: Option<Arc<LazyAtomRegistry>>,
 ) -> Option<Cdcl<'a>> {
     if stop.load(Ordering::Relaxed) {
         return None;
     }
-    let mut cdcl = Cdcl::new(solver, vars);
+    let mut cdcl = match lazy_atoms {
+        Some(registry) => Cdcl::new_with_registry(solver, vars, registry),
+        None => Cdcl::new(solver, vars),
+    };
     cdcl.set_stop(stop);
     cdcl.set_seed(seed);
     Some(cdcl)
@@ -87,7 +92,7 @@ pub(crate) fn solve_interruptible_seeded<F>(
 where
     F: FnMut(&Solver) -> SearchControl,
 {
-    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed) else {
+    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, None) else {
         return SolveStats::default();
     };
     cdcl.enumerate(vars, on_solution, stop)
@@ -150,7 +155,8 @@ pub(crate) fn optimize_seeded(
     cube: &[Lit],
     on_improve: impl FnMut(i32, &[i32]),
 ) -> (Option<(Vec<i32>, i32)>, SolveStats, bool) {
-    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed) else {
+    let lazy_atoms = clause_sharing.as_ref().map(ClauseSharing::lazy_atoms);
+    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, lazy_atoms) else {
         return (None, SolveStats::default(), false);
     };
     if let Some(sharing) = clause_sharing {
@@ -169,12 +175,21 @@ pub(crate) fn optimize_linear_seeded(
     minimizing: bool,
     stop: &AtomicBool,
     seed: u64,
+    shared_bound: Option<&AtomicI64>,
     on_improve: impl FnMut(i64, &[i32]),
 ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
-    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed) else {
+    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, None) else {
         return (None, SolveStats::default(), false);
     };
-    cdcl.optimize_linear(vars, coeffs, terms, minimizing, stop, on_improve)
+    cdcl.optimize_linear(
+        vars,
+        coeffs,
+        terms,
+        minimizing,
+        stop,
+        shared_bound,
+        on_improve,
+    )
 }
 
 /// Optimise a symbolic expression without materializing auxiliary domains.
@@ -186,12 +201,13 @@ pub(crate) fn optimize_expr_seeded(
     minimizing: bool,
     stop: &AtomicBool,
     seed: u64,
+    shared_bound: Option<&AtomicI64>,
     on_improve: impl FnMut(i64, &[i32]),
 ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
-    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed) else {
+    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, None) else {
         return (None, SolveStats::default(), false);
     };
-    cdcl.optimize_expr(vars, expr, minimizing, stop, on_improve)
+    cdcl.optimize_expr(vars, expr, minimizing, stop, shared_bound, on_improve)
 }
 
 /// Pick a binary split for one root cube.
@@ -201,8 +217,9 @@ pub(crate) fn split_cube_seeded(
     cube: &[Lit],
     stop: &AtomicBool,
     seed: u64,
+    lazy_atoms: Option<Arc<LazyAtomRegistry>>,
 ) -> Option<Lit> {
-    let mut cdcl = seeded_cdcl(solver, vars, stop, seed)?;
+    let mut cdcl = seeded_cdcl(solver, vars, stop, seed, lazy_atoms)?;
     cdcl.split_cube(vars, cube)
 }
 
@@ -218,7 +235,8 @@ pub(crate) fn probe_seeded(
     seed: u64,
     clause_sharing: Option<ClauseSharing>,
 ) -> (Option<(Vec<i32>, i32)>, SolveStats, bool) {
-    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed) else {
+    let lazy_atoms = clause_sharing.as_ref().map(ClauseSharing::lazy_atoms);
+    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, lazy_atoms) else {
         return (None, SolveStats::default(), false);
     };
     if let Some(sharing) = clause_sharing {

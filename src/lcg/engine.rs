@@ -416,6 +416,7 @@ impl Cdcl<'_> {
     }
 
     /// CDCL branch-and-bound over a symbolic weighted sum.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn optimize_linear<F: FnMut(i64, &[i32])>(
         &mut self,
         vars: &[VarId],
@@ -423,6 +424,7 @@ impl Cdcl<'_> {
         terms: &[VarId],
         minimizing: bool,
         stop: &AtomicBool,
+        shared_bound: Option<&AtomicI64>,
         on_improve: F,
     ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
         assert_eq!(
@@ -438,7 +440,7 @@ impl Cdcl<'_> {
             },
             minimizing,
             stop,
-            None,
+            shared_bound,
             &[],
             on_improve,
         )
@@ -451,6 +453,7 @@ impl Cdcl<'_> {
         expr: &Expr,
         minimizing: bool,
         stop: &AtomicBool,
+        shared_bound: Option<&AtomicI64>,
         on_improve: F,
     ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
         self.optimize_objective(
@@ -458,7 +461,7 @@ impl Cdcl<'_> {
             Objective::Expr(expr),
             minimizing,
             stop,
-            None,
+            shared_bound,
             &[],
             on_improve,
         )

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::ids::VarId;
 use crate::lcg::clause::{ClauseDb, ClauseRef, ClauseSharing, SharedClause};
-use crate::lcg::lit::{Atom, AtomTable, Lit, LitOrConst};
+use crate::lcg::lit::{Atom, AtomTable, LazyAtomRegistry, Lit, LitOrConst};
 use crate::lcg::view::{self, Tri};
 use crate::propagator::Inconsistency;
 use crate::store::{Cause, DomEvent, Premise, ScopeVar, Solver, StepOutcome};
@@ -69,7 +69,7 @@ fn build_ds(atoms: &AtomTable, scope: &[ScopeVar]) -> Vec<Lit> {
 
 /// Translate a tight [`Premise`] conjunction into the true literals that entail
 /// the inference (constants fold away).
-fn translate_premises(atoms: &AtomTable, premises: &[Premise]) -> Vec<Lit> {
+fn translate_premises(atoms: &AtomTable, premises: &[Premise]) -> Option<Vec<Lit>> {
     let mut lits = Vec::with_capacity(premises.len());
     let push = |loc: LitOrConst, out: &mut Vec<Lit>| {
         if let LitOrConst::Lit(l) = loc {
@@ -77,6 +77,15 @@ fn translate_premises(atoms: &AtomTable, premises: &[Premise]) -> Vec<Lit> {
         }
     };
     for &p in premises {
+        let var = match p {
+            Premise::Ge { var, .. }
+            | Premise::Le { var, .. }
+            | Premise::Eq { var, .. }
+            | Premise::Ne { var, .. } => var,
+        };
+        if atoms.is_lazy(var) {
+            return None;
+        }
         match p {
             Premise::Ge { var, bound } => push(atoms.ge(var, bound), &mut lits),
             Premise::Le { var, bound } => {
@@ -92,14 +101,16 @@ fn translate_premises(atoms: &AtomTable, premises: &[Premise]) -> Vec<Lit> {
             Premise::Ne { var, val } => push(neg(atoms.eq(var, val)), &mut lits),
         }
     }
-    lits
+    Some(lits)
 }
 
 /// Antecedent literals for an event's [`Cause`]: tight premises if supplied,
 /// else the pre-propagator whole-scope snapshot.
 fn cause_lits(atoms: &AtomTable, cause: &Cause, fallback: &[ScopeVar]) -> Vec<Lit> {
     match cause {
-        Cause::Premises(p) => translate_premises(atoms, p),
+        Cause::Premises(p) => {
+            translate_premises(atoms, p).unwrap_or_else(|| build_ds(atoms, fallback))
+        }
         Cause::Scope => build_ds(atoms, fallback),
     }
 }
@@ -166,6 +177,8 @@ pub struct Cdcl<'s> {
     conflict_scope: Vec<ScopeVar>,
     /// Reusable scratch for variables touched by one buffered FD step.
     changed_vars: Vec<VarId>,
+    /// Reusable scratch for atoms allocated for one variable.
+    atom_scratch: Vec<Atom>,
     /// Index into `trail` of the next literal whose watches need processing.
     qhead: usize,
     /// VSIDS per-variable activity (indexed by `VarId`); read by the branching heuristic.
@@ -197,6 +210,14 @@ pub struct Cdcl<'s> {
 impl<'s> Cdcl<'s> {
     /// Build the engine over `solver`, allocating atoms from the root domains.
     pub fn new(solver: &'s mut Solver, vars: &[VarId]) -> Self {
+        Self::new_with_registry(solver, vars, LazyAtomRegistry::new())
+    }
+
+    pub(crate) fn new_with_registry(
+        solver: &'s mut Solver,
+        vars: &[VarId],
+        lazy_atoms: Arc<LazyAtomRegistry>,
+    ) -> Self {
         // Ablation hook: `QAYD_SCOPE_REASONS` forces whole-scope explanations.
         solver
             .store
@@ -208,7 +229,7 @@ impl<'s> Cdcl<'s> {
         for &var in vars {
             active[var.index()] = true;
         }
-        let atoms = AtomTable::build_active_sparse(
+        let atoms = AtomTable::build_active_sparse_with_registry(
             nvars,
             |v: VarId| active[v.index()],
             |v: VarId| {
@@ -218,6 +239,7 @@ impl<'s> Cdcl<'s> {
             },
             |v: VarId| solver.store.sparse_values(v),
             |v: VarId| (solver.store.min(v), solver.store.max(v)),
+            lazy_atoms,
         );
         let n = atoms.num_atoms();
         Cdcl {
@@ -234,6 +256,7 @@ impl<'s> Cdcl<'s> {
             watches: HashMap::new(),
             conflict_scope: Vec::new(),
             changed_vars: Vec::new(),
+            atom_scratch: Vec::new(),
             qhead: 0,
             activity: vec![0.0; nvars],
             var_inc: 1.0,
@@ -436,13 +459,15 @@ impl<'s> Cdcl<'s> {
     /// Whether `atom` is currently assigned.
     #[inline]
     pub fn is_assigned(&self, atom: Atom) -> bool {
-        self.atom_level[atom as usize] != UNSET
+        self.atom_level
+            .get(atom as usize)
+            .is_some_and(|&level| level != UNSET)
     }
 
     /// The level `atom` was assigned at (only meaningful while assigned).
     #[inline]
     pub fn level_of(&self, atom: Atom) -> u32 {
-        self.atom_level[atom as usize]
+        self.atom_level.get(atom as usize).copied().unwrap_or(UNSET)
     }
 
     /// The reason `atom` was assigned (only meaningful while assigned).
@@ -461,7 +486,11 @@ impl<'s> Cdcl<'s> {
     /// equal at a fixpoint (invariant T2).
     #[inline]
     pub fn tvalue(&self, lit: Lit) -> Tri {
-        let t = self.tval[lit.atom() as usize];
+        let t = self
+            .tval
+            .get(lit.atom() as usize)
+            .copied()
+            .unwrap_or(Tri::Unknown);
         if lit.is_positive() {
             t
         } else {
@@ -481,6 +510,7 @@ impl<'s> Cdcl<'s> {
     /// level. No-op if its atom is already assigned.
     fn record(&mut self, lit: Lit, reason: Reason) {
         let a = lit.atom() as usize;
+        self.ensure_atom(a);
         if self.atom_level[a] != UNSET {
             return;
         }
@@ -500,6 +530,18 @@ impl<'s> Cdcl<'s> {
         self.trail.push(lit);
     }
 
+    fn ensure_atom(&mut self, atom: usize) {
+        if atom < self.atom_level.len() {
+            return;
+        }
+        let len = atom + 1;
+        self.atom_level.resize(len, UNSET);
+        self.atom_trail_pos.resize(len, usize::MAX);
+        self.atom_reason.resize(len, Reason::Unset);
+        self.tval.resize(len, Tri::Unknown);
+        self.seen.resize(len, false);
+    }
+
     /// The currently-recorded atoms of `var`, each as the literal matching its
     /// trail truth. This conjunction is a sound, recorded antecedent for any of
     /// `var`'s determined-but-unrecorded atoms, and bottoms out 1-UIP analysis.
@@ -507,7 +549,12 @@ impl<'s> Cdcl<'s> {
         let mut lits = Vec::new();
         let push_if_recorded = |loc: LitOrConst, out: &mut Vec<Lit>| {
             if let LitOrConst::Lit(l) = loc {
-                match self.tval[l.atom() as usize] {
+                match self
+                    .tval
+                    .get(l.atom() as usize)
+                    .copied()
+                    .unwrap_or(Tri::Unknown)
+                {
                     Tri::True => out.push(Lit::positive(l.atom())),
                     Tri::False => out.push(Lit::negative(l.atom())),
                     Tri::Unknown => {}
@@ -518,7 +565,9 @@ impl<'s> Cdcl<'s> {
             push_if_recorded(self.atoms.ge(var, 1), &mut lits);
             return lits;
         }
-        for atom in self.atoms.atoms_of(var) {
+        let mut atoms = Vec::new();
+        self.atoms.append_atoms(var, &mut atoms);
+        for atom in atoms {
             push_if_recorded(LitOrConst::Lit(Lit::positive(atom)), &mut lits);
         }
         lits
@@ -543,8 +592,16 @@ impl<'s> Cdcl<'s> {
             }
             return;
         }
+        if self.atoms.is_lazy(var) {
+            let _ = self.atoms.ge(var, self.solver.store.min(var));
+            let _ = self
+                .atoms
+                .ge_i64(var, i64::from(self.solver.store.max(var)) + 1);
+        }
         let mut todo: Vec<Lit> = Vec::new();
-        for atom in self.atoms.atoms_of(var) {
+        self.atom_scratch.clear();
+        self.atoms.append_atoms(var, &mut self.atom_scratch);
+        for &atom in &self.atom_scratch {
             let l = Lit::positive(atom);
             if !self.is_assigned(atom) {
                 match view::lit_value(&self.solver.store, &self.atoms, l) {
@@ -724,7 +781,8 @@ impl<'s> Cdcl<'s> {
                     // pre-call scope: intermediate FD mutations are not yet SAT
                     // assignments and cannot participate in conflict analysis.
                     let preferred = match self.solver.store.take_pending_conflict() {
-                        Some(p) => translate_premises(&self.atoms, &p),
+                        Some(p) => translate_premises(&self.atoms, &p)
+                            .unwrap_or_else(|| build_ds(&self.atoms, &self.conflict_scope)),
                         None => build_ds(&self.atoms, &self.conflict_scope),
                     };
                     let ds = self.reason_before_step(preferred, step_trail_len);
@@ -774,13 +832,21 @@ impl<'s> Cdcl<'s> {
     /// whole-scope snapshot, which is always trail-consistent.
     fn reason_before_step(&self, preferred: Vec<Lit>, step_trail_len: usize) -> Vec<Lit> {
         if preferred.iter().all(|&l| {
-            self.tvalue(l) == Tri::True && self.atom_trail_pos[l.atom() as usize] < step_trail_len
+            self.tvalue(l) == Tri::True
+                && self
+                    .atom_trail_pos
+                    .get(l.atom() as usize)
+                    .is_some_and(|&pos| pos < step_trail_len)
         }) {
             return preferred;
         }
         let fallback = build_ds(&self.atoms, &self.conflict_scope);
         debug_assert!(fallback.iter().all(|&l| {
-            self.tvalue(l) == Tri::True && self.atom_trail_pos[l.atom() as usize] < step_trail_len
+            self.tvalue(l) == Tri::True
+                && self
+                    .atom_trail_pos
+                    .get(l.atom() as usize)
+                    .is_some_and(|&pos| pos < step_trail_len)
         }));
         fallback
     }
@@ -822,6 +888,9 @@ impl<'s> Cdcl<'s> {
     }
 
     fn import_shared_clause(&mut self, clause: SharedClause) -> bool {
+        for &lit in clause.lits.iter() {
+            self.sync_var(self.atoms.var_of(lit.atom()));
+        }
         let mut open = None;
         let mut num_open = 0;
         let mut satisfied = false;

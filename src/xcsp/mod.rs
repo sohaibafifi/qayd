@@ -174,6 +174,15 @@ impl Problem {
             _ => None,
         }
     }
+
+    fn objective_dir(&self) -> Option<bool> {
+        match self.objective {
+            Some(Objective::Var(minimizing, _))
+            | Some(Objective::Linear(minimizing, _, _))
+            | Some(Objective::Expr(minimizing, _)) => Some(minimizing),
+            None => None,
+        }
+    }
 }
 
 type Cube = Vec<Lit>;
@@ -310,7 +319,7 @@ struct CopShared {
     cancel: AtomicBool,
     proved: AtomicBool,
     best: AtomicI64,
-    solution: Mutex<Option<(Vec<i32>, i32)>>,
+    solution: Mutex<Option<(Vec<i32>, i64)>>,
     clauses: Arc<SharedClausePool>,
     work: WorkQueue,
     minimizing: bool,
@@ -326,23 +335,22 @@ impl CopShared {
         self.work.wake_all();
     }
 
-    fn improve(&self, value: i32, solution: &[i32]) -> bool {
-        let value64 = value as i64;
+    fn improve(&self, value: i64, solution: &[i32]) -> bool {
         let mut current = self.best.load(Ordering::Relaxed);
         while if self.minimizing {
-            value64 < current
+            value < current
         } else {
-            value64 > current
+            value > current
         } {
             match self.best.compare_exchange_weak(
                 current,
-                value64,
+                value,
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
                     let mut slot = self.solution.lock().unwrap();
-                    if self.best.load(Ordering::Acquire) == value64 {
+                    if self.best.load(Ordering::Acquire) == value {
                         *slot = Some((solution.to_vec(), value));
                     }
                     return true;
@@ -400,7 +408,7 @@ impl CopShared {
 }
 
 enum WorkerMsg {
-    Improved(i32),
+    Improved(i64),
     Done(SolveStats),
 }
 
@@ -446,15 +454,14 @@ pub fn run_to_with_options<W: Write>(
     };
     let path = stage_xml(xml)?;
     let problem = parse_problem(&path.0)?;
-    let parallel_objective = problem.var_objective().is_some();
-    let workers = if parallel_objective {
-        options.workers
-    } else {
-        1
-    };
+    let has_objective = problem.objective.is_some();
+    let var_objective = problem.var_objective().is_some();
+    let symbolic_probes_disabled = has_objective && !var_objective && options.probes > 0;
+    let workers = if has_objective { options.workers } else { 1 };
     let options = RunOptions {
         workers,
-        probes: if parallel_objective {
+        split: options.split && var_objective,
+        probes: if var_objective {
             options.probes.min(workers.saturating_sub(1))
         } else {
             0
@@ -489,11 +496,19 @@ pub fn run_to_with_options<W: Write>(
         writeln!(w, "c seed {}", options.seed).map_err(to_err)?;
         writeln!(w, "c workers {}", options.workers).map_err(to_err)?;
         writeln!(w, "c split {}", options.split).map_err(to_err)?;
-        writeln!(w, "c probes {}", options.probes).map_err(to_err)?;
+        if symbolic_probes_disabled {
+            writeln!(
+                w,
+                "c probes 0 (probe worker only supports a materialized objective variable)"
+            )
+            .map_err(to_err)?;
+        } else {
+            writeln!(w, "c probes {}", options.probes).map_err(to_err)?;
+        }
         w.flush().map_err(to_err)?;
     }
 
-    if options.workers == 1 || !parallel_objective {
+    if options.workers == 1 || !has_objective {
         solve_single(problem, verbose, stop, w, options.seed)?;
     } else {
         solve_parallel_cop(problem, verbose, stop, w, options)?;
@@ -600,6 +615,7 @@ fn solve_linear_objective<W: Write>(
         minimizing,
         stop,
         seed,
+        None,
         |value, _| write_improvement(w, verbose, &mut io_err, value),
     );
     if let Some(e) = io_err {
@@ -636,6 +652,7 @@ fn solve_expr_objective<W: Write>(
         minimizing,
         stop,
         seed,
+        None,
         |value, _| write_improvement(w, verbose, &mut io_err, value),
     );
     if let Some(e) = io_err {
@@ -690,8 +707,8 @@ fn run_probe_worker(
         }
         match found {
             Some((solution, value)) => {
-                if shared.improve(value, &solution) {
-                    let _ = tx.send(WorkerMsg::Improved(value));
+                if shared.improve(value as i64, &solution) {
+                    let _ = tx.send(WorkerMsg::Improved(value as i64));
                 }
             }
             None => shared.record_probe_unsat(target),
@@ -708,9 +725,16 @@ fn solve_parallel_cop<W: Write>(
     w: &mut W,
     options: RunOptions,
 ) -> Result<(), String> {
-    let (minimizing, obj) = problem.var_objective().expect("COP lost its objective");
-    let probe_lower = problem.solver.store.min(obj) as i64;
-    let probe_upper = problem.solver.store.max(obj) as i64;
+    let minimizing = problem.objective_dir().expect("COP lost its objective");
+    let var_objective = problem.var_objective();
+    let (probe_lower, probe_upper) = var_objective
+        .map(|(_, obj)| {
+            (
+                problem.solver.store.min(obj) as i64,
+                problem.solver.store.max(obj) as i64,
+            )
+        })
+        .unwrap_or((i64::MIN, i64::MAX));
     let shared = Arc::new(CopShared {
         cancel: AtomicBool::new(false),
         proved: AtomicBool::new(false),
@@ -753,28 +777,67 @@ fn solve_parallel_cop<W: Write>(
             scope.spawn(move || {
                 let seed = options.seed.wrapping_add(worker as u64);
                 if worker >= regular_workers {
+                    let (_, obj) = var_objective.expect("symbolic objective cannot use probes");
                     run_probe_worker(model, worker, obj, minimizing, seed, &shared, &tx);
                     return;
                 }
                 let vars = &model.search;
                 if !options.split {
                     let mut solver = model.solver;
-                    let (_, worker_stats, complete) = optimize_seeded(
-                        &mut solver,
-                        vars,
-                        obj,
-                        minimizing,
-                        &shared.cancel,
-                        seed,
-                        Some(&shared.best),
-                        Some(ClauseSharing::new(Arc::clone(&shared.clauses), worker)),
-                        &[],
-                        |value, solution| {
-                            if shared.improve(value, solution) {
-                                let _ = tx.send(WorkerMsg::Improved(value));
-                            }
-                        },
-                    );
+                    let (_, worker_stats, complete) = match model.objective.unwrap() {
+                        Objective::Var(_, obj) => {
+                            let (best, stats, complete) = optimize_seeded(
+                                &mut solver,
+                                vars,
+                                obj,
+                                minimizing,
+                                &shared.cancel,
+                                seed,
+                                Some(&shared.best),
+                                Some(ClauseSharing::new(Arc::clone(&shared.clauses), worker)),
+                                &[],
+                                |value, solution| {
+                                    if shared.improve(value as i64, solution) {
+                                        let _ = tx.send(WorkerMsg::Improved(value as i64));
+                                    }
+                                },
+                            );
+                            (
+                                best.map(|(solution, value)| (solution, value as i64)),
+                                stats,
+                                complete,
+                            )
+                        }
+                        Objective::Linear(_, coeffs, terms) => optimize_linear_seeded(
+                            &mut solver,
+                            vars,
+                            &coeffs,
+                            &terms,
+                            minimizing,
+                            &shared.cancel,
+                            seed,
+                            Some(&shared.best),
+                            |value, solution| {
+                                if shared.improve(value, solution) {
+                                    let _ = tx.send(WorkerMsg::Improved(value));
+                                }
+                            },
+                        ),
+                        Objective::Expr(_, expr) => optimize_expr_seeded(
+                            &mut solver,
+                            vars,
+                            &expr,
+                            minimizing,
+                            &shared.cancel,
+                            seed,
+                            Some(&shared.best),
+                            |value, solution| {
+                                if shared.improve(value, solution) {
+                                    let _ = tx.send(WorkerMsg::Improved(value));
+                                }
+                            },
+                        ),
+                    };
                     if complete {
                         shared.proved.store(true, Ordering::Relaxed);
                         shared.stop();
@@ -784,13 +847,19 @@ fn solve_parallel_cop<W: Write>(
                 }
                 let split_target = 2 * regular_workers;
                 let split_limit = 4 * regular_workers as u64;
+                let (_, obj) = var_objective.expect("symbolic objective cannot split");
                 let mut worker_stats = SolveStats::default();
                 while let Some(mut cube) = shared.work.take(&shared.cancel) {
                     while shared.work.needs_split(split_target, split_limit) {
                         let mut probe = model.solver.clone();
-                        let Some(lit) =
-                            split_cube_seeded(&mut probe, vars, &cube, &shared.cancel, seed)
-                        else {
+                        let Some(lit) = split_cube_seeded(
+                            &mut probe,
+                            vars,
+                            &cube,
+                            &shared.cancel,
+                            seed,
+                            Some(shared.clauses.lazy_atoms()),
+                        ) else {
                             break;
                         };
                         let mut sibling = cube.clone();
@@ -818,8 +887,8 @@ fn solve_parallel_cop<W: Write>(
                             Some(ClauseSharing::new(Arc::clone(&shared.clauses), worker)),
                             &cube,
                             |value, solution| {
-                                if shared.improve(value, solution) {
-                                    let _ = tx.send(WorkerMsg::Improved(value));
+                                if shared.improve(value as i64, solution) {
+                                    let _ = tx.send(WorkerMsg::Improved(value as i64));
                                 }
                             },
                         );

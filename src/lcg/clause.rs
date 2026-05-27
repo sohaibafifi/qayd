@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::lcg::lit::Lit;
+use crate::lcg::lit::{LazyAtomRegistry, Lit};
 
 const MAX_SHARED_LEN: usize = 8;
 const MAX_SHARED_LBD: u32 = 4;
@@ -97,10 +97,20 @@ pub(crate) struct SharedClause {
 }
 
 /// Append-only shared clause pool. Workers keep private watch state.
-#[derive(Default)]
 pub(crate) struct SharedClausePool {
     clauses: Mutex<Vec<SharedClause>>,
     imported: AtomicU64,
+    lazy_atoms: Arc<LazyAtomRegistry>,
+}
+
+impl Default for SharedClausePool {
+    fn default() -> Self {
+        Self {
+            clauses: Mutex::new(Vec::new()),
+            imported: AtomicU64::new(0),
+            lazy_atoms: LazyAtomRegistry::new(),
+        }
+    }
 }
 
 impl SharedClausePool {
@@ -110,6 +120,10 @@ impl SharedClausePool {
 
     pub fn imported(&self) -> u64 {
         self.imported.load(Ordering::Relaxed)
+    }
+
+    pub fn lazy_atoms(&self) -> Arc<LazyAtomRegistry> {
+        Arc::clone(&self.lazy_atoms)
     }
 }
 
@@ -153,5 +167,9 @@ impl ClauseSharing {
 
     pub fn record_import(&self) {
         self.pool.imported.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn lazy_atoms(&self) -> Arc<LazyAtomRegistry> {
+        Arc::clone(&self.pool.lazy_atoms)
     }
 }
