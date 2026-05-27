@@ -478,6 +478,12 @@ pub fn run_to_with_options<W: Write>(
             problem.solver.store.num_sparse_domains()
         )
         .map_err(to_err)?;
+        writeln!(
+            w,
+            "c bounds domains {}",
+            problem.solver.store.num_bounds_domains()
+        )
+        .map_err(to_err)?;
         writeln!(w, "c search variables {}", problem.search.len()).map_err(to_err)?;
         writeln!(w, "c propagators {}", problem.solver.num_propagators()).map_err(to_err)?;
         writeln!(w, "c seed {}", options.seed).map_err(to_err)?;

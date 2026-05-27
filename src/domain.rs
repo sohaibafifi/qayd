@@ -1,9 +1,10 @@
-//! Trailed sparse-set integer domain.
+//! Trailed finite-integer domain.
 //!
-//! Membership is "position in `dense` < size". The `dense`/`sparse` permutation
-//! is never undone; only `size`/`min`/`max` are trailed, and restoring them
-//! restores membership.
+//! Small ranges and explicit sets use sparse sets. Wide contiguous ranges use
+//! reversible bounds and a trailed prefix of removed interior values.
 
+use std::ops::RangeInclusive;
+use std::slice;
 use std::sync::Arc;
 
 use crate::propagator::Inconsistency;
@@ -18,9 +19,15 @@ enum ValueMap {
     Dense { offset: i32 },
     /// Internal index `i` represents `values[i]`.
     Sparse { values: Arc<[i32]> },
+    /// Wide contiguous range with a reusable prefix of removed interior values.
+    Bounds {
+        holes: Vec<i32>,
+        holes_len: ReversibleInt,
+        empty: ReversibleInt,
+    },
 }
 
-/// A finite-integer domain backed by a trailed sparse set.
+/// A finite-integer domain with storage selected from its root shape.
 #[derive(Clone)]
 pub struct Domain {
     values: ValueMap,
@@ -38,11 +45,11 @@ impl Domain {
     pub fn new_range(lo: i32, hi: i32, trail: &mut Trail) -> Self {
         assert!(lo <= hi, "empty domain range [{lo}, {hi}]");
         let size = span_len(lo, hi);
-        assert!(
-            size <= MAX_DENSE_VALUES,
-            "dense domain range [{lo}, {hi}] has {size} values; maximum supported is {MAX_DENSE_VALUES}"
-        );
-        Self::from_dense_range(lo, hi, size, trail)
+        if size <= MAX_DENSE_VALUES {
+            Self::from_dense_range(lo, hi, size, trail)
+        } else {
+            Self::from_bounds_range(lo, hi, trail)
+        }
     }
 
     /// Domain over an explicit non-empty value set; duplicates ignored.
@@ -131,10 +138,45 @@ impl Domain {
         }
     }
 
+    fn from_bounds_range(lo: i32, hi: i32, trail: &mut Trail) -> Self {
+        let holes_len = trail.new_int(0);
+        let empty = trail.new_int(0);
+        Self {
+            values: ValueMap::Bounds {
+                holes: Vec::new(),
+                holes_len,
+                empty,
+            },
+            dense: Vec::new(),
+            sparse: Vec::new(),
+            size: trail.new_int(0),
+            min: trail.new_int(lo),
+            max: trail.new_int(hi),
+        }
+    }
+
     /// Number of present values.
     #[inline]
     pub fn size(&self, trail: &Trail) -> usize {
-        trail.get(self.size) as usize
+        match &self.values {
+            ValueMap::Bounds {
+                holes,
+                holes_len,
+                empty,
+            } => {
+                if trail.get(*empty) != 0 {
+                    return 0;
+                }
+                let min = self.min(trail);
+                let max = self.max(trail);
+                let removed = holes[..trail.get(*holes_len) as usize]
+                    .iter()
+                    .filter(|&&v| min <= v && v <= max)
+                    .count();
+                span_len(min, max) - removed
+            }
+            _ => trail.get(self.size) as usize,
+        }
     }
 
     /// Current minimum present value. Meaningful only while `size > 0`.
@@ -158,32 +200,79 @@ impl Domain {
     /// Whether `val` is currently present.
     #[inline]
     pub fn contains(&self, val: i32, trail: &Trail) -> bool {
-        self.index_of(val)
-            .is_some_and(|i| (self.sparse[i] as usize) < self.size(trail))
+        match &self.values {
+            ValueMap::Bounds {
+                holes,
+                holes_len,
+                empty,
+            } => {
+                trail.get(*empty) == 0
+                    && self.min(trail) <= val
+                    && val <= self.max(trail)
+                    && !holes[..trail.get(*holes_len) as usize].contains(&val)
+            }
+            _ => self
+                .index_of(val)
+                .is_some_and(|i| (self.sparse[i] as usize) < self.size(trail)),
+        }
     }
 
     /// Iterate present values in arbitrary order.
-    pub fn values<'a>(&'a self, trail: &Trail) -> impl Iterator<Item = i32> + 'a {
-        self.dense[..self.size(trail)]
-            .iter()
-            .map(|&i| self.value_of(i as usize))
+    pub fn values<'a>(&'a self, trail: &'a Trail) -> Values<'a> {
+        match &self.values {
+            ValueMap::Bounds { empty, .. } if trail.get(*empty) == 0 => Values {
+                domain: self,
+                trail,
+                inner: ValueIter::Bounds(self.min(trail)..=self.max(trail)),
+            },
+            ValueMap::Bounds { .. } => Values {
+                domain: self,
+                trail,
+                inner: ValueIter::Empty,
+            },
+            _ => Values {
+                domain: self,
+                trail,
+                inner: ValueIter::Indexed(self.dense[..self.size(trail)].iter()),
+            },
+        }
     }
 
-    /// Iterate values in the immutable root representation.
-    pub(crate) fn root_values(&self) -> impl Iterator<Item = i32> + '_ {
-        (0..self.dense.len()).map(|i| self.value_of(i))
+    /// Append absent root-supported values inside the current bounds.
+    pub(crate) fn append_removed_values(&self, trail: &Trail, out: &mut Vec<i32>) {
+        let min = self.min(trail);
+        let max = self.max(trail);
+        match &self.values {
+            ValueMap::Bounds {
+                holes, holes_len, ..
+            } => out.extend(
+                holes[..trail.get(*holes_len) as usize]
+                    .iter()
+                    .copied()
+                    .filter(|&v| min < v && v < max),
+            ),
+            _ => out.extend(
+                (0..self.dense.len())
+                    .map(|i| self.value_of(i))
+                    .filter(|&v| min < v && v < max && !self.contains(v, trail)),
+            ),
+        }
     }
 
     /// Root support when this domain uses cardinality-sized storage.
     pub(crate) fn sparse_values(&self) -> Option<Arc<[i32]>> {
         match &self.values {
             ValueMap::Sparse { values } => Some(Arc::clone(values)),
-            ValueMap::Dense { .. } => None,
+            ValueMap::Dense { .. } | ValueMap::Bounds { .. } => None,
         }
     }
 
     pub(crate) fn is_sparse(&self) -> bool {
         matches!(&self.values, ValueMap::Sparse { .. })
+    }
+
+    pub(crate) fn is_bounds(&self) -> bool {
+        matches!(&self.values, ValueMap::Bounds { .. })
     }
 
     fn index_of(&self, val: i32) -> Option<usize> {
@@ -193,6 +282,7 @@ impl Domain {
                 (shifted >= 0 && shifted < self.dense.len() as i64).then_some(shifted as usize)
             }
             ValueMap::Sparse { values } => values.binary_search(&val).ok(),
+            ValueMap::Bounds { .. } => None,
         }
     }
 
@@ -200,6 +290,7 @@ impl Domain {
         match &self.values {
             ValueMap::Dense { offset } => (i64::from(*offset) + index as i64) as i32,
             ValueMap::Sparse { values } => values[index],
+            ValueMap::Bounds { .. } => unreachable!("bounds domains have no indexed values"),
         }
     }
 
@@ -216,6 +307,9 @@ impl Domain {
     /// Remove `val`; returns whether the domain changed. Absent value is a
     /// no-op. Caller detects wipeout via [`Domain::size`].
     pub fn remove(&mut self, val: i32, trail: &mut Trail) -> bool {
+        if matches!(&self.values, ValueMap::Bounds { .. }) {
+            return self.remove_bounds(val, trail);
+        }
         let Some(i) = self.index_of(val) else {
             return false;
         };
@@ -240,6 +334,15 @@ impl Domain {
     /// Fix the domain to `val`. Returns `Ok(changed)`, or `Err(Inconsistency)`
     /// if `val` is absent.
     pub fn fix(&mut self, val: i32, trail: &mut Trail) -> Result<bool, Inconsistency> {
+        if matches!(&self.values, ValueMap::Bounds { .. }) {
+            if !self.contains(val, trail) {
+                return Err(Inconsistency);
+            }
+            let changed = self.size(trail) > 1;
+            trail.set(self.min, val);
+            trail.set(self.max, val);
+            return Ok(changed);
+        }
         let Some(i) = self.index_of(val) else {
             return Err(Inconsistency);
         };
@@ -274,6 +377,7 @@ impl Domain {
                 changed
             }
             ValueMap::Sparse { .. } => self.remove_if(trail, |v| v < bound),
+            ValueMap::Bounds { .. } => self.remove_bounds_below(bound, trail),
         }
     }
 
@@ -296,6 +400,7 @@ impl Domain {
                 changed
             }
             ValueMap::Sparse { .. } => self.remove_if(trail, |v| v > bound),
+            ValueMap::Bounds { .. } => self.remove_bounds_above(bound, trail),
         }
     }
 
@@ -333,6 +438,7 @@ impl Domain {
                 v as i32
             }
             ValueMap::Sparse { .. } => self.values(trail).min().unwrap(),
+            ValueMap::Bounds { .. } => unreachable!("bounds domains update bounds directly"),
         };
         trail.set(self.min, min);
     }
@@ -349,6 +455,7 @@ impl Domain {
                 v as i32
             }
             ValueMap::Sparse { .. } => self.values(trail).max().unwrap(),
+            ValueMap::Bounds { .. } => unreachable!("bounds domains update bounds directly"),
         };
         trail.set(self.max, max);
     }
@@ -359,6 +466,118 @@ impl Domain {
             .fold((i32::MAX, i32::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
         trail.set(self.min, min);
         trail.set(self.max, max);
+    }
+
+    fn remove_bounds(&mut self, val: i32, trail: &mut Trail) -> bool {
+        if !self.contains(val, trail) {
+            return false;
+        }
+        if self.size(trail) == 1 {
+            self.set_bounds_empty(trail);
+        } else if val == self.min(trail) {
+            self.set_bounds_min(i64::from(val) + 1, trail);
+        } else if val == self.max(trail) {
+            self.set_bounds_max(i64::from(val) - 1, trail);
+        } else {
+            let ValueMap::Bounds {
+                holes, holes_len, ..
+            } = &mut self.values
+            else {
+                unreachable!()
+            };
+            let len = trail.get(*holes_len) as usize;
+            if len == holes.len() {
+                holes.push(val);
+            } else {
+                holes[len] = val;
+            }
+            trail.set(*holes_len, (len + 1) as i32);
+        }
+        true
+    }
+
+    fn remove_bounds_below(&mut self, bound: i32, trail: &mut Trail) -> bool {
+        if bound > self.max(trail) {
+            self.set_bounds_empty(trail);
+        } else {
+            self.set_bounds_min(i64::from(bound), trail);
+        }
+        true
+    }
+
+    fn remove_bounds_above(&mut self, bound: i32, trail: &mut Trail) -> bool {
+        if bound < self.min(trail) {
+            self.set_bounds_empty(trail);
+        } else {
+            self.set_bounds_max(i64::from(bound), trail);
+        }
+        true
+    }
+
+    fn set_bounds_min(&mut self, mut val: i64, trail: &mut Trail) {
+        let max = i64::from(self.max(trail));
+        while val <= max && self.is_bounds_hole(val as i32, trail) {
+            val += 1;
+        }
+        if val > max {
+            self.set_bounds_empty(trail);
+        } else {
+            trail.set(self.min, val as i32);
+        }
+    }
+
+    fn set_bounds_max(&mut self, mut val: i64, trail: &mut Trail) {
+        let min = i64::from(self.min(trail));
+        while val >= min && self.is_bounds_hole(val as i32, trail) {
+            val -= 1;
+        }
+        if val < min {
+            self.set_bounds_empty(trail);
+        } else {
+            trail.set(self.max, val as i32);
+        }
+    }
+
+    fn is_bounds_hole(&self, val: i32, trail: &Trail) -> bool {
+        let ValueMap::Bounds {
+            holes, holes_len, ..
+        } = &self.values
+        else {
+            unreachable!()
+        };
+        holes[..trail.get(*holes_len) as usize].contains(&val)
+    }
+
+    fn set_bounds_empty(&self, trail: &mut Trail) {
+        let ValueMap::Bounds { empty, .. } = &self.values else {
+            unreachable!()
+        };
+        trail.set(*empty, 1);
+    }
+}
+
+/// Present values of a domain in arbitrary order.
+pub struct Values<'a> {
+    domain: &'a Domain,
+    trail: &'a Trail,
+    inner: ValueIter<'a>,
+}
+
+enum ValueIter<'a> {
+    Indexed(slice::Iter<'a, u32>),
+    Bounds(RangeInclusive<i32>),
+    Empty,
+}
+
+impl Iterator for Values<'_> {
+    type Item = i32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.inner {
+            ValueIter::Indexed(values) => values.next().map(|&i| self.domain.value_of(i as usize)),
+            ValueIter::Bounds(values) => values.find(|&v| self.domain.contains(v, self.trail)),
+            ValueIter::Empty => None,
+        }
     }
 }
 

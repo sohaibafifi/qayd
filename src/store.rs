@@ -152,6 +152,11 @@ impl Store {
         self.domains.iter().filter(|dom| dom.is_sparse()).count()
     }
 
+    /// Number of wide contiguous domains using bounds-only storage.
+    pub fn num_bounds_domains(&self) -> usize {
+        self.domains.iter().filter(|dom| dom.is_bounds()).count()
+    }
+
     // --- domain reads ---
 
     /// Minimum value in `var`'s domain.
@@ -351,14 +356,10 @@ impl Store {
         let max = dom.max(&self.trail);
         let size = dom.size(&self.trail) as i64;
         // Enumerate only root-supported holes so sparse numeric gaps stay compact.
-        let holes = if size == max as i64 - min as i64 + 1 {
-            Vec::new()
-        } else {
-            dom.root_values()
-                .filter(|&v| min < v && v < max)
-                .filter(|&v| !dom.contains(v, &self.trail))
-                .collect()
-        };
+        let mut holes = Vec::new();
+        if size != max as i64 - min as i64 + 1 {
+            dom.append_removed_values(&self.trail, &mut holes);
+        }
         ScopeVar {
             var,
             min,
