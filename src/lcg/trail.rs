@@ -831,24 +831,23 @@ impl<'s> Cdcl<'s> {
     /// before the current propagator call. Otherwise fall back to the pre-call
     /// whole-scope snapshot, which is always trail-consistent.
     fn reason_before_step(&self, preferred: Vec<Lit>, step_trail_len: usize) -> Vec<Lit> {
-        if preferred.iter().all(|&l| {
-            self.tvalue(l) == Tri::True
-                && self
-                    .atom_trail_pos
-                    .get(l.atom() as usize)
-                    .is_some_and(|&pos| pos < step_trail_len)
-        }) {
+        if preferred
+            .iter()
+            .all(|&lit| self.was_recorded_before(lit, step_trail_len))
+        {
             return preferred;
         }
         let fallback = build_ds(&self.atoms, &self.conflict_scope);
-        debug_assert!(fallback.iter().all(|&l| {
-            self.tvalue(l) == Tri::True
-                && self
-                    .atom_trail_pos
-                    .get(l.atom() as usize)
-                    .is_some_and(|&pos| pos < step_trail_len)
-        }));
+        debug_assert!(fallback
+            .iter()
+            .all(|&lit| self.was_recorded_before(lit, step_trail_len)));
         fallback
+    }
+
+    fn was_recorded_before(&self, lit: Lit, trail_len: usize) -> bool {
+        self.atom_trail_pos
+            .get(lit.atom() as usize)
+            .is_some_and(|&pos| self.tvalue(lit) == Tri::True && pos < trail_len)
     }
 
     /// Propagate; on each conflict, learn a 1-UIP clause, backjump, assert it.

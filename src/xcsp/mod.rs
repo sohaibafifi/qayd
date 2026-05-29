@@ -335,7 +335,7 @@ impl CopShared {
         self.work.wake_all();
     }
 
-    fn improve(&self, value: i64, solution: &[i32]) -> bool {
+    fn report_improvement(&self, tx: &mpsc::Sender<WorkerMsg>, value: i64, solution: &[i32]) {
         let mut current = self.best.load(Ordering::Relaxed);
         while if self.minimizing {
             value < current
@@ -353,12 +353,12 @@ impl CopShared {
                     if self.best.load(Ordering::Acquire) == value {
                         *slot = Some((solution.to_vec(), value));
                     }
-                    return true;
+                    let _ = tx.send(WorkerMsg::Improved(value));
+                    return;
                 }
                 Err(actual) => current = actual,
             }
         }
-        false
     }
 
     fn next_probe(&self) -> Option<i32> {
@@ -706,11 +706,7 @@ fn run_probe_worker(
             break;
         }
         match found {
-            Some((solution, value)) => {
-                if shared.improve(value as i64, &solution) {
-                    let _ = tx.send(WorkerMsg::Improved(value as i64));
-                }
-            }
+            Some((solution, value)) => shared.report_improvement(tx, value as i64, &solution),
             None => shared.record_probe_unsat(target),
         }
     }
@@ -797,9 +793,7 @@ fn solve_parallel_cop<W: Write>(
                                 Some(ClauseSharing::new(Arc::clone(&shared.clauses), worker)),
                                 &[],
                                 |value, solution| {
-                                    if shared.improve(value as i64, solution) {
-                                        let _ = tx.send(WorkerMsg::Improved(value as i64));
-                                    }
+                                    shared.report_improvement(&tx, value as i64, solution);
                                 },
                             );
                             (
@@ -818,9 +812,7 @@ fn solve_parallel_cop<W: Write>(
                             seed,
                             Some(&shared.best),
                             |value, solution| {
-                                if shared.improve(value, solution) {
-                                    let _ = tx.send(WorkerMsg::Improved(value));
-                                }
+                                shared.report_improvement(&tx, value, solution);
                             },
                         ),
                         Objective::Expr(_, expr) => optimize_expr_seeded(
@@ -832,9 +824,7 @@ fn solve_parallel_cop<W: Write>(
                             seed,
                             Some(&shared.best),
                             |value, solution| {
-                                if shared.improve(value, solution) {
-                                    let _ = tx.send(WorkerMsg::Improved(value));
-                                }
+                                shared.report_improvement(&tx, value, solution);
                             },
                         ),
                     };
@@ -887,9 +877,7 @@ fn solve_parallel_cop<W: Write>(
                             Some(ClauseSharing::new(Arc::clone(&shared.clauses), worker)),
                             &cube,
                             |value, solution| {
-                                if shared.improve(value as i64, solution) {
-                                    let _ = tx.send(WorkerMsg::Improved(value as i64));
-                                }
+                                shared.report_improvement(&tx, value as i64, solution);
                             },
                         );
                         (job_stats, complete)
