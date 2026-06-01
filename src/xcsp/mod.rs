@@ -25,6 +25,8 @@ use crate::store::Solver;
 use callback::Objective;
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+const LNS_CONFLICT_BUDGET: u64 = 10_000;
+const LNS_RELAX_DIVISOR: u64 = 5;
 
 struct StagedXml(PathBuf);
 
@@ -45,6 +47,8 @@ pub struct RunOptions {
     pub split: bool,
     /// Number of workers dedicated to optimistic objective probes.
     pub probes: usize,
+    /// Number of workers dedicated to incumbent-driven LNS.
+    pub lns: usize,
 }
 
 impl Default for RunOptions {
@@ -54,6 +58,7 @@ impl Default for RunOptions {
             workers: 1,
             split: false,
             probes: 0,
+            lns: 0,
         }
     }
 }
@@ -327,6 +332,7 @@ struct CopShared {
     probe_upper: AtomicI64,
     probe_attempts: AtomicU64,
     probe_unsat: AtomicU64,
+    lns_attempts: AtomicU64,
 }
 
 impl CopShared {
@@ -359,6 +365,14 @@ impl CopShared {
                 Err(actual) => current = actual,
             }
         }
+    }
+
+    fn incumbent(&self) -> Option<Vec<i32>> {
+        self.solution
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(solution, _)| solution.clone())
     }
 
     fn next_probe(&self) -> Option<i32> {
@@ -458,14 +472,16 @@ pub fn run_to_with_options<W: Write>(
     let var_objective = problem.var_objective().is_some();
     let symbolic_probes_disabled = has_objective && !var_objective && options.probes > 0;
     let workers = if has_objective { options.workers } else { 1 };
+    let probes = if var_objective {
+        options.probes.min(workers.saturating_sub(1))
+    } else {
+        0
+    };
     let options = RunOptions {
         workers,
         split: options.split && var_objective,
-        probes: if var_objective {
-            options.probes.min(workers.saturating_sub(1))
-        } else {
-            0
-        },
+        probes,
+        lns: options.lns.min(workers.saturating_sub(probes + 1)),
         ..options
     };
     let to_err = |e: std::io::Error| e.to_string();
@@ -505,6 +521,7 @@ pub fn run_to_with_options<W: Write>(
         } else {
             writeln!(w, "c probes {}", options.probes).map_err(to_err)?;
         }
+        writeln!(w, "c lns {}", options.lns).map_err(to_err)?;
         w.flush().map_err(to_err)?;
     }
 
@@ -582,6 +599,7 @@ fn solve_single<W: Write>(
                 None,
                 None,
                 &[],
+                None,
                 |v, _| write_improvement(w, verbose, &mut io_err, v),
             );
             if let Some(e) = io_err {
@@ -615,6 +633,7 @@ fn solve_linear_objective<W: Write>(
         minimizing,
         stop,
         seed,
+        None,
         None,
         |value, _| write_improvement(w, verbose, &mut io_err, value),
     );
@@ -652,6 +671,7 @@ fn solve_expr_objective<W: Write>(
         minimizing,
         stop,
         seed,
+        None,
         None,
         |value, _| write_improvement(w, verbose, &mut io_err, value),
     );
@@ -714,6 +734,137 @@ fn run_probe_worker(
     let _ = tx.send(WorkerMsg::Done(stats));
 }
 
+fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+fn fix_lns_neighborhood(
+    solver: &mut Solver,
+    vars: &[VarId],
+    solution: &[i32],
+    candidates: &[usize],
+    seed: u64,
+) -> bool {
+    let pivot = candidates[mix64(seed) as usize % candidates.len()];
+    candidates.iter().copied().all(|i| {
+        i == pivot
+            || mix64(seed ^ i as u64).is_multiple_of(LNS_RELAX_DIVISOR)
+            || solver.store.fix(vars[i], solution[i]).is_ok()
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn optimize_worker(
+    solver: &mut Solver,
+    vars: &[VarId],
+    objective: Objective,
+    minimizing: bool,
+    seed: u64,
+    shared: &CopShared,
+    tx: &mpsc::Sender<WorkerMsg>,
+    clause_worker: Option<usize>,
+    conflict_budget: Option<u64>,
+) -> (SolveStats, bool) {
+    match objective {
+        Objective::Var(_, obj) => {
+            let (_, stats, complete) = optimize_seeded(
+                solver,
+                vars,
+                obj,
+                minimizing,
+                &shared.cancel,
+                seed,
+                Some(&shared.best),
+                clause_worker.map(|worker| ClauseSharing::new(Arc::clone(&shared.clauses), worker)),
+                &[],
+                conflict_budget,
+                |value, solution| shared.report_improvement(tx, value as i64, solution),
+            );
+            (stats, complete)
+        }
+        Objective::Linear(_, coeffs, terms) => {
+            let (_, stats, complete) = optimize_linear_seeded(
+                solver,
+                vars,
+                &coeffs,
+                &terms,
+                minimizing,
+                &shared.cancel,
+                seed,
+                Some(&shared.best),
+                conflict_budget,
+                |value, solution| shared.report_improvement(tx, value, solution),
+            );
+            (stats, complete)
+        }
+        Objective::Expr(_, expr) => {
+            let (_, stats, complete) = optimize_expr_seeded(
+                solver,
+                vars,
+                &expr,
+                minimizing,
+                &shared.cancel,
+                seed,
+                Some(&shared.best),
+                conflict_budget,
+                |value, solution| shared.report_improvement(tx, value, solution),
+            );
+            (stats, complete)
+        }
+    }
+}
+
+fn run_lns_worker(
+    model: Problem,
+    minimizing: bool,
+    seed: u64,
+    shared: &CopShared,
+    tx: &mpsc::Sender<WorkerMsg>,
+) {
+    let vars = &model.search;
+    let objective = model.objective.clone().expect("COP lost its objective");
+    let objective_var = model.var_objective().map(|(_, obj)| obj);
+    let candidates = vars
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &var)| {
+            (Some(var) != objective_var && !model.solver.store.is_fixed(var)).then_some(i)
+        })
+        .collect::<Vec<_>>();
+    let mut stats = SolveStats::default();
+    let mut attempt = 0u64;
+    while !candidates.is_empty() && !shared.cancel.load(Ordering::Relaxed) {
+        let Some(solution) = shared.incumbent() else {
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
+        };
+        let attempt_seed = seed.wrapping_add(attempt);
+        attempt += 1;
+        let mut solver = model.solver.clone();
+        if !fix_lns_neighborhood(&mut solver, vars, &solution, &candidates, attempt_seed) {
+            continue;
+        }
+        shared.lns_attempts.fetch_add(1, Ordering::Relaxed);
+        let (part, _) = optimize_worker(
+            &mut solver,
+            vars,
+            objective.clone(),
+            minimizing,
+            attempt_seed,
+            shared,
+            tx,
+            None,
+            Some(LNS_CONFLICT_BUDGET),
+        );
+        merge_stats(&mut stats, part);
+    }
+    let _ = tx.send(WorkerMsg::Done(stats));
+}
+
 fn solve_parallel_cop<W: Write>(
     problem: Problem,
     verbose: bool,
@@ -743,6 +894,7 @@ fn solve_parallel_cop<W: Write>(
         probe_upper: AtomicI64::new(probe_upper),
         probe_attempts: AtomicU64::new(0),
         probe_unsat: AtomicU64::new(0),
+        lns_attempts: AtomicU64::new(0),
     });
     let (tx, rx) = mpsc::channel();
     let mut stats = SolveStats::default();
@@ -754,7 +906,8 @@ fn solve_parallel_cop<W: Write>(
     for _ in 1..options.workers {
         models.push(models[0].clone());
     }
-    let regular_workers = options.workers - options.probes;
+    let regular_workers = options.workers - options.probes - options.lns;
+    let lns_end = regular_workers + options.lns;
 
     std::thread::scope(|scope| {
         let monitor = Arc::clone(&shared);
@@ -772,62 +925,29 @@ fn solve_parallel_cop<W: Write>(
             let tx = tx.clone();
             scope.spawn(move || {
                 let seed = options.seed.wrapping_add(worker as u64);
-                if worker >= regular_workers {
+                if worker >= lns_end {
                     let (_, obj) = var_objective.expect("symbolic objective cannot use probes");
                     run_probe_worker(model, worker, obj, minimizing, seed, &shared, &tx);
+                    return;
+                }
+                if worker >= regular_workers {
+                    run_lns_worker(model, minimizing, seed, &shared, &tx);
                     return;
                 }
                 let vars = &model.search;
                 if !options.split {
                     let mut solver = model.solver;
-                    let (_, worker_stats, complete) = match model.objective.unwrap() {
-                        Objective::Var(_, obj) => {
-                            let (best, stats, complete) = optimize_seeded(
-                                &mut solver,
-                                vars,
-                                obj,
-                                minimizing,
-                                &shared.cancel,
-                                seed,
-                                Some(&shared.best),
-                                Some(ClauseSharing::new(Arc::clone(&shared.clauses), worker)),
-                                &[],
-                                |value, solution| {
-                                    shared.report_improvement(&tx, value as i64, solution);
-                                },
-                            );
-                            (
-                                best.map(|(solution, value)| (solution, value as i64)),
-                                stats,
-                                complete,
-                            )
-                        }
-                        Objective::Linear(_, coeffs, terms) => optimize_linear_seeded(
-                            &mut solver,
-                            vars,
-                            &coeffs,
-                            &terms,
-                            minimizing,
-                            &shared.cancel,
-                            seed,
-                            Some(&shared.best),
-                            |value, solution| {
-                                shared.report_improvement(&tx, value, solution);
-                            },
-                        ),
-                        Objective::Expr(_, expr) => optimize_expr_seeded(
-                            &mut solver,
-                            vars,
-                            &expr,
-                            minimizing,
-                            &shared.cancel,
-                            seed,
-                            Some(&shared.best),
-                            |value, solution| {
-                                shared.report_improvement(&tx, value, solution);
-                            },
-                        ),
-                    };
+                    let (worker_stats, complete) = optimize_worker(
+                        &mut solver,
+                        vars,
+                        model.objective.unwrap(),
+                        minimizing,
+                        seed,
+                        &shared,
+                        &tx,
+                        Some(worker),
+                        None,
+                    );
                     if complete {
                         shared.proved.store(true, Ordering::Relaxed);
                         shared.stop();
@@ -876,6 +996,7 @@ fn solve_parallel_cop<W: Write>(
                             Some(&shared.best),
                             Some(ClauseSharing::new(Arc::clone(&shared.clauses), worker)),
                             &cube,
+                            None,
                             |value, solution| {
                                 shared.report_improvement(&tx, value as i64, solution);
                             },
@@ -951,6 +1072,14 @@ fn solve_parallel_cop<W: Write>(
                 "c probes attempts {} unsat {}",
                 shared.probe_attempts.load(Ordering::Relaxed),
                 shared.probe_unsat.load(Ordering::Relaxed)
+            )
+            .map_err(to_err)?;
+        }
+        if options.lns > 0 {
+            writeln!(
+                w,
+                "c lns attempts {}",
+                shared.lns_attempts.load(Ordering::Relaxed)
             )
             .map_err(to_err)?;
         }

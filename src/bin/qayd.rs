@@ -1,4 +1,4 @@
-//! `qayd` CLI: `qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] [--probe N] <instance.xml[.lzma|.xz]>`.
+//! `qayd` CLI: `qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] [--probe N] [--lns N] <instance.xml[.lzma|.xz]>`.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -23,15 +23,7 @@ fn read_instance(path: &str) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|e| e.to_string())
 }
 
-fn run_instance(
-    path: &str,
-    verbose: bool,
-    stop: &AtomicBool,
-    seed: u64,
-    workers: usize,
-    split: bool,
-    probes: usize,
-) {
+fn run_instance(path: &str, verbose: bool, stop: &AtomicBool, options: qayd::xcsp::RunOptions) {
     let xml = match read_instance(path) {
         Ok(x) => x,
         Err(e) => {
@@ -41,12 +33,6 @@ fn run_instance(
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    let options = qayd::xcsp::RunOptions {
-        seed,
-        workers,
-        split,
-        probes,
-    };
     if let Err(e) = qayd::xcsp::run_to_with_options(&xml, verbose, stop, &mut lock, options) {
         eprintln!("error: {e}");
         std::process::exit(2);
@@ -61,7 +47,7 @@ fn is_instance(arg: &str) -> bool {
 }
 
 const USAGE: &str =
-    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] [--probe N] <instance.xml[.lzma|.xz]>";
+    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] [--probe N] [--lns N] <instance.xml[.lzma|.xz]>";
 
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
@@ -99,6 +85,7 @@ fn main() {
     let mut workers: Option<usize> = None;
     let mut split = false;
     let mut probes = 0;
+    let mut lns = 0;
     let mut path: Option<String> = None;
 
     let mut it = args.iter();
@@ -129,6 +116,12 @@ fn main() {
                 probes = positive(
                     it.next().map(String::as_str),
                     "--probe needs a positive integer",
+                )
+            }
+            "--lns" => {
+                lns = positive(
+                    it.next().map(String::as_str),
+                    "--lns needs a positive integer",
                 )
             }
             other if other.starts_with('-') => {
@@ -168,5 +161,16 @@ fn main() {
         });
     }
 
-    run_instance(&path, verbose, &stop, seed, workers, split, probes);
+    run_instance(
+        &path,
+        verbose,
+        &stop,
+        qayd::xcsp::RunOptions {
+            seed,
+            workers,
+            split,
+            probes,
+            lns,
+        },
+    );
 }

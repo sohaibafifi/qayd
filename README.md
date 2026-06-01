@@ -47,7 +47,9 @@ Priorities, in order: **correct, then simple, then fast.**
   materialized objectives also share short low-LBD clauses. `--split` enables
   proof-job stealing inspired by [Buffered Work
   Stealing](https://doi.org/10.1007/978-3-031-95973-8_13), and `--probe`
-  dedicates materialized-objective workers to optimistic probes.
+  dedicates materialized-objective workers to optimistic probes. `--lns`
+  dedicates workers to bounded incumbent-driven [Large Neighborhood
+  Search](https://doi.org/10.1007/978-3-319-91086-4_4).
 
 ## Build
 
@@ -59,7 +61,7 @@ cargo test
 ## Solve an instance
 
 ```bash
-qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] [--probe N] <instance.xml[.lzma|.xz]>
+qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] [--probe N] [--lns N] <instance.xml[.lzma|.xz]>
 ```
 
 - `-h`, `--help` prints the usage.
@@ -69,6 +71,7 @@ qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] [--probe N] <in
 - `-p THREADS`, `--threads THREADS` sets the COP portfolio worker count. It defaults to `NBCORE`, then `1`.
 - `--split` divides COP proof search into disjoint jobs for worker stealing.
 - `--probe N` dedicates up to `N` COP workers to optimistic objective probes.
+- `--lns N` dedicates up to `N` COP workers to bounded Large Neighborhood Search.
 
 ## As a library
 

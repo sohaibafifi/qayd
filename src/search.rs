@@ -135,6 +135,7 @@ pub fn optimize_with(
         None,
         None,
         &[],
+        None,
         |value, _| on_improve(value),
     );
     (best, stats)
@@ -153,6 +154,7 @@ pub(crate) fn optimize_seeded(
     shared_bound: Option<&AtomicI64>,
     clause_sharing: Option<ClauseSharing>,
     cube: &[Lit],
+    conflict_budget: Option<u64>,
     on_improve: impl FnMut(i32, &[i32]),
 ) -> (Option<(Vec<i32>, i32)>, SolveStats, bool) {
     let lazy_atoms = clause_sharing.as_ref().map(ClauseSharing::lazy_atoms);
@@ -162,7 +164,16 @@ pub(crate) fn optimize_seeded(
     if let Some(sharing) = clause_sharing {
         cdcl.set_clause_sharing(sharing);
     }
-    cdcl.optimize(vars, obj, minimizing, stop, shared_bound, cube, on_improve)
+    cdcl.optimize(
+        vars,
+        obj,
+        minimizing,
+        stop,
+        shared_bound,
+        cube,
+        conflict_budget,
+        on_improve,
+    )
 }
 
 /// Optimise a symbolic weighted sum without materializing its potentially huge domain.
@@ -176,6 +187,7 @@ pub(crate) fn optimize_linear_seeded(
     stop: &AtomicBool,
     seed: u64,
     shared_bound: Option<&AtomicI64>,
+    conflict_budget: Option<u64>,
     on_improve: impl FnMut(i64, &[i32]),
 ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
     let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, None) else {
@@ -188,6 +200,7 @@ pub(crate) fn optimize_linear_seeded(
         minimizing,
         stop,
         shared_bound,
+        conflict_budget,
         on_improve,
     )
 }
@@ -202,12 +215,21 @@ pub(crate) fn optimize_expr_seeded(
     stop: &AtomicBool,
     seed: u64,
     shared_bound: Option<&AtomicI64>,
+    conflict_budget: Option<u64>,
     on_improve: impl FnMut(i64, &[i32]),
 ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
     let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, None) else {
         return (None, SolveStats::default(), false);
     };
-    cdcl.optimize_expr(vars, expr, minimizing, stop, shared_bound, on_improve)
+    cdcl.optimize_expr(
+        vars,
+        expr,
+        minimizing,
+        stop,
+        shared_bound,
+        conflict_budget,
+        on_improve,
+    )
 }
 
 /// Pick a binary split for one root cube.

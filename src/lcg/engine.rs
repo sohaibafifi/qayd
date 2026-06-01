@@ -397,6 +397,7 @@ impl Cdcl<'_> {
         stop: &AtomicBool,
         shared_bound: Option<&AtomicI64>,
         cube: &[Lit],
+        conflict_budget: Option<u64>,
         mut on_improve: F,
     ) -> (Option<(Vec<i32>, i32)>, SolveStats, bool) {
         let (best, stats, complete) = self.optimize_objective(
@@ -406,6 +407,7 @@ impl Cdcl<'_> {
             stop,
             shared_bound,
             cube,
+            conflict_budget,
             |value, solution| on_improve(value as i32, solution),
         );
         (
@@ -425,6 +427,7 @@ impl Cdcl<'_> {
         minimizing: bool,
         stop: &AtomicBool,
         shared_bound: Option<&AtomicI64>,
+        conflict_budget: Option<u64>,
         on_improve: F,
     ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
         assert_eq!(
@@ -442,11 +445,13 @@ impl Cdcl<'_> {
             stop,
             shared_bound,
             &[],
+            conflict_budget,
             on_improve,
         )
     }
 
     /// CDCL branch-and-bound over a symbolic expression.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn optimize_expr<F: FnMut(i64, &[i32])>(
         &mut self,
         vars: &[VarId],
@@ -454,6 +459,7 @@ impl Cdcl<'_> {
         minimizing: bool,
         stop: &AtomicBool,
         shared_bound: Option<&AtomicI64>,
+        conflict_budget: Option<u64>,
         on_improve: F,
     ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
         self.optimize_objective(
@@ -463,6 +469,7 @@ impl Cdcl<'_> {
             stop,
             shared_bound,
             &[],
+            conflict_budget,
             on_improve,
         )
     }
@@ -476,6 +483,7 @@ impl Cdcl<'_> {
         stop: &AtomicBool,
         shared_bound: Option<&AtomicI64>,
         cube: &[Lit],
+        conflict_budget: Option<u64>,
         mut on_improve: F,
     ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
         let mut stats = SolveStats::default();
@@ -493,6 +501,7 @@ impl Cdcl<'_> {
         let mut phase: Vec<Option<i32>> = vec![None; self.solver.store.num_vars()];
         let mut enforced = None;
         let mut complete = true;
+        let conflict_limit = conflict_budget.map(|n| self.conflicts.saturating_add(n));
         let (mut last_restart, mut restart_limit) = (self.conflicts, 100u64);
         if !self.sync_shared_clauses() {
             stats.failures = self.conflicts;
@@ -501,7 +510,9 @@ impl Cdcl<'_> {
         }
 
         loop {
-            if stop.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed)
+                || conflict_limit.is_some_and(|limit| self.conflicts >= limit)
+            {
                 complete = false;
                 break;
             }
