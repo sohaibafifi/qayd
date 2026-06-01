@@ -92,7 +92,10 @@ fn write_improvement<W: Write>(
     value: impl Display,
 ) {
     if verbose && error.is_none() {
-        *error = writeln!(w, "o {value}").and_then(|_| w.flush()).err();
+        *error = writeln!(w, "o {value}")
+            .and_then(|_| writeln!(w, "c incumbent {value} source sequential"))
+            .and_then(|_| w.flush())
+            .err();
     }
 }
 
@@ -341,7 +344,13 @@ impl CopShared {
         self.work.wake_all();
     }
 
-    fn report_improvement(&self, tx: &mpsc::Sender<WorkerMsg>, value: i64, solution: &[i32]) {
+    fn report_improvement(
+        &self,
+        tx: &mpsc::Sender<WorkerMsg>,
+        value: i64,
+        solution: &[i32],
+        source: WorkerSource,
+    ) {
         let mut current = self.best.load(Ordering::Relaxed);
         while if self.minimizing {
             value < current
@@ -359,7 +368,7 @@ impl CopShared {
                     if self.best.load(Ordering::Acquire) == value {
                         *slot = Some((solution.to_vec(), value));
                     }
-                    let _ = tx.send(WorkerMsg::Improved(value));
+                    let _ = tx.send(WorkerMsg::Improved { value, source });
                     return;
                 }
                 Err(actual) => current = actual,
@@ -421,8 +430,14 @@ impl CopShared {
     }
 }
 
+#[derive(Clone, Copy)]
+struct WorkerSource {
+    kind: &'static str,
+    worker: usize,
+}
+
 enum WorkerMsg {
-    Improved(i64),
+    Improved { value: i64, source: WorkerSource },
     Done(SolveStats),
 }
 
@@ -726,7 +741,15 @@ fn run_probe_worker(
             break;
         }
         match found {
-            Some((solution, value)) => shared.report_improvement(tx, value as i64, &solution),
+            Some((solution, value)) => shared.report_improvement(
+                tx,
+                value as i64,
+                &solution,
+                WorkerSource {
+                    kind: "probe",
+                    worker,
+                },
+            ),
             None => shared.record_probe_unsat(target),
         }
     }
@@ -766,6 +789,7 @@ fn optimize_worker(
     seed: u64,
     shared: &CopShared,
     tx: &mpsc::Sender<WorkerMsg>,
+    source: WorkerSource,
     clause_worker: Option<usize>,
     conflict_budget: Option<u64>,
 ) -> (SolveStats, bool) {
@@ -782,7 +806,9 @@ fn optimize_worker(
                 clause_worker.map(|worker| ClauseSharing::new(Arc::clone(&shared.clauses), worker)),
                 &[],
                 conflict_budget,
-                |value, solution| shared.report_improvement(tx, value as i64, solution),
+                |value, solution| {
+                    shared.report_improvement(tx, value as i64, solution, source);
+                },
             );
             (stats, complete)
         }
@@ -797,7 +823,7 @@ fn optimize_worker(
                 seed,
                 Some(&shared.best),
                 conflict_budget,
-                |value, solution| shared.report_improvement(tx, value, solution),
+                |value, solution| shared.report_improvement(tx, value, solution, source),
             );
             (stats, complete)
         }
@@ -811,7 +837,7 @@ fn optimize_worker(
                 seed,
                 Some(&shared.best),
                 conflict_budget,
-                |value, solution| shared.report_improvement(tx, value, solution),
+                |value, solution| shared.report_improvement(tx, value, solution, source),
             );
             (stats, complete)
         }
@@ -820,6 +846,7 @@ fn optimize_worker(
 
 fn run_lns_worker(
     model: Problem,
+    worker: usize,
     minimizing: bool,
     seed: u64,
     shared: &CopShared,
@@ -857,6 +884,10 @@ fn run_lns_worker(
             attempt_seed,
             shared,
             tx,
+            WorkerSource {
+                kind: "lns",
+                worker,
+            },
             None,
             Some(LNS_CONFLICT_BUDGET),
         );
@@ -931,7 +962,7 @@ fn solve_parallel_cop<W: Write>(
                     return;
                 }
                 if worker >= regular_workers {
-                    run_lns_worker(model, minimizing, seed, &shared, &tx);
+                    run_lns_worker(model, worker, minimizing, seed, &shared, &tx);
                     return;
                 }
                 let vars = &model.search;
@@ -945,6 +976,10 @@ fn solve_parallel_cop<W: Write>(
                         seed,
                         &shared,
                         &tx,
+                        WorkerSource {
+                            kind: "portfolio",
+                            worker,
+                        },
                         Some(worker),
                         None,
                     );
@@ -998,7 +1033,15 @@ fn solve_parallel_cop<W: Write>(
                             &cube,
                             None,
                             |value, solution| {
-                                shared.report_improvement(&tx, value as i64, solution);
+                                shared.report_improvement(
+                                    &tx,
+                                    value as i64,
+                                    solution,
+                                    WorkerSource {
+                                        kind: "split",
+                                        worker,
+                                    },
+                                );
                             },
                         );
                         (job_stats, complete)
@@ -1021,7 +1064,7 @@ fn solve_parallel_cop<W: Write>(
         drop(tx);
         for msg in rx {
             match msg {
-                WorkerMsg::Improved(value)
+                WorkerMsg::Improved { value, source }
                     if printed.is_none_or(
                         |old| {
                             if minimizing {
@@ -1034,13 +1077,22 @@ fn solve_parallel_cop<W: Write>(
                 {
                     printed = Some(value);
                     if verbose && error.is_none() {
-                        if let Err(e) = writeln!(w, "o {value}").and_then(|_| w.flush()) {
+                        if let Err(e) = writeln!(w, "o {value}")
+                            .and_then(|_| {
+                                writeln!(
+                                    w,
+                                    "c incumbent {value} source {} worker {}",
+                                    source.kind, source.worker
+                                )
+                            })
+                            .and_then(|_| w.flush())
+                        {
                             error = Some(e.to_string());
                             shared.stop();
                         }
                     }
                 }
-                WorkerMsg::Improved(_) => {}
+                WorkerMsg::Improved { .. } => {}
                 WorkerMsg::Done(worker_stats) => {
                     merge_stats(&mut stats, worker_stats);
                 }

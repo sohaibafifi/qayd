@@ -65,7 +65,7 @@ qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] [--probe N] [--
 ```
 
 - `-h`, `--help` prints the usage.
-- `-v`, `--verbose` emits `c` comment lines (model size, search stats, wall time).
+- `-v`, `--verbose` emits `c` comment lines (model size, search stats, wall time, incumbent source).
 - `-t SECONDS`, `--time SECONDS` stops after a time budget, reporting the best solution so far.
 - `--seed SEED` sets the reproducible search seed. It defaults to `RANDOMSEED`, then `0`.
 - `-p THREADS`, `--threads THREADS` sets the COP portfolio worker count. It defaults to `NBCORE`, then `1`.
