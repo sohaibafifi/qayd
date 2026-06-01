@@ -114,15 +114,17 @@ impl Propagator for LinearLeq {
                 if a > 0 {
                     let bound = clamp_i32(floor_div(allowed, a));
                     let before = store.max(v);
-                    let why = self.min_side(store, idx);
-                    store.remove_above_because(v, bound, why)?;
-                    changed |= store.max(v) != before;
+                    if bound < before {
+                        store.remove_above_because(v, bound, self.min_side(store, idx))?;
+                        changed = true;
+                    }
                 } else {
                     let bound = clamp_i32(ceil_div(allowed, a));
                     let before = store.min(v);
-                    let why = self.min_side(store, idx);
-                    store.remove_below_because(v, bound, why)?;
-                    changed |= store.min(v) != before;
+                    if bound > before {
+                        store.remove_below_because(v, bound, self.min_side(store, idx))?;
+                        changed = true;
+                    }
                 }
             }
 
@@ -246,16 +248,28 @@ impl Propagator for LinearEq {
                 } else {
                     (ceil_div(thi, a), floor_div(tlo, a))
                 };
-                let (lo_why, hi_why) = if a > 0 {
-                    (self.max_side(store, i), self.min_side(store, i))
-                } else {
-                    (self.min_side(store, i), self.max_side(store, i))
-                };
                 let before_min = store.min(v);
                 let before_max = store.max(v);
-                store.remove_below_because(v, clamp_i32(lo), lo_why)?;
-                store.remove_above_because(v, clamp_i32(hi), hi_why)?;
-                changed |= store.min(v) != before_min || store.max(v) != before_max;
+                let lo = clamp_i32(lo);
+                let hi = clamp_i32(hi);
+                if lo > before_min {
+                    let why = if a > 0 {
+                        self.max_side(store, i)
+                    } else {
+                        self.min_side(store, i)
+                    };
+                    store.remove_below_because(v, lo, why)?;
+                    changed = true;
+                }
+                if hi < before_max {
+                    let why = if a > 0 {
+                        self.min_side(store, i)
+                    } else {
+                        self.max_side(store, i)
+                    };
+                    store.remove_above_because(v, hi, why)?;
+                    changed = true;
+                }
             }
             if !changed {
                 return Ok(());
