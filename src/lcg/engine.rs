@@ -8,11 +8,11 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use crate::constraints::intension::intension;
 use crate::constraints::linear::{linear, Relation};
-use crate::expr::{self, Expr};
+use crate::expr;
 use crate::ids::VarId;
 use crate::lcg::lit::{Lit, LitOrConst};
 use crate::lcg::trail::{Cdcl, Reason};
-use crate::search::{SearchControl, SolveStats};
+use crate::search::{Objective, SearchControl, SolveStats};
 use crate::store::Solver;
 
 fn mix64(mut x: u64) -> u64 {
@@ -29,16 +29,6 @@ fn strict_bound(incumbent: i64, minimizing: bool) -> Option<i64> {
     } else {
         incumbent.checked_add(1)
     }
-}
-
-#[derive(Clone, Copy)]
-enum Objective<'a> {
-    Var(VarId),
-    Linear {
-        coeffs: &'a [i64],
-        vars: &'a [VarId],
-    },
-    Expr(&'a Expr),
 }
 
 impl Objective<'_> {
@@ -386,96 +376,10 @@ impl Cdcl<'_> {
         self.tighten_objective(objective, minimizing, value)
     }
 
-    /// CDCL branch-and-bound with restarts. `obj` must be among `vars`. Returns
-    /// the best `(assignment, value)`, proven optimal unless `stop` was set.
+    /// CDCL branch-and-bound with restarts. Returns the best `(assignment,
+    /// value)`, proven optimal unless `stop` was set.
     #[allow(clippy::too_many_arguments)]
-    pub fn optimize<F: FnMut(i32, &[i32])>(
-        &mut self,
-        vars: &[VarId],
-        obj: VarId,
-        minimizing: bool,
-        stop: &AtomicBool,
-        shared_bound: Option<&AtomicI64>,
-        cube: &[Lit],
-        conflict_budget: Option<u64>,
-        mut on_improve: F,
-    ) -> (Option<(Vec<i32>, i32)>, SolveStats, bool) {
-        let (best, stats, complete) = self.optimize_objective(
-            vars,
-            Objective::Var(obj),
-            minimizing,
-            stop,
-            shared_bound,
-            cube,
-            conflict_budget,
-            |value, solution| on_improve(value as i32, solution),
-        );
-        (
-            best.map(|(solution, value)| (solution, value as i32)),
-            stats,
-            complete,
-        )
-    }
-
-    /// CDCL branch-and-bound over a symbolic weighted sum.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn optimize_linear<F: FnMut(i64, &[i32])>(
-        &mut self,
-        vars: &[VarId],
-        coeffs: &[i64],
-        terms: &[VarId],
-        minimizing: bool,
-        stop: &AtomicBool,
-        shared_bound: Option<&AtomicI64>,
-        conflict_budget: Option<u64>,
-        on_improve: F,
-    ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
-        assert_eq!(
-            coeffs.len(),
-            terms.len(),
-            "linear objective: coeffs/terms length mismatch"
-        );
-        self.optimize_objective(
-            vars,
-            Objective::Linear {
-                coeffs,
-                vars: terms,
-            },
-            minimizing,
-            stop,
-            shared_bound,
-            &[],
-            conflict_budget,
-            on_improve,
-        )
-    }
-
-    /// CDCL branch-and-bound over a symbolic expression.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn optimize_expr<F: FnMut(i64, &[i32])>(
-        &mut self,
-        vars: &[VarId],
-        expr: &Expr,
-        minimizing: bool,
-        stop: &AtomicBool,
-        shared_bound: Option<&AtomicI64>,
-        conflict_budget: Option<u64>,
-        on_improve: F,
-    ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
-        self.optimize_objective(
-            vars,
-            Objective::Expr(expr),
-            minimizing,
-            stop,
-            shared_bound,
-            &[],
-            conflict_budget,
-            on_improve,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn optimize_objective<F: FnMut(i64, &[i32])>(
+    pub(crate) fn optimize<F: FnMut(i64, &[i32])>(
         &mut self,
         vars: &[VarId],
         objective: Objective<'_>,
@@ -486,6 +390,13 @@ impl Cdcl<'_> {
         conflict_budget: Option<u64>,
         mut on_improve: F,
     ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
+        if let Objective::Linear { coeffs, vars } = objective {
+            assert_eq!(
+                coeffs.len(),
+                vars.len(),
+                "linear objective: coeffs/terms length mismatch"
+            );
+        }
         let mut stats = SolveStats::default();
         let mut best: Option<(Vec<i32>, i64)> = None;
         if !self.init() {

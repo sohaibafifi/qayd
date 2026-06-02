@@ -13,13 +13,12 @@ use std::time::{Duration, Instant};
 
 use xcsp3_rust_parser::xcsp_runner::XcspRunner;
 
-use crate::expr::Expr;
 use crate::ids::VarId;
 use crate::lcg::clause::{ClauseSharing, SharedClausePool};
 use crate::lcg::lit::Lit;
 use crate::search::{
-    optimize_expr_seeded, optimize_linear_seeded, optimize_seeded, probe_seeded,
-    solve_interruptible_seeded, split_cube_seeded, SearchControl, SolveStats,
+    optimize_seeded, probe_seeded, solve_interruptible_seeded, split_cube_seeded,
+    Objective as SearchObjective, SearchControl, SolveStats,
 };
 use crate::store::Solver;
 use callback::Objective;
@@ -177,18 +176,37 @@ impl SolutionOutput {
 
 impl Problem {
     fn var_objective(&self) -> Option<(bool, VarId)> {
-        match self.objective {
-            Some(Objective::Var(minimizing, obj)) => Some((minimizing, obj)),
-            _ => None,
-        }
+        self.objective
+            .as_ref()
+            .and_then(|objective| objective.var().map(|obj| (objective.minimizing(), obj)))
     }
 
     fn objective_dir(&self) -> Option<bool> {
-        match self.objective {
-            Some(Objective::Var(minimizing, _))
-            | Some(Objective::Linear(minimizing, _, _))
-            | Some(Objective::Expr(minimizing, _)) => Some(minimizing),
-            None => None,
+        self.objective.as_ref().map(Objective::minimizing)
+    }
+}
+
+impl Objective {
+    fn minimizing(&self) -> bool {
+        match self {
+            Self::Var(minimizing, _)
+            | Self::Linear(minimizing, _, _)
+            | Self::Expr(minimizing, _) => *minimizing,
+        }
+    }
+
+    fn var(&self) -> Option<VarId> {
+        match self {
+            Self::Var(_, var) => Some(*var),
+            Self::Linear(_, _, _) | Self::Expr(_, _) => None,
+        }
+    }
+
+    fn search(&self) -> SearchObjective<'_> {
+        match self {
+            Self::Var(_, var) => SearchObjective::Var(*var),
+            Self::Linear(_, coeffs, vars) => SearchObjective::Linear { coeffs, vars },
+            Self::Expr(_, expr) => SearchObjective::Expr(expr),
         }
     }
 }
@@ -569,12 +587,6 @@ fn solve_single<W: Write>(
     let to_err = |e: std::io::Error| e.to_string();
 
     match problem.objective {
-        Some(Objective::Linear(minimizing, coeffs, terms)) => solve_linear_objective(
-            solver, vars, output, coeffs, terms, minimizing, verbose, stop, w, seed,
-        ),
-        Some(Objective::Expr(minimizing, expr)) => solve_expr_objective(
-            solver, vars, output, expr, minimizing, verbose, stop, w, seed,
-        ),
         None => {
             let mut sol = None;
             let stats = solve_interruptible_seeded(
@@ -602,12 +614,13 @@ fn solve_single<W: Write>(
             }
             Ok(())
         }
-        Some(Objective::Var(minimizing, obj)) => {
+        Some(objective) => {
+            let minimizing = objective.minimizing();
             let mut io_err: Option<std::io::Error> = None;
-            let (best, stats, _) = optimize_seeded(
+            let (best, stats, complete) = optimize_seeded(
                 &mut solver,
                 &vars,
-                obj,
+                objective.search(),
                 minimizing,
                 stop,
                 seed,
@@ -621,87 +634,9 @@ fn solve_single<W: Write>(
                 return Err(e.to_string());
             }
             let interrupted = stop.load(Ordering::Relaxed);
-            write_optimization_result(w, &output, best, stats, !interrupted, interrupted, verbose)
+            write_optimization_result(w, &output, best, stats, complete, interrupted, verbose)
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn solve_linear_objective<W: Write>(
-    mut solver: Solver,
-    vars: Vec<VarId>,
-    output: SolutionOutput,
-    coeffs: Vec<i64>,
-    terms: Vec<VarId>,
-    minimizing: bool,
-    verbose: bool,
-    stop: &AtomicBool,
-    w: &mut W,
-    seed: u64,
-) -> Result<(), String> {
-    let mut io_err: Option<std::io::Error> = None;
-    let (best, stats, complete) = optimize_linear_seeded(
-        &mut solver,
-        &vars,
-        &coeffs,
-        &terms,
-        minimizing,
-        stop,
-        seed,
-        None,
-        None,
-        |value, _| write_improvement(w, verbose, &mut io_err, value),
-    );
-    if let Some(e) = io_err {
-        return Err(e.to_string());
-    }
-    write_optimization_result(
-        w,
-        &output,
-        best,
-        stats,
-        complete,
-        stop.load(Ordering::Relaxed),
-        verbose,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn solve_expr_objective<W: Write>(
-    mut solver: Solver,
-    vars: Vec<VarId>,
-    output: SolutionOutput,
-    expr: Expr,
-    minimizing: bool,
-    verbose: bool,
-    stop: &AtomicBool,
-    w: &mut W,
-    seed: u64,
-) -> Result<(), String> {
-    let mut io_err: Option<std::io::Error> = None;
-    let (best, stats, complete) = optimize_expr_seeded(
-        &mut solver,
-        &vars,
-        &expr,
-        minimizing,
-        stop,
-        seed,
-        None,
-        None,
-        |value, _| write_improvement(w, verbose, &mut io_err, value),
-    );
-    if let Some(e) = io_err {
-        return Err(e.to_string());
-    }
-    write_optimization_result(
-        w,
-        &output,
-        best,
-        stats,
-        complete,
-        stop.load(Ordering::Relaxed),
-        verbose,
-    )
 }
 
 fn run_probe_worker(
@@ -785,7 +720,6 @@ fn optimize_worker(
     solver: &mut Solver,
     vars: &[VarId],
     objective: Objective,
-    minimizing: bool,
     seed: u64,
     shared: &CopShared,
     tx: &mpsc::Sender<WorkerMsg>,
@@ -793,61 +727,29 @@ fn optimize_worker(
     clause_worker: Option<usize>,
     conflict_budget: Option<u64>,
 ) -> (SolveStats, bool) {
-    match objective {
-        Objective::Var(_, obj) => {
-            let (_, stats, complete) = optimize_seeded(
-                solver,
-                vars,
-                obj,
-                minimizing,
-                &shared.cancel,
-                seed,
-                Some(&shared.best),
-                clause_worker.map(|worker| ClauseSharing::new(Arc::clone(&shared.clauses), worker)),
-                &[],
-                conflict_budget,
-                |value, solution| {
-                    shared.report_improvement(tx, value as i64, solution, source);
-                },
-            );
-            (stats, complete)
-        }
-        Objective::Linear(_, coeffs, terms) => {
-            let (_, stats, complete) = optimize_linear_seeded(
-                solver,
-                vars,
-                &coeffs,
-                &terms,
-                minimizing,
-                &shared.cancel,
-                seed,
-                Some(&shared.best),
-                conflict_budget,
-                |value, solution| shared.report_improvement(tx, value, solution, source),
-            );
-            (stats, complete)
-        }
-        Objective::Expr(_, expr) => {
-            let (_, stats, complete) = optimize_expr_seeded(
-                solver,
-                vars,
-                &expr,
-                minimizing,
-                &shared.cancel,
-                seed,
-                Some(&shared.best),
-                conflict_budget,
-                |value, solution| shared.report_improvement(tx, value, solution, source),
-            );
-            (stats, complete)
-        }
-    }
+    let minimizing = objective.minimizing();
+    let sharing = objective.var().and_then(|_| {
+        clause_worker.map(|worker| ClauseSharing::new(Arc::clone(&shared.clauses), worker))
+    });
+    let (_, stats, complete) = optimize_seeded(
+        solver,
+        vars,
+        objective.search(),
+        minimizing,
+        &shared.cancel,
+        seed,
+        Some(&shared.best),
+        sharing,
+        &[],
+        conflict_budget,
+        |value, solution| shared.report_improvement(tx, value, solution, source),
+    );
+    (stats, complete)
 }
 
 fn run_lns_worker(
     model: Problem,
     worker: usize,
-    minimizing: bool,
     seed: u64,
     shared: &CopShared,
     tx: &mpsc::Sender<WorkerMsg>,
@@ -880,7 +782,6 @@ fn run_lns_worker(
             &mut solver,
             vars,
             objective.clone(),
-            minimizing,
             attempt_seed,
             shared,
             tx,
@@ -962,7 +863,7 @@ fn solve_parallel_cop<W: Write>(
                     return;
                 }
                 if worker >= regular_workers {
-                    run_lns_worker(model, worker, minimizing, seed, &shared, &tx);
+                    run_lns_worker(model, worker, seed, &shared, &tx);
                     return;
                 }
                 let vars = &model.search;
@@ -972,7 +873,6 @@ fn solve_parallel_cop<W: Write>(
                         &mut solver,
                         vars,
                         model.objective.unwrap(),
-                        minimizing,
                         seed,
                         &shared,
                         &tx,
@@ -1024,7 +924,7 @@ fn solve_parallel_cop<W: Write>(
                         let (_, job_stats, complete) = optimize_seeded(
                             &mut solver,
                             vars,
-                            obj,
+                            SearchObjective::Var(obj),
                             minimizing,
                             &shared.cancel,
                             seed,
@@ -1035,7 +935,7 @@ fn solve_parallel_cop<W: Write>(
                             |value, solution| {
                                 shared.report_improvement(
                                     &tx,
-                                    value as i64,
+                                    value,
                                     solution,
                                     WorkerSource {
                                         kind: "split",

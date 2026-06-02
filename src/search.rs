@@ -1,8 +1,8 @@
 //! Search entry points over the Lazy Clause Generation engine ([`crate::lcg`]).
 //!
-//! Enumeration adds a blocking clause per solution; optimization asserts a
-//! tighter objective bound after each incumbent. Each entry point has an
-//! interruptible variant that halts when a shared stop flag is set.
+//! Enumeration uses chronological backtracking; optimization asserts a tighter
+//! objective bound after each incumbent. Each entry point has an interruptible
+//! variant that halts when a shared stop flag is set.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
@@ -37,6 +37,17 @@ pub struct SolveStats {
     pub failures: u64,
     /// Total literals across all learned clauses (CDCL search only).
     pub learned_lits: u64,
+}
+
+/// Materialized or symbolic objective evaluated by the CDCL optimizer.
+#[derive(Clone, Copy)]
+pub(crate) enum Objective<'a> {
+    Var(VarId),
+    Linear {
+        coeffs: &'a [i64],
+        vars: &'a [VarId],
+    },
+    Expr(&'a Expr),
 }
 
 #[inline]
@@ -128,7 +139,7 @@ pub fn optimize_with(
     let (best, stats, _) = optimize_seeded(
         solver,
         vars,
-        obj,
+        Objective::Var(obj),
         minimizing,
         stop,
         0,
@@ -136,9 +147,12 @@ pub fn optimize_with(
         None,
         &[],
         None,
-        |value, _| on_improve(value),
+        |value, _| on_improve(value as i32),
     );
-    (best, stats)
+    (
+        best.map(|(solution, value)| (solution, value as i32)),
+        stats,
+    )
 }
 
 /// Optimise with a reproducible seed and an optional shared incumbent.
@@ -147,7 +161,7 @@ pub fn optimize_with(
 pub(crate) fn optimize_seeded(
     solver: &mut Solver,
     vars: &[VarId],
-    obj: VarId,
+    objective: Objective<'_>,
     minimizing: bool,
     stop: &AtomicBool,
     seed: u64,
@@ -155,8 +169,8 @@ pub(crate) fn optimize_seeded(
     clause_sharing: Option<ClauseSharing>,
     cube: &[Lit],
     conflict_budget: Option<u64>,
-    on_improve: impl FnMut(i32, &[i32]),
-) -> (Option<(Vec<i32>, i32)>, SolveStats, bool) {
+    on_improve: impl FnMut(i64, &[i32]),
+) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
     let lazy_atoms = clause_sharing.as_ref().map(ClauseSharing::lazy_atoms);
     let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, lazy_atoms) else {
         return (None, SolveStats::default(), false);
@@ -166,67 +180,11 @@ pub(crate) fn optimize_seeded(
     }
     cdcl.optimize(
         vars,
-        obj,
+        objective,
         minimizing,
         stop,
         shared_bound,
         cube,
-        conflict_budget,
-        on_improve,
-    )
-}
-
-/// Optimise a symbolic weighted sum without materializing its potentially huge domain.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn optimize_linear_seeded(
-    solver: &mut Solver,
-    vars: &[VarId],
-    coeffs: &[i64],
-    terms: &[VarId],
-    minimizing: bool,
-    stop: &AtomicBool,
-    seed: u64,
-    shared_bound: Option<&AtomicI64>,
-    conflict_budget: Option<u64>,
-    on_improve: impl FnMut(i64, &[i32]),
-) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
-    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, None) else {
-        return (None, SolveStats::default(), false);
-    };
-    cdcl.optimize_linear(
-        vars,
-        coeffs,
-        terms,
-        minimizing,
-        stop,
-        shared_bound,
-        conflict_budget,
-        on_improve,
-    )
-}
-
-/// Optimise a symbolic expression without materializing auxiliary domains.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn optimize_expr_seeded(
-    solver: &mut Solver,
-    vars: &[VarId],
-    expr: &Expr,
-    minimizing: bool,
-    stop: &AtomicBool,
-    seed: u64,
-    shared_bound: Option<&AtomicI64>,
-    conflict_budget: Option<u64>,
-    on_improve: impl FnMut(i64, &[i32]),
-) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
-    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, None) else {
-        return (None, SolveStats::default(), false);
-    };
-    cdcl.optimize_expr(
-        vars,
-        expr,
-        minimizing,
-        stop,
-        shared_bound,
         conflict_budget,
         on_improve,
     )
