@@ -75,9 +75,5 @@ pub fn intension(solver: &mut Solver, expr: Expr) {
     expr.collect_vars(&mut vars);
     vars.sort_unstable();
     vars.dedup();
-    solver.post(Box::new(Intension {
-        expr,
-        vars,
-        scratch: Vec::new(),
-    }));
+    solver.post(Box::new(Intension { expr, vars, scratch: Vec::new() }));
 }

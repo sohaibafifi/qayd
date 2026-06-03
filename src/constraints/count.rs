@@ -93,12 +93,7 @@ impl Propagator for Count {
 
 /// Post `#{ i : vars[i] = value }  rel  k`.
 pub fn count(solver: &mut Solver, vars: &[VarId], value: i32, rel: Relation, k: i64) {
-    solver.post(Box::new(Count {
-        vars: vars.to_vec(),
-        value,
-        rel,
-        k,
-    }));
+    solver.post(Box::new(Count { vars: vars.to_vec(), value, rel, k }));
 }
 
 // ===========================================================================
@@ -137,30 +132,15 @@ impl Propagator for InSet {
 /// Post `cardinality`: count of variables equal to `values[j]` lies in
 /// `[low[j], high[j]]`. When `closed`, every variable must take a value from
 /// `values`. Bounds form, decomposed into independent `count` ranges.
-pub fn cardinality(
-    solver: &mut Solver,
-    vars: &[VarId],
-    values: &[i32],
-    low: &[i64],
-    high: &[i64],
-    closed: bool,
-) {
+pub fn cardinality(solver: &mut Solver, vars: &[VarId], values: &[i32], low: &[i64], high: &[i64], closed: bool) {
     assert_eq!(values.len(), low.len(), "cardinality: values/low mismatch");
-    assert_eq!(
-        values.len(),
-        high.len(),
-        "cardinality: values/high mismatch"
-    );
+    assert_eq!(values.len(), high.len(), "cardinality: values/high mismatch");
     for (j, &val) in values.iter().enumerate() {
         count(solver, vars, val, Relation::Ge, low[j]);
         count(solver, vars, val, Relation::Le, high[j]);
     }
     if closed {
-        solver.post(Box::new(InSet {
-            vars: vars.to_vec(),
-            set: values.to_vec(),
-            buf: Vec::new(),
-        }));
+        solver.post(Box::new(InSet { vars: vars.to_vec(), set: values.to_vec(), buf: Vec::new() }));
     }
 }
 
@@ -221,11 +201,5 @@ impl Propagator for NValues {
 
 /// Post `#{ distinct values among vars }  rel  k`.
 pub fn n_values(solver: &mut Solver, vars: &[VarId], rel: Relation, k: i64) {
-    solver.post(Box::new(NValues {
-        vars: vars.to_vec(),
-        rel,
-        k,
-        fixed: Vec::new(),
-        union: Vec::new(),
-    }));
+    solver.post(Box::new(NValues { vars: vars.to_vec(), rel, k, fixed: Vec::new(), union: Vec::new() }));
 }

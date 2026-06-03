@@ -34,13 +34,7 @@ impl Circuit {
             len.push(store.new_rev_int(1));
             linked.push(store.new_rev_int(0));
         }
-        Self {
-            succ: succ.to_vec(),
-            dest,
-            orig,
-            len,
-            linked,
-        }
+        Self { succ: succ.to_vec(), dest, orig, len, linked }
     }
 }
 

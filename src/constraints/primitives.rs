@@ -26,19 +26,13 @@ impl Propagator for NotEqualOffset {
         // x = v  =>  y != v - c.
         if store.is_fixed(self.x) {
             let v = store.value(self.x);
-            let why = vec![Premise::Eq {
-                var: self.x,
-                val: v,
-            }];
+            let why = vec![Premise::Eq { var: self.x, val: v }];
             store.remove_because(self.y, v - self.c, why)?;
         }
         // y = w  =>  x != w + c.
         if store.is_fixed(self.y) {
             let w = store.value(self.y);
-            let why = vec![Premise::Eq {
-                var: self.y,
-                val: w,
-            }];
+            let why = vec![Premise::Eq { var: self.y, val: w }];
             store.remove_because(self.x, w + self.c, why)?;
         }
         Ok(())
@@ -94,16 +88,13 @@ impl Propagator for SignProducts {
                         }
                     }
                     [false, true, true] => {
-                        changed |=
-                            fix_sign_product(store, y, store.value(x) * store.value(z), x, z)?;
+                        changed |= fix_sign_product(store, y, store.value(x) * store.value(z), x, z)?;
                     }
                     [true, false, true] => {
-                        changed |=
-                            fix_sign_product(store, x, store.value(y) * store.value(z), y, z)?;
+                        changed |= fix_sign_product(store, x, store.value(y) * store.value(z), y, z)?;
                     }
                     [true, true, false] => {
-                        changed |=
-                            fix_sign_product(store, z, store.value(y) * store.value(x), y, x)?;
+                        changed |= fix_sign_product(store, z, store.value(y) * store.value(x), y, x)?;
                     }
                     _ => {}
                 }
@@ -115,23 +106,8 @@ impl Propagator for SignProducts {
     }
 }
 
-fn fix_sign_product(
-    store: &mut Store,
-    target: VarId,
-    value: i32,
-    a: VarId,
-    b: VarId,
-) -> Result<bool, Inconsistency> {
-    let why = vec![
-        Premise::Eq {
-            var: a,
-            val: store.value(a),
-        },
-        Premise::Eq {
-            var: b,
-            val: store.value(b),
-        },
-    ];
+fn fix_sign_product(store: &mut Store, target: VarId, value: i32, a: VarId, b: VarId) -> Result<bool, Inconsistency> {
+    let why = vec![Premise::Eq { var: a, val: store.value(a) }, Premise::Eq { var: b, val: store.value(b) }];
     if !store.contains(target, value) {
         return Err(store.fail_because(why));
     }
@@ -143,9 +119,7 @@ fn fix_sign_product(
 /// Post `y = x * z` equalities for distinct variables over `{-1, 1}`.
 pub fn sign_products(solver: &mut Solver, terms: &[[VarId; 3]]) {
     for terms in terms.chunks(SIGN_PRODUCT_BATCH) {
-        solver.post(Box::new(SignProducts {
-            terms: terms.to_vec(),
-        }));
+        solver.post(Box::new(SignProducts { terms: terms.to_vec() }));
     }
 }
 
@@ -170,17 +144,11 @@ impl Propagator for LessOrEqual {
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
         // x <= max(y) - k.
         let my = store.max(self.y);
-        let why = vec![Premise::Le {
-            var: self.y,
-            bound: my,
-        }];
+        let why = vec![Premise::Le { var: self.y, bound: my }];
         store.remove_above_because(self.x, my.saturating_sub(self.k), why)?;
         // y >= min(x) + k.
         let mx = store.min(self.x);
-        let why = vec![Premise::Ge {
-            var: self.x,
-            bound: mx,
-        }];
+        let why = vec![Premise::Ge { var: self.x, bound: mx }];
         store.remove_below_because(self.y, mx.saturating_add(self.k), why)?;
         Ok(())
     }
@@ -240,10 +208,7 @@ impl Propagator for Instantiation {
 /// Post `vars[i] = vals[i]` for all `i`.
 pub fn instantiation(solver: &mut Solver, vars: &[VarId], vals: &[i32]) {
     assert_eq!(vars.len(), vals.len(), "instantiation: length mismatch");
-    solver.post(Box::new(Instantiation {
-        vars: vars.to_vec(),
-        vals: vals.to_vec(),
-    }));
+    solver.post(Box::new(Instantiation { vars: vars.to_vec(), vals: vals.to_vec() }));
 }
 
 // ---------------------------------------------------------------------------
@@ -291,11 +256,7 @@ impl Propagator for AllEqual {
 
 /// Post `vars[0] = vars[1] = ...`.
 pub fn all_equal(solver: &mut Solver, vars: &[VarId]) {
-    solver.post(Box::new(AllEqual {
-        vars: vars.to_vec(),
-        common: Vec::new(),
-        buf: Vec::new(),
-    }));
+    solver.post(Box::new(AllEqual { vars: vars.to_vec(), common: Vec::new(), buf: Vec::new() }));
 }
 
 // ---------------------------------------------------------------------------
@@ -332,11 +293,7 @@ impl Propagator for Extremum {
         }
         store.remove_below(self.y, lb)?;
         store.remove_above(self.y, ub)?;
-        let y_bound = if self.is_min {
-            store.min(self.y)
-        } else {
-            store.max(self.y)
-        };
+        let y_bound = if self.is_min { store.min(self.y) } else { store.max(self.y) };
         for &x in &self.xs {
             if self.is_min {
                 store.remove_below(x, y_bound)?;
@@ -351,21 +308,13 @@ impl Propagator for Extremum {
 /// Post `y = min(xs)`. `xs` must be non-empty.
 pub fn minimum(solver: &mut Solver, y: VarId, xs: &[VarId]) {
     assert!(!xs.is_empty(), "minimum: empty list");
-    solver.post(Box::new(Extremum {
-        y,
-        xs: xs.to_vec(),
-        is_min: true,
-    }));
+    solver.post(Box::new(Extremum { y, xs: xs.to_vec(), is_min: true }));
 }
 
 /// Post `y = max(xs)`. `xs` must be non-empty.
 pub fn maximum(solver: &mut Solver, y: VarId, xs: &[VarId]) {
     assert!(!xs.is_empty(), "maximum: empty list");
-    solver.post(Box::new(Extremum {
-        y,
-        xs: xs.to_vec(),
-        is_min: false,
-    }));
+    solver.post(Box::new(Extremum { y, xs: xs.to_vec(), is_min: false }));
 }
 
 // ---------------------------------------------------------------------------
@@ -437,9 +386,7 @@ impl Propagator for Element {
             self.buf.clear();
             self.buf.extend(store.values(self.value));
             for &v in &self.buf {
-                let supported = store
-                    .values(self.idx)
-                    .any(|i| store.contains(self.array[i as usize], v));
+                let supported = store.values(self.idx).any(|i| store.contains(self.array[i as usize], v));
                 if !supported {
                     store.remove(self.value, v)?;
                 }
@@ -452,12 +399,7 @@ impl Propagator for Element {
 /// Post `value = array[idx]` (0-based index). `array` must be non-empty.
 pub fn element(solver: &mut Solver, array: &[VarId], idx: VarId, value: VarId) {
     assert!(!array.is_empty(), "element: empty array");
-    solver.post(Box::new(Element {
-        array: array.to_vec(),
-        idx,
-        value,
-        buf: Vec::new(),
-    }));
+    solver.post(Box::new(Element { array: array.to_vec(), idx, value, buf: Vec::new() }));
 }
 
 // ---------------------------------------------------------------------------
@@ -475,13 +417,7 @@ struct AllDifferent {
 }
 
 /// Kuhn augmenting step for the bipartite matching.
-fn augment(
-    u: usize,
-    adj: &[Vec<usize>],
-    val_to_var: &mut [i32],
-    var_to_val: &mut [i32],
-    seen: &mut [bool],
-) -> bool {
+fn augment(u: usize, adj: &[Vec<usize>], val_to_var: &mut [i32], var_to_val: &mut [i32], seen: &mut [bool]) -> bool {
     for &v in &adj[u] {
         if !seen[v] {
             seen[v] = true;
@@ -618,17 +554,7 @@ impl Propagator for AllDifferent {
         let mut ncomp = 0usize;
         for s in 0..total {
             if index[s] < 0 {
-                scc_dfs(
-                    s,
-                    &g,
-                    &mut index,
-                    &mut low,
-                    &mut on_stack,
-                    &mut tj_stack,
-                    &mut comp,
-                    &mut counter,
-                    &mut ncomp,
-                );
+                scc_dfs(s, &g, &mut index, &mut low, &mut on_stack, &mut tj_stack, &mut comp, &mut counter, &mut ncomp);
             }
         }
 
@@ -653,10 +579,7 @@ impl Propagator for AllDifferent {
 
 /// Post `allDifferent(vars)` with Régin domain-consistent filtering.
 pub fn all_different(solver: &mut Solver, vars: &[VarId]) {
-    solver.post(Box::new(AllDifferent {
-        vars: vars.to_vec(),
-        buf: Vec::new(),
-    }));
+    solver.post(Box::new(AllDifferent { vars: vars.to_vec(), buf: Vec::new() }));
 }
 
 // ---------------------------------------------------------------------------

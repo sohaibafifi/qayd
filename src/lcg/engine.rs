@@ -35,14 +35,8 @@ impl Objective<'_> {
     fn value(self, solver: &Solver) -> i64 {
         match self {
             Self::Var(obj) => solver.store.value(obj) as i64,
-            Self::Linear { coeffs, vars } => coeffs
-                .iter()
-                .zip(vars)
-                .map(|(&coeff, &var)| coeff * solver.store.value(var) as i64)
-                .sum(),
-            Self::Expr(expr) => expr
-                .eval(&|var| solver.store.value(var) as i64)
-                .expect("objective expression is undefined at a solution"),
+            Self::Linear { coeffs, vars } => coeffs.iter().zip(vars).map(|(&coeff, &var)| coeff * solver.store.value(var) as i64).sum(),
+            Self::Expr(expr) => expr.eval(&|var| solver.store.value(var) as i64).expect("objective expression is undefined at a solution"),
         }
     }
 }
@@ -73,9 +67,7 @@ impl Cdcl<'_> {
     fn decision_lit(&self, v: VarId, phase: &[Option<i32>]) -> Lit {
         let val = match phase[v.index()] {
             Some(p) if self.solver.store.contains(v, p) => p,
-            _ if self.seed != 0 && mix64(self.seed ^ v.0 as u64) & 1 != 0 => {
-                self.solver.store.max(v)
-            }
+            _ if self.seed != 0 && mix64(self.seed ^ v.0 as u64) & 1 != 0 => self.solver.store.max(v),
             _ => self.solver.store.min(v),
         };
         match self.atoms.eq(v, val) {
@@ -107,12 +99,7 @@ impl Cdcl<'_> {
     /// constraints) can drop sibling solutions when enumerating.
     // TODO(strong): a sound CDCL enumeration (restart-per-solution with blocking
     // clauses kept out of analysis, or dual reasoning) would prune harder.
-    pub fn enumerate<F>(
-        &mut self,
-        vars: &[VarId],
-        mut on_solution: F,
-        stop: &AtomicBool,
-    ) -> SolveStats
+    pub fn enumerate<F>(&mut self, vars: &[VarId], mut on_solution: F, stop: &AtomicBool) -> SolveStats
     where
         F: FnMut(&Solver) -> SearchControl,
     {
@@ -211,12 +198,7 @@ impl Cdcl<'_> {
     }
 
     /// Assert a strict improvement on a materialized or symbolic objective.
-    fn tighten_objective(
-        &mut self,
-        objective: Objective<'_>,
-        minimizing: bool,
-        incumbent: i64,
-    ) -> bool {
+    fn tighten_objective(&mut self, objective: Objective<'_>, minimizing: bool, incumbent: i64) -> bool {
         match objective {
             Objective::Var(obj) => self.tighten_bound(obj, minimizing, incumbent as i32),
             Objective::Linear { coeffs, vars } => {
@@ -224,17 +206,7 @@ impl Cdcl<'_> {
                     return false;
                 };
                 self.backjump_to(0);
-                linear(
-                    self.solver,
-                    coeffs,
-                    vars,
-                    if minimizing {
-                        Relation::Le
-                    } else {
-                        Relation::Ge
-                    },
-                    bound,
-                );
+                linear(self.solver, coeffs, vars, if minimizing { Relation::Le } else { Relation::Ge }, bound);
                 self.propagate_and_learn()
             }
             Objective::Expr(expr) => {
@@ -244,11 +216,7 @@ impl Cdcl<'_> {
                 self.backjump_to(0);
                 intension(
                     self.solver,
-                    if minimizing {
-                        expr::le(expr.clone(), expr::int(bound))
-                    } else {
-                        expr::ge(expr.clone(), expr::int(bound))
-                    },
+                    if minimizing { expr::le(expr.clone(), expr::int(bound)) } else { expr::ge(expr.clone(), expr::int(bound)) },
                 );
                 self.propagate_and_learn()
             }
@@ -309,10 +277,7 @@ impl Cdcl<'_> {
         stop: &AtomicBool,
     ) -> (Option<(Vec<i32>, i32)>, SolveStats, bool) {
         let mut stats = SolveStats::default();
-        if !self.init()
-            || !self.assume_objective_bound(obj, target, minimizing)
-            || !self.sync_shared_clauses()
-        {
+        if !self.init() || !self.assume_objective_bound(obj, target, minimizing) || !self.sync_shared_clauses() {
             stats.failures = self.conflicts;
             stats.learned_lits = self.learned_lits;
             return (None, stats, true);
@@ -391,11 +356,7 @@ impl Cdcl<'_> {
         mut on_improve: F,
     ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
         if let Objective::Linear { coeffs, vars } = objective {
-            assert_eq!(
-                coeffs.len(),
-                vars.len(),
-                "linear objective: coeffs/terms length mismatch"
-            );
+            assert_eq!(coeffs.len(), vars.len(), "linear objective: coeffs/terms length mismatch");
         }
         let mut stats = SolveStats::default();
         let mut best: Option<(Vec<i32>, i64)> = None;
@@ -421,25 +382,14 @@ impl Cdcl<'_> {
         }
 
         loop {
-            if stop.load(Ordering::Relaxed)
-                || conflict_limit.is_some_and(|limit| self.conflicts >= limit)
-            {
+            if stop.load(Ordering::Relaxed) || conflict_limit.is_some_and(|limit| self.conflicts >= limit) {
                 complete = false;
                 break;
             }
             if let Some(shared) = shared_bound {
                 let value = shared.load(Ordering::Relaxed);
                 if value != i64::MAX && value != i64::MIN {
-                    let stronger =
-                        enforced.is_none_or(
-                            |old| {
-                                if minimizing {
-                                    value < old
-                                } else {
-                                    value > old
-                                }
-                            },
-                        );
+                    let stronger = enforced.is_none_or(|old| if minimizing { value < old } else { value > old });
                     if stronger {
                         enforced = Some(value);
                         if !self.tighten_objective(objective, minimizing, value) {
@@ -453,16 +403,8 @@ impl Cdcl<'_> {
             }
             match self.select_var(vars) {
                 None => {
-                    if !self.accept_solution(
-                        vars,
-                        objective,
-                        minimizing,
-                        &mut best,
-                        &mut enforced,
-                        &mut phase,
-                        &mut stats,
-                        &mut on_improve,
-                    ) {
+                    if !self.accept_solution(vars, objective, minimizing, &mut best, &mut enforced, &mut phase, &mut stats, &mut on_improve)
+                    {
                         break; // optimal
                     }
                 }

@@ -1,0 +1,21 @@
+unstable_features = true
+
+# Prefer long lines before rustfmt starts wrapping.
+max_width = 140
+
+# Make rustfmt use the widest possible heuristics.
+use_small_heuristics = "Max"
+
+# Keep imports compact where possible.
+reorder_imports = true
+reorder_modules = true
+
+# Avoid extra formatting inside comments/strings.
+wrap_comments = false
+format_strings = false
+format_code_in_doc_comments = false
+
+
+# Don't put each argument on its own line.
+# fn_call_width = 60
+# struct_lit_width = 18

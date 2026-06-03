@@ -35,8 +35,7 @@ pub use expr::Expr;
 pub use ids::{PropId, VarId};
 pub use propagator::{Event, Inconsistency, Propagator};
 pub use search::{
-    count_solutions, first_solution, maximize, minimize, optimize_with, solve, solve_interruptible,
-    SearchControl, SolveStats,
+    count_solutions, first_solution, maximize, minimize, optimize_with, solve, solve_interruptible, SearchControl, SolveStats,
 };
 pub use store::{Solver, Store};
 pub use trail::{ReversibleInt, Trail};

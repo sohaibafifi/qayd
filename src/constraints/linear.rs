@@ -38,12 +38,7 @@ struct LinearLeq {
 impl LinearLeq {
     fn new(coeffs: &[i64], vars: &[VarId], c: i64) -> Self {
         debug_assert_eq!(coeffs.len(), vars.len());
-        Self {
-            coeffs: coeffs.to_vec(),
-            vars: vars.to_vec(),
-            c,
-            term_min: vec![0; vars.len()],
-        }
+        Self { coeffs: coeffs.to_vec(), vars: vars.to_vec(), c, term_min: vec![0; vars.len()] }
     }
 
     /// Near bound of every term but `skip` (`x_j ≥ min` if `a_j > 0`, else
@@ -54,17 +49,7 @@ impl LinearLeq {
             if j == skip || a == 0 {
                 continue;
             }
-            why.push(if a > 0 {
-                Premise::Ge {
-                    var: v,
-                    bound: store.min(v),
-                }
-            } else {
-                Premise::Le {
-                    var: v,
-                    bound: store.max(v),
-                }
-            });
+            why.push(if a > 0 { Premise::Ge { var: v, bound: store.min(v) } } else { Premise::Le { var: v, bound: store.max(v) } });
         }
         why
     }
@@ -81,18 +66,10 @@ impl Propagator for LinearLeq {
         loop {
             let mut sum_min: i64 = 0;
             let mut sum_max: i64 = 0;
-            for (slot, (&a, &v)) in self
-                .term_min
-                .iter_mut()
-                .zip(self.coeffs.iter().zip(&self.vars))
-            {
+            for (slot, (&a, &v)) in self.term_min.iter_mut().zip(self.coeffs.iter().zip(&self.vars)) {
                 let lo = store.min(v) as i64;
                 let hi = store.max(v) as i64;
-                let (tmin, tmax) = if a >= 0 {
-                    (a * lo, a * hi)
-                } else {
-                    (a * hi, a * lo)
-                };
+                let (tmin, tmax) = if a >= 0 { (a * lo, a * hi) } else { (a * hi, a * lo) };
                 *slot = tmin;
                 sum_min += tmin;
                 sum_max += tmax;
@@ -148,13 +125,7 @@ struct LinearEq {
 impl LinearEq {
     fn new(coeffs: &[i64], vars: &[VarId], c: i64) -> Self {
         debug_assert_eq!(coeffs.len(), vars.len());
-        Self {
-            coeffs: coeffs.to_vec(),
-            vars: vars.to_vec(),
-            c,
-            term_min: vec![0; vars.len()],
-            term_max: vec![0; vars.len()],
-        }
+        Self { coeffs: coeffs.to_vec(), vars: vars.to_vec(), c, term_min: vec![0; vars.len()], term_max: vec![0; vars.len()] }
     }
 
     /// Near bound of every term but `skip`; entails
@@ -165,17 +136,7 @@ impl LinearEq {
             if j == skip || a == 0 {
                 continue;
             }
-            why.push(if a > 0 {
-                Premise::Ge {
-                    var: v,
-                    bound: store.min(v),
-                }
-            } else {
-                Premise::Le {
-                    var: v,
-                    bound: store.max(v),
-                }
-            });
+            why.push(if a > 0 { Premise::Ge { var: v, bound: store.min(v) } } else { Premise::Le { var: v, bound: store.max(v) } });
         }
         why
     }
@@ -188,17 +149,7 @@ impl LinearEq {
             if j == skip || a == 0 {
                 continue;
             }
-            why.push(if a > 0 {
-                Premise::Le {
-                    var: v,
-                    bound: store.max(v),
-                }
-            } else {
-                Premise::Ge {
-                    var: v,
-                    bound: store.min(v),
-                }
-            });
+            why.push(if a > 0 { Premise::Le { var: v, bound: store.max(v) } } else { Premise::Ge { var: v, bound: store.min(v) } });
         }
         why
     }
@@ -218,11 +169,7 @@ impl Propagator for LinearEq {
             for (i, (&a, &v)) in self.coeffs.iter().zip(&self.vars).enumerate() {
                 let lo = store.min(v) as i64;
                 let hi = store.max(v) as i64;
-                let (tmin, tmax) = if a >= 0 {
-                    (a * lo, a * hi)
-                } else {
-                    (a * hi, a * lo)
-                };
+                let (tmin, tmax) = if a >= 0 { (a * lo, a * hi) } else { (a * hi, a * lo) };
                 self.term_min[i] = tmin;
                 self.term_max[i] = tmax;
                 sum_min += tmin;
@@ -243,30 +190,18 @@ impl Propagator for LinearEq {
                 // a_i*x_i in [tlo, thi]; sign of a_i decides x_i's lo vs hi bound.
                 let tlo = self.c - (sum_max - self.term_max[i]);
                 let thi = self.c - (sum_min - self.term_min[i]);
-                let (lo, hi) = if a > 0 {
-                    (ceil_div(tlo, a), floor_div(thi, a))
-                } else {
-                    (ceil_div(thi, a), floor_div(tlo, a))
-                };
+                let (lo, hi) = if a > 0 { (ceil_div(tlo, a), floor_div(thi, a)) } else { (ceil_div(thi, a), floor_div(tlo, a)) };
                 let before_min = store.min(v);
                 let before_max = store.max(v);
                 let lo = clamp_i32(lo);
                 let hi = clamp_i32(hi);
                 if lo > before_min {
-                    let why = if a > 0 {
-                        self.max_side(store, i)
-                    } else {
-                        self.min_side(store, i)
-                    };
+                    let why = if a > 0 { self.max_side(store, i) } else { self.min_side(store, i) };
                     store.remove_below_because(v, lo, why)?;
                     changed = true;
                 }
                 if hi < before_max {
-                    let why = if a > 0 {
-                        self.min_side(store, i)
-                    } else {
-                        self.max_side(store, i)
-                    };
+                    let why = if a > 0 { self.min_side(store, i) } else { self.max_side(store, i) };
                     store.remove_above_because(v, hi, why)?;
                     changed = true;
                 }
@@ -289,11 +224,7 @@ struct LinearNeq {
 impl LinearNeq {
     fn new(coeffs: &[i64], vars: &[VarId], c: i64) -> Self {
         debug_assert_eq!(coeffs.len(), vars.len());
-        Self {
-            coeffs: coeffs.to_vec(),
-            vars: vars.to_vec(),
-            c,
-        }
+        Self { coeffs: coeffs.to_vec(), vars: vars.to_vec(), c }
     }
 }
 
@@ -380,11 +311,7 @@ fn post_leq(solver: &mut Solver, coeffs: &[i64], vars: &[VarId], c: i64) {
 
 /// Post \( \sum_i \texttt{coeffs}[i] \cdot \texttt{vars}[i] \;\texttt{rel}\; \texttt{rhs} \).
 pub fn linear(solver: &mut Solver, coeffs: &[i64], vars: &[VarId], rel: Relation, rhs: i64) {
-    assert_eq!(
-        coeffs.len(),
-        vars.len(),
-        "linear: coeffs/vars length mismatch"
-    );
+    assert_eq!(coeffs.len(), vars.len(), "linear: coeffs/vars length mismatch");
     match rel {
         Relation::Le => post_leq(solver, coeffs, vars, rhs),
         Relation::Lt => post_leq(solver, coeffs, vars, rhs - 1),

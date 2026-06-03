@@ -70,20 +70,9 @@ impl ClauseDb {
     }
 
     /// Add a clause, returning its handle.
-    pub fn add(
-        &mut self,
-        lits: Arc<[Lit]>,
-        watch: [usize; 2],
-        deletable: bool,
-        lbd: u32,
-    ) -> ClauseRef {
+    pub fn add(&mut self, lits: Arc<[Lit]>, watch: [usize; 2], deletable: bool, lbd: u32) -> ClauseRef {
         let r = ClauseRef(self.clauses.len() as u32);
-        self.clauses.push(Clause {
-            lits,
-            watch,
-            deletable,
-            lbd,
-        });
+        self.clauses.push(Clause { lits, watch, deletable, lbd });
         r
     }
 }
@@ -105,11 +94,7 @@ pub(crate) struct SharedClausePool {
 
 impl Default for SharedClausePool {
     fn default() -> Self {
-        Self {
-            clauses: Mutex::new(Vec::new()),
-            imported: AtomicU64::new(0),
-            lazy_atoms: LazyAtomRegistry::new(),
-        }
+        Self { clauses: Mutex::new(Vec::new()), imported: AtomicU64::new(0), lazy_atoms: LazyAtomRegistry::new() }
     }
 }
 
@@ -136,22 +121,14 @@ pub(crate) struct ClauseSharing {
 
 impl ClauseSharing {
     pub fn new(pool: Arc<SharedClausePool>, worker: usize) -> Self {
-        Self {
-            pool,
-            worker,
-            cursor: 0,
-        }
+        Self { pool, worker, cursor: 0 }
     }
 
     pub fn publish(&self, lits: Arc<[Lit]>, lbd: u32) {
         if lits.is_empty() || lits.len() > MAX_SHARED_LEN || lbd > MAX_SHARED_LBD {
             return;
         }
-        self.pool.clauses.lock().unwrap().push(SharedClause {
-            lits,
-            lbd,
-            source: self.worker,
-        });
+        self.pool.clauses.lock().unwrap().push(SharedClause { lits, lbd, source: self.worker });
     }
 
     pub fn copy_new_into(&mut self, out: &mut Vec<SharedClause>) {

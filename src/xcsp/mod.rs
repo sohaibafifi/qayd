@@ -17,8 +17,7 @@ use crate::ids::VarId;
 use crate::lcg::clause::{ClauseSharing, SharedClausePool};
 use crate::lcg::lit::Lit;
 use crate::search::{
-    optimize_seeded, probe_seeded, solve_interruptible_seeded, split_cube_seeded,
-    Objective as SearchObjective, SearchControl, SolveStats,
+    optimize_seeded, probe_seeded, solve_interruptible_seeded, split_cube_seeded, Objective as SearchObjective, SearchControl, SolveStats,
 };
 use crate::store::Solver;
 use callback::Objective;
@@ -52,22 +51,13 @@ pub struct RunOptions {
 
 impl Default for RunOptions {
     fn default() -> Self {
-        Self {
-            seed: 0,
-            workers: 1,
-            split: false,
-            probes: 0,
-            lns: 0,
-        }
+        Self { seed: 0, workers: 1, split: false, probes: 0, lns: 0 }
     }
 }
 
 const MAX_VALUE_LINE_LEN: usize = 4096;
 
-fn write_tokens<W: Write>(
-    w: &mut W,
-    tokens: impl IntoIterator<Item = impl Display>,
-) -> std::io::Result<()> {
+fn write_tokens<W: Write>(w: &mut W, tokens: impl IntoIterator<Item = impl Display>) -> std::io::Result<()> {
     let mut line = String::from("v");
     for token in tokens {
         let token = token.to_string();
@@ -84,17 +74,9 @@ fn write_tokens<W: Write>(
     Ok(())
 }
 
-fn write_improvement<W: Write>(
-    w: &mut W,
-    verbose: bool,
-    error: &mut Option<std::io::Error>,
-    value: impl Display,
-) {
+fn write_improvement<W: Write>(w: &mut W, verbose: bool, error: &mut Option<std::io::Error>, value: impl Display) {
     if verbose && error.is_none() {
-        *error = writeln!(w, "o {value}")
-            .and_then(|_| writeln!(w, "c incumbent {value} source sequential"))
-            .and_then(|_| w.flush())
-            .err();
+        *error = writeln!(w, "o {value}").and_then(|_| writeln!(w, "c incumbent {value} source sequential")).and_then(|_| w.flush()).err();
     }
 }
 
@@ -116,16 +98,7 @@ fn write_optimization_result<W: Write>(
             if !verbose {
                 writeln!(w, "o {value}").map_err(to_err)?;
             }
-            writeln!(
-                w,
-                "{}",
-                if complete {
-                    "s OPTIMUM FOUND"
-                } else {
-                    "s SATISFIABLE"
-                }
-            )
-            .map_err(to_err)?;
+            writeln!(w, "{}", if complete { "s OPTIMUM FOUND" } else { "s SATISFIABLE" }).map_err(to_err)?;
             output.write(w, &solution).map_err(to_err)?;
         }
         None if interrupted => writeln!(w, "s UNKNOWN").map_err(to_err)?,
@@ -163,12 +136,7 @@ impl SolutionOutput {
         write_tokens(w, &self.names)?;
         writeln!(w, "v </list>")?;
         writeln!(w, "v <values>")?;
-        write_tokens(
-            w,
-            self.entries.iter().map(|&position| {
-                position.map_or_else(|| "*".to_string(), |i| solution[i].to_string())
-            }),
-        )?;
+        write_tokens(w, self.entries.iter().map(|&position| position.map_or_else(|| "*".to_string(), |i| solution[i].to_string())))?;
         writeln!(w, "v </values>")?;
         writeln!(w, "v </instantiation>")
     }
@@ -176,9 +144,7 @@ impl SolutionOutput {
 
 impl Problem {
     fn var_objective(&self) -> Option<(bool, VarId)> {
-        self.objective
-            .as_ref()
-            .and_then(|objective| objective.var().map(|obj| (objective.minimizing(), obj)))
+        self.objective.as_ref().and_then(|objective| objective.var().map(|obj| (objective.minimizing(), obj)))
     }
 
     fn objective_dir(&self) -> Option<bool> {
@@ -189,9 +155,7 @@ impl Problem {
 impl Objective {
     fn minimizing(&self) -> bool {
         match self {
-            Self::Var(minimizing, _)
-            | Self::Linear(minimizing, _, _)
-            | Self::Expr(minimizing, _) => *minimizing,
+            Self::Var(minimizing, _) | Self::Linear(minimizing, _, _) | Self::Expr(minimizing, _) => *minimizing,
         }
     }
 
@@ -228,12 +192,7 @@ struct WorkQueue {
 impl WorkQueue {
     fn new() -> Self {
         Self {
-            state: Mutex::new(WorkState {
-                jobs: VecDeque::from([Vec::new()]),
-                active: 0,
-                split: 0,
-                completed: 0,
-            }),
+            state: Mutex::new(WorkState { jobs: VecDeque::from([Vec::new()]), active: 0, split: 0, completed: 0 }),
             ready: Condvar::new(),
         }
     }
@@ -298,9 +257,7 @@ fn parse_problem(path: &Path) -> Result<Problem, String> {
     if let Some(e) = model.error.take() {
         return Err(e);
     }
-    let mut relevant = (0..model.solver.store.num_vars())
-        .map(|i| model.solver.store.is_relevant(VarId(i as u32)))
-        .collect::<Vec<_>>();
+    let mut relevant = (0..model.solver.store.num_vars()).map(|i| model.solver.store.is_relevant(VarId(i as u32))).collect::<Vec<_>>();
     if let Some(objective) = &model.objective {
         match objective {
             Objective::Var(_, var) => relevant[var.index()] = true,
@@ -318,27 +275,14 @@ fn parse_problem(path: &Path) -> Result<Problem, String> {
             }
         }
     }
-    let search = relevant
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &used)| used.then_some(VarId(i as u32)))
-        .collect::<Vec<_>>();
+    let search = relevant.iter().enumerate().filter_map(|(i, &used)| used.then_some(VarId(i as u32))).collect::<Vec<_>>();
     let mut positions = vec![None; model.solver.store.num_vars()];
     for (i, &var) in search.iter().enumerate() {
         positions[var.index()] = Some(i);
     }
-    let (names, entries) = model
-        .declared
-        .iter()
-        .map(|(name, var)| (name.clone(), positions[var.index()]))
-        .unzip();
+    let (names, entries) = model.declared.iter().map(|(name, var)| (name.clone(), positions[var.index()])).unzip();
     let output = SolutionOutput { names, entries };
-    Ok(Problem {
-        solver: model.solver,
-        search,
-        output,
-        objective: model.objective,
-    })
+    Ok(Problem { solver: model.solver, search, output, objective: model.objective })
 }
 
 struct CopShared {
@@ -362,25 +306,10 @@ impl CopShared {
         self.work.wake_all();
     }
 
-    fn report_improvement(
-        &self,
-        tx: &mpsc::Sender<WorkerMsg>,
-        value: i64,
-        solution: &[i32],
-        source: WorkerSource,
-    ) {
+    fn report_improvement(&self, tx: &mpsc::Sender<WorkerMsg>, value: i64, solution: &[i32], source: WorkerSource) {
         let mut current = self.best.load(Ordering::Relaxed);
-        while if self.minimizing {
-            value < current
-        } else {
-            value > current
-        } {
-            match self.best.compare_exchange_weak(
-                current,
-                value,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
+        while if self.minimizing { value < current } else { value > current } {
+            match self.best.compare_exchange_weak(current, value, Ordering::AcqRel, Ordering::Relaxed) {
                 Ok(_) => {
                     let mut slot = self.solution.lock().unwrap();
                     if self.best.load(Ordering::Acquire) == value {
@@ -395,11 +324,7 @@ impl CopShared {
     }
 
     fn incumbent(&self) -> Option<Vec<i32>> {
-        self.solution
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|(solution, _)| solution.clone())
+        self.solution.lock().unwrap().as_ref().map(|(solution, _)| solution.clone())
     }
 
     fn next_probe(&self) -> Option<i32> {
@@ -416,11 +341,9 @@ impl CopShared {
 
     fn record_probe_unsat(&self, target: i32) {
         if self.minimizing {
-            self.probe_lower
-                .fetch_max(target as i64 + 1, Ordering::Relaxed);
+            self.probe_lower.fetch_max(target as i64 + 1, Ordering::Relaxed);
         } else {
-            self.probe_upper
-                .fetch_min(target as i64 - 1, Ordering::Relaxed);
+            self.probe_upper.fetch_min(target as i64 - 1, Ordering::Relaxed);
         }
         self.probe_unsat.fetch_add(1, Ordering::Relaxed);
     }
@@ -477,39 +400,21 @@ pub fn run(xml: &str) -> Result<String, String> {
 
 /// Solve an XCSP3 instance, streaming output to `w`. When `verbose`, emits `c`
 /// comment lines. Search halts as soon as `stop` is set (time limit / Ctrl+C).
-pub fn run_to<W: Write>(
-    xml: &str,
-    verbose: bool,
-    stop: &AtomicBool,
-    w: &mut W,
-) -> Result<(), String> {
+pub fn run_to<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool, w: &mut W) -> Result<(), String> {
     run_to_with_options(xml, verbose, stop, w, RunOptions::default())
 }
 
 /// Like [`run_to`], with explicit seed and portfolio-worker settings.
-pub fn run_to_with_options<W: Write>(
-    xml: &str,
-    verbose: bool,
-    stop: &AtomicBool,
-    w: &mut W,
-    options: RunOptions,
-) -> Result<(), String> {
+pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool, w: &mut W, options: RunOptions) -> Result<(), String> {
     let start = Instant::now();
-    let options = RunOptions {
-        workers: options.workers.max(1),
-        ..options
-    };
+    let options = RunOptions { workers: options.workers.max(1), ..options };
     let path = stage_xml(xml)?;
     let problem = parse_problem(&path.0)?;
     let has_objective = problem.objective.is_some();
     let var_objective = problem.var_objective().is_some();
     let symbolic_probes_disabled = has_objective && !var_objective && options.probes > 0;
     let workers = if has_objective { options.workers } else { 1 };
-    let probes = if var_objective {
-        options.probes.min(workers.saturating_sub(1))
-    } else {
-        0
-    };
+    let probes = if var_objective { options.probes.min(workers.saturating_sub(1)) } else { 0 };
     let options = RunOptions {
         workers,
         split: options.split && var_objective,
@@ -520,37 +425,19 @@ pub fn run_to_with_options<W: Write>(
     let to_err = |e: std::io::Error| e.to_string();
 
     if verbose {
-        let kind = if problem.objective.is_some() {
-            "COP"
-        } else {
-            "CSP"
-        };
+        let kind = if problem.objective.is_some() { "COP" } else { "CSP" };
         writeln!(w, "c qayd XCSP3").map_err(to_err)?;
         writeln!(w, "c type {kind}").map_err(to_err)?;
         writeln!(w, "c variables {}", problem.solver.store.num_vars()).map_err(to_err)?;
-        writeln!(
-            w,
-            "c sparse domains {}",
-            problem.solver.store.num_sparse_domains()
-        )
-        .map_err(to_err)?;
-        writeln!(
-            w,
-            "c bounds domains {}",
-            problem.solver.store.num_bounds_domains()
-        )
-        .map_err(to_err)?;
+        writeln!(w, "c sparse domains {}", problem.solver.store.num_sparse_domains()).map_err(to_err)?;
+        writeln!(w, "c bounds domains {}", problem.solver.store.num_bounds_domains()).map_err(to_err)?;
         writeln!(w, "c search variables {}", problem.search.len()).map_err(to_err)?;
         writeln!(w, "c propagators {}", problem.solver.num_propagators()).map_err(to_err)?;
         writeln!(w, "c seed {}", options.seed).map_err(to_err)?;
         writeln!(w, "c workers {}", options.workers).map_err(to_err)?;
         writeln!(w, "c split {}", options.split).map_err(to_err)?;
         if symbolic_probes_disabled {
-            writeln!(
-                w,
-                "c probes 0 (probe worker only supports a materialized objective variable)"
-            )
-            .map_err(to_err)?;
+            writeln!(w, "c probes 0 (probe worker only supports a materialized objective variable)").map_err(to_err)?;
         } else {
             writeln!(w, "c probes {}", options.probes).map_err(to_err)?;
         }
@@ -574,13 +461,7 @@ pub fn run_to_with_options<W: Write>(
     Ok(())
 }
 
-fn solve_single<W: Write>(
-    problem: Problem,
-    verbose: bool,
-    stop: &AtomicBool,
-    w: &mut W,
-    seed: u64,
-) -> Result<(), String> {
+fn solve_single<W: Write>(problem: Problem, verbose: bool, stop: &AtomicBool, w: &mut W, seed: u64) -> Result<(), String> {
     let mut solver = problem.solver;
     let vars = problem.search;
     let output = problem.output;
@@ -601,8 +482,7 @@ fn solve_single<W: Write>(
                 seed,
             );
             if verbose {
-                writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures)
-                    .map_err(to_err)?;
+                writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(to_err)?;
             }
             match sol {
                 Some(s) => {
@@ -617,19 +497,10 @@ fn solve_single<W: Write>(
         Some(objective) => {
             let minimizing = objective.minimizing();
             let mut io_err: Option<std::io::Error> = None;
-            let (best, stats, complete) = optimize_seeded(
-                &mut solver,
-                &vars,
-                objective.search(),
-                minimizing,
-                stop,
-                seed,
-                None,
-                None,
-                &[],
-                None,
-                |v, _| write_improvement(w, verbose, &mut io_err, v),
-            );
+            let (best, stats, complete) =
+                optimize_seeded(&mut solver, &vars, objective.search(), minimizing, stop, seed, None, None, &[], None, |v, _| {
+                    write_improvement(w, verbose, &mut io_err, v)
+                });
             if let Some(e) = io_err {
                 return Err(e.to_string());
             }
@@ -676,15 +547,7 @@ fn run_probe_worker(
             break;
         }
         match found {
-            Some((solution, value)) => shared.report_improvement(
-                tx,
-                value as i64,
-                &solution,
-                WorkerSource {
-                    kind: "probe",
-                    worker,
-                },
-            ),
+            Some((solution, value)) => shared.report_improvement(tx, value as i64, &solution, WorkerSource { kind: "probe", worker }),
             None => shared.record_probe_unsat(target),
         }
     }
@@ -700,19 +563,12 @@ fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-fn fix_lns_neighborhood(
-    solver: &mut Solver,
-    vars: &[VarId],
-    solution: &[i32],
-    candidates: &[usize],
-    seed: u64,
-) -> bool {
+fn fix_lns_neighborhood(solver: &mut Solver, vars: &[VarId], solution: &[i32], candidates: &[usize], seed: u64) -> bool {
     let pivot = candidates[mix64(seed) as usize % candidates.len()];
-    candidates.iter().copied().all(|i| {
-        i == pivot
-            || mix64(seed ^ i as u64).is_multiple_of(LNS_RELAX_DIVISOR)
-            || solver.store.fix(vars[i], solution[i]).is_ok()
-    })
+    candidates
+        .iter()
+        .copied()
+        .all(|i| i == pivot || mix64(seed ^ i as u64).is_multiple_of(LNS_RELAX_DIVISOR) || solver.store.fix(vars[i], solution[i]).is_ok())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -728,9 +584,7 @@ fn optimize_worker(
     conflict_budget: Option<u64>,
 ) -> (SolveStats, bool) {
     let minimizing = objective.minimizing();
-    let sharing = objective.var().and_then(|_| {
-        clause_worker.map(|worker| ClauseSharing::new(Arc::clone(&shared.clauses), worker))
-    });
+    let sharing = objective.var().and_then(|_| clause_worker.map(|worker| ClauseSharing::new(Arc::clone(&shared.clauses), worker)));
     let (_, stats, complete) = optimize_seeded(
         solver,
         vars,
@@ -747,22 +601,14 @@ fn optimize_worker(
     (stats, complete)
 }
 
-fn run_lns_worker(
-    model: Problem,
-    worker: usize,
-    seed: u64,
-    shared: &CopShared,
-    tx: &mpsc::Sender<WorkerMsg>,
-) {
+fn run_lns_worker(model: Problem, worker: usize, seed: u64, shared: &CopShared, tx: &mpsc::Sender<WorkerMsg>) {
     let vars = &model.search;
     let objective = model.objective.clone().expect("COP lost its objective");
     let objective_var = model.var_objective().map(|(_, obj)| obj);
     let candidates = vars
         .iter()
         .enumerate()
-        .filter_map(|(i, &var)| {
-            (Some(var) != objective_var && !model.solver.store.is_fixed(var)).then_some(i)
-        })
+        .filter_map(|(i, &var)| (Some(var) != objective_var && !model.solver.store.is_fixed(var)).then_some(i))
         .collect::<Vec<_>>();
     let mut stats = SolveStats::default();
     let mut attempt = 0u64;
@@ -785,10 +631,7 @@ fn run_lns_worker(
             attempt_seed,
             shared,
             tx,
-            WorkerSource {
-                kind: "lns",
-                worker,
-            },
+            WorkerSource { kind: "lns", worker },
             None,
             Some(LNS_CONFLICT_BUDGET),
         );
@@ -797,22 +640,11 @@ fn run_lns_worker(
     let _ = tx.send(WorkerMsg::Done(stats));
 }
 
-fn solve_parallel_cop<W: Write>(
-    problem: Problem,
-    verbose: bool,
-    stop: &AtomicBool,
-    w: &mut W,
-    options: RunOptions,
-) -> Result<(), String> {
+fn solve_parallel_cop<W: Write>(problem: Problem, verbose: bool, stop: &AtomicBool, w: &mut W, options: RunOptions) -> Result<(), String> {
     let minimizing = problem.objective_dir().expect("COP lost its objective");
     let var_objective = problem.var_objective();
     let (probe_lower, probe_upper) = var_objective
-        .map(|(_, obj)| {
-            (
-                problem.solver.store.min(obj) as i64,
-                problem.solver.store.max(obj) as i64,
-            )
-        })
+        .map(|(_, obj)| (problem.solver.store.min(obj) as i64, problem.solver.store.max(obj) as i64))
         .unwrap_or((i64::MIN, i64::MAX));
     let shared = Arc::new(CopShared {
         cancel: AtomicBool::new(false),
@@ -876,10 +708,7 @@ fn solve_parallel_cop<W: Write>(
                         seed,
                         &shared,
                         &tx,
-                        WorkerSource {
-                            kind: "portfolio",
-                            worker,
-                        },
+                        WorkerSource { kind: "portfolio", worker },
                         Some(worker),
                         None,
                     );
@@ -897,22 +726,13 @@ fn solve_parallel_cop<W: Write>(
                 while let Some(mut cube) = shared.work.take(&shared.cancel) {
                     while shared.work.needs_split(split_target, split_limit) {
                         let mut probe = model.solver.clone();
-                        let Some(lit) = split_cube_seeded(
-                            &mut probe,
-                            vars,
-                            &cube,
-                            &shared.cancel,
-                            seed,
-                            Some(shared.clauses.lazy_atoms()),
-                        ) else {
+                        let Some(lit) = split_cube_seeded(&mut probe, vars, &cube, &shared.cancel, seed, Some(shared.clauses.lazy_atoms()))
+                        else {
                             break;
                         };
                         let mut sibling = cube.clone();
                         sibling.push(lit.negate());
-                        if !shared
-                            .work
-                            .try_push_split(sibling, split_target, split_limit)
-                        {
+                        if !shared.work.try_push_split(sibling, split_target, split_limit) {
                             break;
                         }
                         cube.push(lit);
@@ -933,15 +753,7 @@ fn solve_parallel_cop<W: Write>(
                             &cube,
                             None,
                             |value, solution| {
-                                shared.report_improvement(
-                                    &tx,
-                                    value,
-                                    solution,
-                                    WorkerSource {
-                                        kind: "split",
-                                        worker,
-                                    },
-                                );
+                                shared.report_improvement(&tx, value, solution, WorkerSource { kind: "split", worker });
                             },
                         );
                         (job_stats, complete)
@@ -964,27 +776,11 @@ fn solve_parallel_cop<W: Write>(
         drop(tx);
         for msg in rx {
             match msg {
-                WorkerMsg::Improved { value, source }
-                    if printed.is_none_or(
-                        |old| {
-                            if minimizing {
-                                value < old
-                            } else {
-                                value > old
-                            }
-                        },
-                    ) =>
-                {
+                WorkerMsg::Improved { value, source } if printed.is_none_or(|old| if minimizing { value < old } else { value > old }) => {
                     printed = Some(value);
                     if verbose && error.is_none() {
                         if let Err(e) = writeln!(w, "o {value}")
-                            .and_then(|_| {
-                                writeln!(
-                                    w,
-                                    "c incumbent {value} source {} worker {}",
-                                    source.kind, source.worker
-                                )
-                            })
+                            .and_then(|_| writeln!(w, "c incumbent {value} source {} worker {}", source.kind, source.worker))
                             .and_then(|_| w.flush())
                         {
                             error = Some(e.to_string());
@@ -1007,13 +803,7 @@ fn solve_parallel_cop<W: Write>(
     let to_err = |e: std::io::Error| e.to_string();
     if verbose {
         writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(to_err)?;
-        writeln!(
-            w,
-            "c shared clauses {} imported {}",
-            shared.clauses.len(),
-            shared.clauses.imported()
-        )
-        .map_err(to_err)?;
+        writeln!(w, "c shared clauses {} imported {}", shared.clauses.len(), shared.clauses.imported()).map_err(to_err)?;
         if options.split {
             let (split, completed) = shared.work.stats();
             writeln!(w, "c split jobs {split} completed {completed}").map_err(to_err)?;
@@ -1028,12 +818,7 @@ fn solve_parallel_cop<W: Write>(
             .map_err(to_err)?;
         }
         if options.lns > 0 {
-            writeln!(
-                w,
-                "c lns attempts {}",
-                shared.lns_attempts.load(Ordering::Relaxed)
-            )
-            .map_err(to_err)?;
+            writeln!(w, "c lns attempts {}", shared.lns_attempts.load(Ordering::Relaxed)).map_err(to_err)?;
         }
     }
     let interrupted = stop.load(Ordering::Relaxed);
@@ -1043,11 +828,7 @@ fn solve_parallel_cop<W: Write>(
             if !verbose {
                 writeln!(w, "o {value}").map_err(to_err)?;
             }
-            let status = if proved {
-                "s OPTIMUM FOUND"
-            } else {
-                "s SATISFIABLE"
-            };
+            let status = if proved { "s OPTIMUM FOUND" } else { "s SATISFIABLE" };
             writeln!(w, "{status}").map_err(to_err)?;
             output.write(w, &sol).map_err(to_err)?;
         }

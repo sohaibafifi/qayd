@@ -20,11 +20,7 @@ enum ValueMap {
     /// Internal index `i` represents `values[i]`.
     Sparse { values: Arc<[i32]> },
     /// Wide contiguous range with a reusable prefix of removed interior values.
-    Bounds {
-        holes: Vec<i32>,
-        holes_len: ReversibleInt,
-        empty: ReversibleInt,
-    },
+    Bounds { holes: Vec<i32>, holes_len: ReversibleInt, empty: ReversibleInt },
 }
 
 /// A finite-integer domain with storage selected from its root shape.
@@ -119,17 +115,11 @@ impl Domain {
         let lo = vals[0];
         let hi = *vals.last().unwrap();
         let size = vals.len();
-        assert!(
-            size <= i32::MAX as usize,
-            "sparse domain has {size} values; maximum supported is {}",
-            i32::MAX
-        );
+        assert!(size <= i32::MAX as usize, "sparse domain has {size} values; maximum supported is {}", i32::MAX);
         let dense: Vec<u32> = (0..size as u32).collect();
         let sparse = dense.clone();
         Self {
-            values: ValueMap::Sparse {
-                values: Arc::from(vals),
-            },
+            values: ValueMap::Sparse { values: Arc::from(vals) },
             dense,
             sparse,
             size: trail.new_int(size as i32),
@@ -142,11 +132,7 @@ impl Domain {
         let holes_len = trail.new_int(0);
         let empty = trail.new_int(0);
         Self {
-            values: ValueMap::Bounds {
-                holes: Vec::new(),
-                holes_len,
-                empty,
-            },
+            values: ValueMap::Bounds { holes: Vec::new(), holes_len, empty },
             dense: Vec::new(),
             sparse: Vec::new(),
             size: trail.new_int(0),
@@ -159,20 +145,13 @@ impl Domain {
     #[inline]
     pub fn size(&self, trail: &Trail) -> usize {
         match &self.values {
-            ValueMap::Bounds {
-                holes,
-                holes_len,
-                empty,
-            } => {
+            ValueMap::Bounds { holes, holes_len, empty } => {
                 if trail.get(*empty) != 0 {
                     return 0;
                 }
                 let min = self.min(trail);
                 let max = self.max(trail);
-                let removed = holes[..trail.get(*holes_len) as usize]
-                    .iter()
-                    .filter(|&&v| min <= v && v <= max)
-                    .count();
+                let removed = holes[..trail.get(*holes_len) as usize].iter().filter(|&&v| min <= v && v <= max).count();
                 span_len(min, max) - removed
             }
             _ => trail.get(self.size) as usize,
@@ -201,40 +180,24 @@ impl Domain {
     #[inline]
     pub fn contains(&self, val: i32, trail: &Trail) -> bool {
         match &self.values {
-            ValueMap::Bounds {
-                holes,
-                holes_len,
-                empty,
-            } => {
+            ValueMap::Bounds { holes, holes_len, empty } => {
                 trail.get(*empty) == 0
                     && self.min(trail) <= val
                     && val <= self.max(trail)
                     && !holes[..trail.get(*holes_len) as usize].contains(&val)
             }
-            _ => self
-                .index_of(val)
-                .is_some_and(|i| (self.sparse[i] as usize) < self.size(trail)),
+            _ => self.index_of(val).is_some_and(|i| (self.sparse[i] as usize) < self.size(trail)),
         }
     }
 
     /// Iterate present values in arbitrary order.
     pub fn values<'a>(&'a self, trail: &'a Trail) -> Values<'a> {
         match &self.values {
-            ValueMap::Bounds { empty, .. } if trail.get(*empty) == 0 => Values {
-                domain: self,
-                trail,
-                inner: ValueIter::Bounds(self.min(trail)..=self.max(trail)),
-            },
-            ValueMap::Bounds { .. } => Values {
-                domain: self,
-                trail,
-                inner: ValueIter::Empty,
-            },
-            _ => Values {
-                domain: self,
-                trail,
-                inner: ValueIter::Indexed(self.dense[..self.size(trail)].iter()),
-            },
+            ValueMap::Bounds { empty, .. } if trail.get(*empty) == 0 => {
+                Values { domain: self, trail, inner: ValueIter::Bounds(self.min(trail)..=self.max(trail)) }
+            }
+            ValueMap::Bounds { .. } => Values { domain: self, trail, inner: ValueIter::Empty },
+            _ => Values { domain: self, trail, inner: ValueIter::Indexed(self.dense[..self.size(trail)].iter()) },
         }
     }
 
@@ -243,19 +206,10 @@ impl Domain {
         let min = self.min(trail);
         let max = self.max(trail);
         match &self.values {
-            ValueMap::Bounds {
-                holes, holes_len, ..
-            } => out.extend(
-                holes[..trail.get(*holes_len) as usize]
-                    .iter()
-                    .copied()
-                    .filter(|&v| min < v && v < max),
-            ),
-            _ => out.extend(
-                (0..self.dense.len())
-                    .map(|i| self.value_of(i))
-                    .filter(|&v| min < v && v < max && !self.contains(v, trail)),
-            ),
+            ValueMap::Bounds { holes, holes_len, .. } => {
+                out.extend(holes[..trail.get(*holes_len) as usize].iter().copied().filter(|&v| min < v && v < max))
+            }
+            _ => out.extend((0..self.dense.len()).map(|i| self.value_of(i)).filter(|&v| min < v && v < max && !self.contains(v, trail))),
         }
     }
 
@@ -461,9 +415,7 @@ impl Domain {
     }
 
     fn recompute_bounds(&mut self, trail: &mut Trail) {
-        let (min, max) = self
-            .values(trail)
-            .fold((i32::MAX, i32::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
+        let (min, max) = self.values(trail).fold((i32::MAX, i32::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
         trail.set(self.min, min);
         trail.set(self.max, max);
     }
@@ -479,12 +431,7 @@ impl Domain {
         } else if val == self.max(trail) {
             self.set_bounds_max(i64::from(val) - 1, trail);
         } else {
-            let ValueMap::Bounds {
-                holes, holes_len, ..
-            } = &mut self.values
-            else {
-                unreachable!()
-            };
+            let ValueMap::Bounds { holes, holes_len, .. } = &mut self.values else { unreachable!() };
             let len = trail.get(*holes_len) as usize;
             if len == holes.len() {
                 holes.push(val);
@@ -539,19 +486,12 @@ impl Domain {
     }
 
     fn is_bounds_hole(&self, val: i32, trail: &Trail) -> bool {
-        let ValueMap::Bounds {
-            holes, holes_len, ..
-        } = &self.values
-        else {
-            unreachable!()
-        };
+        let ValueMap::Bounds { holes, holes_len, .. } = &self.values else { unreachable!() };
         holes[..trail.get(*holes_len) as usize].contains(&val)
     }
 
     fn set_bounds_empty(&self, trail: &mut Trail) {
-        let ValueMap::Bounds { empty, .. } = &self.values else {
-            unreachable!()
-        };
+        let ValueMap::Bounds { empty, .. } = &self.values else { unreachable!() };
         trail.set(*empty, 1);
     }
 }

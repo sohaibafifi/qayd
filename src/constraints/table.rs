@@ -29,12 +29,7 @@ fn ts_is_zero(bs: &[u64]) -> bool {
 fn ts_intersects(a: &[u64], b: &[u64]) -> bool {
     a.iter().zip(b).any(|(x, y)| x & y != 0)
 }
-fn ts_has_match(
-    current: &[u64],
-    star: &[u64],
-    exact: Option<&Vec<u64>>,
-    residue: &mut usize,
-) -> bool {
+fn ts_has_match(current: &[u64], star: &[u64], exact: Option<&Vec<u64>>, residue: &mut usize) -> bool {
     if current.is_empty() {
         return false;
     }
@@ -130,21 +125,11 @@ struct Extension {
 }
 
 impl Extension {
-    fn new(
-        store: &Store,
-        vars: &[VarId],
-        template: Arc<ExtensionTemplate>,
-        positive: bool,
-    ) -> Self {
+    fn new(store: &Store, vars: &[VarId], template: Arc<ExtensionTemplate>, positive: bool) -> Self {
         assert_eq!(template.arity, vars.len(), "extension: arity mismatch");
         let nwords = template.full.len();
-        let residues = if positive {
-            vars.iter()
-                .map(|&var| store.values(var).map(|value| (value, 0)).collect())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let residues =
+            if positive { vars.iter().map(|&var| store.values(var).map(|value| (value, 0)).collect()).collect() } else { Vec::new() };
         Self {
             vars: vars.to_vec(),
             positive,
@@ -161,10 +146,7 @@ impl Extension {
 
 impl ExtensionTemplate {
     fn new(arity: usize, tuples: &[Vec<i32>]) -> Self {
-        assert!(
-            tuples.iter().all(|t| t.len() == arity),
-            "extension: tuple arity mismatch"
-        );
+        assert!(tuples.iter().all(|t| t.len() == arity), "extension: tuple arity mismatch");
         let ntuples = tuples.len();
         let nwords = ntuples.div_ceil(64);
         let mut supports: Vec<HashMap<i32, Vec<u64>>> = vec![HashMap::new(); arity];
@@ -183,12 +165,7 @@ impl ExtensionTemplate {
         for t in 0..ntuples {
             full[t / 64] |= 1u64 << (t % 64);
         }
-        Self {
-            arity,
-            supports,
-            star,
-            full,
-        }
+        Self { arity, supports, star, full }
     }
 }
 
@@ -200,23 +177,8 @@ impl Propagator for Extension {
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
-        let Extension {
-            vars,
-            positive,
-            template,
-            current,
-            union,
-            residues,
-            search,
-            cover,
-            buf,
-        } = self;
-        let ExtensionTemplate {
-            supports,
-            star,
-            full,
-            ..
-        } = &**template;
+        let Extension { vars, positive, template, current, union, residues, search, cover, buf } = self;
+        let ExtensionTemplate { supports, star, full, .. } = &**template;
 
         if *positive {
             // current = AND over columns of (wildcards OR (OR over present values)).
@@ -240,9 +202,7 @@ impl Propagator for Extension {
                 buf.clear();
                 buf.extend(store.values(v));
                 for &val in buf.iter() {
-                    let residue = residues[c]
-                        .get_mut(&val)
-                        .expect("extension residue missing root-domain value");
+                    let residue = residues[c].get_mut(&val).expect("extension residue missing root-domain value");
                     if !ts_has_match(current, &star[c], supports[c].get(&val), residue) {
                         store.remove(v, val)?;
                     }
@@ -265,14 +225,7 @@ impl Propagator for Extension {
                 for &val in buf.iter() {
                     search[0].copy_from_slice(full);
                     ts_and_match(&mut search[0], &star[c], supports[c].get(&val));
-                    let ctx = NegativeSearch {
-                        store,
-                        vars,
-                        supports,
-                        star,
-                        cover,
-                        fixed_col: c,
-                    };
+                    let ctx = NegativeSearch { store, vars, supports, star, cover, fixed_col: c };
                     if !negative_has_support(&ctx, search, 0) {
                         store.remove(v, val)?;
                     }
@@ -286,12 +239,7 @@ impl Propagator for Extension {
 /// Post a table constraint. `positive`: tuple must be one of `tuples`; else none.
 /// Use [`STAR`] for `*` wildcards.
 pub fn extension(solver: &mut Solver, vars: &[VarId], tuples: &[Vec<i32>], positive: bool) {
-    extension_from_template(
-        solver,
-        vars,
-        extension_template(vars.len(), tuples),
-        positive,
-    );
+    extension_from_template(solver, vars, extension_template(vars.len(), tuples), positive);
 }
 
 /// Compile an extension table's immutable tuple bitsets.
@@ -300,12 +248,7 @@ pub fn extension_template(arity: usize, tuples: &[Vec<i32>]) -> Arc<ExtensionTem
 }
 
 /// Post an extension constraint backed by a shared immutable template.
-pub fn extension_from_template(
-    solver: &mut Solver,
-    vars: &[VarId],
-    template: Arc<ExtensionTemplate>,
-    positive: bool,
-) {
+pub fn extension_from_template(solver: &mut Solver, vars: &[VarId], template: Arc<ExtensionTemplate>, positive: bool) {
     let prop = Extension::new(&solver.store, vars, template, positive);
     solver.post(Box::new(prop));
 }
@@ -370,11 +313,7 @@ impl Propagator for Regular {
         let n = self.vars.len();
         let s = self.n_states;
         if n == 0 {
-            return if self.accept.contains(&self.start) {
-                Ok(())
-            } else {
-                Err(Inconsistency)
-            };
+            return if self.accept.contains(&self.start) { Ok(()) } else { Err(Inconsistency) };
         }
 
         self.fwd.fill(false);
@@ -412,12 +351,8 @@ impl Propagator for Regular {
             self.buf.clear();
             self.buf.extend(store.values(self.vars[i]));
             for &val in &self.buf {
-                let supported = (0..s).any(|q| {
-                    self.fwd[i * s + q]
-                        && self.delta[q]
-                            .get(&val)
-                            .is_some_and(|&q2| self.bwd[(i + 1) * s + q2])
-                });
+                let supported =
+                    (0..s).any(|q| self.fwd[i * s + q] && self.delta[q].get(&val).is_some_and(|&q2| self.bwd[(i + 1) * s + q2]));
                 if !supported {
                     store.remove(self.vars[i], val)?;
                 }
@@ -429,10 +364,7 @@ impl Propagator for Regular {
 
 /// Post `regular`: the sequence `vars` must be accepted by `dfa`.
 pub fn regular(solver: &mut Solver, vars: &[VarId], dfa: Dfa) {
-    assert!(
-        dfa.start < dfa.n_states,
-        "regular: start state out of range"
-    );
+    assert!(dfa.start < dfa.n_states, "regular: start state out of range");
     solver.post(Box::new(Regular::new(vars, dfa)));
 }
 
@@ -479,14 +411,7 @@ impl MddProp {
             offsets[i] = acc;
             acc += c;
         }
-        Self {
-            vars: vars.to_vec(),
-            layers: mdd.layers,
-            offsets,
-            fwd: vec![false; acc],
-            bwd: vec![false; acc],
-            buf: Vec::new(),
-        }
+        Self { vars: vars.to_vec(), layers: mdd.layers, offsets, fwd: vec![false; acc], bwd: vec![false; acc], buf: Vec::new() }
     }
 }
 
@@ -516,8 +441,7 @@ impl Propagator for MddProp {
         }
         for i in (0..n).rev() {
             for arc in &self.layers[i] {
-                if store.contains(self.vars[i], arc.value) && self.bwd[self.offsets[i + 1] + arc.to]
-                {
+                if store.contains(self.vars[i], arc.value) && self.bwd[self.offsets[i + 1] + arc.to] {
                     self.bwd[self.offsets[i] + arc.from] = true;
                 }
             }
@@ -527,11 +451,9 @@ impl Propagator for MddProp {
             self.buf.clear();
             self.buf.extend(store.values(self.vars[i]));
             for &val in &self.buf {
-                let supported = self.layers[i].iter().any(|arc| {
-                    arc.value == val
-                        && self.fwd[self.offsets[i] + arc.from]
-                        && self.bwd[self.offsets[i + 1] + arc.to]
-                });
+                let supported = self.layers[i]
+                    .iter()
+                    .any(|arc| arc.value == val && self.fwd[self.offsets[i] + arc.from] && self.bwd[self.offsets[i + 1] + arc.to]);
                 if !supported {
                     store.remove(self.vars[i], val)?;
                 }
@@ -543,15 +465,7 @@ impl Propagator for MddProp {
 
 /// Post `mdd`: the assignment must trace a root-to-final path of `mdd`.
 pub fn mdd(solver: &mut Solver, vars: &[VarId], mdd: Mdd) {
-    assert_eq!(
-        mdd.layers.len(),
-        vars.len(),
-        "mdd: one arc layer per variable"
-    );
-    assert_eq!(
-        mdd.nodes_per_layer.len(),
-        vars.len() + 1,
-        "mdd: nodes_per_layer must have n+1 entries"
-    );
+    assert_eq!(mdd.layers.len(), vars.len(), "mdd: one arc layer per variable");
+    assert_eq!(mdd.nodes_per_layer.len(), vars.len() + 1, "mdd: nodes_per_layer must have n+1 entries");
     solver.post(Box::new(MddProp::new(vars, mdd)));
 }

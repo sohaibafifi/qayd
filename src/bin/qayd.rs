@@ -40,10 +40,7 @@ fn run_instance(path: &str, verbose: bool, stop: &AtomicBool, options: qayd::xcs
 }
 
 fn is_instance(arg: &str) -> bool {
-    Path::new(arg).is_file()
-        || arg.ends_with(".xml")
-        || arg.ends_with(".lzma")
-        || arg.ends_with(".xz")
+    Path::new(arg).is_file() || arg.ends_with(".xml") || arg.ends_with(".lzma") || arg.ends_with(".xz")
 }
 
 const USAGE: &str =
@@ -55,9 +52,7 @@ fn fail(message: &str) -> ! {
 }
 
 fn parse<T: FromStr>(value: Option<&str>, message: &str) -> T {
-    value
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| fail(message))
+    value.and_then(|s| s.parse().ok()).unwrap_or_else(|| fail(message))
 }
 
 fn positive(value: Option<&str>, message: &str) -> usize {
@@ -93,37 +88,12 @@ fn main() {
         match a.as_str() {
             "-h" | "--help" => help(),
             "-v" | "--verbose" => verbose = true,
-            "-t" | "--time" => {
-                time_limit = Some(parse(
-                    it.next().map(String::as_str),
-                    "-t/--time needs a number of seconds",
-                ))
-            }
-            "--seed" => {
-                seed = Some(parse(
-                    it.next().map(String::as_str),
-                    "--seed needs an unsigned integer",
-                ))
-            }
-            "-p" | "--threads" => {
-                workers = Some(positive(
-                    it.next().map(String::as_str),
-                    "-p/--threads needs a positive integer",
-                ))
-            }
+            "-t" | "--time" => time_limit = Some(parse(it.next().map(String::as_str), "-t/--time needs a number of seconds")),
+            "--seed" => seed = Some(parse(it.next().map(String::as_str), "--seed needs an unsigned integer")),
+            "-p" | "--threads" => workers = Some(positive(it.next().map(String::as_str), "-p/--threads needs a positive integer")),
             "--split" => split = true,
-            "--probe" => {
-                probes = positive(
-                    it.next().map(String::as_str),
-                    "--probe needs a positive integer",
-                )
-            }
-            "--lns" => {
-                lns = positive(
-                    it.next().map(String::as_str),
-                    "--lns needs a positive integer",
-                )
-            }
+            "--probe" => probes = positive(it.next().map(String::as_str), "--probe needs a positive integer"),
+            "--lns" => lns = positive(it.next().map(String::as_str), "--lns needs a positive integer"),
             other if other.starts_with('-') => {
                 eprintln!("unknown option {other}");
                 usage();
@@ -137,12 +107,7 @@ fn main() {
     if !is_instance(&path) {
         usage();
     }
-    let seed = seed.unwrap_or_else(|| {
-        std::env::var("RANDOMSEED")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
-    });
+    let seed = seed.unwrap_or_else(|| std::env::var("RANDOMSEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
     let workers = workers.unwrap_or_else(|| match std::env::var("NBCORE") {
         Ok(s) => positive(Some(&s), "NBCORE needs a positive integer"),
         Err(_) => 1,
@@ -161,16 +126,5 @@ fn main() {
         });
     }
 
-    run_instance(
-        &path,
-        verbose,
-        &stop,
-        qayd::xcsp::RunOptions {
-            seed,
-            workers,
-            split,
-            probes,
-            lns,
-        },
-    );
+    run_instance(&path, verbose, &stop, qayd::xcsp::RunOptions { seed, workers, split, probes, lns });
 }

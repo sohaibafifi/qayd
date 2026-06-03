@@ -264,9 +264,7 @@ impl Store {
     fn cause_for(&mut self, will_change: bool) -> Cause {
         let pending = self.pending_premises.take();
         match pending {
-            Some(p) if !self.force_scope_reasons => {
-                Cause::Premises(if will_change { p } else { Vec::new() })
-            }
+            Some(p) if !self.force_scope_reasons => Cause::Premises(if will_change { p } else { Vec::new() }),
             _ => Cause::Scope,
         }
     }
@@ -282,45 +280,25 @@ impl Store {
     // real change, then calls the plain mutator.
 
     /// [`remove`](Store::remove), explained by `why`.
-    pub fn remove_because(
-        &mut self,
-        var: VarId,
-        val: i32,
-        why: Vec<Premise>,
-    ) -> Result<(), Inconsistency> {
+    pub fn remove_because(&mut self, var: VarId, val: i32, why: Vec<Premise>) -> Result<(), Inconsistency> {
         self.pending_premises = Some(why);
         self.remove(var, val)
     }
 
     /// [`fix`](Store::fix), explained by `why`.
-    pub fn fix_because(
-        &mut self,
-        var: VarId,
-        val: i32,
-        why: Vec<Premise>,
-    ) -> Result<(), Inconsistency> {
+    pub fn fix_because(&mut self, var: VarId, val: i32, why: Vec<Premise>) -> Result<(), Inconsistency> {
         self.pending_premises = Some(why);
         self.fix(var, val)
     }
 
     /// [`remove_below`](Store::remove_below), explained by `why`.
-    pub fn remove_below_because(
-        &mut self,
-        var: VarId,
-        bound: i32,
-        why: Vec<Premise>,
-    ) -> Result<(), Inconsistency> {
+    pub fn remove_below_because(&mut self, var: VarId, bound: i32, why: Vec<Premise>) -> Result<(), Inconsistency> {
         self.pending_premises = Some(why);
         self.remove_below(var, bound)
     }
 
     /// [`remove_above`](Store::remove_above), explained by `why`.
-    pub fn remove_above_because(
-        &mut self,
-        var: VarId,
-        bound: i32,
-        why: Vec<Premise>,
-    ) -> Result<(), Inconsistency> {
+    pub fn remove_above_because(&mut self, var: VarId, bound: i32, why: Vec<Premise>) -> Result<(), Inconsistency> {
         self.pending_premises = Some(why);
         self.remove_above(var, bound)
     }
@@ -360,12 +338,7 @@ impl Store {
         if size != max as i64 - min as i64 + 1 {
             dom.append_removed_values(&self.trail, &mut holes);
         }
-        ScopeVar {
-            var,
-            min,
-            max,
-            holes,
-        }
+        ScopeVar { var, min, max, holes }
     }
 
     /// Append an engine event for a real domain change.
@@ -380,12 +353,7 @@ impl Store {
     }
 
     /// Check for wipeout and wake the right subscribers after a real change.
-    fn after_change(
-        &mut self,
-        var: VarId,
-        old_min: i32,
-        old_max: i32,
-    ) -> Result<(), Inconsistency> {
+    fn after_change(&mut self, var: VarId, old_min: i32, old_max: i32) -> Result<(), Inconsistency> {
         let i = var.index();
         let size = self.domains[i].size(&self.trail);
         if size == 0 {
@@ -503,31 +471,17 @@ impl Store {
     fn notify(&mut self, var: VarId, bounds_moved: bool, fixed: bool) {
         // Split the borrow: read subscription lists while mutating queue/flags.
         // Subscription lists never change during propagation.
-        let Store {
-            subs,
-            queue,
-            enqueued,
-            current,
-            ..
-        } = self;
+        let Store { subs, queue, enqueued, current, .. } = self;
         let s = &subs[var.index()];
         for &(event, p) in &s.entries {
-            if event == Event::DomainChange
-                || (bounds_moved && event == Event::BoundChange)
-                || (fixed && event == Event::Fix)
-            {
+            if event == Event::DomainChange || (bounds_moved && event == Event::BoundChange) || (fixed && event == Event::Fix) {
                 Self::wake(queue, enqueued, *current, p);
             }
         }
     }
 
     /// Enqueue `p` unless it is the running propagator or already queued.
-    fn wake(
-        queue: &mut VecDeque<PropId>,
-        enqueued: &mut [bool],
-        current: Option<PropId>,
-        p: PropId,
-    ) {
+    fn wake(queue: &mut VecDeque<PropId>, enqueued: &mut [bool], current: Option<PropId>, p: PropId) {
         if current == Some(p) {
             return;
         }
@@ -639,10 +593,7 @@ impl Solver {
     /// Run the propagation fixpoint, polling `should_stop`. On stop, clears the
     /// queue and returns `Ok`; the caller must abandon the search, never treat
     /// this as a consistent fixpoint.
-    pub fn propagate_until<F: Fn() -> bool>(
-        &mut self,
-        should_stop: F,
-    ) -> Result<(), Inconsistency> {
+    pub fn propagate_until<F: Fn() -> bool>(&mut self, should_stop: F) -> Result<(), Inconsistency> {
         while let Some(id) = self.store.dequeue() {
             // Poll every dequeue: one propagator call can be slow on huge instances.
             if should_stop() {
@@ -668,9 +619,7 @@ impl Solver {
     }
 
     fn run_prop(&mut self, id: PropId) -> Result<(), Inconsistency> {
-        let mut prop = self.propagators[id.index()]
-            .take()
-            .expect("running a propagator that is not present");
+        let mut prop = self.propagators[id.index()].take().expect("running a propagator that is not present");
         self.store.clear_pending();
         self.store.current = Some(id);
         let result = prop.propagate(&mut self.store);

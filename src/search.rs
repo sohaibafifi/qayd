@@ -43,10 +43,7 @@ pub struct SolveStats {
 #[derive(Clone, Copy)]
 pub(crate) enum Objective<'a> {
     Var(VarId),
-    Linear {
-        coeffs: &'a [i64],
-        vars: &'a [VarId],
-    },
+    Linear { coeffs: &'a [i64], vars: &'a [VarId] },
     Expr(&'a Expr),
 }
 
@@ -80,12 +77,7 @@ where
 }
 
 /// Like [`solve`], but halts as soon as `stop` is set (time limit / Ctrl+C).
-pub fn solve_interruptible<F>(
-    solver: &mut Solver,
-    vars: &[VarId],
-    on_solution: F,
-    stop: &AtomicBool,
-) -> SolveStats
+pub fn solve_interruptible<F>(solver: &mut Solver, vars: &[VarId], on_solution: F, stop: &AtomicBool) -> SolveStats
 where
     F: FnMut(&Solver) -> SearchControl,
 {
@@ -93,13 +85,7 @@ where
 }
 
 /// Like [`solve_interruptible`], with reproducible search diversification.
-pub(crate) fn solve_interruptible_seeded<F>(
-    solver: &mut Solver,
-    vars: &[VarId],
-    on_solution: F,
-    stop: &AtomicBool,
-    seed: u64,
-) -> SolveStats
+pub(crate) fn solve_interruptible_seeded<F>(solver: &mut Solver, vars: &[VarId], on_solution: F, stop: &AtomicBool, seed: u64) -> SolveStats
 where
     F: FnMut(&Solver) -> SearchControl,
 {
@@ -136,23 +122,9 @@ pub fn optimize_with(
     on_improve: impl FnMut(i32),
 ) -> (Option<(Vec<i32>, i32)>, SolveStats) {
     let mut on_improve = on_improve;
-    let (best, stats, _) = optimize_seeded(
-        solver,
-        vars,
-        Objective::Var(obj),
-        minimizing,
-        stop,
-        0,
-        None,
-        None,
-        &[],
-        None,
-        |value, _| on_improve(value as i32),
-    );
-    (
-        best.map(|(solution, value)| (solution, value as i32)),
-        stats,
-    )
+    let (best, stats, _) =
+        optimize_seeded(solver, vars, Objective::Var(obj), minimizing, stop, 0, None, None, &[], None, |value, _| on_improve(value as i32));
+    (best.map(|(solution, value)| (solution, value as i32)), stats)
 }
 
 /// Optimise with a reproducible seed and an optional shared incumbent.
@@ -178,16 +150,7 @@ pub(crate) fn optimize_seeded(
     if let Some(sharing) = clause_sharing {
         cdcl.set_clause_sharing(sharing);
     }
-    cdcl.optimize(
-        vars,
-        objective,
-        minimizing,
-        stop,
-        shared_bound,
-        cube,
-        conflict_budget,
-        on_improve,
-    )
+    cdcl.optimize(vars, objective, minimizing, stop, shared_bound, cube, conflict_budget, on_improve)
 }
 
 /// Pick a binary split for one root cube.

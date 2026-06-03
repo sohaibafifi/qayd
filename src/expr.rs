@@ -83,12 +83,7 @@ impl Expr {
                 a.collect_vars(out);
                 b.collect_vars(out);
             }
-            Expr::Add(es)
-            | Expr::Mul(es)
-            | Expr::Min(es)
-            | Expr::Max(es)
-            | Expr::And(es)
-            | Expr::Or(es) => {
+            Expr::Add(es) | Expr::Mul(es) | Expr::Min(es) | Expr::Max(es) | Expr::And(es) | Expr::Or(es) => {
                 for e in es {
                     e.collect_vars(out);
                 }
@@ -227,10 +222,7 @@ impl Expr {
             Expr::Sub(a, b) => {
                 let (al, ah) = a.bounds(dom);
                 let (bl, bh) = b.bounds(dom);
-                (
-                    clamp(al as i128 - bh as i128),
-                    clamp(ah as i128 - bl as i128),
-                )
+                (clamp(al as i128 - bh as i128), clamp(ah as i128 - bl as i128))
             }
             Expr::Mul(es) => {
                 let mut acc = (1i128, 1i128);
@@ -396,12 +388,7 @@ fn cmp_bounds(a: &Expr, b: &Expr, dom: &impl Fn(VarId) -> (i64, i64), cmp: Cmp) 
     }
 }
 
-fn fold_bounds(
-    es: &[Expr],
-    dom: &impl Fn(VarId) -> (i64, i64),
-    init: i64,
-    f: impl Fn(i64, i64) -> i64,
-) -> (i64, i64) {
+fn fold_bounds(es: &[Expr], dom: &impl Fn(VarId) -> (i64, i64), init: i64, f: impl Fn(i64, i64) -> i64) -> (i64, i64) {
     let mut lo = init;
     let mut hi = init;
     for e in es {

@@ -74,15 +74,8 @@ impl Propagator for NoOverlap {
 
 /// Post `noOverlap`: the tasks must not overlap in time.
 pub fn no_overlap(solver: &mut Solver, starts: &[VarId], durations: &[i64]) {
-    assert_eq!(
-        starts.len(),
-        durations.len(),
-        "noOverlap: starts/durations mismatch"
-    );
-    solver.post(Box::new(NoOverlap {
-        starts: starts.to_vec(),
-        durations: durations.to_vec(),
-    }));
+    assert_eq!(starts.len(), durations.len(), "noOverlap: starts/durations mismatch");
+    solver.post(Box::new(NoOverlap { starts: starts.to_vec(), durations: durations.to_vec() }));
 }
 
 // ===========================================================================
@@ -133,8 +126,7 @@ impl Propagator for Cumulative {
             }
 
             // Energetic overload check: window [L, U) energy > capacity*(U-L) fails.
-            self.by_est
-                .sort_unstable_by(|&a, &b| self.est[b].cmp(&self.est[a]));
+            self.by_est.sort_unstable_by(|&a, &b| self.est[b].cmp(&self.est[a]));
             for u in 0..n {
                 let ub = self.lct[u];
                 let mut e = 0i64;
@@ -150,8 +142,7 @@ impl Propagator for Cumulative {
 
             // Edge-finding: if Omega ∪ {i} can't fit in [est, U], i ends after Omega,
             // so it can't start until Omega's non-parallelisable rest energy is done.
-            self.by_lct
-                .sort_unstable_by(|&a, &b| self.lct[a].cmp(&self.lct[b]));
+            self.by_lct.sort_unstable_by(|&a, &b| self.lct[a].cmp(&self.lct[b]));
             self.lb.copy_from_slice(&self.est);
             #[allow(clippy::needless_range_loop)]
             for i in 0..n {
@@ -213,11 +204,7 @@ impl Propagator for Cumulative {
                         let s = start as i64;
                         let conflict = (s..s + self.dur[i]).any(|t| {
                             let idx = (t - hmin) as usize;
-                            let own = if t >= mand_start && t < mand_end {
-                                hi
-                            } else {
-                                0
-                            };
+                            let own = if t >= mand_start && t < mand_end { hi } else { 0 };
                             self.profile[idx] - own + hi > self.capacity
                         });
                         if conflict {
@@ -237,13 +224,7 @@ impl Propagator for Cumulative {
 }
 
 /// Post `cumulative`: resource usage never exceeds `capacity`.
-pub fn cumulative(
-    solver: &mut Solver,
-    starts: &[VarId],
-    durations: &[i64],
-    heights: &[i64],
-    capacity: i64,
-) {
+pub fn cumulative(solver: &mut Solver, starts: &[VarId], durations: &[i64], heights: &[i64], capacity: i64) {
     assert_eq!(starts.len(), durations.len(), "cumulative: length mismatch");
     assert_eq!(starts.len(), heights.len(), "cumulative: length mismatch");
     let n = starts.len();
@@ -375,11 +356,7 @@ impl Propagator for CumulativeVar {
                         let s = start as i64;
                         let conflict = (s..s + d_lo).any(|t| {
                             let idx = (t - hmin) as usize;
-                            let own = if t >= mand_start && t < mand_end {
-                                h_lo
-                            } else {
-                                0
-                            };
+                            let own = if t >= mand_start && t < mand_end { h_lo } else { 0 };
                             self.profile[idx] - own + h_lo > cap_max
                         });
                         if conflict {
@@ -399,13 +376,7 @@ impl Propagator for CumulativeVar {
 
 /// Post `cumulative` with variable task durations and heights and a (possibly
 /// variable) `capacity`.
-pub fn cumulative_var(
-    solver: &mut Solver,
-    starts: &[VarId],
-    durations: &[VarId],
-    heights: &[VarId],
-    capacity: VarId,
-) {
+pub fn cumulative_var(solver: &mut Solver, starts: &[VarId], durations: &[VarId], heights: &[VarId], capacity: VarId) {
     assert_eq!(starts.len(), durations.len(), "cumulative: length mismatch");
     assert_eq!(starts.len(), heights.len(), "cumulative: length mismatch");
     solver.post(Box::new(CumulativeVar {

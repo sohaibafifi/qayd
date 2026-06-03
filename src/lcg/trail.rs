@@ -78,19 +78,14 @@ fn translate_premises(atoms: &AtomTable, premises: &[Premise]) -> Option<Vec<Lit
     };
     for &p in premises {
         let var = match p {
-            Premise::Ge { var, .. }
-            | Premise::Le { var, .. }
-            | Premise::Eq { var, .. }
-            | Premise::Ne { var, .. } => var,
+            Premise::Ge { var, .. } | Premise::Le { var, .. } | Premise::Eq { var, .. } | Premise::Ne { var, .. } => var,
         };
         if atoms.is_lazy(var) {
             return None;
         }
         match p {
             Premise::Ge { var, bound } => push(atoms.ge(var, bound), &mut lits),
-            Premise::Le { var, bound } => {
-                push(neg(atoms.ge_i64(var, i64::from(bound) + 1)), &mut lits)
-            }
+            Premise::Le { var, bound } => push(neg(atoms.ge_i64(var, i64::from(bound) + 1)), &mut lits),
             // Express `[x = v]` as order atoms `[x ≥ v] ∧ [x ≤ v]`, never the
             // positive equality atom: the eq atom may carry a deeper level, which
             // would make 1-UIP backjump too far and prune feasible solutions.
@@ -108,9 +103,7 @@ fn translate_premises(atoms: &AtomTable, premises: &[Premise]) -> Option<Vec<Lit
 /// else the pre-propagator whole-scope snapshot.
 fn cause_lits(atoms: &AtomTable, cause: &Cause, fallback: &[ScopeVar]) -> Vec<Lit> {
     match cause {
-        Cause::Premises(p) => {
-            translate_premises(atoms, p).unwrap_or_else(|| build_ds(atoms, fallback))
-        }
+        Cause::Premises(p) => translate_premises(atoms, p).unwrap_or_else(|| build_ds(atoms, fallback)),
         Cause::Scope => build_ds(atoms, fallback),
     }
 }
@@ -137,9 +130,7 @@ fn lit(loc: LitOrConst) -> Option<Lit> {
 fn translate(atoms: &AtomTable, ev: &DomEvent) -> Option<Lit> {
     match *ev {
         DomEvent::GeTrue { var, bound } => lit(atoms.ge(var, bound)),
-        DomEvent::LeTrue { var, bound } => {
-            lit(atoms.ge_i64(var, i64::from(bound) + 1)).map(Lit::negate)
-        }
+        DomEvent::LeTrue { var, bound } => lit(atoms.ge_i64(var, i64::from(bound) + 1)).map(Lit::negate),
         DomEvent::NeTrue { var, val } => lit(atoms.eq(var, val)).map(Lit::negate),
         DomEvent::EqTrue { var, val } => lit(atoms.eq(var, val)),
     }
@@ -213,30 +204,18 @@ impl<'s> Cdcl<'s> {
         Self::new_with_registry(solver, vars, LazyAtomRegistry::new())
     }
 
-    pub(crate) fn new_with_registry(
-        solver: &'s mut Solver,
-        vars: &[VarId],
-        lazy_atoms: Arc<LazyAtomRegistry>,
-    ) -> Self {
+    pub(crate) fn new_with_registry(solver: &'s mut Solver, vars: &[VarId], lazy_atoms: Arc<LazyAtomRegistry>) -> Self {
         // Ablation hook: `QAYD_SCOPE_REASONS` forces whole-scope explanations.
-        solver
-            .store
-            .set_force_scope_reasons(std::env::var_os("QAYD_SCOPE_REASONS").is_some());
+        solver.store.set_force_scope_reasons(std::env::var_os("QAYD_SCOPE_REASONS").is_some());
         let nvars = solver.store.num_vars();
-        let mut active = (0..nvars)
-            .map(|i| solver.store.is_relevant(VarId(i as u32)))
-            .collect::<Vec<_>>();
+        let mut active = (0..nvars).map(|i| solver.store.is_relevant(VarId(i as u32))).collect::<Vec<_>>();
         for &var in vars {
             active[var.index()] = true;
         }
         let atoms = AtomTable::build_active_sparse_with_registry(
             nvars,
             |v: VarId| active[v.index()],
-            |v: VarId| {
-                solver.store.size(v) == 2
-                    && solver.store.contains(v, -1)
-                    && solver.store.contains(v, 1)
-            },
+            |v: VarId| solver.store.size(v) == 2 && solver.store.contains(v, -1) && solver.store.contains(v, 1),
             |v: VarId| solver.store.sparse_values(v),
             |v: VarId| (solver.store.min(v), solver.store.max(v)),
             lazy_atoms,
@@ -291,8 +270,7 @@ impl<'s> Cdcl<'s> {
     /// Scope exported clauses to the current search cube.
     pub(crate) fn set_cube_scope(&mut self, cube: &[Lit]) {
         self.cube_scope.clear();
-        self.cube_scope
-            .extend(cube.iter().map(|assumption| assumption.negate()));
+        self.cube_scope.extend(cube.iter().map(|assumption| assumption.negate()));
     }
 
     /// Scope exported clauses to the current objective bound.
@@ -352,9 +330,7 @@ impl<'s> Cdcl<'s> {
     }
 
     fn unwatch(&mut self, lit: Lit, clause: ClauseRef) {
-        if let std::collections::hash_map::Entry::Occupied(mut entry) =
-            self.watches.entry(lit.code())
-        {
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = self.watches.entry(lit.code()) {
             entry.get_mut().retain(|&c| c != clause);
             if entry.get().is_empty() {
                 entry.remove();
@@ -364,11 +340,7 @@ impl<'s> Cdcl<'s> {
 
     /// Literal Block Distance: distinct decision levels among assigned literals.
     fn lbd_of(&self, lits: &[Lit]) -> u32 {
-        let mut levels: Vec<u32> = lits
-            .iter()
-            .map(|l| self.level_of(l.atom()))
-            .filter(|&lv| lv != UNSET)
-            .collect();
+        let mut levels: Vec<u32> = lits.iter().map(|l| self.level_of(l.atom())).filter(|&lv| lv != UNSET).collect();
         levels.sort_unstable();
         levels.dedup();
         levels.len() as u32
@@ -383,11 +355,7 @@ impl<'s> Cdcl<'s> {
 
     fn add_shared_clause(&mut self, lits: Arc<[Lit]>, deletable: bool, lbd: u32) -> ClauseRef {
         let watch = self.initial_watches(&lits);
-        let (w0, w1) = if lits.len() >= 2 {
-            (Some(lits[watch[0]]), Some(lits[watch[1]]))
-        } else {
-            (None, None)
-        };
+        let (w0, w1) = if lits.len() >= 2 { (Some(lits[watch[0]]), Some(lits[watch[1]])) } else { (None, None) };
         let cref = self.clauses.add(lits, watch, deletable, lbd);
         if let (Some(a), Some(b)) = (w0, w1) {
             self.watches.entry(a.code()).or_default().push(cref);
@@ -459,9 +427,7 @@ impl<'s> Cdcl<'s> {
     /// Whether `atom` is currently assigned.
     #[inline]
     pub fn is_assigned(&self, atom: Atom) -> bool {
-        self.atom_level
-            .get(atom as usize)
-            .is_some_and(|&level| level != UNSET)
+        self.atom_level.get(atom as usize).is_some_and(|&level| level != UNSET)
     }
 
     /// The level `atom` was assigned at (only meaningful while assigned).
@@ -486,11 +452,7 @@ impl<'s> Cdcl<'s> {
     /// equal at a fixpoint (invariant T2).
     #[inline]
     pub fn tvalue(&self, lit: Lit) -> Tri {
-        let t = self
-            .tval
-            .get(lit.atom() as usize)
-            .copied()
-            .unwrap_or(Tri::Unknown);
+        let t = self.tval.get(lit.atom() as usize).copied().unwrap_or(Tri::Unknown);
         if lit.is_positive() {
             t
         } else {
@@ -514,19 +476,11 @@ impl<'s> Cdcl<'s> {
         if self.atom_level[a] != UNSET {
             return;
         }
-        debug_assert_eq!(
-            view::lit_value(&self.solver.store, &self.atoms, lit),
-            Tri::True,
-            "recorded literal is not true in the domain"
-        );
+        debug_assert_eq!(view::lit_value(&self.solver.store, &self.atoms, lit), Tri::True, "recorded literal is not true in the domain");
         self.atom_level[a] = self.decision_level() as u32;
         self.atom_trail_pos[a] = self.trail.len();
         self.atom_reason[a] = reason;
-        self.tval[a] = if lit.is_positive() {
-            Tri::True
-        } else {
-            Tri::False
-        };
+        self.tval[a] = if lit.is_positive() { Tri::True } else { Tri::False };
         self.trail.push(lit);
     }
 
@@ -549,12 +503,7 @@ impl<'s> Cdcl<'s> {
         let mut lits = Vec::new();
         let push_if_recorded = |loc: LitOrConst, out: &mut Vec<Lit>| {
             if let LitOrConst::Lit(l) = loc {
-                match self
-                    .tval
-                    .get(l.atom() as usize)
-                    .copied()
-                    .unwrap_or(Tri::Unknown)
-                {
+                match self.tval.get(l.atom() as usize).copied().unwrap_or(Tri::Unknown) {
                     Tri::True => out.push(Lit::positive(l.atom())),
                     Tri::False => out.push(Lit::negative(l.atom())),
                     Tri::Unknown => {}
@@ -580,9 +529,7 @@ impl<'s> Cdcl<'s> {
     /// [`ds_recorded`], which entails every determination and is itself recorded.
     fn sync_var(&mut self, var: VarId) {
         if self.atoms.is_sign(var) {
-            let LitOrConst::Lit(l) = self.atoms.ge(var, 1) else {
-                unreachable!("a sign variable has one real atom")
-            };
+            let LitOrConst::Lit(l) = self.atoms.ge(var, 1) else { unreachable!("a sign variable has one real atom") };
             if !self.is_assigned(l.atom()) {
                 debug_assert_eq!(
                     view::lit_value(&self.solver.store, &self.atoms, l),
@@ -594,9 +541,7 @@ impl<'s> Cdcl<'s> {
         }
         if self.atoms.is_lazy(var) {
             let _ = self.atoms.ge(var, self.solver.store.min(var));
-            let _ = self
-                .atoms
-                .ge_i64(var, i64::from(self.solver.store.max(var)) + 1);
+            let _ = self.atoms.ge_i64(var, i64::from(self.solver.store.max(var)) + 1);
         }
         let mut todo: Vec<Lit> = Vec::new();
         self.atom_scratch.clear();
@@ -628,11 +573,7 @@ impl<'s> Cdcl<'s> {
         let events = std::mem::take(&mut self.solver.store.events);
         for ev in &events {
             if let Some(el) = translate(&self.atoms, &ev.primary) {
-                debug_assert_eq!(
-                    el.atom(),
-                    lit.atom(),
-                    "an op emitted an unexpected non-primary event"
-                );
+                debug_assert_eq!(el.atom(), lit.atom(), "an op emitted an unexpected non-primary event");
                 self.record(el, reason.clone());
             }
         }
@@ -699,10 +640,7 @@ impl<'s> Cdcl<'s> {
                 {
                     let clause = self.clauses.get(cref);
                     for (k, &lit) in clause.lits.iter().enumerate() {
-                        if k != clause.watch[0]
-                            && k != clause.watch[1]
-                            && self.tvalue(lit) != Tri::False
-                        {
+                        if k != clause.watch[0] && k != clause.watch[1] && self.tvalue(lit) != Tri::False {
                             new_watch = Some((k, lit));
                             break;
                         }
@@ -716,9 +654,7 @@ impl<'s> Cdcl<'s> {
                 // No replacement: the clause is unit on `other` (or a conflict).
                 ws[keep] = cref;
                 keep += 1;
-                if self.tvalue(other) == Tri::False
-                    || self.assign(other, Reason::Clause(cref)).is_err()
-                {
+                if self.tvalue(other) == Tri::False || self.assign(other, Reason::Clause(cref)).is_err() {
                     while read < ws.len() {
                         ws[keep] = ws[read];
                         keep += 1;
@@ -764,11 +700,7 @@ impl<'s> Cdcl<'s> {
             // returning, but the SAT trail only records them after the call.
             let step_trail_len = self.trail.len();
             {
-                let Cdcl {
-                    solver,
-                    conflict_scope,
-                    ..
-                } = self;
+                let Cdcl { solver, conflict_scope, .. } = self;
                 solver.store.snapshot_scope_into(pid, conflict_scope);
             }
             match self.solver.propagate_step() {
@@ -781,8 +713,7 @@ impl<'s> Cdcl<'s> {
                     // pre-call scope: intermediate FD mutations are not yet SAT
                     // assignments and cannot participate in conflict analysis.
                     let preferred = match self.solver.store.take_pending_conflict() {
-                        Some(p) => translate_premises(&self.atoms, &p)
-                            .unwrap_or_else(|| build_ds(&self.atoms, &self.conflict_scope)),
+                        Some(p) => translate_premises(&self.atoms, &p).unwrap_or_else(|| build_ds(&self.atoms, &self.conflict_scope)),
                         None => build_ds(&self.atoms, &self.conflict_scope),
                     };
                     let ds = self.reason_before_step(preferred, step_trail_len);
@@ -831,23 +762,16 @@ impl<'s> Cdcl<'s> {
     /// before the current propagator call. Otherwise fall back to the pre-call
     /// whole-scope snapshot, which is always trail-consistent.
     fn reason_before_step(&self, preferred: Vec<Lit>, step_trail_len: usize) -> Vec<Lit> {
-        if preferred
-            .iter()
-            .all(|&lit| self.was_recorded_before(lit, step_trail_len))
-        {
+        if preferred.iter().all(|&lit| self.was_recorded_before(lit, step_trail_len)) {
             return preferred;
         }
         let fallback = build_ds(&self.atoms, &self.conflict_scope);
-        debug_assert!(fallback
-            .iter()
-            .all(|&lit| self.was_recorded_before(lit, step_trail_len)));
+        debug_assert!(fallback.iter().all(|&lit| self.was_recorded_before(lit, step_trail_len)));
         fallback
     }
 
     fn was_recorded_before(&self, lit: Lit, trail_len: usize) -> bool {
-        self.atom_trail_pos
-            .get(lit.atom() as usize)
-            .is_some_and(|&pos| self.tvalue(lit) == Tri::True && pos < trail_len)
+        self.atom_trail_pos.get(lit.atom() as usize).is_some_and(|&pos| self.tvalue(lit) == Tri::True && pos < trail_len)
     }
 
     /// Propagate; on each conflict, learn a 1-UIP clause, backjump, assert it.
@@ -908,8 +832,7 @@ impl<'s> Cdcl<'s> {
             return true;
         }
         if let Some(lit) = open {
-            return self.assign(lit, Reason::Clause(cref)).is_ok()
-                || self.resolve_conflict(Conflict::Clause(cref));
+            return self.assign(lit, Reason::Clause(cref)).is_ok() || self.resolve_conflict(Conflict::Clause(cref));
         }
         self.resolve_conflict(Conflict::Clause(cref))
     }
@@ -931,9 +854,7 @@ impl<'s> Cdcl<'s> {
             if self.cube_scope.is_empty() && self.bound_scope.is_none() {
                 sharing.publish(Arc::clone(&learnt), lbd);
             } else {
-                let mut exported = Vec::with_capacity(
-                    self.cube_scope.len() + usize::from(self.bound_scope.is_some()) + learnt.len(),
-                );
+                let mut exported = Vec::with_capacity(self.cube_scope.len() + usize::from(self.bound_scope.is_some()) + learnt.len());
                 exported.extend_from_slice(&self.cube_scope);
                 exported.extend(self.bound_scope);
                 exported.extend_from_slice(&learnt);
@@ -957,12 +878,7 @@ impl<'s> Cdcl<'s> {
         let mut clause_lits = self.conflict_lits(&conflict);
         // Analyse at the conflict's deepest level (a propagator may fail on
         // literals all below the current level). All at level 0 means UNSAT.
-        let level = clause_lits
-            .iter()
-            .map(|l| self.level_of(l.atom()))
-            .filter(|&lv| lv != UNSET)
-            .max()
-            .unwrap_or(0);
+        let level = clause_lits.iter().map(|l| self.level_of(l.atom())).filter(|&lv| lv != UNSET).max().unwrap_or(0);
         if level == 0 {
             return None;
         }
@@ -974,13 +890,7 @@ impl<'s> Cdcl<'s> {
 
         loop {
             for q in clause_lits {
-                debug_assert_eq!(
-                    self.tvalue(q),
-                    Tri::False,
-                    "analysis saw non-false literal {:?} {:?}",
-                    q,
-                    self.atoms.decode(q.atom())
-                );
+                debug_assert_eq!(self.tvalue(q), Tri::False, "analysis saw non-false literal {:?} {:?}", q, self.atoms.decode(q.atom()));
                 let a = q.atom();
                 let lv = self.level_of(a);
                 if !self.seen[a as usize] && lv != UNSET && lv > 0 {
@@ -1011,11 +921,7 @@ impl<'s> Cdcl<'s> {
         }
 
         learnt[0] = uip.negate(); // asserting literal
-        let btlevel = learnt[1..]
-            .iter()
-            .map(|l| self.level_of(l.atom()) as usize)
-            .max()
-            .unwrap_or(0);
+        let btlevel = learnt[1..].iter().map(|l| self.level_of(l.atom()) as usize).max().unwrap_or(0);
         for a in touched {
             self.seen[a as usize] = false;
         }
@@ -1093,13 +999,7 @@ impl<'s> Cdcl<'s> {
         match self.reason_of(p.atom()) {
             Reason::Clause(c) => {
                 let c = *c;
-                self.clauses
-                    .get(c)
-                    .lits
-                    .iter()
-                    .copied()
-                    .filter(|&l| l != p)
-                    .collect()
+                self.clauses.get(c).lits.iter().copied().filter(|&l| l != p).collect()
             }
             // Reason clause (p ∨ ⋁ ¬D_S); antecedents are ¬D_S.
             Reason::Generic(ds) => ds.iter().map(|l| l.negate()).collect(),

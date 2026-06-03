@@ -62,10 +62,7 @@ impl Trail {
 
     /// Undo every change made since the matching `push_level`.
     pub fn pop_level(&mut self) {
-        let mark = self
-            .levels
-            .pop()
-            .expect("pop_level without a matching push_level");
+        let mark = self.levels.pop().expect("pop_level without a matching push_level");
         while self.log.len() > mark {
             let (i, old) = self.log.pop().unwrap();
             self.values[i as usize] = old;

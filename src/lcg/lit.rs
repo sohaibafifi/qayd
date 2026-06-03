@@ -151,9 +151,7 @@ impl LazyAtomRegistry {
             return atom;
         }
         let base = lazy.base.expect("lazy LCG atom registry has no eager base");
-        let atom = base
-            .checked_add(Atom::try_from(lazy.decode.len()).expect("LCG atom count overflow"))
-            .expect("LCG atom count overflow");
+        let atom = base.checked_add(Atom::try_from(lazy.decode.len()).expect("LCG atom count overflow")).expect("LCG atom count overflow");
         assert!(atom <= u32::MAX >> 1, "LCG literal count overflow");
         lazy.ids.insert(kind, atom);
         lazy.decode.push(kind);
@@ -213,14 +211,7 @@ impl AtomTable {
         sparse_values: impl Fn(VarId) -> Option<Arc<[i32]>>,
         bounds: impl Fn(VarId) -> (i32, i32),
     ) -> AtomTable {
-        Self::build_active_sparse_with_registry(
-            num_vars,
-            active,
-            sign,
-            sparse_values,
-            bounds,
-            LazyAtomRegistry::new(),
-        )
+        Self::build_active_sparse_with_registry(num_vars, active, sign, sparse_values, bounds, LazyAtomRegistry::new())
     }
 
     pub(crate) fn build_active_sparse_with_registry(
@@ -244,12 +235,7 @@ impl AtomTable {
                 VarLayout::Sign
             } else if sparse_values.is_some() {
                 VarLayout::Sparse
-            } else if active
-                && decode
-                    .len()
-                    .saturating_add(atom_count(VarLayout::Span, lo, hi, &None))
-                    > MAX_EAGER_ATOMS
-            {
+            } else if active && decode.len().saturating_add(atom_count(VarLayout::Span, lo, hi, &None)) > MAX_EAGER_ATOMS {
                 VarLayout::Lazy
             } else {
                 VarLayout::Span
@@ -288,16 +274,7 @@ impl AtomTable {
                     VarLayout::Lazy => {}
                 }
             }
-            vars.push(VarAtoms {
-                lo,
-                hi,
-                active,
-                layout,
-                ge_base,
-                eq_base,
-                end: decode.len() as Atom,
-                sparse_values,
-            });
+            vars.push(VarAtoms { lo, hi, active, layout, ge_base, eq_base, end: decode.len() as Atom, sparse_values });
         }
         lazy.set_base(decode.len() as Atom);
         AtomTable { vars, decode, lazy }
@@ -312,10 +289,7 @@ impl AtomTable {
     /// What `atom` means.
     #[inline]
     pub fn decode(&self, atom: Atom) -> AtomKind {
-        self.decode
-            .get(atom as usize)
-            .copied()
-            .unwrap_or_else(|| self.lazy.decode(atom))
+        self.decode.get(atom as usize).copied().unwrap_or_else(|| self.lazy.decode(atom))
     }
 
     /// The initial integer span `[lo, hi]` a variable's atoms cover.
@@ -401,10 +375,7 @@ impl AtomTable {
                 } else if k > i64::from(a.hi) {
                     LitOrConst::False
                 } else {
-                    LitOrConst::Lit(Lit::positive(self.lazy.intern(AtomKind::Ge {
-                        var: x,
-                        k: k as i32,
-                    })))
+                    LitOrConst::Lit(Lit::positive(self.lazy.intern(AtomKind::Ge { var: x, k: k as i32 })))
                 }
             }
         }
@@ -445,27 +416,17 @@ impl AtomTable {
 
 fn atom_count(layout: VarLayout, lo: i32, hi: i32, sparse_values: &Option<Arc<[i32]>>) -> usize {
     match layout {
-        VarLayout::Span => span_len(lo, hi)
-            .checked_mul(2)
-            .and_then(|n| n.checked_sub(1))
-            .expect("LCG atom count overflow"),
-        VarLayout::Sparse => sparse_values
-            .as_deref()
-            .unwrap()
-            .len()
-            .checked_mul(2)
-            .and_then(|n| n.checked_sub(1))
-            .expect("LCG atom count overflow"),
+        VarLayout::Span => span_len(lo, hi).checked_mul(2).and_then(|n| n.checked_sub(1)).expect("LCG atom count overflow"),
+        VarLayout::Sparse => {
+            sparse_values.as_deref().unwrap().len().checked_mul(2).and_then(|n| n.checked_sub(1)).expect("LCG atom count overflow")
+        }
         VarLayout::Sign => 1,
         VarLayout::Lazy => 0,
     }
 }
 
 fn reserve_atoms(decode: &mut Vec<AtomKind>, var: VarId, additional: usize) {
-    let total = decode
-        .len()
-        .checked_add(additional)
-        .expect("LCG atom count overflow");
+    let total = decode.len().checked_add(additional).expect("LCG atom count overflow");
     assert!(
         total <= MAX_EAGER_ATOMS,
         "eager LCG allocation exceeds {MAX_EAGER_ATOMS} atoms at {var:?}; wide contiguous ranges require lazy atoms"
