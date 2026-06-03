@@ -23,6 +23,7 @@ use crate::constraints::table::{
 };
 use crate::expr::{self, Expr};
 use crate::ids::VarId;
+use crate::problem::Objective;
 use crate::store::Solver;
 
 const MAX_MATERIALIZED_OBJECTIVE_SPAN: i64 = 1_000_000;
@@ -46,13 +47,6 @@ fn ones(n: usize) -> Vec<i64> {
 struct ArrayDecl {
     shape: Vec<usize>,
     cells: Vec<VarId>,
-}
-
-#[derive(Clone)]
-pub(super) enum Objective {
-    Var(bool, VarId),
-    Linear(bool, Vec<i64>, Vec<VarId>),
-    Expr(bool, Expr),
 }
 
 /// Accumulates the model as the parser walks the instance.
