@@ -40,6 +40,14 @@ fn require(ok: bool, message: &str) -> Result<(), String> {
     }
 }
 
+fn i64s(values: &[i32]) -> Vec<i64> {
+    values.iter().map(|&x| x as i64).collect()
+}
+
+fn ones(n: usize) -> Vec<i64> {
+    vec![1; n]
+}
+
 struct ArrayDecl {
     shape: Vec<usize>,
     cells: Vec<VarId>,
@@ -244,6 +252,30 @@ impl Model {
             self.post_linear(coeffs.clone(), vars.clone(), rel, rhs)?;
         }
         Ok(())
+    }
+
+    fn post_sum_vars(
+        &mut self,
+        list: &[String],
+        coeffs: Option<&[i32]>,
+        operator: ROp,
+        operand: Operand,
+    ) -> Result<(), String> {
+        let vars = self.scope(list)?;
+        let coeffs = coeffs.map(i64s).unwrap_or_else(|| ones(vars.len()));
+        self.post_sum(coeffs, vars, operator, operand)
+    }
+
+    fn post_sum_exprs(
+        &mut self,
+        list: &[ExpressionTree],
+        coeffs: Option<&[i32]>,
+        operator: ROp,
+        operand: Operand,
+    ) -> Result<(), String> {
+        let vars = self.tree_vars(list)?;
+        let coeffs = coeffs.map(i64s).unwrap_or_else(|| ones(vars.len()));
+        self.post_sum(coeffs, vars, operator, operand)
     }
 
     /// Post `Σ coeffs·vars  rel  rhs` (moving a variable rhs to the lhs).
@@ -757,11 +789,7 @@ impl XcspCallback for Model {
     }
 
     fn on_constraint_sum_v1(&mut self, list: &[String], operator: ROp, operand: Operand) {
-        guard!(self, {
-            let vars = self.scope(list)?;
-            let coeffs = vec![1i64; vars.len()];
-            self.post_sum(coeffs, vars, operator, operand)
-        });
+        guard!(self, { self.post_sum_vars(list, None, operator, operand) });
     }
     fn on_constraint_sum_v2(
         &mut self,
@@ -771,17 +799,11 @@ impl XcspCallback for Model {
         operand: Operand,
     ) {
         guard!(self, {
-            let vars = self.scope(list)?;
-            let coeffs: Vec<i64> = coeffs.iter().map(|&c| c as i64).collect();
-            self.post_sum(coeffs, vars, operator, operand)
+            self.post_sum_vars(list, Some(coeffs), operator, operand)
         });
     }
     fn on_constraint_sum_v4(&mut self, list: &[ExpressionTree], operator: ROp, operand: Operand) {
-        guard!(self, {
-            let vars = self.tree_vars(list)?;
-            let coeffs = vec![1i64; vars.len()];
-            self.post_sum(coeffs, vars, operator, operand)
-        });
+        guard!(self, { self.post_sum_exprs(list, None, operator, operand) });
     }
     fn on_constraint_sum_v5(
         &mut self,
@@ -791,9 +813,7 @@ impl XcspCallback for Model {
         operand: Operand,
     ) {
         guard!(self, {
-            let vars = self.tree_vars(list)?;
-            let coeffs: Vec<i64> = coeffs.iter().map(|&c| c as i64).collect();
-            self.post_sum(coeffs, vars, operator, operand)
+            self.post_sum_exprs(list, Some(coeffs), operator, operand)
         });
     }
 
@@ -870,10 +890,9 @@ impl XcspCallback for Model {
         value: i32,
     ) {
         guard!(self, {
-            require(start_index == 0, "element with non-zero startIndex")?;
             let array = self.scope(list)?;
             let val = self.constant(value);
-            self.post_element(array, &index, val)
+            self.post_element(array, start_index, &index, val)
         });
     }
     fn on_constraint_element_v3(
@@ -884,10 +903,9 @@ impl XcspCallback for Model {
         value: String,
     ) {
         guard!(self, {
-            require(start_index == 0, "element with non-zero startIndex")?;
             let array = self.scope(list)?;
             let val = self.var_id(&value)?;
-            self.post_element(array, &index, val)
+            self.post_element(array, start_index, &index, val)
         });
     }
     fn on_constraint_element_v5(
@@ -899,9 +917,8 @@ impl XcspCallback for Model {
         operand: Operand,
     ) {
         guard!(self, {
-            require(start_index == 0, "element with non-zero startIndex")?;
             let array = self.scope(list)?;
-            self.post_element_cond(array, &index, operator, operand)
+            self.post_element_cond(array, start_index, &index, operator, operand)
         });
     }
     fn on_constraint_element_v8(
@@ -913,9 +930,8 @@ impl XcspCallback for Model {
         operand: Operand,
     ) {
         guard!(self, {
-            require(start_index == 0, "element with non-zero startIndex")?;
             let array = self.consts(list);
-            self.post_element_cond(array, &index, operator, operand)
+            self.post_element_cond(array, start_index, &index, operator, operand)
         });
     }
     fn on_constraint_element_v6(
@@ -926,10 +942,9 @@ impl XcspCallback for Model {
         value: String,
     ) {
         guard!(self, {
-            require(start_index == 0, "element with non-zero startIndex")?;
             let array = self.consts(list);
             let val = self.var_id(&value)?;
-            self.post_element(array, &index, val)
+            self.post_element(array, start_index, &index, val)
         });
     }
     fn on_constraint_element_v7(
@@ -940,10 +955,9 @@ impl XcspCallback for Model {
         value: i32,
     ) {
         guard!(self, {
-            require(start_index == 0, "element with non-zero startIndex")?;
             let array = self.consts(list);
             let val = self.constant(value);
-            self.post_element(array, &index, val)
+            self.post_element(array, start_index, &index, val)
         });
     }
 
@@ -961,11 +975,11 @@ impl XcspCallback for Model {
                 "cumulative condition must be <=",
             )?;
             let starts = self.scope(origins)?;
-            let d: Vec<i64> = lengths.iter().map(|&x| x as i64).collect();
+            let d = i64s(lengths);
             match self.rhs(&operand)? {
                 // Fixed heights + constant capacity: the strong edge-finder.
                 Rhs::Const(k) => {
-                    let h: Vec<i64> = heights.iter().map(|&x| x as i64).collect();
+                    let h = i64s(heights);
                     cumulative(&mut self.solver, &starts, &d, &h, k);
                 }
                 // Variable capacity: the weaker variable-resource propagator.
@@ -1121,7 +1135,7 @@ impl XcspCallback for Model {
                 return Err("cardinality: occurs/values length mismatch".to_string());
             }
             let vars = self.scope(list)?;
-            let low: Vec<i64> = occurs.iter().map(|&x| x as i64).collect();
+            let low = i64s(occurs);
             cardinality(&mut self.solver, &vars, values, &low, &low, closed);
             Ok(())
         });
@@ -1154,7 +1168,7 @@ impl XcspCallback for Model {
     ) {
         guard!(self, {
             let items = self.scope(list)?;
-            let s: Vec<i64> = sizes.iter().map(|&x| x as i64).collect();
+            let s = i64s(sizes);
             let cap = match (operator, self.rhs(&operand)?) {
                 (ROp::Le, Rhs::Const(k)) => k,
                 _ => return Err("binPacking needs <= constant capacity".to_string()),
@@ -1172,8 +1186,8 @@ impl XcspCallback for Model {
     fn on_constraint_bin_packing_v2(&mut self, list: &[String], sizes: &[i32], limits: &[i32]) {
         guard!(self, {
             let items = self.scope(list)?;
-            let s: Vec<i64> = sizes.iter().map(|&x| x as i64).collect();
-            let caps: Vec<i64> = limits.iter().map(|&x| x as i64).collect();
+            let s = i64s(sizes);
+            let caps = i64s(limits);
             bin_packing(&mut self.solver, &items, &s, &caps);
             Ok(())
         });
@@ -1184,7 +1198,7 @@ impl XcspCallback for Model {
             // load_b = Σ_i size_i · [item_i == b].
             let items = self.scope(list)?;
             let loadv = self.scope(loads)?;
-            let s: Vec<i64> = sizes.iter().map(|&x| x as i64).collect();
+            let s = i64s(sizes);
             for (b, &lb) in loadv.iter().enumerate() {
                 let mut coeffs = Vec::with_capacity(items.len() + 1);
                 let mut vars = Vec::with_capacity(items.len() + 1);
@@ -1214,8 +1228,8 @@ impl XcspCallback for Model {
     ) {
         guard!(self, {
             let vars = self.scope(list)?;
-            let w: Vec<i64> = weights.iter().map(|&x| x as i64).collect();
-            let p: Vec<i64> = profits.iter().map(|&x| x as i64).collect();
+            let w = i64s(weights);
+            let p = i64s(profits);
             // Σ w·x ≤ W and Σ p·x ≥ P (W, P may be variables).
             self.post_linear(w, vars.clone(), Relation::Le, self.rhs(&w_operand)?)?;
             self.post_linear(p, vars, Relation::Ge, self.rhs(&p_operand)?)?;
@@ -1231,7 +1245,7 @@ impl XcspCallback for Model {
     ) {
         guard!(self, {
             let starts = self.scope(list)?;
-            let d: Vec<i64> = lengths.iter().map(|&x| x as i64).collect();
+            let d = i64s(lengths);
             no_overlap(&mut self.solver, &starts, &d);
             Ok(())
         });
@@ -1354,33 +1368,29 @@ impl XcspCallback for Model {
     fn on_maximize_expression(&mut self, e: &ExpressionTree) {
         guard!(self, { self.set_expr_objective(e, false) });
     }
-    fn on_minimize_v1(&mut self, t: XElementOperator, list: &[String], coefs: &[i32]) {
-        guard!(self, { self.objective_sum(t, list, coefs, true) });
+    fn on_minimize_v1(&mut self, t: XElementOperator, list: &[String], coeffs: &[i32]) {
+        guard!(self, { self.objective_sum(t, list, Some(coeffs), true) });
     }
-    fn on_maximize_v1(&mut self, t: XElementOperator, list: &[String], coefs: &[i32]) {
-        guard!(self, { self.objective_sum(t, list, coefs, false) });
+    fn on_maximize_v1(&mut self, t: XElementOperator, list: &[String], coeffs: &[i32]) {
+        guard!(self, { self.objective_sum(t, list, Some(coeffs), false) });
     }
     fn on_minimize_v5(&mut self, t: XElementOperator, list: &[String]) {
-        let ones = vec![1i32; list.len()];
-        guard!(self, { self.objective_sum(t, list, &ones, true) });
+        guard!(self, { self.objective_sum(t, list, None, true) });
     }
     fn on_maximize_v5(&mut self, t: XElementOperator, list: &[String]) {
-        let ones = vec![1i32; list.len()];
-        guard!(self, { self.objective_sum(t, list, &ones, false) });
+        guard!(self, { self.objective_sum(t, list, None, false) });
     }
-    fn on_minimize_v3(&mut self, t: XElementOperator, list: &[ExpressionTree], coefs: &[i32]) {
-        guard!(self, { self.objective_exprs(t, list, coefs, true) });
+    fn on_minimize_v3(&mut self, t: XElementOperator, list: &[ExpressionTree], coeffs: &[i32]) {
+        guard!(self, { self.objective_exprs(t, list, Some(coeffs), true) });
     }
-    fn on_maximize_v3(&mut self, t: XElementOperator, list: &[ExpressionTree], coefs: &[i32]) {
-        guard!(self, { self.objective_exprs(t, list, coefs, false) });
+    fn on_maximize_v3(&mut self, t: XElementOperator, list: &[ExpressionTree], coeffs: &[i32]) {
+        guard!(self, { self.objective_exprs(t, list, Some(coeffs), false) });
     }
     fn on_minimize_v6(&mut self, t: XElementOperator, list: &[ExpressionTree]) {
-        let ones = vec![1i32; list.len()];
-        guard!(self, { self.objective_exprs(t, list, &ones, true) });
+        guard!(self, { self.objective_exprs(t, list, None, true) });
     }
     fn on_maximize_v6(&mut self, t: XElementOperator, list: &[ExpressionTree]) {
-        let ones = vec![1i32; list.len()];
-        guard!(self, { self.objective_exprs(t, list, &ones, false) });
+        guard!(self, { self.objective_exprs(t, list, None, false) });
     }
 }
 
@@ -1504,7 +1514,14 @@ impl Model {
         Ok(())
     }
 
-    fn post_element(&mut self, array: Vec<VarId>, index: &str, value: VarId) -> Result<(), String> {
+    fn post_element(
+        &mut self,
+        array: Vec<VarId>,
+        start_index: i32,
+        index: &str,
+        value: VarId,
+    ) -> Result<(), String> {
+        require(start_index == 0, "element with non-zero startIndex")?;
         let idx = self.var_id(index)?;
         element(&mut self.solver, &array, idx, value);
         Ok(())
@@ -1513,10 +1530,12 @@ impl Model {
     fn post_element_cond(
         &mut self,
         array: Vec<VarId>,
+        start_index: i32,
         index: &str,
         operator: ROp,
         operand: Operand,
     ) -> Result<(), String> {
+        require(start_index == 0, "element with non-zero startIndex")?;
         let idx = self.var_id(index)?;
         self.element_cond(array, idx, operator, operand)
     }
@@ -1632,11 +1651,11 @@ impl Model {
         &mut self,
         t: XElementOperator,
         list: &[String],
-        coefs: &[i32],
+        coeffs: Option<&[i32]>,
         minimize: bool,
     ) -> Result<(), String> {
         let vars = self.scope(list)?;
-        let coeffs: Vec<i64> = coefs.iter().map(|&c| c as i64).collect();
+        let coeffs = coeffs.map(i64s).unwrap_or_else(|| ones(vars.len()));
         self.objective_agg(t, vars, coeffs, minimize)
     }
 
@@ -1645,23 +1664,24 @@ impl Model {
         &mut self,
         t: XElementOperator,
         list: &[ExpressionTree],
-        coefs: &[i32],
+        coeffs: Option<&[i32]>,
         minimize: bool,
     ) -> Result<(), String> {
         use XElementOperator::*;
+        let coeffs = coeffs.map(i64s).unwrap_or_else(|| ones(list.len()));
         if matches!(t, Sum) {
-            if coefs.len() != list.len() {
+            if coeffs.len() != list.len() {
                 return Err("objective: coeffs/terms length mismatch".to_string());
             }
             let terms = list
                 .iter()
-                .zip(coefs)
+                .zip(&coeffs)
                 .map(|(tree, &coeff)| {
                     let term = self.tree(tree)?;
                     Ok(if coeff == 1 {
                         term
                     } else {
-                        expr::mul(vec![expr::int(coeff as i64), term])
+                        expr::mul(vec![expr::int(coeff), term])
                     })
                 })
                 .collect::<Result<_, String>>()?;
@@ -1669,7 +1689,6 @@ impl Model {
             return Ok(());
         }
         let vars = self.tree_vars(list)?;
-        let coeffs: Vec<i64> = coefs.iter().map(|&c| c as i64).collect();
         self.objective_agg(t, vars, coeffs, minimize)
     }
 

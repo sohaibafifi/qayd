@@ -649,22 +649,7 @@ impl Solver {
                 self.store.clear_queue();
                 return Ok(());
             }
-            // Take the propagator out to satisfy the borrow checker, then put back.
-            let mut prop = self.propagators[id.index()]
-                .take()
-                .expect("running a propagator that is not present");
-            self.store.clear_pending();
-            self.store.current = Some(id);
-            let result = prop.propagate(&mut self.store);
-            self.store.current = None;
-            self.propagators[id.index()] = Some(prop);
-
-            if let Err(e) = result {
-                // dom/wdeg: blame the propagator that wiped out a domain.
-                self.weights[id.index()] += 1;
-                self.store.clear_queue();
-                return Err(e);
-            }
+            self.run_prop(id)?;
         }
         Ok(())
     }
@@ -676,6 +661,13 @@ impl Solver {
         let Some(id) = self.store.dequeue() else {
             return StepOutcome::Empty;
         };
+        match self.run_prop(id) {
+            Ok(()) => StepOutcome::Ran(id),
+            Err(_) => StepOutcome::Failed(id),
+        }
+    }
+
+    fn run_prop(&mut self, id: PropId) -> Result<(), Inconsistency> {
         let mut prop = self.propagators[id.index()]
             .take()
             .expect("running a propagator that is not present");
@@ -684,14 +676,12 @@ impl Solver {
         let result = prop.propagate(&mut self.store);
         self.store.current = None;
         self.propagators[id.index()] = Some(prop);
-        match result {
-            Ok(()) => StepOutcome::Ran(id),
-            Err(_) => {
-                self.weights[id.index()] += 1;
-                self.store.clear_queue();
-                StepOutcome::Failed(id)
-            }
+        if let Err(e) = result {
+            self.weights[id.index()] += 1;
+            self.store.clear_queue();
+            return Err(e);
         }
+        Ok(())
     }
 
     /// The next propagator that would run (without dequeuing it).

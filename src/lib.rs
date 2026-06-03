@@ -25,7 +25,6 @@ pub mod domain;
 pub mod expr;
 pub mod ids;
 pub mod lcg;
-pub mod oracle;
 pub mod propagator;
 pub mod search;
 pub mod store;
@@ -33,7 +32,7 @@ pub mod trail;
 pub mod xcsp;
 
 pub use expr::Expr;
-pub use ids::{PropId, ValId, VarId};
+pub use ids::{PropId, VarId};
 pub use propagator::{Event, Inconsistency, Propagator};
 pub use search::{
     count_solutions, first_solution, maximize, minimize, optimize_with, solve, solve_interruptible,

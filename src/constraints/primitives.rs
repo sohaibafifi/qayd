@@ -302,14 +302,15 @@ pub fn all_equal(solver: &mut Solver, vars: &[VarId]) {
 // minimum / maximum
 // ---------------------------------------------------------------------------
 
-/// `y = min(xs)` (bounds reasoning).
+/// `y = min(xs)` or `y = max(xs)` (bounds reasoning).
 #[derive(Clone)]
-struct Minimum {
+struct Extremum {
     y: VarId,
     xs: Vec<VarId>,
+    is_min: bool,
 }
 
-impl Propagator for Minimum {
+impl Propagator for Extremum {
     fn register(&mut self, store: &mut Store, me: PropId) {
         store.subscribe(self.y, me, Event::BoundChange);
         for &x in &self.xs {
@@ -318,52 +319,30 @@ impl Propagator for Minimum {
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
-        // min(xs) in [min of lower bounds, min of upper bounds].
-        let mut lb = i32::MAX;
-        let mut ub = i32::MAX;
+        let mut lb = if self.is_min { i32::MAX } else { i32::MIN };
+        let mut ub = lb;
         for &x in &self.xs {
-            lb = lb.min(store.min(x));
-            ub = ub.min(store.max(x));
+            if self.is_min {
+                lb = lb.min(store.min(x));
+                ub = ub.min(store.max(x));
+            } else {
+                lb = lb.max(store.min(x));
+                ub = ub.max(store.max(x));
+            }
         }
         store.remove_below(self.y, lb)?;
         store.remove_above(self.y, ub)?;
-        // Every x >= y.
-        let ymin = store.min(self.y);
+        let y_bound = if self.is_min {
+            store.min(self.y)
+        } else {
+            store.max(self.y)
+        };
         for &x in &self.xs {
-            store.remove_below(x, ymin)?;
-        }
-        Ok(())
-    }
-}
-
-/// `y = max(xs)`.
-#[derive(Clone)]
-struct Maximum {
-    y: VarId,
-    xs: Vec<VarId>,
-}
-
-impl Propagator for Maximum {
-    fn register(&mut self, store: &mut Store, me: PropId) {
-        store.subscribe(self.y, me, Event::BoundChange);
-        for &x in &self.xs {
-            store.subscribe(x, me, Event::BoundChange);
-        }
-    }
-
-    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
-        let mut lb = i32::MIN;
-        let mut ub = i32::MIN;
-        for &x in &self.xs {
-            lb = lb.max(store.min(x));
-            ub = ub.max(store.max(x));
-        }
-        store.remove_below(self.y, lb)?;
-        store.remove_above(self.y, ub)?;
-        // Every x <= y.
-        let ymax = store.max(self.y);
-        for &x in &self.xs {
-            store.remove_above(x, ymax)?;
+            if self.is_min {
+                store.remove_below(x, y_bound)?;
+            } else {
+                store.remove_above(x, y_bound)?;
+            }
         }
         Ok(())
     }
@@ -372,13 +351,21 @@ impl Propagator for Maximum {
 /// Post `y = min(xs)`. `xs` must be non-empty.
 pub fn minimum(solver: &mut Solver, y: VarId, xs: &[VarId]) {
     assert!(!xs.is_empty(), "minimum: empty list");
-    solver.post(Box::new(Minimum { y, xs: xs.to_vec() }));
+    solver.post(Box::new(Extremum {
+        y,
+        xs: xs.to_vec(),
+        is_min: true,
+    }));
 }
 
 /// Post `y = max(xs)`. `xs` must be non-empty.
 pub fn maximum(solver: &mut Solver, y: VarId, xs: &[VarId]) {
     assert!(!xs.is_empty(), "maximum: empty list");
-    solver.post(Box::new(Maximum { y, xs: xs.to_vec() }));
+    solver.post(Box::new(Extremum {
+        y,
+        xs: xs.to_vec(),
+        is_min: false,
+    }));
 }
 
 // ---------------------------------------------------------------------------
