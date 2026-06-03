@@ -231,8 +231,14 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
         writeln!(w, "c seed {}", options.seed).map_err(to_err)?;
         writeln!(w, "c workers {} ({})", options.workers, worker_roles(has_objective, options)).map_err(to_err)?;
         writeln!(w, "c split {}", options.split).map_err(to_err)?;
-        writeln!(w, "c presolve fixed {} search {} -> {}", presolve.fixed, presolve.search_before, presolve.search_after)
-            .map_err(to_err)?;
+        if presolve.failed {
+            writeln!(w, "c presolve failed").map_err(to_err)?;
+        } else if presolve.stopped {
+            writeln!(w, "c presolve stopped").map_err(to_err)?;
+        } else if presolve.search_before != presolve.search_after || presolve.fixed > 0 {
+            writeln!(w, "c presolve reduced search {} -> {} fixed {}", presolve.search_before, presolve.search_after, presolve.fixed)
+                .map_err(to_err)?;
+        }
         if symbolic_probes_disabled {
             writeln!(w, "c probes disabled (probe worker only supports a materialized objective variable)").map_err(to_err)?;
         }

@@ -2,6 +2,7 @@
 //! [`Propagator`](crate::Propagator) plus a posting helper.
 
 pub mod count;
+pub mod flatten;
 pub mod graph;
 pub mod intension;
 pub mod lex;

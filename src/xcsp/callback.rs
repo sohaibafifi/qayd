@@ -13,6 +13,7 @@ use xcsp3_rust_parser::xcsp_callback::XcspCallback;
 use xcsp3_rust_parser::xcsp_xml::xcsp_xml_model::xcsp3_xml::InstanceType;
 
 use crate::constraints::count::{cardinality, count, n_values};
+use crate::constraints::flatten;
 use crate::constraints::graph::circuit;
 use crate::constraints::lex::{channel, lex_chain};
 use crate::constraints::linear::{linear, Relation};
@@ -319,10 +320,7 @@ impl Model {
 
     /// Aux variable equal to `e`, linked by an intension constraint.
     fn aux_for(&mut self, e: Expr) -> VarId {
-        let (lo, hi) = e.bounds(&|v| (self.solver.store.min(v) as i64, self.solver.store.max(v) as i64));
-        let aux = self.solver.new_var_range(clamp(lo), clamp(hi));
-        crate::constraints::intension::intension(&mut self.solver, expr::eq(expr::var(aux), e));
-        aux
+        flatten::aux_for_expr(&mut self.solver, e)
     }
 
     /// Turn a list of parser expression trees into solver variables (aux vars
@@ -349,7 +347,7 @@ impl Model {
 }
 
 fn clamp(x: i64) -> i32 {
-    x.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    flatten::clamp_i64(x)
 }
 
 fn cell_ref(name: &str) -> Option<(&str, Vec<usize>)> {
@@ -599,12 +597,7 @@ impl XcspCallback for Model {
                 let tuples = lists.iter().map(|l| self.scope(l)).collect::<Result<Vec<_>, _>>()?;
                 for i in 0..tuples.len() {
                     for j in (i + 1)..tuples.len() {
-                        if tuples[i].len() != tuples[j].len() {
-                            return Err("allDifferent-list: ragged tuples".to_string());
-                        }
-                        let diffs =
-                            tuples[i].iter().zip(&tuples[j]).map(|(&x, &y)| expr::ne(expr::var(x), expr::var(y))).collect::<Vec<_>>();
-                        crate::constraints::intension::intension(&mut self.solver, expr::or(diffs));
+                        flatten::post_tuple_not_equal(&mut self.solver, &tuples[i], &tuples[j])?;
                     }
                 }
             }
@@ -618,15 +611,7 @@ impl XcspCallback for Model {
             // exempt value (`x_i == x_j ⟹ x_i ∈ except`).
             // TODO(strong): allDifferent-except via matching that ignores exempts.
             let vars = self.scope(list)?;
-            for i in 0..vars.len() {
-                for j in (i + 1)..vars.len() {
-                    let mut terms = vec![expr::ne(expr::var(vars[i]), expr::var(vars[j]))];
-                    for &e in except {
-                        terms.push(expr::eq(expr::var(vars[i]), expr::int(e as i64)));
-                    }
-                    crate::constraints::intension::intension(&mut self.solver, expr::or(terms));
-                }
-            }
+            flatten::post_all_different_except(&mut self.solver, &vars, except);
             Ok(())
         });
     }
@@ -824,7 +809,7 @@ impl XcspCallback for Model {
             match self.rhs(&operand)? {
                 Rhs::Const(k) => n_values(&mut self.solver, &vars, rel, k),
                 Rhs::Var(y) => {
-                    let aux = self.nvalues_var(&vars);
+                    let aux = flatten::nvalues_var(&mut self.solver, &vars);
                     linear(&mut self.solver, &[1, -1], &[aux, y], rel, 0);
                 }
             }
@@ -845,13 +830,7 @@ impl XcspCallback for Model {
             // x[i] == 1  ⟺  value == i + start_index.
             let xs = self.scope(list)?;
             let v = self.var_id(&value)?;
-            for (i, &xi) in xs.iter().enumerate() {
-                let idx = start_index as i64 + i as i64;
-                crate::constraints::intension::intension(
-                    &mut self.solver,
-                    expr::iff(expr::eq(expr::var(xi), expr::int(1)), expr::eq(expr::var(v), expr::int(idx))),
-                );
-            }
+            flatten::post_channel_onehot_index(&mut self.solver, &xs, v, start_index);
             Ok(())
         });
     }
@@ -956,18 +935,7 @@ impl XcspCallback for Model {
             let items = self.scope(list)?;
             let loadv = self.scope(loads)?;
             let s = i64s(sizes);
-            for (b, &lb) in loadv.iter().enumerate() {
-                let mut coeffs = Vec::with_capacity(items.len() + 1);
-                let mut vars = Vec::with_capacity(items.len() + 1);
-                for (i, &it) in items.iter().enumerate() {
-                    let ind = self.aux_for(expr::eq(expr::var(it), expr::int(b as i64)));
-                    coeffs.push(s[i]);
-                    vars.push(ind);
-                }
-                coeffs.push(-1);
-                vars.push(lb);
-                linear(&mut self.solver, &coeffs, &vars, Relation::Eq, 0);
-            }
+            flatten::post_bin_loads(&mut self.solver, &items, &s, &loadv);
             Ok(())
         });
     }
@@ -1155,9 +1123,9 @@ impl Model {
             Rhs::Const(k) if values.len() == 1 => count(&mut self.solver, vars, values[0], rel, k),
             Rhs::Const(k) => {
                 let y = self.constant(clamp(k));
-                self.count_compare(vars, values, rel, y);
+                flatten::count_values_to_var(&mut self.solver, vars, values, rel, y);
             }
-            Rhs::Var(y) => self.count_compare(vars, values, rel, y),
+            Rhs::Var(y) => flatten::count_values_to_var(&mut self.solver, vars, values, rel, y),
         }
     }
 
@@ -1165,42 +1133,8 @@ impl Model {
         origins.iter().map(|b| b.iter().map(|s| self.var_id(s)).collect()).collect()
     }
 
-    /// Post k-dimensional `noOverlap` (diffn): every pair of boxes is separated
-    /// in at least one dimension. Weak-but-correct pairwise decomposition; with
-    /// `zero_ignored`, a box that is degenerate (length 0 in some dimension)
-    /// imposes no separation. TODO(strong): sweep-based diffn.
     fn post_diffn(&mut self, origins: Vec<Vec<VarId>>, lengths: Vec<Vec<Expr>>, zero_ignored: bool) -> Result<(), String> {
-        let nb = origins.len();
-        if nb != lengths.len() {
-            return Err("noOverlap: origins/lengths length mismatch".to_string());
-        }
-        for i in 0..nb {
-            if origins[i].len() != lengths[i].len() {
-                return Err("noOverlap: box origin/length arity mismatch".to_string());
-            }
-        }
-        for i in 0..nb {
-            for j in (i + 1)..nb {
-                let k = origins[i].len();
-                let mut terms: Vec<Expr> = Vec::with_capacity(2 * k);
-                for d in 0..k {
-                    // i ends before j starts, in dimension d.
-                    terms.push(expr::le(expr::add(vec![expr::var(origins[i][d]), lengths[i][d].clone()]), expr::var(origins[j][d])));
-                    // j ends before i starts, in dimension d.
-                    terms.push(expr::le(expr::add(vec![expr::var(origins[j][d]), lengths[j][d].clone()]), expr::var(origins[i][d])));
-                }
-                if zero_ignored {
-                    for l in &lengths[i] {
-                        terms.push(expr::eq(l.clone(), expr::int(0)));
-                    }
-                    for l in &lengths[j] {
-                        terms.push(expr::eq(l.clone(), expr::int(0)));
-                    }
-                }
-                crate::constraints::intension::intension(&mut self.solver, expr::or(terms));
-            }
-        }
-        Ok(())
+        flatten::post_diffn(&mut self.solver, &origins, &lengths, zero_ignored)
     }
 
     fn post_element(&mut self, array: Vec<VarId>, start_index: i32, index: &str, value: VarId) -> Result<(), String> {
@@ -1248,48 +1182,6 @@ impl Model {
         let y = self.rhs_var(&operand)?;
         linear(&mut self.solver, &[1, -1], &[aux, y], rel, 0);
         Ok(())
-    }
-
-    /// A fresh variable equal to the number of distinct values among `vars`,
-    /// via `nValues = Σ_v [∃i: vars[i] = v]` over the union of domains.
-    fn nvalues_var(&mut self, vars: &[VarId]) -> VarId {
-        let mut vals: Vec<i32> = Vec::new();
-        for &v in vars {
-            vals.extend(self.solver.store.values(v));
-        }
-        vals.sort_unstable();
-        vals.dedup();
-        let mut present = Vec::with_capacity(vals.len());
-        for val in vals {
-            let any = expr::or(vars.iter().map(|&x| expr::eq(expr::var(x), expr::int(val as i64))).collect());
-            present.push(self.aux_for(any));
-        }
-        let n = present.len();
-        let lo = if vars.is_empty() { 0 } else { 1 };
-        let aux = self.solver.new_var_range(lo, n as i32);
-        let mut coeffs = vec![1i64; n];
-        coeffs.push(-1);
-        present.push(aux);
-        linear(&mut self.solver, &coeffs, &present, Relation::Eq, 0);
-        aux
-    }
-
-    /// Post `#{i : vars[i] ∈ values}  rel  y` via reified 0/1 indicators summed
-    /// linearly. Correct for value sets and a variable bound `y`.
-    fn count_compare(&mut self, vars: &[VarId], values: &[i32], rel: Relation, y: VarId) {
-        let mut terms: Vec<VarId> = Vec::with_capacity(vars.len() + 1);
-        for &v in vars {
-            let hit = if values.len() == 1 {
-                expr::eq(expr::var(v), expr::int(values[0] as i64))
-            } else {
-                expr::or(values.iter().map(|&val| expr::eq(expr::var(v), expr::int(val as i64))).collect())
-            };
-            terms.push(self.aux_for(hit));
-        }
-        let mut coeffs = vec![1i64; terms.len()];
-        coeffs.push(-1);
-        terms.push(y);
-        linear(&mut self.solver, &coeffs, &terms, rel, 0);
     }
 
     fn set_var_objective(&mut self, var: &str, minimize: bool) -> Result<(), String> {
@@ -1387,7 +1279,7 @@ impl Model {
                 }
                 obj
             }
-            NValues => self.nvalues_var(&vars),
+            NValues => flatten::nvalues_var(&mut self.solver, &vars),
             _ => return Err("unsupported objective type (product/lex)".to_string()),
         };
         self.objective = Some(Objective::Var(minimize, obj));
