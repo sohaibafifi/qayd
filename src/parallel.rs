@@ -50,12 +50,17 @@ pub(crate) struct ParallelOutcome {
 pub(crate) fn normalize_options(has_objective: bool, var_objective: bool, options: RunOptions) -> RunOptions {
     let options = RunOptions { workers: options.workers.max(1), ..options };
     let workers = if has_objective { options.workers } else { 1 };
-    let probes = if var_objective { options.probes.min(workers.saturating_sub(1)) } else { 0 };
+    if workers == 1 {
+        return RunOptions { workers, split: false, probes: 0, lns: 0, ..options };
+    }
+    let reserved_probe = usize::from(workers > 3 && var_objective);
+    let probes = if var_objective { options.probes.max(reserved_probe).min(workers.saturating_sub(1)) } else { 0 };
+    let reserved_lns = usize::from(workers > 2);
     RunOptions {
         workers,
         split: options.split && var_objective,
         probes,
-        lns: options.lns.min(workers.saturating_sub(probes + 1)),
+        lns: options.lns.max(reserved_lns).min(workers.saturating_sub(probes + 1)),
         ..options
     }
 }
