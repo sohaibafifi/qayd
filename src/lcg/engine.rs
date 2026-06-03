@@ -78,14 +78,12 @@ impl Cdcl<'_> {
         }
     }
 
-    /// Restart to the root once conflicts since the last restart reach `limit`,
-    /// then grow `limit` by ×1.5. Learned clauses and saved phases survive.
-    fn maybe_restart(&mut self, last: &mut u64, limit: &mut u64) -> bool {
-        if self.conflicts - *last >= *limit {
+    /// Restart to the root when the restart policy fires. Learned clauses and
+    /// saved phases survive.
+    fn maybe_restart(&mut self) -> bool {
+        if self.should_restart() {
             self.backjump_to(0);
             self.maybe_reduce_db();
-            *last = self.conflicts;
-            *limit += *limit / 2;
             return self.sync_shared_clauses();
         }
         true
@@ -282,13 +280,12 @@ impl Cdcl<'_> {
         }
         let phase = vec![None; self.solver.store.num_vars()];
         let mut complete = true;
-        let (mut last_restart, mut restart_limit) = (self.conflicts, 100u64);
         let found = loop {
             if stop.load(Ordering::Relaxed) {
                 complete = false;
                 break None;
             }
-            if !self.maybe_restart(&mut last_restart, &mut restart_limit) {
+            if !self.maybe_restart() {
                 break None;
             }
             match self.select_var(vars) {
@@ -377,7 +374,6 @@ impl Cdcl<'_> {
         let mut enforced = None;
         let mut complete = true;
         let conflict_limit = conflict_budget.map(|n| self.conflicts.saturating_add(n));
-        let (mut last_restart, mut restart_limit) = (self.conflicts, 100u64);
         if !self.sync_shared_clauses() {
             stats.failures = self.conflicts;
             stats.learned_lits = self.learned_lits;
@@ -401,7 +397,7 @@ impl Cdcl<'_> {
                     }
                 }
             }
-            if !self.maybe_restart(&mut last_restart, &mut restart_limit) {
+            if !self.maybe_restart() {
                 break;
             }
             match self.select_var(vars) {

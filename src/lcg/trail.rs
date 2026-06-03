@@ -24,6 +24,9 @@ pub const UNSET: u32 = u32::MAX;
 const ROOT_PROBE_MAX_CANDIDATES: usize = 32;
 const ROOT_PROBE_MAX_DOMAIN_SIZE: usize = 16;
 const ROOT_PROBE_MAX_BRANCH_LITS: usize = 512;
+const RESTART_BASE_CONFLICTS: u64 = 256;
+const RESTART_LBD_WINDOW: usize = 128;
+const RESTART_LBD_RATIO: f64 = 1.5;
 
 /// Why an atom became assigned. Drives 1-UIP conflict analysis.
 #[derive(Clone)]
@@ -67,6 +70,88 @@ enum ProbeOutcome {
     Consistent(ProbeBranch),
     Failed,
     RootUnsat,
+}
+
+struct RestartPolicy {
+    due: bool,
+    luby_index: u64,
+    next_luby_conflict: u64,
+    lbd_window: [u32; RESTART_LBD_WINDOW],
+    lbd_window_len: usize,
+    lbd_window_pos: usize,
+    lbd_window_sum: u64,
+    lbd_global_sum: u64,
+    lbd_global_count: u64,
+}
+
+impl RestartPolicy {
+    fn new() -> Self {
+        Self {
+            due: false,
+            luby_index: 1,
+            next_luby_conflict: RESTART_BASE_CONFLICTS,
+            lbd_window: [0; RESTART_LBD_WINDOW],
+            lbd_window_len: 0,
+            lbd_window_pos: 0,
+            lbd_window_sum: 0,
+            lbd_global_sum: 0,
+            lbd_global_count: 0,
+        }
+    }
+
+    fn on_conflict(&mut self, conflicts: u64, lbd: u32) {
+        self.lbd_global_sum += lbd as u64;
+        self.lbd_global_count += 1;
+        if self.lbd_window_len < RESTART_LBD_WINDOW {
+            self.lbd_window[self.lbd_window_len] = lbd;
+            self.lbd_window_len += 1;
+            self.lbd_window_sum += lbd as u64;
+        } else {
+            self.lbd_window_sum -= self.lbd_window[self.lbd_window_pos] as u64;
+            self.lbd_window[self.lbd_window_pos] = lbd;
+            self.lbd_window_sum += lbd as u64;
+            self.lbd_window_pos = (self.lbd_window_pos + 1) % RESTART_LBD_WINDOW;
+        }
+        self.due |= conflicts >= self.next_luby_conflict || self.lbd_window_is_degraded();
+    }
+
+    fn should_restart(&mut self, conflicts: u64) -> bool {
+        if !self.due {
+            return false;
+        }
+        self.due = false;
+        self.luby_index += 1;
+        self.next_luby_conflict = conflicts.saturating_add(RESTART_BASE_CONFLICTS.saturating_mul(luby(self.luby_index)));
+        self.clear_lbd_window();
+        true
+    }
+
+    fn lbd_window_is_degraded(&self) -> bool {
+        if self.lbd_window_len < RESTART_LBD_WINDOW || self.lbd_global_count <= RESTART_LBD_WINDOW as u64 {
+            return false;
+        }
+        let global = self.lbd_global_sum as f64 / self.lbd_global_count as f64;
+        let window = self.lbd_window_sum as f64 / self.lbd_window_len as f64;
+        window > global * RESTART_LBD_RATIO
+    }
+
+    fn clear_lbd_window(&mut self) {
+        self.lbd_window_len = 0;
+        self.lbd_window_pos = 0;
+        self.lbd_window_sum = 0;
+    }
+}
+
+fn luby(mut i: u64) -> u64 {
+    debug_assert!(i > 0);
+    while i > 2 {
+        let msb = 63 - (i + 1).leading_zeros();
+        if (1u64 << msb) == i + 1 {
+            return 1u64 << (msb - 1);
+        }
+        i -= (1u64 << msb) - 1;
+    }
+    1
 }
 
 /// Build `D_S`: the true literals describing a scope's domains
@@ -210,6 +295,8 @@ pub struct Cdcl<'s> {
     pub(crate) conflicts: u64,
     /// Total literals across all learned clauses (numerator of avg learned size).
     pub(crate) learned_lits: u64,
+    /// Restart schedule and LBD moving-average trigger.
+    restart: RestartPolicy,
     /// Optional portfolio clause exchange.
     clause_sharing: Option<ClauseSharing>,
     /// Reused buffer for newly published clauses.
@@ -267,6 +354,7 @@ impl<'s> Cdcl<'s> {
             max_learned: 2000,
             conflicts: 0,
             learned_lits: 0,
+            restart: RestartPolicy::new(),
             clause_sharing: None,
             shared_scratch: Vec::new(),
             cube_scope: Vec::new(),
@@ -818,6 +906,10 @@ impl<'s> Cdcl<'s> {
         }
     }
 
+    pub(crate) fn should_restart(&mut self) -> bool {
+        self.restart.should_restart(self.conflicts)
+    }
+
     /// One bounded root probing pass. For each selected decision literal, both
     /// branches are propagated once. Failed branches become root units; branch
     /// implications become binary clauses; implications common to both branches
@@ -1068,6 +1160,7 @@ impl<'s> Cdcl<'s> {
         self.learned_lits += learnt.len() as u64;
         // LBD measured at learn time, while every literal is still assigned.
         let lbd = self.lbd_of(&learnt);
+        self.restart.on_conflict(self.conflicts, lbd);
         let deletable = learnt.len() >= 2;
         let learnt: Arc<[Lit]> = Arc::from(learnt);
         if let Some(sharing) = &self.clause_sharing {
