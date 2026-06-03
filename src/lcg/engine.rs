@@ -104,7 +104,7 @@ impl Cdcl<'_> {
         F: FnMut(&Solver) -> SearchControl,
     {
         let mut stats = SolveStats::default();
-        if !self.init() {
+        if !self.init() || !self.root_probe(vars) {
             stats.failures = self.conflicts;
             stats.learned_lits = self.learned_lits;
             return stats; // root unsatisfiable
@@ -225,9 +225,7 @@ impl Cdcl<'_> {
 
     /// Assert a non-deletable root unit and propagate it.
     fn assert_root(&mut self, lit: Lit) -> bool {
-        debug_assert_eq!(self.decision_level(), 0);
-        let cref = self.add_clause(vec![lit], false, 0);
-        self.assign(lit, Reason::Clause(cref)).is_ok() && self.propagate_and_learn()
+        self.assert_root_lit(lit)
     }
 
     /// Assert the root units defining one disjoint search cube.
@@ -361,6 +359,11 @@ impl Cdcl<'_> {
         let mut stats = SolveStats::default();
         let mut best: Option<(Vec<i32>, i64)> = None;
         if !self.init() {
+            stats.failures = self.conflicts;
+            stats.learned_lits = self.learned_lits;
+            return (best, stats, true);
+        }
+        if cube.is_empty() && conflict_budget.is_none() && !self.root_probe(vars) {
             stats.failures = self.conflicts;
             stats.learned_lits = self.learned_lits;
             return (best, stats, true);

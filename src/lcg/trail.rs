@@ -4,7 +4,7 @@
 //! records only assignment order and reasons. Backjump truncates the trail and
 //! pops the matching domain-trail levels, rolling truth back with it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -20,6 +20,10 @@ pub(crate) static NEVER_STOP: AtomicBool = AtomicBool::new(false);
 
 /// Sentinel `atom_level` for an unassigned atom.
 pub const UNSET: u32 = u32::MAX;
+
+const ROOT_PROBE_MAX_CANDIDATES: usize = 32;
+const ROOT_PROBE_MAX_DOMAIN_SIZE: usize = 16;
+const ROOT_PROBE_MAX_BRANCH_LITS: usize = 512;
 
 /// Why an atom became assigned. Drives 1-UIP conflict analysis.
 #[derive(Clone)]
@@ -45,6 +49,24 @@ pub enum Conflict {
     /// Propagator failure: these `D_S` literals (all true) are jointly
     /// infeasible; conflict clause is `⋁ ¬D_S`.
     Generic(Vec<Lit>),
+}
+
+struct ProbeDomain {
+    var: VarId,
+    min: i32,
+    max: i32,
+}
+
+#[derive(Default)]
+struct ProbeBranch {
+    lits: Vec<Lit>,
+    domains: Vec<ProbeDomain>,
+}
+
+enum ProbeOutcome {
+    Consistent(ProbeBranch),
+    Failed,
+    RootUnsat,
 }
 
 /// Build `D_S`: the true literals describing a scope's domains
@@ -351,6 +373,13 @@ impl<'s> Cdcl<'s> {
     /// `deletable` marks a reduction-eligible learned clause; `lbd` meaningful only then.
     pub(crate) fn add_clause(&mut self, lits: Vec<Lit>, deletable: bool, lbd: u32) -> ClauseRef {
         self.add_shared_clause(Arc::from(lits), deletable, lbd)
+    }
+
+    /// Assert a non-deletable root unit and propagate it.
+    pub(crate) fn assert_root_lit(&mut self, lit: Lit) -> bool {
+        debug_assert_eq!(self.decision_level(), 0);
+        let cref = self.add_clause(vec![lit], false, 0);
+        self.assign(lit, Reason::Clause(cref)).is_ok() && self.propagate_and_learn()
     }
 
     fn add_shared_clause(&mut self, lits: Arc<[Lit]>, deletable: bool, lbd: u32) -> ClauseRef {
@@ -787,6 +816,197 @@ impl<'s> Cdcl<'s> {
                 }
             }
         }
+    }
+
+    /// One bounded root probing pass. For each selected decision literal, both
+    /// branches are propagated once. Failed branches become root units; branch
+    /// implications become binary clauses; implications common to both branches
+    /// are asserted at the root.
+    pub(crate) fn root_probe(&mut self, vars: &[VarId]) -> bool {
+        debug_assert_eq!(self.decision_level(), 0);
+        if self.stopped() {
+            return true;
+        }
+        let candidates = self.root_probe_candidates(vars);
+        let mut added = HashSet::new();
+        for decision in candidates {
+            if self.stopped() || self.tvalue(decision) != Tri::Unknown {
+                continue;
+            }
+            let left = match self.probe_branch(decision, &mut added) {
+                ProbeOutcome::Consistent(branch) => branch,
+                ProbeOutcome::Failed => {
+                    if !self.assert_root_lit(decision.negate()) {
+                        return false;
+                    }
+                    continue;
+                }
+                ProbeOutcome::RootUnsat => return false,
+            };
+            if self.tvalue(decision) != Tri::Unknown {
+                continue;
+            }
+            let right = match self.probe_branch(decision.negate(), &mut added) {
+                ProbeOutcome::Consistent(branch) => branch,
+                ProbeOutcome::Failed => {
+                    if !self.assert_root_lit(decision) {
+                        return false;
+                    }
+                    continue;
+                }
+                ProbeOutcome::RootUnsat => return false,
+            };
+            if !self.assert_common_probe_lits(&left.lits, &right.lits) || !self.assert_common_probe_bounds(&left.domains, &right.domains) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn root_probe_candidates(&self, vars: &[VarId]) -> Vec<Lit> {
+        let weights = self.solver.weights();
+        let mut scored = Vec::new();
+        for &var in vars {
+            let size = self.solver.store.size(var);
+            if !(2..=ROOT_PROBE_MAX_DOMAIN_SIZE).contains(&size) {
+                continue;
+            }
+            let val = self.solver.store.min(var);
+            let LitOrConst::Lit(lit) = self.atoms.eq(var, val) else {
+                continue;
+            };
+            if self.tvalue(lit) == Tri::Unknown {
+                scored.push((size, std::cmp::Reverse(self.solver.store.var_weight(var, weights)), var, lit));
+            }
+        }
+        scored.sort_unstable_by_key(|&(size, weight, var, _)| (size, weight, var));
+        scored.into_iter().take(ROOT_PROBE_MAX_CANDIDATES).map(|(_, _, _, lit)| lit).collect()
+    }
+
+    fn probe_branch(&mut self, decision: Lit, added: &mut HashSet<(u32, u32)>) -> ProbeOutcome {
+        debug_assert_eq!(self.decision_level(), 0);
+        let root_len = self.trail.len();
+        match self.decide(decision) {
+            Ok(()) => {}
+            Err(_) => {
+                self.backjump_to(0);
+                return ProbeOutcome::Failed;
+            }
+        }
+        if !self.propagate_and_learn() {
+            self.backjump_to(0);
+            return ProbeOutcome::RootUnsat;
+        }
+        if self.decision_level() == 0 {
+            return if self.tvalue(decision) == Tri::False {
+                ProbeOutcome::Failed
+            } else {
+                ProbeOutcome::Consistent(ProbeBranch::default())
+            };
+        }
+        let mut lits: Vec<Lit> =
+            self.trail[root_len..].iter().copied().filter(|&lit| lit != decision).take(ROOT_PROBE_MAX_BRANCH_LITS).collect();
+        lits.sort_unstable_by_key(|lit| lit.code());
+        lits.dedup_by_key(|lit| lit.code());
+        let domains = self.probe_domains(&lits);
+        self.backjump_to(0);
+        if !self.add_probe_implications(decision, &lits, added) {
+            return ProbeOutcome::RootUnsat;
+        }
+        ProbeOutcome::Consistent(ProbeBranch { lits, domains })
+    }
+
+    fn probe_domains(&self, lits: &[Lit]) -> Vec<ProbeDomain> {
+        let mut vars: Vec<VarId> = lits.iter().map(|lit| self.atoms.var_of(lit.atom())).collect();
+        vars.sort_unstable();
+        vars.dedup();
+        vars.into_iter().map(|var| ProbeDomain { var, min: self.solver.store.min(var), max: self.solver.store.max(var) }).collect()
+    }
+
+    fn add_probe_implications(&mut self, decision: Lit, implied: &[Lit], added: &mut HashSet<(u32, u32)>) -> bool {
+        let guard = decision.negate();
+        self.sync_var(self.atoms.var_of(guard.atom()));
+        for &lit in implied {
+            self.sync_var(self.atoms.var_of(lit.atom()));
+            if !self.add_probe_clause(guard, lit, added) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn add_probe_clause(&mut self, guard: Lit, implied: Lit, added: &mut HashSet<(u32, u32)>) -> bool {
+        if guard == implied || self.tvalue(guard) == Tri::True || self.tvalue(implied) == Tri::True {
+            return true;
+        }
+        match (self.tvalue(guard), self.tvalue(implied)) {
+            (Tri::False, Tri::False) => false,
+            (Tri::False, Tri::Unknown) => self.assert_root_lit(implied),
+            (Tri::Unknown, Tri::False) => self.assert_root_lit(guard),
+            (Tri::Unknown, Tri::Unknown) => {
+                if added.insert((guard.code(), implied.code())) {
+                    self.add_clause(vec![guard, implied], true, 2);
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
+    fn assert_common_probe_lits(&mut self, left: &[Lit], right: &[Lit]) -> bool {
+        let mut i = 0;
+        let mut j = 0;
+        while i < left.len() && j < right.len() {
+            match left[i].code().cmp(&right[j].code()) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    let lit = left[i];
+                    self.sync_var(self.atoms.var_of(lit.atom()));
+                    match self.tvalue(lit) {
+                        Tri::True => {}
+                        Tri::Unknown if self.assert_root_lit(lit) => {}
+                        Tri::Unknown | Tri::False => return false,
+                    }
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        true
+    }
+
+    fn assert_common_probe_bounds(&mut self, left: &[ProbeDomain], right: &[ProbeDomain]) -> bool {
+        let mut i = 0;
+        let mut j = 0;
+        while i < left.len() && j < right.len() {
+            match left[i].var.cmp(&right[j].var) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    let var = left[i].var;
+                    let min = left[i].min.min(right[j].min);
+                    let max = left[i].max.max(right[j].max);
+                    if min > self.solver.store.min(var) {
+                        if let LitOrConst::Lit(lit) = self.atoms.ge(var, min) {
+                            if !self.assert_root_lit(lit) {
+                                return false;
+                            }
+                        }
+                    }
+                    if max < self.solver.store.max(var) {
+                        if let LitOrConst::Lit(lit) = self.atoms.ge_i64(var, i64::from(max) + 1) {
+                            if !self.assert_root_lit(lit.negate()) {
+                                return false;
+                            }
+                        }
+                    }
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        true
     }
 
     /// Import clauses published by other workers and propagate their effects.
