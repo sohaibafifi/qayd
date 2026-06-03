@@ -28,3 +28,21 @@ lzma-rs = "0.3.0"
 # Patched fork: cardinality mixed occurs, %N group injection, notin, stray stdout
 # prints. Rev-pinned for reproducibility.
 xcsp3-rust-parser = { git = "https://github.com/sohaibafifi/XCSP3-Rust-Parser", rev = "37c9b7dba7690b702ed188e778876fa712083e7c" }
+
+
+# Cold parse/decompress stack: runs once per instance, never in the solve loop.
+# Build it for size, not speed — keeps the hot solver (qayd, std) at opt-level 3.
+[profile.release.package.regex-automata]
+opt-level = "z"
+[profile.release.package.regex-syntax]
+opt-level = "z"
+[profile.release.package.aho-corasick]
+opt-level = "z"
+[profile.release.package.regex]
+opt-level = "z"
+[profile.release.package.quick-xml]
+opt-level = "z"
+[profile.release.package.xcsp3-rust-parser]
+opt-level = "z"
+[profile.release.package.lzma-rs]
+opt-level = "z"
