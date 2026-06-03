@@ -41,25 +41,62 @@ impl Objective<'_> {
     }
 }
 
+struct ObjectiveImpact {
+    coeffs: Vec<u64>,
+}
+
+impl ObjectiveImpact {
+    fn new(objective: Objective<'_>, nvars: usize) -> Option<Self> {
+        let Objective::Linear { coeffs, vars } = objective else {
+            return None;
+        };
+        let mut impact = vec![0u64; nvars];
+        for (&coeff, &var) in coeffs.iter().zip(vars) {
+            impact[var.index()] = impact[var.index()].saturating_add(coeff.unsigned_abs());
+        }
+        impact.iter().any(|&coeff| coeff > 0).then_some(Self { coeffs: impact })
+    }
+
+    fn score(&self, solver: &Solver, var: VarId) -> u128 {
+        let coeff = self.coeffs[var.index()] as u128;
+        if coeff == 0 {
+            return 0;
+        }
+        let width = i64::from(solver.store.max(var)) - i64::from(solver.store.min(var));
+        coeff.saturating_mul(width.max(0) as u128)
+    }
+}
+
 impl Cdcl<'_> {
     /// Branching heuristic: unfixed variable minimising `size / (wdeg + activity)`
     /// (dom/wdeg combined with VSIDS activity), or `None` if all fixed.
-    fn select_var(&self, vars: &[VarId]) -> Option<VarId> {
+    fn select_var(&self, vars: &[VarId], objective: Option<&ObjectiveImpact>) -> Option<VarId> {
         let weights = self.solver.weights();
         let mut best: Option<VarId> = None;
         let mut best_score = f64::INFINITY;
+        let mut best_objective: Option<VarId> = None;
+        let mut best_objective_impact = 0u128;
+        let mut best_objective_score = f64::INFINITY;
         for &v in vars {
             let size = self.solver.store.size(v);
             if size > 1 {
                 let wdeg = self.solver.store.var_weight(v, weights) as f64;
                 let score = size as f64 / (wdeg + self.activity[v.index()]);
+                if let Some(objective) = objective {
+                    let impact = objective.score(self.solver, v);
+                    if impact > best_objective_impact || (impact == best_objective_impact && impact > 0 && score < best_objective_score) {
+                        best_objective_impact = impact;
+                        best_objective_score = score;
+                        best_objective = Some(v);
+                    }
+                }
                 if score < best_score {
                     best_score = score;
                     best = Some(v);
                 }
             }
         }
-        best
+        best_objective.or(best)
     }
 
     /// The decision literal for `v`: `[v = p]` toward the saved phase `p` when
@@ -113,7 +150,7 @@ impl Cdcl<'_> {
                 break;
             }
             match self.propagate() {
-                Ok(()) => match self.select_var(vars) {
+                Ok(()) => match self.select_var(vars, None) {
                     None => {
                         // Full assignment.
                         for &v in vars {
@@ -260,7 +297,7 @@ impl Cdcl<'_> {
             return None;
         }
         let phase = vec![None; self.solver.store.num_vars()];
-        self.select_var(vars).map(|v| self.decision_lit(v, &phase))
+        self.select_var(vars, None).map(|v| self.decision_lit(v, &phase))
     }
 
     /// Find one solution under an optimistic objective bound.
@@ -288,7 +325,7 @@ impl Cdcl<'_> {
             if !self.maybe_restart() {
                 break None;
             }
-            match self.select_var(vars) {
+            match self.select_var(vars, None) {
                 None => {
                     stats.solutions += 1;
                     let value = self.solver.store.value(obj);
@@ -371,6 +408,7 @@ impl Cdcl<'_> {
             return (best, stats, true);
         }
         let mut phase: Vec<Option<i32>> = vec![None; self.solver.store.num_vars()];
+        let objective_impact = ObjectiveImpact::new(objective, self.solver.store.num_vars());
         let mut enforced = None;
         let mut complete = true;
         let conflict_limit = conflict_budget.map(|n| self.conflicts.saturating_add(n));
@@ -400,7 +438,7 @@ impl Cdcl<'_> {
             if !self.maybe_restart() {
                 break;
             }
-            match self.select_var(vars) {
+            match self.select_var(vars, objective_impact.as_ref()) {
                 None => {
                     if !self.accept_solution(vars, objective, minimizing, &mut best, &mut enforced, &mut phase, &mut stats, &mut on_improve)
                     {

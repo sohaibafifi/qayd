@@ -90,7 +90,14 @@ fn stage_xml(xml: &str) -> Result<StagedXml, String> {
 #[derive(Clone)]
 struct SolutionOutput {
     names: Vec<String>,
-    entries: Vec<Option<usize>>,
+    entries: Vec<SolutionEntry>,
+}
+
+#[derive(Clone, Copy)]
+enum SolutionEntry {
+    Star,
+    Search(usize),
+    Fixed(i32),
 }
 
 impl SolutionOutput {
@@ -100,9 +107,36 @@ impl SolutionOutput {
         write_tokens(w, &self.names)?;
         writeln!(w, "v </list>")?;
         writeln!(w, "v <values>")?;
-        write_tokens(w, self.entries.iter().map(|&position| position.map_or_else(|| "*".to_string(), |i| solution[i].to_string())))?;
+        write_tokens(
+            w,
+            self.entries.iter().map(|entry| match *entry {
+                SolutionEntry::Star => "*".to_string(),
+                SolutionEntry::Search(i) => solution[i].to_string(),
+                SolutionEntry::Fixed(value) => value.to_string(),
+            }),
+        )?;
         writeln!(w, "v </values>")?;
         writeln!(w, "v </instantiation>")
+    }
+
+    fn remap_after_presolve(&mut self, old_search: &[VarId], problem: &Problem) {
+        let mut positions = vec![None; problem.solver.store.num_vars()];
+        for (i, &var) in problem.search.iter().enumerate() {
+            positions[var.index()] = Some(i);
+        }
+        for entry in &mut self.entries {
+            let SolutionEntry::Search(old_position) = *entry else {
+                continue;
+            };
+            let var = old_search[old_position];
+            *entry = if let Some(new_position) = positions[var.index()] {
+                SolutionEntry::Search(new_position)
+            } else if problem.solver.store.is_fixed(var) {
+                SolutionEntry::Fixed(problem.solver.store.value(var))
+            } else {
+                SolutionEntry::Star
+            };
+        }
     }
 }
 
@@ -142,7 +176,14 @@ fn parse_problem(path: &Path) -> Result<XcspProblem, String> {
     for (i, &var) in search.iter().enumerate() {
         positions[var.index()] = Some(i);
     }
-    let (names, entries) = model.declared.iter().map(|(name, var)| (name.clone(), positions[var.index()])).unzip();
+    let (names, entries) = model
+        .declared
+        .iter()
+        .map(|(name, var)| {
+            let entry = positions[var.index()].map_or(SolutionEntry::Star, SolutionEntry::Search);
+            (name.clone(), entry)
+        })
+        .unzip();
     let output = SolutionOutput { names, entries };
     let problem = Problem { solver: model.solver, search, objective: model.objective };
     Ok(XcspProblem { problem, output })
@@ -168,11 +209,14 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
     let start = Instant::now();
     let options = RunOptions { workers: options.workers.max(1), ..options };
     let path = stage_xml(xml)?;
-    let xcsp = parse_problem(&path.0)?;
+    let mut xcsp = parse_problem(&path.0)?;
     let has_objective = xcsp.problem.objective.is_some();
     let var_objective = xcsp.problem.var_objective().is_some();
     let symbolic_probes_disabled = has_objective && !var_objective && options.probes > 0;
     let options = normalize_options(has_objective, var_objective, options);
+    let old_search = xcsp.problem.search.clone();
+    let presolve = xcsp.problem.presolve(stop);
+    xcsp.output.remap_after_presolve(&old_search, &xcsp.problem);
     let to_err = |e: std::io::Error| e.to_string();
 
     if verbose {
@@ -187,9 +231,26 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
         writeln!(w, "c seed {}", options.seed).map_err(to_err)?;
         writeln!(w, "c workers {} ({})", options.workers, worker_roles(has_objective, options)).map_err(to_err)?;
         writeln!(w, "c split {}", options.split).map_err(to_err)?;
+        writeln!(w, "c presolve fixed {} search {} -> {}", presolve.fixed, presolve.search_before, presolve.search_after)
+            .map_err(to_err)?;
         if symbolic_probes_disabled {
             writeln!(w, "c probes disabled (probe worker only supports a materialized objective variable)").map_err(to_err)?;
         }
+    }
+
+    if presolve.failed || presolve.stopped {
+        if verbose {
+            writeln!(w, "c nodes 0 failures {}", usize::from(presolve.failed)).map_err(to_err)?;
+        }
+        writeln!(w, "{}", if presolve.failed { "s UNSATISFIABLE" } else { "s UNKNOWN" }).map_err(to_err)?;
+        if verbose {
+            if stop.load(Ordering::Relaxed) {
+                writeln!(w, "c interrupted").map_err(to_err)?;
+            }
+            writeln!(w, "c time {:.3}s", start.elapsed().as_secs_f64()).map_err(to_err)?;
+        }
+        w.flush().map_err(to_err)?;
+        return Ok(());
     }
 
     if options.workers == 1 || !has_objective {
