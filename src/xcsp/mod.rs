@@ -85,6 +85,22 @@ fn write_improvement<W: Write>(w: &mut W, verbose: bool, error: &mut Option<std:
     }
 }
 
+fn worker_roles(has_objective: bool, options: RunOptions) -> String {
+    if !has_objective || options.workers == 1 {
+        return "sequential 1".to_string();
+    }
+    let regular = options.workers - options.probes - options.lns;
+    let mut roles = Vec::new();
+    roles.push(format!("{} {regular}", if options.split { "split" } else { "portfolio" }));
+    if options.lns > 0 {
+        roles.push(format!("lns {}", options.lns));
+    }
+    if options.probes > 0 {
+        roles.push(format!("probe {}", options.probes));
+    }
+    roles.join(", ")
+}
+
 fn write_optimization_result<W: Write>(
     w: &mut W,
     output: &SolutionOutput,
@@ -441,15 +457,11 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
         writeln!(w, "c search variables {}", problem.search.len()).map_err(to_err)?;
         writeln!(w, "c propagators {}", problem.solver.num_propagators()).map_err(to_err)?;
         writeln!(w, "c seed {}", options.seed).map_err(to_err)?;
-        writeln!(w, "c workers {}", options.workers).map_err(to_err)?;
+        writeln!(w, "c workers {} ({})", options.workers, worker_roles(has_objective, options)).map_err(to_err)?;
         writeln!(w, "c split {}", options.split).map_err(to_err)?;
         if symbolic_probes_disabled {
-            writeln!(w, "c probes 0 (probe worker only supports a materialized objective variable)").map_err(to_err)?;
-        } else {
-            writeln!(w, "c probes {}", options.probes).map_err(to_err)?;
-        }
-        writeln!(w, "c lns {}", options.lns).map_err(to_err)?;
-        w.flush().map_err(to_err)?;
+            writeln!(w, "c probes disabled (probe worker only supports a materialized objective variable)").map_err(to_err)?;
+        } 
     }
 
     if options.workers == 1 || !has_objective {
