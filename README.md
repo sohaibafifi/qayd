@@ -62,7 +62,7 @@ cargo test
 ## Solve an instance
 
 ```bash
-qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] [--probe N] [--lns N] <instance.xml[.lzma|.xz]>
+qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] [--probe N] [--lns N] [--learn-csp] <instance.xml[.lzma|.xz]>
 ```
 
 - `-h`, `--help` prints the usage.
@@ -73,6 +73,7 @@ qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] [--probe N] [--
 - `--split` divides COP proof search into disjoint jobs for worker stealing.
 - `--probe N` dedicates up to `N` COP workers to optimistic objective probes.
 - `--lns N` dedicates up to `N` COP workers to bounded Large Neighborhood Search.
+- `--learn-csp` uses CDCL learning and restarts for CSP find-one/UNSAT solving.
 
 ## As a library
 

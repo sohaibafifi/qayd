@@ -99,6 +99,15 @@ where
     cdcl.enumerate(vars, on_solution, stop)
 }
 
+/// Find one solution over `vars`, or prove UNSAT, with CDCL learning and restarts.
+/// This is not an enumeration driver: it does not count or block all solutions.
+pub(crate) fn decide_sat_seeded(solver: &mut Solver, vars: &[VarId], stop: &AtomicBool, seed: u64) -> (Option<Vec<i32>>, SolveStats, bool) {
+    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, None) else {
+        return (None, SolveStats::default(), false);
+    };
+    cdcl.decide_sat(vars, stop)
+}
+
 /// Find the first solution, returning the values of `vars`.
 pub fn first_solution(solver: &mut Solver, vars: &[VarId]) -> Option<Vec<i32>> {
     let mut found = None;

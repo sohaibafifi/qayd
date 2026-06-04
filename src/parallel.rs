@@ -27,11 +27,13 @@ pub struct RunOptions {
     pub probes: usize,
     /// Number of workers dedicated to incumbent-driven LNS.
     pub lns: usize,
+    /// Use CDCL learning for CSP find-one/UNSAT solving.
+    pub learn_csp: bool,
 }
 
 impl Default for RunOptions {
     fn default() -> Self {
-        Self { seed: 0, workers: 1, split: false, probes: 0, lns: 0 }
+        Self { seed: 0, workers: 1, split: false, probes: 0, lns: 0, learn_csp: false }
     }
 }
 

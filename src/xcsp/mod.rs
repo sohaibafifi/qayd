@@ -14,7 +14,7 @@ use xcsp3_rust_parser::xcsp_runner::XcspRunner;
 use crate::ids::VarId;
 use crate::parallel::{normalize_options, solve_cop, worker_roles, ParallelOutcome};
 use crate::problem::{Objective, Problem};
-use crate::search::{optimize_seeded, solve_interruptible_seeded, SearchControl, SolveStats};
+use crate::search::{decide_sat_seeded, optimize_seeded, solve_interruptible_seeded, SearchControl, SolveStats};
 
 pub use crate::parallel::RunOptions;
 
@@ -238,6 +238,9 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
         writeln!(w, "c propagators {}", xcsp.problem.solver.num_propagators()).map_err(to_err)?;
         writeln!(w, "c seed {}", options.seed).map_err(to_err)?;
         writeln!(w, "c workers {} ({})", options.workers, worker_roles(has_objective, options)).map_err(to_err)?;
+        if !has_objective && options.learn_csp {
+            writeln!(w, "c csp learning true").map_err(to_err)?;
+        }
         writeln!(w, "c split {}", options.split).map_err(to_err)?;
         if presolve.failed {
             writeln!(w, "c presolve failed").map_err(to_err)?;
@@ -268,7 +271,7 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
     }
 
     if options.workers == 1 || !has_objective {
-        solve_single(xcsp, verbose, stop, w, options.seed)?;
+        solve_single(xcsp, verbose, stop, w, options.seed, options.learn_csp)?;
     } else {
         let XcspProblem { problem, output } = xcsp;
         let result = solve_cop(problem, verbose, stop, w, options)?;
@@ -285,7 +288,14 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
     Ok(())
 }
 
-fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w: &mut W, seed: u64) -> Result<(), String> {
+fn solve_single<W: Write>(
+    xcsp: XcspProblem,
+    verbose: bool,
+    stop: &AtomicBool,
+    w: &mut W,
+    seed: u64,
+    learn_csp: bool,
+) -> Result<(), String> {
     let XcspProblem { problem, output } = xcsp;
     let mut solver = problem.solver;
     let vars = problem.search;
@@ -293,18 +303,22 @@ fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w
 
     match problem.objective {
         None => {
-            let mut sol = None;
-            let stats = solve_interruptible_seeded(
-                &mut solver,
-                &vars,
-                |s| {
-                    let active = vars.iter().map(|&v| s.store.value(v)).collect::<Vec<_>>();
-                    sol = Some(active);
-                    SearchControl::Stop
-                },
-                stop,
-                seed,
-            );
+            let (sol, stats, complete) = if learn_csp {
+                decide_sat_seeded(&mut solver, &vars, stop, seed)
+            } else {
+                let mut found = None;
+                let stats = solve_interruptible_seeded(
+                    &mut solver,
+                    &vars,
+                    |s| {
+                        found = Some(vars.iter().map(|&v| s.store.value(v)).collect::<Vec<_>>());
+                        SearchControl::Stop
+                    },
+                    stop,
+                    seed,
+                );
+                (found, stats, !stop.load(Ordering::Relaxed))
+            };
             if verbose {
                 writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(to_err)?;
                 write_inprocessing_stats(w, stats).map_err(to_err)?;
@@ -314,7 +328,7 @@ fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w
                     writeln!(w, "s SATISFIABLE").map_err(to_err)?;
                     output.write(w, &s).map_err(to_err)?;
                 }
-                None if stop.load(Ordering::Relaxed) => writeln!(w, "s UNKNOWN").map_err(to_err)?,
+                None if !complete => writeln!(w, "s UNKNOWN").map_err(to_err)?,
                 None => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
             }
             Ok(())

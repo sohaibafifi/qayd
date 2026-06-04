@@ -459,4 +459,43 @@ impl Cdcl<'_> {
         self.copy_inprocessing_stats(&mut stats);
         (best, stats, complete)
     }
+
+    /// CDCL decision driver for CSP: find one solution or prove UNSAT.
+    /// It never posts solution-blocking clauses, so learned clauses remain
+    /// consequences of the model. Use enumeration for counting/all-solutions.
+    pub(crate) fn decide_sat(&mut self, vars: &[VarId], stop: &AtomicBool) -> (Option<Vec<i32>>, SolveStats, bool) {
+        let mut stats = SolveStats::default();
+        if !self.init() || !self.root_probe(vars) || !self.sync_shared_clauses() {
+            stats.failures = self.conflicts;
+            self.copy_inprocessing_stats(&mut stats);
+            return (None, stats, true);
+        }
+        let mut complete = true;
+        let solution = loop {
+            if stop.load(Ordering::Relaxed) {
+                complete = false;
+                break None;
+            }
+            if !self.maybe_restart() {
+                break None;
+            }
+            match self.select_var(vars, None) {
+                None => {
+                    stats.solutions += 1;
+                    break Some(vars.iter().map(|&v| self.solver.store.value(v)).collect());
+                }
+                Some(v) => {
+                    stats.nodes += 1;
+                    let lit = self.decision_lit(v, &self.saved_phase);
+                    self.decide(lit).expect("in-domain decision cannot fail");
+                    if !self.propagate_and_learn() {
+                        break None;
+                    }
+                }
+            }
+        };
+        stats.failures = self.conflicts;
+        self.copy_inprocessing_stats(&mut stats);
+        (solution, stats, complete)
+    }
 }

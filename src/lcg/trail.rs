@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::ids::VarId;
 use crate::lcg::clause::{ClauseDb, ClauseRef, ClauseSharing, SharedClause};
-use crate::lcg::lit::{Atom, AtomTable, LazyAtomRegistry, Lit, LitOrConst};
+use crate::lcg::lit::{Atom, AtomKind, AtomTable, LazyAtomRegistry, Lit, LitOrConst};
 use crate::lcg::view::{self, Tri};
 use crate::propagator::Inconsistency;
 use crate::store::{Cause, DomEvent, Premise, ScopeVar, Solver, StepOutcome};
@@ -314,6 +314,8 @@ pub struct Cdcl<'s> {
     cube_scope: Vec<Lit>,
     /// Negated objective bound prepended to exported learned clauses.
     bound_scope: Option<Lit>,
+    /// Last value recorded when a variable is unassigned by backjumping.
+    pub(crate) saved_phase: Vec<Option<i32>>,
 }
 
 impl<'s> Cdcl<'s> {
@@ -370,6 +372,7 @@ impl<'s> Cdcl<'s> {
             shared_scratch: Vec::new(),
             cube_scope: Vec::new(),
             bound_scope: None,
+            saved_phase: vec![None; nvars],
         }
     }
 
@@ -1427,6 +1430,11 @@ impl<'s> Cdcl<'s> {
             self.atom_trail_pos[a] = usize::MAX;
             self.atom_reason[a] = Reason::Unset;
             self.tval[a] = Tri::Unknown;
+            if lit.is_positive() {
+                if let AtomKind::Eq { var, v } = self.atoms.decode(lit.atom()) {
+                    self.saved_phase[var.index()] = Some(v);
+                }
+            }
         }
         self.level_starts.truncate(d + 1);
         for _ in 0..(cur - d) {
