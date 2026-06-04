@@ -27,6 +27,11 @@ const ROOT_PROBE_MAX_BRANCH_LITS: usize = 512;
 const RESTART_BASE_CONFLICTS: u64 = 256;
 const RESTART_LBD_WINDOW: usize = 128;
 const RESTART_LBD_RATIO: f64 = 1.5;
+const VIVIFY_MIN_LEN: usize = 3;
+const VIVIFY_MAX_LEN: usize = 8;
+const VIVIFY_MAX_LBD: u32 = 4;
+const VIVIFY_MAX_REMOVED: usize = 2;
+const VIVIFY_MAX_VARS: usize = 50_000;
 
 /// Why an atom became assigned. Drives 1-UIP conflict analysis.
 #[derive(Clone)]
@@ -295,6 +300,10 @@ pub struct Cdcl<'s> {
     pub(crate) conflicts: u64,
     /// Total literals across all learned clauses (numerator of avg learned size).
     pub(crate) learned_lits: u64,
+    /// Learned clauses shortened by CP-aware vivification.
+    pub(crate) vivified_clauses: u64,
+    /// Literals removed by CP-aware vivification.
+    pub(crate) vivified_lits: u64,
     /// Restart schedule and LBD moving-average trigger.
     restart: RestartPolicy,
     /// Optional portfolio clause exchange.
@@ -354,6 +363,8 @@ impl<'s> Cdcl<'s> {
             max_learned: 2000,
             conflicts: 0,
             learned_lits: 0,
+            vivified_clauses: 0,
+            vivified_lits: 0,
             restart: RestartPolicy::new(),
             clause_sharing: None,
             shared_scratch: Vec::new(),
@@ -454,6 +465,12 @@ impl<'s> Cdcl<'s> {
         levels.sort_unstable();
         levels.dedup();
         levels.len() as u32
+    }
+
+    pub(crate) fn copy_inprocessing_stats(&self, stats: &mut crate::search::SolveStats) {
+        stats.learned_lits = self.learned_lits;
+        stats.vivified_clauses = self.vivified_clauses;
+        stats.vivified_lits = self.vivified_lits;
     }
 
     /// Add a clause and watch two non-false literals when possible. Clauses with
@@ -1149,14 +1166,89 @@ impl<'s> Cdcl<'s> {
         self.resolve_conflict(Conflict::Clause(cref))
     }
 
+    fn vivify_learned(&mut self, learnt: &mut Vec<Lit>) {
+        if learnt.len() < VIVIFY_MIN_LEN
+            || learnt.len() > VIVIFY_MAX_LEN
+            || self.lbd_of(learnt) > VIVIFY_MAX_LBD
+            || self.solver.store.num_vars() > VIVIFY_MAX_VARS
+        {
+            return;
+        }
+
+        let mut checker = self.root_solver_clone();
+        let mut removed = 0usize;
+        let mut i = 1; // keep the asserting literal
+        while i < learnt.len() && removed < VIVIFY_MAX_REMOVED {
+            if self.cp_refutes_without(&mut checker, learnt, i) {
+                learnt.remove(i);
+                removed += 1;
+            } else {
+                i += 1;
+            }
+        }
+        if removed > 0 {
+            self.vivified_clauses += 1;
+            self.vivified_lits += removed as u64;
+        }
+    }
+
+    fn root_solver_clone(&self) -> Solver {
+        let mut solver = self.solver.clone();
+        while solver.store.level() > 0 {
+            solver.store.pop_level();
+        }
+        solver.store.clear_queue();
+        solver.store.events.clear();
+        solver.store.clear_pending();
+        solver
+    }
+
+    fn cp_refutes_without(&self, solver: &mut Solver, clause: &[Lit], skip: usize) -> bool {
+        solver.store.push_level();
+        solver.store.clear_queue();
+        solver.store.events.clear();
+        solver.store.clear_pending();
+
+        let mut refuted = false;
+        for (i, &lit) in clause.iter().enumerate() {
+            if i == skip {
+                continue;
+            }
+            match view::lit_value(&solver.store, &self.atoms, lit) {
+                Tri::False => {}
+                Tri::True => {
+                    refuted = true;
+                    break;
+                }
+                Tri::Unknown => {
+                    if view::apply(&mut solver.store, &self.atoms, lit.negate()).is_err() {
+                        refuted = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !refuted {
+            refuted = solver.propagate().is_err();
+        }
+
+        solver.store.clear_queue();
+        solver.store.events.clear();
+        solver.store.clear_pending();
+        solver.store.pop_level();
+        refuted
+    }
+
     /// Analyse `conflict`, backjump, learn the 1-UIP clause and assert it. `false`
     /// if the conflict proves UNSAT. Also used to inject an externally-detected
     /// conflict (a falsified blocking clause after enumerating a solution).
     pub(crate) fn resolve_conflict(&mut self, conflict: Conflict) -> bool {
         self.conflicts += 1;
-        let Some((learnt, btlevel)) = self.analyze(conflict) else {
+        let Some((mut learnt, _)) = self.analyze(conflict) else {
             return false;
         };
+        self.vivify_learned(&mut learnt);
+        let btlevel = learnt[1..].iter().map(|l| self.level_of(l.atom()) as usize).max().unwrap_or(0);
         self.learned_lits += learnt.len() as u64;
         // LBD measured at learn time, while every literal is still assigned.
         let lbd = self.lbd_of(&learnt);

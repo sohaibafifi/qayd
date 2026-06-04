@@ -41,7 +41,8 @@ Priorities, in order: **correct, then simple, then fast.**
   reduction, [dom/wdeg](https://dl.acm.org/doi/10.5555/3000001.3000033),
   [VSIDS](https://doi.org/10.1145/378239.379017), phase saving, and restarts.
   Sparse domains allocate atoms by support; wide domains allocate shared atoms
-  on demand.
+  on demand. Short learned clauses are strengthened by budgeted CP-aware
+  vivification through the global propagators.
 - **COP and parallel search.** Branch-and-bound keeps wide linear and expression
   objectives symbolic. Opt-in portfolio workers share incumbents; workers with
   materialized objectives also share short low-LBD clauses. `--split` enables

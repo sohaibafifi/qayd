@@ -258,6 +258,8 @@ fn merge_stats(total: &mut SolveStats, part: SolveStats) {
     total.nodes += part.nodes;
     total.failures += part.failures;
     total.learned_lits += part.learned_lits;
+    total.vivified_clauses += part.vivified_clauses;
+    total.vivified_lits += part.vivified_lits;
 }
 
 fn run_probe_worker(

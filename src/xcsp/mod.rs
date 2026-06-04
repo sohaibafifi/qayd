@@ -65,6 +65,7 @@ fn write_optimization_result<W: Write>(
     let to_err = |e: std::io::Error| e.to_string();
     if verbose {
         writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(to_err)?;
+        write_inprocessing_stats(w, stats).map_err(to_err)?;
     }
     match best {
         Some((solution, value)) => {
@@ -76,6 +77,13 @@ fn write_optimization_result<W: Write>(
         }
         None if interrupted => writeln!(w, "s UNKNOWN").map_err(to_err)?,
         None => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
+    }
+    Ok(())
+}
+
+fn write_inprocessing_stats<W: Write>(w: &mut W, stats: SolveStats) -> std::io::Result<()> {
+    if stats.vivified_clauses > 0 {
+        writeln!(w, "c inprocessing vivified {} removed {}", stats.vivified_clauses, stats.vivified_lits)?;
     }
     Ok(())
 }
@@ -299,6 +307,7 @@ fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w
             );
             if verbose {
                 writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(to_err)?;
+                write_inprocessing_stats(w, stats).map_err(to_err)?;
             }
             match sol {
                 Some(s) => {
@@ -330,6 +339,7 @@ fn write_parallel_result<W: Write>(w: &mut W, output: &SolutionOutput, result: P
     let to_err = |e: std::io::Error| e.to_string();
     if verbose {
         writeln!(w, "c nodes {} failures {}", result.stats.nodes, result.stats.failures).map_err(to_err)?;
+        write_inprocessing_stats(w, result.stats).map_err(to_err)?;
         writeln!(w, "c shared clauses {} imported {}", result.shared_clauses, result.imported_clauses).map_err(to_err)?;
         if let Some((split, completed)) = result.split_jobs {
             writeln!(w, "c split jobs {split} completed {completed}").map_err(to_err)?;

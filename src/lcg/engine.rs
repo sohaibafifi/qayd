@@ -141,7 +141,7 @@ impl Cdcl<'_> {
         let mut stats = SolveStats::default();
         if !self.init() || !self.root_probe(vars) {
             stats.failures = self.conflicts;
-            stats.learned_lits = self.learned_lits;
+            self.copy_inprocessing_stats(&mut stats);
             return stats; // root unsatisfiable
         }
         let mut phase: Vec<Option<i32>> = vec![None; self.solver.store.num_vars()];
@@ -178,7 +178,7 @@ impl Cdcl<'_> {
                 }
             }
         }
-        stats.learned_lits = self.learned_lits;
+        self.copy_inprocessing_stats(&mut stats);
         stats
     }
 
@@ -312,7 +312,7 @@ impl Cdcl<'_> {
         let mut stats = SolveStats::default();
         if !self.init() || !self.assume_objective_bound(obj, target, minimizing) || !self.sync_shared_clauses() {
             stats.failures = self.conflicts;
-            stats.learned_lits = self.learned_lits;
+            self.copy_inprocessing_stats(&mut stats);
             return (None, stats, true);
         }
         let phase = vec![None; self.solver.store.num_vars()];
@@ -343,7 +343,7 @@ impl Cdcl<'_> {
             }
         };
         stats.failures = self.conflicts;
-        stats.learned_lits = self.learned_lits;
+        self.copy_inprocessing_stats(&mut stats);
         (found, stats, complete)
     }
 
@@ -394,17 +394,17 @@ impl Cdcl<'_> {
         let mut best: Option<(Vec<i32>, i64)> = None;
         if !self.init() {
             stats.failures = self.conflicts;
-            stats.learned_lits = self.learned_lits;
+            self.copy_inprocessing_stats(&mut stats);
             return (best, stats, true);
         }
         if cube.is_empty() && conflict_budget.is_none() && !self.root_probe(vars) {
             stats.failures = self.conflicts;
-            stats.learned_lits = self.learned_lits;
+            self.copy_inprocessing_stats(&mut stats);
             return (best, stats, true);
         }
         if !self.assume_cube(cube) {
             stats.failures = self.conflicts;
-            stats.learned_lits = self.learned_lits;
+            self.copy_inprocessing_stats(&mut stats);
             return (best, stats, true);
         }
         let mut phase: Vec<Option<i32>> = vec![None; self.solver.store.num_vars()];
@@ -414,7 +414,7 @@ impl Cdcl<'_> {
         let conflict_limit = conflict_budget.map(|n| self.conflicts.saturating_add(n));
         if !self.sync_shared_clauses() {
             stats.failures = self.conflicts;
-            stats.learned_lits = self.learned_lits;
+            self.copy_inprocessing_stats(&mut stats);
             return (best, stats, true);
         }
 
@@ -456,7 +456,7 @@ impl Cdcl<'_> {
             }
         }
         stats.failures = self.conflicts;
-        stats.learned_lits = self.learned_lits;
+        self.copy_inprocessing_stats(&mut stats);
         (best, stats, complete)
     }
 }

@@ -37,6 +37,10 @@ pub struct SolveStats {
     pub failures: u64,
     /// Total literals across all learned clauses (CDCL search only).
     pub learned_lits: u64,
+    /// Learned clauses shortened by CP-aware vivification.
+    pub vivified_clauses: u64,
+    /// Literals removed by CP-aware vivification.
+    pub vivified_lits: u64,
 }
 
 /// Materialized or symbolic objective evaluated by the CDCL optimizer.
