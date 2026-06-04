@@ -45,6 +45,14 @@ fn ones(n: usize) -> Vec<i64> {
     vec![1; n]
 }
 
+fn sorted_values(values: impl IntoIterator<Item = i32>) -> Result<Vec<i32>, String> {
+    let mut values: Vec<i32> = values.into_iter().collect();
+    values.sort_unstable();
+    values.dedup();
+    require(!values.is_empty(), "empty set condition")?;
+    Ok(values)
+}
+
 struct ArrayDecl {
     shape: Vec<usize>,
     cells: Vec<VarId>,
@@ -68,6 +76,16 @@ pub struct Model {
 enum Rhs {
     Const(i64),
     Var(VarId),
+}
+
+#[derive(Clone, Copy)]
+struct MatrixAccess<'a> {
+    rows: usize,
+    cols: usize,
+    row_index: &'a str,
+    col_index: &'a str,
+    start_row_index: i32,
+    start_col_index: i32,
 }
 
 impl Model {
@@ -188,6 +206,13 @@ impl Model {
         })
     }
 
+    fn var_or_constant(&mut self, s: &str) -> Result<VarId, String> {
+        match s.parse::<i32>() {
+            Ok(v) => Ok(self.constant(v)),
+            Err(_) => self.var_id(s),
+        }
+    }
+
     /// Decode a condition `(operator, operand)` into the relations to post.
     /// An `(in, lo..hi)` interval becomes two bounds; `(notin, …)` and set
     /// operands are unsupported.
@@ -204,8 +229,17 @@ impl Model {
 
     /// Post `Σ coeffs·vars  (operator)  operand`, expanding interval conditions.
     fn post_sum(&mut self, coeffs: Vec<i64>, vars: Vec<VarId>, operator: ROp, operand: Operand) -> Result<(), String> {
-        for (rel, rhs) in self.conditions(operator, operand)? {
-            self.post_linear(coeffs.clone(), vars.clone(), rel, rhs)?;
+        match (operator, operand) {
+            (ROp::In, Operand::SetInteger(set)) => {
+                let allowed = sorted_values(set)?;
+                let y = self.solver.new_var_set(&allowed);
+                self.post_linear(coeffs, vars, Relation::Eq, Rhs::Var(y))?;
+            }
+            (operator, operand) => {
+                for (rel, rhs) in self.conditions(operator, operand)? {
+                    self.post_linear(coeffs.clone(), vars.clone(), rel, rhs)?;
+                }
+            }
         }
         Ok(())
     }
@@ -220,6 +254,36 @@ impl Model {
         let vars = self.tree_vars(list)?;
         let coeffs = coeffs.map(i64s).unwrap_or_else(|| ones(vars.len()));
         self.post_sum(coeffs, vars, operator, operand)
+    }
+
+    fn post_count_condition(&mut self, vars: &[VarId], values: &[i32], operator: ROp, operand: Operand) -> Result<(), String> {
+        match (operator, operand) {
+            (ROp::In, Operand::SetInteger(set)) => {
+                let allowed = sorted_values(set)?;
+                let y = self.solver.new_var_set(&allowed);
+                self.post_count(vars, values, Relation::Eq, Rhs::Var(y));
+            }
+            (operator, operand) => {
+                for (rel, rhs) in self.conditions(operator, operand)? {
+                    self.post_count(vars, values, rel, rhs);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn post_lex_rows(&mut self, lists: &[Vec<String>], operator: ROp) -> Result<(), String> {
+        let mut rows = Vec::with_capacity(lists.len());
+        for l in lists {
+            rows.push(self.scope(l)?);
+        }
+        let rel = Model::rel(operator)?;
+        let strict = matches!(rel, Relation::Lt | Relation::Gt);
+        if matches!(rel, Relation::Gt | Relation::Ge) {
+            rows.reverse();
+        }
+        lex_chain(&mut self.solver, &rows, strict);
+        Ok(())
     }
 
     /// Post `Σ coeffs·vars  rel  rhs` (moving a variable rhs to the lhs).
@@ -586,6 +650,14 @@ impl XcspCallback for Model {
         });
     }
 
+    fn on_constraint_all_different_v2(&mut self, list: &[ExpressionTree]) {
+        guard!(self, {
+            let vars = self.tree_vars(list)?;
+            all_different(&mut self.solver, &vars);
+            Ok(())
+        });
+    }
+
     fn on_constraint_all_different_list(&mut self, lists: &[Vec<String>]) {
         guard!(self, {
             if lists.len() == 1 {
@@ -672,19 +744,13 @@ impl XcspCallback for Model {
     fn on_constraint_count_v2(&mut self, list: &[String], values: &[i32], operator: ROp, operand: Operand) {
         guard!(self, {
             let vars = self.scope(list)?;
-            // `(in, lo..hi)` condition: occurrences within an interval.
-            if matches!(operator, ROp::In) {
-                if let Operand::Interval(lo, hi) = operand {
-                    self.post_count(&vars, values, Relation::Ge, Rhs::Const(lo as i64));
-                    self.post_count(&vars, values, Relation::Le, Rhs::Const(hi as i64));
-                    return Ok(());
-                }
-                return Err("count: in <set> condition".to_string());
-            }
-            let rel = Model::rel(operator)?;
-            let rhs = self.rhs(&operand)?;
-            self.post_count(&vars, values, rel, rhs);
-            Ok(())
+            self.post_count_condition(&vars, values, operator, operand)
+        });
+    }
+    fn on_constraint_count_v1(&mut self, list: &[ExpressionTree], values: &[i32], operator: ROp, operand: Operand) {
+        guard!(self, {
+            let vars = self.tree_vars(list)?;
+            self.post_count_condition(&vars, values, operator, operand)
         });
     }
 
@@ -756,6 +822,75 @@ impl XcspCallback for Model {
             let array = self.consts(list);
             let val = self.constant(value);
             self.post_element(array, start_index, &index, val)
+        });
+    }
+
+    fn on_constraint_element_matrix_v1(
+        &mut self,
+        matrix: &Vec<Vec<String>>,
+        row_index: String,
+        col_index: String,
+        start_row_index: i32,
+        start_col_index: i32,
+        value: i32,
+    ) {
+        guard!(self, {
+            let (rows, cols) = self.matrix_shape(matrix)?;
+            let array = matrix.iter().flatten().map(|s| self.var_id(s)).collect::<Result<Vec<_>, _>>()?;
+            let val = self.constant(value);
+            let access = MatrixAccess { rows, cols, row_index: &row_index, col_index: &col_index, start_row_index, start_col_index };
+            self.post_element_matrix(array, access, val)
+        });
+    }
+    fn on_constraint_element_matrix_v2(
+        &mut self,
+        matrix: &Vec<Vec<String>>,
+        row_index: String,
+        col_index: String,
+        start_row_index: i32,
+        start_col_index: i32,
+        value: String,
+    ) {
+        guard!(self, {
+            let (rows, cols) = self.matrix_shape(matrix)?;
+            let array = matrix.iter().flatten().map(|s| self.var_id(s)).collect::<Result<Vec<_>, _>>()?;
+            let val = self.var_id(&value)?;
+            let access = MatrixAccess { rows, cols, row_index: &row_index, col_index: &col_index, start_row_index, start_col_index };
+            self.post_element_matrix(array, access, val)
+        });
+    }
+    fn on_constraint_element_matrix_v5(
+        &mut self,
+        matrix: &Vec<Vec<i32>>,
+        row_index: String,
+        col_index: String,
+        start_row_index: i32,
+        start_col_index: i32,
+        value: i32,
+    ) {
+        guard!(self, {
+            let (rows, cols) = self.matrix_shape(matrix)?;
+            let array = matrix.iter().flatten().map(|&v| self.constant(v)).collect();
+            let val = self.constant(value);
+            let access = MatrixAccess { rows, cols, row_index: &row_index, col_index: &col_index, start_row_index, start_col_index };
+            self.post_element_matrix(array, access, val)
+        });
+    }
+    fn on_constraint_element_matrix_v6(
+        &mut self,
+        matrix: &Vec<Vec<i32>>,
+        row_index: String,
+        col_index: String,
+        start_row_index: i32,
+        start_col_index: i32,
+        value: String,
+    ) {
+        guard!(self, {
+            let (rows, cols) = self.matrix_shape(matrix)?;
+            let array = matrix.iter().flatten().map(|&v| self.constant(v)).collect();
+            let val = self.var_id(&value)?;
+            let access = MatrixAccess { rows, cols, row_index: &row_index, col_index: &col_index, start_row_index, start_col_index };
+            self.post_element_matrix(array, access, val)
         });
     }
 
@@ -866,19 +1001,10 @@ impl XcspCallback for Model {
     }
 
     fn on_constraint_lex(&mut self, lists: &Vec<Vec<String>>, operator: ROp) {
-        guard!(self, {
-            let mut rows = Vec::new();
-            for l in lists {
-                rows.push(self.scope(l)?);
-            }
-            let rel = Model::rel(operator)?;
-            let strict = matches!(rel, Relation::Lt | Relation::Gt);
-            if matches!(rel, Relation::Gt | Relation::Ge) {
-                rows.reverse();
-            }
-            lex_chain(&mut self.solver, &rows, strict);
-            Ok(())
-        });
+        guard!(self, { self.post_lex_rows(lists, operator) });
+    }
+    fn on_constraint_lex_matrix(&mut self, matrix: &Vec<Vec<String>>, operator: ROp) {
+        guard!(self, { self.post_lex_rows(matrix, operator) });
     }
 
     fn on_constraint_cardinality_v1(&mut self, list: &[String], values: &[i32], occurs: &[i32], closed: bool) {
@@ -1155,6 +1281,33 @@ impl Model {
         require(start_index == 0, "element with non-zero startIndex")?;
         let idx = self.var_id(index)?;
         self.element_cond(array, idx, operator, operand)
+    }
+
+    fn matrix_shape<T>(&self, matrix: &[Vec<T>]) -> Result<(usize, usize), String> {
+        require(!matrix.is_empty(), "element matrix: empty matrix")?;
+        let cols = matrix[0].len();
+        require(cols > 0, "element matrix: empty row")?;
+        for row in matrix {
+            require(row.len() == cols, "element matrix: ragged matrix")?;
+        }
+        Ok((matrix.len(), cols))
+    }
+
+    fn matrix_index(&mut self, access: MatrixAccess<'_>) -> Result<VarId, String> {
+        let len = access.rows.checked_mul(access.cols).ok_or_else(|| "element matrix: too large".to_string())?;
+        require(len <= i32::MAX as usize, "element matrix: too large")?;
+        let row = self.var_or_constant(access.row_index)?;
+        let col = self.var_or_constant(access.col_index)?;
+        let idx = self.solver.new_var_range(0, len as i32 - 1);
+        let offset = access.cols as i64 * i64::from(access.start_row_index) + i64::from(access.start_col_index);
+        linear(&mut self.solver, &[1, -(access.cols as i64), -1], &[idx, row, col], Relation::Eq, -offset);
+        Ok(idx)
+    }
+
+    fn post_element_matrix(&mut self, array: Vec<VarId>, access: MatrixAccess<'_>, value: VarId) -> Result<(), String> {
+        let idx = self.matrix_index(access)?;
+        element(&mut self.solver, &array, idx, value);
+        Ok(())
     }
 
     fn post_cumulative_var(
