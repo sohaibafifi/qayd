@@ -677,6 +677,24 @@ impl XcspCallback for Model {
         });
     }
 
+    fn on_constraint_all_different_matrix(&mut self, lists: &[Vec<String>]) {
+        guard!(self, {
+            let (rows, cols) = self.matrix_shape(lists)?;
+            let mut matrix = Vec::with_capacity(rows);
+            for row in lists {
+                let vars = self.scope(row)?;
+                require(vars.len() == cols, "allDifferent matrix: ragged matrix")?;
+                all_different(&mut self.solver, &vars);
+                matrix.push(vars);
+            }
+            let columns = (0..cols).map(|c| (0..rows).map(|r| matrix[r][c]).collect::<Vec<_>>()).collect::<Vec<_>>();
+            for col in columns {
+                all_different(&mut self.solver, &col);
+            }
+            Ok(())
+        });
+    }
+
     fn on_constraint_all_different_except(&mut self, list: &[String], except: &[i32]) {
         guard!(self, {
             // Weak form: for every pair, they differ unless the first takes an
@@ -959,6 +977,28 @@ impl XcspCallback for Model {
             Ok(())
         });
     }
+    fn on_constraint_channel_v2(&mut self, list1: &[String], start_index1: i32, list2: &[String], start_index2: i32) {
+        guard!(self, {
+            let xs = self.scope(list1)?;
+            let ys = self.scope(list2)?;
+            for &x in &xs {
+                linear(&mut self.solver, &[1], &[x], Relation::Ge, start_index2 as i64);
+                linear(&mut self.solver, &[1], &[x], Relation::Le, start_index2 as i64 + ys.len() as i64 - 1);
+            }
+            for &y in &ys {
+                linear(&mut self.solver, &[1], &[y], Relation::Ge, start_index1 as i64);
+                linear(&mut self.solver, &[1], &[y], Relation::Le, start_index1 as i64 + xs.len() as i64 - 1);
+            }
+            for (i, &x) in xs.iter().enumerate() {
+                for (j, &y) in ys.iter().enumerate() {
+                    let xv = expr::eq(expr::var(x), expr::int(start_index2 as i64 + j as i64));
+                    let yv = expr::eq(expr::var(y), expr::int(start_index1 as i64 + i as i64));
+                    crate::constraints::intension::intension(&mut self.solver, expr::iff(xv, yv));
+                }
+            }
+            Ok(())
+        });
+    }
     fn on_constraint_channel_v3(&mut self, list: &[String], start_index: i32, value: String) {
         guard!(self, {
             // 0/1 list; `value` is the index of the single 1:
@@ -1015,6 +1055,24 @@ impl XcspCallback for Model {
             let vars = self.scope(list)?;
             let low = i64s(occurs);
             cardinality(&mut self.solver, &vars, values, &low, &low, closed);
+            Ok(())
+        });
+    }
+    fn on_constraint_cardinality_v2(&mut self, list: &[String], values: &[i32], occurs: &[String], closed: bool) {
+        guard!(self, {
+            if occurs.len() != values.len() {
+                return Err("cardinality: occurs/values length mismatch".to_string());
+            }
+            let vars = self.scope(list)?;
+            let occ = self.scope(occurs)?;
+            for (&value, &target) in values.iter().zip(&occ) {
+                flatten::count_values_to_var(&mut self.solver, &vars, &[value], Relation::Eq, target);
+            }
+            if closed {
+                let low = vec![0; values.len()];
+                let high = vec![vars.len() as i64; values.len()];
+                cardinality(&mut self.solver, &vars, values, &low, &high, true);
+            }
             Ok(())
         });
     }
