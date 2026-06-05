@@ -3,12 +3,18 @@ use std::collections::HashMap;
 use qayd::constraints::count::count;
 use qayd::constraints::intension::intension;
 use qayd::constraints::linear::{linear, Relation};
-use qayd::constraints::primitives::{all_different, element};
+use qayd::constraints::primitives::{all_different, element, maximum, minimum};
 use qayd::expr;
 use qayd::{first_solution, maximize, minimize, Solver, VarId};
 
 const UNBOUNDED_LO: i32 = -1_000_000;
 const UNBOUNDED_HI: i32 = 1_000_000;
+const MAX_EXPLICIT_DOMAIN_VALUES: usize = 100_000;
+
+enum FznDomain {
+    Range(i32, i32),
+    Set(Vec<i32>),
+}
 
 struct Model {
     solver: Solver,
@@ -35,8 +41,11 @@ impl Model {
         }
     }
 
-    fn new_var(&mut self, name: String, lo: i32, hi: i32) -> VarId {
-        let var = self.solver.new_var_range(lo, hi);
+    fn new_var(&mut self, name: String, domain: &FznDomain) -> VarId {
+        let var = match domain {
+            FznDomain::Range(lo, hi) => self.solver.new_var_range(*lo, *hi),
+            FznDomain::Set(values) => self.solver.new_var_set(values),
+        };
         self.vars.insert(name.clone(), var);
         self.search.push(var);
         self.names.push((name, var));
@@ -125,7 +134,7 @@ impl Model {
         require(args.len() == 4, "gecode_int_element expects 4 arguments")?;
         let index = self.var_atom(&args[0])?;
         let offset = self.int_atom(&args[1])?;
-        let array = self.int_list(&args[2])?.into_iter().map(|v| self.constant(v)).collect::<Vec<_>>();
+        let array = self.var_list(&args[2])?;
         let value = self.var_atom(&args[3])?;
         let zero = self.solver.new_var_range(0, array.len() as i32 - 1);
         linear(&mut self.solver, &[1, -1], &[index, zero], Relation::Eq, offset as i64);
@@ -139,6 +148,18 @@ impl Model {
         let value = self.int_atom(&args[1])?;
         let target = self.int_atom(&args[2])?;
         count(&mut self.solver, &vars, value, rel, target as i64);
+        Ok(())
+    }
+
+    fn post_extremum(&mut self, args: &[String], is_min: bool) -> Result<(), String> {
+        require(args.len() == 2, "array extremum predicate expects 2 arguments")?;
+        let target = self.var_atom(&args[0])?;
+        let vars = self.var_list(&args[1])?;
+        if is_min {
+            minimum(&mut self.solver, target, &vars);
+        } else {
+            maximum(&mut self.solver, target, &vars);
+        }
         Ok(())
     }
 
@@ -205,8 +226,8 @@ fn split_args(s: &str) -> Vec<String> {
     let mut start = 0usize;
     for (i, ch) in s.char_indices() {
         match ch {
-            '[' | '(' => depth += 1,
-            ']' | ')' => depth -= 1,
+            '[' | '(' | '{' => depth += 1,
+            ']' | ')' | '}' => depth -= 1,
             ',' if depth == 0 => {
                 args.push(s[start..i].trim().to_string());
                 start = i + 1;
@@ -218,16 +239,46 @@ fn split_args(s: &str) -> Vec<String> {
     args
 }
 
-fn parse_bound(model: &Model, s: &str) -> Result<(i32, i32), String> {
+fn parse_domain(model: &Model, s: &str) -> Result<FznDomain, String> {
     let s = s.trim();
     if s == "bool" {
-        return Ok((0, 1));
+        return Ok(FznDomain::Range(0, 1));
     }
     if s == "int" {
-        return Ok((UNBOUNDED_LO, UNBOUNDED_HI));
+        return Ok(FznDomain::Range(UNBOUNDED_LO, UNBOUNDED_HI));
+    }
+    if let Some(inner) = s.strip_prefix('{').and_then(|rest| rest.strip_suffix('}')) {
+        return parse_set_domain(model, inner);
     }
     let (lo, hi) = s.split_once("..").ok_or_else(|| format!("unsupported domain `{s}`"))?;
-    Ok((model.int_atom(lo)?, model.int_atom(hi)?))
+    Ok(FznDomain::Range(model.int_atom(lo)?, model.int_atom(hi)?))
+}
+
+fn parse_set_domain(model: &Model, s: &str) -> Result<FznDomain, String> {
+    let mut values = Vec::new();
+    for item in split_args(s) {
+        if item.is_empty() {
+            continue;
+        }
+        if let Some((lo, hi)) = item.split_once("..") {
+            let lo = model.int_atom(lo)?;
+            let hi = model.int_atom(hi)?;
+            require(lo <= hi, "set domain interval has lower bound above upper bound")?;
+            let len = i64::from(hi) - i64::from(lo) + 1;
+            require(len as usize <= MAX_EXPLICIT_DOMAIN_VALUES.saturating_sub(values.len()), "explicit set domain is too large")?;
+            values.extend(lo..=hi);
+        } else {
+            values.push(model.int_atom(&item)?);
+        }
+    }
+    require(!values.is_empty(), "empty set domain")?;
+    values.sort_unstable();
+    values.dedup();
+    if values.len() == (i64::from(*values.last().unwrap()) - i64::from(values[0]) + 1) as usize {
+        Ok(FznDomain::Range(values[0], *values.last().unwrap()))
+    } else {
+        Ok(FznDomain::Set(values))
+    }
 }
 
 fn array_len(model: &Model, left: &str) -> Result<usize, String> {
@@ -257,8 +308,8 @@ fn parse_decl(model: &mut Model, stmt: &str) -> Result<(), String> {
         }
         let n = array_len(model, left)?;
         let domain = left.rsplit_once(" of var ").map(|(_, d)| d).ok_or("only var arrays without assignment are supported")?;
-        let (lo, hi) = parse_bound(model, domain)?;
-        let vars = (1..=n).map(|i| model.new_var(format!("{name}[{i}]"), lo, hi)).collect();
+        let domain = parse_domain(model, domain)?;
+        let vars = (1..=n).map(|i| model.new_var(format!("{name}[{i}]"), &domain)).collect();
         model.arrays.insert(name, vars);
         return Ok(());
     }
@@ -270,8 +321,8 @@ fn parse_decl(model: &mut Model, stmt: &str) -> Result<(), String> {
     }
     let domain = left.trim().strip_prefix("var ").ok_or("unsupported declaration")?;
     let name = clean_name(right);
-    let (lo, hi) = parse_bound(model, domain)?;
-    let var = model.new_var(name, lo, hi);
+    let domain = parse_domain(model, domain)?;
+    let var = model.new_var(name, &domain);
     if let Some((_, value)) = right.split_once('=') {
         let fixed = model.var_atom(strip_annotations(value))?;
         linear(&mut model.solver, &[1, -1], &[var, fixed], Relation::Eq, 0);
@@ -305,6 +356,8 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
         "array_int_element" => model.post_element(&args, false),
         "array_var_int_element" => model.post_element(&args, true),
         "gecode_int_element" => model.post_gecode_element(&args),
+        "array_int_minimum" => model.post_extremum(&args, true),
+        "array_int_maximum" => model.post_extremum(&args, false),
         "fzn_count_eq" => model.post_count(&args, Relation::Eq),
         "fzn_count_ne" | "fzn_count_neq" => model.post_count(&args, Relation::Ne),
         "fzn_count_le" | "fzn_count_leq" => model.post_count(&args, Relation::Le),
