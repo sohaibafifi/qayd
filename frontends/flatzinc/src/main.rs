@@ -168,6 +168,28 @@ fn strip_annotations(s: &str) -> &str {
     s.split("::").next().unwrap_or(s).trim()
 }
 
+fn strip_leading_solve_annotations(mut s: &str) -> &str {
+    loop {
+        s = s.trim_start();
+        let Some(rest) = s.strip_prefix("::") else { return s };
+        s = rest.trim_start();
+        let mut depth = 0i32;
+        let mut end = s.len();
+        for (i, ch) in s.char_indices() {
+            match ch {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                _ if ch.is_whitespace() && depth == 0 => {
+                    end = i;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        s = &s[end..];
+    }
+}
+
 fn bracket_items(s: &str) -> Option<Vec<String>> {
     let s = s.trim();
     let inner = s.strip_prefix('[')?.strip_suffix(']')?;
@@ -295,7 +317,7 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
 }
 
 fn parse_solve(model: &mut Model, stmt: &str) -> Result<(), String> {
-    let stmt = strip_annotations(stmt.strip_prefix("solve").unwrap()).trim();
+    let stmt = strip_annotations(strip_leading_solve_annotations(stmt.strip_prefix("solve").unwrap())).trim();
     if stmt == "satisfy" {
         return Ok(());
     }
