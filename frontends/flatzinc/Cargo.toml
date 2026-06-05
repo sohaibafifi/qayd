@@ -1,0 +1,12 @@
+[package]
+name = "qayd-flatzinc"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "qayd-fzn"
+path = "src/main.rs"
+
+[dependencies]
+qayd = { path = "../.." }

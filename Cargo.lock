@@ -150,6 +150,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "qayd-flatzinc"
+version = "0.1.0"
+dependencies = [
+ "qayd",
+]
+
+[[package]]
 name = "quick-xml"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
