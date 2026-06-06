@@ -294,6 +294,7 @@ impl Model {
         if matches!(rel, Relation::Gt | Relation::Ge) {
             rows.reverse();
         }
+        self.local.add_lex_chain(rows.clone(), strict);
         lex_chain(&mut self.solver, &rows, strict);
         Ok(())
     }
@@ -337,9 +338,9 @@ impl Model {
             && y != z
             && x != z
             && vars
-            .iter()
-            .all(|&v| self.solver.store.size(v) == 2 && self.solver.store.contains(v, -1) && self.solver.store.contains(v, 1)))
-            .then_some(vars)
+                .iter()
+                .all(|&v| self.solver.store.size(v) == 2 && self.solver.store.contains(v, -1) && self.solver.store.contains(v, 1)))
+        .then_some(vars)
     }
 
     /// Convert a parser expression tree to a solver [`Expr`].
@@ -1097,11 +1098,9 @@ impl XcspCallback for Model {
     }
 
     fn on_constraint_lex(&mut self, lists: &Vec<Vec<String>>, operator: ROp) {
-        self.local.mark_unsupported();
         guard!(self, { self.post_lex_rows(lists, operator) });
     }
     fn on_constraint_lex_matrix(&mut self, matrix: &Vec<Vec<String>>, operator: ROp) {
-        self.local.mark_unsupported();
         guard!(self, { self.post_lex_rows(matrix, operator) });
     }
 

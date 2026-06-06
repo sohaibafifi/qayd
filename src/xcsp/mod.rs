@@ -7,6 +7,7 @@ use std::fmt::Display;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::time::Instant;
 
 use xcsp3_rust_parser::xcsp_runner::XcspRunner;
@@ -52,10 +53,6 @@ fn write_improvement_from<W: Write>(w: &mut W, verbose: bool, error: &mut Option
     if verbose && error.is_none() {
         *error = writeln!(w, "o {value}").and_then(|_| writeln!(w, "c incumbent {value} source {source}")).and_then(|_| w.flush()).err();
     }
-}
-
-fn write_improvement<W: Write>(w: &mut W, verbose: bool, error: &mut Option<std::io::Error>, value: impl Display) {
-    write_improvement_from(w, verbose, error, value, "sequential");
 }
 
 fn write_optimization_result<W: Write>(
@@ -283,11 +280,15 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
         return Ok(());
     }
 
-    if options.workers == 1 || !has_objective {
+    if options.fast_cop && options.workers > 1 {
+        let XcspProblem { problem, local, output } = xcsp;
+        let result = solve_fast_cop_parallel(problem, local, verbose, stop, w, options)?;
+        write_fast_cop_result(w, &output, result, verbose)?;
+    } else if options.workers == 1 || !has_objective {
         solve_single(xcsp, verbose, stop, w, options)?;
     } else {
-        let XcspProblem { problem, output, .. } = xcsp;
-        let result = solve_cop(problem, verbose, stop, w, options)?;
+        let XcspProblem { problem, local, output } = xcsp;
+        let result = solve_cop(problem, local, verbose, stop, w, options)?;
         write_parallel_result(w, &output, result, verbose)?;
     }
 
@@ -299,6 +300,94 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
     }
     w.flush().map_err(to_err)?;
     Ok(())
+}
+
+enum FastCopMsg {
+    Improved { value: i64, source: &'static str, worker: usize },
+    Done(LocalSearchOutcome),
+}
+
+fn solve_fast_cop_parallel<W: Write>(
+    problem: Problem,
+    local: LocalSearchSpec,
+    verbose: bool,
+    stop: &AtomicBool,
+    w: &mut W,
+    options: RunOptions,
+) -> Result<LocalSearchOutcome, String> {
+    let minimizing = problem.objective.as_ref().is_none_or(Objective::minimizing);
+    let (tx, rx) = mpsc::channel();
+    let mut printed = None;
+    let mut summary = None;
+    let mut error = None;
+
+    std::thread::scope(|scope| {
+        for worker in 0..options.workers {
+            let tx = tx.clone();
+            let problem = problem.clone();
+            let local = local.clone();
+            scope.spawn(move || {
+                let seed = options.seed.wrapping_add(worker as u64);
+                let result = solve_fast_cop(problem, local, stop, seed, |value, _, source| {
+                    let _ = tx.send(FastCopMsg::Improved { value, source, worker });
+                });
+                let _ = tx.send(FastCopMsg::Done(result));
+            });
+        }
+        drop(tx);
+
+        for msg in rx {
+            match msg {
+                FastCopMsg::Improved { value, source, worker, .. }
+                    if printed.is_none_or(|old| if minimizing { value < old } else { value > old }) =>
+                {
+                    printed = Some(value);
+                    if verbose && error.is_none() {
+                        if let Err(e) = writeln!(w, "o {value}")
+                            .and_then(|_| writeln!(w, "c incumbent {value} source {source} worker {worker}"))
+                            .and_then(|_| w.flush())
+                        {
+                            error = Some(e.to_string());
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+                FastCopMsg::Improved { .. } => {}
+                FastCopMsg::Done(result) => merge_fast_cop_result(&mut summary, result, minimizing),
+            }
+        }
+    });
+
+    if let Some(e) = error {
+        return Err(e);
+    }
+    Ok(summary.unwrap_or(LocalSearchOutcome {
+        best: None,
+        iterations: 0,
+        moves: 0,
+        restarts: 0,
+        constraints: 0,
+        functionals: 0,
+        unsupported: 1,
+    }))
+}
+
+fn merge_fast_cop_result(summary: &mut Option<LocalSearchOutcome>, mut result: LocalSearchOutcome, minimizing: bool) {
+    let Some(current) = summary else {
+        *summary = Some(result);
+        return;
+    };
+    current.iterations += result.iterations;
+    current.moves += result.moves;
+    current.restarts += result.restarts;
+    current.constraints = current.constraints.max(result.constraints);
+    current.functionals = current.functionals.max(result.functionals);
+    current.unsupported = current.unsupported.max(result.unsupported);
+    if let Some((solution, value)) = result.best.take() {
+        if current.best.as_ref().is_none_or(|(_, old)| if minimizing { value < *old } else { value > *old }) {
+            current.best = Some((solution, value));
+        }
+    }
 }
 
 fn write_fast_cop_result<W: Write>(w: &mut W, output: &SolutionOutput, result: LocalSearchOutcome, verbose: bool) -> Result<(), String> {
@@ -326,18 +415,7 @@ fn write_fast_cop_result<W: Write>(w: &mut W, output: &SolutionOutput, result: L
 }
 
 fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w: &mut W, options: RunOptions) -> Result<(), String> {
-    let XcspProblem { problem, local, output } = xcsp;
-    if options.fast_cop {
-        let mut io_err: Option<std::io::Error> = None;
-        let result = solve_fast_cop(problem, local, stop, options.seed, |value, _, source| {
-            write_improvement_from(w, verbose, &mut io_err, value, source);
-        });
-        if let Some(e) = io_err {
-            return Err(e.to_string());
-        }
-        return write_fast_cop_result(w, &output, result, verbose);
-    }
-
+    let XcspProblem { problem, output, .. } = xcsp;
     let mut solver = problem.solver;
     let vars = problem.search;
     let to_err = |e: std::io::Error| e.to_string();
@@ -377,9 +455,10 @@ fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w
         Some(objective) => {
             let minimizing = objective.minimizing();
             let mut io_err: Option<std::io::Error> = None;
+            let source = if options.fast_cop { "cp" } else { "sequential" };
             let (best, stats, complete) =
                 optimize_seeded(&mut solver, &vars, objective.search(), minimizing, stop, options.seed, None, None, &[], None, |v, _| {
-                    write_improvement(w, verbose, &mut io_err, v)
+                    write_improvement_from(w, verbose, &mut io_err, v, source)
                 });
             if let Some(e) = io_err {
                 return Err(e.to_string());

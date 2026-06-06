@@ -13,6 +13,8 @@ const MAX_DOMAIN_VALUES: usize = 4096;
 const MAX_SAMPLED_VARS: usize = 48;
 const RANDOM_WALK_PERIOD: u64 = 17;
 const RESTART_AFTER: u64 = 200;
+const CONSTRUCTIVE_KICK_PERIOD: u64 = 5;
+const WORD_PLACEMENT_NODE_LIMIT: usize = 20_000;
 
 #[derive(Clone)]
 pub(crate) enum LocalConstraint {
@@ -21,6 +23,7 @@ pub(crate) enum LocalConstraint {
     AllDifferent(Vec<VarId>),
     AllEqual(Vec<VarId>),
     Extension { vars: Vec<VarId>, tuples: Vec<Vec<i32>> },
+    Lex { rows: Vec<Vec<VarId>>, strict: bool },
     Count { vars: Vec<VarId>, values: Vec<i32>, rel: Relation, rhs: LocalRhs },
     CountAllowed { vars: Vec<VarId>, values: Vec<i32>, allowed: Vec<i32> },
     NValues { vars: Vec<VarId>, rel: Relation, rhs: LocalRhs },
@@ -33,6 +36,7 @@ enum Functional {
     Expr { target: VarId, expr: Expr },
     Linear { target: VarId, coeff: i64, terms: Vec<(i64, VarId)>, rhs: i64 },
     Element { target: VarId, array: Vec<VarId>, index: VarId, start_index: i32 },
+    BoolTable { target: VarId, left: VarId, right: VarId, true_pairs: Vec<(i32, i32)> },
 }
 
 #[derive(Clone, Copy)]
@@ -117,6 +121,7 @@ struct LocalModel {
     objective: Objective,
     constraints: Vec<LocalConstraint>,
     functionals: Vec<Functional>,
+    bool_tables: HashMap<(VarId, VarId), Vec<(i32, i32)>>,
     exact_covers: Vec<Vec<VarId>>,
 }
 
@@ -125,6 +130,12 @@ struct GuardedWord<'a> {
     weight: i64,
     array: &'a [VarId],
     letters: Vec<(VarId, i32)>,
+}
+
+struct WordPlacementState {
+    values: Vec<Option<i32>>,
+    cells: Vec<usize>,
+    nodes: usize,
 }
 
 type ElementViews<'a> = HashMap<VarId, (&'a [VarId], VarId, i32)>;
@@ -184,6 +195,26 @@ fn functional_from_linear(coeffs: &[i64], vars: &[VarId], rel: Relation, rhs: i6
     Some(Functional::Linear { target, coeff, terms, rhs })
 }
 
+fn functional_from_extension(vars: &[VarId], tuples: &[Vec<i32>]) -> Option<Functional> {
+    let [left, right, target] = *vars else {
+        return None;
+    };
+    let mut true_pairs = Vec::new();
+    for tuple in tuples {
+        let [a, b, value] = tuple.as_slice() else {
+            return None;
+        };
+        match *value {
+            0 => {}
+            1 => true_pairs.push((*a, *b)),
+            _ => return None,
+        }
+    }
+    true_pairs.sort_unstable();
+    true_pairs.dedup();
+    Some(Functional::BoolTable { target, left, right, true_pairs })
+}
+
 fn relation_violation(lhs: i64, rel: Relation, rhs: i64) -> i64 {
     match rel {
         Relation::Eq => (lhs - rhs).abs(),
@@ -233,10 +264,17 @@ impl LocalSearchSpec {
 
     pub(crate) fn add_extension(&mut self, vars: Vec<VarId>, tuples: Vec<Vec<i32>>, positive: bool) {
         if positive {
+            if let Some(functional) = functional_from_extension(&vars, &tuples) {
+                self.mark_functional(functional);
+            }
             self.constraints.push(LocalConstraint::Extension { vars, tuples });
         } else {
             self.mark_unsupported();
         }
+    }
+
+    pub(crate) fn add_lex_chain(&mut self, rows: Vec<Vec<VarId>>, strict: bool) {
+        self.constraints.push(LocalConstraint::Lex { rows, strict });
     }
 
     pub(crate) fn add_count(&mut self, vars: Vec<VarId>, values: Vec<i32>, rel: Relation, rhs: LocalRhs) {
@@ -279,7 +317,10 @@ impl LocalSearchSpec {
 
     fn mark_functional(&mut self, functional: Functional) {
         let target = match &functional {
-            Functional::Expr { target, .. } | Functional::Linear { target, .. } | Functional::Element { target, .. } => *target,
+            Functional::Expr { target, .. }
+            | Functional::Linear { target, .. }
+            | Functional::Element { target, .. }
+            | Functional::BoolTable { target, .. } => *target,
         };
         self.ensure(target);
         self.derived[target.index()] = true;
@@ -312,8 +353,10 @@ impl LocalModel {
             .filter(|&var| domains[var.index()].values.len() > 1 && !spec.derived.get(var.index()).copied().unwrap_or(false))
             .collect();
         let constraints = spec.constraints;
+        let functionals = spec.functionals;
+        let bool_tables = bool_tables(&functionals);
         let exact_covers = exact_cover_rows(&constraints, &domains);
-        Ok(Self { domains, mutable, search: problem.search, objective, constraints, functionals: spec.functionals, exact_covers })
+        Ok(Self { domains, mutable, search: problem.search, objective, constraints, functionals, bool_tables, exact_covers })
     }
 
     fn random_assignment(&self, seed: u64) -> Vec<i32> {
@@ -324,11 +367,11 @@ impl LocalModel {
         self.domains.iter().map(LocalDomain::min_value).collect()
     }
 
-    fn constructive_assignment(&self) -> Vec<i32> {
+    fn constructive_assignment(&self, seed: u64) -> Vec<i32> {
         let mut assignment = self.min_assignment();
         self.greedy_exact_cover(&mut assignment);
         let _ = self.complete(&mut assignment);
-        self.place_guarded_elements(assignment)
+        self.place_guarded_elements(assignment, seed)
     }
 
     fn has_extension(&self) -> bool {
@@ -450,10 +493,20 @@ impl LocalModel {
         best.map(|(_, var)| var)
     }
 
-    fn place_guarded_elements(&self, mut assignment: Vec<i32>) -> Vec<i32> {
+    fn place_guarded_elements(&self, mut assignment: Vec<i32>, seed: u64) -> Vec<i32> {
         let elements = self.element_views();
         let mut words = self.guarded_words(&elements);
-        words.sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.guard.cmp(&b.guard)));
+        if seed == 0 {
+            words.sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.guard.cmp(&b.guard)));
+        } else {
+            words.sort_by(|a, b| {
+                let ak = mix64(seed ^ a.guard.index() as u64);
+                let bk = mix64(seed ^ b.guard.index() as u64);
+                let aw = a.weight * 64 + (ak & 511) as i64;
+                let bw = b.weight * 64 + (bk & 511) as i64;
+                bw.cmp(&aw).then_with(|| a.guard.cmp(&b.guard))
+            });
+        }
         let mut fixed = vec![None; self.domains.len()];
 
         for word in words {
@@ -484,11 +537,18 @@ impl LocalModel {
     fn guarded_words<'a>(&self, elements: &ElementViews<'a>) -> Vec<GuardedWord<'a>> {
         let mut requirements: BTreeMap<VarId, Vec<(VarId, i32)>> = BTreeMap::new();
         for constraint in &self.constraints {
-            let LocalConstraint::Extension { vars, tuples } = constraint else {
-                continue;
-            };
-            if let Some((guard, target, value)) = guarded_value(vars, tuples) {
-                requirements.entry(guard).or_default().push((target, value));
+            match constraint {
+                LocalConstraint::Extension { vars, tuples } => {
+                    if let Some((guard, target, value)) = guarded_value(vars, tuples) {
+                        requirements.entry(guard).or_default().push((target, value));
+                    }
+                }
+                LocalConstraint::Expr(expr) => {
+                    if let Some((guard, target, value)) = guarded_expr_value(expr) {
+                        requirements.entry(guard).or_default().push((target, value));
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -529,27 +589,94 @@ impl LocalModel {
     }
 
     fn try_place_word(&self, assignment: &[i32], fixed: &[Option<i32>], word: &GuardedWord<'_>) -> Option<TrialPlacement> {
-        for path in candidate_paths(word.array.len(), word.letters.len()) {
-            let mut trial = assignment.to_vec();
-            let mut placements = Vec::with_capacity(path.len());
-            trial[word.guard.index()] = 1;
+        let mut state = WordPlacementState {
+            values: vec![None; word.array.len()],
+            cells: vec![0; word.letters.len()],
+            nodes: WORD_PLACEMENT_NODE_LIMIT,
+        };
+        for (cell, &var) in word.array.iter().enumerate() {
+            state.values[cell] = fixed[var.index()];
+        }
+        self.place_word_letters(assignment, word, 0, None, &mut state)
+    }
 
-            let mut feasible = true;
-            for (&cell, &(index, value)) in path.iter().zip(&word.letters) {
+    fn word_trial(&self, assignment: &[i32], word: &GuardedWord<'_>, values: &[Option<i32>], cells: &[usize]) -> Option<TrialPlacement> {
+        let mut trial = assignment.to_vec();
+        let mut placements = Vec::new();
+        trial[word.guard.index()] = 1;
+        for (cell, &value) in values.iter().enumerate() {
+            if let Some(value) = value {
                 let x = word.array[cell];
-                feasible &= self.domains[x.index()].contains(value);
-                feasible &= self.domains[index.index()].contains(cell as i32);
-                feasible &= fixed[x.index()].is_none_or(|old| old == value);
-                if !feasible {
-                    break;
-                }
                 trial[x.index()] = value;
-                trial[index.index()] = cell as i32;
                 placements.push((x, value));
             }
+        }
+        for (&cell, &(index, _)) in cells.iter().zip(&word.letters) {
+            trial[index.index()] = cell as i32;
+        }
+        self.lex_constraints_ok(&trial).then_some((trial, placements))
+    }
 
-            if feasible {
-                return Some((trial, placements));
+    fn lex_constraints_ok(&self, assignment: &[i32]) -> bool {
+        self.constraints.iter().all(|constraint| match constraint {
+            LocalConstraint::Lex { rows, strict } => lex_chain_violation(rows, *strict, assignment) == 0,
+            _ => true,
+        })
+    }
+
+    fn pair_allowed(&self, left: VarId, right: VarId, left_value: i32, right_value: i32) -> bool {
+        if let Some(true_pairs) = self.bool_tables.get(&(left, right)) {
+            return true_pairs.binary_search(&(left_value, right_value)).is_ok();
+        }
+        self.bool_tables.get(&(right, left)).is_none_or(|true_pairs| true_pairs.binary_search(&(right_value, left_value)).is_ok())
+    }
+
+    fn place_word_letters(
+        &self,
+        assignment: &[i32],
+        word: &GuardedWord<'_>,
+        pos: usize,
+        previous: Option<usize>,
+        state: &mut WordPlacementState,
+    ) -> Option<TrialPlacement> {
+        if state.nodes == 0 {
+            return None;
+        }
+        state.nodes -= 1;
+        if pos == word.letters.len() {
+            return self.word_trial(assignment, word, &state.values, &state.cells);
+        }
+        let (index, value) = word.letters[pos];
+        for cell in 0..word.array.len() {
+            if previous == Some(cell) || !self.domains[index.index()].contains(cell as i32) {
+                continue;
+            }
+            if let Some(previous) = previous {
+                let previous_index = word.letters[pos - 1].0;
+                if !self.pair_allowed(previous_index, index, previous as i32, cell as i32) {
+                    continue;
+                }
+            }
+            match state.values[cell] {
+                Some(old) if old != value => continue,
+                Some(_) => {
+                    state.cells[pos] = cell;
+                    if let Some(trial) = self.place_word_letters(assignment, word, pos + 1, Some(cell), state) {
+                        return Some(trial);
+                    }
+                }
+                None => {
+                    let x = word.array[cell];
+                    if !self.domains[x.index()].contains(value) {
+                        continue;
+                    }
+                    state.values[cell] = Some(value);
+                    state.cells[pos] = cell;
+                    if let Some(trial) = self.place_word_letters(assignment, word, pos + 1, Some(cell), state) {
+                        return Some(trial);
+                    }
+                    state.values[cell] = None;
+                }
             }
         }
         None
@@ -576,7 +703,10 @@ impl LocalModel {
                 return false;
             };
             let target = match functional {
-                Functional::Expr { target, .. } | Functional::Linear { target, .. } | Functional::Element { target, .. } => *target,
+                Functional::Expr { target, .. }
+                | Functional::Linear { target, .. }
+                | Functional::Element { target, .. }
+                | Functional::BoolTable { target, .. } => *target,
             };
             if !self.domains[target.index()].contains(value) {
                 return false;
@@ -603,6 +733,9 @@ impl LocalModel {
                     return None;
                 }
                 Some(assignment[array[offset as usize].index()])
+            }
+            Functional::BoolTable { left, right, true_pairs, .. } => {
+                Some(i32::from(true_pairs.binary_search(&(assignment[left.index()], assignment[right.index()])).is_ok()))
             }
         }
     }
@@ -650,6 +783,7 @@ impl LocalModel {
                     1
                 }
             }
+            LocalConstraint::Lex { rows, strict } => lex_chain_violation(rows, *strict, assignment),
             LocalConstraint::Count { vars, values, rel, rhs } => {
                 let count = vars.iter().filter(|&&var| values.contains(&assignment[var.index()])).count() as i64;
                 relation_violation(count, *rel, rhs.value(assignment))
@@ -685,6 +819,21 @@ fn to_i32(value: i64) -> Option<i32> {
 
 fn tuple_matches(vars: &[VarId], tuple: &[i32], assignment: &[i32]) -> bool {
     vars.iter().zip(tuple).all(|(&var, &value)| value == STAR || assignment[var.index()] == value)
+}
+
+fn lex_chain_violation(rows: &[Vec<VarId>], strict: bool, assignment: &[i32]) -> i64 {
+    rows.windows(2).filter(|pair| !lex_le(&pair[0], &pair[1], strict, assignment)).count() as i64
+}
+
+fn lex_le(a: &[VarId], b: &[VarId], strict: bool, assignment: &[i32]) -> bool {
+    for (&x, &y) in a.iter().zip(b) {
+        let xv = assignment[x.index()];
+        let yv = assignment[y.index()];
+        if xv != yv {
+            return xv < yv;
+        }
+    }
+    !strict
 }
 
 fn extremum(vars: &[VarId], is_min: bool, assignment: &[i32]) -> Option<i32> {
@@ -724,6 +873,18 @@ fn exact_cover_rows(constraints: &[LocalConstraint], domains: &[LocalDomain]) ->
         .collect()
 }
 
+fn bool_tables(functionals: &[Functional]) -> HashMap<(VarId, VarId), Vec<(i32, i32)>> {
+    functionals
+        .iter()
+        .filter_map(|functional| {
+            let Functional::BoolTable { left, right, true_pairs, .. } = functional else {
+                return None;
+            };
+            Some(((*left, *right), true_pairs.clone()))
+        })
+        .collect()
+}
+
 fn guarded_value(vars: &[VarId], tuples: &[Vec<i32>]) -> Option<(VarId, VarId, i32)> {
     if vars.len() != 2 {
         return None;
@@ -743,31 +904,39 @@ fn guarded_value(vars: &[VarId], tuples: &[Vec<i32>]) -> Option<(VarId, VarId, i
     inactive_free.then_some((vars[0], vars[1], active_value?))
 }
 
-fn candidate_paths(array_len: usize, len: usize) -> Vec<Vec<usize>> {
-    if len == 0 || len > array_len {
-        return Vec::new();
-    }
-    let mut paths = Vec::new();
-    let width = square_width(array_len);
-    if len <= width {
-        for row in 0..array_len / width {
-            for col in 0..=width - len {
-                paths.push((0..len).map(|i| row * width + col + i).collect());
-            }
-        }
-    }
-    for start in 0..=array_len - len {
-        paths.push((start..start + len).collect());
-    }
-    paths
+fn guarded_expr_value(expr: &Expr) -> Option<(VarId, VarId, i32)> {
+    let Expr::Or(terms) = expr else {
+        return None;
+    };
+    let [a, b] = terms.as_slice() else {
+        return None;
+    };
+    guarded_expr_parts(a, b).or_else(|| guarded_expr_parts(b, a))
 }
 
-fn square_width(n: usize) -> usize {
-    let width = (n as f64).sqrt() as usize;
-    if width > 0 && width * width == n {
-        width
-    } else {
-        n
+fn guarded_expr_parts(guard: &Expr, target: &Expr) -> Option<(VarId, VarId, i32)> {
+    let guard = eq_var_const(guard, 0)?;
+    let (target, value) = eq_var_any_const(target)?;
+    Some((guard, target, value))
+}
+
+fn eq_var_const(expr: &Expr, expected: i64) -> Option<VarId> {
+    let Expr::Eq(a, b) = expr else {
+        return None;
+    };
+    match (&**a, &**b) {
+        (Expr::Var(var), Expr::Const(value)) | (Expr::Const(value), Expr::Var(var)) if *value == expected => Some(*var),
+        _ => None,
+    }
+}
+
+fn eq_var_any_const(expr: &Expr) -> Option<(VarId, i32)> {
+    let Expr::Eq(a, b) = expr else {
+        return None;
+    };
+    match (&**a, &**b) {
+        (Expr::Var(var), Expr::Const(value)) | (Expr::Const(value), Expr::Var(var)) => to_i32(*value).map(|value| (*var, value)),
+        _ => None,
     }
 }
 
@@ -831,7 +1000,7 @@ where
     let minimizing = model.objective.minimizing();
     let objective_kicks = model.objective_kicks();
     let constructive_start = model.has_extension();
-    let mut assignment = if constructive_start { model.constructive_assignment() } else { model.random_assignment(seed) };
+    let mut assignment = if constructive_start { model.constructive_assignment(seed) } else { model.random_assignment(seed) };
     let mut current = model.score(&mut assignment);
     let mut source = if constructive_start { "constructive" } else { "local-search" };
     let mut best_solution: Option<(Vec<i32>, i64)> = None;
@@ -854,11 +1023,26 @@ where
 
         if stagnant >= RESTART_AFTER {
             restarts += 1;
-            assignment = model.random_assignment(seed ^ mix64(iterations));
+            let restart_seed = seed ^ mix64(iterations);
+            assignment =
+                if constructive_start { model.constructive_assignment(restart_seed) } else { model.random_assignment(restart_seed) };
             current = model.score(&mut assignment);
-            source = "local-search";
+            source = if constructive_start { "constructive" } else { "local-search" };
             stagnant = 0;
             continue;
+        }
+
+        if constructive_start && iterations.is_multiple_of(CONSTRUCTIVE_KICK_PERIOD) {
+            let mut trial = model.constructive_assignment(seed ^ mix64(iterations));
+            let score = model.score(&mut trial);
+            if score < current {
+                assignment = trial;
+                current = score;
+                source = "constructive";
+                moves += 1;
+                stagnant = 0;
+                continue;
+            }
         }
 
         if let Some(trial) = objective_kick(&model, &assignment, &objective_kicks, seed, iterations) {

@@ -26,6 +26,7 @@ pub mod expr;
 pub mod ids;
 pub mod lcg;
 mod lns;
+mod ls;
 mod parallel;
 mod problem;
 pub mod propagator;
@@ -33,7 +34,6 @@ pub mod search;
 pub mod store;
 pub mod trail;
 pub mod xcsp;
-mod ls;
 
 pub use expr::Expr;
 pub use ids::{PropId, VarId};
