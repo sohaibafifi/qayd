@@ -26,8 +26,8 @@ panic = "abort"
 ctrlc = "3.5.2"
 lzma-rs = "0.3.0"
 # Patched fork: cardinality mixed occurs, %N group injection, notin, stray stdout
-# prints. Rev-pinned for reproducibility.
-xcsp3-rust-parser = { git = "https://github.com/sohaibafifi/XCSP3-Rust-Parser", rev = "37c9b7dba7690b702ed188e778876fa712083e7c" }
+# prints, lex constant tuples. Rev-pinned for reproducibility.
+xcsp3-rust-parser = { git = "https://github.com/sohaibafifi/XCSP3-Rust-Parser", rev = "f38435d7c362a65e275693953a830264b9a384cd" }
 
 
 # Cold parse/decompress stack: runs once per instance, never in the solve loop.
