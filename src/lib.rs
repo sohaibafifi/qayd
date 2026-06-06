@@ -26,6 +26,7 @@ pub mod expr;
 pub mod ids;
 pub mod lcg;
 mod lns;
+mod ls;
 mod parallel;
 mod problem;
 pub mod propagator;

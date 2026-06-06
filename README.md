@@ -51,6 +51,7 @@ Priorities, in order: **correct, then simple, then fast.**
   dedicates materialized-objective workers to optimistic probes. `--lns`
   dedicates workers to bounded incumbent-driven [Large Neighborhood
   Search](https://doi.org/10.1007/978-3-319-91086-4_4).
+- **Fast COP mode.** `--fast-cop` is an incumbent-only mode for the Fast COP style of use: it searches for feasible solutions and objective improvements, without trying to prove optimality. It uses local scoring for common constraints, constructive starts for guarded table/element patterns, and  focused repair for simple Boolean exact-cover rows.
 
 ## Build
 
@@ -62,7 +63,7 @@ cargo test
 ## Solve an instance
 
 ```bash
-qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] [--probe N] [--lns N] [--learn-csp] <instance.xml[.lzma|.xz]>
+qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--fast-cop] [--split] [--probe N] [--lns N] [--learn-csp] <instance.xml[.lzma|.xz]>
 ```
 
 - `-h`, `--help` prints the usage.
@@ -70,6 +71,7 @@ qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] [--probe N] [--
 - `-t SECONDS`, `--time SECONDS` stops after a time budget, reporting the best solution so far.
 - `--seed SEED` sets the reproducible search seed. It defaults to `RANDOMSEED`, then `0`.
 - `-p THREADS`, `--threads THREADS` sets the COP portfolio worker count. It defaults to `NBCORE`, then `1`.
+- `--fast-cop` searches for good COP incumbents only. It does not prove optimality and defaults to a 240 second limit when `-t` is omitted.
 - `--split` divides COP proof search into disjoint jobs for worker stealing.
 - `--probe N` dedicates up to `N` COP workers to optimistic objective probes.
 - `--lns N` dedicates up to `N` COP workers to bounded Large Neighborhood Search.

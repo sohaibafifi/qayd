@@ -166,6 +166,32 @@ pub(crate) fn optimize_seeded(
     cdcl.optimize(vars, objective, minimizing, stop, shared_bound, cube, conflict_budget, on_improve)
 }
 
+/// Incumbent-oriented optimization for fast COP mode.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn optimize_fast_seeded(
+    solver: &mut Solver,
+    vars: &[VarId],
+    objective: Objective<'_>,
+    minimizing: bool,
+    stop: &AtomicBool,
+    seed: u64,
+    shared_bound: Option<&AtomicI64>,
+    clause_sharing: Option<ClauseSharing>,
+    cube: &[Lit],
+    conflict_budget: Option<u64>,
+    on_improve: impl FnMut(i64, &[i32]),
+) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
+    let lazy_atoms = clause_sharing.as_ref().map(ClauseSharing::lazy_atoms);
+    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, lazy_atoms) else {
+        return (None, SolveStats::default(), false);
+    };
+    if let Some(sharing) = clause_sharing {
+        cdcl.set_clause_sharing(sharing);
+    }
+    cdcl.use_fast_restarts();
+    cdcl.optimize_fast(vars, objective, minimizing, stop, shared_bound, cube, conflict_budget, on_improve)
+}
+
 /// Pick a binary split for one root cube.
 pub(crate) fn split_cube_seeded(
     solver: &mut Solver,

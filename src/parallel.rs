@@ -10,6 +10,7 @@ use crate::ids::VarId;
 use crate::lcg::clause::{ClauseSharing, SharedClausePool};
 use crate::lcg::lit::Lit;
 use crate::lns::{fix_neighborhood, LnsState};
+use crate::ls::{solve_fast_cop, LocalSearchSpec};
 use crate::problem::{Objective, Problem};
 use crate::search::{optimize_seeded, probe_seeded, split_cube_seeded, Objective as SearchObjective, SolveStats};
 use crate::store::Solver;
@@ -21,6 +22,8 @@ pub struct RunOptions {
     pub seed: u64,
     /// Number of independent portfolio workers.
     pub workers: usize,
+    /// Optimize incumbent quality only; do not try to prove optimality.
+    pub fast_cop: bool,
     /// Split the search space into disjoint proof jobs.
     pub split: bool,
     /// Number of workers dedicated to optimistic objective probes.
@@ -33,7 +36,7 @@ pub struct RunOptions {
 
 impl Default for RunOptions {
     fn default() -> Self {
-        Self { seed: 0, workers: 1, split: false, probes: 0, lns: 0, learn_csp: false }
+        Self { seed: 0, workers: 1, fast_cop: false, split: false, probes: 0, lns: 0, learn_csp: false }
     }
 }
 
@@ -52,26 +55,34 @@ pub(crate) struct ParallelOutcome {
 pub(crate) fn normalize_options(has_objective: bool, var_objective: bool, options: RunOptions) -> RunOptions {
     let options = RunOptions { workers: options.workers.max(1), ..options };
     let workers = if has_objective { options.workers } else { 1 };
+    if options.fast_cop {
+        return RunOptions { workers, fast_cop: has_objective, split: false, probes: 0, lns: 0, learn_csp: false, ..options };
+    }
     if workers == 1 {
         return RunOptions { workers, split: false, probes: 0, lns: 0, ..options };
     }
+    let fast_incumbents = usize::from(options.probes.saturating_add(options.lns) < workers.saturating_sub(1));
     let reserved_probe = usize::from(workers > 3 && var_objective);
-    let probes = if var_objective { options.probes.max(reserved_probe).min(workers.saturating_sub(1)) } else { 0 };
+    let probes = if var_objective { options.probes.max(reserved_probe).min(workers.saturating_sub(fast_incumbents + 1)) } else { 0 };
     let reserved_lns = usize::from(workers > 2);
     RunOptions {
         workers,
         split: options.split && var_objective,
         probes,
-        lns: options.lns.max(reserved_lns).min(workers.saturating_sub(probes + 1)),
+        lns: options.lns.max(reserved_lns).min(workers.saturating_sub(probes + fast_incumbents + 1)),
         ..options
     }
 }
 
 pub(crate) fn worker_roles(has_objective: bool, options: RunOptions) -> String {
-    if !has_objective || options.workers == 1 {
-        return "sequential 1".to_string();
+    if has_objective && options.fast_cop {
+        return format!("incumbent {}", options.workers);
     }
-    let regular = options.workers - options.probes - options.lns;
+    if !has_objective || options.workers == 1 {
+        return format!("{} 1", if options.fast_cop && has_objective { "incumbent" } else { "sequential" });
+    }
+    let incumbent = fast_incumbent_workers(has_objective, options);
+    let regular = options.workers - options.probes - options.lns - incumbent;
     let mut roles = vec![format!("{} {regular}", if options.split { "split" } else { "portfolio" })];
     if options.lns > 0 {
         roles.push(format!("lns {}", options.lns));
@@ -79,7 +90,14 @@ pub(crate) fn worker_roles(has_objective: bool, options: RunOptions) -> String {
     if options.probes > 0 {
         roles.push(format!("probe {}", options.probes));
     }
+    if incumbent > 0 {
+        roles.push(format!("incumbent {incumbent}"));
+    }
     roles.join(", ")
+}
+
+fn fast_incumbent_workers(has_objective: bool, options: RunOptions) -> usize {
+    usize::from(has_objective && !options.fast_cop && options.workers > options.probes + options.lns + 1)
 }
 
 type Cube = Vec<Lit>;
@@ -386,8 +404,62 @@ fn run_lns_worker(model: Problem, worker: usize, seed: u64, shared: &CopShared, 
     let _ = tx.send(WorkerMsg::Done(stats));
 }
 
+fn validated_incumbent(model: &Problem, solution: &[i32]) -> Option<(Vec<i32>, i64)> {
+    if solution.len() != model.search.len() {
+        return None;
+    }
+    let mut solver = model.solver.clone();
+    solver.enqueue_all();
+    for (&var, &value) in model.search.iter().zip(solution) {
+        solver.store.fix(var, value).ok()?;
+    }
+    solver.propagate().ok()?;
+    let value = objective_value(&solver, model.objective.as_ref()?)?;
+    let solution = model.search.iter().map(|&var| solver.store.value(var)).collect();
+    Some((solution, value))
+}
+
+fn objective_value(solver: &Solver, objective: &Objective) -> Option<i64> {
+    match objective {
+        Objective::Var(_, var) => fixed_value(solver, *var),
+        Objective::Linear(_, coeffs, vars) => {
+            coeffs.iter().zip(vars).try_fold(0i64, |sum, (&coeff, &var)| Some(sum + coeff * fixed_value(solver, var)?))
+        }
+        Objective::Expr(_, expr) => {
+            let mut vars = Vec::new();
+            expr.collect_vars(&mut vars);
+            for var in vars {
+                fixed_value(solver, var)?;
+            }
+            expr.eval(&|var| solver.store.value(var) as i64)
+        }
+    }
+}
+
+fn fixed_value(solver: &Solver, var: VarId) -> Option<i64> {
+    solver.store.is_fixed(var).then(|| solver.store.value(var) as i64)
+}
+
+fn run_incumbent_worker(
+    model: Problem,
+    local: LocalSearchSpec,
+    worker: usize,
+    seed: u64,
+    shared: &CopShared,
+    tx: &mpsc::Sender<WorkerMsg>,
+) {
+    let validator = model.clone();
+    solve_fast_cop(model, local, &shared.cancel, seed, |_, solution, _| {
+        if let Some((solution, value)) = validated_incumbent(&validator, solution) {
+            shared.report_improvement(tx, value, &solution, WorkerSource { kind: "incumbent", worker });
+        }
+    });
+    let _ = tx.send(WorkerMsg::Done(SolveStats::default()));
+}
+
 pub(crate) fn solve_cop<W: Write>(
     problem: Problem,
+    local: LocalSearchSpec,
     verbose: bool,
     stop: &AtomicBool,
     w: &mut W,
@@ -422,8 +494,10 @@ pub(crate) fn solve_cop<W: Write>(
     for _ in 1..options.workers {
         models.push(models[0].clone());
     }
-    let regular_workers = options.workers - options.probes - options.lns;
+    let incumbent_workers = fast_incumbent_workers(true, options);
+    let regular_workers = options.workers - options.probes - options.lns - incumbent_workers;
     let lns_end = regular_workers + options.lns;
+    let probe_end = lns_end + options.probes;
 
     std::thread::scope(|scope| {
         let monitor = Arc::clone(&shared);
@@ -439,8 +513,13 @@ pub(crate) fn solve_cop<W: Write>(
         for (worker, model) in models.into_iter().enumerate() {
             let shared = Arc::clone(&shared);
             let tx = tx.clone();
+            let local = local.clone();
             scope.spawn(move || {
                 let seed = options.seed.wrapping_add(worker as u64);
+                if worker >= probe_end {
+                    run_incumbent_worker(model, local, worker, seed, &shared, &tx);
+                    return;
+                }
                 if worker >= lns_end {
                     let (_, obj) = var_objective.expect("symbolic objective cannot use probes");
                     run_probe_worker(model, worker, obj, minimizing, seed, &shared, &tx);
