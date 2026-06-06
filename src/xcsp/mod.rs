@@ -12,6 +12,7 @@ use std::time::Instant;
 use xcsp3_rust_parser::xcsp_runner::XcspRunner;
 
 use crate::ids::VarId;
+use crate::ls::{solve_fast_cop, LocalSearchOutcome, LocalSearchSpec};
 use crate::parallel::{normalize_options, solve_cop, worker_roles, ParallelOutcome};
 use crate::problem::{Objective, Problem};
 use crate::search::{decide_sat_seeded, optimize_seeded, solve_interruptible_seeded, SearchControl, SolveStats};
@@ -47,10 +48,14 @@ fn write_tokens<W: Write>(w: &mut W, tokens: impl IntoIterator<Item = impl Displ
     Ok(())
 }
 
-fn write_improvement<W: Write>(w: &mut W, verbose: bool, error: &mut Option<std::io::Error>, value: impl Display) {
+fn write_improvement_from<W: Write>(w: &mut W, verbose: bool, error: &mut Option<std::io::Error>, value: impl Display, source: &str) {
     if verbose && error.is_none() {
-        *error = writeln!(w, "o {value}").and_then(|_| writeln!(w, "c incumbent {value} source sequential")).and_then(|_| w.flush()).err();
+        *error = writeln!(w, "o {value}").and_then(|_| writeln!(w, "c incumbent {value} source {source}")).and_then(|_| w.flush()).err();
     }
+}
+
+fn write_improvement<W: Write>(w: &mut W, verbose: bool, error: &mut Option<std::io::Error>, value: impl Display) {
+    write_improvement_from(w, verbose, error, value, "sequential");
 }
 
 fn write_optimization_result<W: Write>(
@@ -150,6 +155,7 @@ impl SolutionOutput {
 
 struct XcspProblem {
     problem: Problem,
+    local: LocalSearchSpec,
     output: SolutionOutput,
 }
 
@@ -194,7 +200,7 @@ fn parse_problem(path: &Path) -> Result<XcspProblem, String> {
         .unzip();
     let output = SolutionOutput { names, entries };
     let problem = Problem { solver: model.solver, search, objective: model.objective };
-    Ok(XcspProblem { problem, output })
+    Ok(XcspProblem { problem, local: model.local, output })
 }
 
 /// Parse, build, and solve an XCSP3 instance, returning competition-style
@@ -220,6 +226,9 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
     let mut xcsp = parse_problem(&path.0)?;
     let has_objective = xcsp.problem.objective.is_some();
     let var_objective = xcsp.problem.var_objective().is_some();
+    if options.fast_cop && !has_objective {
+        return Err("--fast-cop requires a COP instance".to_string());
+    }
     let symbolic_probes_disabled = has_objective && !var_objective && options.probes > 0;
     let options = normalize_options(has_objective, var_objective, options);
     let old_search = xcsp.problem.search.clone();
@@ -231,6 +240,10 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
         let kind = if xcsp.problem.objective.is_some() { "COP" } else { "CSP" };
         writeln!(w, "c qayd XCSP3").map_err(to_err)?;
         writeln!(w, "c type {kind}").map_err(to_err)?;
+        if options.fast_cop {
+            writeln!(w, "c mode fast-cop").map_err(to_err)?;
+            writeln!(w, "c effort incumbent").map_err(to_err)?;
+        }
         writeln!(w, "c variables {}", xcsp.problem.solver.store.num_vars()).map_err(to_err)?;
         writeln!(w, "c sparse domains {}", xcsp.problem.solver.store.num_sparse_domains()).map_err(to_err)?;
         writeln!(w, "c bounds domains {}", xcsp.problem.solver.store.num_bounds_domains()).map_err(to_err)?;
@@ -271,9 +284,9 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
     }
 
     if options.workers == 1 || !has_objective {
-        solve_single(xcsp, verbose, stop, w, options.seed, options.learn_csp)?;
+        solve_single(xcsp, verbose, stop, w, options)?;
     } else {
-        let XcspProblem { problem, output } = xcsp;
+        let XcspProblem { problem, output, .. } = xcsp;
         let result = solve_cop(problem, verbose, stop, w, options)?;
         write_parallel_result(w, &output, result, verbose)?;
     }
@@ -288,23 +301,51 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
     Ok(())
 }
 
-fn solve_single<W: Write>(
-    xcsp: XcspProblem,
-    verbose: bool,
-    stop: &AtomicBool,
-    w: &mut W,
-    seed: u64,
-    learn_csp: bool,
-) -> Result<(), String> {
-    let XcspProblem { problem, output } = xcsp;
+fn write_fast_cop_result<W: Write>(w: &mut W, output: &SolutionOutput, result: LocalSearchOutcome, verbose: bool) -> Result<(), String> {
+    let to_err = |e: std::io::Error| e.to_string();
+    if verbose {
+        writeln!(w, "c local constraints {} functionals {}", result.constraints, result.functionals).map_err(to_err)?;
+        if result.unsupported > 0 {
+            writeln!(w, "c local unsupported {}", result.unsupported).map_err(to_err)?;
+        }
+        if result.iterations > 0 {
+            writeln!(w, "c local iterations {} moves {} restarts {}", result.iterations, result.moves, result.restarts).map_err(to_err)?;
+        }
+    }
+    match result.best {
+        Some((solution, value)) => {
+            if !verbose {
+                writeln!(w, "o {value}").map_err(to_err)?;
+            }
+            writeln!(w, "s SATISFIABLE").map_err(to_err)?;
+            output.write(w, &solution).map_err(to_err)?;
+        }
+        None => writeln!(w, "s UNKNOWN").map_err(to_err)?,
+    }
+    Ok(())
+}
+
+fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w: &mut W, options: RunOptions) -> Result<(), String> {
+    let XcspProblem { problem, local, output } = xcsp;
+    if options.fast_cop {
+        let mut io_err: Option<std::io::Error> = None;
+        let result = solve_fast_cop(problem, local, stop, options.seed, |value, _, source| {
+            write_improvement_from(w, verbose, &mut io_err, value, source);
+        });
+        if let Some(e) = io_err {
+            return Err(e.to_string());
+        }
+        return write_fast_cop_result(w, &output, result, verbose);
+    }
+
     let mut solver = problem.solver;
     let vars = problem.search;
     let to_err = |e: std::io::Error| e.to_string();
 
     match problem.objective {
         None => {
-            let (sol, stats, complete) = if learn_csp {
-                decide_sat_seeded(&mut solver, &vars, stop, seed)
+            let (sol, stats, complete) = if options.learn_csp {
+                decide_sat_seeded(&mut solver, &vars, stop, options.seed)
             } else {
                 let mut found = None;
                 let stats = solve_interruptible_seeded(
@@ -315,7 +356,7 @@ fn solve_single<W: Write>(
                         SearchControl::Stop
                     },
                     stop,
-                    seed,
+                    options.seed,
                 );
                 (found, stats, !stop.load(Ordering::Relaxed))
             };
@@ -337,14 +378,14 @@ fn solve_single<W: Write>(
             let minimizing = objective.minimizing();
             let mut io_err: Option<std::io::Error> = None;
             let (best, stats, complete) =
-                optimize_seeded(&mut solver, &vars, objective.search(), minimizing, stop, seed, None, None, &[], None, |v, _| {
+                optimize_seeded(&mut solver, &vars, objective.search(), minimizing, stop, options.seed, None, None, &[], None, |v, _| {
                     write_improvement(w, verbose, &mut io_err, v)
                 });
             if let Some(e) = io_err {
                 return Err(e.to_string());
             }
             let interrupted = stop.load(Ordering::Relaxed);
-            write_optimization_result(w, &output, best, stats, complete, interrupted, verbose)
+            write_optimization_result(w, &output, best, stats, complete && !options.fast_cop, interrupted, verbose)
         }
     }
 }
@@ -354,7 +395,9 @@ fn write_parallel_result<W: Write>(w: &mut W, output: &SolutionOutput, result: P
     if verbose {
         writeln!(w, "c nodes {} failures {}", result.stats.nodes, result.stats.failures).map_err(to_err)?;
         write_inprocessing_stats(w, result.stats).map_err(to_err)?;
-        writeln!(w, "c shared clauses {} imported {}", result.shared_clauses, result.imported_clauses).map_err(to_err)?;
+        if result.shared_clauses > 0 || result.imported_clauses > 0 {
+            writeln!(w, "c shared clauses {} imported {}", result.shared_clauses, result.imported_clauses).map_err(to_err)?;
+        }
         if let Some((split, completed)) = result.split_jobs {
             writeln!(w, "c split jobs {split} completed {completed}").map_err(to_err)?;
         }

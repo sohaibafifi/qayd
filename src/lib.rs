@@ -33,6 +33,7 @@ pub mod search;
 pub mod store;
 pub mod trail;
 pub mod xcsp;
+mod ls;
 
 pub use expr::Expr;
 pub use ids::{PropId, VarId};

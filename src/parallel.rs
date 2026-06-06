@@ -21,6 +21,8 @@ pub struct RunOptions {
     pub seed: u64,
     /// Number of independent portfolio workers.
     pub workers: usize,
+    /// Optimize incumbent quality only; do not try to prove optimality.
+    pub fast_cop: bool,
     /// Split the search space into disjoint proof jobs.
     pub split: bool,
     /// Number of workers dedicated to optimistic objective probes.
@@ -33,7 +35,7 @@ pub struct RunOptions {
 
 impl Default for RunOptions {
     fn default() -> Self {
-        Self { seed: 0, workers: 1, split: false, probes: 0, lns: 0, learn_csp: false }
+        Self { seed: 0, workers: 1, fast_cop: false, split: false, probes: 0, lns: 0, learn_csp: false }
     }
 }
 
@@ -52,6 +54,9 @@ pub(crate) struct ParallelOutcome {
 pub(crate) fn normalize_options(has_objective: bool, var_objective: bool, options: RunOptions) -> RunOptions {
     let options = RunOptions { workers: options.workers.max(1), ..options };
     let workers = if has_objective { options.workers } else { 1 };
+    if options.fast_cop {
+        return RunOptions { workers: 1, fast_cop: has_objective, split: false, probes: 0, lns: 0, learn_csp: false, ..options };
+    }
     if workers == 1 {
         return RunOptions { workers, split: false, probes: 0, lns: 0, ..options };
     }
@@ -69,7 +74,7 @@ pub(crate) fn normalize_options(has_objective: bool, var_objective: bool, option
 
 pub(crate) fn worker_roles(has_objective: bool, options: RunOptions) -> String {
     if !has_objective || options.workers == 1 {
-        return "sequential 1".to_string();
+        return format!("{} 1", if options.fast_cop && has_objective { "incumbent" } else { "sequential" });
     }
     let regular = options.workers - options.probes - options.lns;
     let mut roles = vec![format!("{} {regular}", if options.split { "split" } else { "portfolio" })];
