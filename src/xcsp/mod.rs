@@ -16,7 +16,7 @@ use crate::ids::VarId;
 use crate::ls::{solve_fast_cop, LocalSearchOutcome, LocalSearchSpec};
 use crate::parallel::{normalize_options, solve_cop, worker_roles, ParallelOutcome};
 use crate::problem::{Objective, Problem};
-use crate::search::{decide_sat_seeded, optimize_seeded, solve_interruptible_seeded, SearchControl, SolveStats};
+use crate::search::{decide_sat_seeded, optimize_fast_seeded, optimize_seeded, solve_interruptible_seeded, SearchControl, SolveStats};
 
 pub use crate::parallel::RunOptions;
 
@@ -456,10 +456,25 @@ fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w
             let minimizing = objective.minimizing();
             let mut io_err: Option<std::io::Error> = None;
             let source = if options.fast_cop { "cp" } else { "sequential" };
-            let (best, stats, complete) =
+            let (best, stats, complete) = if options.fast_cop {
+                optimize_fast_seeded(
+                    &mut solver,
+                    &vars,
+                    objective.search(),
+                    minimizing,
+                    stop,
+                    options.seed,
+                    None,
+                    None,
+                    &[],
+                    None,
+                    |v, _| write_improvement_from(w, verbose, &mut io_err, v, source),
+                )
+            } else {
                 optimize_seeded(&mut solver, &vars, objective.search(), minimizing, stop, options.seed, None, None, &[], None, |v, _| {
                     write_improvement_from(w, verbose, &mut io_err, v, source)
-                });
+                })
+            };
             if let Some(e) = io_err {
                 return Err(e.to_string());
             }
