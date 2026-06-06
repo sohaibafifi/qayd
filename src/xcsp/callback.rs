@@ -46,6 +46,23 @@ fn ones(n: usize) -> Vec<i64> {
     vec![1; n]
 }
 
+fn weighted_sum_expr(coeffs: &[i64], vars: &[VarId]) -> Expr {
+    let mut terms = Vec::with_capacity(vars.len());
+    for (&coeff, &var) in coeffs.iter().zip(vars) {
+        match coeff {
+            0 => {}
+            1 => terms.push(expr::var(var)),
+            -1 => terms.push(expr::neg(expr::var(var))),
+            _ => terms.push(expr::mul(vec![expr::int(coeff), expr::var(var)])),
+        }
+    }
+    match terms.len() {
+        0 => expr::int(0),
+        1 => terms.pop().unwrap(),
+        _ => expr::add(terms),
+    }
+}
+
 fn sorted_values(values: impl IntoIterator<Item = i32>) -> Result<Vec<i32>, String> {
     let mut values: Vec<i32> = values.into_iter().collect();
     values.sort_unstable();
@@ -317,19 +334,12 @@ impl Model {
                 self.post_linear(coeffs, vars, Relation::Eq, Rhs::Var(y))?;
             }
             (ROp::Notin, Operand::Interval(lo, hi)) => {
-                // Σ ∉ [lo,hi] is a disjunction; constrain the sum to the complement
-                // within its own reachable range (mirrors the `in {set}` path).
-                let (mut smin, mut smax) = (0i64, 0i64);
-                for (&c, &v) in coeffs.iter().zip(&vars) {
-                    let (a, b) = (self.solver.store.min(v) as i64, self.solver.store.max(v) as i64);
-                    let (p, q) = if c >= 0 { (c * a, c * b) } else { (c * b, c * a) };
-                    smin += p;
-                    smax += q;
-                }
-                let (lo, hi) = (lo as i64, hi as i64);
-                let allowed: Vec<i32> = (smin..=smax).filter(|&v| v < lo || v > hi).map(clamp).collect();
-                let y = self.solver.new_var_set(&allowed);
-                self.post_linear(coeffs, vars, Relation::Eq, Rhs::Var(y))?;
+                // Σ ∉ [lo,hi] is a disjunction. Keep it symbolic instead of
+                // materialising the complement, which can be empty or huge.
+                let sum = weighted_sum_expr(&coeffs, &vars);
+                let e = expr::or(vec![expr::lt(sum.clone(), expr::int(lo as i64)), expr::gt(sum, expr::int(hi as i64))]);
+                self.local.add_expr(e.clone());
+                crate::constraints::intension::intension(&mut self.solver, e);
             }
             (operator, operand) => {
                 for (rel, rhs) in self.conditions(operator, operand)? {
