@@ -456,14 +456,15 @@ impl Model {
         Ok(())
     }
 
-    /// `gecode_bin_packing_load(l, bin, w, minIndex)`: per-bin load equals the
+    /// `gecode_bin_packing_load(l, bin, w, minIndex)` or the standard 3-argument
+    /// `fzn_bin_packing_load(l, bin, w)` (bins 1-based): per-bin load equals the
     /// sum of the weights of the items assigned to it.
     pub(crate) fn post_bin_packing_load(&mut self, args: &[String]) -> Result<(), String> {
-        require(args.len() == 4, "bin_packing_load expects 4 arguments")?;
+        require(args.len() == 3 || args.len() == 4, "bin_packing_load expects 3 or 4 arguments")?;
         let load = self.var_list(&args[0])?;
         let bin = self.var_list(&args[1])?;
         let weight = self.int_list(&args[2])?;
-        let min_index = self.int_atom(&args[3])?;
+        let min_index = if args.len() == 4 { self.int_atom(&args[3])? } else { 1 };
         require(bin.len() == weight.len(), "bin_packing_load bin/weight mismatch")?;
         for (j, &l) in load.iter().enumerate() {
             let target = min_index + j as i32;
@@ -515,6 +516,103 @@ impl Model {
         let vars = self.var_list(&args[0])?;
         if vars.len() > 1 {
             ordered(&mut self.solver, &vars, rel);
+        }
+        Ok(())
+    }
+
+    /// `fzn_member_int(x, y)`: `y` occurs in the array `x`.
+    pub(crate) fn post_member(&mut self, args: &[String]) -> Result<(), String> {
+        require(args.len() == 2, "member expects 2 arguments")?;
+        let xs = self.var_list(&args[0])?;
+        require(!xs.is_empty(), "member over empty array")?;
+        let y = self.atom_expr(&args[1])?;
+        let terms = xs.iter().map(|&x| expr::eq(expr::var(x), y.clone())).collect();
+        intension(&mut self.solver, expr::or(terms));
+        Ok(())
+    }
+
+    /// `bool_sum_eq/le/ge(x, c)`: sum of Booleans `<rel>` `c` (constant or variable).
+    pub(crate) fn post_bool_sum(&mut self, args: &[String], rel: Relation) -> Result<(), String> {
+        require(args.len() == 2, "bool_sum expects 2 arguments")?;
+        let mut vars = self.var_list(&args[0])?;
+        let mut coeffs = vec![1i64; vars.len()];
+        let rhs = if let Ok(k) = self.int_atom(&args[1]) {
+            i64::from(k)
+        } else {
+            vars.push(self.var_atom(&args[1])?);
+            coeffs.push(-1);
+            0
+        };
+        linear(&mut self.solver, &coeffs, &vars, rel, rhs);
+        Ok(())
+    }
+
+    /// `chuffed_connected(from, to, ns, es)`: the subgraph induced by the
+    /// selected nodes `ns` and edges `es` is connected. Decomposed with BFS
+    /// levels: one selected root at level 0; every other selected node needs a
+    /// selected edge to a neighbour exactly one level below.
+    pub(crate) fn post_connected(&mut self, args: &[String]) -> Result<(), String> {
+        require(args.len() == 4, "connected expects 4 arguments")?;
+        let from = self.int_list(&args[0])?;
+        let to = self.int_list(&args[1])?;
+        let ns = self.var_list(&args[2])?;
+        let es = self.var_list(&args[3])?;
+        require(from.len() == to.len(), "connected: from/to length mismatch")?;
+        require(from.len() == es.len(), "connected: edge arrays length mismatch")?;
+        let n = ns.len();
+        let node = |id: i32| -> Result<usize, String> {
+            let i = id - 1; // FlatZinc node ids are 1-based
+            if i >= 0 && (i as usize) < n {
+                Ok(i as usize)
+            } else {
+                Err(format!("connected: node id `{id}` out of range"))
+            }
+        };
+        // A selected edge selects both its endpoints.
+        for (e, &sel) in es.iter().enumerate() {
+            let (u, v) = (node(from[e])?, node(to[e])?);
+            intension(&mut self.solver, expr::imp(expr::var(sel), expr::var(ns[u])));
+            intension(&mut self.solver, expr::imp(expr::var(sel), expr::var(ns[v])));
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        // Levels, root indicators, and "any node selected". These are search
+        // variables: `intension`'s exact final check only fires once every
+        // variable in scope is fixed, so leaving them out of the search would
+        // let spurious (disconnected) solutions through.
+        let level: Vec<VarId> = (0..n).map(|_| self.solver.new_var_range(0, n as i32 - 1)).collect();
+        let root: Vec<VarId> = (0..n).map(|_| self.solver.new_var_range(0, 1)).collect();
+        let any = self.solver.new_var_range(0, 1);
+        self.search.extend(level.iter().copied());
+        self.search.extend(root.iter().copied());
+        self.search.push(any);
+        intension(&mut self.solver, expr::iff(expr::var(any), expr::or(ns.iter().map(|&v| expr::var(v)).collect())));
+        // Exactly one root when any node is selected, none otherwise.
+        let mut coeffs = vec![1i64; n];
+        let mut vars = root.clone();
+        coeffs.push(-1);
+        vars.push(any);
+        linear(&mut self.solver, &coeffs, &vars, Relation::Eq, 0);
+        // Incident (edge, neighbour) pairs per node.
+        let mut incident: Vec<Vec<(VarId, usize)>> = vec![Vec::new(); n];
+        for (e, &sel) in es.iter().enumerate() {
+            let (u, v) = (node(from[e])?, node(to[e])?);
+            incident[u].push((sel, v));
+            incident[v].push((sel, u));
+        }
+        for v in 0..n {
+            // A root is a selected node at level 0.
+            intension(
+                &mut self.solver,
+                expr::imp(expr::var(root[v]), expr::and(vec![expr::var(ns[v]), expr::eq(expr::var(level[v]), expr::int(0))])),
+            );
+            // A selected non-root node has a selected edge to a parent one level below.
+            let parents: Vec<Expr> = incident[v]
+                .iter()
+                .map(|&(e, u)| expr::and(vec![expr::var(e), expr::eq(expr::var(level[u]), expr::sub(expr::var(level[v]), expr::int(1)))]))
+                .collect();
+            intension(&mut self.solver, expr::imp(expr::and(vec![expr::var(ns[v]), expr::not(expr::var(root[v]))]), expr::or(parents)));
         }
         Ok(())
     }

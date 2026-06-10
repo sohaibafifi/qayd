@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use qayd::constraints::intension::intension;
 use qayd::constraints::linear::{linear, Relation};
-use qayd::constraints::primitives::{all_different, precedence};
+use qayd::constraints::primitives::{all_different, all_equal, precedence};
 use qayd::expr;
 use qayd::VarId;
 
@@ -177,8 +177,8 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
             all_different(&mut model.solver, &vars);
             Ok(())
         }
-        "array_int_element" => model.post_element(&args, false),
-        "array_var_int_element" => model.post_element(&args, true),
+        "array_int_element" | "array_bool_element" => model.post_element(&args, false),
+        "array_var_int_element" | "array_var_bool_element" => model.post_element(&args, true),
         "gecode_int_element" => model.post_gecode_element(&args),
         "array_int_minimum" => model.post_extremum(&args, true),
         "array_int_maximum" => model.post_extremum(&args, false),
@@ -295,17 +295,33 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
         }
         "int_pow" | "gecode_int_pow" => model.post_int_pow(&args),
 
+        // Boolean sums (Chuffed flavour; the target may be a variable).
+        "bool_sum_eq" => model.post_bool_sum(&args, Relation::Eq),
+        "bool_sum_le" => model.post_bool_sum(&args, Relation::Le),
+        "bool_sum_lt" => model.post_bool_sum(&args, Relation::Lt),
+        "bool_sum_ge" => model.post_bool_sum(&args, Relation::Ge),
+        "bool_sum_gt" => model.post_bool_sum(&args, Relation::Gt),
+        "bool_lin_eq" => model.post_linear(&args, Relation::Eq),
+        "bool_lin_le" => model.post_linear(&args, Relation::Le),
+
         // Globals mapped onto existing propagators / decompositions.
-        "gecode_table_int" | "fzn_table_int" | "table_int" => model.post_table(&args),
+        "gecode_table_int" | "chuffed_table_int" | "fzn_table_int" | "table_int" => model.post_table(&args),
         "gecode_bool_element" => model.post_gecode_element(&args),
-        "gecode_regular" | "fzn_regular" => model.post_regular(&args),
+        "gecode_regular" | "chuffed_regular" | "fzn_regular" => model.post_regular(&args),
         "gecode_circuit" => model.post_circuit(&args),
-        "gecode_cumulatives" => model.post_cumulatives(&args),
-        "gecode_schedule_unary" => model.post_schedule_unary(&args),
-        "gecode_global_cardinality" => model.post_gcc_counts(&args),
+        "fzn_circuit" => {
+            require(args.len() == 1, "fzn_circuit expects 1 argument")?;
+            // Standard form: successors are 1-based over the index set.
+            model.post_circuit(&["1".to_string(), args[0].clone()])
+        }
+        "gecode_cumulatives" | "chuffed_cumulative_vars" | "fzn_cumulative" => model.post_cumulatives(&args),
+        "gecode_schedule_unary" | "chuffed_disjunctive_strict" | "fzn_disjunctive" | "fzn_disjunctive_strict" => {
+            model.post_schedule_unary(&args)
+        }
+        "gecode_global_cardinality" | "fzn_global_cardinality" => model.post_gcc_counts(&args),
         "fzn_global_cardinality_low_up" => model.post_gcc_low_up(&args, false),
         "fzn_global_cardinality_low_up_closed" => model.post_gcc_low_up(&args, true),
-        "gecode_bin_packing_load" => model.post_bin_packing_load(&args),
+        "gecode_bin_packing_load" | "fzn_bin_packing_load" => model.post_bin_packing_load(&args),
         "gecode_maximum_arg_int_offset" => model.post_arg_max(&args),
         "gecode_precede" | "fzn_int_precede" => {
             let list = model.var_list(&args[0])?;
@@ -314,8 +330,27 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
             precedence(&mut model.solver, &list, &[s, t]);
             Ok(())
         }
-        "array_int_lq" | "array_bool_lq" => model.post_array_lex(&args, false),
-        "array_int_lt" | "array_bool_lt" => model.post_array_lex(&args, true),
+        "chuffed_value_precede" | "fzn_value_precede_int" => {
+            // Same as `gecode_precede`, with the values first: `(s, t, x)`.
+            let s = model.int_atom(&args[0])?;
+            let t = model.int_atom(&args[1])?;
+            let list = model.var_list(&args[2])?;
+            precedence(&mut model.solver, &list, &[s, t]);
+            Ok(())
+        }
+        "chuffed_connected" | "fzn_connected" => model.post_connected(&args),
+        "fzn_member_int" => model.post_member(&args),
+        "fzn_all_equal_int" => {
+            let vars = model.var_list(&args[0])?;
+            if vars.len() > 1 {
+                all_equal(&mut model.solver, &vars);
+            }
+            Ok(())
+        }
+        "fzn_maximum_int" => model.post_extremum(&args, false),
+        "fzn_minimum_int" => model.post_extremum(&args, true),
+        "array_int_lq" | "array_bool_lq" | "fzn_lex_lesseq_int" | "fzn_lex_lesseq_bool" => model.post_array_lex(&args, false),
+        "array_int_lt" | "array_bool_lt" | "fzn_lex_less_int" | "fzn_lex_less_bool" => model.post_array_lex(&args, true),
         "fzn_increasing_int" | "fzn_increasing_bool" => model.post_ordered(&args, Relation::Le),
         "fzn_decreasing_int" | "fzn_decreasing_bool" => model.post_ordered(&args, Relation::Ge),
 
