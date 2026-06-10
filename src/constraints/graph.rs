@@ -54,16 +54,16 @@ impl Propagator for Circuit {
             return store.fix(self.succ[0], 0);
         }
 
+        // Domain in range, no self-loops. Idempotent, so apply once up front.
+        for i in 0..n {
+            store.remove_below(self.succ[i], 0)?;
+            store.remove_above(self.succ[i], (n - 1) as i32)?;
+            store.remove(self.succ[i], i as i32)?;
+        }
+
         loop {
             let before_size: usize = self.succ.iter().map(|&v| store.size(v)).sum();
             let before_linked: i32 = self.linked.iter().map(|&r| store.rev_get(r)).sum();
-
-            // Domain in range, no self-loops.
-            for i in 0..n {
-                store.remove_below(self.succ[i], 0)?;
-                store.remove_above(self.succ[i], (n - 1) as i32)?;
-                store.remove(self.succ[i], i as i32)?;
-            }
 
             // Forward-checking distinctness.
             for i in 0..n {

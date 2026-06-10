@@ -676,6 +676,15 @@ macro_rules! guard {
     }};
 }
 
+/// `guard!` for a constraint with no local-search encoding: first flags it so LS
+/// falls back, then runs the body for the CP model.
+macro_rules! guard_unsupported {
+    ($self:ident, $body:block) => {{
+        $self.local.mark_unsupported();
+        guard!($self, $body);
+    }};
+}
+
 impl XcspCallback for Model {
     fn begin_instance(&mut self, _t: &InstanceType) {}
 
@@ -812,8 +821,7 @@ impl XcspCallback for Model {
     }
 
     fn on_constraint_all_different_except(&mut self, list: &[String], except: &[i32]) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             // Weak form: for every pair, they differ unless the first takes an
             // exempt value (`x_i == x_j ⟹ x_i ∈ except`).
             // TODO(strong): allDifferent-except via matching that ignores exempts.
@@ -898,14 +906,9 @@ impl XcspCallback for Model {
     }
     fn on_constraint_sum_v3(&mut self, list: &[String], coeffs: &[String], operator: ROp, operand: Operand) {
         guard!(self, {
-            let xs = self.scope(list)?;
-            let cs = self.scope(coeffs)?;
-            if xs.len() != cs.len() {
-                return Err("sum: list/coeffs length mismatch".to_string());
-            }
             // Variable coefficients: materialise p_i = c_i · x_i as intension-backed
             // aux vars, then post a unit-coefficient linear sum over them.
-            let prods: Vec<VarId> = xs.iter().zip(&cs).map(|(&x, &c)| self.aux_for(expr::mul(vec![expr::var(c), expr::var(x)]))).collect();
+            let prods = self.var_coeff_products(list, coeffs, "sum")?;
             let coeffs = ones(prods.len());
             self.post_sum(coeffs, prods, operator, operand)
         });
@@ -967,8 +970,7 @@ impl XcspCallback for Model {
     }
 
     fn on_constraint_element_v1(&mut self, list: &[String], value: i32) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             // value belongs to the list (existential element with free index).
             let array = self.scope(list)?;
             let n = array.len() as i32;
@@ -993,15 +995,13 @@ impl XcspCallback for Model {
         });
     }
     fn on_constraint_element_v5(&mut self, list: &[String], start_index: i32, index: String, operator: ROp, operand: Operand) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let array = self.scope(list)?;
             self.post_element_cond(array, start_index, &index, operator, operand)
         });
     }
     fn on_constraint_element_v8(&mut self, list: &[i32], start_index: i32, index: String, operator: ROp, operand: Operand) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let array = self.consts(list);
             self.post_element_cond(array, start_index, &index, operator, operand)
         });
@@ -1030,8 +1030,7 @@ impl XcspCallback for Model {
         start_col_index: i32,
         value: i32,
     ) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let (rows, cols) = self.matrix_shape(matrix)?;
             let array = matrix.iter().flatten().map(|s| self.var_id(s)).collect::<Result<Vec<_>, _>>()?;
             let val = self.constant(value);
@@ -1048,8 +1047,7 @@ impl XcspCallback for Model {
         start_col_index: i32,
         value: String,
     ) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let (rows, cols) = self.matrix_shape(matrix)?;
             let array = matrix.iter().flatten().map(|s| self.var_id(s)).collect::<Result<Vec<_>, _>>()?;
             let val = self.var_id(&value)?;
@@ -1066,8 +1064,7 @@ impl XcspCallback for Model {
         start_col_index: i32,
         value: i32,
     ) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let (rows, cols) = self.matrix_shape(matrix)?;
             let array = matrix.iter().flatten().map(|&v| self.constant(v)).collect();
             let val = self.constant(value);
@@ -1084,8 +1081,7 @@ impl XcspCallback for Model {
         start_col_index: i32,
         value: String,
     ) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let (rows, cols) = self.matrix_shape(matrix)?;
             let array = matrix.iter().flatten().map(|&v| self.constant(v)).collect();
             let val = self.var_id(&value)?;
@@ -1095,8 +1091,7 @@ impl XcspCallback for Model {
     }
 
     fn on_constraint_cumulative_v1(&mut self, origins: &[String], lengths: &[i32], heights: &[i32], operator: ROp, operand: Operand) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             require(matches!(operator, ROp::Le), "cumulative condition must be <=")?;
             let starts = self.scope(origins)?;
             let d = i64s(lengths);
@@ -1117,24 +1112,21 @@ impl XcspCallback for Model {
         });
     }
     fn on_constraint_cumulative_v2(&mut self, origins: &[String], lengths: &[i32], heights: &[String], operator: ROp, operand: Operand) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let dv = self.consts(lengths);
             let h = self.scope(heights)?;
             self.post_cumulative_var(origins, dv, h, operator, &operand)
         });
     }
     fn on_constraint_cumulative_v3(&mut self, origins: &[String], lengths: &[String], heights: &[i32], operator: ROp, operand: Operand) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let dv = self.scope(lengths)?;
             let h = self.consts(heights);
             self.post_cumulative_var(origins, dv, h, operator, &operand)
         });
     }
     fn on_constraint_cumulative_v4(&mut self, origins: &[String], lengths: &[String], heights: &[String], operator: ROp, operand: Operand) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let dv = self.scope(lengths)?;
             let h = self.scope(heights)?;
             self.post_cumulative_var(origins, dv, h, operator, &operand)
@@ -1156,16 +1148,14 @@ impl XcspCallback for Model {
     }
 
     fn on_constraint_channel_v1(&mut self, list: &[String], _start_index: i32) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let vars = self.scope(list)?;
             channel(&mut self.solver, &vars, &vars);
             Ok(())
         });
     }
     fn on_constraint_channel_v2(&mut self, list1: &[String], start_index1: i32, list2: &[String], start_index2: i32) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let xs = self.scope(list1)?;
             let ys = self.scope(list2)?;
             for &x in &xs {
@@ -1187,8 +1177,7 @@ impl XcspCallback for Model {
         });
     }
     fn on_constraint_channel_v3(&mut self, list: &[String], start_index: i32, value: String) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             // 0/1 list; `value` is the index of the single 1:
             // x[i] == 1  ⟺  value == i + start_index.
             let xs = self.scope(list)?;
@@ -1199,8 +1188,7 @@ impl XcspCallback for Model {
     }
 
     fn on_constraint_precedence_v1(&mut self, list: &[String], _covered: bool) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             // Default value order: the sorted distinct values across all domains.
             let vars = self.scope(list)?;
             let mut vals: Vec<i32> = Vec::new();
@@ -1214,8 +1202,7 @@ impl XcspCallback for Model {
         });
     }
     fn on_constraint_precedence_v2(&mut self, list: &[String], values: &[i32], _covered: bool) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let vars = self.scope(list)?;
             crate::constraints::primitives::precedence(&mut self.solver, &vars, values);
             Ok(())
@@ -1223,8 +1210,7 @@ impl XcspCallback for Model {
     }
 
     fn on_constraint_circuit_v1(&mut self, list: &Vec<String>) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let vars = self.scope(list)?;
             circuit(&mut self.solver, &vars);
             Ok(())
@@ -1285,8 +1271,7 @@ impl XcspCallback for Model {
     }
 
     fn on_constraint_bin_packing_v1(&mut self, list: &[String], sizes: &[i32], operator: ROp, operand: Operand) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let items = self.scope(list)?;
             let s = i64s(sizes);
             let cap = match (operator, self.rhs(&operand)?) {
@@ -1300,8 +1285,7 @@ impl XcspCallback for Model {
         });
     }
     fn on_constraint_bin_packing_v2(&mut self, list: &[String], sizes: &[i32], limits: &[i32]) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let items = self.scope(list)?;
             let s = i64s(sizes);
             let caps = i64s(limits);
@@ -1310,8 +1294,7 @@ impl XcspCallback for Model {
         });
     }
     fn on_constraint_bin_packing_v3(&mut self, list: &[String], sizes: &[i32], limits: &[String]) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             // Variable capacities: load_b = Σ_i size_i·[item_i==b]  must be ≤ limit_b.
             let items = self.scope(list)?;
             let lim = self.scope(limits)?;
@@ -1326,8 +1309,7 @@ impl XcspCallback for Model {
         });
     }
     fn on_constraint_bin_packing_v4(&mut self, list: &[String], sizes: &[i32], loads: &[i32]) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             // Each bin's load is fixed to the given constant loads[b].
             let items = self.scope(list)?;
             let s = i64s(sizes);
@@ -1337,8 +1319,7 @@ impl XcspCallback for Model {
         });
     }
     fn on_constraint_bin_packing_v5(&mut self, list: &[String], sizes: &[i32], loads: &[String]) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             // Each bin's load variable equals the total size assigned to it:
             // load_b = Σ_i size_i · [item_i == b].
             let items = self.scope(list)?;
@@ -1372,8 +1353,7 @@ impl XcspCallback for Model {
     }
 
     fn on_constraint_no_overlap_v1(&mut self, list: &[String], lengths: &[i32], _zero_ignored: bool) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let starts = self.scope(list)?;
             let d = i64s(lengths);
             no_overlap(&mut self.solver, &starts, &d);
@@ -1381,8 +1361,7 @@ impl XcspCallback for Model {
         });
     }
     fn on_constraint_no_overlap_v2(&mut self, list: &[String], lengths: &[String], zero: bool) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             if list.len() != lengths.len() {
                 return Err("noOverlap: list/lengths length mismatch".to_string());
             }
@@ -1396,16 +1375,14 @@ impl XcspCallback for Model {
         });
     }
     fn on_constraint_no_overlap_k_dim_v1(&mut self, origins: &Vec<Vec<String>>, lengths: &Vec<Vec<i32>>, zero: bool) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let org = self.origins_to_ids(origins)?;
             let len: Vec<Vec<Expr>> = lengths.iter().map(|b| b.iter().map(|&l| expr::int(l as i64)).collect()).collect();
             self.post_diffn(org, len, zero)
         });
     }
     fn on_constraint_no_overlap_k_dim_v2(&mut self, origins: &Vec<Vec<String>>, lengths: &Vec<Vec<String>>, zero: bool) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let org = self.origins_to_ids(origins)?;
             let mut len = Vec::with_capacity(lengths.len());
             for b in lengths {
@@ -1419,8 +1396,7 @@ impl XcspCallback for Model {
         });
     }
     fn on_constraint_no_overlap_k_dim_v3(&mut self, origins: &Vec<Vec<String>>, lengths: &Vec<(String, i32)>, zero: bool) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let org = self.origins_to_ids(origins)?;
             let mut len = Vec::with_capacity(lengths.len());
             for &(ref s, l) in lengths {
@@ -1431,8 +1407,7 @@ impl XcspCallback for Model {
     }
 
     fn on_constraint_regular(&mut self, list: &[String], start: String, finals: &[String], transitions: &[(String, i32, String)]) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let vars = self.scope(list)?;
             let mut states: HashMap<String, usize> = HashMap::new();
             let state_id = |s: &str, m: &mut HashMap<String, usize>| {
@@ -1450,8 +1425,7 @@ impl XcspCallback for Model {
     }
 
     fn on_constraint_mdd(&mut self, list: &[String], transitions: &Vec<(String, i32, String)>) {
-        self.local.mark_unsupported();
-        guard!(self, {
+        guard_unsupported!(self, {
             let vars = self.scope(list)?;
             // Layer per variable, inferred from a root reachable BFS over labels.
             let m = build_mdd(vars.len(), transitions)?;
@@ -1672,15 +1646,21 @@ impl Model {
         self.objective_agg(t, vars, coeffs, minimize)
     }
 
-    /// Objective with variable coefficients: each term is a var*var product,
-    /// materialised to an aux var, then aggregated with unit coefficients.
-    fn objective_sum_varcoeffs(&mut self, t: XElementOperator, list: &[String], coeffs: &[String], minimize: bool) -> Result<(), String> {
+    /// Materialise variable-coefficient products `c_i · x_i`, each an aux var, from
+    /// the named term/coeff lists. `what` tags the length-mismatch error.
+    fn var_coeff_products(&mut self, list: &[String], coeffs: &[String], what: &str) -> Result<Vec<VarId>, String> {
         let xs = self.scope(list)?;
         let cs = self.scope(coeffs)?;
         if xs.len() != cs.len() {
-            return Err("objective: coeffs/terms length mismatch".to_string());
+            return Err(format!("{what}: list/coeffs length mismatch"));
         }
-        let prods: Vec<VarId> = xs.iter().zip(&cs).map(|(&x, &c)| self.aux_for(expr::mul(vec![expr::var(c), expr::var(x)]))).collect();
+        Ok(xs.iter().zip(&cs).map(|(&x, &c)| self.aux_for(expr::mul(vec![expr::var(c), expr::var(x)]))).collect())
+    }
+
+    /// Objective with variable coefficients: each term is a var*var product,
+    /// materialised to an aux var, then aggregated with unit coefficients.
+    fn objective_sum_varcoeffs(&mut self, t: XElementOperator, list: &[String], coeffs: &[String], minimize: bool) -> Result<(), String> {
+        let prods = self.var_coeff_products(list, coeffs, "objective")?;
         let coeffs = ones(prods.len());
         self.objective_agg(t, prods, coeffs, minimize)
     }

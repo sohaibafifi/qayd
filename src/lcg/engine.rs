@@ -135,9 +135,9 @@ impl Cdcl<'_> {
     fn decision_lit(&self, v: VarId, phase: &[Option<i32>], objective: Option<&ObjectiveImpact>, mode: SearchMode) -> Lit {
         let val = match phase[v.index()] {
             Some(p) if self.rephase_mode == 0 && self.solver.store.contains(v, p) => p,
-            _ if mode == SearchMode::FastCop => objective
-                .and_then(|objective| objective.preferred_value(self.solver, v))
-                .unwrap_or_else(|| self.rephase_value(v)),
+            _ if mode == SearchMode::FastCop => {
+                objective.and_then(|objective| objective.preferred_value(self.solver, v)).unwrap_or_else(|| self.rephase_value(v))
+            }
             _ => self.rephase_value(v),
         };
         match self.atoms.eq(v, val) {
@@ -286,7 +286,7 @@ impl Cdcl<'_> {
         };
         self.backjump_to(0);
         self.set_bound_scope(bound);
-        self.assert_root(bound)
+        self.assert_root_lit(bound)
     }
 
     /// Assert a strict improvement on a materialized or symbolic objective.
@@ -315,15 +315,10 @@ impl Cdcl<'_> {
         }
     }
 
-    /// Assert a non-deletable root unit and propagate it.
-    fn assert_root(&mut self, lit: Lit) -> bool {
-        self.assert_root_lit(lit)
-    }
-
     /// Assert the root units defining one disjoint search cube.
     fn assume_cube(&mut self, cube: &[Lit]) -> bool {
         self.set_cube_scope(cube);
-        cube.iter().copied().all(|lit| self.assert_root(lit))
+        cube.iter().copied().all(|lit| self.assert_root_lit(lit))
     }
 
     /// Assert `obj <= target` when minimizing or `obj >= target` when maximizing.
@@ -345,7 +340,7 @@ impl Cdcl<'_> {
             }
         };
         self.set_bound_scope(bound);
-        self.assert_root(bound)
+        self.assert_root_lit(bound)
     }
 
     /// Pick one binary split for a cube, or `None` when it is already terminal.

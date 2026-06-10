@@ -49,6 +49,36 @@ fn write_tokens<W: Write>(w: &mut W, tokens: impl IntoIterator<Item = impl Displ
     Ok(())
 }
 
+fn io_err(e: std::io::Error) -> String {
+    e.to_string()
+}
+
+/// Write a result's tail: the optional `o {value}` line (non-verbose runs with a
+/// known objective), the status line, and the instantiation. `sat`/`none` are
+/// the status lines for the solved / unsolved cases; `value` is `None` for CSP.
+fn write_solution_tail<W: Write>(
+    w: &mut W,
+    output: &SolutionOutput,
+    best: Option<(Vec<i32>, Option<impl Display>)>,
+    sat: &str,
+    none: &str,
+    verbose: bool,
+) -> Result<(), String> {
+    match best {
+        Some((solution, value)) => {
+            if !verbose {
+                if let Some(value) = value {
+                    writeln!(w, "o {value}").map_err(io_err)?;
+                }
+            }
+            writeln!(w, "{sat}").map_err(io_err)?;
+            output.write(w, &solution).map_err(io_err)?;
+        }
+        None => writeln!(w, "{none}").map_err(io_err)?,
+    }
+    Ok(())
+}
+
 fn write_improvement_from<W: Write>(w: &mut W, verbose: bool, error: &mut Option<std::io::Error>, value: impl Display, source: &str) {
     if verbose && error.is_none() {
         *error = writeln!(w, "o {value}").and_then(|_| writeln!(w, "c incumbent {value} source {source}")).and_then(|_| w.flush()).err();
@@ -64,23 +94,13 @@ fn write_optimization_result<W: Write>(
     interrupted: bool,
     verbose: bool,
 ) -> Result<(), String> {
-    let to_err = |e: std::io::Error| e.to_string();
     if verbose {
-        writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(to_err)?;
-        write_inprocessing_stats(w, stats).map_err(to_err)?;
+        writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(io_err)?;
+        write_inprocessing_stats(w, stats).map_err(io_err)?;
     }
-    match best {
-        Some((solution, value)) => {
-            if !verbose {
-                writeln!(w, "o {value}").map_err(to_err)?;
-            }
-            writeln!(w, "{}", if complete { "s OPTIMUM FOUND" } else { "s SATISFIABLE" }).map_err(to_err)?;
-            output.write(w, &solution).map_err(to_err)?;
-        }
-        None if interrupted => writeln!(w, "s UNKNOWN").map_err(to_err)?,
-        None => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
-    }
-    Ok(())
+    let sat = if complete { "s OPTIMUM FOUND" } else { "s SATISFIABLE" };
+    let none = if interrupted { "s UNKNOWN" } else { "s UNSATISFIABLE" };
+    write_solution_tail(w, output, best.map(|(s, v)| (s, Some(v))), sat, none, verbose)
 }
 
 fn write_inprocessing_stats<W: Write>(w: &mut W, stats: SolveStats) -> std::io::Result<()> {
@@ -231,52 +251,51 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
     let old_search = xcsp.problem.search.clone();
     let presolve = xcsp.problem.presolve(stop);
     xcsp.output.remap_after_presolve(&old_search, &xcsp.problem);
-    let to_err = |e: std::io::Error| e.to_string();
 
     if verbose {
         let kind = if xcsp.problem.objective.is_some() { "COP" } else { "CSP" };
-        writeln!(w, "c qayd XCSP3").map_err(to_err)?;
-        writeln!(w, "c type {kind}").map_err(to_err)?;
+        writeln!(w, "c qayd XCSP3").map_err(io_err)?;
+        writeln!(w, "c type {kind}").map_err(io_err)?;
         if options.fast_cop {
-            writeln!(w, "c mode fast-cop").map_err(to_err)?;
-            writeln!(w, "c effort incumbent").map_err(to_err)?;
+            writeln!(w, "c mode fast-cop").map_err(io_err)?;
+            writeln!(w, "c effort incumbent").map_err(io_err)?;
         }
-        writeln!(w, "c variables {}", xcsp.problem.solver.store.num_vars()).map_err(to_err)?;
-        writeln!(w, "c sparse domains {}", xcsp.problem.solver.store.num_sparse_domains()).map_err(to_err)?;
-        writeln!(w, "c bounds domains {}", xcsp.problem.solver.store.num_bounds_domains()).map_err(to_err)?;
-        writeln!(w, "c search variables {}", xcsp.problem.search.len()).map_err(to_err)?;
-        writeln!(w, "c propagators {}", xcsp.problem.solver.num_propagators()).map_err(to_err)?;
-        writeln!(w, "c seed {}", options.seed).map_err(to_err)?;
-        writeln!(w, "c workers {} ({})", options.workers, worker_roles(has_objective, options)).map_err(to_err)?;
+        writeln!(w, "c variables {}", xcsp.problem.solver.store.num_vars()).map_err(io_err)?;
+        writeln!(w, "c sparse domains {}", xcsp.problem.solver.store.num_sparse_domains()).map_err(io_err)?;
+        writeln!(w, "c bounds domains {}", xcsp.problem.solver.store.num_bounds_domains()).map_err(io_err)?;
+        writeln!(w, "c search variables {}", xcsp.problem.search.len()).map_err(io_err)?;
+        writeln!(w, "c propagators {}", xcsp.problem.solver.num_propagators()).map_err(io_err)?;
+        writeln!(w, "c seed {}", options.seed).map_err(io_err)?;
+        writeln!(w, "c workers {} ({})", options.workers, worker_roles(has_objective, options)).map_err(io_err)?;
         if !has_objective {
-            writeln!(w, "c csp learning true").map_err(to_err)?;
+            writeln!(w, "c csp learning true").map_err(io_err)?;
         }
-        writeln!(w, "c split {}", options.split).map_err(to_err)?;
+        writeln!(w, "c split {}", options.split).map_err(io_err)?;
         if presolve.failed {
-            writeln!(w, "c presolve failed").map_err(to_err)?;
+            writeln!(w, "c presolve failed").map_err(io_err)?;
         } else if presolve.stopped {
-            writeln!(w, "c presolve stopped").map_err(to_err)?;
+            writeln!(w, "c presolve stopped").map_err(io_err)?;
         } else if presolve.search_before != presolve.search_after || presolve.fixed > 0 {
             writeln!(w, "c presolve reduced search {} -> {} fixed {}", presolve.search_before, presolve.search_after, presolve.fixed)
-                .map_err(to_err)?;
+                .map_err(io_err)?;
         }
         if symbolic_probes_disabled {
-            writeln!(w, "c probes disabled (probe worker only supports a materialized objective variable)").map_err(to_err)?;
+            writeln!(w, "c probes disabled (probe worker only supports a materialized objective variable)").map_err(io_err)?;
         }
     }
 
     if presolve.failed || presolve.stopped {
         if verbose {
-            writeln!(w, "c nodes 0 failures {}", usize::from(presolve.failed)).map_err(to_err)?;
+            writeln!(w, "c nodes 0 failures {}", usize::from(presolve.failed)).map_err(io_err)?;
         }
-        writeln!(w, "{}", if presolve.failed { "s UNSATISFIABLE" } else { "s UNKNOWN" }).map_err(to_err)?;
+        writeln!(w, "{}", if presolve.failed { "s UNSATISFIABLE" } else { "s UNKNOWN" }).map_err(io_err)?;
         if verbose {
             if stop.load(Ordering::Relaxed) {
-                writeln!(w, "c interrupted").map_err(to_err)?;
+                writeln!(w, "c interrupted").map_err(io_err)?;
             }
-            writeln!(w, "c time {:.3}s", start.elapsed().as_secs_f64()).map_err(to_err)?;
+            writeln!(w, "c time {:.3}s", start.elapsed().as_secs_f64()).map_err(io_err)?;
         }
-        w.flush().map_err(to_err)?;
+        w.flush().map_err(io_err)?;
         return Ok(());
     }
 
@@ -298,11 +317,11 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
 
     if verbose {
         if stop.load(Ordering::Relaxed) {
-            writeln!(w, "c interrupted").map_err(to_err)?;
+            writeln!(w, "c interrupted").map_err(io_err)?;
         }
-        writeln!(w, "c time {:.3}s", start.elapsed().as_secs_f64()).map_err(to_err)?;
+        writeln!(w, "c time {:.3}s", start.elapsed().as_secs_f64()).map_err(io_err)?;
     }
-    w.flush().map_err(to_err)?;
+    w.flush().map_err(io_err)?;
     Ok(())
 }
 
@@ -395,34 +414,22 @@ fn merge_fast_cop_result(summary: &mut Option<LocalSearchOutcome>, mut result: L
 }
 
 fn write_fast_cop_result<W: Write>(w: &mut W, output: &SolutionOutput, result: LocalSearchOutcome, verbose: bool) -> Result<(), String> {
-    let to_err = |e: std::io::Error| e.to_string();
     if verbose {
-        writeln!(w, "c local constraints {} functionals {}", result.constraints, result.functionals).map_err(to_err)?;
+        writeln!(w, "c local constraints {} functionals {}", result.constraints, result.functionals).map_err(io_err)?;
         if result.unsupported > 0 {
-            writeln!(w, "c local unsupported {}", result.unsupported).map_err(to_err)?;
+            writeln!(w, "c local unsupported {}", result.unsupported).map_err(io_err)?;
         }
         if result.iterations > 0 {
-            writeln!(w, "c local iterations {} moves {} restarts {}", result.iterations, result.moves, result.restarts).map_err(to_err)?;
+            writeln!(w, "c local iterations {} moves {} restarts {}", result.iterations, result.moves, result.restarts).map_err(io_err)?;
         }
     }
-    match result.best {
-        Some((solution, value)) => {
-            if !verbose {
-                writeln!(w, "o {value}").map_err(to_err)?;
-            }
-            writeln!(w, "s SATISFIABLE").map_err(to_err)?;
-            output.write(w, &solution).map_err(to_err)?;
-        }
-        None => writeln!(w, "s UNKNOWN").map_err(to_err)?,
-    }
-    Ok(())
+    write_solution_tail(w, output, result.best.map(|(s, v)| (s, Some(v))), "s SATISFIABLE", "s UNKNOWN", verbose)
 }
 
 fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w: &mut W, options: RunOptions) -> Result<(), String> {
     let XcspProblem { problem, output, .. } = xcsp;
     let mut solver = problem.solver;
     let vars = problem.search;
-    let to_err = |e: std::io::Error| e.to_string();
 
     match problem.objective {
         None => {
@@ -432,16 +439,16 @@ fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w
             // (Enumeration/counting uses the separate non-learning `enumerate`.)
             let (sol, stats, complete) = decide_sat_seeded(&mut solver, &vars, stop, options.seed);
             if verbose {
-                writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(to_err)?;
-                write_inprocessing_stats(w, stats).map_err(to_err)?;
+                writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(io_err)?;
+                write_inprocessing_stats(w, stats).map_err(io_err)?;
             }
             match sol {
                 Some(s) => {
-                    writeln!(w, "s SATISFIABLE").map_err(to_err)?;
-                    output.write(w, &s).map_err(to_err)?;
+                    writeln!(w, "s SATISFIABLE").map_err(io_err)?;
+                    output.write(w, &s).map_err(io_err)?;
                 }
-                None if !complete => writeln!(w, "s UNKNOWN").map_err(to_err)?,
-                None => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
+                None if !complete => writeln!(w, "s UNKNOWN").map_err(io_err)?,
+                None => writeln!(w, "s UNSATISFIABLE").map_err(io_err)?,
             }
             Ok(())
         }
@@ -478,54 +485,35 @@ fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w
 }
 
 fn write_parallel_result<W: Write>(w: &mut W, output: &SolutionOutput, result: ParallelOutcome, verbose: bool) -> Result<(), String> {
-    let to_err = |e: std::io::Error| e.to_string();
     if verbose {
-        writeln!(w, "c nodes {} failures {}", result.stats.nodes, result.stats.failures).map_err(to_err)?;
-        write_inprocessing_stats(w, result.stats).map_err(to_err)?;
+        writeln!(w, "c nodes {} failures {}", result.stats.nodes, result.stats.failures).map_err(io_err)?;
+        write_inprocessing_stats(w, result.stats).map_err(io_err)?;
         if result.shared_clauses > 0 || result.imported_clauses > 0 {
-            writeln!(w, "c shared clauses {} imported {}", result.shared_clauses, result.imported_clauses).map_err(to_err)?;
+            writeln!(w, "c shared clauses {} imported {}", result.shared_clauses, result.imported_clauses).map_err(io_err)?;
         }
         if let Some((split, completed)) = result.split_jobs {
-            writeln!(w, "c split jobs {split} completed {completed}").map_err(to_err)?;
+            writeln!(w, "c split jobs {split} completed {completed}").map_err(io_err)?;
         }
         if let Some((attempts, unsat)) = result.probe_stats {
-            writeln!(w, "c probes attempts {attempts} unsat {unsat}").map_err(to_err)?;
+            writeln!(w, "c probes attempts {attempts} unsat {unsat}").map_err(io_err)?;
         }
         if let Some((attempts, improved)) = result.lns_stats {
-            writeln!(w, "c lns attempts {attempts} improved {improved}").map_err(to_err)?;
+            writeln!(w, "c lns attempts {attempts} improved {improved}").map_err(io_err)?;
         }
     }
-    match result.best {
-        Some((solution, value)) => {
-            if !verbose {
-                writeln!(w, "o {value}").map_err(to_err)?;
-            }
-            writeln!(w, "{}", if result.proved { "s OPTIMUM FOUND" } else { "s SATISFIABLE" }).map_err(to_err)?;
-            output.write(w, &solution).map_err(to_err)?;
-        }
-        None if result.interrupted => writeln!(w, "s UNKNOWN").map_err(to_err)?,
-        None if result.proved => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
-        None => writeln!(w, "s UNKNOWN").map_err(to_err)?,
-    }
-    Ok(())
+    let sat = if result.proved { "s OPTIMUM FOUND" } else { "s SATISFIABLE" };
+    let none = if result.proved && !result.interrupted { "s UNSATISFIABLE" } else { "s UNKNOWN" };
+    write_solution_tail(w, output, result.best.map(|(s, v)| (s, Some(v))), sat, none, verbose)
 }
 
 fn write_csp_result<W: Write>(w: &mut W, output: &SolutionOutput, result: CspOutcome, verbose: bool) -> Result<(), String> {
-    let to_err = |e: std::io::Error| e.to_string();
     if verbose {
-        writeln!(w, "c nodes {} failures {}", result.stats.nodes, result.stats.failures).map_err(to_err)?;
-        write_inprocessing_stats(w, result.stats).map_err(to_err)?;
+        writeln!(w, "c nodes {} failures {}", result.stats.nodes, result.stats.failures).map_err(io_err)?;
+        write_inprocessing_stats(w, result.stats).map_err(io_err)?;
         if result.shared_clauses > 0 || result.imported_clauses > 0 {
-            writeln!(w, "c shared clauses {} imported {}", result.shared_clauses, result.imported_clauses).map_err(to_err)?;
+            writeln!(w, "c shared clauses {} imported {}", result.shared_clauses, result.imported_clauses).map_err(io_err)?;
         }
     }
-    match result.solution {
-        Some(solution) => {
-            writeln!(w, "s SATISFIABLE").map_err(to_err)?;
-            output.write(w, &solution).map_err(to_err)?;
-        }
-        None if result.decided => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
-        None => writeln!(w, "s UNKNOWN").map_err(to_err)?,
-    }
-    Ok(())
+    let none = if result.decided { "s UNSATISFIABLE" } else { "s UNKNOWN" };
+    write_solution_tail(w, output, result.solution.map(|s| (s, None::<i32>)), "s SATISFIABLE", none, verbose)
 }

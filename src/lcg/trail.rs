@@ -1276,10 +1276,11 @@ impl<'s> Cdcl<'s> {
     /// conflict (a falsified blocking clause after enumerating a solution).
     pub(crate) fn resolve_conflict(&mut self, conflict: Conflict) -> bool {
         self.conflicts += 1;
-        let Some((mut learnt, _)) = self.analyze(conflict) else {
+        let Some(mut learnt) = self.analyze(conflict) else {
             return false;
         };
         self.vivify_learned(&mut learnt);
+        // Backjump level recomputed here: vivification may have shortened the clause.
         let btlevel = learnt[1..].iter().map(|l| self.level_of(l.atom()) as usize).max().unwrap_or(0);
         self.learned_lits += learnt.len() as u64;
         // LBD measured at learn time, while every literal is still assigned.
@@ -1309,9 +1310,9 @@ impl<'s> Cdcl<'s> {
         }
     }
 
-    /// First-UIP conflict analysis. Returns the learned clause (asserting literal
-    /// first) and the backjump level (second-highest in the clause, 0 if unit).
-    fn analyze(&mut self, conflict: Conflict) -> Option<(Vec<Lit>, usize)> {
+    /// First-UIP conflict analysis. Returns the learned clause, asserting literal
+    /// first. The caller derives the backjump level after vivification.
+    fn analyze(&mut self, conflict: Conflict) -> Option<Vec<Lit>> {
         let mut clause_lits = self.conflict_lits(&conflict);
         // Analyse at the conflict's deepest level (a propagator may fail on
         // literals all below the current level). All at level 0 means UNSAT.
@@ -1358,12 +1359,11 @@ impl<'s> Cdcl<'s> {
         }
 
         learnt[0] = uip.negate(); // asserting literal
-        let btlevel = learnt[1..].iter().map(|l| self.level_of(l.atom()) as usize).max().unwrap_or(0);
         for a in touched {
             self.seen[a as usize] = false;
         }
         self.decay_activity();
-        Some((learnt, btlevel))
+        Some(learnt)
     }
 
     /// Bump a variable's VSIDS activity, rescaling all if it overflows.

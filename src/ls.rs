@@ -126,6 +126,14 @@ struct LocalModel {
     exact_covers: Vec<Vec<VarId>>,
 }
 
+// TODO(simplify): the guarded-word placement subsystem below (GuardedWord,
+// WordPlacementState, try_place_word/word_trial/place_word_letters, guarded_*,
+// place_guarded_elements) is ~250 LOC of crossword-specific constructive
+// heuristic, fired only for the Extension+Element+guard pattern via
+// has_extension(). It is the largest single simplification target in this file.
+// Decide on bench evidence: if it does not measurably beat generic LS on the
+// word/crossword instances, delete it and let those fall back to the generic
+// constructive path. Until then it stays, gated and isolated.
 struct GuardedWord<'a> {
     guard: VarId,
     weight: i64,
