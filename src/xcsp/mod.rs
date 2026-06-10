@@ -14,9 +14,9 @@ use xcsp3_rust_parser::xcsp_runner::XcspRunner;
 
 use crate::ids::VarId;
 use crate::ls::{solve_fast_cop, LocalSearchOutcome, LocalSearchSpec};
-use crate::parallel::{normalize_options, solve_cop, worker_roles, ParallelOutcome};
+use crate::parallel::{normalize_options, solve_cop, solve_csp, worker_roles, CspOutcome, ParallelOutcome};
 use crate::problem::{Objective, Problem};
-use crate::search::{decide_sat_seeded, optimize_fast_seeded, optimize_seeded, solve_interruptible_seeded, SearchControl, SolveStats};
+use crate::search::{decide_sat_seeded, optimize_fast_seeded, optimize_seeded, SolveStats};
 
 pub use crate::parallel::RunOptions;
 
@@ -248,7 +248,7 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
         writeln!(w, "c propagators {}", xcsp.problem.solver.num_propagators()).map_err(to_err)?;
         writeln!(w, "c seed {}", options.seed).map_err(to_err)?;
         writeln!(w, "c workers {} ({})", options.workers, worker_roles(has_objective, options)).map_err(to_err)?;
-        if !has_objective && options.learn_csp {
+        if !has_objective {
             writeln!(w, "c csp learning true").map_err(to_err)?;
         }
         writeln!(w, "c split {}", options.split).map_err(to_err)?;
@@ -284,8 +284,12 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
         let XcspProblem { problem, local, output } = xcsp;
         let result = solve_fast_cop_parallel(problem, local, verbose, stop, w, options)?;
         write_fast_cop_result(w, &output, result, verbose)?;
-    } else if options.workers == 1 || !has_objective {
+    } else if options.workers == 1 {
         solve_single(xcsp, verbose, stop, w, options)?;
+    } else if !has_objective {
+        let XcspProblem { problem, output, .. } = xcsp;
+        let result = solve_csp(problem, stop, options);
+        write_csp_result(w, &output, result, verbose)?;
     } else {
         let XcspProblem { problem, local, output } = xcsp;
         let result = solve_cop(problem, local, verbose, stop, w, options)?;
@@ -422,22 +426,11 @@ fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w
 
     match problem.objective {
         None => {
-            let (sol, stats, complete) = if options.learn_csp {
-                decide_sat_seeded(&mut solver, &vars, stop, options.seed)
-            } else {
-                let mut found = None;
-                let stats = solve_interruptible_seeded(
-                    &mut solver,
-                    &vars,
-                    |s| {
-                        found = Some(vars.iter().map(|&v| s.store.value(v)).collect::<Vec<_>>());
-                        SearchControl::Stop
-                    },
-                    stop,
-                    options.seed,
-                );
-                (found, stats, !stop.load(Ordering::Relaxed))
-            };
+            // Find-one CSP always learns: CDCL with restarts and root probing
+            // dominates plain chronological DFS, and never enumerates, so the
+            // soundness caveat on learned blocking clauses does not apply here.
+            // (Enumeration/counting uses the separate non-learning `enumerate`.)
+            let (sol, stats, complete) = decide_sat_seeded(&mut solver, &vars, stop, options.seed);
             if verbose {
                 writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(to_err)?;
                 write_inprocessing_stats(w, stats).map_err(to_err)?;
@@ -512,6 +505,26 @@ fn write_parallel_result<W: Write>(w: &mut W, output: &SolutionOutput, result: P
         }
         None if result.interrupted => writeln!(w, "s UNKNOWN").map_err(to_err)?,
         None if result.proved => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
+        None => writeln!(w, "s UNKNOWN").map_err(to_err)?,
+    }
+    Ok(())
+}
+
+fn write_csp_result<W: Write>(w: &mut W, output: &SolutionOutput, result: CspOutcome, verbose: bool) -> Result<(), String> {
+    let to_err = |e: std::io::Error| e.to_string();
+    if verbose {
+        writeln!(w, "c nodes {} failures {}", result.stats.nodes, result.stats.failures).map_err(to_err)?;
+        write_inprocessing_stats(w, result.stats).map_err(to_err)?;
+        if result.shared_clauses > 0 || result.imported_clauses > 0 {
+            writeln!(w, "c shared clauses {} imported {}", result.shared_clauses, result.imported_clauses).map_err(to_err)?;
+        }
+    }
+    match result.solution {
+        Some(solution) => {
+            writeln!(w, "s SATISFIABLE").map_err(to_err)?;
+            output.write(w, &solution).map_err(to_err)?;
+        }
+        None if result.decided => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
         None => writeln!(w, "s UNKNOWN").map_err(to_err)?,
     }
     Ok(())
