@@ -73,9 +73,9 @@ impl Propagator for Count {
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
         match self.rel {
             Relation::Le => self.enforce_le(store, self.k)?,
-            Relation::Lt => self.enforce_le(store, self.k - 1)?,
+            Relation::Lt => self.enforce_le(store, self.k.saturating_sub(1))?,
             Relation::Ge => self.enforce_ge(store, self.k)?,
-            Relation::Gt => self.enforce_ge(store, self.k + 1)?,
+            Relation::Gt => self.enforce_ge(store, self.k.saturating_add(1))?,
             Relation::Eq => {
                 self.enforce_le(store, self.k)?;
                 self.enforce_ge(store, self.k)?;

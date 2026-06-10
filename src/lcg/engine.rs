@@ -20,13 +20,7 @@ use crate::store::Solver;
 /// convergence is preserved and diversification stays a minority of the effort.
 const REPHASE_PERIOD: u64 = 4;
 
-fn mix64(mut x: u64) -> u64 {
-    x ^= x >> 30;
-    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^ (x >> 31)
-}
+use crate::mix64;
 
 fn strict_bound(incumbent: i64, minimizing: bool) -> Option<i64> {
     if minimizing {
@@ -40,7 +34,14 @@ impl Objective<'_> {
     fn value(self, solver: &Solver) -> i64 {
         match self {
             Self::Var(obj) => solver.store.value(obj) as i64,
-            Self::Linear { coeffs, vars } => coeffs.iter().zip(vars).map(|(&coeff, &var)| coeff * solver.store.value(var) as i64).sum(),
+            // Accumulate in i128 so large coeffs/many terms can't overflow, then
+            // clamp: a wrapped objective would post a wrong bound (lost optimum).
+            Self::Linear { coeffs, vars } => coeffs
+                .iter()
+                .zip(vars)
+                .map(|(&coeff, &var)| coeff as i128 * solver.store.value(var) as i128)
+                .sum::<i128>()
+                .clamp(i64::MIN as i128, i64::MAX as i128) as i64,
             Self::Expr(expr) => expr.eval(&|var| solver.store.value(var) as i64).expect("objective expression is undefined at a solution"),
         }
     }

@@ -7,6 +7,7 @@ use crate::constraints::linear::Relation;
 use crate::constraints::table::STAR;
 use crate::expr::Expr;
 use crate::ids::VarId;
+use crate::mix64;
 use crate::problem::{Objective, Problem};
 
 const MAX_DOMAIN_VALUES: usize = 4096;
@@ -141,14 +142,6 @@ struct WordPlacementState {
 type ElementViews<'a> = HashMap<VarId, (&'a [VarId], VarId, i32)>;
 type Placement = (VarId, i32);
 type TrialPlacement = (Vec<i32>, Vec<Placement>);
-
-fn mix64(mut x: u64) -> u64 {
-    x ^= x >> 30;
-    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^ (x >> 31)
-}
 
 fn contains_var(expr: &Expr, target: VarId) -> bool {
     let mut vars = Vec::new();

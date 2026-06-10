@@ -1390,38 +1390,6 @@ impl<'s> Cdcl<'s> {
         self.propagate_and_learn()
     }
 
-    /// Decision literal `[x = min(x)]` for the first unfixed var in `vars`, or
-    /// `None` if all fixed. (Simple heuristic; the real driver uses dom/wdeg.)
-    fn pick_decision(&self, vars: &[VarId]) -> Option<Lit> {
-        for &v in vars {
-            if !self.solver.store.is_fixed(v) {
-                let val = self.solver.store.min(v);
-                if let LitOrConst::Lit(l) = self.atoms.eq(v, val) {
-                    return Some(l);
-                }
-            }
-        }
-        None
-    }
-
-    /// One solution over `vars` by CDCL, or `None` if UNSAT. Assumes
-    /// [`init`](Self::init) succeeded.
-    pub fn solve_first(&mut self, vars: &[VarId]) -> Option<Vec<i32>> {
-        loop {
-            match self.pick_decision(vars) {
-                None => {
-                    return Some(vars.iter().map(|&v| self.solver.store.value(v)).collect());
-                }
-                Some(lit) => {
-                    self.decide(lit).expect("in-domain decision cannot fail");
-                    if !self.propagate_and_learn() {
-                        return None;
-                    }
-                }
-            }
-        }
-    }
-
     /// Literals of the initial conflict clause (all currently false).
     fn conflict_lits(&self, conflict: &Conflict) -> Vec<Lit> {
         match conflict {

@@ -11,13 +11,7 @@ const MIN_RELAX_PERCENT: u32 = 5;
 const MAX_RELAX_PERCENT: u32 = 60;
 const RELAX_STEP: u32 = 5;
 
-pub(crate) fn mix64(mut x: u64) -> u64 {
-    x ^= x >> 30;
-    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^ (x >> 31)
-}
+use crate::mix64;
 
 pub(crate) struct LnsState {
     relax_percent: u32,
