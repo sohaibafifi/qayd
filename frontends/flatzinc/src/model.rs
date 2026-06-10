@@ -437,14 +437,29 @@ impl Model {
     pub(crate) fn post_schedule_unary(&mut self, args: &[String]) -> Result<(), String> {
         require(args.len() == 2, "schedule_unary expects 2 arguments")?;
         let starts = self.var_list(&args[0])?;
-        let durations: Vec<i64> = self.int_list(&args[1])?.into_iter().map(i64::from).collect();
+        // Constant durations use the dedicated sweep propagator.
+        if let Ok(durations) = self.int_list(&args[1]) {
+            let durations: Vec<i64> = durations.into_iter().map(i64::from).collect();
+            require(starts.len() == durations.len(), "schedule_unary length mismatch")?;
+            no_overlap(&mut self.solver, &starts, &durations);
+            return Ok(());
+        }
+        // Variable durations: pairwise ordering decomposition,
+        // `s_i + d_i <= s_j \/ s_j + d_j <= s_i`.
+        let durations = self.var_list(&args[1])?;
         require(starts.len() == durations.len(), "schedule_unary length mismatch")?;
-        no_overlap(&mut self.solver, &starts, &durations);
+        for i in 0..starts.len() {
+            for j in i + 1..starts.len() {
+                let i_first = expr::le(expr::add(vec![expr::var(starts[i]), expr::var(durations[i])]), expr::var(starts[j]));
+                let j_first = expr::le(expr::add(vec![expr::var(starts[j]), expr::var(durations[j])]), expr::var(starts[i]));
+                intension(&mut self.solver, expr::or(vec![i_first, j_first]));
+            }
+        }
         Ok(())
     }
 
     /// `gecode_global_cardinality(x, cover, counts)` with variable occurrence counts.
-    pub(crate) fn post_gcc_counts(&mut self, args: &[String]) -> Result<(), String> {
+    pub(crate) fn post_gcc_counts(&mut self, args: &[String], closed: bool) -> Result<(), String> {
         require(args.len() == 3, "global_cardinality expects 3 arguments")?;
         let vars = self.var_list(&args[0])?;
         let cover = self.int_list(&args[1])?;
@@ -453,6 +468,13 @@ impl Model {
         for (j, &val) in cover.iter().enumerate() {
             let terms: Vec<Expr> = vars.iter().map(|&v| expr::eq(expr::var(v), expr::int(val as i64))).collect();
             intension(&mut self.solver, expr::eq(expr::add(terms), expr::var(counts[j])));
+        }
+        if closed {
+            // Closed form: every variable must take a value from `cover`.
+            for &v in &vars {
+                let member = cover.iter().map(|&c| expr::eq(expr::var(v), expr::int(c as i64))).collect();
+                intension(&mut self.solver, expr::or(member));
+            }
         }
         Ok(())
     }

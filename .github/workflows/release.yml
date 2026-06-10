@@ -49,18 +49,86 @@ jobs:
       - uses: actions/checkout@v4
 
       # Builds `--release --target <target>` (using `cross` for the Linux ARM
-      # target), archives the binary as .tar.gz / .zip, writes a .sha256, and
-      # uploads everything to the Release created above. All jobs upsert into
-      # the same Release.
+      # target), archives both binaries as .tar.gz / .zip, writes a .sha256,
+      # and uploads everything to the Release created above. All jobs upsert
+      # into the same Release. `qayd-fzn` (the MiniZinc/FlatZinc frontend)
+      # shares the workspace version, so one tag releases both. The full
+      # MiniZinc integration (solver config + mznlib + installer) ships as a
+      # separate `qayd-minizinc-*` bundle assembled below.
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: qayd
+          bin: qayd,qayd-fzn
           target: ${{ matrix.target }}
           archive: qayd-$tag-$target
           include: README.md,LICENSE
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
 
+
+  # Self-contained MiniZinc solver bundle per target: qayd-fzn + relocatable
+  # qayd.msc + mznlib + standalone installer. The bare binary is not enough
+  # for MiniZinc users — the driver needs the solver config and the library.
+  # Reuses the binary already built and uploaded by upload-assets.
+  minizinc-bundle:
+    name: minizinc ${{ matrix.target }}
+    # After compress-assets so the bundle picks up the final (UPX'd where
+    # applicable) binaries and never races a --clobber re-upload.
+    needs: [upload-assets, compress-assets]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+          - x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble and upload bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          version="${tag#v}"
+          base="qayd-${tag}-${{ matrix.target }}"
+
+          # Fetch the binary archive built by upload-assets.
+          asset=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+                    --json assets --jq '.assets[].name' \
+                  | grep -E "^${base}\.(tar\.gz|zip)$" | head -n1)
+          [ -n "${asset:-}" ] || { echo "no archive for ${base}" >&2; exit 1; }
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$asset" --dir dl
+          mkdir ex
+          case "$asset" in
+            *.tar.gz) tar -xzf "dl/$asset" -C ex ;;
+            *.zip)    unzip -q "dl/$asset" -d ex ;;
+          esac
+          binfile=$(find ex -type f \( -name qayd-fzn -o -name qayd-fzn.exe \) | head -n1)
+          [ -n "$binfile" ] || { echo "qayd-fzn missing from $asset" >&2; exit 1; }
+
+          # Bundle layout matches what dist/qayd.msc.in's relative paths expect.
+          bundle="qayd-minizinc-${tag}-${{ matrix.target }}"
+          mkdir "$bundle"
+          cp "$binfile" "$bundle/"
+          cp -r frontends/flatzinc/minizinc/mznlib "$bundle/mznlib"
+          sed "s/@VERSION@/$version/" frontends/flatzinc/minizinc/dist/qayd.msc.in > "$bundle/qayd.msc"
+          cp frontends/flatzinc/minizinc/dist/install.sh "$bundle/"
+          cp frontends/flatzinc/minizinc/dist/README.md "$bundle/"
+          cp LICENSE "$bundle/"
+          chmod +x "$bundle/install.sh" "$bundle/qayd-fzn"* 2>/dev/null || true
+
+          case "${{ matrix.target }}" in
+            *windows*) out="$bundle.zip"; zip -qr "$out" "$bundle" ;;
+            *)         out="$bundle.tar.gz"; tar -czf "$out" "$bundle" ;;
+          esac
+          sha256sum "$out" > "$out.sha256"
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" \
+            "$out" "$out.sha256" --clobber
 
   compress-assets:
     name: upx ${{ matrix.target }}
@@ -105,12 +173,13 @@ jobs:
           esac
 
           # Round-tripping the archive means we reproduce taiki-e's exact member
-          # layout; we only mutate the binary itself.
-          binfile=$(find ex -type f \( -name qayd -o -name qayd.exe \) | head -n1)
-          before=$(stat -c%s "$binfile")
-          upx --best --lzma "$binfile"
-          after=$(stat -c%s "$binfile")
-          echo "Binary: ${before} -> ${after} bytes"
+          # layout; we only mutate the binaries themselves.
+          find ex -type f \( -name qayd -o -name qayd.exe -o -name qayd-fzn -o -name qayd-fzn.exe \) | while read -r binfile; do
+            before=$(stat -c%s "$binfile")
+            upx --best --lzma "$binfile"
+            after=$(stat -c%s "$binfile")
+            echo "$(basename "$binfile"): ${before} -> ${after} bytes"
+          done
 
           # Re-archive with the same members and the same name, then refresh the
           # sha256 sidecar in taiki-e's "<hash>  <name>" format.

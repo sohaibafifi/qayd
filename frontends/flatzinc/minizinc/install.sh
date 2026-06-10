@@ -2,16 +2,20 @@
 # Register qayd as a MiniZinc solver (CLI + IDE).
 #
 # Builds the release binary and writes a solver configuration into
-# ~/.minizinc/solvers/ pointing at the wrapper, which runs the binary
-# straight from target/release (rebuilds are picked up automatically).
+# ~/.minizinc/solvers/ pointing straight at target/release/qayd-fzn —
+# the binary speaks the MiniZinc protocol natively, and rebuilds are
+# picked up automatically. The config also points at the bundled mznlib,
+# which keeps supported globals (all_different, table, regular, ...) as
+# native FlatZinc predicates instead of decompositions.
 set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)
-WRAPPER="$REPO/frontends/flatzinc/minizinc/qayd-fzn-mzn.sh"
+BIN="$REPO/target/release/qayd-fzn"
+MZNLIB="$REPO/frontends/flatzinc/minizinc/mznlib"
 SOLVERS_DIR="$HOME/.minizinc/solvers"
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$REPO/Cargo.toml" | head -1)
 
 cargo build --release -p qayd-flatzinc --manifest-path "$REPO/Cargo.toml"
-chmod +x "$WRAPPER"
 
 mkdir -p "$SOLVERS_DIR"
 cat > "$SOLVERS_DIR/qayd.msc" <<EOF
@@ -19,8 +23,9 @@ cat > "$SOLVERS_DIR/qayd.msc" <<EOF
   "id": "org.qayd.qayd",
   "name": "qayd",
   "description": "qayd constraint-programming solver",
-  "version": "0.1.0",
-  "executable": "$WRAPPER",
+  "version": "$VERSION",
+  "executable": "$BIN",
+  "mznlib": "$MZNLIB",
   "tags": ["cp", "int"],
   "stdFlags": ["-t"],
   "supportsMzn": false,
@@ -30,5 +35,5 @@ cat > "$SOLVERS_DIR/qayd.msc" <<EOF
 }
 EOF
 
-echo "installed: $SOLVERS_DIR/qayd.msc"
+echo "installed: $SOLVERS_DIR/qayd.msc (version $VERSION)"
 echo "try: minizinc --solver qayd $REPO/data/fzn/all_diff.mzn"

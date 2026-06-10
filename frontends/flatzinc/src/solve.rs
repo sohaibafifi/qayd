@@ -1,4 +1,8 @@
 //! Search driver: dispatch CSP / COP, stream progress, honour a time limit.
+//! Output follows the MiniZinc FlatZinc solver protocol: `name = value;` items
+//! for annotated output variables, `----------` after a solution, `==========`
+//! after a completeness proof, `=====UNSATISFIABLE=====` / `=====UNKNOWN=====`
+//! otherwise. Verbose extras are emitted as `%` comment lines.
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -13,17 +17,13 @@ use crate::model::{Model, Output};
 
 /// Run-time options from the command line.
 pub(crate) struct Options {
-    /// Stream improving bounds (`o` lines) and print end-of-search statistics.
+    /// Stream improving bounds and print end-of-search statistics (as `%` comments).
     pub(crate) verbose: bool,
     /// Wall-clock limit; search is interrupted once it elapses.
     pub(crate) time_limit: Option<Duration>,
-    /// Emit the MiniZinc FlatZinc output protocol (`x = v;`, `----------`,
-    /// `==========`) instead of the native `o`/`s`/`v` lines.
-    pub(crate) mzn: bool,
 }
 
-/// Solve `model` and print FlatZinc-style status, solution, and (in verbose mode)
-/// progress and statistics.
+/// Solve `model` and print the result in the MiniZinc solver protocol.
 pub(crate) fn solve(mut model: Model, opts: &Options) {
     let start = Instant::now();
     let stop = Arc::new(AtomicBool::new(false));
@@ -43,37 +43,25 @@ pub(crate) fn solve(mut model: Model, opts: &Options) {
 
 /// Branch-and-bound optimisation, streaming each improving bound when verbose.
 fn solve_opt(model: &mut Model, minimizing: bool, obj: VarId, stop: &AtomicBool, opts: &Options, start: Instant) {
-    let verbose = opts.verbose && !opts.mzn;
+    let verbose = opts.verbose;
     let (best, stats) = optimize_with(&mut model.solver, &model.search, obj, minimizing, stop, |value| {
         if verbose {
-            println!("o {value}");
+            println!("% o {value}");
             let _ = io::stdout().flush();
         }
     });
     let interrupted = stop.load(Ordering::Relaxed);
-    if opts.mzn {
-        match best {
-            Some((solution, _)) => {
-                print_mzn_solution(model, &solution);
-                println!("----------");
-                if !interrupted {
-                    println!("==========");
-                }
-            }
-            None => println!("{}", if interrupted { "=====UNKNOWN=====" } else { "=====UNSATISFIABLE=====" }),
-        }
-        return;
-    }
     match best {
-        Some((solution, value)) => {
-            if !verbose {
-                println!("o {value}");
-            }
-            // An incumbent under an interrupted search is feasible but not proven optimal.
-            println!("s {}", if interrupted { "SATISFIABLE" } else { "OPTIMUM FOUND" });
+        Some((solution, _)) => {
             print_solution(model, &solution);
+            println!("----------");
+            // `==========` is the completeness proof; an interrupted incumbent
+            // is feasible but not proven optimal.
+            if !interrupted {
+                println!("==========");
+            }
         }
-        None => println!("s {}", if interrupted { "UNKNOWN" } else { "UNSATISFIABLE" }),
+        None => println!("{}", if interrupted { "=====UNKNOWN=====" } else { "=====UNSATISFIABLE=====" }),
     }
     if verbose {
         print_stats(&stats, start);
@@ -92,42 +80,21 @@ fn solve_sat(model: &mut Model, stop: &AtomicBool, opts: &Options, start: Instan
         },
         stop,
     );
-    if opts.mzn {
-        match solution {
-            Some(values) => {
-                print_mzn_solution(model, &values);
-                println!("----------");
-            }
-            None => {
-                println!("{}", if stop.load(Ordering::Relaxed) { "=====UNKNOWN=====" } else { "=====UNSATISFIABLE=====" })
-            }
-        }
-        return;
-    }
     match solution {
         Some(values) => {
-            println!("s SATISFIABLE");
             print_solution(model, &values);
+            println!("----------");
         }
-        None => println!("s {}", if stop.load(Ordering::Relaxed) { "UNKNOWN" } else { "UNSATISFIABLE" }),
+        None => println!("{}", if stop.load(Ordering::Relaxed) { "=====UNKNOWN=====" } else { "=====UNSATISFIABLE=====" }),
     }
     if opts.verbose {
         print_stats(&stats, start);
     }
 }
 
-/// Print `v name = value` for each named variable, in declaration order.
-fn print_solution(model: &Model, assignment: &[i32]) {
-    for (name, var) in &model.names {
-        if let Some(pos) = model.search.iter().position(|&v| v == *var) {
-            println!("v {name} = {}", assignment[pos]);
-        }
-    }
-}
-
 /// Print the annotated output items in MiniZinc's FlatZinc solution format:
 /// `name = value;` and `name = arrayNd(1..a, ..., [values]);`.
-fn print_mzn_solution(model: &Model, assignment: &[i32]) {
+fn print_solution(model: &Model, assignment: &[i32]) {
     let by_search: HashMap<VarId, i32> = model.search.iter().copied().zip(assignment.iter().copied()).collect();
     // Constants and root-fixed variables keep their value in the store.
     let value = |v: VarId| by_search.get(&v).copied().unwrap_or_else(|| model.solver.store.value(v));

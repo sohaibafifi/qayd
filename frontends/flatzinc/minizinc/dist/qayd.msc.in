@@ -1,0 +1,14 @@
+{
+  "id": "org.qayd.qayd",
+  "name": "qayd",
+  "description": "qayd constraint-programming solver",
+  "version": "@VERSION@",
+  "executable": "./qayd-fzn",
+  "mznlib": "./mznlib",
+  "tags": ["cp", "int"],
+  "stdFlags": ["-t"],
+  "supportsMzn": false,
+  "supportsFzn": true,
+  "needsSolns2Out": true,
+  "inputType": "FZN"
+}

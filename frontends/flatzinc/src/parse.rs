@@ -330,9 +330,9 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
         "bool_lin_le" => model.post_linear(&args, Relation::Le),
 
         // Globals mapped onto existing propagators / decompositions.
-        "gecode_table_int" | "chuffed_table_int" | "fzn_table_int" | "table_int" => model.post_table(&args),
+        "gecode_table_int" | "chuffed_table_int" | "fzn_table_int" | "table_int" | "qayd_table_int" => model.post_table(&args),
         "gecode_bool_element" => model.post_gecode_element(&args),
-        "gecode_regular" | "chuffed_regular" | "fzn_regular" => model.post_regular(&args),
+        "gecode_regular" | "chuffed_regular" | "fzn_regular" | "qayd_regular" => model.post_regular(&args),
         "gecode_circuit" => model.post_circuit(&args),
         "fzn_circuit" => {
             require(args.len() == 1, "fzn_circuit expects 1 argument")?;
@@ -343,7 +343,8 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
         "gecode_schedule_unary" | "chuffed_disjunctive_strict" | "fzn_disjunctive" | "fzn_disjunctive_strict" => {
             model.post_schedule_unary(&args)
         }
-        "gecode_global_cardinality" | "fzn_global_cardinality" => model.post_gcc_counts(&args),
+        "gecode_global_cardinality" | "fzn_global_cardinality" => model.post_gcc_counts(&args, false),
+        "fzn_global_cardinality_closed" => model.post_gcc_counts(&args, true),
         "fzn_global_cardinality_low_up" => model.post_gcc_low_up(&args, false),
         "fzn_global_cardinality_low_up_closed" => model.post_gcc_low_up(&args, true),
         "gecode_bin_packing_load" | "fzn_bin_packing_load" => model.post_bin_packing_load(&args),
