@@ -5,6 +5,9 @@ edition = "2021"
 description = "Yet another constraint-programming solver."
 license = "MIT"
 
+[workspace]
+members = [".", "frontends/flatzinc"]
+
 [lib]
 name = "qayd"
 path = "src/lib.rs"

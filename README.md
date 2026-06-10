@@ -58,7 +58,13 @@ Priorities, in order: **correct, then simple, then fast.**
   dedicates materialized-objective workers to optimistic probes. `--lns`
   dedicates workers to bounded incumbent-driven [Large Neighborhood
   Search](https://doi.org/10.1007/978-3-319-91086-4_4).
-- **Fast COP mode.** `--fast-cop` is an incumbent-only mode for the Fast COP style of use: it searches for feasible solutions and objective improvements, without trying to prove optimality. It uses local scoring for common constraints, constructive starts for guarded table/element patterns, and  focused repair for simple Boolean exact-cover rows.
+- **Fast COP mode.** `--fast-cop` is an incumbent-only mode for the Fast COP style of use: 
+it searches for feasible solutions and objective improvements, without trying to prove optimality. 
+It uses local scoring for common constraints, constructive starts for guarded table/element patterns, 
+and  focused repair for simple Boolean exact-cover rows.
+- **A beta support for MiniZinc.** The `qayd-fzn` driver speaks the MiniZinc solver protocol, 
+so it can be used as a backend for the MiniZinc CLI and IDE. The `--mzn` flag enables some 
+MiniZinc-specific behaviour. (see [for details](frontends/flatzinc/minizinc/README.md)).
 
 ## Build
 
