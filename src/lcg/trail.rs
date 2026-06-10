@@ -318,7 +318,7 @@ pub struct Cdcl<'s> {
     /// Restart schedule and LBD moving-average trigger.
     restart: RestartPolicy,
     /// Optional portfolio clause exchange.
-    clause_sharing: Option<ClauseSharing>,
+    pub(crate) clause_sharing: Option<ClauseSharing>,
     /// Reused buffer for newly published clauses.
     shared_scratch: Vec<SharedClause>,
     /// Negated job assumptions prepended to exported learned clauses.
@@ -327,6 +327,12 @@ pub struct Cdcl<'s> {
     bound_scope: Option<Lit>,
     /// Last value recorded when a variable is unassigned by backjumping.
     pub(crate) saved_phase: Vec<Option<i32>>,
+    /// Restarts performed so far; drives periodic rephasing.
+    pub(crate) restarts_done: u64,
+    /// Phase policy for the current restart segment: 0 = saved phase (default),
+    /// 1 = inverted default, 2 = pseudo-random. Non-zero only on periodic
+    /// rephasing segments, which diversify like a portfolio without a portfolio.
+    pub(crate) rephase_mode: u8,
 }
 
 impl<'s> Cdcl<'s> {
@@ -384,6 +390,8 @@ impl<'s> Cdcl<'s> {
             cube_scope: Vec::new(),
             bound_scope: None,
             saved_phase: vec![None; nvars],
+            restarts_done: 0,
+            rephase_mode: 0,
         }
     }
 

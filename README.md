@@ -40,9 +40,13 @@ Priorities, in order: **correct, then simple, then fast.**
   watched clauses, [LBD](https://www.ijcai.org/Proceedings/09/Papers/074.pdf)
   reduction, [dom/wdeg](https://dl.acm.org/doi/10.5555/3000001.3000033),
   [VSIDS](https://doi.org/10.1145/378239.379017), phase saving, and restarts.
-  Sparse domains allocate atoms by support; wide domains allocate shared atoms
-  on demand. Short learned clauses are strengthened by budgeted CP-aware
-  vivification through the global propagators.
+  A lone sequential search periodically *rephases* — every few restarts it
+  ignores saved phases and dives with the inverted polarity — to escape regions
+  the saved phase keeps pulling it back to (this finds first solutions on
+  feasibility-hard COP instances that otherwise time out). Sparse domains
+  allocate atoms by support; wide domains allocate shared atoms on demand. Short
+  learned clauses are strengthened by budgeted CP-aware vivification through the
+  global propagators.
 - **Parallel search.** CSP find-one/UNSAT runs a portfolio of CDCL workers that
   differ by seed and restart cadence and cross-pollinate short low-LBD learned
   clauses; the first to find a solution or prove unsatisfiability wins. COP
