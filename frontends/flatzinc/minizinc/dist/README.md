@@ -3,10 +3,11 @@
 Everything needed to use qayd from the MiniZinc CLI and IDE:
 
 ```
-qayd-fzn     the FlatZinc solver binary (speaks the MiniZinc protocol)
-qayd.msc     solver configuration (relative paths — works in place)
-mznlib/      solver library: globals qayd propagates natively
-install.sh   registers the bundle with your MiniZinc installation
+qayd-fzn(.exe)  the FlatZinc solver binary (speaks the MiniZinc protocol)
+qayd.msc        solver configuration (relative paths — works in place)
+mznlib/         solver library: globals qayd propagates natively
+install.sh      registers the bundle (Linux/macOS bundles)
+install.ps1     registers the bundle (Windows bundles)
 ```
 
 ## Quick start (no install)
@@ -20,19 +21,23 @@ minizinc --solver /path/to/this/dir/qayd.msc model.mzn data.dzn
 
 ## Install (CLI + IDE discovery)
 
+Linux / macOS:
+
 ```bash
 ./install.sh
 ```
 
-writes `~/.minizinc/solvers/qayd.msc` with absolute paths into this directory
-— after that `minizinc --solver qayd ...` works and the IDE lists **qayd** in
-its solver dropdown (restart the IDE once). Keep the bundle where it is, or
-re-run `install.sh` after moving it.
+Windows:
 
-Windows (no shell): copy `qayd.msc` into `%USERPROFILE%\.minizinc\solvers\`
-and replace the two `./` paths inside with the absolute paths of `qayd-fzn`
-and `mznlib`, or add this directory to the `MZN_SOLVER_PATH` environment
-variable.
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+Either writes `qayd.msc` into your user MiniZinc solver directory
+(`~/.minizinc/solvers/` or `%USERPROFILE%\.minizinc\solvers\`) with absolute
+paths into this directory — after that `minizinc --solver qayd ...` works and
+the IDE lists **qayd** in its solver dropdown (restart the IDE once). Keep
+the bundle where it is, or re-run the installer after moving it.
 
 ## Notes
 

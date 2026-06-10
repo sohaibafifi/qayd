@@ -117,10 +117,14 @@ jobs:
           cp "$binfile" "$bundle/"
           cp -r frontends/flatzinc/minizinc/mznlib "$bundle/mznlib"
           sed "s/@VERSION@/$version/" frontends/flatzinc/minizinc/dist/qayd.msc.in > "$bundle/qayd.msc"
-          cp frontends/flatzinc/minizinc/dist/install.sh "$bundle/"
+          # Platform-appropriate installer: PowerShell on Windows, shell elsewhere.
+          case "${{ matrix.target }}" in
+            *windows*) cp frontends/flatzinc/minizinc/dist/install.ps1 "$bundle/" ;;
+            *)         cp frontends/flatzinc/minizinc/dist/install.sh "$bundle/"
+                       chmod +x "$bundle/install.sh" "$bundle/qayd-fzn" ;;
+          esac
           cp frontends/flatzinc/minizinc/dist/README.md "$bundle/"
           cp LICENSE "$bundle/"
-          chmod +x "$bundle/install.sh" "$bundle/qayd-fzn"* 2>/dev/null || true
 
           case "${{ matrix.target }}" in
             *windows*) out="$bundle.zip"; zip -qr "$out" "$bundle" ;;
