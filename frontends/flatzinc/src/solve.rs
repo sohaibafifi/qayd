@@ -1,5 +1,6 @@
 //! Search driver: dispatch CSP / COP, stream progress, honour a time limit.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -8,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use qayd::{optimize_with, solve_interruptible, SearchControl, SolveStats, VarId};
 
-use crate::model::Model;
+use crate::model::{Model, Output};
 
 /// Run-time options from the command line.
 pub(crate) struct Options {
@@ -16,6 +17,9 @@ pub(crate) struct Options {
     pub(crate) verbose: bool,
     /// Wall-clock limit; search is interrupted once it elapses.
     pub(crate) time_limit: Option<Duration>,
+    /// Emit the MiniZinc FlatZinc output protocol (`x = v;`, `----------`,
+    /// `==========`) instead of the native `o`/`s`/`v` lines.
+    pub(crate) mzn: bool,
 }
 
 /// Solve `model` and print FlatZinc-style status, solution, and (in verbose mode)
@@ -39,7 +43,7 @@ pub(crate) fn solve(mut model: Model, opts: &Options) {
 
 /// Branch-and-bound optimisation, streaming each improving bound when verbose.
 fn solve_opt(model: &mut Model, minimizing: bool, obj: VarId, stop: &AtomicBool, opts: &Options, start: Instant) {
-    let verbose = opts.verbose;
+    let verbose = opts.verbose && !opts.mzn;
     let (best, stats) = optimize_with(&mut model.solver, &model.search, obj, minimizing, stop, |value| {
         if verbose {
             println!("o {value}");
@@ -47,6 +51,19 @@ fn solve_opt(model: &mut Model, minimizing: bool, obj: VarId, stop: &AtomicBool,
         }
     });
     let interrupted = stop.load(Ordering::Relaxed);
+    if opts.mzn {
+        match best {
+            Some((solution, _)) => {
+                print_mzn_solution(model, &solution);
+                println!("----------");
+                if !interrupted {
+                    println!("==========");
+                }
+            }
+            None => println!("{}", if interrupted { "=====UNKNOWN=====" } else { "=====UNSATISFIABLE=====" }),
+        }
+        return;
+    }
     match best {
         Some((solution, value)) => {
             if !verbose {
@@ -75,6 +92,18 @@ fn solve_sat(model: &mut Model, stop: &AtomicBool, opts: &Options, start: Instan
         },
         stop,
     );
+    if opts.mzn {
+        match solution {
+            Some(values) => {
+                print_mzn_solution(model, &values);
+                println!("----------");
+            }
+            None => {
+                println!("{}", if stop.load(Ordering::Relaxed) { "=====UNKNOWN=====" } else { "=====UNSATISFIABLE=====" })
+            }
+        }
+        return;
+    }
     match solution {
         Some(values) => {
             println!("s SATISFIABLE");
@@ -92,6 +121,36 @@ fn print_solution(model: &Model, assignment: &[i32]) {
     for (name, var) in &model.names {
         if let Some(pos) = model.search.iter().position(|&v| v == *var) {
             println!("v {name} = {}", assignment[pos]);
+        }
+    }
+}
+
+/// Print the annotated output items in MiniZinc's FlatZinc solution format:
+/// `name = value;` and `name = arrayNd(1..a, ..., [values]);`.
+fn print_mzn_solution(model: &Model, assignment: &[i32]) {
+    let by_search: HashMap<VarId, i32> = model.search.iter().copied().zip(assignment.iter().copied()).collect();
+    // Constants and root-fixed variables keep their value in the store.
+    let value = |v: VarId| by_search.get(&v).copied().unwrap_or_else(|| model.solver.store.value(v));
+    let fmt = |v: VarId, is_bool: bool| {
+        let x = value(v);
+        if is_bool {
+            if x != 0 {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        } else {
+            x.to_string()
+        }
+    };
+    for out in &model.outputs {
+        match out {
+            Output::Var { name, var, is_bool } => println!("{name} = {};", fmt(*var, *is_bool)),
+            Output::Array { name, dims, vars, is_bool } => {
+                let ranges = dims.iter().map(|(lo, hi)| format!("{lo}..{hi}")).collect::<Vec<_>>().join(", ");
+                let values = vars.iter().map(|&v| fmt(v, *is_bool)).collect::<Vec<_>>().join(", ");
+                println!("{name} = array{}d({ranges}, [{values}]);", dims.len());
+            }
         }
     }
 }

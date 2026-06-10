@@ -35,6 +35,15 @@ pub(crate) enum FznDomain {
     Set(Vec<i32>),
 }
 
+/// An item the model marks for output (`:: output_var` / `:: output_array`).
+/// Used by the MiniZinc output protocol (`--mzn`).
+pub(crate) enum Output {
+    /// `name = <value>;`
+    Var { name: String, var: VarId, is_bool: bool },
+    /// `name = arrayNd(<dims>, [<values>]);`
+    Array { name: String, dims: Vec<(i32, i32)>, vars: Vec<VarId>, is_bool: bool },
+}
+
 /// Symbol tables and the solver under construction.
 pub(crate) struct Model {
     pub(crate) solver: Solver,
@@ -47,6 +56,8 @@ pub(crate) struct Model {
     pub(crate) set_vars: HashMap<String, HashMap<i32, VarId>>,
     pub(crate) search: Vec<VarId>,
     pub(crate) names: Vec<(String, VarId)>,
+    /// Items annotated for output, in declaration order.
+    pub(crate) outputs: Vec<Output>,
     /// `(minimizing, objective var)`.
     pub(crate) objective: Option<(bool, VarId)>,
 }
@@ -62,6 +73,7 @@ impl Model {
             set_vars: HashMap::new(),
             search: Vec::new(),
             names: Vec::new(),
+            outputs: Vec::new(),
             objective: None,
         }
     }

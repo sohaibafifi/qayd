@@ -8,7 +8,7 @@ use qayd::constraints::primitives::{all_different, all_equal, precedence};
 use qayd::expr;
 use qayd::VarId;
 
-use crate::model::{FznDomain, Model, Reif, UNBOUNDED_HI, UNBOUNDED_LO};
+use crate::model::{FznDomain, Model, Output, Reif, UNBOUNDED_HI, UNBOUNDED_LO};
 use crate::text::{clean_name, require, split_args, strip_annotations, strip_leading_solve_annotations};
 
 const MAX_EXPLICIT_DOMAIN_VALUES: usize = 100_000;
@@ -108,13 +108,31 @@ fn array_len(model: &Model, left: &str) -> Result<usize, String> {
     Ok((model.int_atom(hi)? - model.int_atom(lo)? + 1) as usize)
 }
 
+/// Dimension ranges of an `:: output_array([1..a, 1..b, ...])` annotation, if present.
+fn output_array_dims(model: &Model, right: &str) -> Result<Option<Vec<(i32, i32)>>, String> {
+    let Some(pos) = right.find("output_array") else { return Ok(None) };
+    let rest = &right[pos..];
+    let inner = rest.split_once('[').and_then(|(_, r)| r.split_once(']')).map(|(x, _)| x).ok_or("malformed output_array annotation")?;
+    let mut dims = Vec::new();
+    for item in split_args(inner) {
+        let (lo, hi) = item.split_once("..").ok_or("output_array dimension must be an interval")?;
+        dims.push((model.int_atom(lo)?, model.int_atom(hi)?));
+    }
+    Ok(Some(dims))
+}
+
 fn parse_decl(model: &mut Model, stmt: &str) -> Result<(), String> {
     if stmt.starts_with("array ") {
         let (left, right) = stmt.split_once(':').ok_or("bad array declaration")?;
         let name = clean_name(right);
+        let is_bool = left.contains(" of bool") || left.contains(" of var bool");
+        let dims = output_array_dims(model, right)?;
         if let Some((_, value)) = right.split_once('=') {
             if left.contains(" of var ") {
                 let vars = model.var_list(strip_annotations(value))?;
+                if let Some(dims) = dims {
+                    model.outputs.push(Output::Array { name: name.clone(), dims, vars: vars.clone(), is_bool });
+                }
                 model.arrays.insert(name, vars);
             } else {
                 let values = model.int_list(strip_annotations(value))?;
@@ -125,7 +143,10 @@ fn parse_decl(model: &mut Model, stmt: &str) -> Result<(), String> {
         let n = array_len(model, left)?;
         let domain = left.rsplit_once(" of var ").map(|(_, d)| d).ok_or("only var arrays without assignment are supported")?;
         let domain = parse_domain(model, domain)?;
-        let vars = (1..=n).map(|i| model.new_var(format!("{name}[{i}]"), &domain)).collect();
+        let vars: Vec<VarId> = (1..=n).map(|i| model.new_var(format!("{name}[{i}]"), &domain)).collect();
+        if let Some(dims) = dims {
+            model.outputs.push(Output::Array { name: name.clone(), dims, vars: vars.clone(), is_bool });
+        }
         model.arrays.insert(name, vars);
         return Ok(());
     }
@@ -145,8 +166,12 @@ fn parse_decl(model: &mut Model, stmt: &str) -> Result<(), String> {
         model.set_vars.insert(name, members);
         return Ok(());
     }
+    let is_bool = domain.trim() == "bool";
     let domain = parse_domain(model, domain)?;
-    let var = model.new_var(name, &domain);
+    let var = model.new_var(name.clone(), &domain);
+    if right.contains("output_var") {
+        model.outputs.push(Output::Var { name, var, is_bool });
+    }
     if let Some((_, value)) = right.split_once('=') {
         let fixed = model.var_atom(strip_annotations(value))?;
         linear(&mut model.solver, &[1, -1], &[var, fixed], Relation::Eq, 0);

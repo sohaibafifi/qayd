@@ -14,18 +14,20 @@ use crate::solve::Options;
 
 fn main() {
     let mut path: Option<String> = None;
-    let mut opts = Options { verbose: false, time_limit: None };
+    let mut opts = Options { verbose: false, time_limit: None, mzn: false };
+    let mut time_value: Option<u64> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-v" | "--verbose" => opts.verbose = true,
+            "--mzn" => opts.mzn = true,
             "-t" | "--time-limit" => {
-                let sec = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or_else(|| {
-                    eprintln!("error: --time-limit expects a value in seconds");
+                let v = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or_else(|| {
+                    eprintln!("error: --time-limit expects an integer value");
                     std::process::exit(1);
                 });
-                opts.time_limit = Some(Duration::from_secs(sec));
+                time_value = Some(v);
             }
             "-h" | "--help" => {
                 print_usage();
@@ -44,6 +46,12 @@ fn main() {
                 path = Some(other.to_string());
             }
         }
+    }
+
+    // Native CLI takes seconds; under `--mzn` the MiniZinc driver's standard
+    // `-t` flag is in milliseconds.
+    if let Some(v) = time_value {
+        opts.time_limit = Some(if opts.mzn { Duration::from_millis(v) } else { Duration::from_secs(v) });
     }
 
     let Some(path) = path else {
@@ -70,6 +78,8 @@ fn print_usage() {
          options:\n\
          \x20 -v, --verbose           stream improving bounds and print statistics\n\
          \x20 -t, --time-limit <sec>  stop the search after <sec> seconds\n\
+         \x20 --mzn                   speak the MiniZinc solver protocol\n\
+         \x20                         (solution items + `----------`; `-t` in ms)\n\
          \x20 -h, --help              show this help"
     );
 }
