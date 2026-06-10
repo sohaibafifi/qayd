@@ -15,6 +15,11 @@ use crate::lcg::trail::{Cdcl, Reason};
 use crate::search::{Objective, SearchControl, SolveStats};
 use crate::store::Solver;
 
+/// One in every `REPHASE_PERIOD` restart segments rephases (ignores saved phases
+/// and dives with a fresh polarity). The other segments keep saved phases, so
+/// convergence is preserved and diversification stays a minority of the effort.
+const REPHASE_PERIOD: u64 = 4;
+
 fn mix64(mut x: u64) -> u64 {
     x ^= x >> 30;
     x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -123,22 +128,16 @@ impl Cdcl<'_> {
         best_objective.or(best)
     }
 
-    /// The decision literal for `v`: `[v = p]` toward the saved phase `p` when
-    /// it is still in the domain, else a seed-dependent endpoint.
+    /// The decision literal for `v`: `[v = p]` toward the saved phase `p` when it
+    /// is still in the domain (skipped on a rephasing segment), else a polarity
+    /// endpoint chosen by [`rephase_value`](Self::rephase_value).
     fn decision_lit(&self, v: VarId, phase: &[Option<i32>], objective: Option<&ObjectiveImpact>, mode: SearchMode) -> Lit {
         let val = match phase[v.index()] {
-            Some(p) if self.solver.store.contains(v, p) => p,
-            _ if mode == SearchMode::FastCop => {
-                objective.and_then(|objective| objective.preferred_value(self.solver, v)).unwrap_or_else(|| {
-                    if self.seed != 0 && mix64(self.seed ^ v.0 as u64) & 1 != 0 {
-                        self.solver.store.max(v)
-                    } else {
-                        self.solver.store.min(v)
-                    }
-                })
-            }
-            _ if self.seed != 0 && mix64(self.seed ^ v.0 as u64) & 1 != 0 => self.solver.store.max(v),
-            _ => self.solver.store.min(v),
+            Some(p) if self.rephase_mode == 0 && self.solver.store.contains(v, p) => p,
+            _ if mode == SearchMode::FastCop => objective
+                .and_then(|objective| objective.preferred_value(self.solver, v))
+                .unwrap_or_else(|| self.rephase_value(v)),
+            _ => self.rephase_value(v),
         };
         match self.atoms.eq(v, val) {
             LitOrConst::Lit(l) => l,
@@ -148,11 +147,35 @@ impl Cdcl<'_> {
         }
     }
 
+    /// The domain endpoint to branch to when no saved phase applies: the
+    /// seed-dependent endpoint by default, inverted on a rephasing segment.
+    fn rephase_value(&self, v: VarId) -> i32 {
+        let default_max = self.seed != 0 && mix64(self.seed ^ v.0 as u64) & 1 != 0;
+        let want_max = default_max ^ (self.rephase_mode != 0);
+        if want_max {
+            self.solver.store.max(v)
+        } else {
+            self.solver.store.min(v)
+        }
+    }
+
     /// Restart to the root when the restart policy fires. Learned clauses and
-    /// saved phases survive.
+    /// saved phases survive. Every `REPHASE_PERIOD` restarts the next segment
+    /// *rephases*: it ignores saved phases and dives with an inverted or random
+    /// polarity, escaping a region the saved phase keeps pulling search back to.
     fn maybe_restart(&mut self) -> bool {
         if self.should_restart() {
             self.backjump_to(0);
+            self.restarts_done += 1;
+            // Rephase only in a lone sequential search. Every `REPHASE_PERIOD`
+            // restarts the next segment inverts the default polarity (not random:
+            // an opposite dive diversifies the feasibility search without
+            // shredding structured objectives like LABS). Portfolio workers
+            // already diversify across workers, and per-worker rephasing
+            // *synchronizes* their polarity flips and hurts — so it is disabled
+            // whenever clause sharing (a portfolio) is active.
+            let lone = self.clause_sharing.is_none();
+            self.rephase_mode = u8::from(lone && self.restarts_done.is_multiple_of(REPHASE_PERIOD));
             self.maybe_reduce_db();
             return self.sync_shared_clauses();
         }

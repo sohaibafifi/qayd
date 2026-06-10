@@ -40,10 +40,17 @@ Priorities, in order: **correct, then simple, then fast.**
   watched clauses, [LBD](https://www.ijcai.org/Proceedings/09/Papers/074.pdf)
   reduction, [dom/wdeg](https://dl.acm.org/doi/10.5555/3000001.3000033),
   [VSIDS](https://doi.org/10.1145/378239.379017), phase saving, and restarts.
-  Sparse domains allocate atoms by support; wide domains allocate shared atoms
-  on demand. Short learned clauses are strengthened by budgeted CP-aware
-  vivification through the global propagators.
-- **COP and parallel search.** Branch-and-bound keeps wide linear and expression
+  A lone sequential search periodically *rephases* — every few restarts it
+  ignores saved phases and dives with the inverted polarity — to escape regions
+  the saved phase keeps pulling it back to (this finds first solutions on
+  feasibility-hard COP instances that otherwise time out). Sparse domains
+  allocate atoms by support; wide domains allocate shared atoms on demand. Short
+  learned clauses are strengthened by budgeted CP-aware vivification through the
+  global propagators.
+- **Parallel search.** CSP find-one/UNSAT runs a portfolio of CDCL workers that
+  differ by seed and restart cadence and cross-pollinate short low-LBD learned
+  clauses; the first to find a solution or prove unsatisfiability wins. COP
+  branch-and-bound keeps wide linear and expression
   objectives symbolic. Opt-in portfolio workers share incumbents; workers with
   materialized objectives also share short low-LBD clauses. `--split` enables
   proof-job stealing inspired by [Buffered Work
@@ -70,12 +77,12 @@ qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--fast-cop] [--split] [-
 - `-v`, `--verbose` emits `c` comment lines (model size, search stats, wall time, incumbent source).
 - `-t SECONDS`, `--time SECONDS` stops after a time budget, reporting the best solution so far.
 - `--seed SEED` sets the reproducible search seed. It defaults to `RANDOMSEED`, then `0`.
-- `-p THREADS`, `--threads THREADS` sets the COP portfolio worker count. It defaults to `NBCORE`, then `1`.
+- `-p THREADS`, `--threads THREADS` sets the portfolio worker count (CSP and COP). It defaults to `NBCORE`, then `1`.
 - `--fast-cop` searches for good COP incumbents only. It does not prove optimality and defaults to a 240 second limit when `-t` is omitted.
 - `--split` divides COP proof search into disjoint jobs for worker stealing.
 - `--probe N` dedicates up to `N` COP workers to optimistic objective probes.
 - `--lns N` dedicates up to `N` COP workers to bounded Large Neighborhood Search.
-- `--learn-csp` uses CDCL learning and restarts for CSP find-one/UNSAT solving.
+- `--learn-csp` is accepted for compatibility but has no effect: CSP find-one/UNSAT always uses CDCL learning and restarts.
 
 ## As a library
 

@@ -102,10 +102,53 @@ where
 /// Find one solution over `vars`, or prove UNSAT, with CDCL learning and restarts.
 /// This is not an enumeration driver: it does not count or block all solutions.
 pub(crate) fn decide_sat_seeded(solver: &mut Solver, vars: &[VarId], stop: &AtomicBool, seed: u64) -> (Option<Vec<i32>>, SolveStats, bool) {
-    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, None) else {
+    decide_sat_shared_seeded(solver, vars, stop, seed, None, false)
+}
+
+/// Like [`decide_sat_seeded`], cooperating in a CSP portfolio: learned clauses
+/// (sound model consequences, never solution-blocking) are exchanged through
+/// `clause_sharing`. `fast` picks the shorter restart schedule to diversify
+/// workers. Find-one/UNSAT only — never used for enumeration.
+pub(crate) fn decide_sat_shared_seeded(
+    solver: &mut Solver,
+    vars: &[VarId],
+    stop: &AtomicBool,
+    seed: u64,
+    clause_sharing: Option<ClauseSharing>,
+    fast: bool,
+) -> (Option<Vec<i32>>, SolveStats, bool) {
+    let lazy_atoms = clause_sharing.as_ref().map(ClauseSharing::lazy_atoms);
+    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, lazy_atoms) else {
         return (None, SolveStats::default(), false);
     };
+    if let Some(sharing) = clause_sharing {
+        cdcl.set_clause_sharing(sharing);
+    }
+    if fast {
+        cdcl.use_fast_restarts();
+    }
     cdcl.decide_sat(vars, stop)
+}
+
+/// Find one solution by non-learning chronological DFS, or report exhaustion.
+/// Returns `(solution, stats, complete)`, where `complete` is `true` unless the
+/// search was interrupted. Run as a diversified portfolio worker alongside the
+/// learning [`decide_sat_shared_seeded`]: plain DFS wins on instances (e.g.
+/// highly symmetric ones, such as graph colouring) where clause learning thrashes.
+pub(crate) fn find_one_seeded(solver: &mut Solver, vars: &[VarId], stop: &AtomicBool, seed: u64) -> (Option<Vec<i32>>, SolveStats, bool) {
+    let mut found = None;
+    let stats = solve_interruptible_seeded(
+        solver,
+        vars,
+        |s| {
+            found = Some(vars.iter().map(|&v| s.store.value(v)).collect::<Vec<_>>());
+            SearchControl::Stop
+        },
+        stop,
+        seed,
+    );
+    let complete = !stop.load(Ordering::Relaxed);
+    (found, stats, complete)
 }
 
 /// Find the first solution, returning the values of `vars`.

@@ -12,7 +12,9 @@ use crate::lcg::lit::Lit;
 use crate::lns::{fix_neighborhood, LnsState};
 use crate::ls::{solve_fast_cop, LocalSearchSpec};
 use crate::problem::{Objective, Problem};
-use crate::search::{optimize_seeded, probe_seeded, split_cube_seeded, Objective as SearchObjective, SolveStats};
+use crate::search::{
+    decide_sat_shared_seeded, find_one_seeded, optimize_seeded, probe_seeded, split_cube_seeded, Objective as SearchObjective, SolveStats,
+};
 use crate::store::Solver;
 
 /// Solver execution settings. Parallel search is opt-in with `workers > 1`.
@@ -54,9 +56,14 @@ pub(crate) struct ParallelOutcome {
 
 pub(crate) fn normalize_options(has_objective: bool, var_objective: bool, options: RunOptions) -> RunOptions {
     let options = RunOptions { workers: options.workers.max(1), ..options };
-    let workers = if has_objective { options.workers } else { 1 };
+    let workers = options.workers;
+    if !has_objective {
+        // CSP runs a clause-sharing find-one/UNSAT portfolio; none of the
+        // COP-only worker roles apply.
+        return RunOptions { workers, fast_cop: false, split: false, probes: 0, lns: 0, ..options };
+    }
     if options.fast_cop {
-        return RunOptions { workers, fast_cop: has_objective, split: false, probes: 0, lns: 0, learn_csp: false, ..options };
+        return RunOptions { workers, fast_cop: true, split: false, probes: 0, lns: 0, learn_csp: false, ..options };
     }
     if workers == 1 {
         return RunOptions { workers, split: false, probes: 0, lns: 0, ..options };
@@ -78,8 +85,11 @@ pub(crate) fn worker_roles(has_objective: bool, options: RunOptions) -> String {
     if has_objective && options.fast_cop {
         return format!("incumbent {}", options.workers);
     }
-    if !has_objective || options.workers == 1 {
-        return format!("{} 1", if options.fast_cop && has_objective { "incumbent" } else { "sequential" });
+    if !has_objective {
+        return if options.workers == 1 { "sequential 1".to_string() } else { format!("portfolio {}", options.workers) };
+    }
+    if options.workers == 1 {
+        return format!("{} 1", if options.fast_cop { "incumbent" } else { "sequential" });
     }
     let incumbent = fast_incumbent_workers(has_objective, options);
     let regular = options.workers - options.probes - options.lns - incumbent;
@@ -455,6 +465,112 @@ fn run_incumbent_worker(
         }
     });
     let _ = tx.send(WorkerMsg::Done(SolveStats::default()));
+}
+
+/// Outcome of a CSP portfolio: a solution, a UNSAT proof, or (if interrupted) neither.
+pub(crate) struct CspOutcome {
+    pub(crate) solution: Option<Vec<i32>>,
+    pub(crate) stats: SolveStats,
+    /// `true` once some worker found a solution or exhausted the tree (SAT/UNSAT
+    /// decided); `false` only when every worker was interrupted first.
+    pub(crate) decided: bool,
+    pub(crate) shared_clauses: usize,
+    pub(crate) imported_clauses: u64,
+}
+
+/// Shared state for the CSP find-one/UNSAT portfolio.
+struct CspShared {
+    cancel: AtomicBool,
+    /// First solution found by any worker.
+    solution: Mutex<Option<Vec<i32>>>,
+    /// Set once SAT (a solution) or UNSAT (an exhausted worker) is determined.
+    decided: AtomicBool,
+    clauses: Arc<SharedClausePool>,
+}
+
+/// Race `workers` diversified find-one workers on the same CSP. Worker 0 runs
+/// plain non-learning DFS, which wins on highly symmetric models (e.g. graph
+/// colouring) where clause learning thrashes; the rest run CDCL, differing by
+/// seed (value-endpoint choice) and restart cadence (odd workers restart faster)
+/// and cross-pollinating learned clauses (sound model consequences). The first
+/// worker to find a solution, or to exhaust the tree (proving UNSAT), decides the
+/// answer and cancels the rest. UNSAT and SAT are mutually exclusive across
+/// workers solving the identical model, so the first decision is authoritative.
+///
+/// Workers clone their private solver from the immutable model. Because a
+/// propagator is `Send` but not `Sync`, the source cannot be shared by reference,
+/// so the clones are made serially up front; the loop polls the stop flag so a
+/// slow clone of a large model cannot overrun the deadline before search begins.
+pub(crate) fn solve_csp(problem: Problem, stop: &AtomicBool, options: RunOptions) -> CspOutcome {
+    let shared = Arc::new(CspShared {
+        cancel: AtomicBool::new(false),
+        solution: Mutex::new(None),
+        decided: AtomicBool::new(false),
+        clauses: Arc::new(SharedClausePool::default()),
+    });
+    let mut models = Vec::with_capacity(options.workers);
+    models.push(problem);
+    for _ in 1..options.workers {
+        if stop.load(Ordering::Relaxed) {
+            break; // out of time before search even starts; run with what we have
+        }
+        models.push(models[0].clone());
+    }
+    let (tx, rx) = mpsc::channel();
+    let mut stats = SolveStats::default();
+
+    std::thread::scope(|scope| {
+        let monitor = Arc::clone(&shared);
+        scope.spawn(move || {
+            while !monitor.cancel.load(Ordering::Relaxed) {
+                if stop.load(Ordering::Relaxed) {
+                    monitor.cancel.store(true, Ordering::Relaxed);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        for (worker, model) in models.into_iter().enumerate() {
+            let shared = Arc::clone(&shared);
+            let tx = tx.clone();
+            scope.spawn(move || {
+                let seed = options.seed.wrapping_add(worker as u64);
+                let mut solver = model.solver;
+                let vars = &model.search;
+                let (solution, worker_stats, complete) = if worker == 0 {
+                    // Strategy diversity: a non-learning DFS worker.
+                    find_one_seeded(&mut solver, vars, &shared.cancel, seed)
+                } else {
+                    let sharing = ClauseSharing::new(Arc::clone(&shared.clauses), worker);
+                    decide_sat_shared_seeded(&mut solver, vars, &shared.cancel, seed, Some(sharing), worker % 2 == 1)
+                };
+                if solution.is_some() {
+                    *shared.solution.lock().unwrap() = solution;
+                    shared.decided.store(true, Ordering::Relaxed);
+                    shared.cancel.store(true, Ordering::Relaxed);
+                } else if complete {
+                    // Exhausted, not cancelled: a sound UNSAT proof.
+                    shared.decided.store(true, Ordering::Relaxed);
+                    shared.cancel.store(true, Ordering::Relaxed);
+                }
+                let _ = tx.send(worker_stats);
+            });
+        }
+        drop(tx);
+        for worker_stats in rx {
+            merge_stats(&mut stats, worker_stats);
+        }
+        shared.cancel.store(true, Ordering::Relaxed);
+    });
+
+    let solution = shared.solution.lock().unwrap().clone();
+    CspOutcome {
+        solution,
+        stats,
+        decided: shared.decided.load(Ordering::Relaxed),
+        shared_clauses: shared.clauses.len(),
+        imported_clauses: shared.clauses.imported(),
+    }
 }
 
 pub(crate) fn solve_cop<W: Write>(
