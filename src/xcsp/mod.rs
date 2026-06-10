@@ -12,11 +12,13 @@ use std::time::Instant;
 
 use xcsp3_rust_parser::xcsp_runner::XcspRunner;
 
-use crate::ids::VarId;
+use crate::ids::{PropId, VarId};
 use crate::ls::{solve_fast_cop, LocalSearchOutcome, LocalSearchSpec};
 use crate::parallel::{normalize_options, solve_cop, solve_csp, worker_roles, CspOutcome, ParallelOutcome};
 use crate::problem::{Objective, Problem};
-use crate::search::{decide_sat_seeded, optimize_fast_seeded, optimize_seeded, SolveStats};
+use crate::search::{decide_sat_seeded, optimize_fast_seeded, optimize_seeded, root_unsat_core, SolveStats};
+use crate::store::Solver;
+use callback::ConstraintGroup;
 
 pub use crate::parallel::RunOptions;
 
@@ -174,6 +176,53 @@ struct XcspProblem {
     problem: Problem,
     local: LocalSearchSpec,
     output: SolutionOutput,
+    /// Propagator→source-constraint grouping, for unsat-core reporting.
+    groups: Vec<ConstraintGroup>,
+}
+
+/// State retained (pre-presolve) to extract a root-refutation unsat core on
+/// demand. Held only when `--core` is requested, so SAT instances pay nothing.
+struct CoreCtx {
+    solver: Solver,
+    search: Vec<VarId>,
+    groups: Vec<ConstraintGroup>,
+}
+
+/// Map a propagator core to deduplicated source-constraint descriptors, in
+/// first-seen order. Propagators outside every group (e.g. injected by
+/// presolve) are skipped.
+fn map_core(props: &[PropId], groups: &[ConstraintGroup]) -> Vec<String> {
+    let mut seen = vec![false; groups.len()];
+    let mut out = Vec::new();
+    for p in props {
+        let pi = p.index();
+        if let Some(gi) = groups.iter().position(|g| pi >= g.start && pi < g.end) {
+            if !std::mem::replace(&mut seen[gi], true) {
+                out.push(format!("#{} {}", gi, groups[gi].label));
+            }
+        }
+    }
+    out
+}
+
+/// Print the root-refutation unsat core, if `--core` was requested. Called only
+/// on an UNSAT result. Re-runs root propagation on the pre-presolve model and
+/// attributes the refutation to source constraints. A root-consistent model
+/// (unsat only under search) yields no single-pass core.
+fn write_core<W: Write>(w: &mut W, ctx: &Option<CoreCtx>) -> Result<(), String> {
+    let Some(ctx) = ctx else { return Ok(()) };
+    let mut solver = ctx.solver.clone();
+    match root_unsat_core(&mut solver, &ctx.search) {
+        Some(props) => {
+            let groups = map_core(&props, &ctx.groups);
+            writeln!(w, "c core {} constraint(s)", groups.len()).map_err(io_err)?;
+            for g in groups {
+                writeln!(w, "c core-constraint {g}").map_err(io_err)?;
+            }
+        }
+        None => writeln!(w, "c core unavailable (root-consistent; refutation needs search)").map_err(io_err)?,
+    }
+    Ok(())
 }
 
 fn parse_problem(path: &Path) -> Result<XcspProblem, String> {
@@ -216,8 +265,9 @@ fn parse_problem(path: &Path) -> Result<XcspProblem, String> {
         })
         .unzip();
     let output = SolutionOutput { names, entries };
+    let groups = model.groups;
     let problem = Problem { solver: model.solver, search, objective: model.objective };
-    Ok(XcspProblem { problem, local: model.local, output })
+    Ok(XcspProblem { problem, local: model.local, output, groups })
 }
 
 /// Parse, build, and solve an XCSP3 instance, returning competition-style
@@ -249,6 +299,13 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
     let symbolic_probes_disabled = has_objective && !var_objective && options.probes > 0;
     let options = normalize_options(has_objective, var_objective, options);
     let old_search = xcsp.problem.search.clone();
+    // Snapshot the pre-presolve model so an unsat core can be re-derived by root
+    // propagation. Held only under `--core`, so SAT runs pay nothing.
+    let core_ctx = options.core.then(|| CoreCtx {
+        solver: xcsp.problem.solver.clone(),
+        search: old_search.clone(),
+        groups: std::mem::take(&mut xcsp.groups),
+    });
     let presolve = xcsp.problem.presolve(stop);
     xcsp.output.remap_after_presolve(&old_search, &xcsp.problem);
 
@@ -289,6 +346,9 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
             writeln!(w, "c nodes 0 failures {}", usize::from(presolve.failed)).map_err(io_err)?;
         }
         writeln!(w, "{}", if presolve.failed { "s UNSATISFIABLE" } else { "s UNKNOWN" }).map_err(io_err)?;
+        if presolve.failed {
+            write_core(w, &core_ctx)?;
+        }
         if verbose {
             if stop.load(Ordering::Relaxed) {
                 writeln!(w, "c interrupted").map_err(io_err)?;
@@ -300,17 +360,17 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
     }
 
     if options.fast_cop && options.workers > 1 {
-        let XcspProblem { problem, local, output } = xcsp;
+        let XcspProblem { problem, local, output, .. } = xcsp;
         let result = solve_fast_cop_parallel(problem, local, verbose, stop, w, options)?;
         write_fast_cop_result(w, &output, result, verbose)?;
     } else if options.workers == 1 {
-        solve_single(xcsp, verbose, stop, w, options)?;
+        solve_single(xcsp, verbose, stop, w, options, &core_ctx)?;
     } else if !has_objective {
         let XcspProblem { problem, output, .. } = xcsp;
         let result = solve_csp(problem, stop, options);
-        write_csp_result(w, &output, result, verbose)?;
+        write_csp_result(w, &output, result, verbose, &core_ctx)?;
     } else {
-        let XcspProblem { problem, local, output } = xcsp;
+        let XcspProblem { problem, local, output, .. } = xcsp;
         let result = solve_cop(problem, local, verbose, stop, w, options)?;
         write_parallel_result(w, &output, result, verbose)?;
     }
@@ -426,7 +486,14 @@ fn write_fast_cop_result<W: Write>(w: &mut W, output: &SolutionOutput, result: L
     write_solution_tail(w, output, result.best.map(|(s, v)| (s, Some(v))), "s SATISFIABLE", "s UNKNOWN", verbose)
 }
 
-fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w: &mut W, options: RunOptions) -> Result<(), String> {
+fn solve_single<W: Write>(
+    xcsp: XcspProblem,
+    verbose: bool,
+    stop: &AtomicBool,
+    w: &mut W,
+    options: RunOptions,
+    core_ctx: &Option<CoreCtx>,
+) -> Result<(), String> {
     let XcspProblem { problem, output, .. } = xcsp;
     let mut solver = problem.solver;
     let vars = problem.search;
@@ -448,7 +515,10 @@ fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w
                     output.write(w, &s).map_err(io_err)?;
                 }
                 None if !complete => writeln!(w, "s UNKNOWN").map_err(io_err)?,
-                None => writeln!(w, "s UNSATISFIABLE").map_err(io_err)?,
+                None => {
+                    writeln!(w, "s UNSATISFIABLE").map_err(io_err)?;
+                    write_core(w, core_ctx)?;
+                }
             }
             Ok(())
         }
@@ -506,7 +576,13 @@ fn write_parallel_result<W: Write>(w: &mut W, output: &SolutionOutput, result: P
     write_solution_tail(w, output, result.best.map(|(s, v)| (s, Some(v))), sat, none, verbose)
 }
 
-fn write_csp_result<W: Write>(w: &mut W, output: &SolutionOutput, result: CspOutcome, verbose: bool) -> Result<(), String> {
+fn write_csp_result<W: Write>(
+    w: &mut W,
+    output: &SolutionOutput,
+    result: CspOutcome,
+    verbose: bool,
+    core_ctx: &Option<CoreCtx>,
+) -> Result<(), String> {
     if verbose {
         writeln!(w, "c nodes {} failures {}", result.stats.nodes, result.stats.failures).map_err(io_err)?;
         write_inprocessing_stats(w, result.stats).map_err(io_err)?;
@@ -514,6 +590,11 @@ fn write_csp_result<W: Write>(w: &mut W, output: &SolutionOutput, result: CspOut
             writeln!(w, "c shared clauses {} imported {}", result.shared_clauses, result.imported_clauses).map_err(io_err)?;
         }
     }
+    let unsat = result.solution.is_none() && result.decided;
     let none = if result.decided { "s UNSATISFIABLE" } else { "s UNKNOWN" };
-    write_solution_tail(w, output, result.solution.map(|s| (s, None::<i32>)), "s SATISFIABLE", none, verbose)
+    write_solution_tail(w, output, result.solution.map(|s| (s, None::<i32>)), "s SATISFIABLE", none, verbose)?;
+    if unsat {
+        write_core(w, core_ctx)?;
+    }
+    Ok(())
 }

@@ -62,6 +62,12 @@ Priorities, in order: **correct, then simple, then fast.**
 it searches for feasible solutions and objective improvements, without trying to prove optimality. 
 It uses local scoring for common constraints, constructive starts for guarded table/element patterns, 
 and  focused repair for simple Boolean exact-cover rows.
+- **Unsat-core explanation (beta).** `--core` reports *why* a CSP is infeasible.
+  On `s UNSATISFIABLE` it walks the refutation's reason graph and prints the
+  subset of source constraints that are jointly unsatisfiable (`c core` /
+  `c core-constraint` lines). Tight when root propagation alone refutes; a model
+  that is unsatisfiable only under search reports the core as unavailable. The
+  groundwork for minimal-unsatisfiable-subset (MUS) extraction.
 - **A beta support for MiniZinc.** The `qayd-fzn` driver speaks the MiniZinc solver protocol, 
 so it can be used as a backend for the MiniZinc CLI and IDE. The `--mzn` flag enables some 
 MiniZinc-specific behaviour. (see [for details](frontends/flatzinc/minizinc/README.md)).
@@ -76,7 +82,7 @@ cargo test
 ## Solve an instance
 
 ```bash
-qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--fast-cop] [--split] [--probe N] [--lns N] [--learn-csp] <instance.xml[.lzma|.xz]>
+qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--fast-cop] [--split] [--probe N] [--lns N] [--learn-csp] [--core] <instance.xml[.lzma|.xz]>
 ```
 
 - `-h`, `--help` prints the usage.
@@ -89,6 +95,7 @@ qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--fast-cop] [--split] [-
 - `--probe N` dedicates up to `N` COP workers to optimistic objective probes.
 - `--lns N` dedicates up to `N` COP workers to bounded Large Neighborhood Search.
 - `--learn-csp` is accepted for compatibility but has no effect: CSP find-one/UNSAT always uses CDCL learning and restarts.
+- `--core` on UNSAT prints a root-refutation unsat core: the source constraints jointly responsible, as `c core <n> constraint(s)` and `c core-constraint #<i> <label>` lines. Reports the core as unavailable when refutation needs search.
 
 ## As a library
 

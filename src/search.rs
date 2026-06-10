@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
 use crate::expr::Expr;
-use crate::ids::VarId;
+use crate::ids::{PropId, VarId};
 use crate::lcg::clause::ClauseSharing;
 use crate::lcg::lit::{LazyAtomRegistry, Lit};
 use crate::lcg::trail::Cdcl;
@@ -149,6 +149,17 @@ pub(crate) fn find_one_seeded(solver: &mut Solver, vars: &[VarId], stop: &Atomic
     );
     let complete = !stop.load(Ordering::Relaxed);
     (found, stats, complete)
+}
+
+/// Extract a root-refutation unsat core: the propagators (constraints) whose
+/// inferences jointly refute the model by root propagation alone. `None` when
+/// the root is propagation-consistent (an unsat instance that needs search to
+/// refute is out of scope for this single-pass extractor). The returned
+/// [`PropId`]s are in first-seen order; map them to source constraints via the
+/// frontend's propagator→constraint grouping.
+pub(crate) fn root_unsat_core(solver: &mut Solver, vars: &[VarId]) -> Option<Vec<PropId>> {
+    let mut cdcl = Cdcl::new(solver, vars);
+    cdcl.root_core()
 }
 
 /// Find the first solution, returning the values of `vars`.

@@ -79,10 +79,22 @@ struct ArrayDecl {
     cells: HashMap<Vec<usize>, VarId>,
 }
 
+/// A source constraint's footprint in the propagator store: the half-open
+/// `[start, end)` range of propagator indices it posted, with a human label.
+/// Lets an unsat core (a set of propagators) be reported as source constraints.
+pub struct ConstraintGroup {
+    pub label: String,
+    pub start: usize,
+    pub end: usize,
+}
+
 /// Accumulates the model as the parser walks the instance.
 pub struct Model {
     pub solver: Solver,
     pub declared: Vec<(String, VarId)>,
+    /// One entry per source constraint, in parse order: its posted-propagator
+    /// range. Empty ranges (fully presolved / no propagator) are not recorded.
+    pub groups: Vec<ConstraintGroup>,
     pub(super) objective: Option<Objective>,
     pub(super) local: LocalSearchSpec,
     pub error: Option<String>,
@@ -115,6 +127,7 @@ impl Model {
         Self {
             solver: Solver::new(),
             declared: Vec::new(),
+            groups: Vec::new(),
             objective: None,
             local: LocalSearchSpec::default(),
             error: None,
@@ -141,6 +154,16 @@ impl Model {
     fn fail(&mut self, msg: impl Into<String>) {
         if self.error.is_none() {
             self.error = Some(msg.into());
+        }
+    }
+
+    /// Register the propagators posted since `start` as one source-constraint
+    /// group. Skips empty ranges (a constraint that posted no propagator, e.g.
+    /// fully resolved at post time, can never appear in a core).
+    fn record_group(&mut self, label: &str, start: usize) {
+        let end = self.solver.num_propagators();
+        if end > start {
+            self.groups.push(ConstraintGroup { label: label.to_string(), start, end });
         }
     }
 
@@ -662,27 +685,37 @@ fn build_op(op: &EOp, args: Vec<Expr>) -> Result<Expr, String> {
     })
 }
 
-/// Run a fallible mapping, recording the first error.
+/// Run a fallible mapping, recording the first error. The labelled form also
+/// registers the propagators posted by the body as one [`ConstraintGroup`], so
+/// an unsat core can be reported in terms of source constraints.
 macro_rules! guard {
-    ($self:ident, $body:block) => {{
+    ($self:ident, $label:expr, $body:block) => {{
         if $self.error.is_some() {
             return;
         }
+        let __group_start = $self.solver.num_propagators();
         #[allow(clippy::redundant_closure_call)]
         let r: Result<(), String> = (|| $body)();
-        if let Err(e) = r {
-            $self.fail(e);
+        match r {
+            Err(e) => $self.fail(e),
+            Ok(()) => $self.record_group($label, __group_start),
         }
     }};
+    ($self:ident, $body:block) => {
+        guard!($self, "constraint", $body)
+    };
 }
 
 /// `guard!` for a constraint with no local-search encoding: first flags it so LS
 /// falls back, then runs the body for the CP model.
 macro_rules! guard_unsupported {
-    ($self:ident, $body:block) => {{
+    ($self:ident, $label:expr, $body:block) => {{
         $self.local.mark_unsupported();
-        guard!($self, $body);
+        guard!($self, $label, $body);
     }};
+    ($self:ident, $body:block) => {
+        guard_unsupported!($self, "constraint", $body)
+    };
 }
 
 impl XcspCallback for Model {

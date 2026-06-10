@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::ids::VarId;
+use crate::ids::{PropId, VarId};
 use crate::lcg::clause::{ClauseDb, ClauseRef, ClauseSharing, SharedClause};
 use crate::lcg::lit::{Atom, AtomKind, AtomTable, LazyAtomRegistry, Lit, LitOrConst};
 use crate::lcg::view::{self, Tri};
@@ -46,8 +46,10 @@ pub enum Reason {
     /// Forced as the last open literal of a clause.
     Clause(ClauseRef),
     /// Propagator inference. Literals are `D_S` (true scope literals entailing
-    /// the inference); reason clause is `(consequent ∨ ⋁ ¬D_S)`.
-    Generic(Arc<[Lit]>),
+    /// the inference); reason clause is `(consequent ∨ ⋁ ¬D_S)`. `prop` is the
+    /// propagator that drew the inference (for unsat-core attribution), or
+    /// `None` for a domain-determination mirror with no single owner.
+    Generic { lits: Arc<[Lit]>, prop: Option<PropId> },
 }
 
 /// A detected conflict, before analysis turns it into a learned clause.
@@ -56,8 +58,9 @@ pub enum Conflict {
     /// A fully falsified clause.
     Clause(ClauseRef),
     /// Propagator failure: these `D_S` literals (all true) are jointly
-    /// infeasible; conflict clause is `⋁ ¬D_S`.
-    Generic(Vec<Lit>),
+    /// infeasible; conflict clause is `⋁ ¬D_S`. `prop` is the failing
+    /// propagator (for unsat-core attribution).
+    Generic { ds: Vec<Lit>, prop: Option<PropId> },
 }
 
 struct ProbeDomain {
@@ -727,7 +730,7 @@ impl<'s> Cdcl<'s> {
         }
         let ds: Arc<[Lit]> = Arc::from(self.ds_recorded(var));
         for l in todo {
-            self.record(l, Reason::Generic(Arc::clone(&ds)));
+            self.record(l, Reason::Generic { lits: Arc::clone(&ds), prop: None });
         }
     }
 
@@ -871,8 +874,8 @@ impl<'s> Cdcl<'s> {
             }
             match self.solver.propagate_step() {
                 StepOutcome::Empty => return Ok(()),
-                StepOutcome::Ran(_) => self.record_prop_events(step_trail_len)?,
-                StepOutcome::Failed(_) => {
+                StepOutcome::Ran(pid) => self.record_prop_events(step_trail_len, pid)?,
+                StepOutcome::Failed(pid) => {
                     self.solver.store.events.clear();
                     // Prefer a tight conflict reason only when it existed on the
                     // trail before this propagator call. Otherwise use the
@@ -883,7 +886,7 @@ impl<'s> Cdcl<'s> {
                         None => build_ds(&self.atoms, &self.conflict_scope),
                     };
                     let ds = self.reason_before_step(preferred, step_trail_len);
-                    return Err(Conflict::Generic(ds));
+                    return Err(Conflict::Generic { ds, prop: Some(pid) });
                 }
             }
         }
@@ -894,7 +897,7 @@ impl<'s> Cdcl<'s> {
     /// snapshot. Record every primary first: the FD domain already reflects the
     /// full propagator call, so synchronising a variable after only its first
     /// buffered event could mirror facts caused by later, unrecorded events.
-    fn record_prop_events(&mut self, step_trail_len: usize) -> Result<(), Conflict> {
+    fn record_prop_events(&mut self, step_trail_len: usize, prop: PropId) -> Result<(), Conflict> {
         let events = std::mem::take(&mut self.solver.store.events);
         self.changed_vars.clear();
         for ev in &events {
@@ -908,7 +911,7 @@ impl<'s> Cdcl<'s> {
                 if !self.is_assigned(lit.atom()) {
                     let preferred = cause_lits(&self.atoms, &ev.cause, &self.conflict_scope);
                     let ds = self.reason_before_step(preferred, step_trail_len);
-                    self.record(lit, Reason::Generic(Arc::from(ds)));
+                    self.record(lit, Reason::Generic { lits: Arc::from(ds), prop: Some(prop) });
                 }
             }
             if !self.changed_vars.contains(&var) {
@@ -1366,6 +1369,65 @@ impl<'s> Cdcl<'s> {
         Some(learnt)
     }
 
+    /// Walk a conflict's reason graph, collecting every propagator whose
+    /// inference participates in the refutation: a sound (not necessarily
+    /// minimal) unsat core, as a set of [`PropId`]s. Intended for root
+    /// refutation, where no decisions and no learned clauses are present, so
+    /// the graph bottoms out at level-0 [`Fact`](Reason::Fact)s and every
+    /// inference carries its owning propagator. First-seen order is preserved.
+    fn analyze_core(&mut self, conflict: &Conflict) -> Vec<PropId> {
+        let mut props: Vec<PropId> = Vec::new();
+        let push = |props: &mut Vec<PropId>, p: PropId| {
+            if !props.contains(&p) {
+                props.push(p);
+            }
+        };
+        if let Conflict::Generic { prop: Some(p), .. } = conflict {
+            push(&mut props, *p);
+        }
+        let mut touched: Vec<u32> = Vec::new();
+        let mut stack: Vec<u32> = self.conflict_lits(conflict).iter().map(|l| l.atom()).collect();
+        while let Some(a) = stack.pop() {
+            if self.seen.get(a as usize).copied().unwrap_or(false) {
+                continue;
+            }
+            self.seen[a as usize] = true;
+            touched.push(a);
+            if let Reason::Generic { prop: Some(p), .. } = &self.atom_reason[a as usize] {
+                push(&mut props, *p);
+            }
+            // Resolve through the trail literal of `a` (the one recorded true).
+            let true_lit = if self.tval.get(a as usize).copied().unwrap_or(Tri::Unknown) == Tri::True {
+                Lit::positive(a)
+            } else {
+                Lit::negative(a)
+            };
+            for l in self.reason_lits(true_lit) {
+                stack.push(l.atom());
+            }
+        }
+        for a in touched {
+            self.seen[a as usize] = false;
+        }
+        props
+    }
+
+    /// Refute the root by propagation alone (no learning, no search) and, on a
+    /// root conflict, return the unsat core as a set of [`PropId`]s. `None` when
+    /// the root is propagation-consistent (the instance, if unsat, needs search
+    /// to refute — outside this single-pass extractor's scope).
+    pub(crate) fn root_core(&mut self) -> Option<Vec<PropId>> {
+        self.seed_facts();
+        self.solver.enqueue_all();
+        if self.stopped() {
+            return None;
+        }
+        match self.propagate() {
+            Ok(()) => None,
+            Err(conflict) => Some(self.analyze_core(&conflict)),
+        }
+    }
+
     /// Bump a variable's VSIDS activity, rescaling all if it overflows.
     fn bump_var(&mut self, var: VarId) {
         self.activity[var.index()] += self.var_inc;
@@ -1394,7 +1456,7 @@ impl<'s> Cdcl<'s> {
     fn conflict_lits(&self, conflict: &Conflict) -> Vec<Lit> {
         match conflict {
             Conflict::Clause(c) => self.clauses.get(*c).lits.to_vec(),
-            Conflict::Generic(ds) => ds.iter().map(|l| l.negate()).collect(),
+            Conflict::Generic { ds, .. } => ds.iter().map(|l| l.negate()).collect(),
         }
     }
 
@@ -1407,7 +1469,7 @@ impl<'s> Cdcl<'s> {
                 self.clauses.get(c).lits.iter().copied().filter(|&l| l != p).collect()
             }
             // Reason clause (p ∨ ⋁ ¬D_S); antecedents are ¬D_S.
-            Reason::Generic(ds) => ds.iter().map(|l| l.negate()).collect(),
+            Reason::Generic { lits, .. } => lits.iter().map(|l| l.negate()).collect(),
             // No antecedents (never resolved here).
             Reason::Decision | Reason::Fact | Reason::Unset => Vec::new(),
         }

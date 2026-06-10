@@ -34,11 +34,13 @@ pub struct RunOptions {
     pub lns: usize,
     /// Use CDCL learning for CSP find-one/UNSAT solving.
     pub learn_csp: bool,
+    /// On UNSAT, also extract and report a root-refutation unsat core.
+    pub core: bool,
 }
 
 impl Default for RunOptions {
     fn default() -> Self {
-        Self { seed: 0, workers: 1, fast_cop: false, split: false, probes: 0, lns: 0, learn_csp: false }
+        Self { seed: 0, workers: 1, fast_cop: false, split: false, probes: 0, lns: 0, learn_csp: false, core: false }
     }
 }
 
