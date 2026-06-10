@@ -21,11 +21,11 @@ fn main() {
         match arg.as_str() {
             "-v" | "--verbose" => opts.verbose = true,
             "-t" | "--time-limit" => {
-                let ms = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or_else(|| {
+                let sec = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or_else(|| {
                     eprintln!("error: --time-limit expects a value in seconds");
                     std::process::exit(1);
                 });
-                opts.time_limit = Some(Duration::from_secs(ms));
+                opts.time_limit = Some(Duration::from_secs(sec));
             }
             "-h" | "--help" => {
                 print_usage();
