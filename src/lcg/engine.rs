@@ -15,13 +15,12 @@ use crate::lcg::trail::{Cdcl, Reason};
 use crate::search::{Objective, SearchControl, SolveStats};
 use crate::store::Solver;
 
-fn mix64(mut x: u64) -> u64 {
-    x ^= x >> 30;
-    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^ (x >> 31)
-}
+/// One in every `REPHASE_PERIOD` restart segments rephases (ignores saved phases
+/// and dives with a fresh polarity). The other segments keep saved phases, so
+/// convergence is preserved and diversification stays a minority of the effort.
+const REPHASE_PERIOD: u64 = 4;
+
+use crate::mix64;
 
 fn strict_bound(incumbent: i64, minimizing: bool) -> Option<i64> {
     if minimizing {
@@ -35,7 +34,14 @@ impl Objective<'_> {
     fn value(self, solver: &Solver) -> i64 {
         match self {
             Self::Var(obj) => solver.store.value(obj) as i64,
-            Self::Linear { coeffs, vars } => coeffs.iter().zip(vars).map(|(&coeff, &var)| coeff * solver.store.value(var) as i64).sum(),
+            // Accumulate in i128 so large coeffs/many terms can't overflow, then
+            // clamp: a wrapped objective would post a wrong bound (lost optimum).
+            Self::Linear { coeffs, vars } => coeffs
+                .iter()
+                .zip(vars)
+                .map(|(&coeff, &var)| coeff as i128 * solver.store.value(var) as i128)
+                .sum::<i128>()
+                .clamp(i64::MIN as i128, i64::MAX as i128) as i64,
             Self::Expr(expr) => expr.eval(&|var| solver.store.value(var) as i64).expect("objective expression is undefined at a solution"),
         }
     }
@@ -43,18 +49,28 @@ impl Objective<'_> {
 
 struct ObjectiveImpact {
     coeffs: Vec<u64>,
+    signed: Vec<i64>,
 }
 
 impl ObjectiveImpact {
-    fn new(objective: Objective<'_>, nvars: usize) -> Option<Self> {
-        let Objective::Linear { coeffs, vars } = objective else {
-            return None;
-        };
+    fn new(objective: Objective<'_>, nvars: usize, minimizing: bool) -> Option<Self> {
         let mut impact = vec![0u64; nvars];
-        for (&coeff, &var) in coeffs.iter().zip(vars) {
-            impact[var.index()] = impact[var.index()].saturating_add(coeff.unsigned_abs());
+        let mut signed = vec![0i64; nvars];
+        match objective {
+            Objective::Var(var) => {
+                impact[var.index()] = 0;
+                signed[var.index()] = if minimizing { 1 } else { -1 };
+            }
+            Objective::Linear { coeffs, vars } => {
+                for (&coeff, &var) in coeffs.iter().zip(vars) {
+                    impact[var.index()] = impact[var.index()].saturating_add(coeff.unsigned_abs());
+                    let directed = if minimizing { coeff } else { coeff.saturating_neg() };
+                    signed[var.index()] = signed[var.index()].saturating_add(directed);
+                }
+            }
+            Objective::Expr(_) => return None,
         }
-        impact.iter().any(|&coeff| coeff > 0).then_some(Self { coeffs: impact })
+        (impact.iter().any(|&coeff| coeff > 0) || signed.iter().any(|&coeff| coeff != 0)).then_some(Self { coeffs: impact, signed })
     }
 
     fn score(&self, solver: &Solver, var: VarId) -> u128 {
@@ -65,6 +81,20 @@ impl ObjectiveImpact {
         let width = i64::from(solver.store.max(var)) - i64::from(solver.store.min(var));
         coeff.saturating_mul(width.max(0) as u128)
     }
+
+    fn preferred_value(&self, solver: &Solver, var: VarId) -> Option<i32> {
+        match self.signed[var.index()].cmp(&0) {
+            std::cmp::Ordering::Less => Some(solver.store.max(var)),
+            std::cmp::Ordering::Greater => Some(solver.store.min(var)),
+            std::cmp::Ordering::Equal => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchMode {
+    Proof,
+    FastCop,
 }
 
 impl Cdcl<'_> {
@@ -99,13 +129,16 @@ impl Cdcl<'_> {
         best_objective.or(best)
     }
 
-    /// The decision literal for `v`: `[v = p]` toward the saved phase `p` when
-    /// it is still in the domain, else a seed-dependent endpoint.
-    fn decision_lit(&self, v: VarId, phase: &[Option<i32>]) -> Lit {
+    /// The decision literal for `v`: `[v = p]` toward the saved phase `p` when it
+    /// is still in the domain (skipped on a rephasing segment), else a polarity
+    /// endpoint chosen by [`rephase_value`](Self::rephase_value).
+    fn decision_lit(&self, v: VarId, phase: &[Option<i32>], objective: Option<&ObjectiveImpact>, mode: SearchMode) -> Lit {
         let val = match phase[v.index()] {
-            Some(p) if self.solver.store.contains(v, p) => p,
-            _ if self.seed != 0 && mix64(self.seed ^ v.0 as u64) & 1 != 0 => self.solver.store.max(v),
-            _ => self.solver.store.min(v),
+            Some(p) if self.rephase_mode == 0 && self.solver.store.contains(v, p) => p,
+            _ if mode == SearchMode::FastCop => {
+                objective.and_then(|objective| objective.preferred_value(self.solver, v)).unwrap_or_else(|| self.rephase_value(v))
+            }
+            _ => self.rephase_value(v),
         };
         match self.atoms.eq(v, val) {
             LitOrConst::Lit(l) => l,
@@ -115,11 +148,35 @@ impl Cdcl<'_> {
         }
     }
 
+    /// The domain endpoint to branch to when no saved phase applies: the
+    /// seed-dependent endpoint by default, inverted on a rephasing segment.
+    fn rephase_value(&self, v: VarId) -> i32 {
+        let default_max = self.seed != 0 && mix64(self.seed ^ v.0 as u64) & 1 != 0;
+        let want_max = default_max ^ (self.rephase_mode != 0);
+        if want_max {
+            self.solver.store.max(v)
+        } else {
+            self.solver.store.min(v)
+        }
+    }
+
     /// Restart to the root when the restart policy fires. Learned clauses and
-    /// saved phases survive.
+    /// saved phases survive. Every `REPHASE_PERIOD` restarts the next segment
+    /// *rephases*: it ignores saved phases and dives with an inverted or random
+    /// polarity, escaping a region the saved phase keeps pulling search back to.
     fn maybe_restart(&mut self) -> bool {
         if self.should_restart() {
             self.backjump_to(0);
+            self.restarts_done += 1;
+            // Rephase only in a lone sequential search. Every `REPHASE_PERIOD`
+            // restarts the next segment inverts the default polarity (not random:
+            // an opposite dive diversifies the feasibility search without
+            // shredding structured objectives like LABS). Portfolio workers
+            // already diversify across workers, and per-worker rephasing
+            // *synchronizes* their polarity flips and hurts — so it is disabled
+            // whenever clause sharing (a portfolio) is active.
+            let lone = self.clause_sharing.is_none();
+            self.rephase_mode = u8::from(lone && self.restarts_done.is_multiple_of(REPHASE_PERIOD));
             self.maybe_reduce_db();
             return self.sync_shared_clauses();
         }
@@ -166,7 +223,7 @@ impl Cdcl<'_> {
                     }
                     Some(v) => {
                         stats.nodes += 1;
-                        let lit = self.decision_lit(v, &phase);
+                        let lit = self.decision_lit(v, &phase, None, SearchMode::Proof);
                         self.decide(lit).expect("in-domain decision cannot fail");
                     }
                 },
@@ -229,7 +286,7 @@ impl Cdcl<'_> {
         };
         self.backjump_to(0);
         self.set_bound_scope(bound);
-        self.assert_root(bound)
+        self.assert_root_lit(bound)
     }
 
     /// Assert a strict improvement on a materialized or symbolic objective.
@@ -258,15 +315,10 @@ impl Cdcl<'_> {
         }
     }
 
-    /// Assert a non-deletable root unit and propagate it.
-    fn assert_root(&mut self, lit: Lit) -> bool {
-        self.assert_root_lit(lit)
-    }
-
     /// Assert the root units defining one disjoint search cube.
     fn assume_cube(&mut self, cube: &[Lit]) -> bool {
         self.set_cube_scope(cube);
-        cube.iter().copied().all(|lit| self.assert_root(lit))
+        cube.iter().copied().all(|lit| self.assert_root_lit(lit))
     }
 
     /// Assert `obj <= target` when minimizing or `obj >= target` when maximizing.
@@ -288,7 +340,7 @@ impl Cdcl<'_> {
             }
         };
         self.set_bound_scope(bound);
-        self.assert_root(bound)
+        self.assert_root_lit(bound)
     }
 
     /// Pick one binary split for a cube, or `None` when it is already terminal.
@@ -297,7 +349,7 @@ impl Cdcl<'_> {
             return None;
         }
         let phase = vec![None; self.solver.store.num_vars()];
-        self.select_var(vars, None).map(|v| self.decision_lit(v, &phase))
+        self.select_var(vars, None).map(|v| self.decision_lit(v, &phase, None, SearchMode::Proof))
     }
 
     /// Find one solution under an optimistic objective bound.
@@ -334,7 +386,7 @@ impl Cdcl<'_> {
                 }
                 Some(v) => {
                     stats.nodes += 1;
-                    let lit = self.decision_lit(v, &phase);
+                    let lit = self.decision_lit(v, &phase, None, SearchMode::Proof);
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
                         break None;
@@ -387,6 +439,50 @@ impl Cdcl<'_> {
         conflict_budget: Option<u64>,
         mut on_improve: F,
     ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
+        self.optimize_with_mode(vars, objective, minimizing, stop, shared_bound, cube, conflict_budget, SearchMode::Proof, &mut on_improve)
+    }
+
+    /// Incumbent-oriented COP search. It uses the same sound branch-and-bound
+    /// driver as optimize, but objective variables prefer objective-improving
+    /// endpoint values when no saved phase is available.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn optimize_fast<F: FnMut(i64, &[i32])>(
+        &mut self,
+        vars: &[VarId],
+        objective: Objective<'_>,
+        minimizing: bool,
+        stop: &AtomicBool,
+        shared_bound: Option<&AtomicI64>,
+        cube: &[Lit],
+        conflict_budget: Option<u64>,
+        mut on_improve: F,
+    ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
+        self.optimize_with_mode(
+            vars,
+            objective,
+            minimizing,
+            stop,
+            shared_bound,
+            cube,
+            conflict_budget,
+            SearchMode::FastCop,
+            &mut on_improve,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn optimize_with_mode<F: FnMut(i64, &[i32])>(
+        &mut self,
+        vars: &[VarId],
+        objective: Objective<'_>,
+        minimizing: bool,
+        stop: &AtomicBool,
+        shared_bound: Option<&AtomicI64>,
+        cube: &[Lit],
+        conflict_budget: Option<u64>,
+        mode: SearchMode,
+        on_improve: &mut F,
+    ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
         if let Objective::Linear { coeffs, vars } = objective {
             assert_eq!(coeffs.len(), vars.len(), "linear objective: coeffs/terms length mismatch");
         }
@@ -408,7 +504,7 @@ impl Cdcl<'_> {
             return (best, stats, true);
         }
         let mut phase: Vec<Option<i32>> = vec![None; self.solver.store.num_vars()];
-        let objective_impact = ObjectiveImpact::new(objective, self.solver.store.num_vars());
+        let objective_impact = ObjectiveImpact::new(objective, self.solver.store.num_vars(), minimizing);
         let mut enforced = None;
         let mut complete = true;
         let conflict_limit = conflict_budget.map(|n| self.conflicts.saturating_add(n));
@@ -440,14 +536,18 @@ impl Cdcl<'_> {
             }
             match self.select_var(vars, objective_impact.as_ref()) {
                 None => {
-                    if !self.accept_solution(vars, objective, minimizing, &mut best, &mut enforced, &mut phase, &mut stats, &mut on_improve)
-                    {
+                    let keep_searching =
+                        self.accept_solution(vars, objective, minimizing, &mut best, &mut enforced, &mut phase, &mut stats, on_improve);
+                    if mode == SearchMode::FastCop && stats.solutions == 1 {
+                        self.use_default_restarts();
+                    }
+                    if !keep_searching {
                         break; // optimal
                     }
                 }
                 Some(v) => {
                     stats.nodes += 1;
-                    let lit = self.decision_lit(v, &phase);
+                    let lit = self.decision_lit(v, &phase, objective_impact.as_ref(), mode);
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
                         break; // tree exhausted under the bound: optimal
@@ -486,7 +586,7 @@ impl Cdcl<'_> {
                 }
                 Some(v) => {
                     stats.nodes += 1;
-                    let lit = self.decision_lit(v, &self.saved_phase);
+                    let lit = self.decision_lit(v, &self.saved_phase, None, SearchMode::Proof);
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
                         break None;

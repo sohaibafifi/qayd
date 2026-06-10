@@ -25,6 +25,7 @@ const ROOT_PROBE_MAX_CANDIDATES: usize = 32;
 const ROOT_PROBE_MAX_DOMAIN_SIZE: usize = 16;
 const ROOT_PROBE_MAX_BRANCH_LITS: usize = 512;
 const RESTART_BASE_CONFLICTS: u64 = 256;
+const FAST_RESTART_BASE_CONFLICTS: u64 = 64;
 const RESTART_LBD_WINDOW: usize = 128;
 const RESTART_LBD_RATIO: f64 = 1.5;
 const VIVIFY_MIN_LEN: usize = 3;
@@ -78,6 +79,7 @@ enum ProbeOutcome {
 }
 
 struct RestartPolicy {
+    base_conflicts: u64,
     due: bool,
     luby_index: u64,
     next_luby_conflict: u64,
@@ -91,10 +93,19 @@ struct RestartPolicy {
 
 impl RestartPolicy {
     fn new() -> Self {
+        Self::with_base(RESTART_BASE_CONFLICTS)
+    }
+
+    fn fast() -> Self {
+        Self::with_base(FAST_RESTART_BASE_CONFLICTS)
+    }
+
+    fn with_base(base_conflicts: u64) -> Self {
         Self {
+            base_conflicts,
             due: false,
             luby_index: 1,
-            next_luby_conflict: RESTART_BASE_CONFLICTS,
+            next_luby_conflict: base_conflicts,
             lbd_window: [0; RESTART_LBD_WINDOW],
             lbd_window_len: 0,
             lbd_window_pos: 0,
@@ -126,7 +137,7 @@ impl RestartPolicy {
         }
         self.due = false;
         self.luby_index += 1;
-        self.next_luby_conflict = conflicts.saturating_add(RESTART_BASE_CONFLICTS.saturating_mul(luby(self.luby_index)));
+        self.next_luby_conflict = conflicts.saturating_add(self.base_conflicts.saturating_mul(luby(self.luby_index)));
         self.clear_lbd_window();
         true
     }
@@ -307,7 +318,7 @@ pub struct Cdcl<'s> {
     /// Restart schedule and LBD moving-average trigger.
     restart: RestartPolicy,
     /// Optional portfolio clause exchange.
-    clause_sharing: Option<ClauseSharing>,
+    pub(crate) clause_sharing: Option<ClauseSharing>,
     /// Reused buffer for newly published clauses.
     shared_scratch: Vec<SharedClause>,
     /// Negated job assumptions prepended to exported learned clauses.
@@ -316,6 +327,12 @@ pub struct Cdcl<'s> {
     bound_scope: Option<Lit>,
     /// Last value recorded when a variable is unassigned by backjumping.
     pub(crate) saved_phase: Vec<Option<i32>>,
+    /// Restarts performed so far; drives periodic rephasing.
+    pub(crate) restarts_done: u64,
+    /// Phase policy for the current restart segment: 0 = saved phase (default),
+    /// 1 = inverted default, 2 = pseudo-random. Non-zero only on periodic
+    /// rephasing segments, which diversify like a portfolio without a portfolio.
+    pub(crate) rephase_mode: u8,
 }
 
 impl<'s> Cdcl<'s> {
@@ -373,6 +390,8 @@ impl<'s> Cdcl<'s> {
             cube_scope: Vec::new(),
             bound_scope: None,
             saved_phase: vec![None; nvars],
+            restarts_done: 0,
+            rephase_mode: 0,
         }
     }
 
@@ -389,6 +408,16 @@ impl<'s> Cdcl<'s> {
     /// Enable learned-clause exchange for one portfolio worker.
     pub(crate) fn set_clause_sharing(&mut self, sharing: ClauseSharing) {
         self.clause_sharing = Some(sharing);
+    }
+
+    /// Use a shorter restart schedule for incumbent-oriented fast COP search.
+    pub(crate) fn use_fast_restarts(&mut self) {
+        self.restart = RestartPolicy::fast();
+    }
+
+    /// Restore the default proof-oriented restart schedule.
+    pub(crate) fn use_default_restarts(&mut self) {
+        self.restart = RestartPolicy::new();
     }
 
     /// Scope exported clauses to the current search cube.
@@ -1247,10 +1276,11 @@ impl<'s> Cdcl<'s> {
     /// conflict (a falsified blocking clause after enumerating a solution).
     pub(crate) fn resolve_conflict(&mut self, conflict: Conflict) -> bool {
         self.conflicts += 1;
-        let Some((mut learnt, _)) = self.analyze(conflict) else {
+        let Some(mut learnt) = self.analyze(conflict) else {
             return false;
         };
         self.vivify_learned(&mut learnt);
+        // Backjump level recomputed here: vivification may have shortened the clause.
         let btlevel = learnt[1..].iter().map(|l| self.level_of(l.atom()) as usize).max().unwrap_or(0);
         self.learned_lits += learnt.len() as u64;
         // LBD measured at learn time, while every literal is still assigned.
@@ -1280,9 +1310,9 @@ impl<'s> Cdcl<'s> {
         }
     }
 
-    /// First-UIP conflict analysis. Returns the learned clause (asserting literal
-    /// first) and the backjump level (second-highest in the clause, 0 if unit).
-    fn analyze(&mut self, conflict: Conflict) -> Option<(Vec<Lit>, usize)> {
+    /// First-UIP conflict analysis. Returns the learned clause, asserting literal
+    /// first. The caller derives the backjump level after vivification.
+    fn analyze(&mut self, conflict: Conflict) -> Option<Vec<Lit>> {
         let mut clause_lits = self.conflict_lits(&conflict);
         // Analyse at the conflict's deepest level (a propagator may fail on
         // literals all below the current level). All at level 0 means UNSAT.
@@ -1329,12 +1359,11 @@ impl<'s> Cdcl<'s> {
         }
 
         learnt[0] = uip.negate(); // asserting literal
-        let btlevel = learnt[1..].iter().map(|l| self.level_of(l.atom()) as usize).max().unwrap_or(0);
         for a in touched {
             self.seen[a as usize] = false;
         }
         self.decay_activity();
-        Some((learnt, btlevel))
+        Some(learnt)
     }
 
     /// Bump a variable's VSIDS activity, rescaling all if it overflows.
@@ -1359,38 +1388,6 @@ impl<'s> Cdcl<'s> {
         self.seed_facts();
         self.solver.enqueue_all();
         self.propagate_and_learn()
-    }
-
-    /// Decision literal `[x = min(x)]` for the first unfixed var in `vars`, or
-    /// `None` if all fixed. (Simple heuristic; the real driver uses dom/wdeg.)
-    fn pick_decision(&self, vars: &[VarId]) -> Option<Lit> {
-        for &v in vars {
-            if !self.solver.store.is_fixed(v) {
-                let val = self.solver.store.min(v);
-                if let LitOrConst::Lit(l) = self.atoms.eq(v, val) {
-                    return Some(l);
-                }
-            }
-        }
-        None
-    }
-
-    /// One solution over `vars` by CDCL, or `None` if UNSAT. Assumes
-    /// [`init`](Self::init) succeeded.
-    pub fn solve_first(&mut self, vars: &[VarId]) -> Option<Vec<i32>> {
-        loop {
-            match self.pick_decision(vars) {
-                None => {
-                    return Some(vars.iter().map(|&v| self.solver.store.value(v)).collect());
-                }
-                Some(lit) => {
-                    self.decide(lit).expect("in-domain decision cannot fail");
-                    if !self.propagate_and_learn() {
-                        return None;
-                    }
-                }
-            }
-        }
     }
 
     /// Literals of the initial conflict clause (all currently false).

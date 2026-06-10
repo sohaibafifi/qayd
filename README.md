@@ -40,10 +40,17 @@ Priorities, in order: **correct, then simple, then fast.**
   watched clauses, [LBD](https://www.ijcai.org/Proceedings/09/Papers/074.pdf)
   reduction, [dom/wdeg](https://dl.acm.org/doi/10.5555/3000001.3000033),
   [VSIDS](https://doi.org/10.1145/378239.379017), phase saving, and restarts.
-  Sparse domains allocate atoms by support; wide domains allocate shared atoms
-  on demand. Short learned clauses are strengthened by budgeted CP-aware
-  vivification through the global propagators.
-- **COP and parallel search.** Branch-and-bound keeps wide linear and expression
+  A lone sequential search periodically *rephases* — every few restarts it
+  ignores saved phases and dives with the inverted polarity — to escape regions
+  the saved phase keeps pulling it back to (this finds first solutions on
+  feasibility-hard COP instances that otherwise time out). Sparse domains
+  allocate atoms by support; wide domains allocate shared atoms on demand. Short
+  learned clauses are strengthened by budgeted CP-aware vivification through the
+  global propagators.
+- **Parallel search.** CSP find-one/UNSAT runs a portfolio of CDCL workers that
+  differ by seed and restart cadence and cross-pollinate short low-LBD learned
+  clauses; the first to find a solution or prove unsatisfiability wins. COP
+  branch-and-bound keeps wide linear and expression
   objectives symbolic. Opt-in portfolio workers share incumbents; workers with
   materialized objectives also share short low-LBD clauses. `--split` enables
   proof-job stealing inspired by [Buffered Work
@@ -51,6 +58,10 @@ Priorities, in order: **correct, then simple, then fast.**
   dedicates materialized-objective workers to optimistic probes. `--lns`
   dedicates workers to bounded incumbent-driven [Large Neighborhood
   Search](https://doi.org/10.1007/978-3-319-91086-4_4).
+- **Fast COP mode.** `--fast-cop` is an incumbent-only mode for the Fast COP style of use: 
+it searches for feasible solutions and objective improvements, without trying to prove optimality. 
+It uses local scoring for common constraints, constructive starts for guarded table/element patterns, 
+and  focused repair for simple Boolean exact-cover rows.
 - **A beta support for MiniZinc.** The `qayd-fzn` driver speaks the MiniZinc solver protocol, 
 so it can be used as a backend for the MiniZinc CLI and IDE. The `--mzn` flag enables some 
 MiniZinc-specific behaviour. (see [for details](frontends/flatzinc/minizinc/README.md)).
@@ -65,18 +76,19 @@ cargo test
 ## Solve an instance
 
 ```bash
-qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--split] [--probe N] [--lns N] [--learn-csp] <instance.xml[.lzma|.xz]>
+qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--fast-cop] [--split] [--probe N] [--lns N] [--learn-csp] <instance.xml[.lzma|.xz]>
 ```
 
 - `-h`, `--help` prints the usage.
 - `-v`, `--verbose` emits `c` comment lines (model size, search stats, wall time, incumbent source).
 - `-t SECONDS`, `--time SECONDS` stops after a time budget, reporting the best solution so far.
 - `--seed SEED` sets the reproducible search seed. It defaults to `RANDOMSEED`, then `0`.
-- `-p THREADS`, `--threads THREADS` sets the COP portfolio worker count. It defaults to `NBCORE`, then `1`.
+- `-p THREADS`, `--threads THREADS` sets the portfolio worker count (CSP and COP). It defaults to `NBCORE`, then `1`.
+- `--fast-cop` searches for good COP incumbents only. It does not prove optimality and defaults to a 240 second limit when `-t` is omitted.
 - `--split` divides COP proof search into disjoint jobs for worker stealing.
 - `--probe N` dedicates up to `N` COP workers to optimistic objective probes.
 - `--lns N` dedicates up to `N` COP workers to bounded Large Neighborhood Search.
-- `--learn-csp` uses CDCL learning and restarts for CSP find-one/UNSAT solving.
+- `--learn-csp` is accepted for compatibility but has no effect: CSP find-one/UNSAT always uses CDCL learning and restarts.
 
 ## As a library
 

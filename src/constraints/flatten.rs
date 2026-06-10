@@ -60,6 +60,21 @@ pub(crate) fn post_channel_onehot_index(solver: &mut Solver, xs: &[VarId], value
 }
 
 pub(crate) fn post_bin_loads(solver: &mut Solver, items: &[VarId], sizes: &[i64], loads: &[VarId]) {
+    assert!(loads.len() <= i32::MAX as usize, "binPacking: too many bins");
+    if loads.is_empty() {
+        if !items.is_empty() {
+            // No declared bin can host a non-empty item list.
+            linear(solver, &[], &[], Relation::Eq, 1);
+        }
+        return;
+    }
+
+    let last_bin = loads.len() as i64 - 1;
+    for &item in items {
+        linear(solver, &[1], &[item], Relation::Ge, 0);
+        linear(solver, &[1], &[item], Relation::Le, last_bin);
+    }
+
     for (bin, &load) in loads.iter().enumerate() {
         let mut coeffs = Vec::with_capacity(items.len() + 1);
         let mut vars = Vec::with_capacity(items.len() + 1);

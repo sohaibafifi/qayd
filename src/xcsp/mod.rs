@@ -7,14 +7,16 @@ use std::fmt::Display;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::time::Instant;
 
 use xcsp3_rust_parser::xcsp_runner::XcspRunner;
 
 use crate::ids::VarId;
-use crate::parallel::{normalize_options, solve_cop, worker_roles, ParallelOutcome};
+use crate::ls::{solve_fast_cop, LocalSearchOutcome, LocalSearchSpec};
+use crate::parallel::{normalize_options, solve_cop, solve_csp, worker_roles, CspOutcome, ParallelOutcome};
 use crate::problem::{Objective, Problem};
-use crate::search::{decide_sat_seeded, optimize_seeded, solve_interruptible_seeded, SearchControl, SolveStats};
+use crate::search::{decide_sat_seeded, optimize_fast_seeded, optimize_seeded, SolveStats};
 
 pub use crate::parallel::RunOptions;
 
@@ -47,9 +49,39 @@ fn write_tokens<W: Write>(w: &mut W, tokens: impl IntoIterator<Item = impl Displ
     Ok(())
 }
 
-fn write_improvement<W: Write>(w: &mut W, verbose: bool, error: &mut Option<std::io::Error>, value: impl Display) {
+fn io_err(e: std::io::Error) -> String {
+    e.to_string()
+}
+
+/// Write a result's tail: the optional `o {value}` line (non-verbose runs with a
+/// known objective), the status line, and the instantiation. `sat`/`none` are
+/// the status lines for the solved / unsolved cases; `value` is `None` for CSP.
+fn write_solution_tail<W: Write>(
+    w: &mut W,
+    output: &SolutionOutput,
+    best: Option<(Vec<i32>, Option<impl Display>)>,
+    sat: &str,
+    none: &str,
+    verbose: bool,
+) -> Result<(), String> {
+    match best {
+        Some((solution, value)) => {
+            if !verbose {
+                if let Some(value) = value {
+                    writeln!(w, "o {value}").map_err(io_err)?;
+                }
+            }
+            writeln!(w, "{sat}").map_err(io_err)?;
+            output.write(w, &solution).map_err(io_err)?;
+        }
+        None => writeln!(w, "{none}").map_err(io_err)?,
+    }
+    Ok(())
+}
+
+fn write_improvement_from<W: Write>(w: &mut W, verbose: bool, error: &mut Option<std::io::Error>, value: impl Display, source: &str) {
     if verbose && error.is_none() {
-        *error = writeln!(w, "o {value}").and_then(|_| writeln!(w, "c incumbent {value} source sequential")).and_then(|_| w.flush()).err();
+        *error = writeln!(w, "o {value}").and_then(|_| writeln!(w, "c incumbent {value} source {source}")).and_then(|_| w.flush()).err();
     }
 }
 
@@ -62,23 +94,13 @@ fn write_optimization_result<W: Write>(
     interrupted: bool,
     verbose: bool,
 ) -> Result<(), String> {
-    let to_err = |e: std::io::Error| e.to_string();
     if verbose {
-        writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(to_err)?;
-        write_inprocessing_stats(w, stats).map_err(to_err)?;
+        writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(io_err)?;
+        write_inprocessing_stats(w, stats).map_err(io_err)?;
     }
-    match best {
-        Some((solution, value)) => {
-            if !verbose {
-                writeln!(w, "o {value}").map_err(to_err)?;
-            }
-            writeln!(w, "{}", if complete { "s OPTIMUM FOUND" } else { "s SATISFIABLE" }).map_err(to_err)?;
-            output.write(w, &solution).map_err(to_err)?;
-        }
-        None if interrupted => writeln!(w, "s UNKNOWN").map_err(to_err)?,
-        None => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
-    }
-    Ok(())
+    let sat = if complete { "s OPTIMUM FOUND" } else { "s SATISFIABLE" };
+    let none = if interrupted { "s UNKNOWN" } else { "s UNSATISFIABLE" };
+    write_solution_tail(w, output, best.map(|(s, v)| (s, Some(v))), sat, none, verbose)
 }
 
 fn write_inprocessing_stats<W: Write>(w: &mut W, stats: SolveStats) -> std::io::Result<()> {
@@ -150,6 +172,7 @@ impl SolutionOutput {
 
 struct XcspProblem {
     problem: Problem,
+    local: LocalSearchSpec,
     output: SolutionOutput,
 }
 
@@ -194,7 +217,7 @@ fn parse_problem(path: &Path) -> Result<XcspProblem, String> {
         .unzip();
     let output = SolutionOutput { names, entries };
     let problem = Problem { solver: model.solver, search, objective: model.objective };
-    Ok(XcspProblem { problem, output })
+    Ok(XcspProblem { problem, local: model.local, output })
 }
 
 /// Parse, build, and solve an XCSP3 instance, returning competition-style
@@ -220,162 +243,277 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
     let mut xcsp = parse_problem(&path.0)?;
     let has_objective = xcsp.problem.objective.is_some();
     let var_objective = xcsp.problem.var_objective().is_some();
+    if options.fast_cop && !has_objective {
+        return Err("--fast-cop requires a COP instance".to_string());
+    }
     let symbolic_probes_disabled = has_objective && !var_objective && options.probes > 0;
     let options = normalize_options(has_objective, var_objective, options);
     let old_search = xcsp.problem.search.clone();
     let presolve = xcsp.problem.presolve(stop);
     xcsp.output.remap_after_presolve(&old_search, &xcsp.problem);
-    let to_err = |e: std::io::Error| e.to_string();
 
     if verbose {
         let kind = if xcsp.problem.objective.is_some() { "COP" } else { "CSP" };
-        writeln!(w, "c qayd XCSP3").map_err(to_err)?;
-        writeln!(w, "c type {kind}").map_err(to_err)?;
-        writeln!(w, "c variables {}", xcsp.problem.solver.store.num_vars()).map_err(to_err)?;
-        writeln!(w, "c sparse domains {}", xcsp.problem.solver.store.num_sparse_domains()).map_err(to_err)?;
-        writeln!(w, "c bounds domains {}", xcsp.problem.solver.store.num_bounds_domains()).map_err(to_err)?;
-        writeln!(w, "c search variables {}", xcsp.problem.search.len()).map_err(to_err)?;
-        writeln!(w, "c propagators {}", xcsp.problem.solver.num_propagators()).map_err(to_err)?;
-        writeln!(w, "c seed {}", options.seed).map_err(to_err)?;
-        writeln!(w, "c workers {} ({})", options.workers, worker_roles(has_objective, options)).map_err(to_err)?;
-        if !has_objective && options.learn_csp {
-            writeln!(w, "c csp learning true").map_err(to_err)?;
+        writeln!(w, "c qayd XCSP3").map_err(io_err)?;
+        writeln!(w, "c type {kind}").map_err(io_err)?;
+        if options.fast_cop {
+            writeln!(w, "c mode fast-cop").map_err(io_err)?;
+            writeln!(w, "c effort incumbent").map_err(io_err)?;
         }
-        writeln!(w, "c split {}", options.split).map_err(to_err)?;
+        writeln!(w, "c variables {}", xcsp.problem.solver.store.num_vars()).map_err(io_err)?;
+        writeln!(w, "c sparse domains {}", xcsp.problem.solver.store.num_sparse_domains()).map_err(io_err)?;
+        writeln!(w, "c bounds domains {}", xcsp.problem.solver.store.num_bounds_domains()).map_err(io_err)?;
+        writeln!(w, "c search variables {}", xcsp.problem.search.len()).map_err(io_err)?;
+        writeln!(w, "c propagators {}", xcsp.problem.solver.num_propagators()).map_err(io_err)?;
+        writeln!(w, "c seed {}", options.seed).map_err(io_err)?;
+        writeln!(w, "c workers {} ({})", options.workers, worker_roles(has_objective, options)).map_err(io_err)?;
+        if !has_objective {
+            writeln!(w, "c csp learning true").map_err(io_err)?;
+        }
+        writeln!(w, "c split {}", options.split).map_err(io_err)?;
         if presolve.failed {
-            writeln!(w, "c presolve failed").map_err(to_err)?;
+            writeln!(w, "c presolve failed").map_err(io_err)?;
         } else if presolve.stopped {
-            writeln!(w, "c presolve stopped").map_err(to_err)?;
+            writeln!(w, "c presolve stopped").map_err(io_err)?;
         } else if presolve.search_before != presolve.search_after || presolve.fixed > 0 {
             writeln!(w, "c presolve reduced search {} -> {} fixed {}", presolve.search_before, presolve.search_after, presolve.fixed)
-                .map_err(to_err)?;
+                .map_err(io_err)?;
         }
         if symbolic_probes_disabled {
-            writeln!(w, "c probes disabled (probe worker only supports a materialized objective variable)").map_err(to_err)?;
+            writeln!(w, "c probes disabled (probe worker only supports a materialized objective variable)").map_err(io_err)?;
         }
     }
 
     if presolve.failed || presolve.stopped {
         if verbose {
-            writeln!(w, "c nodes 0 failures {}", usize::from(presolve.failed)).map_err(to_err)?;
+            writeln!(w, "c nodes 0 failures {}", usize::from(presolve.failed)).map_err(io_err)?;
         }
-        writeln!(w, "{}", if presolve.failed { "s UNSATISFIABLE" } else { "s UNKNOWN" }).map_err(to_err)?;
+        writeln!(w, "{}", if presolve.failed { "s UNSATISFIABLE" } else { "s UNKNOWN" }).map_err(io_err)?;
         if verbose {
             if stop.load(Ordering::Relaxed) {
-                writeln!(w, "c interrupted").map_err(to_err)?;
+                writeln!(w, "c interrupted").map_err(io_err)?;
             }
-            writeln!(w, "c time {:.3}s", start.elapsed().as_secs_f64()).map_err(to_err)?;
+            writeln!(w, "c time {:.3}s", start.elapsed().as_secs_f64()).map_err(io_err)?;
         }
-        w.flush().map_err(to_err)?;
+        w.flush().map_err(io_err)?;
         return Ok(());
     }
 
-    if options.workers == 1 || !has_objective {
-        solve_single(xcsp, verbose, stop, w, options.seed, options.learn_csp)?;
+    if options.fast_cop && options.workers > 1 {
+        let XcspProblem { problem, local, output } = xcsp;
+        let result = solve_fast_cop_parallel(problem, local, verbose, stop, w, options)?;
+        write_fast_cop_result(w, &output, result, verbose)?;
+    } else if options.workers == 1 {
+        solve_single(xcsp, verbose, stop, w, options)?;
+    } else if !has_objective {
+        let XcspProblem { problem, output, .. } = xcsp;
+        let result = solve_csp(problem, stop, options);
+        write_csp_result(w, &output, result, verbose)?;
     } else {
-        let XcspProblem { problem, output } = xcsp;
-        let result = solve_cop(problem, verbose, stop, w, options)?;
+        let XcspProblem { problem, local, output } = xcsp;
+        let result = solve_cop(problem, local, verbose, stop, w, options)?;
         write_parallel_result(w, &output, result, verbose)?;
     }
 
     if verbose {
         if stop.load(Ordering::Relaxed) {
-            writeln!(w, "c interrupted").map_err(to_err)?;
+            writeln!(w, "c interrupted").map_err(io_err)?;
         }
-        writeln!(w, "c time {:.3}s", start.elapsed().as_secs_f64()).map_err(to_err)?;
+        writeln!(w, "c time {:.3}s", start.elapsed().as_secs_f64()).map_err(io_err)?;
     }
-    w.flush().map_err(to_err)?;
+    w.flush().map_err(io_err)?;
     Ok(())
 }
 
-fn solve_single<W: Write>(
-    xcsp: XcspProblem,
+enum FastCopMsg {
+    Improved { value: i64, source: &'static str, worker: usize },
+    Done(LocalSearchOutcome),
+}
+
+fn solve_fast_cop_parallel<W: Write>(
+    problem: Problem,
+    local: LocalSearchSpec,
     verbose: bool,
     stop: &AtomicBool,
     w: &mut W,
-    seed: u64,
-    learn_csp: bool,
-) -> Result<(), String> {
-    let XcspProblem { problem, output } = xcsp;
+    options: RunOptions,
+) -> Result<LocalSearchOutcome, String> {
+    let minimizing = problem.objective.as_ref().is_none_or(Objective::minimizing);
+    let (tx, rx) = mpsc::channel();
+    let mut printed = None;
+    let mut summary = None;
+    let mut error = None;
+
+    std::thread::scope(|scope| {
+        for worker in 0..options.workers {
+            let tx = tx.clone();
+            let problem = problem.clone();
+            let local = local.clone();
+            scope.spawn(move || {
+                let seed = options.seed.wrapping_add(worker as u64);
+                let result = solve_fast_cop(problem, local, stop, seed, |value, _, source| {
+                    let _ = tx.send(FastCopMsg::Improved { value, source, worker });
+                });
+                let _ = tx.send(FastCopMsg::Done(result));
+            });
+        }
+        drop(tx);
+
+        for msg in rx {
+            match msg {
+                FastCopMsg::Improved { value, source, worker, .. }
+                    if printed.is_none_or(|old| if minimizing { value < old } else { value > old }) =>
+                {
+                    printed = Some(value);
+                    if verbose && error.is_none() {
+                        if let Err(e) = writeln!(w, "o {value}")
+                            .and_then(|_| writeln!(w, "c incumbent {value} source {source} worker {worker}"))
+                            .and_then(|_| w.flush())
+                        {
+                            error = Some(e.to_string());
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+                FastCopMsg::Improved { .. } => {}
+                FastCopMsg::Done(result) => merge_fast_cop_result(&mut summary, result, minimizing),
+            }
+        }
+    });
+
+    if let Some(e) = error {
+        return Err(e);
+    }
+    Ok(summary.unwrap_or(LocalSearchOutcome {
+        best: None,
+        iterations: 0,
+        moves: 0,
+        restarts: 0,
+        constraints: 0,
+        functionals: 0,
+        unsupported: 1,
+    }))
+}
+
+fn merge_fast_cop_result(summary: &mut Option<LocalSearchOutcome>, mut result: LocalSearchOutcome, minimizing: bool) {
+    let Some(current) = summary else {
+        *summary = Some(result);
+        return;
+    };
+    current.iterations += result.iterations;
+    current.moves += result.moves;
+    current.restarts += result.restarts;
+    current.constraints = current.constraints.max(result.constraints);
+    current.functionals = current.functionals.max(result.functionals);
+    current.unsupported = current.unsupported.max(result.unsupported);
+    if let Some((solution, value)) = result.best.take() {
+        if current.best.as_ref().is_none_or(|(_, old)| if minimizing { value < *old } else { value > *old }) {
+            current.best = Some((solution, value));
+        }
+    }
+}
+
+fn write_fast_cop_result<W: Write>(w: &mut W, output: &SolutionOutput, result: LocalSearchOutcome, verbose: bool) -> Result<(), String> {
+    if verbose {
+        writeln!(w, "c local constraints {} functionals {}", result.constraints, result.functionals).map_err(io_err)?;
+        if result.unsupported > 0 {
+            writeln!(w, "c local unsupported {}", result.unsupported).map_err(io_err)?;
+        }
+        if result.iterations > 0 {
+            writeln!(w, "c local iterations {} moves {} restarts {}", result.iterations, result.moves, result.restarts).map_err(io_err)?;
+        }
+    }
+    write_solution_tail(w, output, result.best.map(|(s, v)| (s, Some(v))), "s SATISFIABLE", "s UNKNOWN", verbose)
+}
+
+fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w: &mut W, options: RunOptions) -> Result<(), String> {
+    let XcspProblem { problem, output, .. } = xcsp;
     let mut solver = problem.solver;
     let vars = problem.search;
-    let to_err = |e: std::io::Error| e.to_string();
 
     match problem.objective {
         None => {
-            let (sol, stats, complete) = if learn_csp {
-                decide_sat_seeded(&mut solver, &vars, stop, seed)
-            } else {
-                let mut found = None;
-                let stats = solve_interruptible_seeded(
-                    &mut solver,
-                    &vars,
-                    |s| {
-                        found = Some(vars.iter().map(|&v| s.store.value(v)).collect::<Vec<_>>());
-                        SearchControl::Stop
-                    },
-                    stop,
-                    seed,
-                );
-                (found, stats, !stop.load(Ordering::Relaxed))
-            };
+            // Find-one CSP always learns: CDCL with restarts and root probing
+            // dominates plain chronological DFS, and never enumerates, so the
+            // soundness caveat on learned blocking clauses does not apply here.
+            // (Enumeration/counting uses the separate non-learning `enumerate`.)
+            let (sol, stats, complete) = decide_sat_seeded(&mut solver, &vars, stop, options.seed);
             if verbose {
-                writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(to_err)?;
-                write_inprocessing_stats(w, stats).map_err(to_err)?;
+                writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(io_err)?;
+                write_inprocessing_stats(w, stats).map_err(io_err)?;
             }
             match sol {
                 Some(s) => {
-                    writeln!(w, "s SATISFIABLE").map_err(to_err)?;
-                    output.write(w, &s).map_err(to_err)?;
+                    writeln!(w, "s SATISFIABLE").map_err(io_err)?;
+                    output.write(w, &s).map_err(io_err)?;
                 }
-                None if !complete => writeln!(w, "s UNKNOWN").map_err(to_err)?,
-                None => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
+                None if !complete => writeln!(w, "s UNKNOWN").map_err(io_err)?,
+                None => writeln!(w, "s UNSATISFIABLE").map_err(io_err)?,
             }
             Ok(())
         }
         Some(objective) => {
             let minimizing = objective.minimizing();
             let mut io_err: Option<std::io::Error> = None;
-            let (best, stats, complete) =
-                optimize_seeded(&mut solver, &vars, objective.search(), minimizing, stop, seed, None, None, &[], None, |v, _| {
-                    write_improvement(w, verbose, &mut io_err, v)
-                });
+            let source = if options.fast_cop { "cp" } else { "sequential" };
+            let (best, stats, complete) = if options.fast_cop {
+                optimize_fast_seeded(
+                    &mut solver,
+                    &vars,
+                    objective.search(),
+                    minimizing,
+                    stop,
+                    options.seed,
+                    None,
+                    None,
+                    &[],
+                    None,
+                    |v, _| write_improvement_from(w, verbose, &mut io_err, v, source),
+                )
+            } else {
+                optimize_seeded(&mut solver, &vars, objective.search(), minimizing, stop, options.seed, None, None, &[], None, |v, _| {
+                    write_improvement_from(w, verbose, &mut io_err, v, source)
+                })
+            };
             if let Some(e) = io_err {
                 return Err(e.to_string());
             }
             let interrupted = stop.load(Ordering::Relaxed);
-            write_optimization_result(w, &output, best, stats, complete, interrupted, verbose)
+            write_optimization_result(w, &output, best, stats, complete && !options.fast_cop, interrupted, verbose)
         }
     }
 }
 
 fn write_parallel_result<W: Write>(w: &mut W, output: &SolutionOutput, result: ParallelOutcome, verbose: bool) -> Result<(), String> {
-    let to_err = |e: std::io::Error| e.to_string();
     if verbose {
-        writeln!(w, "c nodes {} failures {}", result.stats.nodes, result.stats.failures).map_err(to_err)?;
-        write_inprocessing_stats(w, result.stats).map_err(to_err)?;
-        writeln!(w, "c shared clauses {} imported {}", result.shared_clauses, result.imported_clauses).map_err(to_err)?;
+        writeln!(w, "c nodes {} failures {}", result.stats.nodes, result.stats.failures).map_err(io_err)?;
+        write_inprocessing_stats(w, result.stats).map_err(io_err)?;
+        if result.shared_clauses > 0 || result.imported_clauses > 0 {
+            writeln!(w, "c shared clauses {} imported {}", result.shared_clauses, result.imported_clauses).map_err(io_err)?;
+        }
         if let Some((split, completed)) = result.split_jobs {
-            writeln!(w, "c split jobs {split} completed {completed}").map_err(to_err)?;
+            writeln!(w, "c split jobs {split} completed {completed}").map_err(io_err)?;
         }
         if let Some((attempts, unsat)) = result.probe_stats {
-            writeln!(w, "c probes attempts {attempts} unsat {unsat}").map_err(to_err)?;
+            writeln!(w, "c probes attempts {attempts} unsat {unsat}").map_err(io_err)?;
         }
         if let Some((attempts, improved)) = result.lns_stats {
-            writeln!(w, "c lns attempts {attempts} improved {improved}").map_err(to_err)?;
+            writeln!(w, "c lns attempts {attempts} improved {improved}").map_err(io_err)?;
         }
     }
-    match result.best {
-        Some((solution, value)) => {
-            if !verbose {
-                writeln!(w, "o {value}").map_err(to_err)?;
-            }
-            writeln!(w, "{}", if result.proved { "s OPTIMUM FOUND" } else { "s SATISFIABLE" }).map_err(to_err)?;
-            output.write(w, &solution).map_err(to_err)?;
+    let sat = if result.proved { "s OPTIMUM FOUND" } else { "s SATISFIABLE" };
+    let none = if result.proved && !result.interrupted { "s UNSATISFIABLE" } else { "s UNKNOWN" };
+    write_solution_tail(w, output, result.best.map(|(s, v)| (s, Some(v))), sat, none, verbose)
+}
+
+fn write_csp_result<W: Write>(w: &mut W, output: &SolutionOutput, result: CspOutcome, verbose: bool) -> Result<(), String> {
+    if verbose {
+        writeln!(w, "c nodes {} failures {}", result.stats.nodes, result.stats.failures).map_err(io_err)?;
+        write_inprocessing_stats(w, result.stats).map_err(io_err)?;
+        if result.shared_clauses > 0 || result.imported_clauses > 0 {
+            writeln!(w, "c shared clauses {} imported {}", result.shared_clauses, result.imported_clauses).map_err(io_err)?;
         }
-        None if result.interrupted => writeln!(w, "s UNKNOWN").map_err(to_err)?,
-        None if result.proved => writeln!(w, "s UNSATISFIABLE").map_err(to_err)?,
-        None => writeln!(w, "s UNKNOWN").map_err(to_err)?,
     }
-    Ok(())
+    let none = if result.decided { "s UNSATISFIABLE" } else { "s UNKNOWN" };
+    write_solution_tail(w, output, result.solution.map(|s| (s, None::<i32>)), "s SATISFIABLE", none, verbose)
 }

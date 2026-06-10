@@ -15,6 +15,24 @@ fn ceil_div_pos(a: i64, b: i64) -> i64 {
     (a + b - 1) / b
 }
 
+/// Run `$body` to a local fixpoint. `$measure` is a progress quantity that only
+/// shrinks as domains shrink (typically summed domain size); the loop repeats
+/// until a pass leaves it unchanged, then falls through. A propagator's own
+/// filtering does not re-enqueue it, so without this a single pass can miss
+/// inferences unlocked by an earlier removal in the same call. `$body` may
+/// `?`/`return Err` to report a wipeout.
+macro_rules! local_fixpoint {
+    ($measure:expr, $body:block) => {
+        loop {
+            let before = $measure;
+            $body
+            if $measure == before {
+                break;
+            }
+        }
+    };
+}
+
 // ===========================================================================
 // noOverlap (disjunctive, pairwise)
 // ===========================================================================
@@ -35,8 +53,7 @@ impl Propagator for NoOverlap {
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
         let n = self.starts.len();
-        loop {
-            let before: usize = self.starts.iter().map(|&s| store.size(s)).sum();
+        local_fixpoint!(self.starts.iter().map(|&s| store.size(s)).sum::<usize>(), {
             for i in 0..n {
                 for j in (i + 1)..n {
                     let (di, dj) = (self.durations[i], self.durations[j]);
@@ -64,11 +81,8 @@ impl Propagator for NoOverlap {
                     }
                 }
             }
-            let after: usize = self.starts.iter().map(|&s| store.size(s)).sum();
-            if after == before {
-                return Ok(());
-            }
-        }
+        });
+        Ok(())
     }
 }
 
@@ -113,11 +127,9 @@ impl Propagator for Cumulative {
             return Ok(());
         }
 
-        // Local fixpoint: self-changes don't re-enqueue, so one pass could miss
-        // overloads involving a just-fixed task.
-        loop {
-            let before: usize = (0..n).map(|i| store.size(self.starts[i])).sum();
-
+        // Self-changes don't re-enqueue, so one pass could miss overloads
+        // involving a just-fixed task.
+        local_fixpoint!((0..n).map(|i| store.size(self.starts[i])).sum::<usize>(), {
             // Snapshot est, lct, energy.
             for i in 0..n {
                 self.est[i] = store.min(self.starts[i]) as i64;
@@ -213,12 +225,7 @@ impl Propagator for Cumulative {
                     }
                 }
             }
-
-            let after: usize = (0..n).map(|i| store.size(self.starts[i])).sum();
-            if after == before {
-                break;
-            }
-        }
+        });
         Ok(())
     }
 }
@@ -290,8 +297,7 @@ impl Propagator for CumulativeVar {
         if n == 0 {
             return Ok(());
         }
-        loop {
-            let before = self.state(store);
+        local_fixpoint!(self.state(store), {
             let cap_max = store.max(self.capacity) as i64;
 
             // Time horizon over all tasks (longest possible durations).
@@ -365,11 +371,7 @@ impl Propagator for CumulativeVar {
                     }
                 }
             }
-
-            if self.state(store) == before {
-                break;
-            }
-        }
+        });
         Ok(())
     }
 }
@@ -412,8 +414,7 @@ impl Propagator for BinPacking {
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
         let nbins = self.capacities.len();
-        loop {
-            let before: usize = self.items.iter().map(|&it| store.size(it)).sum();
+        local_fixpoint!(self.items.iter().map(|&it| store.size(it)).sum::<usize>(), {
             for &it in &self.items {
                 store.remove_below(it, 0)?;
                 store.remove_above(it, (nbins - 1) as i32)?;
@@ -446,11 +447,8 @@ impl Propagator for BinPacking {
                     }
                 }
             }
-            let after: usize = self.items.iter().map(|&it| store.size(it)).sum();
-            if after == before {
-                return Ok(());
-            }
-        }
+        });
+        Ok(())
     }
 }
 
