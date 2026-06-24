@@ -589,11 +589,23 @@ pub fn all_different(solver: &mut Solver, vars: &[VarId]) {
 /// Value precedence: for each consecutive pair `(s, t)`, the first `s` must
 /// precede the first `t`. Decomposed through `intension`.
 pub fn precedence(solver: &mut Solver, list: &[VarId], values: &[i32]) {
+    precedence_with_covered(solver, list, values, false);
+}
+
+/// Value precedence with optional coverage: when `covered` is true, every value
+/// in `values` must occur at least once in `list`.
+pub fn precedence_with_covered(solver: &mut Solver, list: &[VarId], values: &[i32], covered: bool) {
     for w in values.windows(2) {
         let (s, t) = (w[0], w[1]);
         for i in 0..list.len() {
             let earlier_s: Vec<_> = (0..i).map(|p| eq(var(list[p]), int(s as i64))).collect();
             intension(solver, imp(eq(var(list[i]), int(t as i64)), or(earlier_s)));
+        }
+    }
+    if covered {
+        for &value in values {
+            let occurs = list.iter().map(|&v| eq(var(v), int(value as i64))).collect();
+            intension(solver, or(occurs));
         }
     }
 }

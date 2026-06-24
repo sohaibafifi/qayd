@@ -1189,7 +1189,7 @@ impl XcspCallback for Model {
         });
     }
 
-    fn on_constraint_precedence_v1(&mut self, list: &[String], _covered: bool) {
+    fn on_constraint_precedence_v1(&mut self, list: &[String], covered: bool) {
         guard!(self, {
             // Default value order: the sorted distinct values across all domains.
             let vars = self.scope(list)?;
@@ -1199,16 +1199,16 @@ impl XcspCallback for Model {
             }
             vals.sort_unstable();
             vals.dedup();
-            self.local.add_precedence(vars.clone(), vals.clone());
-            crate::constraints::primitives::precedence(&mut self.solver, &vars, &vals);
+            self.local.add_precedence(vars.clone(), vals.clone(), covered);
+            crate::constraints::primitives::precedence_with_covered(&mut self.solver, &vars, &vals, covered);
             Ok(())
         });
     }
-    fn on_constraint_precedence_v2(&mut self, list: &[String], values: &[i32], _covered: bool) {
+    fn on_constraint_precedence_v2(&mut self, list: &[String], values: &[i32], covered: bool) {
         guard!(self, {
             let vars = self.scope(list)?;
-            self.local.add_precedence(vars.clone(), values.to_vec());
-            crate::constraints::primitives::precedence(&mut self.solver, &vars, values);
+            self.local.add_precedence(vars.clone(), values.to_vec(), covered);
+            crate::constraints::primitives::precedence_with_covered(&mut self.solver, &vars, values, covered);
             Ok(())
         });
     }
@@ -1362,14 +1362,18 @@ impl XcspCallback for Model {
         });
     }
 
-    fn on_constraint_no_overlap_v1(&mut self, list: &[String], lengths: &[i32], _zero_ignored: bool) {
+    fn on_constraint_no_overlap_v1(&mut self, list: &[String], lengths: &[i32], zero_ignored: bool) {
         guard!(self, {
             let starts = self.scope(list)?;
             let d = i64s(lengths);
             let origins = starts.iter().copied().map(|start| vec![start]).collect::<Vec<_>>();
             let len = lengths.iter().map(|&length| vec![expr::int(length as i64)]).collect::<Vec<_>>();
-            self.local.add_no_overlap(origins, len, _zero_ignored);
-            no_overlap(&mut self.solver, &starts, &d);
+            if zero_ignored || lengths.iter().any(|&length| length <= 0) {
+                self.post_diffn(origins, len, zero_ignored)?;
+            } else {
+                self.local.add_no_overlap(origins, len, zero_ignored);
+                no_overlap(&mut self.solver, &starts, &d);
+            }
             Ok(())
         });
     }
