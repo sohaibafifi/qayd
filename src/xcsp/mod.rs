@@ -344,7 +344,7 @@ fn solve_fast_cop_parallel<W: Write>(
     let minimizing = problem.objective.as_ref().is_none_or(Objective::minimizing);
     // `--turbo` turns on the autonomous local-search upgrades (GLS, …); `--fast-cop`
     // keeps the plain min-conflicts descent.
-    let ls_config = LsConfig { gls: options.turbo(), min_conflicts: options.turbo(), kick_bandit: options.turbo() };
+    let ls_config = LsConfig { gls: options.turbo(), min_conflicts: options.turbo(), kick_bandit: false };
     let (tx, rx) = mpsc::channel();
     let mut printed = None;
     let mut summary = None;

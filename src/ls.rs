@@ -2016,9 +2016,9 @@ where
             match op {
                 KickOperator::Repair => {
                     // Descent-only: apply the best single-variable move only when it
-                    // improves. Otherwise leave it to the escape operators (and the
-                    // GLS bump below). Applying worsening moves here made `Repair`
-                    // look bad to the bandit and degenerated it into restart-spam.
+                    // improves. (Adding random-walk sideways moves here was tested and
+                    // both diluted the exploration that helps timetabling and did not
+                    // recover the descent-bound regression — net worse on both.)
                     if let Some((score, j, value)) = best_single_variable_move(
                         &model,
                         &assignment,
