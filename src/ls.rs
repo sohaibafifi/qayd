@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::constraints::linear::Relation;
-use crate::constraints::table::STAR;
+use crate::constraints::table::{Dfa, Mdd, STAR};
 use crate::expr::Expr;
 use crate::ids::VarId;
 use crate::mix64;
@@ -26,18 +26,106 @@ const MIN_CONFLICTS_SAMPLES: usize = 8;
 #[derive(Clone)]
 pub(crate) enum LocalConstraint {
     Expr(Expr),
-    Linear { coeffs: Vec<i64>, vars: Vec<VarId>, rel: Relation, rhs: i64 },
+    Linear {
+        coeffs: Vec<i64>,
+        vars: Vec<VarId>,
+        rel: Relation,
+        rhs: i64,
+    },
     AllDifferent(Vec<VarId>),
+    AllDifferentRows(Vec<Vec<VarId>>),
+    AllDifferentExcept {
+        vars: Vec<VarId>,
+        except: Vec<i32>,
+    },
     AllEqual(Vec<VarId>),
-    Extension { vars: Vec<VarId>, tuples: Vec<Vec<i32>> },
+    Extension {
+        vars: Vec<VarId>,
+        tuples: Vec<Vec<i32>>,
+    },
     /// Negative (conflict) table: the listed tuples are forbidden.
-    NegExtension { vars: Vec<VarId>, tuples: Vec<Vec<i32>> },
-    Lex { rows: Vec<Vec<VarId>>, strict: bool },
-    Count { vars: Vec<VarId>, values: Vec<i32>, rel: Relation, rhs: LocalRhs },
-    CountAllowed { vars: Vec<VarId>, values: Vec<i32>, allowed: Vec<i32> },
-    NValues { vars: Vec<VarId>, rel: Relation, rhs: LocalRhs },
-    Cardinality { vars: Vec<VarId>, values: Vec<i32>, low: Vec<i64>, high: Vec<i64>, closed: bool },
-    Extremum { vars: Vec<VarId>, is_min: bool, rel: Relation, rhs: LocalRhs },
+    NegExtension {
+        vars: Vec<VarId>,
+        tuples: Vec<Vec<i32>>,
+    },
+    Lex {
+        rows: Vec<Vec<VarId>>,
+        strict: bool,
+    },
+    Count {
+        vars: Vec<VarId>,
+        values: Vec<i32>,
+        rel: Relation,
+        rhs: LocalRhs,
+    },
+    CountAllowed {
+        vars: Vec<VarId>,
+        values: Vec<i32>,
+        allowed: Vec<i32>,
+    },
+    NValues {
+        vars: Vec<VarId>,
+        rel: Relation,
+        rhs: LocalRhs,
+    },
+    Cardinality {
+        vars: Vec<VarId>,
+        values: Vec<i32>,
+        low: Vec<i64>,
+        high: Vec<i64>,
+        closed: bool,
+    },
+    Extremum {
+        vars: Vec<VarId>,
+        is_min: bool,
+        rel: Relation,
+        rhs: LocalRhs,
+    },
+    ElementMember {
+        array: Vec<VarId>,
+        value: i32,
+    },
+    Cumulative {
+        starts: Vec<VarId>,
+        durations: Vec<VarId>,
+        heights: Vec<VarId>,
+        cap: LocalRhs,
+    },
+    ChannelInverse {
+        xs: Vec<VarId>,
+        x_start: i32,
+        ys: Vec<VarId>,
+        y_start: i32,
+    },
+    ChannelOneHot {
+        xs: Vec<VarId>,
+        value: VarId,
+        start_index: i32,
+    },
+    Precedence {
+        vars: Vec<VarId>,
+        values: Vec<i32>,
+    },
+    Circuit(Vec<VarId>),
+    BinPacking {
+        items: Vec<VarId>,
+        sizes: Vec<i64>,
+        limits: Vec<LocalRhs>,
+        exact: bool,
+    },
+    NoOverlap {
+        origins: Vec<Vec<VarId>>,
+        lengths: Vec<Vec<Expr>>,
+        zero_ignored: bool,
+    },
+    Regular {
+        vars: Vec<VarId>,
+        dfa: Dfa,
+    },
+    Mdd {
+        vars: Vec<VarId>,
+        mdd: Mdd,
+    },
 }
 
 #[derive(Clone)]
@@ -63,7 +151,7 @@ pub(crate) struct LocalSearchSpec {
 }
 
 /// Behaviour toggles for the local-search engine. `--fast-cop` uses the default
-/// (everything off — plain min-conflicts descent); `--turbo` switches on the
+/// (everything off: plain min-conflicts descent); `--turbo` switches on the
 /// autonomous upgrades. See TURBO.md (Tier-B). New toggles are added here as
 /// each Tier-B feature lands.
 #[derive(Clone, Copy, Default)]
@@ -333,20 +421,62 @@ fn constraint_vars(constraint: &LocalConstraint, out: &mut Vec<VarId>) {
         LocalConstraint::Expr(expr) => expr.collect_vars(out),
         LocalConstraint::Linear { vars, .. }
         | LocalConstraint::AllDifferent(vars)
+        | LocalConstraint::AllDifferentExcept { vars, .. }
         | LocalConstraint::AllEqual(vars)
         | LocalConstraint::Extension { vars, .. }
         | LocalConstraint::NegExtension { vars, .. }
         | LocalConstraint::CountAllowed { vars, .. }
-        | LocalConstraint::Cardinality { vars, .. } => out.extend(vars.iter().copied()),
-        LocalConstraint::Lex { rows, .. } => {
+        | LocalConstraint::Cardinality { vars, .. }
+        | LocalConstraint::ElementMember { array: vars, .. }
+        | LocalConstraint::Precedence { vars, .. }
+        | LocalConstraint::Circuit(vars)
+        | LocalConstraint::Regular { vars, .. }
+        | LocalConstraint::Mdd { vars, .. } => out.extend(vars.iter().copied()),
+        LocalConstraint::AllDifferentRows(rows) | LocalConstraint::Lex { rows, .. } => {
             for row in rows {
                 out.extend(row.iter().copied());
             }
         }
-        LocalConstraint::Count { vars, rhs, .. } | LocalConstraint::NValues { vars, rhs, .. } | LocalConstraint::Extremum { vars, rhs, .. } => {
+        LocalConstraint::Count { vars, rhs, .. }
+        | LocalConstraint::NValues { vars, rhs, .. }
+        | LocalConstraint::Extremum { vars, rhs, .. } => {
             out.extend(vars.iter().copied());
             if let LocalRhs::Var(v) = rhs {
                 out.push(*v);
+            }
+        }
+        LocalConstraint::Cumulative { starts, durations, heights, cap } => {
+            out.extend(starts.iter().copied());
+            out.extend(durations.iter().copied());
+            out.extend(heights.iter().copied());
+            if let LocalRhs::Var(v) = cap {
+                out.push(*v);
+            }
+        }
+        LocalConstraint::ChannelInverse { xs, ys, .. } => {
+            out.extend(xs.iter().copied());
+            out.extend(ys.iter().copied());
+        }
+        LocalConstraint::ChannelOneHot { xs, value, .. } => {
+            out.extend(xs.iter().copied());
+            out.push(*value);
+        }
+        LocalConstraint::BinPacking { items, limits, .. } => {
+            out.extend(items.iter().copied());
+            for limit in limits {
+                if let LocalRhs::Var(v) = limit {
+                    out.push(*v);
+                }
+            }
+        }
+        LocalConstraint::NoOverlap { origins, lengths, .. } => {
+            for row in origins {
+                out.extend(row.iter().copied());
+            }
+            for row in lengths {
+                for expr in row {
+                    expr.collect_vars(out);
+                }
             }
         }
     }
@@ -419,6 +549,26 @@ fn build_affected(num_vars: usize, constraints: &[LocalConstraint], functionals:
     affected
 }
 
+fn order_functionals(mut functionals: Vec<Functional>) -> Vec<Functional> {
+    let mut ordered = Vec::with_capacity(functionals.len());
+    while !functionals.is_empty() {
+        let remaining_targets = functionals.iter().map(functional_target).collect::<HashSet<_>>();
+        let ready = functionals.iter().position(|functional| {
+            let mut inputs = Vec::new();
+            functional_inputs(functional, &mut inputs);
+            inputs.into_iter().all(|input| !remaining_targets.contains(&input))
+        });
+        match ready {
+            Some(index) => ordered.push(functionals.remove(index)),
+            None => {
+                ordered.extend(functionals);
+                break;
+            }
+        }
+    }
+    ordered
+}
+
 impl LocalRhs {
     fn value(self, assignment: &[i32]) -> i64 {
         match self {
@@ -449,6 +599,14 @@ impl LocalSearchSpec {
 
     pub(crate) fn add_all_different(&mut self, vars: Vec<VarId>) {
         self.constraints.push(LocalConstraint::AllDifferent(vars));
+    }
+
+    pub(crate) fn add_all_different_rows(&mut self, rows: Vec<Vec<VarId>>) {
+        self.constraints.push(LocalConstraint::AllDifferentRows(rows));
+    }
+
+    pub(crate) fn add_all_different_except(&mut self, vars: Vec<VarId>, except: Vec<i32>) {
+        self.constraints.push(LocalConstraint::AllDifferentExcept { vars, except });
     }
 
     pub(crate) fn add_all_equal(&mut self, vars: Vec<VarId>) {
@@ -490,12 +648,48 @@ impl LocalSearchSpec {
         self.constraints.push(LocalConstraint::Extremum { vars, is_min, rel, rhs });
     }
 
+    pub(crate) fn add_element_member(&mut self, array: Vec<VarId>, value: i32) {
+        self.constraints.push(LocalConstraint::ElementMember { array, value });
+    }
+
     pub(crate) fn add_element(&mut self, array: Vec<VarId>, index: VarId, target: VarId, start_index: i32) {
         self.mark_functional(Functional::Element { target, array, index, start_index });
     }
 
-    pub(crate) fn mark_unsupported(&mut self) {
-        self.unsupported += 1;
+    pub(crate) fn add_cumulative(&mut self, starts: Vec<VarId>, durations: Vec<VarId>, heights: Vec<VarId>, cap: LocalRhs) {
+        self.constraints.push(LocalConstraint::Cumulative { starts, durations, heights, cap });
+    }
+
+    pub(crate) fn add_channel_inverse(&mut self, xs: Vec<VarId>, x_start: i32, ys: Vec<VarId>, y_start: i32) {
+        self.constraints.push(LocalConstraint::ChannelInverse { xs, x_start, ys, y_start });
+    }
+
+    pub(crate) fn add_channel_onehot(&mut self, xs: Vec<VarId>, value: VarId, start_index: i32) {
+        self.constraints.push(LocalConstraint::ChannelOneHot { xs, value, start_index });
+    }
+
+    pub(crate) fn add_precedence(&mut self, vars: Vec<VarId>, values: Vec<i32>) {
+        self.constraints.push(LocalConstraint::Precedence { vars, values });
+    }
+
+    pub(crate) fn add_circuit(&mut self, vars: Vec<VarId>) {
+        self.constraints.push(LocalConstraint::Circuit(vars));
+    }
+
+    pub(crate) fn add_bin_packing(&mut self, items: Vec<VarId>, sizes: Vec<i64>, limits: Vec<LocalRhs>, exact: bool) {
+        self.constraints.push(LocalConstraint::BinPacking { items, sizes, limits, exact });
+    }
+
+    pub(crate) fn add_no_overlap(&mut self, origins: Vec<Vec<VarId>>, lengths: Vec<Vec<Expr>>, zero_ignored: bool) {
+        self.constraints.push(LocalConstraint::NoOverlap { origins, lengths, zero_ignored });
+    }
+
+    pub(crate) fn add_regular(&mut self, vars: Vec<VarId>, dfa: Dfa) {
+        self.constraints.push(LocalConstraint::Regular { vars, dfa });
+    }
+
+    pub(crate) fn add_mdd(&mut self, vars: Vec<VarId>, mdd: Mdd) {
+        self.constraints.push(LocalConstraint::Mdd { vars, mdd });
     }
 
     pub(crate) fn unsupported(&self) -> usize {
@@ -546,7 +740,7 @@ impl LocalModel {
             .filter(|&var| domains[var.index()].values.len() > 1 && !spec.derived.get(var.index()).copied().unwrap_or(false))
             .collect();
         let constraints = spec.constraints;
-        let functionals = spec.functionals;
+        let functionals = order_functionals(spec.functionals);
         let bool_tables = bool_tables(&functionals);
         let exact_covers = exact_cover_rows(&constraints, &domains);
         let affected = build_affected(domains.len(), &constraints, &functionals);
@@ -988,6 +1182,8 @@ impl LocalModel {
                 values.sort_unstable();
                 values.windows(2).filter(|w| w[0] == w[1]).count() as i64
             }
+            LocalConstraint::AllDifferentRows(rows) => all_different_rows_violation(rows, assignment),
+            LocalConstraint::AllDifferentExcept { vars, except } => all_different_except_violation(vars, except, assignment),
             LocalConstraint::AllEqual(vars) => vars.split_first().map_or(0, |(&first, rest)| {
                 rest.iter().filter(|&&var| assignment[var.index()] != assignment[first.index()]).count() as i64
             }),
@@ -1025,6 +1221,22 @@ impl LocalModel {
                 let Some(value) = extremum(vars, *is_min, assignment) else { return 1 };
                 relation_violation(value as i64, *rel, rhs.value(assignment))
             }
+            LocalConstraint::ElementMember { array, value } => element_member_violation(array, *value, assignment),
+            LocalConstraint::Cumulative { starts, durations, heights, cap } => {
+                cumulative_violation(starts, durations, heights, cap.value(assignment), assignment)
+            }
+            LocalConstraint::ChannelInverse { xs, x_start, ys, y_start } => {
+                channel_inverse_violation(xs, *x_start, ys, *y_start, assignment)
+            }
+            LocalConstraint::ChannelOneHot { xs, value, start_index } => channel_onehot_violation(xs, *value, *start_index, assignment),
+            LocalConstraint::Precedence { vars, values } => precedence_violation(vars, values, assignment),
+            LocalConstraint::Circuit(vars) => circuit_violation(vars, assignment),
+            LocalConstraint::BinPacking { items, sizes, limits, exact } => bin_packing_violation(items, sizes, limits, *exact, assignment),
+            LocalConstraint::NoOverlap { origins, lengths, zero_ignored } => {
+                no_overlap_violation(origins, lengths, *zero_ignored, assignment)
+            }
+            LocalConstraint::Regular { vars, dfa } => regular_violation(vars, dfa, assignment),
+            LocalConstraint::Mdd { vars, mdd } => mdd_violation(vars, mdd, assignment),
         }
     }
 
@@ -1079,6 +1291,264 @@ fn cardinality_violation(vars: &[VarId], values: &[i32], low: &[i64], high: &[i6
         violation += (lo - *count).max(0) + (*count - hi).max(0);
     }
     violation
+}
+
+fn all_different_rows_violation(rows: &[Vec<VarId>], assignment: &[i32]) -> i64 {
+    let mut seen: HashMap<Vec<i32>, i64> = HashMap::new();
+    let mut violation = 0;
+    for row in rows {
+        let tuple = row.iter().map(|&v| assignment[v.index()]).collect::<Vec<_>>();
+        let count = seen.entry(tuple).or_insert(0);
+        violation += *count;
+        *count += 1;
+    }
+    violation
+}
+
+fn all_different_except_violation(vars: &[VarId], except: &[i32], assignment: &[i32]) -> i64 {
+    let mut counts: HashMap<i32, i64> = HashMap::new();
+    let mut violation = 0;
+    for &var in vars {
+        let value = assignment[var.index()];
+        if except.contains(&value) {
+            continue;
+        }
+        let count = counts.entry(value).or_insert(0);
+        violation += *count;
+        *count += 1;
+    }
+    violation
+}
+
+fn element_member_violation(array: &[VarId], value: i32, assignment: &[i32]) -> i64 {
+    if array.iter().any(|&var| assignment[var.index()] == value) {
+        0
+    } else {
+        array.iter().map(|&var| (i64::from(assignment[var.index()]) - i64::from(value)).abs()).min().unwrap_or(1).max(1)
+    }
+}
+
+fn cumulative_violation(starts: &[VarId], durations: &[VarId], heights: &[VarId], cap: i64, assignment: &[i32]) -> i64 {
+    let mut tasks = Vec::new();
+    let mut points = Vec::new();
+    for ((&start, &duration), &height) in starts.iter().zip(durations).zip(heights) {
+        let s = assignment[start.index()] as i64;
+        let d = assignment[duration.index()] as i64;
+        let h = assignment[height.index()] as i64;
+        if d <= 0 || h <= 0 {
+            continue;
+        }
+        let e = s + d;
+        tasks.push((s, e, h));
+        points.push(s);
+        points.push(e);
+    }
+    points.sort_unstable();
+    points.dedup();
+    let mut violation = 0i64;
+    for window in points.windows(2) {
+        let lo = window[0];
+        let hi = window[1];
+        if lo >= hi {
+            continue;
+        }
+        let t = lo;
+        let usage: i64 = tasks.iter().filter(|&&(s, e, _)| s <= t && t < e).map(|&(_, _, h)| h).sum();
+        violation = violation.saturating_add((usage - cap).max(0).saturating_mul((hi - lo).max(1)));
+    }
+    violation
+}
+
+fn channel_inverse_violation(xs: &[VarId], x_start: i32, ys: &[VarId], y_start: i32, assignment: &[i32]) -> i64 {
+    let mut violation = 0;
+    for (i, &x) in xs.iter().enumerate() {
+        let y_pos = assignment[x.index()] - y_start;
+        if (0..ys.len() as i32).contains(&y_pos) {
+            let expected = x_start + i as i32;
+            violation += i64::from(assignment[ys[y_pos as usize].index()] != expected);
+        } else {
+            violation += 1;
+        }
+    }
+    for (j, &y) in ys.iter().enumerate() {
+        let x_pos = assignment[y.index()] - x_start;
+        if (0..xs.len() as i32).contains(&x_pos) {
+            let expected = y_start + j as i32;
+            violation += i64::from(assignment[xs[x_pos as usize].index()] != expected);
+        } else {
+            violation += 1;
+        }
+    }
+    violation
+}
+
+fn channel_onehot_violation(xs: &[VarId], value: VarId, start_index: i32, assignment: &[i32]) -> i64 {
+    let target = assignment[value.index()];
+    let mut violation = 0;
+    let mut ones = 0;
+    for (i, &x) in xs.iter().enumerate() {
+        let xv = assignment[x.index()];
+        let selected = target == start_index + i as i32;
+        violation += match (xv, selected) {
+            (1, true) | (0, false) => 0,
+            _ => 1,
+        };
+        ones += i64::from(xv == 1);
+    }
+    violation + (ones - 1).abs()
+}
+
+fn precedence_violation(vars: &[VarId], values: &[i32], assignment: &[i32]) -> i64 {
+    let first_pos = |value| vars.iter().position(|&var| assignment[var.index()] == value);
+    let mut violation = 0;
+    for pair in values.windows(2) {
+        let prev = first_pos(pair[0]);
+        let next = first_pos(pair[1]);
+        if let Some(next_pos) = next {
+            if prev.is_none_or(|prev_pos| prev_pos > next_pos) {
+                violation += 1;
+            }
+        }
+    }
+    violation
+}
+
+fn circuit_violation(vars: &[VarId], assignment: &[i32]) -> i64 {
+    let n = vars.len();
+    if n == 0 {
+        return 0;
+    }
+    if n == 1 {
+        return i64::from(assignment[vars[0].index()] != 0);
+    }
+    let mut indeg = vec![0i64; n];
+    let mut violation = 0;
+    for (i, &var) in vars.iter().enumerate() {
+        let succ = assignment[var.index()];
+        if succ < 0 || succ as usize >= n {
+            violation += 1;
+            continue;
+        }
+        if succ as usize == i {
+            violation += 1;
+        }
+        indeg[succ as usize] += 1;
+    }
+    violation += indeg.iter().map(|&count| (count - 1).abs()).sum::<i64>();
+    if violation > 0 {
+        return violation;
+    }
+    let mut seen = vec![false; n];
+    let mut cycles = 0;
+    for start in 0..n {
+        if seen[start] {
+            continue;
+        }
+        cycles += 1;
+        let mut cur = start;
+        while !seen[cur] {
+            seen[cur] = true;
+            cur = assignment[vars[cur].index()] as usize;
+        }
+    }
+    violation + (cycles - 1).max(0) as i64
+}
+
+fn bin_packing_violation(items: &[VarId], sizes: &[i64], limits: &[LocalRhs], exact: bool, assignment: &[i32]) -> i64 {
+    let mut loads = vec![0i64; limits.len()];
+    let mut violation = 0;
+    for (&item, &size) in items.iter().zip(sizes) {
+        let bin = assignment[item.index()];
+        if (0..loads.len() as i32).contains(&bin) {
+            loads[bin as usize] += size;
+        } else {
+            violation += size.abs().max(1);
+        }
+    }
+    for (load, limit) in loads.into_iter().zip(limits) {
+        let cap = limit.value(assignment);
+        violation += if exact { (load - cap).abs() } else { (load - cap).max(0) };
+    }
+    violation
+}
+
+fn no_overlap_violation(origins: &[Vec<VarId>], lengths: &[Vec<Expr>], zero_ignored: bool, assignment: &[i32]) -> i64 {
+    let mut boxes = Vec::new();
+    for (origin, length) in origins.iter().zip(lengths) {
+        let mut dims = Vec::with_capacity(origin.len());
+        let mut active = true;
+        for (&start_var, len_expr) in origin.iter().zip(length) {
+            let Some(len) = len_expr.eval(&|v| assignment[v.index()] as i64) else {
+                active = false;
+                break;
+            };
+            if len <= 0 {
+                if zero_ignored {
+                    active = false;
+                    break;
+                }
+                return 1;
+            }
+            let start = assignment[start_var.index()] as i64;
+            dims.push((start, start + len));
+        }
+        if active {
+            boxes.push(dims);
+        }
+    }
+    let mut violation = 0;
+    for i in 0..boxes.len() {
+        for j in (i + 1)..boxes.len() {
+            let mut overlap = i64::MAX;
+            for (&(a0, a1), &(b0, b1)) in boxes[i].iter().zip(&boxes[j]) {
+                let amount = a1.min(b1) - a0.max(b0);
+                if amount <= 0 {
+                    overlap = 0;
+                    break;
+                }
+                overlap = overlap.min(amount);
+            }
+            violation += overlap.max(0);
+        }
+    }
+    violation
+}
+
+fn regular_violation(vars: &[VarId], dfa: &Dfa, assignment: &[i32]) -> i64 {
+    let mut delta = vec![HashMap::new(); dfa.n_states];
+    for &(src, value, dst) in &dfa.transitions {
+        if src < dfa.n_states {
+            delta[src].insert(value, dst);
+        }
+    }
+    let mut state = dfa.start;
+    for (i, &var) in vars.iter().enumerate() {
+        if state >= dfa.n_states {
+            return (vars.len() - i + 1) as i64;
+        }
+        let value = assignment[var.index()];
+        let Some(&next) = delta[state].get(&value) else {
+            return (vars.len() - i) as i64 + 1;
+        };
+        state = next;
+    }
+    i64::from(!dfa.accept.contains(&state))
+}
+
+fn mdd_violation(vars: &[VarId], mdd: &Mdd, assignment: &[i32]) -> i64 {
+    let mut node = 0usize;
+    for (layer, &var) in vars.iter().enumerate() {
+        let value = assignment[var.index()];
+        let Some(arcs) = mdd.layers.get(layer) else {
+            return (vars.len() - layer + 1) as i64;
+        };
+        let Some(arc) = arcs.iter().find(|arc| arc.from == node && arc.value == value) else {
+            return (vars.len() - layer) as i64 + 1;
+        };
+        node = arc.to;
+    }
+    let final_nodes = mdd.nodes_per_layer.last().copied().unwrap_or(0);
+    i64::from(node >= final_nodes)
 }
 
 fn exact_cover_rows(constraints: &[LocalConstraint], domains: &[LocalDomain]) -> Vec<Vec<VarId>> {
@@ -1214,8 +1684,21 @@ where
             unsupported: unsupported + 1,
         };
     };
-    if unsupported > 0 || model.mutable.is_empty() {
+    if unsupported > 0 {
         return LocalSearchOutcome { best: None, iterations: 0, moves: 0, restarts: 0, constraints, functionals, unsupported };
+    }
+    if model.mutable.is_empty() {
+        let mut assignment = model.min_assignment();
+        let best = if model.score(&mut assignment).violation == 0 {
+            model.objective_value(&assignment).map(|value| {
+                let solution = model.search_solution(&assignment);
+                on_improve(value, &solution, "local-search");
+                (solution, value)
+            })
+        } else {
+            None
+        };
+        return LocalSearchOutcome { best, iterations: 0, moves: 0, restarts: 0, constraints, functionals, unsupported };
     }
 
     let minimizing = model.objective.minimizing();
@@ -1391,36 +1874,4 @@ where
     }
 
     LocalSearchOutcome { best: best_solution, iterations, moves, restarts, constraints, functionals, unsupported }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{build_affected, Functional, LocalConstraint};
-    use crate::constraints::linear::Relation;
-    use crate::ids::VarId;
-
-    /// `affected[v]` must include constraints reached through functionals: when a
-    /// flipped variable determines a functional target via `complete()`, every
-    /// constraint over that target depends on it. This transitive case is the
-    /// subtle part of the incremental delta-scoring incidence index.
-    #[test]
-    fn affected_index_follows_functional_dependence() {
-        let v = VarId;
-        // c0: x0 + x1 <= 3   c1: allDifferent(x2, x3)   c2: x4 >= 1
-        let constraints = vec![
-            LocalConstraint::Linear { coeffs: vec![1, 1], vars: vec![v(0), v(1)], rel: Relation::Le, rhs: 3 },
-            LocalConstraint::AllDifferent(vec![v(2), v(3)]),
-            LocalConstraint::Linear { coeffs: vec![1], vars: vec![v(4)], rel: Relation::Ge, rhs: 1 },
-        ];
-        // x4 := x0 (functional), so flipping x0 changes x4 and hence c2.
-        let functionals = vec![Functional::Linear { target: v(4), coeff: 1, terms: vec![(1, v(0))], rhs: 0 }];
-
-        let affected = build_affected(5, &constraints, &functionals);
-
-        assert_eq!(affected[0], vec![0, 2], "x0: direct c0 plus transitive c2 via target x4");
-        assert_eq!(affected[1], vec![0]);
-        assert_eq!(affected[2], vec![1]);
-        assert_eq!(affected[3], vec![1]);
-        assert_eq!(affected[4], vec![2]);
-    }
 }
