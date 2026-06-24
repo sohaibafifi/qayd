@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use pyo3::class::basic::CompareOp;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -14,8 +16,10 @@ use crate::constraints::linear::{self, Relation};
 use crate::constraints::primitives;
 use crate::constraints::scheduling;
 use crate::constraints::table;
-use crate::expr::Expr;
+use crate::expr::{self, Expr};
 use crate::ids::VarId;
+use crate::ls::{solve_fast_cop, LocalRhs, LocalSearchSpec, LsConfig};
+use crate::problem::{Objective as ProblemObjective, Problem};
 use crate::search::{self, Objective as SearchObjective, SearchControl, SolveStats};
 use crate::Solver;
 
@@ -97,6 +101,9 @@ struct PyModel {
     solver: Solver,
     names: Vec<Option<String>>,
     objective: Option<ObjectiveSpec>,
+    /// Local-search model built in parallel with the CP posts, so `--turbo`-style
+    /// LS (`solve(local_search=True)`) can run on the same model.
+    local: LocalSearchSpec,
 }
 
 impl PyIntVar {
@@ -584,7 +591,13 @@ impl PySolution {
 impl PyModel {
     #[new]
     fn new() -> Self {
-        Self { id: NEXT_MODEL_ID.fetch_add(1, Ordering::Relaxed), solver: Solver::new(), names: Vec::new(), objective: None }
+        Self {
+            id: NEXT_MODEL_ID.fetch_add(1, Ordering::Relaxed),
+            solver: Solver::new(),
+            names: Vec::new(),
+            objective: None,
+            local: LocalSearchSpec::default(),
+        }
     }
 
     #[getter]
@@ -625,6 +638,7 @@ impl PyModel {
             _ => return Err(PyValueError::new_err("use int_var(lo, hi, name=...) or int_var(values=[...], name=...)")),
         };
         self.names.push(name.clone());
+        self.local.add_var(id);
         Ok(PyIntVar { model_id: self.id, index: id.0, name })
     }
 
@@ -654,6 +668,7 @@ impl PyModel {
                     return Err(PyValueError::new_err("constraint belongs to a different model"));
                 }
             }
+            self.local.add_expr(constraint.inner.expr.clone());
             intension::intension(&mut self.solver, constraint.inner.expr);
             return Ok(());
         }
@@ -671,25 +686,31 @@ impl PyModel {
         if coeffs.len() != vars.len() {
             return Err(PyValueError::new_err("coeffs and vars must have the same length"));
         }
-        linear::linear(&mut self.solver, &coeffs, &vars, parse_relation(relation)?, rhs);
+        let rel = parse_relation(relation)?;
+        self.local.add_linear(coeffs.clone(), vars.clone(), rel, rhs);
+        linear::linear(&mut self.solver, &coeffs, &vars, rel, rhs);
         Ok(())
     }
 
     #[pyo3(signature = (vars, relation, rhs))]
     fn sum(&mut self, vars: &Bound<'_, PyAny>, relation: &str, rhs: i64) -> PyResult<()> {
         let vars = ids_for(self.id, &var_list_from_py(vars)?)?;
-        linear::sum(&mut self.solver, &vars, parse_relation(relation)?, rhs);
+        let rel = parse_relation(relation)?;
+        self.local.add_linear(vec![1; vars.len()], vars.clone(), rel, rhs);
+        linear::sum(&mut self.solver, &vars, rel, rhs);
         Ok(())
     }
 
     fn all_different(&mut self, vars: &Bound<'_, PyAny>) -> PyResult<()> {
         let vars = ids_for(self.id, &var_list_from_py(vars)?)?;
+        self.local.add_all_different(vars.clone());
         primitives::all_different(&mut self.solver, &vars);
         Ok(())
     }
 
     fn all_equal(&mut self, vars: &Bound<'_, PyAny>) -> PyResult<()> {
         let vars = ids_for(self.id, &var_list_from_py(vars)?)?;
+        self.local.add_all_equal(vars.clone());
         primitives::all_equal(&mut self.solver, &vars);
         Ok(())
     }
@@ -697,6 +718,7 @@ impl PyModel {
     fn not_equal(&mut self, x: &PyIntVar, y: &PyIntVar) -> PyResult<()> {
         let x = one_id_for(self.id, x)?;
         let y = one_id_for(self.id, y)?;
+        self.local.add_expr(expr::ne(expr::var(x), expr::var(y)));
         primitives::not_equal(&mut self.solver, x, y);
         Ok(())
     }
@@ -705,13 +727,18 @@ impl PyModel {
     fn not_equal_offset(&mut self, x: &PyIntVar, y: &PyIntVar, offset: i32) -> PyResult<()> {
         let x = one_id_for(self.id, x)?;
         let y = one_id_for(self.id, y)?;
+        self.local.add_expr(expr::ne(expr::var(x), expr::add(vec![expr::var(y), expr::int(offset as i64)])));
         primitives::not_equal_offset(&mut self.solver, x, y, offset);
         Ok(())
     }
 
     fn ordered(&mut self, vars: &Bound<'_, PyAny>, relation: &str) -> PyResult<()> {
         let vars = ids_for(self.id, &var_list_from_py(vars)?)?;
-        primitives::ordered(&mut self.solver, &vars, parse_relation(relation)?);
+        let rel = parse_relation(relation)?;
+        for pair in vars.windows(2) {
+            self.local.add_linear(vec![1, -1], vec![pair[0], pair[1]], rel, 0);
+        }
+        primitives::ordered(&mut self.solver, &vars, rel);
         Ok(())
     }
 
@@ -719,6 +746,9 @@ impl PyModel {
         let vars = ids_for(self.id, &var_list_from_py(vars)?)?;
         if vars.len() != values.len() {
             return Err(PyValueError::new_err("vars and values must have the same length"));
+        }
+        for (&var, &value) in vars.iter().zip(&values) {
+            self.local.add_linear(vec![1], vec![var], Relation::Eq, value as i64);
         }
         primitives::instantiation(&mut self.solver, &vars, &values);
         Ok(())
@@ -730,6 +760,7 @@ impl PyModel {
         if vars.is_empty() {
             return Err(PyValueError::new_err("minimum requires at least one variable"));
         }
+        self.local.add_extremum(vars.clone(), true, Relation::Eq, LocalRhs::Var(target));
         primitives::minimum(&mut self.solver, target, &vars);
         Ok(())
     }
@@ -740,6 +771,7 @@ impl PyModel {
         if vars.is_empty() {
             return Err(PyValueError::new_err("maximum requires at least one variable"));
         }
+        self.local.add_extremum(vars.clone(), false, Relation::Eq, LocalRhs::Var(target));
         primitives::maximum(&mut self.solver, target, &vars);
         Ok(())
     }
@@ -751,6 +783,7 @@ impl PyModel {
         }
         let index = one_id_for(self.id, index)?;
         let value = one_id_for(self.id, value)?;
+        self.local.add_element(array.clone(), index, value, 0);
         primitives::element(&mut self.solver, &array, index, value);
         Ok(())
     }
@@ -761,13 +794,18 @@ impl PyModel {
         }
         let index = one_id_for(self.id, index)?;
         let value = one_id_for(self.id, value)?;
+        // LS has no constant-array element; model it as element over fixed vars.
+        let const_vars: Vec<VarId> = array.iter().map(|&v| self.const_var(v)).collect();
+        self.local.add_element(const_vars, index, value, 0);
         primitives::element_const(&mut self.solver, &array, index, value);
         Ok(())
     }
 
     fn count(&mut self, vars: &Bound<'_, PyAny>, value: i32, relation: &str, k: i64) -> PyResult<()> {
         let vars = ids_for(self.id, &var_list_from_py(vars)?)?;
-        count::count(&mut self.solver, &vars, value, parse_relation(relation)?, k);
+        let rel = parse_relation(relation)?;
+        self.local.add_count(vars.clone(), vec![value], rel, LocalRhs::Const(k));
+        count::count(&mut self.solver, &vars, value, rel, k);
         Ok(())
     }
 
@@ -777,13 +815,16 @@ impl PyModel {
         if values.len() != low.len() || values.len() != high.len() {
             return Err(PyValueError::new_err("values, low, and high must have the same length"));
         }
+        self.local.add_cardinality(vars.clone(), values.clone(), low.clone(), high.clone(), closed);
         count::cardinality(&mut self.solver, &vars, &values, &low, &high, closed);
         Ok(())
     }
 
     fn n_values(&mut self, vars: &Bound<'_, PyAny>, relation: &str, k: i64) -> PyResult<()> {
         let vars = ids_for(self.id, &var_list_from_py(vars)?)?;
-        count::n_values(&mut self.solver, &vars, parse_relation(relation)?, k);
+        let rel = parse_relation(relation)?;
+        self.local.add_n_values(vars.clone(), rel, LocalRhs::Const(k));
+        count::n_values(&mut self.solver, &vars, rel, k);
         Ok(())
     }
 
@@ -793,6 +834,7 @@ impl PyModel {
         if tuples.iter().any(|tuple| tuple.len() != vars.len()) {
             return Err(PyValueError::new_err("every tuple must match the variable arity"));
         }
+        self.local.add_extension(vars.clone(), tuples.clone(), positive);
         table::extension(&mut self.solver, &vars, &tuples, positive);
         Ok(())
     }
@@ -804,6 +846,7 @@ impl PyModel {
         if x.len() != y.len() {
             return Err(PyValueError::new_err("lex vectors must have the same length"));
         }
+        self.local.add_lex_chain(vec![x.clone(), y.clone()], strict);
         lex::lex(&mut self.solver, &x, &y, strict);
         Ok(())
     }
@@ -812,6 +855,7 @@ impl PyModel {
     fn lex_chain(&mut self, rows: &Bound<'_, PyAny>, strict: bool) -> PyResult<()> {
         let rows = var_matrix_from_py(rows)?;
         let rows: Vec<Vec<VarId>> = rows.iter().map(|row| ids_for(self.id, row)).collect::<PyResult<_>>()?;
+        self.local.add_lex_chain(rows.clone(), strict);
         lex::lex_chain(&mut self.solver, &rows, strict);
         Ok(())
     }
@@ -822,6 +866,7 @@ impl PyModel {
         if x.len() != y.len() {
             return Err(PyValueError::new_err("channel vectors must have the same length"));
         }
+        self.local.mark_unsupported();
         lex::channel(&mut self.solver, &x, &y);
         Ok(())
     }
@@ -831,6 +876,9 @@ impl PyModel {
         if starts.len() != durations.len() {
             return Err(PyValueError::new_err("starts and durations must have the same length"));
         }
+        let origins: Vec<Vec<VarId>> = starts.iter().map(|&s| vec![s]).collect();
+        let lengths: Vec<Vec<Expr>> = durations.iter().map(|&d| vec![expr::int(d)]).collect();
+        self.local.add_no_overlap(origins, lengths, false);
         scheduling::no_overlap(&mut self.solver, &starts, &durations);
         Ok(())
     }
@@ -840,6 +888,10 @@ impl PyModel {
         if starts.len() != durations.len() || starts.len() != heights.len() {
             return Err(PyValueError::new_err("starts, durations, and heights must have the same length"));
         }
+        // LS cumulative wants per-task duration/height vars; pin constants as fixed vars.
+        let dur_vars: Vec<VarId> = durations.iter().map(|&d| self.const_var(d as i32)).collect();
+        let height_vars: Vec<VarId> = heights.iter().map(|&h| self.const_var(h as i32)).collect();
+        self.local.add_cumulative(starts.clone(), dur_vars, height_vars, LocalRhs::Const(capacity));
         scheduling::cumulative(&mut self.solver, &starts, &durations, &heights, capacity);
         Ok(())
     }
@@ -858,6 +910,7 @@ impl PyModel {
             return Err(PyValueError::new_err("starts, durations, and heights must have the same length"));
         }
         let capacity = one_id_for(self.id, capacity)?;
+        self.local.add_cumulative(starts.clone(), durations.clone(), heights.clone(), LocalRhs::Var(capacity));
         scheduling::cumulative_var(&mut self.solver, &starts, &durations, &heights, capacity);
         Ok(())
     }
@@ -867,6 +920,8 @@ impl PyModel {
         if items.len() != sizes.len() {
             return Err(PyValueError::new_err("items and sizes must have the same length"));
         }
+        let limits: Vec<LocalRhs> = capacities.iter().map(|&c| LocalRhs::Const(c)).collect();
+        self.local.add_bin_packing(items.clone(), sizes.clone(), limits, false);
         scheduling::bin_packing(&mut self.solver, &items, &sizes, &capacities);
         Ok(())
     }
@@ -885,6 +940,7 @@ impl PyModel {
         if vars.len() != weights.len() || vars.len() != profits.len() {
             return Err(PyValueError::new_err("vars, weights, and profits must have the same length"));
         }
+        self.local.mark_unsupported();
         scheduling::knapsack(
             &mut self.solver,
             &vars,
@@ -900,6 +956,7 @@ impl PyModel {
 
     fn circuit(&mut self, successors: &Bound<'_, PyAny>) -> PyResult<()> {
         let successors = ids_for(self.id, &var_list_from_py(successors)?)?;
+        self.local.add_circuit(successors.clone());
         graph::circuit(&mut self.solver, &successors);
         Ok(())
     }
@@ -925,8 +982,21 @@ impl PyModel {
         self.objective = None;
     }
 
-    #[pyo3(signature = (*, search=None, verbose=false))]
-    fn solve(&self, search: Option<&Bound<'_, PyAny>>, verbose: bool) -> PyResult<PySolution> {
+    #[pyo3(signature = (*, search=None, verbose=false, local_search=false, time_limit=None, seed=0))]
+    fn solve(
+        &self,
+        search: Option<&Bound<'_, PyAny>>,
+        verbose: bool,
+        local_search: bool,
+        time_limit: Option<u64>,
+        seed: u64,
+    ) -> PyResult<PySolution> {
+        if local_search {
+            let Some(objective) = &self.objective else {
+                return Err(PyValueError::new_err("local_search=True requires an objective (call model.objective(...))"));
+            };
+            return self.solve_local_search(objective, search, verbose, time_limit, seed);
+        }
         if let Some(objective) = &self.objective {
             return self.solve_optimization(objective, search, verbose);
         }
@@ -973,6 +1043,80 @@ impl PyModel {
 }
 
 impl PyModel {
+    /// Create a fixed (single-value) variable and register it with both the CP
+    /// solver and the LS spec. Used to express constant arrays/durations in the LS
+    /// model, which only takes variable operands.
+    fn const_var(&mut self, value: i32) -> VarId {
+        let id = self.solver.new_var_set(&[value]);
+        self.names.push(None);
+        self.local.add_var(id);
+        id
+    }
+
+    /// Solve a COP with the local-search engine (`solve_fast_cop`) — the same
+    /// incumbent-only LS that powers `--turbo`. Requires an objective and a time
+    /// limit (defaults to 10s, since LS never terminates on its own).
+    fn solve_local_search(
+        &self,
+        objective: &ObjectiveSpec,
+        search: Option<&Bound<'_, PyAny>>,
+        verbose: bool,
+        time_limit: Option<u64>,
+        seed: u64,
+    ) -> PyResult<PySolution> {
+        if let Some(model_id) = objective.expr.model_id {
+            if model_id != self.id {
+                return Err(PyValueError::new_err("objective belongs to a different model"));
+            }
+        }
+        let mut vars = search_ids(self, search, None)?;
+        append_expr_vars(&mut vars, &objective.expr.expr);
+        if verbose {
+            verbose_start(self.names.len(), self.solver.num_propagators(), true);
+            println!("  direction: {}", if objective.minimizing { "min" } else { "max" });
+            println!("  expression: {}", objective.expr.text);
+            println!("  engine: local-search");
+        }
+        let problem = Problem {
+            solver: self.solver.clone(),
+            search: vars.clone(),
+            objective: Some(ProblemObjective::Expr(objective.minimizing, objective.expr.expr.clone())),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let limit = time_limit.unwrap_or(10);
+        {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(limit));
+                stop.store(true, Ordering::SeqCst);
+            });
+        }
+        let config = LsConfig { gls: true, min_conflicts: true, kick_bandit: false };
+        let outcome = solve_fast_cop(problem, self.local.clone(), &stop, seed, config, |value, _solution, _source| {
+            if verbose {
+                println!("  incumbent: {value}");
+            }
+        });
+        let sense = if objective.minimizing { "min" } else { "max" };
+        let solution = match outcome.best {
+            Some((assignment, objective_value)) => make_solution(
+                "SATISFIABLE",
+                &vars,
+                Some(&assignment),
+                Some(objective_value),
+                Some(sense),
+                Some(&objective.expr.text),
+                SolveStats::default(),
+                self.names.len(),
+            ),
+            None => make_solution("UNKNOWN", &vars, None, None, Some(sense), Some(&objective.expr.text), SolveStats::default(), self.names.len()),
+        };
+        if verbose {
+            verbose_finish(&solution);
+        }
+        Ok(solution)
+    }
+
     fn solve_optimization(&self, objective: &ObjectiveSpec, search: Option<&Bound<'_, PyAny>>, verbose: bool) -> PyResult<PySolution> {
         if let Some(model_id) = objective.expr.model_id {
             if model_id != self.id {

@@ -770,6 +770,15 @@ impl LocalSearchSpec {
         self.unsupported
     }
 
+    /// Flag a constraint with no local-search encoding. The engine then declines to
+    /// run (returns no incumbent) rather than searching an incomplete model. Only
+    /// the Python front-end currently posts constraints the LS model can't represent
+    /// (channel, knapsack); the XCSP builder covers everything it posts.
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
+    pub(crate) fn mark_unsupported(&mut self) {
+        self.unsupported += 1;
+    }
+
     fn ensure(&mut self, var: VarId) {
         if self.derived.len() <= var.index() {
             self.derived.resize(var.index() + 1, false);
