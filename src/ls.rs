@@ -1,6 +1,6 @@
 //! Incumbent-only local search for `--fast-cop` runs.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::constraints::linear::Relation;
@@ -16,6 +16,12 @@ const RANDOM_WALK_PERIOD: u64 = 17;
 const RESTART_AFTER: u64 = 200;
 const CONSTRUCTIVE_KICK_PERIOD: u64 = 5;
 const WORD_PLACEMENT_NODE_LIMIT: usize = 20_000;
+/// Min-conflicts (#1b): domains with at most this many values are scanned in full
+/// (cheap and optimal); larger ones use the bounded candidate set.
+const MIN_CONFLICTS_FULL: usize = 24;
+/// Min-conflicts (#1b): random domain samples added to the candidate set on a
+/// large domain, alongside the current value and any structural suggestions.
+const MIN_CONFLICTS_SAMPLES: usize = 8;
 
 #[derive(Clone)]
 pub(crate) enum LocalConstraint {
@@ -24,6 +30,8 @@ pub(crate) enum LocalConstraint {
     AllDifferent(Vec<VarId>),
     AllEqual(Vec<VarId>),
     Extension { vars: Vec<VarId>, tuples: Vec<Vec<i32>> },
+    /// Negative (conflict) table: the listed tuples are forbidden.
+    NegExtension { vars: Vec<VarId>, tuples: Vec<Vec<i32>> },
     Lex { rows: Vec<Vec<VarId>>, strict: bool },
     Count { vars: Vec<VarId>, values: Vec<i32>, rel: Relation, rhs: LocalRhs },
     CountAllowed { vars: Vec<VarId>, values: Vec<i32>, allowed: Vec<i32> },
@@ -54,6 +62,23 @@ pub(crate) struct LocalSearchSpec {
     unsupported: usize,
 }
 
+/// Behaviour toggles for the local-search engine. `--fast-cop` uses the default
+/// (everything off — plain min-conflicts descent); `--turbo` switches on the
+/// autonomous upgrades. See TURBO.md (Tier-B). New toggles are added here as
+/// each Tier-B feature lands.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LsConfig {
+    /// Guided Local Search: at a local minimum, penalise the still-violated
+    /// constraints (bump their weights) so search is pushed off the plateau and
+    /// toward the genuinely hard constraints. TURBO.md §4.2 / #2.
+    pub(crate) gls: bool,
+    /// Min-conflicts value selection: on large domains, evaluate a small candidate
+    /// set (current value + structure-suggested values + random samples) instead
+    /// of scanning the whole domain, so more variables are tried per iteration.
+    /// Only bites when a domain exceeds `MIN_CONFLICTS_FULL`. TURBO.md #1b.
+    pub(crate) min_conflicts: bool,
+}
+
 pub(crate) struct LocalSearchOutcome {
     pub(crate) best: Option<(Vec<i32>, i64)>,
     pub(crate) iterations: u64,
@@ -64,7 +89,7 @@ pub(crate) struct LocalSearchOutcome {
     pub(crate) unsupported: usize,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct Score {
     violation: i64,
     objective: i64,
@@ -124,6 +149,12 @@ struct LocalModel {
     functionals: Vec<Functional>,
     bool_tables: HashMap<(VarId, VarId), Vec<(i32, i32)>>,
     exact_covers: Vec<Vec<VarId>>,
+    /// Incidence index for incremental move scoring: `affected[v]` is the set of
+    /// constraint indices whose violation depends on variable `v`, directly or
+    /// transitively through functionals (a flipped `v` propagates to functional
+    /// targets via `complete()`, so constraints over those targets are included).
+    /// Built once in [`LocalModel::new`]; reused by the delta-scoring move loop.
+    affected: Vec<Vec<usize>>,
 }
 
 // TODO(simplify): the guarded-word placement subsystem below (GuardedWord,
@@ -227,6 +258,167 @@ fn relation_violation(lhs: i64, rel: Relation, rhs: i64) -> i64 {
     }
 }
 
+/// Combine the incompleteness penalty and the (non-negative) sum of constraint
+/// violations into a `Score.violation`, clamping at `i64::MAX` to match the
+/// `saturating_add` of [`LocalModel::score_breakdown`].
+fn combine_violation(penalty: i128, sum: i128) -> i64 {
+    let total = penalty + sum;
+    if total > i64::MAX as i128 {
+        i64::MAX
+    } else {
+        total as i64
+    }
+}
+
+/// GLS-weighted sum of per-constraint violations: `Σ wᵢ·violᵢ`.
+fn weighted_sum(con_viol: &[i64], weights: &[i64]) -> i128 {
+    con_viol.iter().zip(weights).map(|(&v, &w)| i128::from(v) * i128::from(w)).sum()
+}
+
+/// Min-conflicts (#1b) candidate-value set for `var` on a large domain: the current
+/// value (the "stay" baseline), the value any single linear constraint over `var`
+/// would need to hit its rhs boundary, and a few random domain samples. Every value
+/// emitted is a genuine domain member (checked against `value_set`), so the caller
+/// can score it with the same exact delta as a full scan.
+fn min_conflict_candidates(
+    model: &LocalModel,
+    var: VarId,
+    assignment: &[i32],
+    value_set: &HashSet<i32>,
+    seed: u64,
+    iter: u64,
+    out: &mut Vec<i32>,
+) {
+    out.clear();
+    let j = var.index();
+    out.push(assignment[j]);
+    for &c in &model.affected[j] {
+        if let LocalConstraint::Linear { coeffs, vars, rhs, .. } = &model.constraints[c] {
+            if let Some(p) = vars.iter().position(|&v| v == var) {
+                let a = coeffs[p];
+                if a != 0 {
+                    let rest: i64 = coeffs
+                        .iter()
+                        .zip(vars)
+                        .enumerate()
+                        .filter(|(i, _)| *i != p)
+                        .map(|(_, (&co, &v))| co * i64::from(assignment[v.index()]))
+                        .sum();
+                    let target = *rhs - rest;
+                    if target % a == 0 {
+                        if let Ok(v) = i32::try_from(target / a) {
+                            if value_set.contains(&v) {
+                                out.push(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let values = &model.domains[j].values;
+    if !values.is_empty() {
+        for k in 0..MIN_CONFLICTS_SAMPLES as u64 {
+            let pick = mix64(seed ^ iter.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add((j as u64) << 1).wrapping_add(k));
+            out.push(values[(pick as usize) % values.len()]);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+}
+
+/// Append every variable whose value a constraint's violation reads.
+fn constraint_vars(constraint: &LocalConstraint, out: &mut Vec<VarId>) {
+    match constraint {
+        LocalConstraint::Expr(expr) => expr.collect_vars(out),
+        LocalConstraint::Linear { vars, .. }
+        | LocalConstraint::AllDifferent(vars)
+        | LocalConstraint::AllEqual(vars)
+        | LocalConstraint::Extension { vars, .. }
+        | LocalConstraint::NegExtension { vars, .. }
+        | LocalConstraint::CountAllowed { vars, .. }
+        | LocalConstraint::Cardinality { vars, .. } => out.extend(vars.iter().copied()),
+        LocalConstraint::Lex { rows, .. } => {
+            for row in rows {
+                out.extend(row.iter().copied());
+            }
+        }
+        LocalConstraint::Count { vars, rhs, .. } | LocalConstraint::NValues { vars, rhs, .. } | LocalConstraint::Extremum { vars, rhs, .. } => {
+            out.extend(vars.iter().copied());
+            if let LocalRhs::Var(v) = rhs {
+                out.push(*v);
+            }
+        }
+    }
+}
+
+/// Append the input variables a functional reads to compute its target.
+fn functional_inputs(functional: &Functional, out: &mut Vec<VarId>) {
+    match functional {
+        Functional::Expr { expr, .. } => expr.collect_vars(out),
+        Functional::Linear { terms, .. } => out.extend(terms.iter().map(|&(_, v)| v)),
+        Functional::Element { array, index, .. } => {
+            out.push(*index);
+            out.extend(array.iter().copied());
+        }
+        Functional::BoolTable { left, right, .. } => {
+            out.push(*left);
+            out.push(*right);
+        }
+    }
+}
+
+fn functional_target(functional: &Functional) -> VarId {
+    match functional {
+        Functional::Expr { target, .. }
+        | Functional::Linear { target, .. }
+        | Functional::Element { target, .. }
+        | Functional::BoolTable { target, .. } => *target,
+    }
+}
+
+/// Build the [`LocalModel::affected`] incidence index. Seed it with each
+/// constraint's direct variable scope, then walk functionals in reverse
+/// topological order (`functionals` is in forward topo order for `complete()`'s
+/// single pass) pushing each target's dependent-constraint set back onto the
+/// input variables that determine it. The result: `affected[v]` lists every
+/// constraint whose violation can change when `v` is flipped.
+fn build_affected(num_vars: usize, constraints: &[LocalConstraint], functionals: &[Functional]) -> Vec<Vec<usize>> {
+    let mut affected: Vec<Vec<usize>> = vec![Vec::new(); num_vars];
+    let mut scratch = Vec::new();
+    for (ci, constraint) in constraints.iter().enumerate() {
+        scratch.clear();
+        constraint_vars(constraint, &mut scratch);
+        for &v in &scratch {
+            if v.index() < num_vars {
+                affected[v.index()].push(ci);
+            }
+        }
+    }
+    for functional in functionals.iter().rev() {
+        let target = functional_target(functional);
+        if target.index() >= num_vars {
+            continue;
+        }
+        let dependents = affected[target.index()].clone();
+        if dependents.is_empty() {
+            continue;
+        }
+        scratch.clear();
+        functional_inputs(functional, &mut scratch);
+        for &input in &scratch {
+            if input.index() < num_vars {
+                affected[input.index()].extend(dependents.iter().copied());
+            }
+        }
+    }
+    for entry in &mut affected {
+        entry.sort_unstable();
+        entry.dedup();
+    }
+    affected
+}
+
 impl LocalRhs {
     fn value(self, assignment: &[i32]) -> i64 {
         match self {
@@ -270,7 +462,7 @@ impl LocalSearchSpec {
             }
             self.constraints.push(LocalConstraint::Extension { vars, tuples });
         } else {
-            self.mark_unsupported();
+            self.constraints.push(LocalConstraint::NegExtension { vars, tuples });
         }
     }
 
@@ -357,7 +549,8 @@ impl LocalModel {
         let functionals = spec.functionals;
         let bool_tables = bool_tables(&functionals);
         let exact_covers = exact_cover_rows(&constraints, &domains);
-        Ok(Self { domains, mutable, search: problem.search, objective, constraints, functionals, bool_tables, exact_covers })
+        let affected = build_affected(domains.len(), &constraints, &functionals);
+        Ok(Self { domains, mutable, search: problem.search, objective, constraints, functionals, bool_tables, exact_covers, affected })
     }
 
     fn random_assignment(&self, seed: u64) -> Vec<i32> {
@@ -749,6 +942,8 @@ impl LocalModel {
         }
     }
 
+    /// Unweighted score, used for feasibility checks (violation == 0). Independent
+    /// of any GLS weights, since a weighted sum is zero iff the raw sum is.
     fn score(&self, assignment: &mut [i32]) -> Score {
         let mut violation = i64::from(!self.complete(assignment)) * 1_000_000;
         for constraint in &self.constraints {
@@ -756,6 +951,25 @@ impl LocalModel {
         }
         let objective = self.objective_value(assignment).unwrap_or(i64::MAX / 4);
         Score { violation, objective: if self.objective.minimizing() { objective } else { -objective } }
+    }
+
+    /// Score plus the per-constraint violation vector and completeness flag, used
+    /// to seed and maintain the incremental delta-scoring caches. The reported
+    /// `violation` is the GLS-**weighted** constraint sum (`Σ wᵢ·violᵢ`) plus the
+    /// incompleteness penalty; pass all-ones weights for the unweighted sum.
+    fn score_breakdown(&self, assignment: &mut [i32], weights: &[i64]) -> (Score, Vec<i64>, bool) {
+        let complete = self.complete(assignment);
+        let mut con_viol = Vec::with_capacity(self.constraints.len());
+        let mut weighted: i128 = 0;
+        for (i, constraint) in self.constraints.iter().enumerate() {
+            let v = self.violation(constraint, assignment);
+            weighted += i128::from(v) * i128::from(weights[i]);
+            con_viol.push(v);
+        }
+        let penalty = i128::from(!complete) * 1_000_000;
+        let objective = self.objective_value(assignment).unwrap_or(i64::MAX / 4);
+        let objective = if self.objective.minimizing() { objective } else { -objective };
+        (Score { violation: combine_violation(penalty, weighted), objective }, con_viol, complete)
     }
 
     fn violation(&self, constraint: &LocalConstraint, assignment: &[i32]) -> i64 {
@@ -783,6 +997,11 @@ impl LocalModel {
                 } else {
                     1
                 }
+            }
+            LocalConstraint::NegExtension { vars, tuples } => {
+                // Conflict table: every forbidden tuple the assignment matches is a
+                // violation (a gradient, since wildcard tuples may match several).
+                tuples.iter().filter(|tuple| tuple_matches(vars, tuple, assignment)).count() as i64
             }
             LocalConstraint::Lex { rows, strict } => lex_chain_violation(rows, *strict, assignment),
             LocalConstraint::Count { vars, values, rel, rhs } => {
@@ -975,6 +1194,7 @@ pub(crate) fn solve_fast_cop<F>(
     spec: LocalSearchSpec,
     stop: &AtomicBool,
     seed: u64,
+    config: LsConfig,
     mut on_improve: F,
 ) -> LocalSearchOutcome
 where
@@ -1001,8 +1221,23 @@ where
     let minimizing = model.objective.minimizing();
     let objective_kicks = model.objective_kicks();
     let constructive_start = model.has_extension();
+    // GLS penalty weights, one per constraint (all 1 = unweighted min-conflicts).
+    // Only mutated when `config.gls` is on (i.e. `--turbo`); they persist across
+    // restarts so effort keeps accumulating on the genuinely hard constraints.
+    let mut weights: Vec<i64> = vec![1; model.constraints.len()];
     let mut assignment = if constructive_start { model.constructive_assignment(seed) } else { model.random_assignment(seed) };
-    let mut current = model.score(&mut assignment);
+    let (mut current, mut con_viol, mut complete_now) = model.score_breakdown(&mut assignment, &weights);
+    let mut viol_sum: i128 = weighted_sum(&con_viol, &weights);
+    // Reusable scratch for trial moves; never reallocated inside the loop.
+    let mut work = assignment.clone();
+    // Min-conflicts (#1b): O(1) membership set per large domain, built once. Empty
+    // when the toggle is off. `cand_values` is the reused candidate buffer.
+    let value_sets: Vec<Option<HashSet<i32>>> = if config.min_conflicts {
+        model.domains.iter().map(|d| (d.values.len() > MIN_CONFLICTS_FULL).then(|| d.values.iter().copied().collect())).collect()
+    } else {
+        Vec::new()
+    };
+    let mut cand_values: Vec<i32> = Vec::new();
     let mut source = if constructive_start { "constructive" } else { "local-search" };
     let mut best_solution: Option<(Vec<i32>, i64)> = None;
     let mut iterations = 0;
@@ -1012,7 +1247,7 @@ where
 
     while !stop.load(Ordering::Relaxed) {
         iterations += 1;
-        if current.violation == 0 {
+        if complete_now && current.violation == 0 {
             if let Some(value) = model.objective_value(&assignment) {
                 if better_value(minimizing, value, best_solution.as_ref().map(|(_, v)| *v)) {
                     let solution = model.search_solution(&assignment);
@@ -1027,7 +1262,8 @@ where
             let restart_seed = seed ^ mix64(iterations);
             assignment =
                 if constructive_start { model.constructive_assignment(restart_seed) } else { model.random_assignment(restart_seed) };
-            current = model.score(&mut assignment);
+            (current, con_viol, complete_now) = model.score_breakdown(&mut assignment, &weights);
+            viol_sum = weighted_sum(&con_viol, &weights);
             source = if constructive_start { "constructive" } else { "local-search" };
             stagnant = 0;
             continue;
@@ -1035,9 +1271,12 @@ where
 
         if constructive_start && iterations.is_multiple_of(CONSTRUCTIVE_KICK_PERIOD) {
             let mut trial = model.constructive_assignment(seed ^ mix64(iterations));
-            let score = model.score(&mut trial);
+            let (score, trial_con_viol, trial_complete) = model.score_breakdown(&mut trial, &weights);
             if score < current {
                 assignment = trial;
+                con_viol = trial_con_viol;
+                viol_sum = weighted_sum(&con_viol, &weights);
+                complete_now = trial_complete;
                 current = score;
                 source = "constructive";
                 moves += 1;
@@ -1048,7 +1287,8 @@ where
 
         if let Some(trial) = objective_kick(&model, &assignment, &objective_kicks, seed, iterations) {
             assignment = trial;
-            current = model.score(&mut assignment);
+            (current, con_viol, complete_now) = model.score_breakdown(&mut assignment, &weights);
+            viol_sum = weighted_sum(&con_viol, &weights);
             source = "local-search";
             moves += 1;
             stagnant = 0;
@@ -1057,37 +1297,130 @@ where
 
         let focused = model.focused_repair_vars(&assignment, seed, iterations);
         let candidates = if focused.is_empty() { candidate_vars(&model.mutable, seed, iterations) } else { focused };
-        let mut best_move: Option<(Score, Vec<i32>)> = None;
+        // Incremental delta scoring: evaluate `x_j := value` by re-running only the
+        // constraints in `affected[j]` against a reused `work` buffer, instead of
+        // cloning the assignment and rescoring every constraint. `complete()` still
+        // runs in full (functional targets are folded into `affected[j]`, so the
+        // delta over those constraints is exact). See TURBO.md §4.1 / first PR.
+        let mut best_move: Option<(Score, usize, i32)> = None;
         for var in candidates {
-            let domain = &model.domains[var.index()].values;
-            for &value in domain {
-                if value == assignment[var.index()] {
+            let j = var.index();
+            let old_val = assignment[j];
+            let affected = &model.affected[j];
+            // On large domains (#1b) score only a bounded candidate set; otherwise
+            // scan the full domain as before.
+            let candidate_values: &[i32] = if config.min_conflicts && value_sets.get(j).and_then(Option::as_ref).is_some() {
+                min_conflict_candidates(&model, var, &assignment, value_sets[j].as_ref().unwrap(), seed, iterations, &mut cand_values);
+                &cand_values
+            } else {
+                &model.domains[j].values
+            };
+            for &value in candidate_values {
+                if value == old_val {
                     continue;
                 }
-                let mut trial = assignment.clone();
-                trial[var.index()] = value;
-                let score = model.score(&mut trial);
-                if best_move.as_ref().is_none_or(|(best, _)| score < *best) {
-                    best_move = Some((score, trial));
+                work.copy_from_slice(&assignment);
+                work[j] = value;
+                let trial_complete = model.complete(&mut work);
+                let mut delta: i128 = 0;
+                for &c in affected {
+                    delta += (i128::from(model.violation(&model.constraints[c], &work)) - i128::from(con_viol[c])) * i128::from(weights[c]);
+                }
+                let trial_penalty = i128::from(!trial_complete) * 1_000_000;
+                let violation = combine_violation(trial_penalty, viol_sum + delta);
+                let objective = model.objective_value(&work).unwrap_or(i64::MAX / 4);
+                let objective = if minimizing { objective } else { -objective };
+                let score = Score { violation, objective };
+                if best_move.as_ref().is_none_or(|&(best, _, _)| score < best) {
+                    best_move = Some((score, j, value));
                 }
             }
         }
 
         let random_walk = iterations.is_multiple_of(RANDOM_WALK_PERIOD);
-        if let Some((score, trial)) = best_move {
+        let mut moved = false;
+        if let Some((score, j, value)) = best_move {
             if score < current || random_walk {
-                assignment = trial;
+                assignment[j] = value;
+                complete_now = model.complete(&mut assignment);
+                for &c in &model.affected[j] {
+                    let updated = model.violation(&model.constraints[c], &assignment);
+                    viol_sum += (i128::from(updated) - i128::from(con_viol[c])) * i128::from(weights[c]);
+                    con_viol[c] = updated;
+                }
                 current = score;
                 source = "local-search";
                 moves += 1;
-                stagnant = 0;
-            } else {
-                stagnant += 1;
+                moved = true;
+                #[cfg(debug_assertions)]
+                {
+                    let mut check = assignment.clone();
+                    let (full, _, full_complete) = model.score_breakdown(&mut check, &weights);
+                    debug_assert_eq!(full, current, "incremental LS score drifted from full recompute");
+                    debug_assert_eq!(full_complete, complete_now, "LS completeness cache drifted");
+                    debug_assert_eq!(
+                        full.violation,
+                        combine_violation(i128::from(!complete_now) * 1_000_000, viol_sum),
+                        "LS violation-sum cache drifted"
+                    );
+                }
             }
+        }
+
+        if moved {
+            stagnant = 0;
         } else {
             stagnant += 1;
+            // Guided Local Search: stuck at a local minimum while still infeasible.
+            // Penalise every currently-violated constraint, reshaping the weighted
+            // landscape so the next descent is pushed toward the hard constraints.
+            if config.gls && complete_now && current.violation > 0 {
+                let mut bumped = false;
+                for (c, weight) in weights.iter_mut().enumerate() {
+                    if con_viol[c] > 0 {
+                        *weight += 1;
+                        bumped = true;
+                    }
+                }
+                if bumped {
+                    viol_sum = weighted_sum(&con_viol, &weights);
+                    current = Score { violation: combine_violation(0, viol_sum), objective: current.objective };
+                }
+            }
         }
     }
 
     LocalSearchOutcome { best: best_solution, iterations, moves, restarts, constraints, functionals, unsupported }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_affected, Functional, LocalConstraint};
+    use crate::constraints::linear::Relation;
+    use crate::ids::VarId;
+
+    /// `affected[v]` must include constraints reached through functionals: when a
+    /// flipped variable determines a functional target via `complete()`, every
+    /// constraint over that target depends on it. This transitive case is the
+    /// subtle part of the incremental delta-scoring incidence index.
+    #[test]
+    fn affected_index_follows_functional_dependence() {
+        let v = VarId;
+        // c0: x0 + x1 <= 3   c1: allDifferent(x2, x3)   c2: x4 >= 1
+        let constraints = vec![
+            LocalConstraint::Linear { coeffs: vec![1, 1], vars: vec![v(0), v(1)], rel: Relation::Le, rhs: 3 },
+            LocalConstraint::AllDifferent(vec![v(2), v(3)]),
+            LocalConstraint::Linear { coeffs: vec![1], vars: vec![v(4)], rel: Relation::Ge, rhs: 1 },
+        ];
+        // x4 := x0 (functional), so flipping x0 changes x4 and hence c2.
+        let functionals = vec![Functional::Linear { target: v(4), coeff: 1, terms: vec![(1, v(0))], rhs: 0 }];
+
+        let affected = build_affected(5, &constraints, &functionals);
+
+        assert_eq!(affected[0], vec![0, 2], "x0: direct c0 plus transitive c2 via target x4");
+        assert_eq!(affected[1], vec![0]);
+        assert_eq!(affected[2], vec![1]);
+        assert_eq!(affected[3], vec![1]);
+        assert_eq!(affected[4], vec![2]);
+    }
 }

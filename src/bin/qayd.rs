@@ -44,7 +44,7 @@ fn is_instance(arg: &str) -> bool {
 }
 
 const USAGE: &str =
-    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--fast-cop] [--split] [--probe N] [--lns N] [--learn-csp] <instance.xml[.lzma|.xz]>";
+    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--fast-cop] [--turbo] [--split] [--probe N] [--lns N] [--learn-csp] <instance.xml[.lzma|.xz]>";
 
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
@@ -79,6 +79,7 @@ fn main() {
     let mut seed: Option<u64> = None;
     let mut workers: Option<usize> = None;
     let mut fast_cop = false;
+    let mut turbo = false;
     let mut split = false;
     let mut probes = 0;
     let mut lns = 0;
@@ -94,6 +95,7 @@ fn main() {
             "--seed" => seed = Some(parse(it.next().map(String::as_str), "--seed needs an unsigned integer")),
             "-p" | "--threads" => workers = Some(positive(it.next().map(String::as_str), "-p/--threads needs a positive integer")),
             "--fast-cop" => fast_cop = true,
+            "--turbo" => turbo = true,
             "--split" => split = true,
             "--probe" => probes = positive(it.next().map(String::as_str), "--probe needs a positive integer"),
             "--lns" => lns = positive(it.next().map(String::as_str), "--lns needs a positive integer"),
@@ -112,7 +114,10 @@ fn main() {
         usage();
     }
     let seed = seed.unwrap_or_else(|| std::env::var("RANDOMSEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
-    if fast_cop && time_limit.is_none() {
+    if fast_cop && turbo {
+        fail("--fast-cop and --turbo are mutually exclusive");
+    }
+    if (fast_cop || turbo) && time_limit.is_none() {
         time_limit = Some(240);
     }
     let workers = match workers {
@@ -137,5 +142,12 @@ fn main() {
         });
     }
 
-    run_instance(&path, verbose, &stop, qayd::xcsp::RunOptions { seed, workers, fast_cop, split, probes, lns, learn_csp });
+    let mode = if turbo {
+        qayd::xcsp::Mode::Turbo
+    } else if fast_cop {
+        qayd::xcsp::Mode::FastCop
+    } else {
+        qayd::xcsp::Mode::Default
+    };
+    run_instance(&path, verbose, &stop, qayd::xcsp::RunOptions { seed, workers, mode, split, probes, lns, learn_csp });
 }

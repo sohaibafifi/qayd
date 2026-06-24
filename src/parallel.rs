@@ -10,12 +10,27 @@ use crate::ids::VarId;
 use crate::lcg::clause::{ClauseSharing, SharedClausePool};
 use crate::lcg::lit::Lit;
 use crate::lns::{fix_neighborhood, LnsState};
-use crate::ls::{solve_fast_cop, LocalSearchSpec};
+use crate::ls::{solve_fast_cop, LocalSearchSpec, LsConfig};
 use crate::problem::{Objective, Problem};
 use crate::search::{
     decide_sat_shared_seeded, find_one_seeded, optimize_seeded, probe_seeded, split_cube_seeded, Objective as SearchObjective, SolveStats,
 };
 use crate::store::Solver;
+
+/// Search strategy selected on the command line. `FastCop` and `Turbo` are both
+/// local-search-first incumbent modes (no optimality proof); `Turbo` additionally
+/// enables the autonomous local-search upgrades (see TURBO.md). They are mutually
+/// exclusive, so they live in one enum rather than separate booleans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// Full solver: propagation + branch-and-bound / LCG; proves optimality.
+    #[default]
+    Default,
+    /// Incumbent-only local search; do not try to prove optimality.
+    FastCop,
+    /// Autonomous local-search-first mode (incumbent-only). See TURBO.md.
+    Turbo,
+}
 
 /// Solver execution settings. Parallel search is opt-in with `workers > 1`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,8 +39,8 @@ pub struct RunOptions {
     pub seed: u64,
     /// Number of independent portfolio workers.
     pub workers: usize,
-    /// Optimize incumbent quality only; do not try to prove optimality.
-    pub fast_cop: bool,
+    /// Search strategy.
+    pub mode: Mode,
     /// Split the search space into disjoint proof jobs.
     pub split: bool,
     /// Number of workers dedicated to optimistic objective probes.
@@ -36,9 +51,26 @@ pub struct RunOptions {
     pub learn_csp: bool,
 }
 
+impl RunOptions {
+    /// Incumbent-only local-search dispatch (either `--fast-cop` or `--turbo`).
+    pub(crate) fn local_search(&self) -> bool {
+        matches!(self.mode, Mode::FastCop | Mode::Turbo)
+    }
+
+    /// The classic `--fast-cop` mode specifically.
+    pub(crate) fn fast_cop(&self) -> bool {
+        self.mode == Mode::FastCop
+    }
+
+    /// The autonomous `--turbo` mode specifically.
+    pub(crate) fn turbo(&self) -> bool {
+        self.mode == Mode::Turbo
+    }
+}
+
 impl Default for RunOptions {
     fn default() -> Self {
-        Self { seed: 0, workers: 1, fast_cop: false, split: false, probes: 0, lns: 0, learn_csp: false }
+        Self { seed: 0, workers: 1, mode: Mode::Default, split: false, probes: 0, lns: 0, learn_csp: false }
     }
 }
 
@@ -60,10 +92,10 @@ pub(crate) fn normalize_options(has_objective: bool, var_objective: bool, option
     if !has_objective {
         // CSP runs a clause-sharing find-one/UNSAT portfolio; none of the
         // COP-only worker roles apply.
-        return RunOptions { workers, fast_cop: false, split: false, probes: 0, lns: 0, ..options };
+        return RunOptions { workers, split: false, probes: 0, lns: 0, ..options };
     }
-    if options.fast_cop {
-        return RunOptions { workers, fast_cop: true, split: false, probes: 0, lns: 0, learn_csp: false, ..options };
+    if options.local_search() {
+        return RunOptions { workers, split: false, probes: 0, lns: 0, learn_csp: false, ..options };
     }
     if workers == 1 {
         return RunOptions { workers, split: false, probes: 0, lns: 0, ..options };
@@ -82,14 +114,21 @@ pub(crate) fn normalize_options(has_objective: bool, var_objective: bool, option
 }
 
 pub(crate) fn worker_roles(has_objective: bool, options: RunOptions) -> String {
-    if has_objective && options.fast_cop {
-        return format!("incumbent {}", options.workers);
+    if has_objective && options.local_search() {
+        return format!("{} {}", if options.turbo() { "turbo" } else { "incumbent" }, options.workers);
     }
     if !has_objective {
         return if options.workers == 1 { "sequential 1".to_string() } else { format!("portfolio {}", options.workers) };
     }
     if options.workers == 1 {
-        return format!("{} 1", if options.fast_cop { "incumbent" } else { "sequential" });
+        let label = if options.turbo() {
+            "turbo"
+        } else if options.fast_cop() {
+            "incumbent"
+        } else {
+            "sequential"
+        };
+        return format!("{label} 1");
     }
     let incumbent = fast_incumbent_workers(has_objective, options);
     let regular = options.workers - options.probes - options.lns - incumbent;
@@ -107,7 +146,7 @@ pub(crate) fn worker_roles(has_objective: bool, options: RunOptions) -> String {
 }
 
 fn fast_incumbent_workers(has_objective: bool, options: RunOptions) -> usize {
-    usize::from(has_objective && !options.fast_cop && options.workers > options.probes + options.lns + 1)
+    usize::from(has_objective && !options.local_search() && options.workers > options.probes + options.lns + 1)
 }
 
 type Cube = Vec<Lit>;
@@ -459,7 +498,7 @@ fn run_incumbent_worker(
     tx: &mpsc::Sender<WorkerMsg>,
 ) {
     let validator = model.clone();
-    solve_fast_cop(model, local, &shared.cancel, seed, |_, solution, _| {
+    solve_fast_cop(model, local, &shared.cancel, seed, LsConfig::default(), |_, solution, _| {
         if let Some((solution, value)) = validated_incumbent(&validator, solution) {
             shared.report_improvement(tx, value, &solution, WorkerSource { kind: "incumbent", worker });
         }

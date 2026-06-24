@@ -13,12 +13,12 @@ use std::time::Instant;
 use xcsp3_rust_parser::xcsp_runner::XcspRunner;
 
 use crate::ids::VarId;
-use crate::ls::{solve_fast_cop, LocalSearchOutcome, LocalSearchSpec};
+use crate::ls::{solve_fast_cop, LocalSearchOutcome, LocalSearchSpec, LsConfig};
 use crate::parallel::{normalize_options, solve_cop, solve_csp, worker_roles, CspOutcome, ParallelOutcome};
 use crate::problem::{Objective, Problem};
 use crate::search::{decide_sat_seeded, optimize_fast_seeded, optimize_seeded, SolveStats};
 
-pub use crate::parallel::RunOptions;
+pub use crate::parallel::{Mode, RunOptions};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -243,8 +243,8 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
     let mut xcsp = parse_problem(&path.0)?;
     let has_objective = xcsp.problem.objective.is_some();
     let var_objective = xcsp.problem.var_objective().is_some();
-    if options.fast_cop && !has_objective {
-        return Err("--fast-cop requires a COP instance".to_string());
+    if options.local_search() && !has_objective {
+        return Err("--fast-cop/--turbo requires a COP instance".to_string());
     }
     let symbolic_probes_disabled = has_objective && !var_objective && options.probes > 0;
     let options = normalize_options(has_objective, var_objective, options);
@@ -256,8 +256,8 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
         let kind = if xcsp.problem.objective.is_some() { "COP" } else { "CSP" };
         writeln!(w, "c qayd XCSP3").map_err(io_err)?;
         writeln!(w, "c type {kind}").map_err(io_err)?;
-        if options.fast_cop {
-            writeln!(w, "c mode fast-cop").map_err(io_err)?;
+        if options.local_search() {
+            writeln!(w, "c mode {}", if options.turbo() { "turbo" } else { "fast-cop" }).map_err(io_err)?;
             writeln!(w, "c effort incumbent").map_err(io_err)?;
         }
         writeln!(w, "c variables {}", xcsp.problem.solver.store.num_vars()).map_err(io_err)?;
@@ -299,7 +299,10 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
         return Ok(());
     }
 
-    if options.fast_cop && options.workers > 1 {
+    // `--turbo` is local-search-first: always run the LS engine (even single
+    // worker). `--fast-cop` keeps its existing dispatch (CP fast path at one
+    // worker, LS portfolio above that).
+    if options.turbo() || (options.local_search() && options.workers > 1) {
         let XcspProblem { problem, local, output } = xcsp;
         let result = solve_fast_cop_parallel(problem, local, verbose, stop, w, options)?;
         write_fast_cop_result(w, &output, result, verbose)?;
@@ -339,6 +342,9 @@ fn solve_fast_cop_parallel<W: Write>(
     options: RunOptions,
 ) -> Result<LocalSearchOutcome, String> {
     let minimizing = problem.objective.as_ref().is_none_or(Objective::minimizing);
+    // `--turbo` turns on the autonomous local-search upgrades (GLS, …); `--fast-cop`
+    // keeps the plain min-conflicts descent.
+    let ls_config = LsConfig { gls: options.turbo(), min_conflicts: options.turbo() };
     let (tx, rx) = mpsc::channel();
     let mut printed = None;
     let mut summary = None;
@@ -351,7 +357,7 @@ fn solve_fast_cop_parallel<W: Write>(
             let local = local.clone();
             scope.spawn(move || {
                 let seed = options.seed.wrapping_add(worker as u64);
-                let result = solve_fast_cop(problem, local, stop, seed, |value, _, source| {
+                let result = solve_fast_cop(problem, local, stop, seed, ls_config, |value, _, source| {
                     let _ = tx.send(FastCopMsg::Improved { value, source, worker });
                 });
                 let _ = tx.send(FastCopMsg::Done(result));
@@ -455,8 +461,8 @@ fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w
         Some(objective) => {
             let minimizing = objective.minimizing();
             let mut io_err: Option<std::io::Error> = None;
-            let source = if options.fast_cop { "cp" } else { "sequential" };
-            let (best, stats, complete) = if options.fast_cop {
+            let source = if options.local_search() { "cp" } else { "sequential" };
+            let (best, stats, complete) = if options.local_search() {
                 optimize_fast_seeded(
                     &mut solver,
                     &vars,
@@ -479,7 +485,7 @@ fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w
                 return Err(e.to_string());
             }
             let interrupted = stop.load(Ordering::Relaxed);
-            write_optimization_result(w, &output, best, stats, complete && !options.fast_cop, interrupted, verbose)
+            write_optimization_result(w, &output, best, stats, complete && !options.local_search(), interrupted, verbose)
         }
     }
 }
