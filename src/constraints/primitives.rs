@@ -402,6 +402,56 @@ pub fn element(solver: &mut Solver, array: &[VarId], idx: VarId, value: VarId) {
     solver.post(Box::new(Element { array: array.to_vec(), idx, value, buf: Vec::new() }));
 }
 
+/// `value = array[idx]`, 0-based, where `array` is constant.
+#[derive(Clone)]
+struct ElementConst {
+    array: Vec<i32>,
+    idx: VarId,
+    value: VarId,
+    buf: Vec<i32>,
+}
+
+impl Propagator for ElementConst {
+    fn register(&mut self, store: &mut Store, me: PropId) {
+        store.subscribe(self.idx, me, Event::DomainChange);
+        store.subscribe(self.value, me, Event::DomainChange);
+    }
+
+    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+        let n = self.array.len() as i32;
+        store.remove_below(self.idx, 0)?;
+        store.remove_above(self.idx, n - 1)?;
+
+        self.buf.clear();
+        self.buf.extend(store.values(self.idx));
+        for &i in &self.buf {
+            if !store.contains(self.value, self.array[i as usize]) {
+                store.remove(self.idx, i)?;
+            }
+        }
+
+        if store.is_fixed(self.idx) {
+            store.fix(self.value, self.array[store.value(self.idx) as usize])?;
+        } else {
+            self.buf.clear();
+            self.buf.extend(store.values(self.value));
+            for &val in &self.buf {
+                let supported = store.values(self.idx).any(|i| self.array[i as usize] == val);
+                if !supported {
+                    store.remove(self.value, val)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Post `value = array[idx]` for a constant array.
+pub fn element_const(solver: &mut Solver, array: &[i32], idx: VarId, value: VarId) {
+    assert!(!array.is_empty(), "elementConst: empty array");
+    solver.post(Box::new(ElementConst { array: array.to_vec(), idx, value, buf: Vec::new() }));
+}
+
 // ---------------------------------------------------------------------------
 // allDifferent (Régin, domain-consistent)
 // ---------------------------------------------------------------------------

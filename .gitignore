@@ -3,3 +3,6 @@
 /tests/
 /vendor/
 /frontends/flatzinc/tests/
+__pycache__/
+*.py[cod]
+*.so

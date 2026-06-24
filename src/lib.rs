@@ -30,6 +30,8 @@ mod ls;
 mod parallel;
 mod problem;
 pub mod propagator;
+#[cfg(feature = "python")]
+mod python;
 pub mod search;
 pub mod store;
 pub mod trail;
