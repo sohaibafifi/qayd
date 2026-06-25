@@ -108,7 +108,7 @@ pub(crate) fn decide_sat_seeded(solver: &mut Solver, vars: &[VarId], stop: &Atom
 /// Like [`decide_sat_seeded`], cooperating in a CSP portfolio: learned clauses
 /// (sound model consequences, never solution-blocking) are exchanged through
 /// `clause_sharing`. `fast` picks the shorter restart schedule to diversify
-/// workers. Find-one/UNSAT only — never used for enumeration.
+/// workers. Find-one/UNSAT only - never used for enumeration.
 pub(crate) fn decide_sat_shared_seeded(
     solver: &mut Solver,
     vars: &[VarId],

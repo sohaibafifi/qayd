@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "qayd"
-version = "0.7.1"
+version = "0.9.0"
 dependencies = [
  "ctrlc",
  "lzma-rs",
@@ -227,7 +227,7 @@ dependencies = [
 
 [[package]]
 name = "qayd-flatzinc"
-version = "0.7.1"
+version = "0.9.0"
 dependencies = [
  "qayd",
 ]

@@ -186,7 +186,7 @@ struct Score {
     objective: i64,
 }
 
-// Restart is deliberately NOT a bandit operator — see the stagnation fallback in
+// Restart is deliberately NOT a bandit operator - see the stagnation fallback in
 // the search loop. These are the refine operators the bandit chooses among.
 const KICK_OPERATOR_COUNT: usize = 3;
 
@@ -2027,7 +2027,7 @@ where
                     // Descent-only: apply the best single-variable move only when it
                     // improves. (Adding random-walk sideways moves here was tested and
                     // both diluted the exploration that helps timetabling and did not
-                    // recover the descent-bound regression — net worse on both.)
+                    // recover the descent-bound regression - net worse on both.)
                     if let Some((score, j, value)) = best_single_variable_move(
                         &model,
                         &assignment,

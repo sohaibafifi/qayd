@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pyo3::class::basic::CompareOp;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -16,6 +16,7 @@ use crate::constraints::linear::{self, Relation};
 use crate::constraints::primitives;
 use crate::constraints::scheduling;
 use crate::constraints::table;
+use crate::collection;
 use crate::expr::{self, Expr};
 use crate::ids::VarId;
 use crate::ls::{solve_fast_cop, LocalRhs, LocalSearchSpec, LsConfig};
@@ -56,6 +57,29 @@ struct PyExpr {
     inner: ExprLike,
 }
 
+/// A list (set) decision variable handle: one of the lists the universe is
+/// partitioned among. Carries its owning model and the generation of the
+/// `list_vars` call that created it, so stale or cross-model use is rejected.
+#[pyclass(name = "ListVar", module = "qayd", skip_from_py_object)]
+#[derive(Clone)]
+struct PyListVar {
+    model_id: u64,
+    gen: u64,
+    index: u32,
+}
+
+#[pymethods]
+impl PyListVar {
+    #[getter]
+    fn index(&self) -> usize {
+        self.index as usize
+    }
+
+    fn __repr__(&self) -> String {
+        format!("ListVar({})", self.index)
+    }
+}
+
 #[pyclass(name = "Constraint", module = "qayd", skip_from_py_object)]
 #[derive(Clone)]
 struct PyConstraint {
@@ -87,6 +111,8 @@ struct PySolution {
     objective_expr: Option<String>,
     values: Vec<Option<i32>>,
     stats: PySolveStats,
+    /// List variable contents, set only for collection (list) models.
+    routes: Option<Vec<Vec<i32>>>,
 }
 
 #[derive(Clone)]
@@ -104,6 +130,17 @@ struct PyModel {
     /// Local-search model built in parallel with the CP posts, so `--turbo`-style
     /// LS (`solve(local_search=True)`) can run on the same model.
     local: LocalSearchSpec,
+    /// Set once `list_vars` is called: the universe of items partitioned among
+    /// the list variables. Its presence makes `solve()` dispatch to the
+    /// collection engine instead of the integer CP/LS path.
+    col_universe: Option<Vec<i32>>,
+    col_lists: usize,
+    /// Bumped on each `list_vars` call so route handles from an earlier call (or
+    /// another model) are rejected instead of silently aliasing the wrong list.
+    col_gen: u64,
+    col_minimize: bool,
+    col_objective: Vec<collection::Reduction>,
+    col_constraints: Vec<collection::Constraint>,
 }
 
 impl PyIntVar {
@@ -194,6 +231,7 @@ fn one_id_for(model_id: u64, var: &PyIntVar) -> PyResult<VarId> {
     Ok(VarId(var.index))
 }
 
+
 fn search_ids(model: &PyModel, search: Option<&Bound<'_, PyAny>>, extra: Option<VarId>) -> PyResult<Vec<VarId>> {
     let mut vars = match search {
         Some(obj) if !obj.is_none() => ids_for(model.id, &var_list_from_py(obj)?)?,
@@ -217,6 +255,7 @@ fn append_expr_vars(vars: &mut Vec<VarId>, expr: &Expr) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_solution(
     status: &str,
     vars: &[VarId],
@@ -240,6 +279,7 @@ fn make_solution(
         objective_expr: objective_expr.map(str::to_string),
         values,
         stats: stats.into(),
+        routes: None,
     }
 }
 
@@ -554,6 +594,13 @@ impl PySolution {
         self.objective_expr.clone()
     }
 
+    /// List variable contents (one list per list variable), or `None` for an
+    /// integer model.
+    #[getter]
+    fn routes(&self) -> Option<Vec<Vec<i32>>> {
+        self.routes.clone()
+    }
+
     #[getter]
     fn stats(&self) -> PySolveStats {
         self.stats.clone()
@@ -597,6 +644,12 @@ impl PyModel {
             names: Vec::new(),
             objective: None,
             local: LocalSearchSpec::default(),
+            col_universe: None,
+            col_lists: 0,
+            col_gen: 0,
+            col_minimize: true,
+            col_objective: Vec::new(),
+            col_constraints: Vec::new(),
         }
     }
 
@@ -662,6 +715,12 @@ impl PyModel {
     }
 
     fn add(&mut self, constraint: &Bound<'_, PyAny>) -> PyResult<()> {
+        // A term comparison is a constraint on the list it references.
+        if let Ok(lc) = constraint.extract::<PyRef<'_, PyListConstraint>>() {
+            self.check_term_scope(lc.model_id, lc.gen)?;
+            self.col_constraints.push(collection::Constraint { reduction: lc.reduction.clone(), op: lc.op, rhs: lc.rhs });
+            return Ok(());
+        }
         if let Ok(constraint) = constraint_from_py(constraint) {
             if let Some(model_id) = constraint.inner.model_id {
                 if model_id != self.id {
@@ -926,6 +985,7 @@ impl PyModel {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn knapsack(
         &mut self,
         vars: &Bound<'_, PyAny>,
@@ -961,8 +1021,49 @@ impl PyModel {
         Ok(())
     }
 
+    /// Declare `k` list variables that partition `universe` among them. Their
+    /// presence switches `solve()` to the collection engine. Objective and
+    /// constraints are added as reductions (e.g. `route_cost`, `list_sum`).
+    #[pyo3(signature = (k, universe))]
+    fn list_vars(&mut self, k: usize, universe: Vec<i32>) -> PyResult<Vec<PyListVar>> {
+        if universe.is_empty() {
+            return Err(PyValueError::new_err("list universe cannot be empty"));
+        }
+        if k == 0 {
+            return Err(PyValueError::new_err("need at least one list"));
+        }
+        if !self.names.is_empty() || self.objective.is_some() {
+            return Err(PyValueError::new_err("cannot mix integer variables with list_vars; use one modeling style per model"));
+        }
+        // The universe is a set partitioned among the lists; duplicate ids would
+        // be independent positions that share a value, which silently diverges
+        // from set semantics (and from how reductions aggregate by value).
+        let mut seen = std::collections::HashSet::with_capacity(universe.len());
+        if let Some(dup) = universe.iter().find(|v| !seen.insert(**v)) {
+            return Err(PyValueError::new_err(format!("list universe has a duplicate item {dup}; items must be distinct")));
+        }
+        self.col_universe = Some(universe);
+        self.col_lists = k;
+        self.col_gen += 1;
+        // Reset any reductions recorded against a previous `list_vars` generation.
+        self.col_objective.clear();
+        self.col_constraints.clear();
+        let gen = self.col_gen;
+        Ok((0..k).map(|i| PyListVar { model_id: self.id, gen, index: i as u32 }).collect())
+    }
+
     #[pyo3(signature = (objective, *, sense="min"))]
     fn objective(&mut self, objective: &Bound<'_, PyAny>, sense: &str) -> PyResult<()> {
+        // A term objective targets the list (collection) model.
+        if let Ok(term) = objective.extract::<PyRef<'_, PyTerm>>() {
+            self.check_term_scope(term.model_id, term.gen)?;
+            self.col_minimize = parse_objective_sense(sense)?;
+            // Replace, matching the integer path: a second objective() call
+            // restates the objective rather than silently summing onto the first.
+            self.col_objective.clear();
+            self.col_objective.extend(term.reductions.iter().cloned());
+            return Ok(());
+        }
         let expr = expr_from_py(objective)?;
         if let Some(model_id) = expr.model_id {
             if model_id != self.id {
@@ -991,6 +1092,14 @@ impl PyModel {
         time_limit: Option<u64>,
         seed: u64,
     ) -> PyResult<PySolution> {
+        // List variables present: the model is a collection model, solved by the
+        // collection engine regardless of the integer-path options.
+        if self.col_universe.is_some() {
+            if !self.names.is_empty() || self.objective.is_some() {
+                return Err(PyValueError::new_err("model mixes integer variables and list variables; use one modeling style per model"));
+            }
+            return self.solve_collection(time_limit, seed, verbose);
+        }
         if local_search {
             let Some(objective) = &self.objective else {
                 return Err(PyValueError::new_err("local_search=True requires an objective (call model.objective(...))"));
@@ -1053,7 +1162,79 @@ impl PyModel {
         id
     }
 
-    /// Solve a COP with the local-search engine (`solve_fast_cop`) — the same
+    /// Solve the recorded collection model (list variables + reductions) with the
+    /// collection local-search engine, time-limited (default 5s).
+    /// Reject a term that belongs to a different model or to a superseded
+    /// `list_vars` generation.
+    fn check_term_scope(&self, model_id: u64, gen: u64) -> PyResult<()> {
+        if model_id != self.id {
+            return Err(PyValueError::new_err("this term/route belongs to a different model"));
+        }
+        if gen != self.col_gen {
+            return Err(PyValueError::new_err("this term/route is stale; rebuild it from the current list_vars()"));
+        }
+        Ok(())
+    }
+
+    fn solve_collection(&self, time_limit: Option<u64>, seed: u64, verbose: bool) -> PyResult<PySolution> {
+        let model = collection::CollectionModel {
+            items: self.col_universe.clone().unwrap_or_default(),
+            lists: self.col_lists,
+            minimize: self.col_minimize,
+            objective: self.col_objective.clone(),
+            constraints: self.col_constraints.clone(),
+        };
+        model.validate().map_err(PyValueError::new_err)?;
+        let limit = time_limit.unwrap_or(5);
+        if verbose {
+            println!("qayd solve (collection)");
+            println!("  items: {}", model.items.len());
+            println!("  lists: {}", model.lists);
+            println!("  constraints: {}", model.constraints.len());
+            println!("  objective: {}", if model.objective.is_empty() { "no" } else { "yes" });
+            println!("  time limit: {limit}s");
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(limit));
+                stop.store(true, Ordering::SeqCst);
+            });
+        }
+        let sense = if self.col_minimize { "min" } else { "max" };
+        let start = Instant::now();
+        let mut improvements = 0u64;
+        let mut report = |objective: i64| {
+            if verbose {
+                improvements += 1;
+                println!("  o {objective}  ({sense}, {:.2}s)", start.elapsed().as_secs_f64());
+            }
+        };
+        let sol = collection::solve_collection(&model, seed, &stop, &mut report);
+        if verbose {
+            println!("qayd result (collection)");
+            println!("  status: {}", if sol.feasible { "SATISFIABLE" } else { "UNKNOWN" });
+            if sol.feasible {
+                println!("  objective: {}", sol.objective);
+            }
+            println!("  improvements: {improvements}");
+        }
+        Ok(PySolution {
+            status: if sol.feasible { "SATISFIABLE".to_string() } else { "UNKNOWN".to_string() },
+            // Only expose the objective and routes for a feasible incumbent. An
+            // infeasible best-effort partition may violate constraints, so hiding
+            // it stops a caller from accidentally consuming an invalid solution.
+            objective: sol.feasible.then_some(sol.objective),
+            objective_sense: Some(sense.to_string()),
+            objective_expr: None,
+            values: Vec::new(),
+            stats: SolveStats::default().into(),
+            routes: sol.feasible.then_some(sol.lists),
+        })
+    }
+
+    /// Solve a COP with the local-search engine (`solve_fast_cop`) - the same
     /// incumbent-only LS that powers `--turbo`. Requires an objective and a time
     /// limit (defaults to 10s, since LS never terminates on its own).
     fn solve_local_search(
@@ -1293,11 +1474,354 @@ fn domain(values: Vec<i64>) -> PyResult<Vec<i32>> {
     values.into_iter().map(|value| checked_i32(value, "domain value")).collect()
 }
 
+/// A node of a lambda body, built by the Python lambda at model-construction
+/// time. Held as an `Arc` tree so subexpressions and constant tables are shared
+/// rather than copied. Never executed as Python during solving; it is lowered
+/// to a [`collection::ExprArena`] when the term joins the model.
+enum PyNode {
+    Const(i64),
+    Arg(u8),
+    Array(Arc<Vec<i64>>, Arc<PyNode>),
+    Matrix(Arc<Vec<Vec<i64>>>, Arc<PyNode>, Arc<PyNode>),
+    Add(Arc<PyNode>, Arc<PyNode>),
+    Sub(Arc<PyNode>, Arc<PyNode>),
+    Mul(Arc<PyNode>, Arc<PyNode>),
+}
+
+/// A symbolic lambda-body expression. Arithmetic operators build a bigger tree;
+/// indexing an `Array`/`Matrix` with one of these builds a table lookup.
+#[pyclass(name = "LambdaExpr", module = "qayd", skip_from_py_object)]
+#[derive(Clone)]
+struct PyLambdaExpr {
+    node: Arc<PyNode>,
+}
+
+fn node(n: PyNode) -> PyLambdaExpr {
+    PyLambdaExpr { node: Arc::new(n) }
+}
+
+/// Coerce a Python value used in a lambda body to a node: a lambda expression
+/// stays, an integer becomes a constant.
+fn coerce_node(obj: &Bound<'_, PyAny>) -> PyResult<Arc<PyNode>> {
+    if let Ok(e) = obj.extract::<PyRef<'_, PyLambdaExpr>>() {
+        return Ok(e.node.clone());
+    }
+    if let Ok(v) = obj.extract::<i64>() {
+        return Ok(Arc::new(PyNode::Const(v)));
+    }
+    Err(PyTypeError::new_err("a lambda body may only combine lambda expressions and integers"))
+}
+
+#[pymethods]
+impl PyLambdaExpr {
+    fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
+        Ok(node(PyNode::Add(self.node.clone(), coerce_node(other)?)))
+    }
+    fn __radd__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
+        Ok(node(PyNode::Add(coerce_node(other)?, self.node.clone())))
+    }
+    fn __sub__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
+        Ok(node(PyNode::Sub(self.node.clone(), coerce_node(other)?)))
+    }
+    fn __rsub__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
+        Ok(node(PyNode::Sub(coerce_node(other)?, self.node.clone())))
+    }
+    fn __mul__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
+        Ok(node(PyNode::Mul(self.node.clone(), coerce_node(other)?)))
+    }
+    fn __rmul__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
+        Ok(node(PyNode::Mul(coerce_node(other)?, self.node.clone())))
+    }
+    fn __neg__(&self) -> PyLambdaExpr {
+        node(PyNode::Sub(Arc::new(PyNode::Const(0)), self.node.clone()))
+    }
+}
+
+/// A constant integer array; index it with a lambda arg to read `array[i]`.
+#[pyclass(name = "Array", module = "qayd", skip_from_py_object)]
+#[derive(Clone)]
+struct PyArray {
+    data: Arc<Vec<i64>>,
+}
+
+#[pymethods]
+impl PyArray {
+    fn __getitem__(&self, idx: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
+        Ok(node(PyNode::Array(self.data.clone(), coerce_node(idx)?)))
+    }
+    fn __len__(&self) -> usize {
+        self.data.len()
+    }
+}
+
+/// A constant integer matrix; `matrix[i][j]` reads a cell.
+#[pyclass(name = "Matrix", module = "qayd", skip_from_py_object)]
+#[derive(Clone)]
+struct PyMatrix {
+    data: Arc<Vec<Vec<i64>>>,
+}
+
+#[pymethods]
+impl PyMatrix {
+    fn __getitem__(&self, row: &Bound<'_, PyAny>) -> PyResult<PyMatrixRow> {
+        Ok(PyMatrixRow { data: self.data.clone(), row: coerce_node(row)? })
+    }
+}
+
+/// The partially indexed `matrix[i]`; index again to get `matrix[i][j]`.
+#[pyclass(name = "MatrixRow", module = "qayd", skip_from_py_object)]
+#[derive(Clone)]
+struct PyMatrixRow {
+    data: Arc<Vec<Vec<i64>>>,
+    row: Arc<PyNode>,
+}
+
+#[pymethods]
+impl PyMatrixRow {
+    fn __getitem__(&self, col: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
+        Ok(node(PyNode::Matrix(self.data.clone(), self.row.clone(), coerce_node(col)?)))
+    }
+}
+
+/// A term over one or more list variables: a sum of reductions. Built by the
+/// reduction operators (`sum`, `sum_edges`, ...), added together for an
+/// objective, and compared to an integer for a constraint.
+#[pyclass(name = "Term", module = "qayd", skip_from_py_object)]
+#[derive(Clone)]
+struct PyTerm {
+    model_id: u64,
+    gen: u64,
+    reductions: Vec<collection::Reduction>,
+}
+
+/// A constraint `term <op> rhs` over a single list reduction.
+#[pyclass(name = "ListConstraint", module = "qayd", skip_from_py_object)]
+#[derive(Clone)]
+struct PyListConstraint {
+    model_id: u64,
+    gen: u64,
+    reduction: collection::Reduction,
+    op: collection::Op,
+    rhs: i64,
+}
+
+/// Sum two terms, rejecting a mix of models or `list_vars` generations.
+fn combine_terms(a: &PyTerm, b: &PyTerm) -> PyResult<PyTerm> {
+    if a.model_id != b.model_id || a.gen != b.gen {
+        return Err(PyValueError::new_err("cannot combine terms from different models or list_vars generations"));
+    }
+    let mut reductions = a.reductions.clone();
+    reductions.extend(b.reductions.iter().cloned());
+    Ok(PyTerm { model_id: a.model_id, gen: a.gen, reductions })
+}
+
+#[pymethods]
+impl PyTerm {
+    fn __add__(&self, other: PyRef<'_, PyTerm>) -> PyResult<PyTerm> {
+        combine_terms(self, &other)
+    }
+
+    /// Support Python's `sum(...)`, which starts the accumulation at integer 0.
+    fn __radd__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
+        if other.extract::<i64>().is_ok_and(|v| v == 0) {
+            return Ok(self.clone());
+        }
+        Err(PyTypeError::new_err("a term can only be added to another term"))
+    }
+
+    fn __richcmp__(&self, other: &Bound<'_, PyAny>, op: CompareOp) -> PyResult<PyListConstraint> {
+        let rhs = other.extract::<i64>().map_err(|_| PyTypeError::new_err("a term can only be compared to an integer bound"))?;
+        let op = match op {
+            CompareOp::Le => collection::Op::Le,
+            CompareOp::Ge => collection::Op::Ge,
+            CompareOp::Eq => collection::Op::Eq,
+            _ => return Err(PyValueError::new_err("a term supports only <=, >=, ==")),
+        };
+        if self.reductions.len() != 1 {
+            return Err(PyValueError::new_err("a constraint must be a single reduction over one list, not a sum of terms"));
+        }
+        Ok(PyListConstraint { model_id: self.model_id, gen: self.gen, reduction: self.reductions[0].clone(), op, rhs })
+    }
+}
+
+/// Lower a Python lambda-body tree into a reduction's flat expression arena.
+fn lower(n: &PyNode, arena: &mut collection::ExprArena) -> collection::ExprId {
+    match n {
+        PyNode::Const(c) => arena.constant(*c),
+        PyNode::Arg(k) => arena.arg(*k),
+        PyNode::Array(a, i) => {
+            let ie = lower(i, arena);
+            arena.array(a.clone(), ie)
+        }
+        PyNode::Matrix(m, i, j) => {
+            let ie = lower(i, arena);
+            let je = lower(j, arena);
+            arena.matrix(m.clone(), ie, je)
+        }
+        PyNode::Add(a, b) => {
+            let x = lower(a, arena);
+            let y = lower(b, arena);
+            arena.add(x, y)
+        }
+        PyNode::Sub(a, b) => {
+            let x = lower(a, arena);
+            let y = lower(b, arena);
+            arena.sub(x, y)
+        }
+        PyNode::Mul(a, b) => {
+            let x = lower(a, arena);
+            let y = lower(b, arena);
+            arena.mul(x, y)
+        }
+    }
+}
+
+fn single_term(route: &PyListVar, reduction: collection::Reduction) -> PyTerm {
+    PyTerm { model_id: route.model_id, gen: route.gen, reductions: vec![reduction] }
+}
+
+/// Build a per-item reduction `op(route, i => body)` from a Python lambda.
+fn build_items_reduction(route: &PyListVar, op: collection::ReduceOp, func: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
+    let body = coerce_node(&func.call1((node(PyNode::Arg(0)),))?)?;
+    let mut arena = collection::ExprArena::default();
+    let body_id = lower(&body, &mut arena);
+    Ok(single_term(route, collection::Reduction { op, iterable: collection::Iterable::Items(route.index as usize), arena, body: body_id }))
+}
+
+/// `sum(route, i => body)`, or `sum(terms)` to add a collection of terms.
+#[pyfunction]
+#[pyo3(signature = (arg, func=None))]
+fn sum(arg: &Bound<'_, PyAny>, func: Option<&Bound<'_, PyAny>>) -> PyResult<PyTerm> {
+    if let Some(f) = func {
+        let route = arg
+            .extract::<PyRef<'_, PyListVar>>()
+            .map_err(|_| PyTypeError::new_err("sum(route, lambda): the first argument must be a list variable"))?;
+        return build_items_reduction(&route, collection::ReduceOp::Sum, f);
+    }
+    let mut acc: Option<PyTerm> = None;
+    for item in arg.try_iter()? {
+        let t = item?
+            .extract::<PyRef<'_, PyTerm>>()
+            .map_err(|_| PyTypeError::new_err("sum(iterable) expects an iterable of terms"))?;
+        acc = Some(match acc {
+            None => t.clone(),
+            Some(a) => combine_terms(&a, &t)?,
+        });
+    }
+    acc.ok_or_else(|| PyValueError::new_err("sum got no terms to add"))
+}
+
+/// `min(route, i => body)` over a route's items (undefined, hence infeasible,
+/// for an empty route).
+#[pyfunction]
+fn minimum(route: &PyListVar, func: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
+    build_items_reduction(route, collection::ReduceOp::Min, func)
+}
+
+/// `max(route, i => body)` over a route's items.
+#[pyfunction]
+fn maximum(route: &PyListVar, func: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
+    build_items_reduction(route, collection::ReduceOp::Max, func)
+}
+
+/// `count(route, i => predicate)`: items whose body is non-zero. With no lambda,
+/// the route's length.
+#[pyfunction(name = "count")]
+#[pyo3(signature = (route, func=None))]
+fn count_reduction(route: &PyListVar, func: Option<&Bound<'_, PyAny>>) -> PyResult<PyTerm> {
+    match func {
+        Some(f) => build_items_reduction(route, collection::ReduceOp::Count, f),
+        None => {
+            let mut arena = collection::ExprArena::default();
+            let body = arena.constant(1);
+            Ok(single_term(route, collection::Reduction { op: collection::ReduceOp::Count, iterable: collection::Iterable::Items(route.index as usize), arena, body }))
+        }
+    }
+}
+
+/// `sum_edges(route, (i, j) => body, start=, end=)`: sum the body over the edges
+/// of the closed tour `[start, items.., end]`.
+#[pyfunction]
+#[pyo3(signature = (route, func, *, start=0, end=0))]
+fn sum_edges(route: &PyListVar, func: &Bound<'_, PyAny>, start: i32, end: i32) -> PyResult<PyTerm> {
+    let body = coerce_node(&func.call1((node(PyNode::Arg(0)), node(PyNode::Arg(1))))?)?;
+    let mut arena = collection::ExprArena::default();
+    let body_id = lower(&body, &mut arena);
+    let iterable = collection::Iterable::Edges { list: route.index as usize, start, end };
+    Ok(single_term(route, collection::Reduction { op: collection::ReduceOp::Sum, iterable, arena, body: body_id }))
+}
+
+/// Wrap a constant integer array / matrix for use inside lambdas.
+#[pyfunction]
+fn array(data: Vec<i64>) -> PyArray {
+    PyArray { data: Arc::new(data) }
+}
+
+#[pyfunction]
+fn matrix(data: Vec<Vec<i64>>) -> PyMatrix {
+    PyMatrix { data: Arc::new(data) }
+}
+
+// --- convenience builders for the common raw-array cases ---
+
+/// Closed-tour cost of `route`: `sum_edges(route, (i, j) => matrix[i][j])` with
+/// `depot` at both ends.
+#[pyfunction]
+#[pyo3(signature = (route, matrix, *, depot=0))]
+fn route_cost(route: &PyListVar, matrix: Vec<Vec<i64>>, depot: i32) -> PyTerm {
+    let mut arena = collection::ExprArena::default();
+    let i = arena.arg(0);
+    let j = arena.arg(1);
+    let body = arena.matrix(Arc::new(matrix), i, j);
+    let iterable = collection::Iterable::Edges { list: route.index as usize, start: depot, end: depot };
+    single_term(route, collection::Reduction { op: collection::ReduceOp::Sum, iterable, arena, body })
+}
+
+fn over_items_raw(route: &PyListVar, op: collection::ReduceOp, values: Vec<i64>) -> PyTerm {
+    let mut arena = collection::ExprArena::default();
+    let i = arena.arg(0);
+    let body = arena.array(Arc::new(values), i);
+    single_term(route, collection::Reduction { op, iterable: collection::Iterable::Items(route.index as usize), arena, body })
+}
+
+/// Sum of `values[item]` over `route`'s items.
+#[pyfunction]
+fn list_sum(route: &PyListVar, values: Vec<i64>) -> PyTerm {
+    over_items_raw(route, collection::ReduceOp::Sum, values)
+}
+
+/// Minimum / maximum of `values[item]` over `route`'s items.
+#[pyfunction]
+fn list_min(route: &PyListVar, values: Vec<i64>) -> PyTerm {
+    over_items_raw(route, collection::ReduceOp::Min, values)
+}
+
+#[pyfunction]
+fn list_max(route: &PyListVar, values: Vec<i64>) -> PyTerm {
+    over_items_raw(route, collection::ReduceOp::Max, values)
+}
+
+/// Number of items in `route`.
+#[pyfunction]
+fn list_count(route: &PyListVar) -> PyTerm {
+    let mut arena = collection::ExprArena::default();
+    let body = arena.constant(1);
+    single_term(route, collection::Reduction { op: collection::ReduceOp::Count, iterable: collection::Iterable::Items(route.index as usize), arena, body })
+}
+
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyModel>()?;
     m.add_class::<PyIntVar>()?;
+    m.add_class::<PyListVar>()?;
+    m.add_class::<PyTerm>()?;
+    m.add_class::<PyListConstraint>()?;
     m.add_class::<PyExpr>()?;
+    m.add_class::<PyLambdaExpr>()?;
+    m.add_class::<PyArray>()?;
+    m.add_class::<PyMatrix>()?;
+    m.add_class::<PyMatrixRow>()?;
     m.add_class::<PyConstraint>()?;
     m.add_class::<PySolution>()?;
     m.add_class::<PySolveStats>()?;
@@ -1310,6 +1834,18 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(max_of, m)?)?;
     m.add_function(wrap_pyfunction!(if_then_else, m)?)?;
     m.add_function(wrap_pyfunction!(domain, m)?)?;
+    m.add_function(wrap_pyfunction!(array, m)?)?;
+    m.add_function(wrap_pyfunction!(matrix, m)?)?;
+    m.add_function(wrap_pyfunction!(sum, m)?)?;
+    m.add_function(wrap_pyfunction!(minimum, m)?)?;
+    m.add_function(wrap_pyfunction!(maximum, m)?)?;
+    m.add_function(wrap_pyfunction!(count_reduction, m)?)?;
+    m.add_function(wrap_pyfunction!(sum_edges, m)?)?;
+    m.add_function(wrap_pyfunction!(route_cost, m)?)?;
+    m.add_function(wrap_pyfunction!(list_sum, m)?)?;
+    m.add_function(wrap_pyfunction!(list_min, m)?)?;
+    m.add_function(wrap_pyfunction!(list_max, m)?)?;
+    m.add_function(wrap_pyfunction!(list_count, m)?)?;
     m.add("STAR", table::STAR)?;
     Ok(())
 }

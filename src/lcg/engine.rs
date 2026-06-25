@@ -173,7 +173,7 @@ impl Cdcl<'_> {
             // an opposite dive diversifies the feasibility search without
             // shredding structured objectives like LABS). Portfolio workers
             // already diversify across workers, and per-worker rephasing
-            // *synchronizes* their polarity flips and hurts — so it is disabled
+            // *synchronizes* their polarity flips and hurts - so it is disabled
             // whenever clause sharing (a portfolio) is active.
             let lone = self.clause_sharing.is_none();
             self.rephase_mode = u8::from(lone && self.restarts_done.is_multiple_of(REPHASE_PERIOD));

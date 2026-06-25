@@ -7,13 +7,13 @@ license = "MIT"
 
 [workspace]
 members = [".", "frontends/flatzinc"]
-# Both packages take part in plain `cargo build --bin ...` at the root — the
+# Both packages take part in plain `cargo build --bin ...` at the root - the
 # release workflow builds `qayd` and `qayd-fzn` in one invocation.
 default-members = [".", "frontends/flatzinc"]
 
 [workspace.package]
 # Single source of truth: qayd and qayd-fzn release under the same version.
-version = "0.7.1"
+version = "0.9.0"
 
 [lib]
 name = "qayd"
