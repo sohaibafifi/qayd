@@ -4,8 +4,8 @@ Adds time windows to the CVRP model. The end-of-service time along each route is
 a prefix scan: ``end = max(earliest[cust], arrival) + service[cust]``, threaded
 with ``cp.scan_sum``. Lateness ``max(0, end - latest[cust])`` is summed per route
 and constrained to 0, so the violation-driven search drives windows to feasible
-exactly as Hexaly's soft time-window objective does. The objective is
-lexicographic: fewest vehicles, then shortest distance.
+with the same feasibility-first scoring used by the collection engine. The
+objective is lexicographic: fewest vehicles, then shortest distance.
 
 Tune via ``QAYD_CVRPTW_N`` / ``QAYD_CVRPTW_T``; trace with ``QAYD_VERBOSE=1``.
 """
