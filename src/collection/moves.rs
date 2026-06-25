@@ -1,0 +1,496 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use super::eval::{eval_expr, violation_of};
+use super::list::{base_totals, compute_con_vals, full_score, list_score, signed, ListScore, PerList, ReductionDeltaKind, Score, State};
+use super::model::{CollectionModel, Iterable, Reduction, MAX_TIERS};
+use crate::mix64;
+
+pub(super) fn snapshot(per: &PerList, state: &State) -> (Vec<Vec<i32>>, Score, bool) {
+    let score = full_score(per, state);
+    let feasible = score.violation == 0;
+    (state.lists.clone(), score, feasible)
+}
+
+/// Prefer feasible over infeasible, then better lexicographic score.
+pub(super) fn better(feasible: bool, score: Score, best_feasible: bool, best_score: Score) -> bool {
+    match (feasible, best_feasible) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => score < best_score,
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Move {
+    Relocate { src: usize, src_pos: usize, dst: usize, dst_pos: usize },
+    Swap { a: usize, a_pos: usize, b: usize, b_pos: usize },
+    Reverse { list: usize, i: usize, j: usize },
+}
+
+/// Score of the state if one list's cached score were replaced by `nl`.
+fn delta_one(per: &PerList, base: (i64, [i64; MAX_TIERS]), scores: &[ListScore], l: usize, nl: ListScore) -> Score {
+    let v = base.0.saturating_sub(scores[l].violation).saturating_add(nl.violation);
+    let mut raw = base.1;
+    for ((r, &old), &new) in raw.iter_mut().zip(scores[l].objectives.iter()).zip(nl.objectives.iter()) {
+        *r = r.saturating_sub(old).saturating_add(new);
+    }
+    signed(per, v, raw)
+}
+
+/// Score of the state if lists `a` and `b` were replaced by `na`/`nb`.
+fn delta_two(
+    per: &PerList,
+    base: (i64, [i64; MAX_TIERS]),
+    scores: &[ListScore],
+    a: usize,
+    na: ListScore,
+    b: usize,
+    nb: ListScore,
+) -> Score {
+    let v = base
+        .0
+        .saturating_sub(scores[a].violation)
+        .saturating_sub(scores[b].violation)
+        .saturating_add(na.violation)
+        .saturating_add(nb.violation);
+    let mut raw = base.1;
+    let (oa, ob) = (&scores[a].objectives, &scores[b].objectives);
+    for ((((r, &sa), &sb), &xa), &xb) in raw.iter_mut().zip(oa.iter()).zip(ob.iter()).zip(na.objectives.iter()).zip(nb.objectives.iter()) {
+        *r = r.saturating_sub(sa).saturating_sub(sb).saturating_add(xa).saturating_add(xb);
+    }
+    signed(per, v, raw)
+}
+
+/// Copy `list` into `buf` (reusing its capacity) with one edit applied.
+fn build_removed(buf: &mut Vec<i32>, list: &[i32], pos: usize) {
+    buf.clear();
+    buf.extend_from_slice(list);
+    buf.remove(pos);
+}
+fn build_inserted(buf: &mut Vec<i32>, list: &[i32], pos: usize, item: i32) {
+    buf.clear();
+    buf.extend_from_slice(list);
+    buf.insert(pos.min(list.len()), item);
+}
+fn build_replaced(buf: &mut Vec<i32>, list: &[i32], pos: usize, item: i32) {
+    buf.clear();
+    buf.extend_from_slice(list);
+    buf[pos] = item;
+}
+fn build_reversed(buf: &mut Vec<i32>, list: &[i32], i: usize, j: usize) {
+    buf.clear();
+    buf.extend_from_slice(list);
+    buf[i..=j].reverse();
+}
+fn build_moved_within(buf: &mut Vec<i32>, list: &[i32], from: usize, to: usize, item: i32) {
+    buf.clear();
+    buf.extend_from_slice(list);
+    buf.remove(from);
+    buf.insert(to.min(buf.len()), item);
+}
+
+/// A single local edit to one list. Carries enough to (a) compute the affected
+/// reductions' delta in O(edit) and (b) materialise the edited list for the
+/// full-recompute fallback. Positions match the `build_*` helpers exactly.
+#[derive(Clone, Copy, Debug)]
+enum Edit {
+    Remove { pos: usize },
+    Insert { pos: usize, item: i32 },
+    MoveWithin { from: usize, to: usize },
+    Replace { pos: usize, item: i32 },
+    Reverse { i: usize, j: usize },
+}
+
+impl Edit {
+    /// Length of the list after the edit.
+    fn new_len(&self, len: usize) -> usize {
+        match self {
+            Edit::Remove { .. } => len - 1,
+            Edit::Insert { .. } => len + 1,
+            _ => len,
+        }
+    }
+
+    /// Materialise the edited list into `buf` (the fallback path).
+    fn apply(&self, buf: &mut Vec<i32>, list: &[i32]) {
+        match *self {
+            Edit::Remove { pos } => build_removed(buf, list, pos),
+            Edit::Insert { pos, item } => build_inserted(buf, list, pos, item),
+            Edit::MoveWithin { from, to } => build_moved_within(buf, list, from, to, list[from]),
+            Edit::Replace { pos, item } => build_replaced(buf, list, pos, item),
+            Edit::Reverse { i, j } => build_reversed(buf, list, i, j),
+        }
+    }
+}
+
+/// Delta of a per-item (order-independent) value reduction under `edit`, where
+/// `value(item)` is the body contribution of one item.
+fn items_value_delta(list: &[i32], edit: &Edit, value: impl Fn(i32) -> i64) -> i64 {
+    match *edit {
+        Edit::Remove { pos } => -value(list[pos]),
+        Edit::Insert { item, .. } => value(item),
+        Edit::Replace { pos, item } => value(item).saturating_sub(value(list[pos])),
+        Edit::MoveWithin { .. } | Edit::Reverse { .. } => 0,
+    }
+}
+
+/// Delta of a closed-tour edge-sum reduction (`Edges { start, end }`) under
+/// `edit`, where `edge(from, to)` is the body contribution of one edge. The tour
+/// is `[start, list.., end]`; only edges local to the edit are touched.
+fn edges_value_delta(list: &[i32], start: i32, end: i32, edit: &Edit, symmetric: bool, edge: impl Fn(i32, i32) -> i64) -> i64 {
+    let n = list.len();
+    // The i-th tour node: 0 -> start, n+1 -> end, else list[i-1].
+    let node = |i: usize| -> i32 {
+        if i == 0 {
+            start
+        } else if i == n + 1 {
+            end
+        } else {
+            list[i - 1]
+        }
+    };
+    match *edit {
+        Edit::Remove { pos } => {
+            let t = pos + 1;
+            edge(node(t - 1), node(t + 1)).saturating_sub(edge(node(t - 1), node(t))).saturating_sub(edge(node(t), node(t + 1)))
+        }
+        Edit::Insert { pos, item } => {
+            let (a, b) = (node(pos), node(pos + 1));
+            edge(a, item).saturating_add(edge(item, b)).saturating_sub(edge(a, b))
+        }
+        Edit::Replace { pos, item } => {
+            let t = pos + 1;
+            let (l, r, old) = (node(t - 1), node(t + 1), node(t));
+            edge(l, item).saturating_add(edge(item, r)).saturating_sub(edge(l, old)).saturating_sub(edge(old, r))
+        }
+        Edit::Reverse { i, j } => {
+            let before = node(i);
+            let after = node(j + 2);
+            if symmetric {
+                return edge(before, list[j])
+                    .saturating_add(edge(list[i], after))
+                    .saturating_sub(edge(before, list[i]))
+                    .saturating_sub(edge(list[j], after));
+            }
+            let mut old = 0i64;
+            for t in i..=j + 1 {
+                old = old.saturating_add(edge(node(t), node(t + 1)));
+            }
+            // New node order across positions i..=j+2: before, list[j..=i], after.
+            let mut new = edge(before, list[j]);
+            for t in (i + 1..=j).rev() {
+                new = new.saturating_add(edge(list[t], list[t - 1]));
+            }
+            new = new.saturating_add(edge(list[i], after));
+            new.saturating_sub(old)
+        }
+        Edit::MoveWithin { from, to } => {
+            let item = list[from];
+            // Removal delta on the original tour.
+            let t = from + 1;
+            let rem = edge(node(t - 1), node(t + 1)).saturating_sub(edge(node(t - 1), node(t))).saturating_sub(edge(node(t), node(t + 1)));
+            // Insertion delta into the post-removal tour L_rm (length n-1).
+            let m = n - 1;
+            let to2 = to.min(m);
+            let lrm = |i: usize| -> i32 { list[if i < from { i } else { i + 1 }] };
+            let node_rm = |i: usize| -> i32 {
+                if i == 0 {
+                    start
+                } else if i == m + 1 {
+                    end
+                } else {
+                    lrm(i - 1)
+                }
+            };
+            let (a, b) = (node_rm(to2), node_rm(to2 + 1));
+            let ins = edge(a, item).saturating_add(edge(item, b)).saturating_sub(edge(a, b));
+            rem.saturating_add(ins)
+        }
+    }
+}
+
+/// Delta of one supported reduction's raw value under `edit`.
+fn reduction_delta(r: &Reduction, kind: ReductionDeltaKind, list: &[i32], edit: &Edit) -> i64 {
+    match kind {
+        ReductionDeltaKind::ItemsSum => items_value_delta(list, edit, |item| eval_expr(&r.arena.exprs, r.body, &[i64::from(item)])),
+        ReductionDeltaKind::ItemsCount => {
+            items_value_delta(list, edit, |item| i64::from(eval_expr(&r.arena.exprs, r.body, &[i64::from(item)]) != 0))
+        }
+        ReductionDeltaKind::Used => {
+            let old = list.len();
+            i64::from(edit.new_len(old) > 0) - i64::from(old > 0)
+        }
+        ReductionDeltaKind::Edges { symmetric } => match &r.iterable {
+            Iterable::Edges { start, end, .. } => edges_value_delta(list, *start, *end, edit, symmetric, |from, to| {
+                eval_expr(&r.arena.exprs, r.body, &[i64::from(from), i64::from(to)])
+            }),
+            _ => unreachable!("edge delta kind on a non-edge reduction"),
+        },
+        ReductionDeltaKind::Unsupported => unreachable!("reduction_delta on an unsupported reduction"),
+    }
+}
+
+/// Trial score of list `idx` after `edit`, computed incrementally from the cached
+/// base score and constraint values when the list is fully incremental, else by
+/// materialising the edited list and rescoring it in full.
+fn trial_list_score(per: &PerList, state: &State, idx: usize, edit: Edit, scratch: &mut Vec<i32>) -> ListScore {
+    if per.list_incremental[idx] {
+        let list = &state.lists[idx];
+        let base = &state.scores[idx];
+        let mut objectives = base.objectives;
+        for (t, slot) in objectives.iter_mut().enumerate() {
+            for (r, kind) in per.objective[idx][t].iter().zip(&per.objective_delta[idx][t]) {
+                *slot = slot.saturating_add(reduction_delta(r, *kind, list, &edit));
+            }
+        }
+        let mut violation = base.violation;
+        for (ci, (c, kind)) in per.constraints[idx].iter().zip(&per.constraint_delta[idx]).enumerate() {
+            let old = state.con_vals[idx][ci].expect("supported constraint reduction is always defined");
+            let new = old.saturating_add(reduction_delta(&c.reduction, *kind, list, &edit));
+            violation = violation.saturating_sub(violation_of(old, c.op, c.rhs)).saturating_add(violation_of(new, c.op, c.rhs));
+        }
+        ListScore { violation, objectives }
+    } else {
+        edit.apply(scratch, &state.lists[idx]);
+        list_score(per, idx, scratch)
+    }
+}
+
+/// Test oracle: for `model` with the given list contents, assert the incremental
+/// trial score of every single-list edit equals a full recompute of the edited
+/// list. Panics on the first mismatch; returns the number of edits checked. The
+/// `model` must use only incremental-supported reductions (so the delta paths,
+/// not the fallback, are exercised). Exposed for the integration oracle, which
+/// keeps the actual test out of `src/`.
+#[doc(hidden)]
+pub fn audit_incremental(model: &CollectionModel, lists: &[Vec<i32>]) -> usize {
+    let per = PerList::build(model);
+    let k = lists.len();
+    assert!((0..k).all(|i| per.list_incremental[i]), "audit model must be fully incremental");
+    let scores: Vec<ListScore> = (0..k).map(|i| list_score(&per, i, &lists[i])).collect();
+    let con_vals: Vec<Vec<Option<i64>>> = (0..k).map(|i| compute_con_vals(&per, i, &lists[i])).collect();
+    let mut item_list = vec![0usize; model.items.len()];
+    for (l, lst) in lists.iter().enumerate() {
+        for &v in lst {
+            if let Some(&i) = per.globals.value_to_idx.get(&v) {
+                item_list[i] = l;
+            }
+        }
+    }
+    let global_viol = per.globals.total(&item_list);
+    let state = State { lists: lists.to_vec(), scores, con_vals, item_list, global_viol };
+
+    let mut scratch = Vec::new();
+    let mut full_buf = Vec::new();
+    let mut checked = 0usize;
+    let same = |a: &ListScore, b: &ListScore| a.violation == b.violation && a.objectives == b.objectives;
+    for (idx, list) in lists.iter().enumerate() {
+        let n = list.len();
+        let mut edits: Vec<Edit> = Vec::new();
+        for pos in 0..n {
+            edits.push(Edit::Remove { pos });
+        }
+        for &item in &model.items {
+            for pos in 0..=n {
+                edits.push(Edit::Insert { pos, item });
+            }
+            for pos in 0..n {
+                edits.push(Edit::Replace { pos, item });
+            }
+        }
+        for from in 0..n {
+            for to in 0..n {
+                if from != to {
+                    edits.push(Edit::MoveWithin { from, to });
+                }
+            }
+        }
+        for i in 0..n {
+            for j in (i + 1)..n {
+                edits.push(Edit::Reverse { i, j });
+            }
+        }
+        for edit in edits {
+            let inc = trial_list_score(&per, &state, idx, edit, &mut scratch);
+            edit.apply(&mut full_buf, list);
+            let full = list_score(&per, idx, &full_buf);
+            assert!(
+                same(&inc, &full),
+                "incremental != full for list {idx} edit {edit:?}: inc=({},{:?}) full=({},{:?})",
+                inc.violation,
+                inc.objectives,
+                full.violation,
+                full.objectives
+            );
+            checked += 1;
+        }
+    }
+    checked
+}
+
+/// First-improvement local move: return the first relocate / swap / segment
+/// reversal that strictly lowers the score, or `None` at a local optimum (or
+/// when `stop` fires). Each candidate is scored in O(1) against the cached base
+/// totals and built into a reused scratch buffer, so no allocation happens per
+/// candidate. `stop` is polled per candidate (inside the innermost loops) so
+/// even an unbalanced state with very long lists honours the time limit.
+pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBool) -> Option<Move> {
+    let base = base_totals(&state.scores);
+    let current = full_score(per, state);
+    let gviol = state.global_viol;
+    let k = state.lists.len();
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    let mut polled = 0u32;
+    let mut stopped = || {
+        polled = polled.wrapping_add(1);
+        polled.is_multiple_of(1024) && stop.load(Ordering::Relaxed)
+    };
+    // Add the current global violation plus a move's global delta to a per-list
+    // trial score, so cross-list constraints steer the search too.
+    let with_global = |s: Score, gdelta: i64| Score { violation: s.violation.saturating_add(gviol).saturating_add(gdelta), tiers: s.tiers };
+
+    for src in 0..k {
+        for src_pos in 0..state.lists[src].len() {
+            let item = state.lists[src][src_pos];
+            for dst in 0..k {
+                if dst == src {
+                    let len = state.lists[src].len();
+                    for dst_pos in 0..len {
+                        if dst_pos == src_pos {
+                            continue;
+                        }
+                        if stopped() {
+                            return None;
+                        }
+                        let nl = trial_list_score(per, state, src, Edit::MoveWithin { from: src_pos, to: dst_pos }, &mut a);
+                        // Within-list move: no item changes list, so gdelta = 0.
+                        if with_global(delta_one(per, base, &state.scores, src, nl), 0) < current {
+                            return Some(Move::Relocate { src, src_pos, dst, dst_pos });
+                        }
+                    }
+                } else {
+                    let na = trial_list_score(per, state, src, Edit::Remove { pos: src_pos }, &mut a);
+                    let gd = per.globals.delta(&state.item_list, &[(item, dst)]);
+                    for dst_pos in 0..=state.lists[dst].len() {
+                        if stopped() {
+                            return None;
+                        }
+                        let nb = trial_list_score(per, state, dst, Edit::Insert { pos: dst_pos, item }, &mut b);
+                        if with_global(delta_two(per, base, &state.scores, src, na, dst, nb), gd) < current {
+                            return Some(Move::Relocate { src, src_pos, dst, dst_pos });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for x in 0..k {
+        for y in (x + 1)..k {
+            for xp in 0..state.lists[x].len() {
+                for yp in 0..state.lists[y].len() {
+                    if stopped() {
+                        return None;
+                    }
+                    let (vx, vy) = (state.lists[x][xp], state.lists[y][yp]);
+                    let na = trial_list_score(per, state, x, Edit::Replace { pos: xp, item: vy }, &mut a);
+                    let nb = trial_list_score(per, state, y, Edit::Replace { pos: yp, item: vx }, &mut b);
+                    let gd = per.globals.delta(&state.item_list, &[(vx, y), (vy, x)]);
+                    if with_global(delta_two(per, base, &state.scores, x, na, y, nb), gd) < current {
+                        return Some(Move::Swap { a: x, a_pos: xp, b: y, b_pos: yp });
+                    }
+                }
+            }
+        }
+    }
+    for list in 0..k {
+        let len = state.lists[list].len();
+        for i in 0..len {
+            for j in (i + 1)..len {
+                if stopped() {
+                    return None;
+                }
+                let nl = trial_list_score(per, state, list, Edit::Reverse { i, j }, &mut a);
+                if with_global(delta_one(per, base, &state.scores, list, nl), 0) < current {
+                    return Some(Move::Reverse { list, i, j });
+                }
+            }
+        }
+    }
+    None
+}
+
+pub(super) fn apply_move(per: &PerList, state: &mut State, mv: Move) {
+    match mv {
+        Move::Relocate { src, src_pos, dst, dst_pos } => {
+            let item = state.lists[src].remove(src_pos);
+            let pos = dst_pos.min(state.lists[dst].len());
+            state.lists[dst].insert(pos, item);
+            state.rescore(per, src);
+            state.rescore(per, dst);
+            if src != dst {
+                state.set_item_list(per, item, dst);
+                state.global_viol = per.globals.total(&state.item_list);
+            }
+        }
+        Move::Swap { a, a_pos, b, b_pos } => {
+            let tmp = state.lists[a][a_pos];
+            state.lists[a][a_pos] = state.lists[b][b_pos];
+            state.lists[b][b_pos] = tmp;
+            state.rescore(per, a);
+            state.rescore(per, b);
+            // After the swap, lists[a][a_pos] holds the item that was in b.
+            state.set_item_list(per, state.lists[a][a_pos], a);
+            state.set_item_list(per, state.lists[b][b_pos], b);
+            state.global_viol = per.globals.total(&state.item_list);
+        }
+        Move::Reverse { list, i, j } => {
+            state.lists[list][i..=j].reverse();
+            state.rescore(per, list);
+            // Reversal keeps every item in the same list, so globals are unchanged.
+        }
+    }
+}
+
+pub(super) fn shuffle(order: &mut [usize], seed: u64) {
+    for i in (1..order.len()).rev() {
+        let j = (mix64(seed.wrapping_add(i as u64)) % (i as u64 + 1)) as usize;
+        order.swap(i, j);
+    }
+}
+
+/// Move `strength` random items, each to a random other list, to escape a local
+/// minimum. A larger strength is a bigger perturbation for a deeper basin.
+pub(super) fn random_kick(per: &PerList, state: &mut State, seed: u64, strength: usize) {
+    if state.lists.len() < 2 {
+        return;
+    }
+    for step in 0..strength.max(1) {
+        let s = seed ^ mix64(step as u64);
+        let total: usize = state.lists.iter().map(Vec::len).sum();
+        if total == 0 {
+            return;
+        }
+        let mut pick = (mix64(s) % total as u64) as usize;
+        let mut src = 0;
+        let mut src_pos = 0;
+        for (r, l) in state.lists.iter().enumerate() {
+            if pick < l.len() {
+                src = r;
+                src_pos = pick;
+                break;
+            }
+            pick -= l.len();
+        }
+        let dst = (mix64(s ^ 0x9E37) % state.lists.len() as u64) as usize;
+        if dst == src {
+            continue;
+        }
+        let item = state.lists[src].remove(src_pos);
+        state.lists[dst].push(item);
+        state.rescore(per, src);
+        state.rescore(per, dst);
+        state.set_item_list(per, item, dst);
+    }
+    state.global_viol = per.globals.total(&state.item_list);
+}

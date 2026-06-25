@@ -43,7 +43,7 @@ Q = cp.array(demand)
 
 model = cp.Model()
 routes = model.list_vars(k, customers)   # up to k vehicles partition the customers
-# Hexaly-style lexicographic objective: minimise the fleet, then the distance.
+# lexicographic objective: minimise the fleet, then the distance.
 # model.minimize(cp.sum(cp.used(r) for r in routes))
 model.minimize(cp.sum(cp.sum_edges(r, lambda i, j: D[i][j], start=depot, end=depot) for r in routes))
 for r in routes:

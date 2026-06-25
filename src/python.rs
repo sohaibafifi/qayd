@@ -8,6 +8,7 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyIterator, PyModule};
 
+use crate::collection;
 use crate::constraints::count;
 use crate::constraints::graph;
 use crate::constraints::intension;
@@ -16,7 +17,6 @@ use crate::constraints::linear::{self, Relation};
 use crate::constraints::primitives;
 use crate::constraints::scheduling;
 use crate::constraints::table;
-use crate::collection;
 use crate::expr::{self, Expr};
 use crate::ids::VarId;
 use crate::ls::{solve_fast_cop, LocalRhs, LocalSearchSpec, LsConfig};
@@ -264,7 +264,6 @@ fn one_id_for(model_id: u64, var: &PyIntVar) -> PyResult<VarId> {
     }
     Ok(VarId(var.index))
 }
-
 
 fn search_ids(model: &PyModel, search: Option<&Bound<'_, PyAny>>, extra: Option<VarId>) -> PyResult<Vec<VarId>> {
     let mut vars = match search {
@@ -1097,7 +1096,9 @@ impl PyModel {
             return Err(PyValueError::new_err("cannot mix integer variables with list_vars; use one modeling style per model"));
         }
         if self.col_schedule.is_some() {
-            return Err(PyValueError::new_err("model already has interval variables; use one collection mode per model (list or interval)"));
+            return Err(PyValueError::new_err(
+                "model already has interval variables; use one collection mode per model (list or interval)",
+            ));
         }
         // The universe is a set partitioned among the lists; duplicate ids would
         // be independent positions that share a value, which silently diverges
@@ -1178,7 +1179,8 @@ impl PyModel {
     fn interval_vars(&mut self, durations: Vec<i64>, horizon: i64) -> PyResult<Vec<PyIntervalVar>> {
         self.enter_schedule_mode()?;
         let intervals = durations.iter().map(|&d| collection::IntervalVar { duration: d, horizon, modes: Vec::new() }).collect();
-        self.col_schedule = Some(collection::Schedule { intervals, precedences: Vec::new(), resources: Vec::new(), minimize_makespan: true });
+        self.col_schedule =
+            Some(collection::Schedule { intervals, precedences: Vec::new(), resources: Vec::new(), minimize_makespan: true });
         let gen = self.col_sched_gen;
         Ok((0..durations.len()).map(|i| PyIntervalVar { model_id: self.id, gen, index: i as u32 }).collect())
     }
@@ -1200,7 +1202,8 @@ impl PyModel {
                 modes: opts.iter().map(|&(machine, duration)| collection::Mode { machine, duration }).collect(),
             })
             .collect();
-        self.col_schedule = Some(collection::Schedule { intervals, precedences: Vec::new(), resources: Vec::new(), minimize_makespan: true });
+        self.col_schedule =
+            Some(collection::Schedule { intervals, precedences: Vec::new(), resources: Vec::new(), minimize_makespan: true });
         let gen = self.col_sched_gen;
         Ok((0..modes.len()).map(|i| PyIntervalVar { model_id: self.id, gen, index: i as u32 }).collect())
     }
@@ -1262,7 +1265,9 @@ impl PyModel {
         // collection engine regardless of the integer-path options.
         if self.col_universe.is_some() || self.col_schedule.is_some() {
             if !self.names.is_empty() || self.objective.is_some() {
-                return Err(PyValueError::new_err("model mixes integer variables with list/interval variables; use one modeling style per model"));
+                return Err(PyValueError::new_err(
+                    "model mixes integer variables with list/interval variables; use one modeling style per model",
+                ));
             }
             return self.solve_collection(time_limit, seed, verbose);
         }
@@ -1527,7 +1532,16 @@ impl PyModel {
                 SolveStats::default(),
                 self.names.len(),
             ),
-            None => make_solution("UNKNOWN", &vars, None, None, Some(sense), Some(&objective.expr.text), SolveStats::default(), self.names.len()),
+            None => make_solution(
+                "UNKNOWN",
+                &vars,
+                None,
+                None,
+                Some(sense),
+                Some(&objective.expr.text),
+                SolveStats::default(),
+                self.names.len(),
+            ),
         };
         if verbose {
             verbose_finish(&solution);
@@ -2010,9 +2024,7 @@ fn sum(arg: &Bound<'_, PyAny>, func: Option<&Bound<'_, PyAny>>) -> PyResult<PyTe
     }
     let mut acc: Option<PyTerm> = None;
     for item in arg.try_iter()? {
-        let t = item?
-            .extract::<PyRef<'_, PyTerm>>()
-            .map_err(|_| PyTypeError::new_err("sum(iterable) expects an iterable of terms"))?;
+        let t = item?.extract::<PyRef<'_, PyTerm>>().map_err(|_| PyTypeError::new_err("sum(iterable) expects an iterable of terms"))?;
         acc = Some(match acc {
             None => t.clone(),
             Some(a) => combine_terms(&a, &t)?,
@@ -2044,7 +2056,15 @@ fn count_reduction(route: &PyListVar, func: Option<&Bound<'_, PyAny>>) -> PyResu
         None => {
             let mut arena = collection::ExprArena::default();
             let body = arena.constant(1);
-            Ok(single_term(route, collection::Reduction { op: collection::ReduceOp::Count, iterable: collection::Iterable::Items(route.index as usize), arena, body }))
+            Ok(single_term(
+                route,
+                collection::Reduction {
+                    op: collection::ReduceOp::Count,
+                    iterable: collection::Iterable::Items(route.index as usize),
+                    arena,
+                    body,
+                },
+            ))
         }
     }
 }
@@ -2229,7 +2249,10 @@ fn list_max(route: &PyListVar, values: Vec<i64>) -> PyTerm {
 fn list_count(route: &PyListVar) -> PyTerm {
     let mut arena = collection::ExprArena::default();
     let body = arena.constant(1);
-    single_term(route, collection::Reduction { op: collection::ReduceOp::Count, iterable: collection::Iterable::Items(route.index as usize), arena, body })
+    single_term(
+        route,
+        collection::Reduction { op: collection::ReduceOp::Count, iterable: collection::Iterable::Items(route.index as usize), arena, body },
+    )
 }
 
 /// `1` if `route` has any item, else `0`. Summed over routes (e.g.
@@ -2239,9 +2262,11 @@ fn list_count(route: &PyListVar) -> PyTerm {
 fn used(route: &PyListVar) -> PyTerm {
     let mut arena = collection::ExprArena::default();
     let body = arena.constant(0);
-    single_term(route, collection::Reduction { op: collection::ReduceOp::Used, iterable: collection::Iterable::Items(route.index as usize), arena, body })
+    single_term(
+        route,
+        collection::Reduction { op: collection::ReduceOp::Used, iterable: collection::Iterable::Items(route.index as usize), arena, body },
+    )
 }
-
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {

@@ -1986,11 +1986,8 @@ where
             if stagnant >= RESTART_AFTER {
                 restarts += 1;
                 let restart_seed = seed ^ mix64(iterations);
-                let mut trial = if constructive_start {
-                    model.constructive_assignment(restart_seed)
-                } else {
-                    model.random_assignment(restart_seed)
-                };
+                let mut trial =
+                    if constructive_start { model.constructive_assignment(restart_seed) } else { model.random_assignment(restart_seed) };
                 let (mut trial_score, mut trial_con_viol, mut trial_complete) = model.score_breakdown(&mut trial, &weights);
                 let mut min_trial = model.min_assignment();
                 let (min_score, min_con_viol, min_complete) = model.score_breakdown(&mut min_trial, &weights);
