@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Qayd</title>
+    <meta name="description" content="Qayd is a rich constraint programming solver in Rust.">
+    <link rel="icon" href="assets/qayd-logo.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="styles.css">
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="index.html" aria-label="Qayd home">
+        <img src="assets/qayd-logo.svg" alt="" width="34" height="34">
+        <span>Qayd</span>
+      </a>
+      <button class="icon-button theme-button" type="button" data-theme-toggle aria-label="Toggle color theme">
+        <span class="theme-glyph" aria-hidden="true"></span>
+      </button>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="hero-copy">
+          <span class="eyebrow">Rust · constraint programming · local search</span>
+          <h1>Qayd</h1>
+          <p class="lead">Yet another rich Constraint Programming solver</p>
+          <p class="summary">
+            Qayd combines finite-domain propagation, global constraints, learning search,
+            parallel optimization, and native collection models for routing, packing,
+            assignment, and scheduling.
+          </p>
+        </div>
+
+        <div class="hero-art" aria-label="Qayd model preview">
+          <div class="code-card" data-tabs>
+            <div class="code-tabs" role="tablist" aria-label="Code preview">
+              <button class="code-tab is-active" type="button" role="tab" aria-selected="true" data-tab="model">model.py</button>
+              <button class="code-tab" type="button" role="tab" aria-selected="false" data-tab="terminal">terminal</button>
+            </div>
+            <pre data-panel="model"><code>routes = model.list_vars(k, customers)
+
+for r in routes:
+    model.add(cp.sum(r, lambda i: demand[i]) <= capacity)
+
+model.minimize(cp.sum(
+    cp.sum_edges(r, lambda i, j: dist[i][j], start=0, end=0)
+    for r in routes
+))</code></pre>
+            <pre data-panel="terminal" hidden><code>$ qayd -t 10 -p 4 -v instance.xml.lzma
+c vars 11842 constraints 29103
+c workers 4 (portfolio 2, lns 1, incumbent 1)
+c presolve reduced search 11842 -> 318 fixed
+o 912
+o 884
+s SATISFIABLE</code></pre>
+          </div>
+<!--          <div class="route-card" aria-hidden="true">-->
+<!--            <svg viewBox="0 0 520 230" role="img">-->
+<!--              <path d="M66 172 L135 92 L226 134 L304 58 L397 94 L466 42" fill="none" stroke="currentColor" stroke-width="4"/>-->
+<!--              <path d="M86 62 L168 44 L250 88 L326 154 L438 166" fill="none" stroke="#93a0af" stroke-width="2" stroke-dasharray="7 10"/>-->
+<!--              <g fill="#f7fbfb" stroke="#087f7b" stroke-width="4">-->
+<!--                <circle cx="66" cy="172" r="11"/><circle cx="135" cy="92" r="11"/><circle cx="226" cy="134" r="11"/>-->
+<!--                <circle cx="304" cy="58" r="11"/><circle cx="397" cy="94" r="11"/><circle cx="466" cy="42" r="11"/>-->
+<!--              </g>-->
+<!--              <g fill="#e8eef4" stroke="#7b8797" stroke-width="2">-->
+<!--                <circle cx="86" cy="62" r="8"/><circle cx="168" cy="44" r="8"/><circle cx="250" cy="88" r="8"/>-->
+<!--                <circle cx="326" cy="154" r="8"/><circle cx="438" cy="166" r="8"/>-->
+<!--              </g>-->
+<!--            </svg>-->
+<!--          </div>-->
+        </div>
+      </section>
+
+      <section class="features" id="features">
+        <div class="section-head">
+          <span class="kicker">Capabilities</span>
+          <h2>Supported Features</h2>
+          <p>Compact, current, and grounded in the solver code.</p>
+        </div>
+        <div class="feature-list">
+          <article>
+            <div>
+              <h3>Finite-domain kernel</h3>
+              <p>Trailed integer domains, central solver ownership, propagation queues, branch-and-bound, and brute-force oracle tests.</p>
+            </div>
+            <span>Rust CP core</span>
+          </article>
+          <article>
+            <div>
+              <h3>XCSP3 and FlatZinc</h3>
+              <p>XCSP3 instance solving through the CLI, plus a beta FlatZinc driver for MiniZinc workflows.</p>
+            </div>
+            <a href="https://xcsp.org">XCSP3</a>
+          </article>
+          <article>
+            <div>
+              <h3>Tables, regular, and MDD</h3>
+              <p>Positive extension tables use bitsets and residues; regular constraints use layered automaton filtering.</p>
+            </div>
+            <span><a href="https://arxiv.org/abs/1604.06641">Compact-Table</a> · <a href="https://doi.org/10.1007/978-3-540-30201-8_36">Pesant</a></span>
+          </article>
+          <article>
+            <div>
+              <h3>Global constraints</h3>
+              <p>Coverage includes allDifferent, allEqual, ordered, lex, sum, count, nValues, cardinality, element, scheduling, packing, circuit, and slide families.</p>
+            </div>
+            <span><a href="https://aaai.org/Library/AAAI/1994/aaai94-055.php">Regin</a> · <a href="https://vilim.eu/petr/cp2009.pdf">edge finding</a></span>
+          </article>
+          <article>
+            <div>
+              <h3>Learning and parallel optimization</h3>
+              <p>Lazy Clause Generation, watched clauses, shared incumbents, clause sharing, split jobs, objective probes, and LNS workers.</p>
+            </div>
+            <span><a href="https://people.eng.unimelb.edu.au/pstuckey/papers/lazy.pdf">LCG</a> · <a href="https://doi.org/10.1007/978-3-031-95973-8_13">work stealing</a> · <a href="https://doi.org/10.1007/978-3-319-91086-4_4">LNS</a></span>
+          </article>
+          <article>
+            <div>
+              <h3>Collection models</h3>
+              <p>Native ordered lists, item and edge reductions, scans, windows, pair reductions, lexicographic objectives, and interval schedules.</p>
+            </div>
+            <span>routes · bins · schedules</span>
+          </article>
+        </div>
+      </section>
+
+      <section class="start" id="start">
+        <div class="start-head">
+          <span class="kicker">Get going</span>
+          <h2>Start Locally</h2>
+          <p>Build, test, and run an example from the repository.</p>
+        </div>
+        <div class="command-grid">
+          <div class="command-card">
+            <span>build</span>
+            <code>cargo build && cargo test</code>
+            <button class="copy-button" type="button" data-copy="cargo build && cargo test">Copy</button>
+          </div>
+          <div class="command-card">
+            <span>python</span>
+            <code>uv run examples/python/vrp.py</code>
+            <button class="copy-button" type="button" data-copy="uv run examples/python/vrp.py">Copy</button>
+          </div>
+          <div class="command-card">
+            <span>quality</span>
+            <code>cargo clippy --all-targets -- -D warnings</code>
+            <button class="copy-button" type="button" data-copy="cargo clippy --all-targets -- -D warnings">Copy</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>Qayd Project</span>
+      <a href="https://github.com/sohaibafifi/qayd">Github</a>
+
+    </footer>
+  </body>
+</html>

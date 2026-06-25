@@ -1,0 +1,22 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Qayd logo">
+  <defs>
+    <linearGradient id="qayd-stroke" x1="96" y1="96" x2="416" y2="416" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2B0A3D"/>
+      <stop offset="1" stop-color="#8A3FFC"/>
+    </linearGradient>
+  </defs>
+  <!-- constraint network inside the lens: variables (nodes) bound by constraints (edges) -->
+  <g stroke="url(#qayd-stroke)" stroke-width="12" stroke-linecap="round" opacity="0.9">
+    <line x1="256" y1="200" x2="206" y2="292"/>
+    <line x1="256" y1="200" x2="306" y2="292"/>
+    <line x1="206" y1="292" x2="306" y2="292"/>
+  </g>
+  <g fill="url(#qayd-stroke)">
+    <circle cx="256" cy="200" r="20"/>
+    <circle cx="206" cy="292" r="20"/>
+    <circle cx="306" cy="292" r="20"/>
+  </g>
+  <!-- magnifying glass: search over the constraint network -->
+  <circle cx="256" cy="256" r="150" stroke="url(#qayd-stroke)" stroke-width="36" stroke-linecap="round"/>
+  <path d="M 356 356 L 448 448" stroke="url(#qayd-stroke)" stroke-width="36" stroke-linecap="round"/>
+</svg>
