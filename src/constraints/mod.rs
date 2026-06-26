@@ -9,4 +9,5 @@ pub mod lex;
 pub mod linear;
 pub mod primitives;
 pub mod scheduling;
+pub mod structured;
 pub mod table;

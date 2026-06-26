@@ -1,4 +1,4 @@
-"""Routing helpers built on the native qayd model API."""
+"""Routing helpers built on the Python qayd model API."""
 
 from __future__ import annotations
 

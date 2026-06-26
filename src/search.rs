@@ -8,11 +8,13 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
 use crate::expr::Expr;
-use crate::ids::VarId;
+use crate::ids::{IntervalId, ListId, VarId};
 use crate::lcg::clause::ClauseSharing;
 use crate::lcg::lit::{LazyAtomRegistry, Lit};
 use crate::lcg::trail::Cdcl;
+use crate::propagator::Inconsistency;
 use crate::store::Solver;
+use crate::structured::IntervalPresence;
 
 /// A stop flag that is never set; used by the non-interruptible entry points.
 static NEVER_STOP: AtomicBool = AtomicBool::new(false);
@@ -41,6 +43,22 @@ pub struct SolveStats {
     pub vivified_clauses: u64,
     /// Literals removed by CP-aware vivification.
     pub vivified_lits: u64,
+}
+
+/// Complete assignment for structured list and interval domains.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StructuredSolution {
+    /// Required item contents of each structured list.
+    pub lists: Vec<Vec<i32>>,
+    /// Fixed start of each present structured interval, or `None` if absent.
+    pub interval_starts: Vec<Option<i32>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StructuredDecision {
+    ListMembership { list: ListId, item: i32 },
+    IntervalPresence { interval: IntervalId },
+    IntervalStartSplit { interval: IntervalId, mid: i32 },
 }
 
 /// Materialized or symbolic objective evaluated by the CDCL optimizer.
@@ -164,6 +182,165 @@ pub fn first_solution(solver: &mut Solver, vars: &[VarId]) -> Option<Vec<i32>> {
 /// Count all solutions over `vars`.
 pub fn count_solutions(solver: &mut Solver, vars: &[VarId]) -> u64 {
     solve(solver, vars, |_| SearchControl::Continue).solutions
+}
+
+/// Enumerate complete assignments over all structured list and interval domains.
+///
+/// This is a chronological DFS with propagation. It is intentionally separate
+/// from the LCG drivers until structured facts have explanations.
+pub fn solve_structured<F>(solver: &mut Solver, mut on_solution: F) -> SolveStats
+where
+    F: FnMut(&Solver, &StructuredSolution) -> SearchControl,
+{
+    solve_structured_interruptible(solver, &mut on_solution, &NEVER_STOP).0
+}
+
+/// Like [`solve_structured`], but halts when `stop` is set. The Boolean is `true`
+/// only when the structured search space was fully exhausted.
+pub fn solve_structured_interruptible<F>(solver: &mut Solver, mut on_solution: F, stop: &AtomicBool) -> (SolveStats, bool)
+where
+    F: FnMut(&Solver, &StructuredSolution) -> SearchControl,
+{
+    solver.enqueue_all();
+    let mut stats = SolveStats::default();
+    let complete = structured_dfs(solver, &mut stats, &mut on_solution, stop) == StructuredExit::Exhausted && !stop.load(Ordering::Relaxed);
+    (stats, complete)
+}
+
+/// Find one complete structured assignment.
+pub fn first_structured_solution(solver: &mut Solver) -> Option<StructuredSolution> {
+    let mut found = None;
+    solve_structured(solver, |_, solution| {
+        found = Some(solution.clone());
+        SearchControl::Stop
+    });
+    found
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StructuredExit {
+    Exhausted,
+    Stopped,
+}
+
+fn structured_dfs<F>(solver: &mut Solver, stats: &mut SolveStats, on_solution: &mut F, stop: &AtomicBool) -> StructuredExit
+where
+    F: FnMut(&Solver, &StructuredSolution) -> SearchControl,
+{
+    if stop.load(Ordering::Relaxed) {
+        return StructuredExit::Stopped;
+    }
+    if solver.propagate().is_err() {
+        stats.failures += 1;
+        return StructuredExit::Exhausted;
+    }
+
+    let Some(decision) = choose_structured_decision(solver) else {
+        stats.solutions += 1;
+        let solution = collect_structured_solution(solver);
+        return if matches!(on_solution(solver, &solution), SearchControl::Stop) {
+            StructuredExit::Stopped
+        } else {
+            StructuredExit::Exhausted
+        };
+    };
+
+    stats.nodes += 1;
+    for left in [true, false] {
+        solver.store.push_level();
+        let branch = apply_structured_decision(solver, decision, left);
+        let exit = if branch.is_ok() {
+            structured_dfs(solver, stats, on_solution, stop)
+        } else {
+            stats.failures += 1;
+            StructuredExit::Exhausted
+        };
+        solver.store.pop_level();
+        if exit == StructuredExit::Stopped {
+            return StructuredExit::Stopped;
+        }
+    }
+    StructuredExit::Exhausted
+}
+
+fn choose_structured_decision(solver: &Solver) -> Option<StructuredDecision> {
+    let store = &solver.store;
+    for i in 0..store.num_intervals() {
+        let interval = IntervalId(i as u32);
+        if store.interval_presence(interval) == IntervalPresence::Optional {
+            return Some(StructuredDecision::IntervalPresence { interval });
+        }
+    }
+
+    for i in 0..store.num_intervals() {
+        let interval = IntervalId(i as u32);
+        if store.interval_presence(interval) != IntervalPresence::Absent {
+            let lo = store.interval_start_min(interval);
+            let hi = store.interval_start_max(interval);
+            if lo < hi {
+                return Some(StructuredDecision::IntervalStartSplit { interval, mid: lo + (hi - lo) / 2 });
+            }
+        }
+    }
+
+    for i in 0..store.num_lists() {
+        let list = ListId(i as u32);
+        for &item in store.list_universe(list) {
+            if store.list_possible(list, item) && !store.list_required(list, item) {
+                return Some(StructuredDecision::ListMembership { list, item });
+            }
+        }
+    }
+
+    None
+}
+
+fn apply_structured_decision(solver: &mut Solver, decision: StructuredDecision, left: bool) -> Result<(), Inconsistency> {
+    match decision {
+        StructuredDecision::ListMembership { list, item } => {
+            if left {
+                solver.store.require_list_item(list, item)?;
+            } else {
+                solver.store.forbid_list_item(list, item)?;
+            }
+        }
+        StructuredDecision::IntervalPresence { interval } => {
+            if left {
+                solver.store.require_interval_presence(interval)?;
+            } else {
+                solver.store.forbid_interval_presence(interval)?;
+            }
+        }
+        StructuredDecision::IntervalStartSplit { interval, mid } => {
+            if left {
+                solver.store.set_interval_start_max(interval, mid)?;
+            } else {
+                solver.store.set_interval_start_min(interval, mid.saturating_add(1))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_structured_solution(solver: &Solver) -> StructuredSolution {
+    let store = &solver.store;
+    let mut lists = Vec::with_capacity(store.num_lists());
+    for i in 0..store.num_lists() {
+        let list = ListId(i as u32);
+        lists.push(store.list_universe(list).iter().copied().filter(|&item| store.list_required(list, item)).collect());
+    }
+
+    let mut interval_starts = Vec::with_capacity(store.num_intervals());
+    for i in 0..store.num_intervals() {
+        let interval = IntervalId(i as u32);
+        let start = match store.interval_presence(interval) {
+            IntervalPresence::Absent => None,
+            IntervalPresence::Optional | IntervalPresence::Present => Some(store.interval_start_min(interval)),
+        };
+        interval_starts.push(start);
+    }
+
+    StructuredSolution { lists, interval_starts }
 }
 
 /// Optimise `obj` by CDCL branch-and-bound; `on_improve` fires per improving

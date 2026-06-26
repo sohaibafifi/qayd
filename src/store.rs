@@ -6,14 +6,27 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::domain::Domain;
-use crate::ids::{PropId, VarId};
+use crate::ids::{IntervalId, ListId, PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Propagator};
+use crate::structured::{IntervalDomain, IntervalEvent, IntervalPresence, ListDomain, ListEvent};
 use crate::trail::{ReversibleInt, Trail};
 
 /// Per-variable subscriptions and their event granularity.
 #[derive(Clone, Default)]
 struct VarSubs {
     entries: Vec<(Event, PropId)>,
+}
+
+/// Per-list subscriptions and their event granularity.
+#[derive(Clone, Default)]
+struct ListSubs {
+    entries: Vec<(ListEvent, PropId)>,
+}
+
+/// Per-interval subscriptions and their event granularity.
+#[derive(Clone, Default)]
+struct IntervalSubs {
+    entries: Vec<(IntervalEvent, PropId)>,
 }
 
 /// A primary domain change, in domain terms, for the LCG layer to pick up.
@@ -87,8 +100,12 @@ pub enum StepOutcome {
 #[derive(Clone, Default)]
 pub struct Store {
     domains: Vec<Domain>,
+    list_domains: Vec<ListDomain>,
+    interval_domains: Vec<IntervalDomain>,
     trail: Trail,
     subs: Vec<VarSubs>,
+    list_subs: Vec<ListSubs>,
+    interval_subs: Vec<IntervalSubs>,
     /// Variables used by at least one propagator, including root-only filters.
     relevant: Vec<bool>,
     /// Propagators waiting to run.
@@ -142,9 +159,46 @@ impl Store {
         id
     }
 
+    /// Create a structured list domain over a fixed item universe.
+    pub fn new_list(&mut self, universe: Vec<i32>) -> ListId {
+        let id = ListId(self.list_domains.len() as u32);
+        let dom = ListDomain::new(universe, &mut self.trail);
+        self.list_domains.push(dom);
+        self.list_subs.push(ListSubs::default());
+        id
+    }
+
+    /// Create a mandatory fixed-duration interval.
+    pub fn new_interval(&mut self, start_min: i32, start_max: i32, duration: i32) -> IntervalId {
+        self.new_interval_with_presence(start_min, start_max, duration, IntervalPresence::Present)
+    }
+
+    /// Create an optional fixed-duration interval.
+    pub fn new_optional_interval(&mut self, start_min: i32, start_max: i32, duration: i32) -> IntervalId {
+        self.new_interval_with_presence(start_min, start_max, duration, IntervalPresence::Optional)
+    }
+
+    fn new_interval_with_presence(&mut self, start_min: i32, start_max: i32, duration: i32, presence: IntervalPresence) -> IntervalId {
+        let id = IntervalId(self.interval_domains.len() as u32);
+        let dom = IntervalDomain::new(start_min, start_max, duration, presence, &mut self.trail);
+        self.interval_domains.push(dom);
+        self.interval_subs.push(IntervalSubs::default());
+        id
+    }
+
     /// Number of variables.
     pub fn num_vars(&self) -> usize {
         self.domains.len()
+    }
+
+    /// Number of structured list domains.
+    pub fn num_lists(&self) -> usize {
+        self.list_domains.len()
+    }
+
+    /// Number of structured interval domains.
+    pub fn num_intervals(&self) -> usize {
+        self.interval_domains.len()
     }
 
     /// Number of domains using cardinality-sized sparse storage.
@@ -193,6 +247,71 @@ impl Store {
     /// Iterate the present values of `var` (arbitrary order).
     pub fn values(&self, var: VarId) -> impl Iterator<Item = i32> + '_ {
         self.domains[var.index()].values(&self.trail)
+    }
+
+    /// Immutable universe of a structured list.
+    pub fn list_universe(&self, list: ListId) -> &[i32] {
+        self.list_domains[list.index()].universe()
+    }
+
+    /// Structured list length lower bound.
+    pub fn list_len_min(&self, list: ListId) -> usize {
+        self.list_domains[list.index()].len_min(&self.trail)
+    }
+
+    /// Structured list length upper bound.
+    pub fn list_len_max(&self, list: ListId) -> usize {
+        self.list_domains[list.index()].len_max(&self.trail)
+    }
+
+    /// Whether `item` can still appear in `list`.
+    pub fn list_possible(&self, list: ListId, item: i32) -> bool {
+        self.list_domains[list.index()].is_possible(item, &self.trail)
+    }
+
+    /// Whether `item` must appear in `list`.
+    pub fn list_required(&self, list: ListId, item: i32) -> bool {
+        self.list_domains[list.index()].is_required(item, &self.trail)
+    }
+
+    /// Current count of possible items in `list`.
+    pub fn list_possible_count(&self, list: ListId) -> usize {
+        self.list_domains[list.index()].possible_count(&self.trail)
+    }
+
+    /// Current count of required items in `list`.
+    pub fn list_required_count(&self, list: ListId) -> usize {
+        self.list_domains[list.index()].required_count(&self.trail)
+    }
+
+    /// Interval start lower bound.
+    pub fn interval_start_min(&self, interval: IntervalId) -> i32 {
+        self.interval_domains[interval.index()].start_min(&self.trail)
+    }
+
+    /// Interval start upper bound.
+    pub fn interval_start_max(&self, interval: IntervalId) -> i32 {
+        self.interval_domains[interval.index()].start_max(&self.trail)
+    }
+
+    /// Interval end lower bound.
+    pub fn interval_end_min(&self, interval: IntervalId) -> i32 {
+        self.interval_domains[interval.index()].end_min(&self.trail)
+    }
+
+    /// Interval end upper bound.
+    pub fn interval_end_max(&self, interval: IntervalId) -> i32 {
+        self.interval_domains[interval.index()].end_max(&self.trail)
+    }
+
+    /// Fixed interval duration.
+    pub fn interval_duration(&self, interval: IntervalId) -> i32 {
+        self.interval_domains[interval.index()].duration()
+    }
+
+    /// Interval presence state.
+    pub fn interval_presence(&self, interval: IntervalId) -> IntervalPresence {
+        self.interval_domains[interval.index()].presence(&self.trail)
     }
 
     /// Root support when `var` uses cardinality-sized sparse storage.
@@ -257,6 +376,84 @@ impl Store {
             self.emit(DomEvent::LeTrue { var, bound }, cause);
         }
         Ok(())
+    }
+
+    /// Require an item in a structured list.
+    pub fn require_list_item(&mut self, list: ListId, item: i32) -> Result<bool, Inconsistency> {
+        let before = self.list_state(list);
+        let changed = self.list_domains[list.index()].require_item(item, &mut self.trail)?;
+        if changed {
+            self.after_list_change(list, before);
+        }
+        Ok(changed)
+    }
+
+    /// Forbid an item from a structured list.
+    pub fn forbid_list_item(&mut self, list: ListId, item: i32) -> Result<bool, Inconsistency> {
+        let before = self.list_state(list);
+        let changed = self.list_domains[list.index()].forbid_item(item, &mut self.trail)?;
+        if changed {
+            self.after_list_change(list, before);
+        }
+        Ok(changed)
+    }
+
+    /// Raise a structured list length lower bound.
+    pub fn set_list_len_min(&mut self, list: ListId, min: usize) -> Result<bool, Inconsistency> {
+        let before = self.list_state(list);
+        let changed = self.list_domains[list.index()].set_len_min(min, &mut self.trail)?;
+        if changed {
+            self.after_list_change(list, before);
+        }
+        Ok(changed)
+    }
+
+    /// Lower a structured list length upper bound.
+    pub fn set_list_len_max(&mut self, list: ListId, max: usize) -> Result<bool, Inconsistency> {
+        let before = self.list_state(list);
+        let changed = self.list_domains[list.index()].set_len_max(max, &mut self.trail)?;
+        if changed {
+            self.after_list_change(list, before);
+        }
+        Ok(changed)
+    }
+
+    /// Raise an interval start lower bound.
+    pub fn set_interval_start_min(&mut self, interval: IntervalId, min: i32) -> Result<bool, Inconsistency> {
+        let changed = self.interval_domains[interval.index()].set_start_min(min, &mut self.trail)?;
+        if changed {
+            self.notify_interval(interval, IntervalEvent::StartBoundChange);
+            self.notify_interval(interval, IntervalEvent::EndBoundChange);
+        }
+        Ok(changed)
+    }
+
+    /// Lower an interval start upper bound.
+    pub fn set_interval_start_max(&mut self, interval: IntervalId, max: i32) -> Result<bool, Inconsistency> {
+        let changed = self.interval_domains[interval.index()].set_start_max(max, &mut self.trail)?;
+        if changed {
+            self.notify_interval(interval, IntervalEvent::StartBoundChange);
+            self.notify_interval(interval, IntervalEvent::EndBoundChange);
+        }
+        Ok(changed)
+    }
+
+    /// Require an optional interval to be present.
+    pub fn require_interval_presence(&mut self, interval: IntervalId) -> Result<bool, Inconsistency> {
+        let changed = self.interval_domains[interval.index()].require_presence(&mut self.trail)?;
+        if changed {
+            self.notify_interval(interval, IntervalEvent::PresenceChange);
+        }
+        Ok(changed)
+    }
+
+    /// Mark an optional interval absent.
+    pub fn forbid_interval_presence(&mut self, interval: IntervalId) -> Result<bool, Inconsistency> {
+        let changed = self.interval_domains[interval.index()].forbid_presence(&mut self.trail)?;
+        if changed {
+            self.notify_interval(interval, IntervalEvent::PresenceChange);
+        }
+        Ok(changed)
     }
 
     /// Reason for an imminent change: staged premises if pending, else the
@@ -366,6 +563,23 @@ impl Store {
         Ok(())
     }
 
+    fn list_state(&self, list: ListId) -> (usize, usize, usize, usize) {
+        (self.list_possible_count(list), self.list_required_count(list), self.list_len_min(list), self.list_len_max(list))
+    }
+
+    fn after_list_change(&mut self, list: ListId, before: (usize, usize, usize, usize)) {
+        let after = self.list_state(list);
+        if after.0 != before.0 {
+            self.notify_list(list, ListEvent::PossibleChange);
+        }
+        if after.1 != before.1 {
+            self.notify_list(list, ListEvent::RequiredChange);
+        }
+        if after.2 != before.2 || after.3 != before.3 {
+            self.notify_list(list, ListEvent::LengthChange);
+        }
+    }
+
     // --- propagator-owned reversible state ---
     //
     // Incremental propagator state that must be restored on backtrack.
@@ -398,6 +612,24 @@ impl Store {
         let scope = &mut self.scope[prop.index()];
         if !scope.contains(&var) {
             scope.push(var);
+        }
+    }
+
+    /// Subscribe `prop` to structured list changes at the given granularity.
+    /// Idempotent per (list, prop, event).
+    pub fn subscribe_list(&mut self, list: ListId, prop: PropId, event: ListEvent) {
+        let s = &mut self.list_subs[list.index()];
+        if !s.entries.contains(&(event, prop)) {
+            s.entries.push((event, prop));
+        }
+    }
+
+    /// Subscribe `prop` to structured interval changes at the given granularity.
+    /// Idempotent per (interval, prop, event).
+    pub fn subscribe_interval(&mut self, interval: IntervalId, prop: PropId, event: IntervalEvent) {
+        let s = &mut self.interval_subs[interval.index()];
+        if !s.entries.contains(&(event, prop)) {
+            s.entries.push((event, prop));
         }
     }
 
@@ -475,6 +707,28 @@ impl Store {
         let s = &subs[var.index()];
         for &(event, p) in &s.entries {
             if event == Event::DomainChange || (bounds_moved && event == Event::BoundChange) || (fixed && event == Event::Fix) {
+                Self::wake(queue, enqueued, *current, p);
+            }
+        }
+    }
+
+    /// Wake subscribers of a structured list event.
+    fn notify_list(&mut self, list: ListId, changed: ListEvent) {
+        let Store { list_subs, queue, enqueued, current, .. } = self;
+        let s = &list_subs[list.index()];
+        for &(event, p) in &s.entries {
+            if event == changed {
+                Self::wake(queue, enqueued, *current, p);
+            }
+        }
+    }
+
+    /// Wake subscribers of a structured interval event.
+    fn notify_interval(&mut self, interval: IntervalId, changed: IntervalEvent) {
+        let Store { interval_subs, queue, enqueued, current, .. } = self;
+        let s = &interval_subs[interval.index()];
+        for &(event, p) in &s.entries {
+            if event == changed {
                 Self::wake(queue, enqueued, *current, p);
             }
         }

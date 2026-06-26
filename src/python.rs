@@ -16,9 +16,10 @@ use crate::constraints::lex;
 use crate::constraints::linear::{self, Relation};
 use crate::constraints::primitives;
 use crate::constraints::scheduling;
+use crate::constraints::structured as structured_constraints;
 use crate::constraints::table;
 use crate::expr::{self, Expr};
-use crate::ids::VarId;
+use crate::ids::{IntervalId, ListId, VarId};
 use crate::ls::{solve_fast_cop, LocalRhs, LocalSearchSpec, LsConfig};
 use crate::problem::{Objective as ProblemObjective, Problem};
 use crate::search::{self, Objective as SearchObjective, SearchControl, SolveStats};
@@ -346,6 +347,18 @@ fn verbose_finish(solution: &PySolution) {
     println!("  learned_lits: {}", solution.stats.learned_lits);
 }
 
+fn stop_after(limit: u64) -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(limit));
+            stop.store(true, Ordering::SeqCst);
+        });
+    }
+    stop
+}
+
 fn binary_expr(lhs: ExprLike, rhs: &Bound<'_, PyAny>, op: &str, f: impl FnOnce(Expr, Expr) -> Expr) -> PyResult<PyExpr> {
     let rhs = expr_from_py(rhs)?;
     let model_id = merge_model_ids(lhs.model_id, rhs.model_id)?;
@@ -406,6 +419,47 @@ fn parse_relation(relation: &str) -> PyResult<Relation> {
 
 fn checked_i32(value: i64, name: &str) -> PyResult<i32> {
     i32::try_from(value).map_err(|_| PyValueError::new_err(format!("{name} is outside the i32 domain range")))
+}
+
+enum StructuredListConstraint {
+    Bounds { list: usize, min: usize, max: usize },
+    Impossible,
+}
+
+fn structured_list_constraint(constraint: &collection::Constraint, item_count: usize) -> Option<StructuredListConstraint> {
+    if !matches!(constraint.reduction.op, collection::ReduceOp::Count) {
+        return None;
+    }
+    let collection::Iterable::Items(list) = &constraint.reduction.iterable else {
+        return None;
+    };
+    let list = *list;
+    let body = constraint.reduction.arena.exprs.get(constraint.reduction.body.0 as usize)?;
+    let collection::Expr::Const(value) = body else {
+        return None;
+    };
+    if *value == 0 {
+        return None;
+    }
+
+    let n = item_count as i64;
+    let rhs = constraint.rhs;
+    let (min, max) = match constraint.op {
+        collection::Op::Le => (0, rhs),
+        collection::Op::Ge => (rhs, n),
+        collection::Op::Eq => (rhs, rhs),
+    };
+    if max < 0 || min > n {
+        return Some(StructuredListConstraint::Impossible);
+    }
+
+    let min = min.max(0) as usize;
+    let max = max.min(n) as usize;
+    if min > max {
+        Some(StructuredListConstraint::Impossible)
+    } else {
+        Some(StructuredListConstraint::Bounds { list, min, max })
+    }
 }
 
 #[pymethods]
@@ -1412,6 +1466,219 @@ impl PyModel {
         Ok(())
     }
 
+    fn try_solve_structured_collection(
+        &self,
+        model: &collection::CollectionModel,
+        time_limit: Option<u64>,
+        verbose: bool,
+    ) -> PyResult<Option<PySolution>> {
+        if let Some(schedule) = &model.schedule {
+            return self.try_solve_structured_schedule(schedule, model, time_limit, verbose);
+        }
+        self.try_solve_structured_lists(model, time_limit, verbose)
+    }
+
+    fn try_solve_structured_lists(
+        &self,
+        model: &collection::CollectionModel,
+        time_limit: Option<u64>,
+        verbose: bool,
+    ) -> PyResult<Option<PySolution>> {
+        if !model.objectives.is_empty() {
+            return Ok(None);
+        }
+
+        let mut length_constraints = Vec::with_capacity(model.constraints.len());
+        for constraint in &model.constraints {
+            let Some(parsed) = structured_list_constraint(constraint, model.items.len()) else {
+                return Ok(None);
+            };
+            length_constraints.push(parsed);
+        }
+
+        let limit = time_limit.unwrap_or(5);
+        let constraint_count = 1 + model.constraints.len() + model.globals.len();
+        if verbose {
+            println!("qayd solve (structured)");
+            println!("  kind: lists");
+            println!("  items: {}", model.items.len());
+            println!("  lists: {}", model.lists);
+            println!("  constraints: {constraint_count}");
+            println!("  objective: no");
+            println!("  time limit: {limit}s");
+        }
+
+        if length_constraints.iter().any(|constraint| matches!(constraint, StructuredListConstraint::Impossible)) {
+            if verbose {
+                println!("qayd result (structured)");
+                println!("  status: UNSATISFIABLE");
+                println!("  solutions: 0");
+                println!("  nodes: 0");
+                println!("  failures: 0");
+            }
+            return Ok(Some(PySolution {
+                status: "UNSATISFIABLE".to_string(),
+                objective: None,
+                objective_sense: None,
+                objective_expr: None,
+                values: Vec::new(),
+                stats: SolveStats::default().into(),
+                routes: None,
+                objectives: Vec::new(),
+                starts: Vec::new(),
+                machines: Vec::new(),
+            }));
+        }
+
+        let mut solver = Solver::new();
+        let lists: Vec<ListId> = (0..model.lists).map(|_| solver.store.new_list(model.items.clone())).collect();
+        structured_constraints::partition(&mut solver, &lists, &model.items);
+        for constraint in length_constraints {
+            let StructuredListConstraint::Bounds { list, min, max } = constraint else {
+                continue;
+            };
+            structured_constraints::list_len(&mut solver, lists[list], min, max);
+        }
+        for global in &model.globals {
+            match *global {
+                collection::GlobalConstraint::ListLe { before, after } => {
+                    structured_constraints::item_precedence(&mut solver, &lists, before, after);
+                }
+                collection::GlobalConstraint::SameList { a, b } => {
+                    structured_constraints::same_list(&mut solver, &lists, a, b);
+                }
+            }
+        }
+
+        let stop = stop_after(limit);
+        let mut solution = None;
+        let (stats, complete) = search::solve_structured_interruptible(
+            &mut solver,
+            |_, structured| {
+                solution = Some(structured.clone());
+                SearchControl::Stop
+            },
+            &stop,
+        );
+        let status = if solution.is_some() {
+            "SATISFIABLE"
+        } else if complete {
+            "UNSATISFIABLE"
+        } else {
+            "UNKNOWN"
+        };
+        if verbose {
+            println!("qayd result (structured)");
+            println!("  status: {status}");
+            println!("  solutions: {}", stats.solutions);
+            println!("  nodes: {}", stats.nodes);
+            println!("  failures: {}", stats.failures);
+        }
+
+        Ok(Some(PySolution {
+            status: status.to_string(),
+            objective: None,
+            objective_sense: None,
+            objective_expr: None,
+            values: Vec::new(),
+            stats: stats.into(),
+            routes: solution.map(|structured| structured.lists),
+            objectives: Vec::new(),
+            starts: Vec::new(),
+            machines: Vec::new(),
+        }))
+    }
+
+    fn try_solve_structured_schedule(
+        &self,
+        schedule: &collection::Schedule,
+        model: &collection::CollectionModel,
+        time_limit: Option<u64>,
+        verbose: bool,
+    ) -> PyResult<Option<PySolution>> {
+        let fixed_intervals = schedule.intervals.iter().all(|iv| iv.modes.is_empty());
+        if !model.objectives.is_empty()
+            || !model.constraints.is_empty()
+            || !model.globals.is_empty()
+            || !model.items.is_empty()
+            || !schedule.resources.is_empty()
+            || !fixed_intervals
+        {
+            return Ok(None);
+        }
+
+        let limit = time_limit.unwrap_or(5);
+        if verbose {
+            println!("qayd solve (structured)");
+            println!("  kind: intervals");
+            println!("  intervals: {}", schedule.intervals.len());
+            println!("  precedences: {}", schedule.precedences.len());
+            println!("  objective: {}", if schedule.minimize_makespan { "makespan" } else { "no" });
+            println!("  time limit: {limit}s");
+        }
+
+        let mut solver = Solver::new();
+        let mut intervals: Vec<IntervalId> = Vec::with_capacity(schedule.intervals.len());
+        let mut durations = Vec::with_capacity(schedule.intervals.len());
+        for interval in &schedule.intervals {
+            let duration = checked_i32(interval.duration, "interval duration")?;
+            let start_max = checked_i32(interval.horizon - interval.duration, "interval start upper bound")?;
+            intervals.push(solver.store.new_interval(0, start_max, duration));
+            durations.push(interval.duration);
+        }
+        for &(before, after) in &schedule.precedences {
+            structured_constraints::interval_precedence(&mut solver, intervals[before], intervals[after]);
+        }
+
+        let stop = stop_after(limit);
+        let mut best: Option<(i64, Vec<i64>)> = None;
+        let (stats, complete) = search::solve_structured_interruptible(
+            &mut solver,
+            |_, structured| {
+                let starts: Vec<i64> = structured.interval_starts.iter().map(|start| i64::from(start.unwrap_or(0))).collect();
+                let makespan = starts.iter().zip(&durations).map(|(&start, &duration)| start + duration).max().unwrap_or(0);
+                if best.as_ref().is_none_or(|(value, _)| makespan < *value) {
+                    if verbose {
+                        println!("  o {makespan}  (min)");
+                    }
+                    best = Some((makespan, starts));
+                }
+                SearchControl::Continue
+            },
+            &stop,
+        );
+
+        let (status, objective, starts) = match (best, complete) {
+            (Some((objective, starts)), true) if schedule.minimize_makespan => ("OPTIMAL", Some(objective), starts),
+            (Some((objective, starts)), _) => ("SATISFIABLE", Some(objective), starts),
+            (None, true) => ("UNSATISFIABLE", None, Vec::new()),
+            (None, false) => ("UNKNOWN", None, Vec::new()),
+        };
+        if verbose {
+            println!("qayd result (structured)");
+            println!("  status: {status}");
+            if let Some(objective) = objective {
+                println!("  objective: {objective}");
+            }
+            println!("  solutions: {}", stats.solutions);
+            println!("  nodes: {}", stats.nodes);
+            println!("  failures: {}", stats.failures);
+        }
+
+        Ok(Some(PySolution {
+            status: status.to_string(),
+            objective,
+            objective_sense: schedule.minimize_makespan.then(|| "min".to_string()),
+            objective_expr: schedule.minimize_makespan.then(|| "makespan".to_string()),
+            values: Vec::new(),
+            stats: stats.into(),
+            routes: None,
+            objectives: objective.map(|value| vec![value]).unwrap_or_default(),
+            starts,
+            machines: vec![-1; schedule.intervals.len()],
+        }))
+    }
+
     fn solve_collection(&self, time_limit: Option<u64>, seed: u64, verbose: bool) -> PyResult<PySolution> {
         let model = collection::CollectionModel {
             items: self.col_universe.clone().unwrap_or_default(),
@@ -1422,6 +1689,9 @@ impl PyModel {
             schedule: self.col_schedule.clone(),
         };
         model.validate().map_err(PyValueError::new_err)?;
+        if let Some(solution) = self.try_solve_structured_collection(&model, time_limit, verbose)? {
+            return Ok(solution);
+        }
         let limit = time_limit.unwrap_or(5);
         // The first tier drives the progress line; report its sense.
         let primary_sense = self.col_objectives.first().map_or("min", |t| if t.minimize { "min" } else { "max" });
@@ -1433,14 +1703,7 @@ impl PyModel {
             println!("  objective tiers: {}", model.objectives.len());
             println!("  time limit: {limit}s");
         }
-        let stop = Arc::new(AtomicBool::new(false));
-        {
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_secs(limit));
-                stop.store(true, Ordering::SeqCst);
-            });
-        }
+        let stop = stop_after(limit);
         let start = Instant::now();
         let mut improvements = 0u64;
         let mut report = |objective: i64| {

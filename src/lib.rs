@@ -35,16 +35,19 @@ pub mod propagator;
 mod python;
 pub mod search;
 pub mod store;
+pub mod structured;
 pub mod trail;
 pub mod xcsp;
 
 pub use expr::Expr;
-pub use ids::{PropId, VarId};
+pub use ids::{IntervalId, ListId, PropId, VarId};
+pub use structured::{IntervalEvent, IntervalPresence, ListEvent};
 // The collection (list/lambda) IR lives under `qayd::collection::*`; it is not
 // re-exported here because its `Expr` would clash with the intension `Expr`.
 pub use propagator::{Event, Inconsistency, Propagator};
 pub use search::{
-    count_solutions, first_solution, maximize, minimize, optimize_with, solve, solve_interruptible, SearchControl, SolveStats,
+    count_solutions, first_solution, first_structured_solution, maximize, minimize, optimize_with, solve, solve_interruptible,
+    solve_structured, solve_structured_interruptible, SearchControl, SolveStats, StructuredSolution,
 };
 pub use store::{Solver, Store};
 pub use trail::{ReversibleInt, Trail};

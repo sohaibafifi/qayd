@@ -1,4 +1,4 @@
-"""Scheduling helpers built on the native qayd model API."""
+"""Scheduling helpers built on the Python qayd model API."""
 
 from __future__ import annotations
 
