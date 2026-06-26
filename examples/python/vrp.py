@@ -5,7 +5,7 @@ distance objective, and a per-route capacity constraint. solve() picks the
 collection engine because the model has list variables.
 
 Instance: set ``QAYD_VRP_INSTANCE`` to any CVRPLIB ``.vrp`` file; defaults to the
-bundled ``instances/E-n22-k4.vrp`` (Christofides & Eilon, optimal 375). More at
+bundled ``data/vrplib/CVRP/X-n101-k25.vrp`` (Uchoa et al.). More at
 http://vrp.galgos.inf.puc-rio.br. Tune time via ``QAYD_VRP_T``; trace with
 ``QAYD_VERBOSE=1``.
 """
@@ -18,7 +18,8 @@ import vrplib
 import qayd as cp
 
 here = os.path.dirname(os.path.abspath(__file__))
-path = os.environ.get("QAYD_VRP_INSTANCE", os.path.join(here, "data", "vrplib", "CVRP", "E-n22-k4.vrp"))
+repo_root = os.path.abspath(os.path.join(here, "..", ".."))
+path = os.environ.get("QAYD_VRP_INSTANCE", os.path.join(repo_root, "data", "vrplib", "CVRP", "X-n101-k25.vrp"))
 time_limit = int(os.environ.get("QAYD_VRP_T", "10"))
 
 inst = vrplib.read_instance(path)
@@ -47,7 +48,7 @@ model.minimize(cp.sum(cp.sum_edges(r, lambda i, j: D[i][j], start=depot, end=dep
 for r in routes:
     model.add(cp.sum(r, lambda i: Q[i]) <= capacity)  # each route within capacity
 
-solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1", local_search=True)
+solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1", local_search=False)
 
 # Known optimum, if the instance comment records it (CVRPLIB convention).
 opt = re.search(r"Optimal value:\s*(\d+)", inst.get("comment", ""))

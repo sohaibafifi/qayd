@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use super::eval::{eval_reduction, violation_of, INFEASIBLE};
 use super::model::{
     CollectionModel, CollectionSolution, Constraint, Expr, ExprId, GlobalConstraint, Iterable, ReduceOp, Reduction, MAX_TIERS,
 };
-use super::moves::{apply_move, best_improving_move, better, random_kick, shuffle, snapshot};
-use super::schedule::solve_schedule;
+use super::moves::{apply_move, best_improving_move, better, random_kick, shuffle, snapshot, SearchMemory};
+use super::schedule_ls::solve_schedule;
 use crate::mix64;
 
 pub(super) struct Globals {
@@ -101,6 +102,77 @@ pub(super) struct PerList {
     /// list. Lists with an unsupported reduction (Pairs, Scan, Windows, Min, Max)
     /// fall back to full recomputation.
     pub(super) list_incremental: Vec<bool>,
+    /// Whether route-edge reductions exist. Routing-only moves such as Or-opt
+    /// are useful here and wasteful on order-independent packing models.
+    pub(super) has_edges: bool,
+    /// Per-list route boundaries from the first edge reduction on that list.
+    pub(super) route_bounds: Vec<Option<(i32, i32)>>,
+    /// Nearest-neighbor candidate edges for routing moves, when a direct matrix
+    /// edge objective is available.
+    pub(super) candidates: Option<CandidateNeighbors>,
+}
+
+pub(super) struct CandidateNeighbors {
+    map: HashMap<i32, Vec<i32>>,
+}
+
+impl CandidateNeighbors {
+    fn build(model: &CollectionModel, matrix: Arc<Vec<Vec<i64>>>) -> Option<Self> {
+        const LIMIT: usize = 24;
+        let n = matrix.len();
+        if n == 0 || matrix.iter().any(|row| row.len() != n) {
+            return None;
+        }
+        let mut values = model.items.clone();
+        for reduction in model.objectives.iter().flat_map(|tier| tier.terms.iter()) {
+            if let Iterable::Edges { start, end, .. } = &reduction.iterable {
+                values.push(*start);
+                values.push(*end);
+            }
+        }
+        for constraint in &model.constraints {
+            if let Iterable::Edges { start, end, .. } = &constraint.reduction.iterable {
+                values.push(*start);
+                values.push(*end);
+            }
+        }
+        values.sort_unstable();
+        values.dedup();
+        if values.iter().any(|&value| usize::try_from(value).ok().is_none_or(|idx| idx >= n)) {
+            return None;
+        }
+
+        let mut targets = model.items.clone();
+        for &value in &values {
+            if !targets.contains(&value) {
+                targets.push(value);
+            }
+        }
+        targets.sort_unstable();
+        targets.dedup();
+
+        let mut map = HashMap::with_capacity(values.len());
+        for &from in &values {
+            let from_idx = usize::try_from(from).ok()?;
+            let mut near = targets
+                .iter()
+                .copied()
+                .filter(|&to| to != from)
+                .map(|to| {
+                    let to_idx = usize::try_from(to).ok()?;
+                    Some((matrix[from_idx][to_idx], to))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            near.sort_unstable_by_key(|&(cost, to)| (cost, to));
+            near.truncate(LIMIT.min(near.len()));
+            map.insert(from, near.into_iter().map(|(_, to)| to).collect());
+        }
+        Some(Self { map })
+    }
+
+    pub(super) fn contains(&self, a: i32, b: i32) -> bool {
+        self.map.get(&a).is_some_and(|near| near.contains(&b)) || self.map.get(&b).is_some_and(|near| near.contains(&a))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -148,6 +220,16 @@ fn direct_symmetric_edge_matrix(r: &Reduction) -> bool {
     }
 }
 
+fn direct_edge_matrix(r: &Reduction) -> Option<Arc<Vec<Vec<i64>>>> {
+    match r.arena.exprs.get(r.body.0 as usize) {
+        Some(Expr::Matrix(matrix, row, col)) => {
+            let direct_args = expr_is_arg(&r.arena.exprs, *row, 0) && expr_is_arg(&r.arena.exprs, *col, 1);
+            direct_args.then(|| Arc::clone(matrix))
+        }
+        _ => None,
+    }
+}
+
 /// How a reduction can be scored incrementally from the old list plus a local
 /// edit. Symmetric edge-cost detection is cached here, when the per-list index
 /// is built, so candidate scoring does not inspect the expression tree.
@@ -169,16 +251,29 @@ impl PerList {
         let mut constraints = vec![Vec::new(); model.lists];
         let mut constraint_delta = vec![Vec::new(); model.lists];
         let mut senses = [true; MAX_TIERS];
+        let mut has_edges = false;
+        let mut route_bounds = vec![None; model.lists];
+        let mut candidate_matrix = None;
         for (t, tier) in model.objectives.iter().enumerate() {
             senses[t] = tier.minimize;
             for r in &tier.terms {
                 let list = r.iterable.list();
+                if let Iterable::Edges { start, end, .. } = &r.iterable {
+                    has_edges = true;
+                    route_bounds[list].get_or_insert((*start, *end));
+                    candidate_matrix.get_or_insert_with(|| direct_edge_matrix(r));
+                }
                 objective_delta[list][t].push(reduction_delta_kind(r));
                 objective[list][t].push(r.clone());
             }
         }
         for c in &model.constraints {
             let list = c.reduction.iterable.list();
+            if let Iterable::Edges { start, end, .. } = &c.reduction.iterable {
+                has_edges = true;
+                route_bounds[list].get_or_insert((*start, *end));
+                candidate_matrix.get_or_insert_with(|| direct_edge_matrix(&c.reduction));
+            }
             constraint_delta[list].push(reduction_delta_kind(&c.reduction));
             constraints[list].push(c.clone());
         }
@@ -197,6 +292,9 @@ impl PerList {
             tiers: model.objectives.len(),
             globals: Globals::build(model),
             list_incremental,
+            has_edges,
+            route_bounds,
+            candidates: candidate_matrix.flatten().and_then(|matrix| CandidateNeighbors::build(model, matrix)),
         }
     }
 }
@@ -387,6 +485,7 @@ pub fn solve_collection(model: &CollectionModel, seed: u64, stop: &AtomicBool, r
     let mut order: Vec<usize> = (0..n).collect();
     shuffle(&mut order, seed);
     let mut state = State::greedy(model, &per, &order);
+    let mut memory = SearchMemory::new(model.lists.max(1));
 
     let (mut best_lists, mut best_score, mut best_feasible) = snapshot(&per, &state);
     if best_feasible && per.tiers > 0 {
@@ -403,8 +502,11 @@ pub fn solve_collection(model: &CollectionModel, seed: u64, stop: &AtomicBool, r
 
     while !stop.load(Ordering::Relaxed) {
         iter += 1;
-        match best_improving_move(&per, &state, stop) {
-            Some(mv) => apply_move(&per, &mut state, mv),
+        match best_improving_move(&per, &state, stop, &mut memory) {
+            Some(mv) => {
+                apply_move(&per, &mut state, mv);
+                memory.reset_touched(mv);
+            }
             None => {
                 let (lists, score, feasible) = snapshot(&per, &state);
                 if better(feasible, score, best_feasible, best_score) {
@@ -421,10 +523,12 @@ pub fn solve_collection(model: &CollectionModel, seed: u64, stop: &AtomicBool, r
                 if since_improve >= RESTART_AFTER {
                     shuffle(&mut order, seed ^ mix64(iter));
                     state = State::greedy(model, &per, &order);
+                    memory.reset_all();
                     since_improve = 0;
                 } else {
                     let strength = 1 + (since_improve / 5) as usize;
                     random_kick(&per, &mut state, seed ^ mix64(iter), strength);
+                    memory.reset_all();
                 }
             }
         }
@@ -435,6 +539,9 @@ pub fn solve_collection(model: &CollectionModel, seed: u64, stop: &AtomicBool, r
         best_lists = lists;
         best_score = score;
         best_feasible = feasible;
+        if feasible && per.tiers > 0 {
+            report(tier_value(&per, &best_score, 0));
+        }
     }
 
     // Report the objective values from the same score that drove the search, so

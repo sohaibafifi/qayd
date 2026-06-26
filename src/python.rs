@@ -21,6 +21,7 @@ use crate::constraints::table;
 use crate::expr::{self, Expr};
 use crate::ids::{IntervalId, ListId, VarId};
 use crate::ls::{solve_fast_cop, LocalRhs, LocalSearchSpec, LsConfig};
+use crate::model as shared_model;
 use crate::problem::{Objective as ProblemObjective, Problem};
 use crate::search::{self, Objective as SearchObjective, SearchControl, SolveStats};
 use crate::Solver;
@@ -422,44 +423,125 @@ fn checked_i32(value: i64, name: &str) -> PyResult<i32> {
 }
 
 enum StructuredListConstraint {
-    Bounds { list: usize, min: usize, max: usize },
+    Length { list: usize, min: usize, max: usize },
+    ItemSum { list: usize, weights: Vec<(i32, i64)>, min: i64, max: i64 },
     Impossible,
 }
 
-fn structured_list_constraint(constraint: &collection::Constraint, item_count: usize) -> Option<StructuredListConstraint> {
-    if !matches!(constraint.reduction.op, collection::ReduceOp::Count) {
-        return None;
-    }
+fn structured_list_constraint(constraint: &collection::Constraint, items: &[i32]) -> Option<StructuredListConstraint> {
     let collection::Iterable::Items(list) = &constraint.reduction.iterable else {
         return None;
     };
     let list = *list;
-    let body = constraint.reduction.arena.exprs.get(constraint.reduction.body.0 as usize)?;
-    let collection::Expr::Const(value) = body else {
-        return None;
-    };
-    if *value == 0 {
-        return None;
+
+    if matches!(constraint.reduction.op, collection::ReduceOp::Used) {
+        return used_constraint_as_length(list, constraint.op, constraint.rhs, items.len());
     }
 
-    let n = item_count as i64;
-    let rhs = constraint.rhs;
-    let (min, max) = match constraint.op {
-        collection::Op::Le => (0, rhs),
-        collection::Op::Ge => (rhs, n),
-        collection::Op::Eq => (rhs, rhs),
-    };
-    if max < 0 || min > n {
-        return Some(StructuredListConstraint::Impossible);
+    if matches!(constraint.reduction.op, collection::ReduceOp::Count) {
+        let body = constraint.reduction.arena.exprs.get(constraint.reduction.body.0 as usize)?;
+        let collection::Expr::Const(value) = body else {
+            return None;
+        };
+        if *value == 0 {
+            return None;
+        }
+
+        let n = items.len() as i64;
+        let rhs = constraint.rhs;
+        let (min, max) = match constraint.op {
+            collection::Op::Le => (0, rhs),
+            collection::Op::Ge => (rhs, n),
+            collection::Op::Eq => (rhs, rhs),
+        };
+        if max < 0 || min > n {
+            return Some(StructuredListConstraint::Impossible);
+        }
+
+        let min = min.max(0) as usize;
+        let max = max.min(n) as usize;
+        return if min > max {
+            Some(StructuredListConstraint::Impossible)
+        } else {
+            Some(StructuredListConstraint::Length { list, min, max })
+        };
     }
 
-    let min = min.max(0) as usize;
-    let max = max.min(n) as usize;
-    if min > max {
-        Some(StructuredListConstraint::Impossible)
-    } else {
-        Some(StructuredListConstraint::Bounds { list, min, max })
+    if matches!(constraint.reduction.op, collection::ReduceOp::Sum) {
+        let mut weights = Vec::with_capacity(items.len());
+        for &item in items {
+            weights.push((item, eval_collection_expr_one(&constraint.reduction.arena.exprs, constraint.reduction.body, i64::from(item))?));
+        }
+        let (min, max) = match constraint.op {
+            collection::Op::Le => (i64::MIN / 4, constraint.rhs),
+            collection::Op::Ge => (constraint.rhs, i64::MAX / 4),
+            collection::Op::Eq => (constraint.rhs, constraint.rhs),
+        };
+        return Some(StructuredListConstraint::ItemSum { list, weights, min, max });
     }
+
+    None
+}
+
+fn used_constraint_as_length(list: usize, op: collection::Op, rhs: i64, item_count: usize) -> Option<StructuredListConstraint> {
+    let (min, max) = match op {
+        collection::Op::Le if rhs < 0 => return Some(StructuredListConstraint::Impossible),
+        collection::Op::Le if rhs == 0 => (0, 0),
+        collection::Op::Le => (0, item_count),
+        collection::Op::Ge if rhs <= 0 => (0, item_count),
+        collection::Op::Ge if rhs == 1 => (1, item_count),
+        collection::Op::Ge => return Some(StructuredListConstraint::Impossible),
+        collection::Op::Eq if rhs == 0 => (0, 0),
+        collection::Op::Eq if rhs == 1 => (1, item_count),
+        collection::Op::Eq => return Some(StructuredListConstraint::Impossible),
+    };
+    Some(StructuredListConstraint::Length { list, min, max })
+}
+
+fn eval_collection_expr_one(arena: &[collection::Expr], id: collection::ExprId, arg0: i64) -> Option<i64> {
+    let node = arena.get(id.0 as usize)?;
+    Some(match node {
+        collection::Expr::Const(value) => *value,
+        collection::Expr::Arg(0) => arg0,
+        collection::Expr::Arg(_) => return None,
+        collection::Expr::Array(values, index) => {
+            let index = eval_collection_expr_one(arena, *index, arg0)?;
+            *values.get(usize::try_from(index).ok()?)?
+        }
+        collection::Expr::Matrix(_, _, _) => return None,
+        collection::Expr::Add(a, b) => {
+            eval_collection_expr_one(arena, *a, arg0)?.checked_add(eval_collection_expr_one(arena, *b, arg0)?)?
+        }
+        collection::Expr::Sub(a, b) => {
+            eval_collection_expr_one(arena, *a, arg0)?.checked_sub(eval_collection_expr_one(arena, *b, arg0)?)?
+        }
+        collection::Expr::Mul(a, b) => {
+            eval_collection_expr_one(arena, *a, arg0)?.checked_mul(eval_collection_expr_one(arena, *b, arg0)?)?
+        }
+        collection::Expr::Min(a, b) => eval_collection_expr_one(arena, *a, arg0)?.min(eval_collection_expr_one(arena, *b, arg0)?),
+        collection::Expr::Max(a, b) => eval_collection_expr_one(arena, *a, arg0)?.max(eval_collection_expr_one(arena, *b, arg0)?),
+        collection::Expr::Div(a, b) => {
+            let numerator = eval_collection_expr_one(arena, *a, arg0)?;
+            let denominator = eval_collection_expr_one(arena, *b, arg0)?;
+            if denominator == 0 {
+                0
+            } else {
+                numerator.checked_div(denominator)?
+            }
+        }
+        collection::Expr::Abs(a) => eval_collection_expr_one(arena, *a, arg0)?.saturating_abs(),
+        collection::Expr::Lt(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? < eval_collection_expr_one(arena, *b, arg0)?),
+        collection::Expr::Le(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? <= eval_collection_expr_one(arena, *b, arg0)?),
+        collection::Expr::Eq(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? == eval_collection_expr_one(arena, *b, arg0)?),
+        collection::Expr::Ne(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? != eval_collection_expr_one(arena, *b, arg0)?),
+        collection::Expr::IfThenElse(c, a, b) => {
+            if eval_collection_expr_one(arena, *c, arg0)? != 0 {
+                eval_collection_expr_one(arena, *a, arg0)?
+            } else {
+                eval_collection_expr_one(arena, *b, arg0)?
+            }
+        }
+    })
 }
 
 #[pymethods]
@@ -1469,46 +1551,58 @@ impl PyModel {
     fn try_solve_structured_collection(
         &self,
         model: &collection::CollectionModel,
+        selection: &shared_model::BackendSelection,
         time_limit: Option<u64>,
         verbose: bool,
     ) -> PyResult<Option<PySolution>> {
-        if let Some(schedule) = &model.schedule {
-            return self.try_solve_structured_schedule(schedule, model, time_limit, verbose);
+        if selection.backend != shared_model::Backend::StructuredExact {
+            return Ok(None);
         }
-        self.try_solve_structured_lists(model, time_limit, verbose)
+        if let Some(schedule) = &model.schedule {
+            return self.try_solve_structured_schedule(schedule, model, selection, time_limit, verbose);
+        }
+        self.try_solve_structured_lists(model, selection, time_limit, verbose)
     }
 
     fn try_solve_structured_lists(
         &self,
         model: &collection::CollectionModel,
+        selection: &shared_model::BackendSelection,
         time_limit: Option<u64>,
         verbose: bool,
     ) -> PyResult<Option<PySolution>> {
-        if !model.objectives.is_empty() {
+        if selection.backend != shared_model::Backend::StructuredExact {
             return Ok(None);
         }
+        let Some(objective_tiers) = shared_model::structured_list_objective_tiers(&model.objectives, &model.items) else {
+            return Ok(None);
+        };
+        let has_objective = !objective_tiers.is_empty();
 
-        let mut length_constraints = Vec::with_capacity(model.constraints.len());
+        let mut list_constraints = Vec::with_capacity(model.constraints.len());
         for constraint in &model.constraints {
-            let Some(parsed) = structured_list_constraint(constraint, model.items.len()) else {
+            let Some(parsed) = structured_list_constraint(constraint, &model.items) else {
                 return Ok(None);
             };
-            length_constraints.push(parsed);
+            list_constraints.push(parsed);
         }
 
         let limit = time_limit.unwrap_or(5);
         let constraint_count = 1 + model.constraints.len() + model.globals.len();
         if verbose {
             println!("qayd solve (structured)");
+            println!("  class: {}", selection.class.name());
+            println!("  backend: {}", selection.backend.name());
+            println!("  reason: {}", selection.reason);
             println!("  kind: lists");
             println!("  items: {}", model.items.len());
             println!("  lists: {}", model.lists);
             println!("  constraints: {constraint_count}");
-            println!("  objective: no");
+            println!("  objective tiers: {}", model.objectives.len());
             println!("  time limit: {limit}s");
         }
 
-        if length_constraints.iter().any(|constraint| matches!(constraint, StructuredListConstraint::Impossible)) {
+        if list_constraints.iter().any(|constraint| matches!(constraint, StructuredListConstraint::Impossible)) {
             if verbose {
                 println!("qayd result (structured)");
                 println!("  status: UNSATISFIABLE");
@@ -1533,11 +1627,16 @@ impl PyModel {
         let mut solver = Solver::new();
         let lists: Vec<ListId> = (0..model.lists).map(|_| solver.store.new_list(model.items.clone())).collect();
         structured_constraints::partition(&mut solver, &lists, &model.items);
-        for constraint in length_constraints {
-            let StructuredListConstraint::Bounds { list, min, max } = constraint else {
-                continue;
-            };
-            structured_constraints::list_len(&mut solver, lists[list], min, max);
+        for constraint in list_constraints {
+            match constraint {
+                StructuredListConstraint::Length { list, min, max } => {
+                    structured_constraints::list_len(&mut solver, lists[list], min, max);
+                }
+                StructuredListConstraint::ItemSum { list, weights, min, max } => {
+                    structured_constraints::list_item_sum(&mut solver, lists[list], weights, min, max);
+                }
+                StructuredListConstraint::Impossible => {}
+            }
         }
         for global in &model.globals {
             match *global {
@@ -1552,16 +1651,36 @@ impl PyModel {
 
         let stop = stop_after(limit);
         let mut solution = None;
+        let mut best_objectives = Vec::new();
         let (stats, complete) = search::solve_structured_interruptible(
             &mut solver,
             |_, structured| {
-                solution = Some(structured.clone());
-                SearchControl::Stop
+                if !has_objective {
+                    solution = Some(structured.clone());
+                    return SearchControl::Stop;
+                }
+
+                let candidate_objectives = shared_model::evaluate_structured_list_objectives(&objective_tiers, &structured.lists);
+                if solution.is_none()
+                    || shared_model::structured_list_objectives_better(&candidate_objectives, &best_objectives, &objective_tiers)
+                {
+                    if verbose {
+                        let sense = if objective_tiers[0].minimize { "min" } else { "max" };
+                        println!("  o {}  ({sense})", candidate_objectives[0]);
+                    }
+                    solution = Some(structured.clone());
+                    best_objectives = candidate_objectives;
+                }
+                SearchControl::Continue
             },
             &stop,
         );
         let status = if solution.is_some() {
-            "SATISFIABLE"
+            if has_objective && complete {
+                "OPTIMAL"
+            } else {
+                "SATISFIABLE"
+            }
         } else if complete {
             "UNSATISFIABLE"
         } else {
@@ -1570,20 +1689,24 @@ impl PyModel {
         if verbose {
             println!("qayd result (structured)");
             println!("  status: {status}");
+            if has_objective && !best_objectives.is_empty() {
+                println!("  objectives: {best_objectives:?}");
+            }
             println!("  solutions: {}", stats.solutions);
             println!("  nodes: {}", stats.nodes);
             println!("  failures: {}", stats.failures);
         }
 
+        let objective = best_objectives.first().copied();
         Ok(Some(PySolution {
             status: status.to_string(),
-            objective: None,
-            objective_sense: None,
-            objective_expr: None,
+            objective,
+            objective_sense: has_objective.then(|| if objective_tiers[0].minimize { "min" } else { "max" }.to_string()),
+            objective_expr: has_objective.then(|| "structured list objective".to_string()),
             values: Vec::new(),
             stats: stats.into(),
             routes: solution.map(|structured| structured.lists),
-            objectives: Vec::new(),
+            objectives: best_objectives,
             starts: Vec::new(),
             machines: Vec::new(),
         }))
@@ -1593,6 +1716,7 @@ impl PyModel {
         &self,
         schedule: &collection::Schedule,
         model: &collection::CollectionModel,
+        selection: &shared_model::BackendSelection,
         time_limit: Option<u64>,
         verbose: bool,
     ) -> PyResult<Option<PySolution>> {
@@ -1610,6 +1734,9 @@ impl PyModel {
         let limit = time_limit.unwrap_or(5);
         if verbose {
             println!("qayd solve (structured)");
+            println!("  class: {}", selection.class.name());
+            println!("  backend: {}", selection.backend.name());
+            println!("  reason: {}", selection.reason);
             println!("  kind: intervals");
             println!("  intervals: {}", schedule.intervals.len());
             println!("  precedences: {}", schedule.precedences.len());
@@ -1689,7 +1816,9 @@ impl PyModel {
             schedule: self.col_schedule.clone(),
         };
         model.validate().map_err(PyValueError::new_err)?;
-        if let Some(solution) = self.try_solve_structured_collection(&model, time_limit, verbose)? {
+        let shared = shared_model::Model::from_collection(&model);
+        let selection = shared_model::BackendSelection::for_model(&shared);
+        if let Some(solution) = self.try_solve_structured_collection(&model, &selection, time_limit, verbose)? {
             return Ok(solution);
         }
         let limit = time_limit.unwrap_or(5);
@@ -1697,6 +1826,9 @@ impl PyModel {
         let primary_sense = self.col_objectives.first().map_or("min", |t| if t.minimize { "min" } else { "max" });
         if verbose {
             println!("qayd solve (collection)");
+            println!("  class: {}", selection.class.name());
+            println!("  backend: {}", selection.backend.name());
+            println!("  reason: {}", selection.reason);
             println!("  items: {}", model.items.len());
             println!("  lists: {}", model.lists);
             println!("  constraints: {}", model.constraints.len());

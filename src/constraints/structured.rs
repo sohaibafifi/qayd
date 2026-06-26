@@ -243,6 +243,90 @@ pub fn list_length(solver: &mut Solver, list: ListId, min: usize, max: usize) ->
     list_len(solver, list, min, max)
 }
 
+/// Bounds a weighted item sum over one list.
+#[derive(Clone)]
+pub struct ListItemSum {
+    list: ListId,
+    weights: Vec<(i32, i64)>,
+    min: i64,
+    max: i64,
+}
+
+impl Propagator for ListItemSum {
+    fn register(&mut self, store: &mut Store, me: PropId) {
+        store.subscribe_list(self.list, me, ListEvent::PossibleChange);
+        store.subscribe_list(self.list, me, ListEvent::RequiredChange);
+    }
+
+    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+        if self.min > self.max {
+            return Err(Inconsistency);
+        }
+
+        loop {
+            let (required, negative_optional, positive_optional) = self.sum_parts(store);
+            let lower = required.saturating_add(negative_optional);
+            let upper = required.saturating_add(positive_optional);
+            if lower > self.max || upper < self.min {
+                return Err(Inconsistency);
+            }
+
+            let mut changed = false;
+            for &(item, weight) in &self.weights {
+                if !store.list_possible(self.list, item) || store.list_required(self.list, item) {
+                    continue;
+                }
+
+                let lower_with_item = required.saturating_add(negative_optional).saturating_add(weight.max(0));
+                if lower_with_item > self.max {
+                    changed |= store.forbid_list_item(self.list, item)?;
+                    continue;
+                }
+
+                let upper_without_item = required.saturating_add(positive_optional).saturating_sub(if weight > 0 { weight } else { 0 });
+                if upper_without_item < self.min {
+                    changed |= store.require_list_item(self.list, item)?;
+                }
+            }
+
+            if !changed {
+                return Ok(());
+            }
+        }
+    }
+}
+
+impl ListItemSum {
+    fn sum_parts(&self, store: &Store) -> (i64, i64, i64) {
+        let mut required = 0i64;
+        let mut negative_optional = 0i64;
+        let mut positive_optional = 0i64;
+        for &(item, weight) in &self.weights {
+            if !store.list_possible(self.list, item) {
+                continue;
+            }
+            if store.list_required(self.list, item) {
+                required = required.saturating_add(weight);
+            } else if weight < 0 {
+                negative_optional = negative_optional.saturating_add(weight);
+            } else {
+                positive_optional = positive_optional.saturating_add(weight);
+            }
+        }
+        (required, negative_optional, positive_optional)
+    }
+}
+
+/// Post weighted item-sum bounds.
+pub fn list_item_sum(solver: &mut Solver, list: ListId, weights: Vec<(i32, i64)>, min: i64, max: i64) -> PropId {
+    solver.post(Box::new(ListItemSum { list, weights, min, max }))
+}
+
+/// Post a capacity-style upper bound over weighted list items.
+pub fn list_item_sum_le(solver: &mut Solver, list: ListId, weights: Vec<(i32, i64)>, max: i64) -> PropId {
+    list_item_sum(solver, list, weights, i64::MIN / 4, max)
+}
+
 fn required_owner(store: &Store, lists: &[ListId], item: i32) -> Result<Option<usize>, Inconsistency> {
     let mut owner = None;
     for (i, &list) in lists.iter().enumerate() {

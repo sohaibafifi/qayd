@@ -49,9 +49,10 @@ model.minimize(cp.sum(
     for r in routes
 ))</code></pre>
             <pre data-panel="terminal" hidden><code>$ qayd -t 10 -p 4 -v instance.xml.lzma
-c vars 11842 constraints 29103
+c variables 11842
+c propagators 29103
 c workers 4 (portfolio 2, lns 1, incumbent 1)
-c presolve reduced search 11842 -> 318 fixed
+c presolve reduced search 11842 -> 11524 fixed 318
 o 912
 o 884
 s SATISFIABLE</code></pre>

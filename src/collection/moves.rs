@@ -1,7 +1,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::eval::{eval_expr, violation_of};
-use super::list::{base_totals, compute_con_vals, full_score, list_score, signed, ListScore, PerList, ReductionDeltaKind, Score, State};
+use super::local_search::{
+    base_totals, compute_con_vals, full_score, list_score, signed, ListScore, PerList, ReductionDeltaKind, Score, State,
+};
 use super::model::{CollectionModel, Iterable, Reduction, MAX_TIERS};
 use crate::mix64;
 
@@ -20,9 +22,14 @@ pub(super) fn better(feasible: bool, score: Score, best_feasible: bool, best_sco
     }
 }
 
+const MAX_OR_OPT: usize = 3;
+
 #[derive(Clone, Copy)]
 pub(super) enum Move {
     Relocate { src: usize, src_pos: usize, dst: usize, dst_pos: usize },
+    OrOpt { src: usize, start: usize, len: usize, dst: usize, dst_pos: usize },
+    TwoOptStar { a: usize, cut_a: usize, b: usize, cut_b: usize },
+    CrossExchange { a: usize, start_a: usize, len_a: usize, b: usize, start_b: usize, len_b: usize },
     Swap { a: usize, a_pos: usize, b: usize, b_pos: usize },
     Reverse { list: usize, i: usize, j: usize },
 }
@@ -82,11 +89,60 @@ fn build_reversed(buf: &mut Vec<i32>, list: &[i32], i: usize, j: usize) {
     buf.extend_from_slice(list);
     buf[i..=j].reverse();
 }
+fn build_segment_removed(buf: &mut Vec<i32>, list: &[i32], start: usize, len: usize) {
+    buf.clear();
+    buf.extend_from_slice(list);
+    buf.drain(start..start + len);
+}
+fn build_segment_inserted(buf: &mut Vec<i32>, list: &[i32], pos: usize, items: &[i32]) {
+    buf.clear();
+    buf.extend_from_slice(list);
+    let pos = pos.min(buf.len());
+    for (offset, &item) in items.iter().enumerate() {
+        buf.insert(pos + offset, item);
+    }
+}
+fn build_segment_moved_within(buf: &mut Vec<i32>, list: &[i32], start: usize, len: usize, to: usize) {
+    let items = segment_items(list, start, len);
+    build_segment_removed(buf, list, start, len);
+    let pos = to.min(buf.len());
+    for (offset, &item) in items[..len].iter().enumerate() {
+        buf.insert(pos + offset, item);
+    }
+}
+fn build_two_opt_star(left: &mut Vec<i32>, right: &mut Vec<i32>, a: &[i32], cut_a: usize, b: &[i32], cut_b: usize) {
+    left.clear();
+    left.extend_from_slice(&a[..cut_a]);
+    left.extend_from_slice(&b[cut_b..]);
+
+    right.clear();
+    right.extend_from_slice(&b[..cut_b]);
+    right.extend_from_slice(&a[cut_a..]);
+}
+fn build_cross_exchange(left: &mut Vec<i32>, right: &mut Vec<i32>, a: (&[i32], usize, usize), b: (&[i32], usize, usize)) {
+    let (a, start_a, len_a) = a;
+    let (b, start_b, len_b) = b;
+    left.clear();
+    left.extend_from_slice(&a[..start_a]);
+    left.extend_from_slice(&b[start_b..start_b + len_b]);
+    left.extend_from_slice(&a[start_a + len_a..]);
+
+    right.clear();
+    right.extend_from_slice(&b[..start_b]);
+    right.extend_from_slice(&a[start_a..start_a + len_a]);
+    right.extend_from_slice(&b[start_b + len_b..]);
+}
 fn build_moved_within(buf: &mut Vec<i32>, list: &[i32], from: usize, to: usize, item: i32) {
     buf.clear();
     buf.extend_from_slice(list);
     buf.remove(from);
     buf.insert(to.min(buf.len()), item);
+}
+
+fn segment_items(list: &[i32], start: usize, len: usize) -> [i32; MAX_OR_OPT] {
+    let mut items = [0; MAX_OR_OPT];
+    items[..len].copy_from_slice(&list[start..start + len]);
+    items
 }
 
 /// A single local edit to one list. Carries enough to (a) compute the affected
@@ -99,6 +155,9 @@ enum Edit {
     MoveWithin { from: usize, to: usize },
     Replace { pos: usize, item: i32 },
     Reverse { i: usize, j: usize },
+    SegmentRemove { start: usize, len: usize },
+    SegmentInsert { pos: usize, items: [i32; MAX_OR_OPT], len: usize },
+    SegmentMoveWithin { start: usize, len: usize, to: usize },
 }
 
 impl Edit {
@@ -107,6 +166,8 @@ impl Edit {
         match self {
             Edit::Remove { .. } => len - 1,
             Edit::Insert { .. } => len + 1,
+            Edit::SegmentRemove { len: segment_len, .. } => len - segment_len,
+            Edit::SegmentInsert { len: segment_len, .. } => len + segment_len,
             _ => len,
         }
     }
@@ -119,6 +180,51 @@ impl Edit {
             Edit::MoveWithin { from, to } => build_moved_within(buf, list, from, to, list[from]),
             Edit::Replace { pos, item } => build_replaced(buf, list, pos, item),
             Edit::Reverse { i, j } => build_reversed(buf, list, i, j),
+            Edit::SegmentRemove { start, len } => build_segment_removed(buf, list, start, len),
+            Edit::SegmentInsert { pos, items, len } => build_segment_inserted(buf, list, pos, &items[..len]),
+            Edit::SegmentMoveWithin { start, len, to } => build_segment_moved_within(buf, list, start, len, to),
+        }
+    }
+}
+
+pub(super) struct SearchMemory {
+    inactive: Vec<bool>,
+}
+
+impl SearchMemory {
+    pub(super) fn new(routes: usize) -> Self {
+        Self { inactive: vec![false; routes] }
+    }
+
+    pub(super) fn reset_all(&mut self) {
+        self.inactive.fill(false);
+    }
+
+    pub(super) fn reset_touched(&mut self, mv: Move) {
+        for list in mv.touched_lists() {
+            if let Some(inactive) = self.inactive.get_mut(list) {
+                *inactive = false;
+            }
+        }
+    }
+
+    fn skip(&self, list: usize) -> bool {
+        self.inactive.get(list).copied().unwrap_or(false)
+    }
+
+    fn mark_inactive(&mut self, list: usize) {
+        if let Some(inactive) = self.inactive.get_mut(list) {
+            *inactive = true;
+        }
+    }
+}
+
+impl Move {
+    fn touched_lists(self) -> [usize; 2] {
+        match self {
+            Move::Relocate { src, dst, .. } | Move::OrOpt { src, dst, .. } => [src, dst],
+            Move::TwoOptStar { a, b, .. } | Move::CrossExchange { a, b, .. } | Move::Swap { a, b, .. } => [a, b],
+            Move::Reverse { list, .. } => [list, list],
         }
     }
 }
@@ -130,7 +236,9 @@ fn items_value_delta(list: &[i32], edit: &Edit, value: impl Fn(i32) -> i64) -> i
         Edit::Remove { pos } => -value(list[pos]),
         Edit::Insert { item, .. } => value(item),
         Edit::Replace { pos, item } => value(item).saturating_sub(value(list[pos])),
-        Edit::MoveWithin { .. } | Edit::Reverse { .. } => 0,
+        Edit::SegmentRemove { start, len } => list[start..start + len].iter().fold(0i64, |delta, &item| delta.saturating_sub(value(item))),
+        Edit::SegmentInsert { items, len, .. } => items[..len].iter().fold(0i64, |delta, &item| delta.saturating_add(value(item))),
+        Edit::MoveWithin { .. } | Edit::Reverse { .. } | Edit::SegmentMoveWithin { .. } => 0,
     }
 }
 
@@ -206,7 +314,62 @@ fn edges_value_delta(list: &[i32], start: i32, end: i32, edit: &Edit, symmetric:
             let ins = edge(a, item).saturating_add(edge(item, b)).saturating_sub(edge(a, b));
             rem.saturating_add(ins)
         }
+        Edit::SegmentRemove { start: segment_start, len } => {
+            let first = segment_start + 1;
+            let last = segment_start + len;
+            edge(node(first - 1), node(last + 1)).saturating_sub(segment_path_cost(
+                node(first - 1),
+                node(last + 1),
+                &list[segment_start..segment_start + len],
+                &edge,
+            ))
+        }
+        Edit::SegmentInsert { pos, items, len } => {
+            let (a, b) = (node(pos), node(pos + 1));
+            segment_insert_delta(a, b, &items[..len], &edge)
+        }
+        Edit::SegmentMoveWithin { start: segment_start, len, to } => {
+            let first = segment_start + 1;
+            let last = segment_start + len;
+            let rem = edge(node(first - 1), node(last + 1)).saturating_sub(segment_path_cost(
+                node(first - 1),
+                node(last + 1),
+                &list[segment_start..segment_start + len],
+                &edge,
+            ));
+
+            let m = n - len;
+            let to2 = to.min(m);
+            let lrm = |i: usize| -> i32 { list[if i < segment_start { i } else { i + len }] };
+            let node_rm = |i: usize| -> i32 {
+                if i == 0 {
+                    start
+                } else if i == m + 1 {
+                    end
+                } else {
+                    lrm(i - 1)
+                }
+            };
+            let (a, b) = (node_rm(to2), node_rm(to2 + 1));
+            rem.saturating_add(segment_insert_delta(a, b, &list[segment_start..segment_start + len], &edge))
+        }
     }
+}
+
+fn segment_insert_delta(a: i32, b: i32, items: &[i32], edge: &impl Fn(i32, i32) -> i64) -> i64 {
+    segment_path_cost(a, b, items, edge).saturating_sub(edge(a, b))
+}
+
+fn segment_path_cost(a: i32, b: i32, items: &[i32], edge: &impl Fn(i32, i32) -> i64) -> i64 {
+    if items.is_empty() {
+        return 0;
+    }
+    let mut added = edge(a, items[0]);
+    for pair in items.windows(2) {
+        added = added.saturating_add(edge(pair[0], pair[1]));
+    }
+    added = added.saturating_add(edge(*items.last().unwrap_or(&items[0]), b));
+    added
 }
 
 /// Delta of one supported reduction's raw value under `edit`.
@@ -310,6 +473,20 @@ pub fn audit_incremental(model: &CollectionModel, lists: &[Vec<i32>]) -> usize {
                 edits.push(Edit::Reverse { i, j });
             }
         }
+        for len in 2..=MAX_OR_OPT.min(n) {
+            for start in 0..=n - len {
+                edits.push(Edit::SegmentRemove { start, len });
+                let items = segment_items(list, start, len);
+                for pos in 0..=n {
+                    edits.push(Edit::SegmentInsert { pos, items, len });
+                }
+                for to in 0..=n - len {
+                    if to != start {
+                        edits.push(Edit::SegmentMoveWithin { start, len, to });
+                    }
+                }
+            }
+        }
         for edit in edits {
             let inc = trial_list_score(&per, &state, idx, edit, &mut scratch);
             edit.apply(&mut full_buf, list);
@@ -328,19 +505,77 @@ pub fn audit_incremental(model: &CollectionModel, lists: &[Vec<i32>]) -> usize {
     checked
 }
 
+fn route_prev_next(per: &PerList, state: &State, list: usize, pos: usize) -> Option<(i32, i32)> {
+    let (start, end) = per.route_bounds.get(list).copied().flatten()?;
+    let route = state.lists.get(list)?;
+    let prev = if pos == 0 { start } else { *route.get(pos - 1)? };
+    let next = if pos == route.len() { end } else { *route.get(pos)? };
+    Some((prev, next))
+}
+
+fn route_before_after(per: &PerList, state: &State, list: usize, start_pos: usize, len: usize) -> Option<(i32, i32)> {
+    let (start, end) = per.route_bounds.get(list).copied().flatten()?;
+    let route = state.lists.get(list)?;
+    let before = if start_pos == 0 { start } else { *route.get(start_pos - 1)? };
+    let after_pos = start_pos + len;
+    let after = if after_pos == route.len() { end } else { *route.get(after_pos)? };
+    Some((before, after))
+}
+
+fn candidate_edge(per: &PerList, a: i32, b: i32) -> bool {
+    per.candidates.as_ref().is_none_or(|candidates| candidates.contains(a, b))
+}
+
+fn candidate_insert(per: &PerList, prev: i32, next: i32, first: i32, last: i32) -> bool {
+    candidate_edge(per, prev, first) || candidate_edge(per, last, next)
+}
+
+fn candidate_segment_insert(per: &PerList, state: &State, list: usize, pos: usize, first: i32, last: i32) -> bool {
+    route_prev_next(per, state, list, pos).is_none_or(|(prev, next)| candidate_insert(per, prev, next, first, last))
+}
+
+fn candidate_two_opt_star(per: &PerList, state: &State, a: usize, cut_a: usize, b: usize, cut_b: usize) -> bool {
+    match (route_prev_next(per, state, a, cut_a), route_prev_next(per, state, b, cut_b)) {
+        (Some((a_prev, a_next)), Some((b_prev, b_next))) => candidate_edge(per, a_prev, b_next) || candidate_edge(per, b_prev, a_next),
+        _ => true,
+    }
+}
+
+fn candidate_cross_exchange(per: &PerList, state: &State, a: (usize, usize, usize), b: (usize, usize, usize)) -> bool {
+    let (a, start_a, len_a) = a;
+    let (b, start_b, len_b) = b;
+    let route_a = &state.lists[a];
+    let route_b = &state.lists[b];
+    let first_a = route_a[start_a];
+    let last_a = route_a[start_a + len_a - 1];
+    let first_b = route_b[start_b];
+    let last_b = route_b[start_b + len_b - 1];
+    match (route_before_after(per, state, a, start_a, len_a), route_before_after(per, state, b, start_b, len_b)) {
+        (Some((a_before, a_after)), Some((b_before, b_after))) => {
+            candidate_edge(per, a_before, first_b)
+                || candidate_edge(per, last_b, a_after)
+                || candidate_edge(per, b_before, first_a)
+                || candidate_edge(per, last_a, b_after)
+        }
+        _ => true,
+    }
+}
+
 /// First-improvement local move: return the first relocate / swap / segment
 /// reversal that strictly lowers the score, or `None` at a local optimum (or
 /// when `stop` fires). Each candidate is scored in O(1) against the cached base
 /// totals and built into a reused scratch buffer, so no allocation happens per
 /// candidate. `stop` is polled per candidate (inside the innermost loops) so
 /// even an unbalanced state with very long lists honours the time limit.
-pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBool) -> Option<Move> {
+pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBool, memory: &mut SearchMemory) -> Option<Move> {
     let base = base_totals(&state.scores);
     let current = full_score(per, state);
+    let use_candidates = per.has_edges && current.violation == 0 && per.candidates.is_some();
     let gviol = state.global_viol;
     let k = state.lists.len();
     let mut a = Vec::new();
     let mut b = Vec::new();
+    let mut overrides = Vec::new();
     let mut polled = 0u32;
     let mut stopped = || {
         polled = polled.wrapping_add(1);
@@ -376,6 +611,9 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                         if stopped() {
                             return None;
                         }
+                        if use_candidates && !candidate_segment_insert(per, state, dst, dst_pos, item, item) {
+                            continue;
+                        }
                         let nb = trial_list_score(per, state, dst, Edit::Insert { pos: dst_pos, item }, &mut b);
                         if with_global(delta_two(per, base, &state.scores, src, na, dst, nb), gd) < current {
                             return Some(Move::Relocate { src, src_pos, dst, dst_pos });
@@ -403,12 +641,139 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
             }
         }
     }
+    if per.has_edges {
+        for src in 0..k {
+            if memory.skip(src) {
+                continue;
+            }
+            let src_len = state.lists[src].len();
+            for len in 2..=MAX_OR_OPT.min(src_len) {
+                for start in 0..=src_len - len {
+                    let items = segment_items(&state.lists[src], start, len);
+                    for dst in 0..k {
+                        if dst == src {
+                            let post_len = src_len - len;
+                            for dst_pos in 0..=post_len {
+                                if dst_pos == start {
+                                    continue;
+                                }
+                                if stopped() {
+                                    return None;
+                                }
+                                let nl = trial_list_score(per, state, src, Edit::SegmentMoveWithin { start, len, to: dst_pos }, &mut a);
+                                if with_global(delta_one(per, base, &state.scores, src, nl), 0) < current {
+                                    return Some(Move::OrOpt { src, start, len, dst, dst_pos });
+                                }
+                            }
+                        } else {
+                            let na = trial_list_score(per, state, src, Edit::SegmentRemove { start, len }, &mut a);
+                            let mut overrides = [(0, 0); MAX_OR_OPT];
+                            for slot in 0..len {
+                                overrides[slot] = (items[slot], dst);
+                            }
+                            let gd = per.globals.delta(&state.item_list, &overrides[..len]);
+                            for dst_pos in 0..=state.lists[dst].len() {
+                                if stopped() {
+                                    return None;
+                                }
+                                if use_candidates && !candidate_segment_insert(per, state, dst, dst_pos, items[0], items[len - 1]) {
+                                    continue;
+                                }
+                                let nb = trial_list_score(per, state, dst, Edit::SegmentInsert { pos: dst_pos, items, len }, &mut b);
+                                if with_global(delta_two(per, base, &state.scores, src, na, dst, nb), gd) < current {
+                                    return Some(Move::OrOpt { src, start, len, dst, dst_pos });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            memory.mark_inactive(src);
+        }
+        for x in 0..k {
+            for y in (x + 1)..k {
+                let lx = state.lists[x].len();
+                let ly = state.lists[y].len();
+                for cut_x in 0..=lx {
+                    for cut_y in 0..=ly {
+                        if cut_x == lx && cut_y == ly {
+                            continue;
+                        }
+                        if stopped() {
+                            return None;
+                        }
+                        if use_candidates && !candidate_two_opt_star(per, state, x, cut_x, y, cut_y) {
+                            continue;
+                        }
+                        build_two_opt_star(&mut a, &mut b, &state.lists[x], cut_x, &state.lists[y], cut_y);
+                        let na = list_score(per, x, &a);
+                        let nb = list_score(per, y, &b);
+                        overrides.clear();
+                        overrides.extend(state.lists[x][cut_x..].iter().map(|&item| (item, y)));
+                        overrides.extend(state.lists[y][cut_y..].iter().map(|&item| (item, x)));
+                        let gd = per.globals.delta(&state.item_list, &overrides);
+                        if with_global(delta_two(per, base, &state.scores, x, na, y, nb), gd) < current {
+                            return Some(Move::TwoOptStar { a: x, cut_a: cut_x, b: y, cut_b: cut_y });
+                        }
+                    }
+                }
+            }
+        }
+        for x in 0..k {
+            for y in (x + 1)..k {
+                let lx = state.lists[x].len();
+                let ly = state.lists[y].len();
+                for len_x in 1..=MAX_OR_OPT.min(lx) {
+                    for start_x in 0..=lx - len_x {
+                        for len_y in 1..=MAX_OR_OPT.min(ly) {
+                            if len_x == 1 && len_y == 1 {
+                                continue;
+                            }
+                            for start_y in 0..=ly - len_y {
+                                if stopped() {
+                                    return None;
+                                }
+                                if use_candidates && !candidate_cross_exchange(per, state, (x, start_x, len_x), (y, start_y, len_y)) {
+                                    continue;
+                                }
+                                build_cross_exchange(&mut a, &mut b, (&state.lists[x], start_x, len_x), (&state.lists[y], start_y, len_y));
+                                let na = list_score(per, x, &a);
+                                let nb = list_score(per, y, &b);
+                                overrides.clear();
+                                overrides.extend(state.lists[x][start_x..start_x + len_x].iter().map(|&item| (item, y)));
+                                overrides.extend(state.lists[y][start_y..start_y + len_y].iter().map(|&item| (item, x)));
+                                let gd = per.globals.delta(&state.item_list, &overrides);
+                                if with_global(delta_two(per, base, &state.scores, x, na, y, nb), gd) < current {
+                                    return Some(Move::CrossExchange {
+                                        a: x,
+                                        start_a: start_x,
+                                        len_a: len_x,
+                                        b: y,
+                                        start_b: start_y,
+                                        len_b: len_y,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     for list in 0..k {
         let len = state.lists[list].len();
         for i in 0..len {
             for j in (i + 1)..len {
                 if stopped() {
                     return None;
+                }
+                if use_candidates {
+                    let Some((before, after)) = route_before_after(per, state, list, i, j + 1 - i) else {
+                        continue;
+                    };
+                    if !candidate_edge(per, before, state.lists[list][j]) && !candidate_edge(per, state.lists[list][i], after) {
+                        continue;
+                    }
                 }
                 let nl = trial_list_score(per, state, list, Edit::Reverse { i, j }, &mut a);
                 if with_global(delta_one(per, base, &state.scores, list, nl), 0) < current {
@@ -432,6 +797,55 @@ pub(super) fn apply_move(per: &PerList, state: &mut State, mv: Move) {
                 state.set_item_list(per, item, dst);
                 state.global_viol = per.globals.total(&state.item_list);
             }
+        }
+        Move::OrOpt { src, start, len, dst, dst_pos } => {
+            let segment: Vec<i32> = state.lists[src].drain(start..start + len).collect();
+            let pos = dst_pos.min(state.lists[dst].len());
+            for (offset, &item) in segment.iter().enumerate() {
+                state.lists[dst].insert(pos + offset, item);
+            }
+            state.rescore(per, src);
+            if src != dst {
+                state.rescore(per, dst);
+                for &item in &segment {
+                    state.set_item_list(per, item, dst);
+                }
+                state.global_viol = per.globals.total(&state.item_list);
+            }
+        }
+        Move::TwoOptStar { a, cut_a, b, cut_b } => {
+            let tail_a = state.lists[a].split_off(cut_a);
+            let tail_b = state.lists[b].split_off(cut_b);
+            state.lists[a].extend(tail_b.iter().copied());
+            state.lists[b].extend(tail_a.iter().copied());
+            state.rescore(per, a);
+            state.rescore(per, b);
+            for item in tail_a {
+                state.set_item_list(per, item, b);
+            }
+            for item in tail_b {
+                state.set_item_list(per, item, a);
+            }
+            state.global_viol = per.globals.total(&state.item_list);
+        }
+        Move::CrossExchange { a, start_a, len_a, b, start_b, len_b } => {
+            let seg_a: Vec<i32> = state.lists[a].drain(start_a..start_a + len_a).collect();
+            let seg_b: Vec<i32> = state.lists[b].drain(start_b..start_b + len_b).collect();
+            for (offset, &item) in seg_b.iter().enumerate() {
+                state.lists[a].insert(start_a + offset, item);
+            }
+            for (offset, &item) in seg_a.iter().enumerate() {
+                state.lists[b].insert(start_b + offset, item);
+            }
+            state.rescore(per, a);
+            state.rescore(per, b);
+            for &item in &seg_a {
+                state.set_item_list(per, item, b);
+            }
+            for &item in &seg_b {
+                state.set_item_list(per, item, a);
+            }
+            state.global_viol = per.globals.total(&state.item_list);
         }
         Move::Swap { a, a_pos, b, b_pos } => {
             let tmp = state.lists[a][a_pos];
