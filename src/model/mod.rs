@@ -78,6 +78,7 @@ pub type ListReduceOp = collection::ReduceOp;
 pub type ListIterable = collection::Iterable;
 
 type ItemSumBound = (usize, Vec<(i32, i64)>, i64, i64);
+const MAX_INTEGER_ROUTING_NODES: usize = 600;
 
 /// Constraint declarations owned by the shared model.
 #[derive(Clone)]
@@ -382,15 +383,31 @@ impl BackendSelection {
     /// Select a backend for a shared Rust model.
     pub fn for_model(model: &Model) -> Self {
         if !model.intervals.is_empty() {
+            let all_fixed = model.intervals.iter().all(|interval| interval.modes.is_empty());
+            // Fixed intervals (JSSP/RCPSP): precedence + no-overlap + cumulative.
+            // Moded intervals (FJSP machine choice): precedence + machine no-overlap,
+            // lowered to optional mode-intervals + an `alternative` per op.
+            let constraints_ok = if all_fixed {
+                model.constraints.iter().all(|constraint| {
+                    matches!(
+                        constraint,
+                        Constraint::IntervalPrecedence { .. }
+                            | Constraint::IntervalResource(collection::Resource::NoOverlap(_))
+                            | Constraint::IntervalResource(collection::Resource::Cumulative { .. })
+                    )
+                })
+            } else {
+                model.constraints.iter().all(|constraint| {
+                    matches!(constraint, Constraint::IntervalPrecedence { .. } | Constraint::IntervalResource(collection::Resource::MachineNoOverlap))
+                })
+            };
             let structured_schedule =
-                model.constraints.iter().all(|constraint| matches!(constraint, Constraint::IntervalPrecedence { .. }))
-                    && model.objectives.iter().all(|objective| matches!(objective, Objective::Makespan { minimize: true, .. }))
-                    && model.intervals.iter().all(|interval| interval.modes.is_empty());
+                constraints_ok && model.objectives.iter().all(|objective| matches!(objective, Objective::Makespan { minimize: true, .. }));
             if structured_schedule {
                 return Self {
                     class: ModelClass::Schedule,
                     backend: Backend::StructuredExact,
-                    reason: "fixed intervals with precedences only",
+                    reason: if all_fixed { "fixed intervals: precedence, no-overlap, cumulative" } else { "machine choice: precedence + per-machine no-overlap via alternative" },
                     routing: None,
                 };
             }
@@ -420,7 +437,7 @@ impl BackendSelection {
                     return Self {
                         class: ModelClass::Routing,
                         backend: Backend::IntegerExact,
-                        reason: "closed one-route edge-sum lowers to integer circuit",
+                        reason: "closed route edge-sums lower to integer circuit",
                         routing: summary.routing_shape(model.lists.len()),
                     };
                 }
@@ -628,38 +645,129 @@ fn is_structured_simple_objective_reduction(reduction: &collection::Reduction) -
 }
 
 fn routing_integer_lowering_supported(model: &Model) -> bool {
-    if model.int_vars.is_empty()
-        && model.intervals.is_empty()
-        && model.lists.len() == 1
-        && model.constraints.iter().all(|constraint| matches!(constraint, Constraint::ListPartition { .. }))
-        && model.objectives.len() == 1
-    {
+    if model.int_vars.is_empty() && model.intervals.is_empty() && !model.lists.is_empty() && model.objectives.len() == 1 {
+        let items = &model.lists[0].universe;
+        if model.lists.len().saturating_add(items.len()) > MAX_INTEGER_ROUTING_NODES
+            || !model.lists.iter().all(|list| list.universe == *items)
+            || !items_are_unique(items)
+        {
+            return false;
+        }
         let Objective::ListTerms { minimize: true, terms } = &model.objectives[0] else {
             return false;
         };
-        return terms.len() == 1 && direct_closed_edge_sum(&terms[0], 0, &model.lists[0].universe);
+        return direct_closed_edge_objective(terms, model.lists.len(), items)
+            && list_constraints_are_integer_routing_supported(model, items);
     }
     false
 }
 
-fn direct_closed_edge_sum(reduction: &collection::Reduction, list: usize, items: &[i32]) -> bool {
-    if !matches!(reduction.op, collection::ReduceOp::Sum) {
+struct EdgeSignature<'a> {
+    depot: i32,
+    reversed: bool,
+    matrix: &'a [Vec<i64>],
+}
+
+fn direct_closed_edge_objective(terms: &[collection::Reduction], list_count: usize, items: &[i32]) -> bool {
+    if terms.len() != list_count {
         return false;
     }
-    let collection::Iterable::Edges { list: reduction_list, start, end } = &reduction.iterable else {
+    let mut by_list: Vec<Option<EdgeSignature<'_>>> = (0..list_count).map(|_| None).collect();
+    for term in terms {
+        let Some((list, signature)) = direct_closed_edge_signature(term, items) else {
+            return false;
+        };
+        if list >= list_count || by_list[list].is_some() {
+            return false;
+        }
+        by_list[list] = Some(signature);
+    }
+    let mut signatures = by_list.into_iter();
+    let Some(Some(first)) = signatures.next() else {
         return false;
     };
-    if *reduction_list != list || start != end || items.contains(start) || !items_are_unique(items) {
-        return false;
+    signatures.all(|item| {
+        let Some(other) = item else {
+            return false;
+        };
+        other.depot == first.depot && other.reversed == first.reversed && other.matrix == first.matrix
+    })
+}
+
+fn direct_closed_edge_signature<'a>(reduction: &'a collection::Reduction, items: &[i32]) -> Option<(usize, EdgeSignature<'a>)> {
+    if !matches!(reduction.op, collection::ReduceOp::Sum) {
+        return None;
+    }
+    let collection::Iterable::Edges { list: reduction_list, start, end } = &reduction.iterable else {
+        return None;
+    };
+    if start != end || items.contains(start) {
+        return None;
     }
     match reduction.arena.exprs.get(reduction.body.0 as usize) {
         Some(collection::Expr::Matrix(matrix, row, col)) => {
             let direct = expr_is_arg(&reduction.arena.exprs, *row, 0) && expr_is_arg(&reduction.arena.exprs, *col, 1);
             let reversed = expr_is_arg(&reduction.arena.exprs, *row, 1) && expr_is_arg(&reduction.arena.exprs, *col, 0);
-            (direct || reversed) && matrix_covers_nodes(matrix, *start, items) && matrix_values_fit_i32(matrix, *start, items)
+            if !(direct || reversed) || !matrix_covers_nodes(matrix, *start, items) || !matrix_values_fit_i32(matrix, *start, items) {
+                return None;
+            }
+            Some((*reduction_list, EdgeSignature { depot: *start, reversed, matrix: matrix.as_ref() }))
         }
-        _ => false,
+        _ => None,
     }
+}
+
+fn list_constraints_are_integer_routing_supported(model: &Model, items: &[i32]) -> bool {
+    let mut capacities: Vec<Option<(Vec<i64>, i64)>> = (0..model.lists.len()).map(|_| None).collect();
+    let mut saw_capacity = false;
+    for constraint in &model.constraints {
+        match constraint {
+            Constraint::ListPartition { .. } => {}
+            Constraint::ListItemSum { list, weights, min, max } => {
+                if list.0 >= capacities.len() {
+                    return false;
+                }
+                if *min > 0 || *max < 0 || i32::try_from(*max).is_err() {
+                    return false;
+                }
+                let Some(values) = capacity_values_for_items(weights, items) else {
+                    return false;
+                };
+                if values.iter().any(|&value| value < 0 || value > *max || i32::try_from(value).is_err()) {
+                    return false;
+                }
+                let slot = &mut capacities[list.0];
+                if slot.is_some() {
+                    return false;
+                }
+                *slot = Some((values, *max));
+                saw_capacity = true;
+            }
+            Constraint::SameList { .. }
+            | Constraint::ItemPrecedence { .. }
+            | Constraint::ListLength { .. }
+            | Constraint::ListReduction(_)
+            | Constraint::IntervalPrecedence { .. }
+            | Constraint::IntervalResource(_)
+            | Constraint::Intension(_) => return false,
+        }
+    }
+    if !saw_capacity {
+        return true;
+    }
+    let mut iter = capacities.into_iter();
+    let Some(Some(first)) = iter.next() else {
+        return false;
+    };
+    iter.all(|item| matches!(item, Some(ref other) if *other == first))
+}
+
+fn capacity_values_for_items(weights: &[(i32, i64)], items: &[i32]) -> Option<Vec<i64>> {
+    let mut values = Vec::with_capacity(items.len());
+    for &item in items {
+        values.push(weights.iter().find_map(|(known, value)| (*known == item).then_some(*value))?);
+    }
+    Some(values)
 }
 
 fn expr_is_arg(exprs: &[collection::Expr], id: collection::ExprId, arg: u8) -> bool {

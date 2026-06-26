@@ -1797,12 +1797,23 @@ impl PyModel {
         time_limit: Option<u64>,
         verbose: bool,
     ) -> PyResult<Option<PySolution>> {
+        // Machine-choice (moded) schedules lower to optional mode-intervals + an
+        // `alternative` per op; handled separately.
+        if schedule.intervals.iter().any(|iv| !iv.modes.is_empty()) {
+            return self.try_solve_structured_fjsp(schedule, model, selection, time_limit, verbose);
+        }
         let fixed_intervals = schedule.intervals.iter().all(|iv| iv.modes.is_empty());
+        // No-overlap and cumulative resources are handled by structured
+        // propagators; machine-choice (modes) stays on local search.
+        let resources_supported = schedule
+            .resources
+            .iter()
+            .all(|resource| matches!(resource, collection::Resource::NoOverlap(_) | collection::Resource::Cumulative { .. }));
         if !model.objectives.is_empty()
             || !model.constraints.is_empty()
             || !model.globals.is_empty()
             || !model.items.is_empty()
-            || !schedule.resources.is_empty()
+            || !resources_supported
             || !fixed_intervals
         {
             return Ok(None);
@@ -1817,6 +1828,7 @@ impl PyModel {
             println!("  kind: intervals");
             println!("  intervals: {}", schedule.intervals.len());
             println!("  precedences: {}", schedule.precedences.len());
+            println!("  resources: {}", schedule.resources.len());
             println!("  objective: {}", if schedule.minimize_makespan { "makespan" } else { "no" });
             println!("  time limit: {limit}s");
         }
@@ -1824,15 +1836,40 @@ impl PyModel {
         let mut solver = Solver::new();
         let mut intervals: Vec<IntervalId> = Vec::with_capacity(schedule.intervals.len());
         let mut durations = Vec::with_capacity(schedule.intervals.len());
+        let mut durations_i32 = Vec::with_capacity(schedule.intervals.len());
         for interval in &schedule.intervals {
             let duration = checked_i32(interval.duration, "interval duration")?;
             let start_max = checked_i32(interval.horizon - interval.duration, "interval start upper bound")?;
             intervals.push(solver.store.new_interval(0, start_max, duration));
             durations.push(interval.duration);
+            durations_i32.push(duration);
         }
         for &(before, after) in &schedule.precedences {
             structured_constraints::interval_precedence(&mut solver, intervals[before], intervals[after]);
         }
+        for resource in &schedule.resources {
+            match resource {
+                collection::Resource::NoOverlap(group) => {
+                    let group_ids: Vec<IntervalId> = group.iter().map(|&index| intervals[index]).collect();
+                    structured_constraints::no_overlap(&mut solver, &group_ids);
+                }
+                collection::Resource::Cumulative { demands, capacity } => {
+                    let group_ids: Vec<IntervalId> = demands.iter().map(|&(index, _)| intervals[index]).collect();
+                    let group_demands: Vec<i32> = demands.iter().map(|&(_, demand)| checked_i32(demand, "cumulative demand")).collect::<PyResult<_>>()?;
+                    let cap = checked_i32(*capacity, "cumulative capacity")?;
+                    structured_constraints::cumulative(&mut solver, &group_ids, &group_demands, cap);
+                }
+                collection::Resource::MachineNoOverlap => {}
+            }
+        }
+
+        // Makespan branch-and-bound: a shared upper bound lowered on each
+        // improving solution prunes subtrees that cannot beat the incumbent.
+        let makespan_ub = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(i32::MAX));
+        if schedule.minimize_makespan {
+            structured_constraints::makespan_bound(&mut solver, &intervals, &durations_i32, std::sync::Arc::clone(&makespan_ub));
+        }
+        let bound_on_improve = std::sync::Arc::clone(&makespan_ub);
 
         let stop = stop_after(limit);
         let mut best: Option<(i64, Vec<i64>)> = None;
@@ -1844,6 +1881,9 @@ impl PyModel {
                 if best.as_ref().is_none_or(|(value, _)| makespan < *value) {
                     if verbose {
                         println!("  o {makespan}  (min)");
+                    }
+                    if schedule.minimize_makespan {
+                        bound_on_improve.store(i32::try_from(makespan.saturating_sub(1)).unwrap_or(i32::MAX), std::sync::atomic::Ordering::Relaxed);
                     }
                     best = Some((makespan, starts));
                 }
@@ -1880,6 +1920,147 @@ impl PyModel {
             objectives: objective.map(|value| vec![value]).unwrap_or_default(),
             starts,
             machines: vec![-1; schedule.intervals.len()],
+        }))
+    }
+
+    /// Flexible job shop (machine choice): each op lowers to one optional
+    /// mode-interval per eligible machine, an `alternative` per op, per-machine
+    /// no-overlap over the mode-intervals, pairwise precedence over mode sets, and
+    /// makespan branch-and-bound. `solution.machines` reports the chosen machine.
+    fn try_solve_structured_fjsp(
+        &self,
+        schedule: &collection::Schedule,
+        model: &collection::CollectionModel,
+        selection: &shared_model::BackendSelection,
+        time_limit: Option<u64>,
+        verbose: bool,
+    ) -> PyResult<Option<PySolution>> {
+        let all_moded = schedule.intervals.iter().all(|iv| !iv.modes.is_empty());
+        let resources_ok = schedule.resources.iter().all(|resource| matches!(resource, collection::Resource::MachineNoOverlap));
+        if !model.objectives.is_empty() || !model.constraints.is_empty() || !model.globals.is_empty() || !model.items.is_empty() || !all_moded || !resources_ok {
+            return Ok(None);
+        }
+
+        let limit = time_limit.unwrap_or(5);
+        if verbose {
+            println!("qayd solve (structured)");
+            println!("  class: {}", selection.class.name());
+            println!("  backend: {}", selection.backend.name());
+            println!("  reason: {}", selection.reason);
+            println!("  kind: intervals (machine choice)");
+            println!("  operations: {}", schedule.intervals.len());
+            println!("  precedences: {}", schedule.precedences.len());
+            println!("  time limit: {limit}s");
+        }
+
+        let mut solver = Solver::new();
+        // op_modes[op] = [(machine, mode-interval id, duration)].
+        let mut op_modes: Vec<Vec<(usize, IntervalId, i32)>> = Vec::with_capacity(schedule.intervals.len());
+        let mut all_modes: Vec<IntervalId> = Vec::new();
+        let mut all_durations: Vec<i32> = Vec::new();
+        for interval in &schedule.intervals {
+            let mut modes = Vec::with_capacity(interval.modes.len());
+            for mode in &interval.modes {
+                let duration = checked_i32(mode.duration, "mode duration")?;
+                let start_max = checked_i32(interval.horizon - mode.duration, "mode start upper bound")?;
+                let id = solver.store.new_optional_interval(0, start_max, duration);
+                modes.push((mode.machine, id, duration));
+                all_modes.push(id);
+                all_durations.push(duration);
+            }
+            let ids: Vec<IntervalId> = modes.iter().map(|&(_, id, _)| id).collect();
+            structured_constraints::exactly_one_mode(&mut solver, &ids);
+            op_modes.push(modes);
+        }
+        // Per-machine no-overlap over all mode-intervals on that machine.
+        let mut machines: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        for modes in &op_modes {
+            for &(machine, _, _) in modes {
+                machines.insert(machine);
+            }
+        }
+        for machine in machines {
+            let group: Vec<IntervalId> = op_modes.iter().flatten().filter(|&&(m, _, _)| m == machine).map(|&(_, id, _)| id).collect();
+            structured_constraints::no_overlap(&mut solver, &group);
+        }
+        // Job precedence: over every mode pair of the two ops (the chosen pair is
+        // the only active one).
+        for &(before, after) in &schedule.precedences {
+            for &(_, ib, _) in &op_modes[before] {
+                for &(_, ia, _) in &op_modes[after] {
+                    structured_constraints::interval_precedence(&mut solver, ib, ia);
+                }
+            }
+        }
+
+        let makespan_ub = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(i32::MAX));
+        if schedule.minimize_makespan {
+            structured_constraints::makespan_bound(&mut solver, &all_modes, &all_durations, std::sync::Arc::clone(&makespan_ub));
+        }
+        let bound_on_improve = std::sync::Arc::clone(&makespan_ub);
+
+        // op -> [(machine, interval index, duration)] for reading the leaf.
+        let op_index: Vec<Vec<(usize, usize, i32)>> =
+            op_modes.iter().map(|modes| modes.iter().map(|&(machine, id, duration)| (machine, id.index(), duration)).collect()).collect();
+        let op_count = op_index.len();
+
+        let stop = stop_after(limit);
+        let mut best: Option<(i64, Vec<i64>, Vec<i64>)> = None; // (makespan, starts, machines)
+        let (stats, complete) = search::solve_structured_interruptible(
+            &mut solver,
+            |_, structured| {
+                let mut starts = vec![0i64; op_count];
+                let mut chosen = vec![-1i64; op_count];
+                let mut makespan = 0i64;
+                for (op, modes) in op_index.iter().enumerate() {
+                    for &(machine, idx, duration) in modes {
+                        if let Some(start) = structured.interval_starts[idx] {
+                            starts[op] = i64::from(start);
+                            chosen[op] = machine as i64;
+                            makespan = makespan.max(i64::from(start) + i64::from(duration));
+                        }
+                    }
+                }
+                if best.as_ref().is_none_or(|(value, _, _)| makespan < *value) {
+                    if verbose {
+                        println!("  o {makespan}  (min)");
+                    }
+                    if schedule.minimize_makespan {
+                        bound_on_improve.store(i32::try_from(makespan.saturating_sub(1)).unwrap_or(i32::MAX), std::sync::atomic::Ordering::Relaxed);
+                    }
+                    best = Some((makespan, starts, chosen));
+                }
+                SearchControl::Continue
+            },
+            &stop,
+        );
+
+        let (status, objective, starts, machines_out) = match (best, complete) {
+            (Some((objective, starts, machines_out)), true) if schedule.minimize_makespan => ("OPTIMAL", Some(objective), starts, machines_out),
+            (Some((objective, starts, machines_out)), _) => ("SATISFIABLE", Some(objective), starts, machines_out),
+            (None, true) => ("UNSATISFIABLE", None, Vec::new(), Vec::new()),
+            (None, false) => ("UNKNOWN", None, Vec::new(), Vec::new()),
+        };
+        if verbose {
+            println!("qayd result (structured)");
+            println!("  status: {status}");
+            if let Some(objective) = objective {
+                println!("  objective: {objective}");
+            }
+            println!("  nodes: {}", stats.nodes);
+        }
+
+        Ok(Some(PySolution {
+            status: status.to_string(),
+            objective,
+            objective_sense: schedule.minimize_makespan.then(|| "min".to_string()),
+            objective_expr: schedule.minimize_makespan.then(|| "makespan".to_string()),
+            values: Vec::new(),
+            stats: stats.into(),
+            routes: None,
+            objectives: objective.map(|value| vec![value]).unwrap_or_default(),
+            starts,
+            machines: machines_out,
         }))
     }
 
