@@ -199,6 +199,25 @@ impl Backend {
             Self::ScheduleLocalSearch => "schedule local search",
         }
     }
+
+    /// Whether this backend is exact.
+    pub fn is_exact(self) -> bool {
+        matches!(self, Self::IntegerExact | Self::StructuredExact)
+    }
+
+    /// Whether this backend is heuristic.
+    pub fn is_heuristic(self) -> bool {
+        !self.is_exact()
+    }
+
+    /// Stable role description for architecture checks and diagnostics.
+    pub fn role(self) -> &'static str {
+        match self {
+            Self::IntegerExact | Self::StructuredExact => "semantic exact solver",
+            Self::ListLocalSearch => "fallback / incumbent / routing heuristic",
+            Self::ScheduleLocalSearch => "fallback schedule heuristic",
+        }
+    }
 }
 
 /// Routing-related features detected in a list model.

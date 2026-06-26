@@ -20,6 +20,7 @@ use crate::constraints::structured as structured_constraints;
 use crate::constraints::table;
 use crate::expr::{self, Expr};
 use crate::ids::{IntervalId, ListId, VarId};
+use crate::list_ls;
 use crate::ls::{solve_fast_cop, LocalRhs, LocalSearchSpec, LsConfig};
 use crate::model as shared_model;
 use crate::problem::{Objective as ProblemObjective, Problem};
@@ -1844,7 +1845,7 @@ impl PyModel {
                 println!("  o {objective}  ({primary_sense}, {:.2}s)", start.elapsed().as_secs_f64());
             }
         };
-        let sol = collection::solve_collection(&model, seed, &stop, &mut report);
+        let sol = list_ls::solve_collection(&model, seed, &stop, &mut report);
         if verbose {
             println!("qayd result (collection)");
             println!("  status: {}", if sol.feasible { "SATISFIABLE" } else { "UNKNOWN" });

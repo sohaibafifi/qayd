@@ -1,3 +1,10 @@
+//! Private list local-search heuristic implementation.
+//!
+//! This module scores and moves over an already-declared model. It must not be
+//! the only place where a new modeling feature exists: add the feature to the
+//! shared Rust model and backend classifier first, then teach this heuristic to
+//! search it as a fallback or incumbent generator.
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -432,6 +439,24 @@ impl State {
         Self { lists, scores, con_vals, item_list, global_viol }
     }
 
+    fn from_lists(model: &CollectionModel, per: &PerList, mut lists: Vec<Vec<i32>>) -> Self {
+        let k = model.lists.max(1);
+        lists.truncate(k);
+        lists.resize_with(k, Vec::new);
+        let scores: Vec<ListScore> = (0..k).map(|idx| list_score(per, idx, &lists[idx])).collect();
+        let con_vals = (0..k).map(|idx| compute_con_vals(per, idx, &lists[idx])).collect();
+        let mut item_list = vec![0usize; model.items.len()];
+        for (l, contents) in lists.iter().enumerate() {
+            for &value in contents {
+                if let Some(&idx) = per.globals.value_to_idx.get(&value) {
+                    item_list[idx] = l;
+                }
+            }
+        }
+        let global_viol = per.globals.total(&item_list);
+        Self { lists, scores, con_vals, item_list, global_viol }
+    }
+
     pub(super) fn rescore(&mut self, per: &PerList, idx: usize) {
         self.scores[idx] = list_score(per, idx, &self.lists[idx]);
         self.con_vals[idx] = compute_con_vals(per, idx, &self.lists[idx]);
@@ -457,6 +482,169 @@ fn tier_value(per: &PerList, score: &Score, tier: usize) -> i64 {
 /// The raw objective values of every declared tier, in model order.
 fn objective_values(per: &PerList, score: &Score) -> Vec<i64> {
     (0..per.tiers).map(|t| tier_value(per, score, t)).collect()
+}
+
+fn record_state(
+    per: &PerList,
+    state: &State,
+    best_lists: &mut Vec<Vec<i32>>,
+    best_score: &mut Score,
+    best_feasible: &mut bool,
+    report: &mut dyn FnMut(i64),
+) -> bool {
+    let score = full_score(per, state);
+    let feasible = score.violation == 0;
+    if !better(feasible, score, *best_feasible, *best_score) {
+        return false;
+    }
+    *best_lists = state.lists.clone();
+    *best_score = score;
+    *best_feasible = feasible;
+    if feasible && per.tiers > 0 {
+        report(tier_value(per, best_score, 0));
+    }
+    true
+}
+
+fn score_with_replaced_list(per: &PerList, state: &State, list: usize, replacement: ListScore, global_delta: i64) -> Score {
+    let (mut violation, mut raw) = base_totals(&state.scores);
+    violation = violation
+        .saturating_sub(state.scores[list].violation)
+        .saturating_add(replacement.violation)
+        .saturating_add(state.global_viol)
+        .saturating_add(global_delta);
+    for ((slot, &old), &new) in raw.iter_mut().zip(state.scores[list].objectives.iter()).zip(replacement.objectives.iter()) {
+        *slot = slot.saturating_sub(old).saturating_add(new);
+    }
+    signed(per, violation, raw)
+}
+
+fn shuffle_values(values: &mut [i32], seed: u64) {
+    for i in (1..values.len()).rev() {
+        let j = (mix64(seed.wrapping_add(i as u64)) % (i as u64 + 1)) as usize;
+        values.swap(i, j);
+    }
+}
+
+fn destroy_route_segments(lists: &mut [Vec<i32>], target: usize, seed: u64) -> Vec<i32> {
+    let mut removed = Vec::with_capacity(target);
+    let mut step = 0u64;
+    while removed.len() < target {
+        let total: usize = lists.iter().map(Vec::len).sum();
+        if total == 0 {
+            break;
+        }
+        let mut pick = (mix64(seed ^ mix64(step)) % total as u64) as usize;
+        let mut route = 0usize;
+        let mut pos = 0usize;
+        for (idx, list) in lists.iter().enumerate() {
+            if pick < list.len() {
+                route = idx;
+                pos = pick;
+                break;
+            }
+            pick -= list.len();
+        }
+
+        let remaining = target - removed.len();
+        let max_len = lists[route].len().min(remaining).min(8);
+        let len = 1 + (mix64(seed.wrapping_add(step).wrapping_add(0x9E37_79B9_7F4A_7C15)) % max_len as u64) as usize;
+        let start = if pos + len <= lists[route].len() { pos } else { lists[route].len() - len };
+        removed.extend(lists[route].drain(start..start + len));
+        step = step.wrapping_add(1);
+    }
+    shuffle_values(&mut removed, seed ^ 0xD1B5_4A32_D192_ED03);
+    removed
+}
+
+fn repair_lns(per: &PerList, state: &mut State, removed: &[i32], seed: u64, stop: &AtomicBool) -> bool {
+    let mut scratch = Vec::new();
+    let mut polled = 0u32;
+    for &item in removed {
+        let mut best: Option<(Score, u64, usize, usize, ListScore)> = None;
+        for list in 0..state.lists.len() {
+            for pos in 0..=state.lists[list].len() {
+                polled = polled.wrapping_add(1);
+                if polled.is_multiple_of(1024) && stop.load(Ordering::Relaxed) {
+                    return false;
+                }
+                scratch.clear();
+                scratch.extend_from_slice(&state.lists[list]);
+                scratch.insert(pos, item);
+                let next = list_score(per, list, &scratch);
+                let global_delta = per.globals.delta(&state.item_list, &[(item, list)]);
+                let score = score_with_replaced_list(per, state, list, next, global_delta);
+                let tie = mix64(seed ^ (item as i64 as u64) ^ ((list as u64) << 32) ^ pos as u64);
+                if best
+                    .as_ref()
+                    .is_none_or(|(best_score, best_tie, _, _, _)| score < *best_score || (score == *best_score && tie < *best_tie))
+                {
+                    best = Some((score, tie, list, pos, next));
+                }
+            }
+        }
+        let Some((_, _, list, pos, score)) = best else {
+            return false;
+        };
+        state.lists[list].insert(pos, item);
+        state.scores[list] = score;
+        state.con_vals[list] = compute_con_vals(per, list, &state.lists[list]);
+        state.set_item_list(per, item, list);
+        state.global_viol = per.globals.total(&state.item_list);
+    }
+    true
+}
+
+fn descend_lns_candidate(per: &PerList, state: &mut State, stop: &AtomicBool, max_steps: usize) {
+    let mut memory = SearchMemory::new(state.lists.len());
+    for _ in 0..max_steps {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(mv) = best_improving_move(per, state, stop, &mut memory) else {
+            return;
+        };
+        apply_move(per, state, mv);
+        memory.reset_touched(mv);
+    }
+}
+
+fn routing_lns(
+    model: &CollectionModel,
+    per: &PerList,
+    incumbent: &[Vec<i32>],
+    seed: u64,
+    since_improve: u64,
+    stop: &AtomicBool,
+) -> Option<State> {
+    if !per.has_edges || stop.load(Ordering::Relaxed) {
+        return None;
+    }
+    let total: usize = incumbent.iter().map(Vec::len).sum();
+    if total == 0 {
+        return None;
+    }
+
+    let pressure = since_improve.min(20) as usize;
+    let jitter = (mix64(seed) % 13) as usize;
+    let destroy_pct = (12 + pressure + jitter).min(45);
+    let target = (total * destroy_pct).div_ceil(100).clamp(1, total);
+    let mut lists = incumbent.to_vec();
+    let removed = destroy_route_segments(&mut lists, target, seed);
+    if removed.is_empty() {
+        return None;
+    }
+
+    let mut state = State::from_lists(model, per, lists);
+    if !repair_lns(per, &mut state, &removed, seed ^ 0xA076_1D64_78BD_642F, stop) {
+        return None;
+    }
+    state = State::from_lists(model, per, state.lists);
+    debug_assert_eq!(state.lists.iter().map(Vec::len).sum::<usize>(), model.items.len());
+
+    let descent_steps = (removed.len() * 2).clamp(8, 64);
+    descend_lns_candidate(per, &mut state, stop, descent_steps);
+    Some(state)
 }
 
 /// Solve a collection model with constraint-based local search until `stop`.
@@ -497,6 +685,7 @@ pub fn solve_collection(model: &CollectionModel, seed: u64, stop: &AtomicBool, r
     // local optima, restart from a fresh random partition (GRASP-style); until
     // then, kick harder the longer the search has been stuck.
     const RESTART_AFTER: u64 = 25;
+    const ROUTING_LNS_AFTER: u64 = 8;
     let mut since_improve = 0u64;
     let mut iter = 0u64;
 
@@ -506,19 +695,29 @@ pub fn solve_collection(model: &CollectionModel, seed: u64, stop: &AtomicBool, r
             Some(mv) => {
                 apply_move(&per, &mut state, mv);
                 memory.reset_touched(mv);
+                if record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report) {
+                    since_improve = 0;
+                }
             }
             None => {
-                let (lists, score, feasible) = snapshot(&per, &state);
-                if better(feasible, score, best_feasible, best_score) {
-                    best_lists = lists;
-                    best_score = score;
-                    best_feasible = feasible;
-                    if feasible && per.tiers > 0 {
-                        report(tier_value(&per, &best_score, 0));
-                    }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                if record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report) {
                     since_improve = 0;
                 } else {
                     since_improve += 1;
+                }
+                if best_feasible && since_improve >= ROUTING_LNS_AFTER {
+                    if let Some(candidate) =
+                        routing_lns(model, &per, &best_lists, seed ^ mix64(iter) ^ mix64(since_improve), since_improve, stop)
+                    {
+                        record_state(&per, &candidate, &mut best_lists, &mut best_score, &mut best_feasible, report);
+                        state = candidate;
+                        memory.reset_all();
+                        since_improve = 0;
+                        continue;
+                    }
                 }
                 if since_improve >= RESTART_AFTER {
                     shuffle(&mut order, seed ^ mix64(iter));
@@ -534,15 +733,7 @@ pub fn solve_collection(model: &CollectionModel, seed: u64, stop: &AtomicBool, r
         }
     }
 
-    let (lists, score, feasible) = snapshot(&per, &state);
-    if better(feasible, score, best_feasible, best_score) {
-        best_lists = lists;
-        best_score = score;
-        best_feasible = feasible;
-        if feasible && per.tiers > 0 {
-            report(tier_value(&per, &best_score, 0));
-        }
-    }
+    record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report);
 
     // Report the objective values from the same score that drove the search, so
     // they can never disagree with the accepted solution. When infeasible they
