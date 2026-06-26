@@ -24,6 +24,7 @@ use crate::list_ls;
 use crate::ls::{solve_fast_cop, LocalRhs, LocalSearchSpec, LsConfig};
 use crate::model as shared_model;
 use crate::problem::{Objective as ProblemObjective, Problem};
+use crate::routing_lowering;
 use crate::search::{self, Objective as SearchObjective, SearchControl, SolveStats};
 use crate::Solver;
 
@@ -1565,6 +1566,81 @@ impl PyModel {
         self.try_solve_structured_lists(model, selection, time_limit, verbose)
     }
 
+    fn try_solve_routing_integer(
+        &self,
+        model: &collection::CollectionModel,
+        selection: &shared_model::BackendSelection,
+        time_limit: Option<u64>,
+        seed: u64,
+        verbose: bool,
+    ) -> PyResult<Option<PySolution>> {
+        if selection.class != shared_model::ModelClass::Routing || selection.backend != shared_model::Backend::IntegerExact {
+            return Ok(None);
+        }
+
+        let limit = time_limit.unwrap_or(5);
+        let primary_sense = model.objectives.first().map_or("min", |tier| if tier.minimize { "min" } else { "max" });
+        if verbose {
+            println!("qayd solve (integer routing)");
+            println!("  class: {}", selection.class.name());
+            println!("  backend: {}", selection.backend.name());
+            println!("  reason: {}", selection.reason);
+            println!("  items: {}", model.items.len());
+            println!("  lists: {}", model.lists);
+            println!("  constraints: {}", model.constraints.len());
+            println!("  objective tiers: {}", model.objectives.len());
+            println!("  time limit: {limit}s");
+        }
+
+        let stop = stop_after(limit);
+        let start = Instant::now();
+        let mut report = |objective: i64| {
+            if verbose {
+                println!("  o {objective}  ({primary_sense}, {:.2}s)", start.elapsed().as_secs_f64());
+            }
+        };
+        let Some(outcome) = routing_lowering::solve_collection(model, seed, &stop, &mut report) else {
+            return Ok(None);
+        };
+        let sol = outcome.solution;
+        let status = if sol.feasible {
+            if outcome.complete {
+                "OPTIMAL"
+            } else {
+                "SATISFIABLE"
+            }
+        } else if outcome.complete {
+            "UNSATISFIABLE"
+        } else {
+            "UNKNOWN"
+        };
+        if verbose {
+            println!("qayd result (integer routing)");
+            println!("  status: {status}");
+            if sol.feasible {
+                println!("  objectives: {:?}", sol.objectives);
+            }
+            println!("  improvements: {}", outcome.improvements);
+            println!("  solutions: {}", outcome.stats.solutions);
+            println!("  nodes: {}", outcome.stats.nodes);
+            println!("  failures: {}", outcome.stats.failures);
+        }
+
+        let objectives = if sol.feasible { sol.objectives.clone() } else { Vec::new() };
+        Ok(Some(PySolution {
+            status: status.to_string(),
+            objective: sol.feasible.then(|| sol.objectives.first().copied().unwrap_or(0)),
+            objective_sense: Some(primary_sense.to_string()),
+            objective_expr: Some("integer routing edge-sum".to_string()),
+            values: Vec::new(),
+            stats: outcome.stats.into(),
+            routes: sol.feasible.then(|| sol.lists.clone()),
+            objectives,
+            starts: Vec::new(),
+            machines: Vec::new(),
+        }))
+    }
+
     fn try_solve_structured_lists(
         &self,
         model: &collection::CollectionModel,
@@ -1819,6 +1895,9 @@ impl PyModel {
         model.validate().map_err(PyValueError::new_err)?;
         let shared = shared_model::Model::from_collection(&model);
         let selection = shared_model::BackendSelection::for_model(&shared);
+        if let Some(solution) = self.try_solve_routing_integer(&model, &selection, time_limit, seed, verbose)? {
+            return Ok(solution);
+        }
         if let Some(solution) = self.try_solve_structured_collection(&model, &selection, time_limit, verbose)? {
             return Ok(solution);
         }

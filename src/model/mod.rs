@@ -416,6 +416,14 @@ impl BackendSelection {
             });
 
             if summary.has_edges {
+                if routing_integer_lowering_supported(model) {
+                    return Self {
+                        class: ModelClass::Routing,
+                        backend: Backend::IntegerExact,
+                        reason: "closed one-route edge-sum lowers to integer circuit",
+                        routing: summary.routing_shape(model.lists.len()),
+                    };
+                }
                 return Self {
                     class: ModelClass::Routing,
                     backend: Backend::ListLocalSearch,
@@ -617,6 +625,88 @@ fn is_structured_simple_objective_reduction(reduction: &collection::Reduction) -
             collection::ReduceOp::Used => true,
             collection::ReduceOp::Min | collection::ReduceOp::Max | collection::ReduceOp::SelectKth(_) => false,
         }
+}
+
+fn routing_integer_lowering_supported(model: &Model) -> bool {
+    if model.int_vars.is_empty()
+        && model.intervals.is_empty()
+        && model.lists.len() == 1
+        && model.constraints.iter().all(|constraint| matches!(constraint, Constraint::ListPartition { .. }))
+        && model.objectives.len() == 1
+    {
+        let Objective::ListTerms { minimize: true, terms } = &model.objectives[0] else {
+            return false;
+        };
+        return terms.len() == 1 && direct_closed_edge_sum(&terms[0], 0, &model.lists[0].universe);
+    }
+    false
+}
+
+fn direct_closed_edge_sum(reduction: &collection::Reduction, list: usize, items: &[i32]) -> bool {
+    if !matches!(reduction.op, collection::ReduceOp::Sum) {
+        return false;
+    }
+    let collection::Iterable::Edges { list: reduction_list, start, end } = &reduction.iterable else {
+        return false;
+    };
+    if *reduction_list != list || start != end || items.contains(start) || !items_are_unique(items) {
+        return false;
+    }
+    match reduction.arena.exprs.get(reduction.body.0 as usize) {
+        Some(collection::Expr::Matrix(matrix, row, col)) => {
+            let direct = expr_is_arg(&reduction.arena.exprs, *row, 0) && expr_is_arg(&reduction.arena.exprs, *col, 1);
+            let reversed = expr_is_arg(&reduction.arena.exprs, *row, 1) && expr_is_arg(&reduction.arena.exprs, *col, 0);
+            (direct || reversed) && matrix_covers_nodes(matrix, *start, items) && matrix_values_fit_i32(matrix, *start, items)
+        }
+        _ => false,
+    }
+}
+
+fn expr_is_arg(exprs: &[collection::Expr], id: collection::ExprId, arg: u8) -> bool {
+    matches!(exprs.get(id.0 as usize), Some(collection::Expr::Arg(found)) if *found == arg)
+}
+
+fn items_are_unique(items: &[i32]) -> bool {
+    for (i, &item) in items.iter().enumerate() {
+        if items[i + 1..].contains(&item) {
+            return false;
+        }
+    }
+    true
+}
+
+fn matrix_covers_nodes(matrix: &[Vec<i64>], depot: i32, items: &[i32]) -> bool {
+    let mut nodes = Vec::with_capacity(items.len() + 1);
+    nodes.push(depot);
+    nodes.extend_from_slice(items);
+    let Some(depot) = usize::try_from(depot).ok() else {
+        return false;
+    };
+    if depot >= matrix.len() {
+        return false;
+    }
+    for &from in &nodes {
+        let Some(from) = usize::try_from(from).ok() else {
+            return false;
+        };
+        let Some(row) = matrix.get(from) else {
+            return false;
+        };
+        if nodes.iter().any(|&to| usize::try_from(to).ok().is_none_or(|to| row.len() <= to)) {
+            return false;
+        }
+    }
+    true
+}
+
+fn matrix_values_fit_i32(matrix: &[Vec<i64>], depot: i32, items: &[i32]) -> bool {
+    let mut nodes = Vec::with_capacity(items.len() + 1);
+    nodes.push(depot);
+    nodes.extend_from_slice(items);
+    nodes.iter().all(|&from| {
+        let from = from as usize;
+        nodes.iter().all(|&to| i32::try_from(matrix[from][to as usize]).is_ok())
+    })
 }
 
 fn expr_uses_at_most_first_arg(arena: &[collection::Expr], id: collection::ExprId) -> bool {
