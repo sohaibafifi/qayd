@@ -32,19 +32,17 @@ customers = [i for i in range(dim) if i != depot]
 # CVRPLIB optima use TSPLIB nearest-integer distances, so round EUC_2D weights.
 dist = [[int(w + 0.5) for w in row] for row in inst["edge_weight"]]
 
-# Available vehicles: the "-kN" in the name (a tight fleet) plus headroom, so the
-# solver can minimise the fleet rather than being forced to use a fixed count.
+# Available vehicles: CVRPLIB names encode the fixed benchmark fleet as "-kN".
+# Override QAYD_VRP_K only when intentionally solving a different fleet size.
 m = re.search(r"-k(\d+)", name)
 min_k = int(m.group(1)) if m else -(-sum(demand) // capacity)
-k = min_k + 2
+k = int(os.environ.get("QAYD_VRP_K", str(min_k)))
 
 D = cp.matrix(dist)        # constant tables, indexed by node id inside lambdas
 Q = cp.array(demand)
 
 model = cp.Model()
-routes = model.list_vars(k, customers)   # up to k vehicles partition the customers
-# lexicographic objective: minimise the fleet, then the distance.
-# model.minimize(cp.sum(cp.used(r) for r in routes))
+routes = model.list_vars(k, customers)   # k vehicles partition the customers
 model.minimize(cp.sum(cp.sum_edges(r, lambda i, j: D[i][j], start=depot, end=depot) for r in routes))
 for r in routes:
     model.add(cp.sum(r, lambda i: Q[i]) <= capacity)  # each route within capacity
@@ -55,10 +53,11 @@ solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBO
 opt = re.search(r"Optimal value:\s*(\d+)", inst.get("comment", ""))
 gap = f"  (known optimum {opt.group(1)})" if opt else ""
 
-print(f"instance: {name}  customers: {len(customers)}  vehicles<={k}  capacity: {capacity}")
+print(f"instance: {name}  customers: {len(customers)}  vehicles: {k}  capacity: {capacity}")
 if solution.routes is None:
     raise SystemExit(f"status: {solution.status} - no feasible solution within {time_limit}s")
-fleet, distance = solution.objectives  # lexicographic: fleet first, then distance
+fleet = sum(1 for route in solution.routes if route)
+distance = solution.objectives[-1]
 print(f"status: {solution.status}  fleet: {fleet}  total distance: {distance}{gap}")
 for r, route in enumerate(solution.routes):
     if not route:
