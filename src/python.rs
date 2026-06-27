@@ -2147,10 +2147,12 @@ impl PyModel {
                 (None, false) => ("UNKNOWN", None, Vec::new(), Vec::new(), stats),
             }
         } else {
-            // Default: chronological branch-and-bound, handling both makespan
-            // minimisation and pure feasibility.
+            // Default: chronological search. With a makespan objective, branch-and-
+            // bound lowers a shared upper bound on each improvement; without one,
+            // the first solution suffices and no makespan is reported.
+            let minimize = schedule.minimize_makespan;
             let makespan_ub = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(i32::MAX));
-            if schedule.minimize_makespan {
+            if minimize {
                 structured_constraints::makespan_bound(&mut solver, &all_modes, &all_durations, std::sync::Arc::clone(&makespan_ub));
             }
             let bound_on_improve = std::sync::Arc::clone(&makespan_ub);
@@ -2173,21 +2175,29 @@ impl PyModel {
                         }
                     }
                     if best.as_ref().is_none_or(|(value, _, _)| makespan < *value) {
-                        if verbose {
-                            println!("  o {makespan}  (min)");
-                        }
-                        if schedule.minimize_makespan {
+                        if minimize {
+                            if verbose {
+                                println!("  o {makespan}  (min)");
+                            }
                             bound_on_improve.store(i32::try_from(makespan.saturating_sub(1)).unwrap_or(i32::MAX), std::sync::atomic::Ordering::Relaxed);
                         }
                         best = Some((makespan, starts, chosen));
                     }
-                    SearchControl::Continue
+                    // No objective: the first feasible schedule is enough.
+                    if minimize {
+                        SearchControl::Continue
+                    } else {
+                        SearchControl::Stop
+                    }
                 },
                 &stop,
             );
             match (best, complete) {
-                (Some((objective, starts, machines_out)), true) if schedule.minimize_makespan => ("OPTIMAL", Some(objective), starts, machines_out, stats),
-                (Some((objective, starts, machines_out)), _) => ("SATISFIABLE", Some(objective), starts, machines_out, stats),
+                (Some((objective, starts, machines_out)), _) if minimize => {
+                    let status = if complete { "OPTIMAL" } else { "SATISFIABLE" };
+                    (status, Some(objective), starts, machines_out, stats)
+                }
+                (Some((_, starts, machines_out)), _) => ("SATISFIABLE", None, starts, machines_out, stats),
                 (None, true) => ("UNSATISFIABLE", None, Vec::new(), Vec::new(), stats),
                 (None, false) => ("UNKNOWN", None, Vec::new(), Vec::new(), stats),
             }
