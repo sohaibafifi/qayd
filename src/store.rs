@@ -129,12 +129,66 @@ pub struct Store {
     /// Ablation switch: always explain with the whole-scope snapshot, ignoring
     /// propagator-supplied premises. Off in normal use.
     force_scope_reasons: bool,
+    /// Unary-resource interval pairs registered by `no_overlap`, with a trailed
+    /// order decision each (0 undecided, 1 = first-before-second, 2 =
+    /// second-before-first) and the owning propagator (woken when the order is
+    /// decided). Lets the scheduling brancher make a durable order decision that
+    /// `no_overlap` then enforces, instead of bisecting start bounds.
+    disjunctive_pairs: Vec<(IntervalId, IntervalId)>,
+    disjunctive_orders: Vec<ReversibleInt>,
+    disjunctive_props: Vec<PropId>,
 }
 
 impl Store {
     /// An empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Register a unary-resource pair owned by propagator `prop`, returning its
+    /// index. The order starts undecided.
+    pub fn register_disjunctive_pair(&mut self, a: IntervalId, b: IntervalId, prop: PropId) -> usize {
+        let index = self.disjunctive_pairs.len();
+        self.disjunctive_pairs.push((a, b));
+        self.disjunctive_orders.push(self.trail.new_int(0));
+        self.disjunctive_props.push(prop);
+        index
+    }
+
+    /// Number of registered unary-resource pairs.
+    pub fn disjunctive_pair_count(&self) -> usize {
+        self.disjunctive_pairs.len()
+    }
+
+    /// The intervals of registered pair `index`.
+    pub fn disjunctive_pair(&self, index: usize) -> (IntervalId, IntervalId) {
+        self.disjunctive_pairs[index]
+    }
+
+    /// Current order decision of pair `index` (0 undecided, 1 a->b, 2 b->a).
+    pub fn disjunctive_order(&self, index: usize) -> i32 {
+        self.trail.get(self.disjunctive_orders[index])
+    }
+
+    /// Set the (trailed) order of pair `index` to `1` (a->b) or `2` (b->a) and
+    /// wake the owning propagator so it enforces the decided precedence. Setting
+    /// the opposite of an already-decided order is inconsistent (a pair cannot be
+    /// ordered both ways). Returns whether it changed.
+    pub fn set_disjunctive_order(&mut self, index: usize, order: i32) -> Result<bool, Inconsistency> {
+        debug_assert!(order == 1 || order == 2, "order decision must be 1 or 2");
+        let current = self.trail.get(self.disjunctive_orders[index]);
+        if current == order {
+            return Ok(false);
+        }
+        if current != 0 {
+            return Err(Inconsistency); // opposite order already decided
+        }
+        self.trail.set(self.disjunctive_orders[index], order);
+        let prop = self.disjunctive_props[index];
+        if self.current != Some(prop) {
+            self.enqueue(prop);
+        }
+        Ok(true)
     }
 
     // --- variable creation ---

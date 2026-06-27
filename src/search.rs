@@ -13,7 +13,7 @@ use crate::lcg::clause::ClauseSharing;
 use crate::lcg::lit::{LazyAtomRegistry, Lit};
 use crate::lcg::trail::Cdcl;
 use crate::propagator::Inconsistency;
-use crate::store::Solver;
+use crate::store::{Solver, Store};
 use crate::structured::IntervalPresence;
 
 /// A stop flag that is never set; used by the non-interruptible entry points.
@@ -58,6 +58,9 @@ pub struct StructuredSolution {
 enum StructuredDecision {
     ListMembership { list: ListId, item: i32 },
     IntervalPresence { interval: IntervalId },
+    /// Durably order a unary-resource pair: first-before-second (left) or
+    /// second-before-first (right). `no_overlap` enforces the chosen precedence.
+    Order { pair: usize },
     IntervalStartSplit { interval: IntervalId, mid: i32 },
 }
 
@@ -263,12 +266,42 @@ where
     StructuredExit::Exhausted
 }
 
+/// Whether two intervals can still strictly overlap (share an instant). Requires
+/// positive durations (a zero-duration interval never strictly overlaps) and
+/// start windows that admit a common covered instant.
+fn can_strictly_overlap(store: &Store, a: IntervalId, b: IntervalId) -> bool {
+    if store.interval_duration(a) == 0 || store.interval_duration(b) == 0 {
+        return false;
+    }
+    let lo = store.interval_start_min(a).max(store.interval_start_min(b));
+    // `interval_end_max` saturates, unlike a hand-rolled start_max + duration.
+    let hi = store.interval_end_max(a).min(store.interval_end_max(b));
+    lo < hi
+}
+
 fn choose_structured_decision(solver: &Solver) -> Option<StructuredDecision> {
     let store = &solver.store;
     for i in 0..store.num_intervals() {
         let interval = IntervalId(i as u32);
         if store.interval_presence(interval) == IntervalPresence::Optional {
             return Some(StructuredDecision::IntervalPresence { interval });
+        }
+    }
+
+    // Disjunctive scheduling: durably order an undecided unary-resource pair only
+    // when the two present intervals can still *strictly* overlap (a real
+    // conflict). Skipping non-overlapping pairs (including zero-duration ones,
+    // which never strictly overlap) keeps enumeration duplicate-free.
+    for pair in 0..store.disjunctive_pair_count() {
+        if store.disjunctive_order(pair) != 0 {
+            continue;
+        }
+        let (a, b) = store.disjunctive_pair(pair);
+        if store.interval_presence(a) == IntervalPresence::Present
+            && store.interval_presence(b) == IntervalPresence::Present
+            && can_strictly_overlap(store, a, b)
+        {
+            return Some(StructuredDecision::Order { pair });
         }
     }
 
@@ -310,6 +343,11 @@ fn apply_structured_decision(solver: &mut Solver, decision: StructuredDecision, 
             } else {
                 solver.store.forbid_interval_presence(interval)?;
             }
+        }
+        StructuredDecision::Order { pair } => {
+            // Durable, trailed order decision; no_overlap enforces the precedence
+            // (and is woken by the store on this change).
+            solver.store.set_disjunctive_order(pair, if left { 1 } else { 2 })?;
         }
         StructuredDecision::IntervalStartSplit { interval, mid } => {
             if left {

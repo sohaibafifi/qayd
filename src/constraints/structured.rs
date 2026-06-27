@@ -421,6 +421,18 @@ pub fn precedence(solver: &mut Solver, before: IntervalId, after: IntervalId) ->
 #[derive(Clone)]
 pub struct NoOverlap {
     intervals: Vec<IntervalId>,
+    /// `(a, b, order index)` for each unordered pair; the order index addresses
+    /// the trailed order decision in the store.
+    pairs: Vec<(usize, usize, usize)>,
+}
+
+/// Enforce `i` before `j` on the start bounds (both must be present). Returns
+/// whether a bound changed.
+fn enforce_before(store: &mut Store, i: IntervalId, j: IntervalId) -> Result<bool, Inconsistency> {
+    let di = store.interval_duration(i);
+    let mut changed = store.set_interval_start_min(j, store.interval_end_min(i))?;
+    changed |= store.set_interval_start_max(i, store.interval_start_max(j).saturating_sub(di))?;
+    Ok(changed)
 }
 
 impl Propagator for NoOverlap {
@@ -430,52 +442,60 @@ impl Propagator for NoOverlap {
             store.subscribe_interval(interval, me, IntervalEvent::EndBoundChange);
             store.subscribe_interval(interval, me, IntervalEvent::PresenceChange);
         }
+        self.pairs.clear();
+        for a in 0..self.intervals.len() {
+            for b in (a + 1)..self.intervals.len() {
+                let order = store.register_disjunctive_pair(self.intervals[a], self.intervals[b], me);
+                self.pairs.push((a, b, order));
+            }
+        }
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
-        let n = self.intervals.len();
         loop {
             let mut changed = false;
-            for a in 0..n {
+            for &(a, b, order_index) in &self.pairs {
                 let i = self.intervals[a];
-                if store.interval_presence(i) == IntervalPresence::Absent {
+                let j = self.intervals[b];
+                let pi = store.interval_presence(i);
+                let pj = store.interval_presence(j);
+                if pi == IntervalPresence::Absent || pj == IntervalPresence::Absent {
                     continue;
                 }
-                for b in (a + 1)..n {
-                    let j = self.intervals[b];
-                    let pi = store.interval_presence(i);
-                    if pi == IntervalPresence::Absent {
-                        break; // `i` was just forbidden; nothing more to pair it with
-                    }
-                    let pj = store.interval_presence(j);
-                    if pj == IntervalPresence::Absent {
-                        continue;
-                    }
-                    // An ordering is feasible iff the earlier interval can end no
-                    // later than the latter can start.
-                    let i_before_j = store.interval_end_min(i) <= store.interval_start_max(j);
-                    let j_before_i = store.interval_end_min(j) <= store.interval_start_max(i);
-                    let both_present = pi == IntervalPresence::Present && pj == IntervalPresence::Present;
-                    match (i_before_j, j_before_i) {
-                        (false, false) => match (pi, pj) {
-                            (IntervalPresence::Present, IntervalPresence::Present) => return Err(Inconsistency),
-                            (IntervalPresence::Present, IntervalPresence::Optional) => changed |= store.forbid_interval_presence(j)?,
-                            (IntervalPresence::Optional, IntervalPresence::Present) => changed |= store.forbid_interval_presence(i)?,
+                // A zero-duration interval occupies no instant, so it never
+                // overlaps and imposes no ordering on anyone.
+                if store.interval_duration(i) == 0 || store.interval_duration(j) == 0 {
+                    continue;
+                }
+                let both_present = pi == IntervalPresence::Present && pj == IntervalPresence::Present;
+                match store.disjunctive_order(order_index) {
+                    // Order already decided (by the brancher or a deduction):
+                    // durably enforce that precedence.
+                    1 if both_present => changed |= enforce_before(store, i, j)?,
+                    2 if both_present => changed |= enforce_before(store, j, i)?,
+                    1 | 2 => {}
+                    // Undecided: weak pairwise feasibility; deduce a forced order
+                    // (detectable precedence) or forbid an unschedulable optional.
+                    _ => {
+                        let i_before_j = store.interval_end_min(i) <= store.interval_start_max(j);
+                        let j_before_i = store.interval_end_min(j) <= store.interval_start_max(i);
+                        match (i_before_j, j_before_i) {
+                            (false, false) => match (pi, pj) {
+                                (IntervalPresence::Present, IntervalPresence::Present) => return Err(Inconsistency),
+                                (IntervalPresence::Present, IntervalPresence::Optional) => changed |= store.forbid_interval_presence(j)?,
+                                (IntervalPresence::Optional, IntervalPresence::Present) => changed |= store.forbid_interval_presence(i)?,
+                                _ => {}
+                            },
+                            (true, false) if both_present => {
+                                changed |= store.set_disjunctive_order(order_index, 1)?;
+                                changed |= enforce_before(store, i, j)?;
+                            }
+                            (false, true) if both_present => {
+                                changed |= store.set_disjunctive_order(order_index, 2)?;
+                                changed |= enforce_before(store, j, i)?;
+                            }
                             _ => {}
-                        },
-                        (true, false) if both_present => {
-                            // Only i-before-j fits: i ends before j starts.
-                            let di = store.interval_duration(i);
-                            changed |= store.set_interval_start_min(j, store.interval_end_min(i))?;
-                            changed |= store.set_interval_start_max(i, store.interval_start_max(j).saturating_sub(di))?;
                         }
-                        (false, true) if both_present => {
-                            // Only j-before-i fits.
-                            let dj = store.interval_duration(j);
-                            changed |= store.set_interval_start_min(i, store.interval_end_min(j))?;
-                            changed |= store.set_interval_start_max(j, store.interval_start_max(i).saturating_sub(dj))?;
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -488,7 +508,7 @@ impl Propagator for NoOverlap {
 
 /// Post a structured unary-resource no-overlap over the given intervals.
 pub fn no_overlap(solver: &mut Solver, intervals: &[IntervalId]) -> PropId {
-    solver.post(Box::new(NoOverlap { intervals: intervals.to_vec() }))
+    solver.post(Box::new(NoOverlap { intervals: intervals.to_vec(), pairs: Vec::new() }))
 }
 
 /// Makespan upper bound for branch-and-bound: every interval must end no later
