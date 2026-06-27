@@ -3,9 +3,9 @@
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 
-use crate::ids::{IntervalId, ListId, PropId};
+use crate::ids::{IntervalId, ListId, PropId, VarId};
 use crate::propagator::{Inconsistency, Propagator};
-use crate::store::{Solver, Store};
+use crate::store::{Premise, Solver, Store};
 use crate::structured::{IntervalEvent, IntervalPresence, ListEvent};
 
 /// Exact partition over structured list membership.
@@ -369,35 +369,62 @@ impl Propagator for IntervalPrecedence {
             return Ok(());
         }
 
-        let feasible = store.interval_end_min(self.before) <= store.interval_start_max(self.after);
-        if !feasible {
+        let before_start = store.interval_start_var(self.before);
+        let after_start = store.interval_start_var(self.after);
+        let before_lb = store.interval_start_min(self.before);
+        let after_ub = store.interval_start_max(self.after);
+        let duration = store.interval_duration(self.before);
+        // `before` ends after `after`'s latest start: the precedence cannot hold.
+        let before_too_late = before_lb.saturating_add(duration) > after_ub;
+        let present = IntervalPresence::Present;
+        let optional = IntervalPresence::Optional;
+
+        if before_too_late {
+            // Reason: `before.start >= before_lb` and `after.start <= after_ub`,
+            // plus the presence of whichever intervals are optional.
+            let mut why = vec![Premise::Ge { var: before_start, bound: before_lb }, Premise::Le { var: after_start, bound: after_ub }];
             match (before_presence, after_presence) {
-                (IntervalPresence::Present, IntervalPresence::Present) => return Err(Inconsistency),
-                (IntervalPresence::Present, IntervalPresence::Optional) => {
-                    store.forbid_interval_presence(self.after)?;
+                (p, q) if p == present && q == present => {
+                    why.extend(present_premise(store, self.before));
+                    why.extend(present_premise(store, self.after));
+                    return Err(store.fail_because(why));
+                }
+                (p, q) if p == present && q == optional => {
+                    why.extend(present_premise(store, self.before));
+                    store.forbid_interval_presence_because(self.after, why)?;
                     return Ok(());
                 }
-                (IntervalPresence::Optional, IntervalPresence::Present) => {
-                    store.forbid_interval_presence(self.before)?;
+                (p, q) if p == optional && q == present => {
+                    why.extend(present_premise(store, self.after));
+                    store.forbid_interval_presence_because(self.before, why)?;
                     return Ok(());
                 }
                 _ => return Ok(()),
             }
         }
 
-        if before_presence == IntervalPresence::Present && after_presence == IntervalPresence::Present {
-            let before_duration = store.interval_duration(self.before);
-            let before_max = store.interval_start_max(self.before);
-            let after_min = store.interval_start_min(self.after);
-            let after_max = store.interval_start_max(self.after);
+        if before_presence == present && after_presence == present {
+            // after.start >= before.start_min + duration(before).
+            let mut why_after = vec![Premise::Ge { var: before_start, bound: before_lb }];
+            why_after.extend(present_premise(store, self.before));
+            why_after.extend(present_premise(store, self.after));
+            store.set_interval_start_min_because(self.after, before_lb.saturating_add(duration), why_after)?;
 
-            store.set_interval_start_max(self.before, before_max.min(after_max.saturating_sub(before_duration)))?;
-            store
-                .set_interval_start_min(self.after, after_min.max(store.interval_start_min(self.before).saturating_add(before_duration)))?;
+            // before.start <= after.start_max - duration(before).
+            let mut why_before = vec![Premise::Le { var: after_start, bound: after_ub }];
+            why_before.extend(present_premise(store, self.before));
+            why_before.extend(present_premise(store, self.after));
+            store.set_interval_start_max_because(self.before, after_ub.saturating_sub(duration), why_before)?;
         }
 
         Ok(())
     }
+}
+
+/// `[present(interval)]` as a premise: an optional interval cites its presence
+/// variable; a mandatory interval is present at the root and cites nothing.
+fn present_premise(store: &Store, interval: IntervalId) -> Option<Premise> {
+    store.interval_presence_var(interval).map(|var| Premise::Eq { var, val: 1 })
 }
 
 /// Post structured interval precedence.
@@ -439,13 +466,41 @@ fn decided_before(store: &Store, pair_index: &[Vec<usize>], i: usize, j: usize) 
     order != usize::MAX && store.disjunctive_order(order) == want
 }
 
-/// Enforce `i` before `j` on the start bounds (both must be present). Returns
-/// whether a bound changed.
-fn enforce_before(store: &mut Store, i: IntervalId, j: IntervalId) -> Result<bool, Inconsistency> {
-    let di = store.interval_duration(i);
-    let mut changed = store.set_interval_start_min(j, store.interval_end_min(i))?;
-    changed |= store.set_interval_start_max(i, store.interval_start_max(j).saturating_sub(di))?;
+/// Enforce `before` ends no later than `after` starts on the start bounds (both
+/// present), citing the decided order `order_var = order_value` and the bounds it
+/// rests on. Returns whether a bound changed.
+fn enforce_before_because(store: &mut Store, before: IntervalId, after: IntervalId, order_var: VarId, order_value: i32) -> Result<bool, Inconsistency> {
+    let duration = store.interval_duration(before);
+    let before_start = store.interval_start_var(before);
+    let after_start = store.interval_start_var(after);
+    let before_lb = store.interval_start_min(before);
+    let after_ub = store.interval_start_max(after);
+
+    // after.start >= before.start_min + duration(before); reason: the order, plus
+    // before's lower bound and both presences.
+    let mut why_after = vec![Premise::Eq { var: order_var, val: order_value }, Premise::Ge { var: before_start, bound: before_lb }];
+    why_after.extend(present_premise(store, before));
+    why_after.extend(present_premise(store, after));
+    let mut changed = store.set_interval_start_min_because(after, before_lb.saturating_add(duration), why_after)?;
+
+    // before.start <= after.start_max - duration(before); reason: the order, plus
+    // after's upper bound and both presences.
+    let mut why_before = vec![Premise::Eq { var: order_var, val: order_value }, Premise::Le { var: after_start, bound: after_ub }];
+    why_before.extend(present_premise(store, before));
+    why_before.extend(present_premise(store, after));
+    changed |= store.set_interval_start_max_because(before, after_ub.saturating_sub(duration), why_before)?;
     Ok(changed)
+}
+
+/// Premises stating neither ordering of `i` and `j` fits: both end-before-start
+/// directions are already violated by the current start bounds.
+fn both_orders_infeasible(store: &Store, i: IntervalId, j: IntervalId) -> Vec<Premise> {
+    vec![
+        Premise::Ge { var: store.interval_start_var(i), bound: store.interval_start_min(i) },
+        Premise::Le { var: store.interval_start_var(j), bound: store.interval_start_max(j) },
+        Premise::Ge { var: store.interval_start_var(j), bound: store.interval_start_min(j) },
+        Premise::Le { var: store.interval_start_var(i), bound: store.interval_start_max(i) },
+    ]
 }
 
 impl Propagator for NoOverlap {
@@ -484,11 +539,12 @@ impl Propagator for NoOverlap {
                     continue;
                 }
                 let both_present = pi == IntervalPresence::Present && pj == IntervalPresence::Present;
+                let order_var = store.disjunctive_order_var(order_index);
                 match store.disjunctive_order(order_index) {
-                    // Order already decided (by the brancher or a deduction):
-                    // durably enforce that precedence.
-                    1 if both_present => changed |= enforce_before(store, i, j)?,
-                    2 if both_present => changed |= enforce_before(store, j, i)?,
+                    // Order already decided (by the brancher, a deduction, or a
+                    // learning-engine branch): durably enforce that precedence.
+                    1 if both_present => changed |= enforce_before_because(store, i, j, order_var, 1)?,
+                    2 if both_present => changed |= enforce_before_because(store, j, i, order_var, 0)?,
                     1 | 2 => {}
                     // Undecided: weak pairwise feasibility; deduce a forced order
                     // (detectable precedence) or forbid an unschedulable optional.
@@ -497,18 +553,48 @@ impl Propagator for NoOverlap {
                         let j_before_i = store.interval_end_min(j) <= store.interval_start_max(i);
                         match (i_before_j, j_before_i) {
                             (false, false) => match (pi, pj) {
-                                (IntervalPresence::Present, IntervalPresence::Present) => return Err(Inconsistency),
-                                (IntervalPresence::Present, IntervalPresence::Optional) => changed |= store.forbid_interval_presence(j)?,
-                                (IntervalPresence::Optional, IntervalPresence::Present) => changed |= store.forbid_interval_presence(i)?,
+                                // Both present yet neither order fits: conflict.
+                                (IntervalPresence::Present, IntervalPresence::Present) => {
+                                    let mut why = both_orders_infeasible(store, i, j);
+                                    why.extend(present_premise(store, i));
+                                    why.extend(present_premise(store, j));
+                                    return Err(store.fail_because(why));
+                                }
+                                // A present partner leaves no room for the optional.
+                                (IntervalPresence::Present, IntervalPresence::Optional) => {
+                                    let mut why = both_orders_infeasible(store, i, j);
+                                    why.extend(present_premise(store, i));
+                                    changed |= store.forbid_interval_presence_because(j, why)?;
+                                }
+                                (IntervalPresence::Optional, IntervalPresence::Present) => {
+                                    let mut why = both_orders_infeasible(store, i, j);
+                                    why.extend(present_premise(store, j));
+                                    changed |= store.forbid_interval_presence_because(i, why)?;
+                                }
                                 _ => {}
                             },
                             (true, false) if both_present => {
-                                changed |= store.set_disjunctive_order(order_index, 1)?;
-                                changed |= enforce_before(store, i, j)?;
+                                // j cannot precede i (its earliest end is past i's
+                                // latest start), so i must run first.
+                                let mut why = vec![
+                                    Premise::Ge { var: store.interval_start_var(j), bound: store.interval_start_min(j) },
+                                    Premise::Le { var: store.interval_start_var(i), bound: store.interval_start_max(i) },
+                                ];
+                                why.extend(present_premise(store, i));
+                                why.extend(present_premise(store, j));
+                                changed |= store.set_disjunctive_order_because(order_index, 1, why)?;
+                                changed |= enforce_before_because(store, i, j, order_var, 1)?;
                             }
                             (false, true) if both_present => {
-                                changed |= store.set_disjunctive_order(order_index, 2)?;
-                                changed |= enforce_before(store, j, i)?;
+                                // i cannot precede j, so j must run first.
+                                let mut why = vec![
+                                    Premise::Ge { var: store.interval_start_var(i), bound: store.interval_start_min(i) },
+                                    Premise::Le { var: store.interval_start_var(j), bound: store.interval_start_max(j) },
+                                ];
+                                why.extend(present_premise(store, i));
+                                why.extend(present_premise(store, j));
+                                changed |= store.set_disjunctive_order_because(order_index, 2, why)?;
+                                changed |= enforce_before_because(store, j, i, order_var, 0)?;
                             }
                             _ => {}
                         }

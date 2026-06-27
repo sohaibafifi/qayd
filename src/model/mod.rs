@@ -384,9 +384,11 @@ impl BackendSelection {
     pub fn for_model(model: &Model) -> Self {
         if !model.intervals.is_empty() {
             let all_fixed = model.intervals.iter().all(|interval| interval.modes.is_empty());
-            // Fixed intervals (JSSP/RCPSP): precedence + no-overlap + cumulative.
-            // Moded intervals (FJSP machine choice): precedence + machine no-overlap,
-            // lowered to optional mode-intervals + an `alternative` per op.
+            // Generic interval model, recognised by structure
+            // Fixed intervals: precedence + no-overlap + cumulative. Moded
+            // intervals (per-operation machine choice): precedence + machine
+            // no-overlap, lowered to optional mode-intervals + an `alternative` per
+            // operation. (Job-shop, flexible job-shop and RCPSP all compose from these.)
             let constraints_ok = if all_fixed {
                 model.constraints.iter().all(|constraint| {
                     matches!(

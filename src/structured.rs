@@ -4,6 +4,7 @@
 //! from the collection local-search IR: this module stores exact mutable state,
 //! while collection search can later act as an incumbent source.
 
+use crate::ids::VarId;
 use crate::propagator::Inconsistency;
 use crate::trail::{ReversibleInt, Trail};
 
@@ -49,23 +50,6 @@ pub enum IntervalPresence {
     Present,
 }
 
-impl IntervalPresence {
-    fn encode(self) -> i32 {
-        match self {
-            Self::Optional => -1,
-            Self::Absent => 0,
-            Self::Present => 1,
-        }
-    }
-
-    fn decode(v: i32) -> Self {
-        match v {
-            0 => Self::Absent,
-            1 => Self::Present,
-            _ => Self::Optional,
-        }
-    }
-}
 
 /// Structured list domain over a fixed item universe.
 #[derive(Clone)]
@@ -241,101 +225,16 @@ impl ListDomain {
     }
 }
 
-/// Structured fixed-duration interval domain.
-#[derive(Clone)]
+/// A fixed-duration interval, backed by integer variables so that its facts
+/// (start bound, presence) are first-class atoms the learning engine reasons
+/// over. The `Store` owns the variables and all the logic; this is just the
+/// handle that records which variables back the interval.
+#[derive(Clone, Copy)]
 pub struct IntervalDomain {
-    start_min: ReversibleInt,
-    start_max: ReversibleInt,
-    duration: i32,
-    presence: ReversibleInt,
-}
-
-impl IntervalDomain {
-    /// Create an interval. Use `presence` to choose mandatory or optional.
-    pub fn new(start_min: i32, start_max: i32, duration: i32, presence: IntervalPresence, trail: &mut Trail) -> Self {
-        assert!(start_min <= start_max, "interval start_min must be <= start_max");
-        assert!(duration >= 0, "interval duration must be non-negative");
-        Self {
-            start_min: trail.new_int(start_min),
-            start_max: trail.new_int(start_max),
-            duration,
-            presence: trail.new_int(presence.encode()),
-        }
-    }
-
-    /// Start lower bound.
-    pub fn start_min(&self, trail: &Trail) -> i32 {
-        trail.get(self.start_min)
-    }
-
-    /// Start upper bound.
-    pub fn start_max(&self, trail: &Trail) -> i32 {
-        trail.get(self.start_max)
-    }
-
-    /// Fixed duration.
-    pub fn duration(&self) -> i32 {
-        self.duration
-    }
-
-    /// End lower bound.
-    pub fn end_min(&self, trail: &Trail) -> i32 {
-        self.start_min(trail).saturating_add(self.duration)
-    }
-
-    /// End upper bound.
-    pub fn end_max(&self, trail: &Trail) -> i32 {
-        self.start_max(trail).saturating_add(self.duration)
-    }
-
-    /// Current presence state.
-    pub fn presence(&self, trail: &Trail) -> IntervalPresence {
-        IntervalPresence::decode(trail.get(self.presence))
-    }
-
-    /// Raise the start lower bound.
-    pub fn set_start_min(&mut self, min: i32, trail: &mut Trail) -> Result<bool, Inconsistency> {
-        if min > self.start_max(trail) {
-            return Err(Inconsistency);
-        }
-        if min <= self.start_min(trail) {
-            return Ok(false);
-        }
-        trail.set(self.start_min, min);
-        Ok(true)
-    }
-
-    /// Lower the start upper bound.
-    pub fn set_start_max(&mut self, max: i32, trail: &mut Trail) -> Result<bool, Inconsistency> {
-        if max < self.start_min(trail) {
-            return Err(Inconsistency);
-        }
-        if max >= self.start_max(trail) {
-            return Ok(false);
-        }
-        trail.set(self.start_max, max);
-        Ok(true)
-    }
-
-    /// Require the interval to be present.
-    pub fn require_presence(&mut self, trail: &mut Trail) -> Result<bool, Inconsistency> {
-        self.set_presence(IntervalPresence::Present, trail)
-    }
-
-    /// Mark the interval absent.
-    pub fn forbid_presence(&mut self, trail: &mut Trail) -> Result<bool, Inconsistency> {
-        self.set_presence(IntervalPresence::Absent, trail)
-    }
-
-    fn set_presence(&mut self, next: IntervalPresence, trail: &mut Trail) -> Result<bool, Inconsistency> {
-        let current = self.presence(trail);
-        if current == next {
-            return Ok(false);
-        }
-        if current != IntervalPresence::Optional {
-            return Err(Inconsistency);
-        }
-        trail.set(self.presence, next.encode());
-        Ok(true)
-    }
+    /// Start-time variable; its domain is the start window `[start_min, start_max]`.
+    pub(crate) start: VarId,
+    pub(crate) duration: i32,
+    /// Presence boolean variable (`1` present, `0` absent); `None` for a
+    /// mandatory interval (always present).
+    pub(crate) presence: Option<VarId>,
 }
