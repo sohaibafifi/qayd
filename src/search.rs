@@ -56,12 +56,22 @@ pub struct StructuredSolution {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StructuredDecision {
-    ListMembership { list: ListId, item: i32 },
-    IntervalPresence { interval: IntervalId },
+    ListMembership {
+        list: ListId,
+        item: i32,
+    },
+    IntervalPresence {
+        interval: IntervalId,
+    },
     /// Durably order a unary-resource pair: first-before-second (left) or
     /// second-before-first (right). `no_overlap` enforces the chosen precedence.
-    Order { pair: usize },
-    IntervalStartSplit { interval: IntervalId, mid: i32 },
+    Order {
+        pair: usize,
+    },
+    IntervalStartSplit {
+        interval: IntervalId,
+        mid: i32,
+    },
 }
 
 /// Materialized or symbolic objective evaluated by the CDCL optimizer.

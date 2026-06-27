@@ -50,7 +50,6 @@ pub enum IntervalPresence {
     Present,
 }
 
-
 /// Structured list domain over a fixed item universe.
 #[derive(Clone)]
 pub struct ListDomain {

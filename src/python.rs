@@ -18,13 +18,13 @@ use crate::constraints::primitives;
 use crate::constraints::scheduling;
 use crate::constraints::structured as structured_constraints;
 use crate::constraints::table;
+use crate::engines::{routing as routing_engine, schedule as schedule_engine};
 use crate::expr::{self, Expr};
-use crate::ids::{IntervalId, ListId, VarId};
+use crate::ids::{ListId, VarId};
 use crate::list_ls;
 use crate::ls::{solve_fast_cop, LocalRhs, LocalSearchSpec, LsConfig};
 use crate::model as shared_model;
 use crate::problem::{Objective as ProblemObjective, Problem};
-use crate::routing_lowering;
 use crate::search::{self, Objective as SearchObjective, SearchControl, SolveStats};
 use crate::Solver;
 
@@ -422,59 +422,6 @@ fn parse_relation(relation: &str) -> PyResult<Relation> {
 
 fn checked_i32(value: i64, name: &str) -> PyResult<i32> {
     i32::try_from(value).map_err(|_| PyValueError::new_err(format!("{name} is outside the i32 domain range")))
-}
-
-/// Mode-interval layout of an optional-interval schedule (each operation chooses
-/// one of several mode-intervals). Built deterministically, so the VarId /
-/// IntervalId / disjunctive-pair indices are identical across solver instances
-/// built from the same schedule (the integer ids are globally meaningful). That is
-/// what lets the optimal assignment found on one solver be replayed on a fresh one.
-struct ModedScheduleBuild {
-    /// op_modes[op] = [(machine, mode-interval id, duration)].
-    op_modes: Vec<Vec<(usize, IntervalId, i32)>>,
-    all_modes: Vec<IntervalId>,
-    all_durations: Vec<i32>,
-}
-
-/// Post an optional-interval schedule onto `solver`: one optional mode-interval per
-/// eligible machine with `exactly_one_mode`, per-machine `no_overlap`, and
-/// precedence over every mode pair of each ordered operation pair.
-fn build_moded_schedule(schedule: &collection::Schedule, solver: &mut Solver) -> PyResult<ModedScheduleBuild> {
-    let mut op_modes: Vec<Vec<(usize, IntervalId, i32)>> = Vec::with_capacity(schedule.intervals.len());
-    let mut all_modes: Vec<IntervalId> = Vec::new();
-    let mut all_durations: Vec<i32> = Vec::new();
-    for interval in &schedule.intervals {
-        let mut modes = Vec::with_capacity(interval.modes.len());
-        for mode in &interval.modes {
-            let duration = checked_i32(mode.duration, "mode duration")?;
-            let start_max = checked_i32(interval.horizon - mode.duration, "mode start upper bound")?;
-            let id = solver.store.new_optional_interval(0, start_max, duration);
-            modes.push((mode.machine, id, duration));
-            all_modes.push(id);
-            all_durations.push(duration);
-        }
-        let ids: Vec<IntervalId> = modes.iter().map(|&(_, id, _)| id).collect();
-        structured_constraints::exactly_one_mode(solver, &ids);
-        op_modes.push(modes);
-    }
-    let mut machines: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-    for modes in &op_modes {
-        for &(machine, _, _) in modes {
-            machines.insert(machine);
-        }
-    }
-    for machine in machines {
-        let group: Vec<IntervalId> = op_modes.iter().flatten().filter(|&&(m, _, _)| m == machine).map(|&(_, id, _)| id).collect();
-        structured_constraints::no_overlap(solver, &group);
-    }
-    for &(before, after) in &schedule.precedences {
-        for &(_, ib, _) in &op_modes[before] {
-            for &(_, ia, _) in &op_modes[after] {
-                structured_constraints::interval_precedence(solver, ib, ia);
-            }
-        }
-    }
-    Ok(ModedScheduleBuild { op_modes, all_modes, all_durations })
 }
 
 enum StructuredListConstraint {
@@ -1608,13 +1555,14 @@ impl PyModel {
         model: &collection::CollectionModel,
         selection: &shared_model::BackendSelection,
         time_limit: Option<u64>,
+        seed: u64,
         verbose: bool,
     ) -> PyResult<Option<PySolution>> {
         if selection.backend != shared_model::Backend::StructuredExact {
             return Ok(None);
         }
         if let Some(schedule) = &model.schedule {
-            return self.try_solve_structured_schedule(schedule, model, selection, time_limit, verbose);
+            return self.try_solve_structured_schedule(schedule, model, selection, time_limit, seed, verbose);
         }
         self.try_solve_structured_lists(model, selection, time_limit, verbose)
     }
@@ -1652,7 +1600,7 @@ impl PyModel {
                 println!("  o {objective}  ({primary_sense}, {:.2}s)", start.elapsed().as_secs_f64());
             }
         };
-        let Some(outcome) = routing_lowering::solve_collection(model, seed, &stop, &mut report) else {
+        let Some(outcome) = routing_engine::solve_collection(model, seed, &stop, &mut report) else {
             return Ok(None);
         };
         let sol = outcome.solution;
@@ -1848,380 +1796,65 @@ impl PyModel {
         model: &collection::CollectionModel,
         selection: &shared_model::BackendSelection,
         time_limit: Option<u64>,
+        seed: u64,
         verbose: bool,
     ) -> PyResult<Option<PySolution>> {
-        // Schedules with optional mode-intervals (an `alternative` per operation)
-        // are a distinct model shape, lowered separately.
-        if schedule.intervals.iter().any(|iv| !iv.modes.is_empty()) {
-            return self.try_solve_optional_interval_schedule(schedule, model, selection, time_limit, verbose);
-        }
-        let fixed_intervals = schedule.intervals.iter().all(|iv| iv.modes.is_empty());
-        // No-overlap and cumulative resources are handled by structured
-        // propagators; machine-choice (modes) stays on local search.
-        let resources_supported = schedule
-            .resources
-            .iter()
-            .all(|resource| matches!(resource, collection::Resource::NoOverlap(_) | collection::Resource::Cumulative { .. }));
-        if !model.objectives.is_empty()
-            || !model.constraints.is_empty()
-            || !model.globals.is_empty()
-            || !model.items.is_empty()
-            || !resources_supported
-            || !fixed_intervals
-        {
+        if !model.objectives.is_empty() || !model.constraints.is_empty() || !model.globals.is_empty() || !model.items.is_empty() {
             return Ok(None);
         }
 
         let limit = time_limit.unwrap_or(5);
+        let moded = schedule.intervals.iter().any(|iv| !iv.modes.is_empty());
         if verbose {
             println!("qayd solve (structured)");
             println!("  class: {}", selection.class.name());
             println!("  backend: {}", selection.backend.name());
             println!("  reason: {}", selection.reason);
-            println!("  kind: intervals");
-            println!("  intervals: {}", schedule.intervals.len());
+            println!("  kind: {}", if moded { "intervals (machine choice)" } else { "intervals" });
+            println!("  operations: {}", schedule.intervals.len());
             println!("  precedences: {}", schedule.precedences.len());
             println!("  resources: {}", schedule.resources.len());
             println!("  objective: {}", if schedule.minimize_makespan { "makespan" } else { "no" });
             println!("  time limit: {limit}s");
         }
 
-        let mut solver = Solver::new();
-        let mut intervals: Vec<IntervalId> = Vec::with_capacity(schedule.intervals.len());
-        let mut durations_i32 = Vec::with_capacity(schedule.intervals.len());
-        for interval in &schedule.intervals {
-            let duration = checked_i32(interval.duration, "interval duration")?;
-            let start_max = checked_i32(interval.horizon - interval.duration, "interval start upper bound")?;
-            intervals.push(solver.store.new_interval(0, start_max, duration));
-            durations_i32.push(duration);
-        }
-        for &(before, after) in &schedule.precedences {
-            structured_constraints::interval_precedence(&mut solver, intervals[before], intervals[after]);
-        }
-        for resource in &schedule.resources {
-            match resource {
-                collection::Resource::NoOverlap(group) => {
-                    let group_ids: Vec<IntervalId> = group.iter().map(|&index| intervals[index]).collect();
-                    structured_constraints::no_overlap(&mut solver, &group_ids);
-                }
-                collection::Resource::Cumulative { demands, capacity } => {
-                    let group_ids: Vec<IntervalId> = demands.iter().map(|&(index, _)| intervals[index]).collect();
-                    let group_demands: Vec<i32> = demands.iter().map(|&(_, demand)| checked_i32(demand, "cumulative demand")).collect::<PyResult<_>>()?;
-                    let cap = checked_i32(*capacity, "cumulative capacity")?;
-                    structured_constraints::cumulative(&mut solver, &group_ids, &group_demands, cap);
-                }
-                collection::Resource::MachineNoOverlap => {}
-            }
-        }
-
-        // Makespan minimisation through the learning (CDCL) engine: branch the
-        // operation starts and the disjunctive order variables, with the makespan
-        // a variable bounded below by every interval's end. Learning over the
-        // integer-backed start/order atoms prunes far more than the chronological
-        // branch-and-bound this replaces.
         let stop = stop_after(limit);
-        let (status, objective, starts, stats): (&str, Option<i64>, Vec<i64>, SolveStats) = if schedule.minimize_makespan {
-            let max_horizon = checked_i32(schedule.intervals.iter().map(|iv| iv.horizon).max().unwrap_or(0), "schedule horizon")?;
-            let makespan = solver.store.new_var_range(0, max_horizon);
-            for (&iv, &dur) in intervals.iter().zip(&durations_i32) {
-                let start = solver.store.interval_start_var(iv);
-                intension::intension(&mut solver, expr::ge(expr::var(makespan), expr::add(vec![expr::var(start), expr::int(i64::from(dur))])));
-            }
-            // schedule_search_vars: starts, then disjunctive order variables, then
-            // the makespan. Fixed intervals are all present, so no absent-mode
-            // start variables arise here.
-            let mut search_vars: Vec<VarId> = intervals.iter().map(|&iv| solver.store.interval_start_var(iv)).collect();
-            let n_starts = search_vars.len();
-            search_vars.extend((0..solver.store.disjunctive_pair_count()).map(|i| solver.store.disjunctive_order_var(i)));
-            search_vars.push(makespan);
-
-            let (best, stats, complete) = search::optimize_seeded(
-                &mut solver,
-                &search_vars,
-                SearchObjective::Var(makespan),
-                true,
-                &stop,
-                0,
-                None,
-                None,
-                &[],
-                None,
-                |value, _| {
-                    if verbose {
-                        println!("  o {value}  (min)");
-                    }
-                },
-            );
-            match (best, complete) {
-                (Some((assignment, value)), true) => ("OPTIMAL", Some(value), assignment[..n_starts].iter().map(|&s| i64::from(s)).collect(), stats),
-                (Some((assignment, value)), false) => ("SATISFIABLE", Some(value), assignment[..n_starts].iter().map(|&s| i64::from(s)).collect(), stats),
-                (None, true) => ("UNSATISFIABLE", None, Vec::new(), stats),
-                (None, false) => ("UNKNOWN", None, Vec::new(), stats),
-            }
-        } else {
-            // Feasibility only (no makespan objective): first solution suffices.
-            let mut starts: Option<Vec<i64>> = None;
-            let (stats, complete) = search::solve_structured_interruptible(
-                &mut solver,
-                |_, structured| {
-                    starts = Some(structured.interval_starts.iter().map(|start| i64::from(start.unwrap_or(0))).collect());
-                    SearchControl::Stop
-                },
-                &stop,
-            );
-            match (starts, complete) {
-                (Some(starts), _) => ("SATISFIABLE", None, starts, stats),
-                (None, true) => ("UNSATISFIABLE", None, Vec::new(), stats),
-                (None, false) => ("UNKNOWN", None, Vec::new(), stats),
-            }
+        let options = schedule_engine::Options {
+            seed,
+            optional_modes_cdcl: schedule.minimize_makespan && std::env::var_os("QAYD_SCHEDULE_CDCL").is_some(),
         };
-        if verbose {
-            println!("qayd result (structured)");
-            println!("  status: {status}");
-            if let Some(objective) = objective {
-                println!("  objective: {objective}");
+        let outcome = schedule_engine::solve(schedule, &stop, options, |value| {
+            if verbose {
+                println!("  o {value}  (min)");
             }
-            println!("  solutions: {}", stats.solutions);
-            println!("  nodes: {}", stats.nodes);
-            println!("  failures: {}", stats.failures);
-        }
-
-        Ok(Some(PySolution {
-            status: status.to_string(),
-            objective,
-            objective_sense: schedule.minimize_makespan.then(|| "min".to_string()),
-            objective_expr: schedule.minimize_makespan.then(|| "makespan".to_string()),
-            values: Vec::new(),
-            stats: stats.into(),
-            routes: None,
-            objectives: objective.map(|value| vec![value]).unwrap_or_default(),
-            starts,
-            machines: vec![-1; schedule.intervals.len()],
-        }))
-    }
-
-    /// Optional-interval schedule (per-operation machine choice): each operation
-    /// lowers to one optional mode-interval per eligible machine, an `alternative`
-    /// per operation, per-machine no-overlap over the mode-intervals, pairwise
-    /// precedence over mode sets, and makespan branch-and-bound. The CDCL backend
-    /// is opt-in via `QAYD_SCHEDULE_CDCL`. `solution.machines` reports the chosen
-    /// machine.
-    fn try_solve_optional_interval_schedule(
-        &self,
-        schedule: &collection::Schedule,
-        model: &collection::CollectionModel,
-        selection: &shared_model::BackendSelection,
-        time_limit: Option<u64>,
-        verbose: bool,
-    ) -> PyResult<Option<PySolution>> {
-        let all_moded = schedule.intervals.iter().all(|iv| !iv.modes.is_empty());
-        let resources_ok = schedule.resources.iter().all(|resource| matches!(resource, collection::Resource::MachineNoOverlap));
-        if !model.objectives.is_empty() || !model.constraints.is_empty() || !model.globals.is_empty() || !model.items.is_empty() || !all_moded || !resources_ok {
+        })
+        .map_err(PyValueError::new_err)?;
+        let Some(outcome) = outcome else {
             return Ok(None);
-        }
-
-        let limit = time_limit.unwrap_or(5);
-        if verbose {
-            println!("qayd solve (structured)");
-            println!("  class: {}", selection.class.name());
-            println!("  backend: {}", selection.backend.name());
-            println!("  reason: {}", selection.reason);
-            println!("  kind: intervals (machine choice)");
-            println!("  operations: {}", schedule.intervals.len());
-            println!("  precedences: {}", schedule.precedences.len());
-            println!("  time limit: {limit}s");
-        }
-
-        let mut solver = Solver::new();
-        let ModedScheduleBuild { op_modes, all_modes, all_durations } = build_moded_schedule(schedule, &mut solver)?;
-
-        let op_count = op_modes.len();
-        let stop = stop_after(limit);
-        // The learning (CDCL) backend is correct for optional-mode schedules but
-        // not yet the strongest default (weaker branching than the structured
-        // disjunctive search), so it is opt-in via QAYD_SCHEDULE_CDCL; chronological
-        // branch-and-bound stays the default.
-        let use_cdcl = schedule.minimize_makespan && std::env::var_os("QAYD_SCHEDULE_CDCL").is_some();
-        let (status, objective, starts, machines_out, stats): (&str, Option<i64>, Vec<i64>, Vec<i64>, SolveStats) = if use_cdcl {
-            // Makespan minimisation through the learning engine: branch the mode
-            // presences and disjunctive order variables; the starts follow by
-            // propagation. The makespan counts only present modes, so it is a reified
-            // bound: present(mode) => makespan >= start + duration.
-            let max_horizon = checked_i32(schedule.intervals.iter().map(|iv| iv.horizon).max().unwrap_or(0), "schedule horizon")?;
-            let makespan = solver.store.new_var_range(0, max_horizon);
-            let start_vars: Vec<VarId> = all_modes.iter().map(|&id| solver.store.interval_start_var(id)).collect();
-            let presence_vars: Vec<VarId> = all_modes.iter().map(|&id| solver.store.interval_presence_var(id).expect("mode interval is optional")).collect();
-            for ((&start, &present), &dur) in start_vars.iter().zip(&presence_vars).zip(&all_durations) {
-                intension::intension(
-                    &mut solver,
-                    expr::imp(expr::eq(expr::var(present), expr::int(1)), expr::ge(expr::var(makespan), expr::add(vec![expr::var(start), expr::int(i64::from(dur))]))),
-                );
-            }
-            // (machine, flat mode index) per op, to read the chosen mode.
-            let mut op_modes_flat: Vec<Vec<(usize, usize)>> = Vec::with_capacity(op_count);
-            let mut flat = 0usize;
-            for modes in &op_modes {
-                let mut row = Vec::with_capacity(modes.len());
-                for &(machine, _, _) in modes {
-                    row.push((machine, flat));
-                    flat += 1;
-                }
-                op_modes_flat.push(row);
-            }
-            // schedule_search_vars: mode presences, then disjunctive orders, then
-            // the makespan. The operation starts are NOT branched -- they follow
-            // from the presences and orders by propagation (the critical path),
-            // which keeps absent-mode starts out of the search entirely.
-            let n_modes = all_modes.len();
-            let n_orders = solver.store.disjunctive_pair_count();
-            let mut search_vars: Vec<VarId> = presence_vars.clone();
-            search_vars.extend((0..n_orders).map(|i| solver.store.disjunctive_order_var(i)));
-            search_vars.push(makespan);
-
-            let (best, stats, complete) = search::optimize_seeded(
-                &mut solver,
-                &search_vars,
-                SearchObjective::Var(makespan),
-                true,
-                &stop,
-                0,
-                None,
-                None,
-                &[],
-                None,
-                |value, _| {
-                    if verbose {
-                        println!("  o {value}  (min)");
-                    }
-                },
-            );
-            match (best, complete) {
-                (Some((assignment, value)), complete_flag) => {
-                    // Replay the optimal presence/order assignment on a FRESH solver
-                    // to recover the earliest start of each chosen mode. The
-                    // optimisation solver must NOT be reused: optimize_seeded asserts
-                    // a strict `makespan < incumbent` bound at the root after each
-                    // improvement, so the very schedule we want is excluded from its
-                    // state. A fresh solver rebuilt from the same schedule has
-                    // identical variable/interval/order ids, so `assignment` indexes
-                    // it correctly. Any inconsistency here is an internal bug, so we
-                    // fail loudly rather than return default starts/machines.
-                    let mut replay = Solver::new();
-                    let replay_build = build_moded_schedule(schedule, &mut replay)?;
-                    let replay_present: Vec<VarId> =
-                        replay_build.all_modes.iter().map(|&id| replay.store.interval_presence_var(id).expect("mode interval is optional")).collect();
-                    let inconsistent = || PyValueError::new_err("internal error: replaying the optimal mode schedule was inconsistent");
-                    for (i, &present) in replay_present.iter().enumerate() {
-                        replay.store.fix(present, assignment[i]).map_err(|_| inconsistent())?;
-                    }
-                    for k in 0..n_orders {
-                        let order_var = replay.store.disjunctive_order_var(k);
-                        replay.store.fix(order_var, assignment[n_modes + k]).map_err(|_| inconsistent())?;
-                    }
-                    replay.propagate().map_err(|_| inconsistent())?;
-
-                    let mut starts = vec![0i64; op_count];
-                    let mut chosen = vec![-1i64; op_count];
-                    let mut makespan_value = 0i64;
-                    for (op, modes) in op_modes_flat.iter().enumerate() {
-                        for &(machine, flat_idx) in modes {
-                            if assignment[flat_idx] == 1 {
-                                let start = i64::from(replay.store.interval_start_min(replay_build.all_modes[flat_idx]));
-                                starts[op] = start;
-                                chosen[op] = machine as i64;
-                                makespan_value = makespan_value.max(start + i64::from(all_durations[flat_idx]));
-                            }
-                        }
-                    }
-                    // The makespan variable is itself a search variable minimised by
-                    // the engine, so the incumbent already carries each assignment's
-                    // earliest makespan. The replayed earliest schedule must therefore
-                    // reproduce `value` exactly; any difference is an internal bug.
-                    if makespan_value != value {
-                        return Err(PyValueError::new_err("internal error: replayed mode schedule makespan does not match the reported value"));
-                    }
-                    let status = if complete_flag { "OPTIMAL" } else { "SATISFIABLE" };
-                    (status, Some(makespan_value), starts, chosen, stats)
-                }
-                (None, true) => ("UNSATISFIABLE", None, Vec::new(), Vec::new(), stats),
-                (None, false) => ("UNKNOWN", None, Vec::new(), Vec::new(), stats),
-            }
-        } else {
-            // Default: chronological search. With a makespan objective, branch-and-
-            // bound lowers a shared upper bound on each improvement; without one,
-            // the first solution suffices and no makespan is reported.
-            let minimize = schedule.minimize_makespan;
-            let makespan_ub = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(i32::MAX));
-            if minimize {
-                structured_constraints::makespan_bound(&mut solver, &all_modes, &all_durations, std::sync::Arc::clone(&makespan_ub));
-            }
-            let bound_on_improve = std::sync::Arc::clone(&makespan_ub);
-            let op_index: Vec<Vec<(usize, usize, i32)>> =
-                op_modes.iter().map(|modes| modes.iter().map(|&(machine, id, duration)| (machine, id.index(), duration)).collect()).collect();
-            let mut best: Option<(i64, Vec<i64>, Vec<i64>)> = None;
-            let (stats, complete) = search::solve_structured_interruptible(
-                &mut solver,
-                |_, structured| {
-                    let mut starts = vec![0i64; op_count];
-                    let mut chosen = vec![-1i64; op_count];
-                    let mut makespan = 0i64;
-                    for (op, modes) in op_index.iter().enumerate() {
-                        for &(machine, idx, duration) in modes {
-                            if let Some(start) = structured.interval_starts[idx] {
-                                starts[op] = i64::from(start);
-                                chosen[op] = machine as i64;
-                                makespan = makespan.max(i64::from(start) + i64::from(duration));
-                            }
-                        }
-                    }
-                    if best.as_ref().is_none_or(|(value, _, _)| makespan < *value) {
-                        if minimize {
-                            if verbose {
-                                println!("  o {makespan}  (min)");
-                            }
-                            bound_on_improve.store(i32::try_from(makespan.saturating_sub(1)).unwrap_or(i32::MAX), std::sync::atomic::Ordering::Relaxed);
-                        }
-                        best = Some((makespan, starts, chosen));
-                    }
-                    // No objective: the first feasible schedule is enough.
-                    if minimize {
-                        SearchControl::Continue
-                    } else {
-                        SearchControl::Stop
-                    }
-                },
-                &stop,
-            );
-            match (best, complete) {
-                (Some((objective, starts, machines_out)), _) if minimize => {
-                    let status = if complete { "OPTIMAL" } else { "SATISFIABLE" };
-                    (status, Some(objective), starts, machines_out, stats)
-                }
-                (Some((_, starts, machines_out)), _) => ("SATISFIABLE", None, starts, machines_out, stats),
-                (None, true) => ("UNSATISFIABLE", None, Vec::new(), Vec::new(), stats),
-                (None, false) => ("UNKNOWN", None, Vec::new(), Vec::new(), stats),
-            }
         };
+
         if verbose {
             println!("qayd result (structured)");
-            println!("  status: {status}");
-            if let Some(objective) = objective {
+            println!("  status: {}", outcome.status.as_str());
+            if let Some(objective) = outcome.objective {
                 println!("  objective: {objective}");
             }
-            println!("  nodes: {}", stats.nodes);
+            println!("  solutions: {}", outcome.stats.solutions);
+            println!("  nodes: {}", outcome.stats.nodes);
+            println!("  failures: {}", outcome.stats.failures);
         }
 
         Ok(Some(PySolution {
-            status: status.to_string(),
-            objective,
+            status: outcome.status.as_str().to_string(),
+            objective: outcome.objective,
             objective_sense: schedule.minimize_makespan.then(|| "min".to_string()),
             objective_expr: schedule.minimize_makespan.then(|| "makespan".to_string()),
             values: Vec::new(),
-            stats: stats.into(),
+            stats: outcome.stats.into(),
             routes: None,
-            objectives: objective.map(|value| vec![value]).unwrap_or_default(),
-            starts,
-            machines: machines_out,
+            objectives: outcome.objective.map(|value| vec![value]).unwrap_or_default(),
+            starts: outcome.starts,
+            machines: outcome.machines,
         }))
     }
 
@@ -2240,7 +1873,7 @@ impl PyModel {
         if let Some(solution) = self.try_solve_routing_integer(&model, &selection, time_limit, seed, verbose)? {
             return Ok(solution);
         }
-        if let Some(solution) = self.try_solve_structured_collection(&model, &selection, time_limit, verbose)? {
+        if let Some(solution) = self.try_solve_structured_collection(&model, &selection, time_limit, seed, verbose)? {
             return Ok(solution);
         }
         let limit = time_limit.unwrap_or(5);

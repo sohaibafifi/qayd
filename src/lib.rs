@@ -23,6 +23,7 @@
 pub mod collection;
 pub mod constraints;
 pub mod domain;
+pub mod engines;
 pub mod expr;
 pub mod ids;
 pub mod lcg;
@@ -35,7 +36,6 @@ mod problem;
 pub mod propagator;
 #[cfg(feature = "python")]
 mod python;
-mod routing_lowering;
 pub mod search;
 pub mod store;
 pub mod structured;

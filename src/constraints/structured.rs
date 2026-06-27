@@ -469,7 +469,13 @@ fn decided_before(store: &Store, pair_index: &[Vec<usize>], i: usize, j: usize) 
 /// Enforce `before` ends no later than `after` starts on the start bounds (both
 /// present), citing the decided order `order_var = order_value` and the bounds it
 /// rests on. Returns whether a bound changed.
-fn enforce_before_because(store: &mut Store, before: IntervalId, after: IntervalId, order_var: VarId, order_value: i32) -> Result<bool, Inconsistency> {
+fn enforce_before_because(
+    store: &mut Store,
+    before: IntervalId,
+    after: IntervalId,
+    order_var: VarId,
+    order_value: i32,
+) -> Result<bool, Inconsistency> {
     let duration = store.interval_duration(before);
     let before_start = store.interval_start_var(before);
     let after_start = store.interval_start_var(after);
@@ -658,7 +664,13 @@ impl NoOverlap {
 
 /// Post a structured unary-resource no-overlap over the given intervals.
 pub fn no_overlap(solver: &mut Solver, intervals: &[IntervalId]) -> PropId {
-    solver.post(Box::new(NoOverlap { intervals: intervals.to_vec(), pairs: Vec::new(), pair_index: Vec::new(), present: Vec::new(), prec: Vec::new() }))
+    solver.post(Box::new(NoOverlap {
+        intervals: intervals.to_vec(),
+        pairs: Vec::new(),
+        pair_index: Vec::new(),
+        present: Vec::new(),
+        prec: Vec::new(),
+    }))
 }
 
 /// Makespan upper bound for branch-and-bound: every interval must end no later

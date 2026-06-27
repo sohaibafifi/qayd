@@ -400,7 +400,10 @@ impl BackendSelection {
                 })
             } else {
                 model.constraints.iter().all(|constraint| {
-                    matches!(constraint, Constraint::IntervalPrecedence { .. } | Constraint::IntervalResource(collection::Resource::MachineNoOverlap))
+                    matches!(
+                        constraint,
+                        Constraint::IntervalPrecedence { .. } | Constraint::IntervalResource(collection::Resource::MachineNoOverlap)
+                    )
                 })
             };
             let structured_schedule =
@@ -409,7 +412,11 @@ impl BackendSelection {
                 return Self {
                     class: ModelClass::Schedule,
                     backend: Backend::StructuredExact,
-                    reason: if all_fixed { "fixed intervals: precedence, no-overlap, cumulative" } else { "machine choice: precedence + per-machine no-overlap via alternative" },
+                    reason: if all_fixed {
+                        "fixed intervals: precedence, no-overlap, cumulative"
+                    } else {
+                        "machine choice: precedence + per-machine no-overlap via alternative"
+                    },
                     routing: None,
                 };
             }
