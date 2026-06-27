@@ -424,6 +424,19 @@ pub struct NoOverlap {
     /// `(a, b, order index)` for each unordered pair; the order index addresses
     /// the trailed order decision in the store.
     pairs: Vec<(usize, usize, usize)>,
+    /// `pair_index[a][b]` (a < b) is the order index of that pair, for O(1) lookup
+    /// of a decided order; `usize::MAX` off the upper triangle.
+    pair_index: Vec<Vec<usize>>,
+    /// Reused scratch for detectable precedences (no per-call allocation).
+    present: Vec<usize>,
+    prec: Vec<usize>,
+}
+
+/// Whether group interval `i` is decided to run before group interval `j`.
+fn decided_before(store: &Store, pair_index: &[Vec<usize>], i: usize, j: usize) -> bool {
+    let (lo, hi, want) = if i < j { (i, j, 1) } else { (j, i, 2) };
+    let order = pair_index[lo][hi];
+    order != usize::MAX && store.disjunctive_order(order) == want
 }
 
 /// Enforce `i` before `j` on the start bounds (both must be present). Returns
@@ -443,10 +456,13 @@ impl Propagator for NoOverlap {
             store.subscribe_interval(interval, me, IntervalEvent::PresenceChange);
         }
         self.pairs.clear();
-        for a in 0..self.intervals.len() {
-            for b in (a + 1)..self.intervals.len() {
+        let n = self.intervals.len();
+        self.pair_index = vec![vec![usize::MAX; n]; n];
+        for a in 0..n {
+            for b in (a + 1)..n {
                 let order = store.register_disjunctive_pair(self.intervals[a], self.intervals[b], me);
                 self.pairs.push((a, b, order));
+                self.pair_index[a][b] = order;
             }
         }
     }
@@ -499,6 +515,13 @@ impl Propagator for NoOverlap {
                     }
                 }
             }
+
+            // Global detectable precedences: for each present interval, the set
+            // that must run before it (decided, or because they cannot fit after
+            // it) must all complete first, so its start is at least that set's
+            // earliest completion time -- stronger than any single predecessor.
+            changed |= self.detectable_precedences(store)?;
+
             if !changed {
                 return Ok(());
             }
@@ -506,9 +529,50 @@ impl Propagator for NoOverlap {
     }
 }
 
+impl NoOverlap {
+    fn detectable_precedences(&mut self, store: &mut Store) -> Result<bool, Inconsistency> {
+        self.present.clear();
+        for k in 0..self.intervals.len() {
+            if store.interval_presence(self.intervals[k]) == IntervalPresence::Present && store.interval_duration(self.intervals[k]) > 0 {
+                self.present.push(k);
+            }
+        }
+        let mut changed = false;
+        for index in 0..self.present.len() {
+            let qj = self.present[index];
+            let j = self.intervals[qj];
+            // Predecessors that must run before j: decided so, or unable to fit
+            // after j (their latest start is before j's earliest end).
+            self.prec.clear();
+            for &pi in &self.present {
+                if pi == qj {
+                    continue;
+                }
+                let i = self.intervals[pi];
+                if decided_before(store, &self.pair_index, pi, qj) || store.interval_end_min(j) > store.interval_start_max(i) {
+                    self.prec.push(pi);
+                }
+            }
+            if self.prec.is_empty() {
+                continue;
+            }
+            // Earliest completion of the whole predecessor set on the unary
+            // resource: schedule them in est order, each after the previous ends.
+            self.prec.sort_by_key(|&pi| store.interval_start_min(self.intervals[pi]));
+            let mut ect = i32::MIN;
+            for &pi in &self.prec {
+                let i = self.intervals[pi];
+                ect = ect.max(store.interval_start_min(i)).saturating_add(store.interval_duration(i));
+            }
+            changed |= store.set_interval_start_min(j, ect)?;
+        }
+        Ok(changed)
+    }
+}
+
 /// Post a structured unary-resource no-overlap over the given intervals.
 pub fn no_overlap(solver: &mut Solver, intervals: &[IntervalId]) -> PropId {
-    solver.post(Box::new(NoOverlap { intervals: intervals.to_vec(), pairs: Vec::new() }))
+    solver.post(Box::new(NoOverlap { intervals: intervals.to_vec(), pairs: Vec::new(), pair_index: Vec::new(), present: Vec::new(), prec: Vec::new() }))
 }
 
 /// Makespan upper bound for branch-and-bound: every interval must end no later
