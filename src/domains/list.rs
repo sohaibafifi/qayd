@@ -38,10 +38,10 @@ impl ListDomain {
     /// Create a list where every item starts possible and no item is required.
     pub fn new(universe: Vec<i32>, trail: &mut Trail) -> Self {
         let n = universe.len();
-        assert!(i32::try_from(n).is_ok(), "structured list universe is too large");
+        assert!(i32::try_from(n).is_ok(), "list universe is too large");
         let mut sorted = universe.clone();
         sorted.sort_unstable();
-        assert!(sorted.windows(2).all(|w| w[0] != w[1]), "structured list universe contains duplicate items");
+        assert!(sorted.windows(2).all(|w| w[0] != w[1]), "list universe contains duplicate items");
         let possible = (0..n).map(|_| trail.new_int(TRUE)).collect();
         let required = (0..n).map(|_| trail.new_int(FALSE)).collect();
         let len_min = trail.new_int(0);

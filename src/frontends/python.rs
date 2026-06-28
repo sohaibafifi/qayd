@@ -8,7 +8,7 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyIterator, PyModule};
 
-use crate::collection;
+use crate::model::list;
 use crate::constraints::count;
 use crate::constraints::graph;
 use crate::constraints::intension;
@@ -16,13 +16,12 @@ use crate::constraints::lex;
 use crate::constraints::linear::{self, Relation};
 use crate::constraints::primitives;
 use crate::constraints::scheduling;
-use crate::constraints::structured as structured_constraints;
 use crate::constraints::table;
-use crate::engines::{routing as routing_engine, schedule as schedule_engine};
+use crate::engines::{list_exact as list_exact_engine, routing as routing_engine, schedule as schedule_engine};
 use crate::expr::{self, Expr};
-use crate::ids::{ListId, VarId};
-use crate::list_ls;
-use crate::ls::{solve_fast_cop, LocalRhs, LocalSearchSpec, LsConfig};
+use crate::ids::VarId;
+use crate::engines::ls::lists;
+use crate::engines::ls::cop::{solve_ls, LocalRhs, LocalSearchSpec, LsConfig};
 use crate::model as shared_model;
 use crate::problem::{Objective as ProblemObjective, Problem};
 use crate::search::{self, Objective as SearchObjective, SearchControl, SolveStats};
@@ -163,7 +162,7 @@ struct PyModel {
     solver: Solver,
     names: Vec<Option<String>>,
     objective: Option<ObjectiveSpec>,
-    /// Local-search model built in parallel with the CP posts, so `--turbo`-style
+    /// Local-search model built in parallel with the CP posts, so `--ls`-style
     /// LS (`solve(local_search=True)`) can run on the same model.
     local: LocalSearchSpec,
     /// Set once `list_vars` is called: the universe of items partitioned among
@@ -174,10 +173,10 @@ struct PyModel {
     /// Bumped on each `list_vars` call so route handles from an earlier call (or
     /// another model) are rejected instead of silently aliasing the wrong list.
     col_gen: u64,
-    col_objectives: Vec<collection::ObjectiveTier>,
-    col_constraints: Vec<collection::Constraint>,
-    col_globals: Vec<collection::GlobalConstraint>,
-    col_schedule: Option<collection::Schedule>,
+    col_objectives: Vec<list::ObjectiveTier>,
+    col_constraints: Vec<list::Constraint>,
+    col_globals: Vec<list::GlobalConstraint>,
+    col_schedule: Option<list::Schedule>,
     col_sched_gen: u64,
 }
 
@@ -422,128 +421,6 @@ fn parse_relation(relation: &str) -> PyResult<Relation> {
 
 fn checked_i32(value: i64, name: &str) -> PyResult<i32> {
     i32::try_from(value).map_err(|_| PyValueError::new_err(format!("{name} is outside the i32 domain range")))
-}
-
-enum StructuredListConstraint {
-    Length { list: usize, min: usize, max: usize },
-    ItemSum { list: usize, weights: Vec<(i32, i64)>, min: i64, max: i64 },
-    Impossible,
-}
-
-fn structured_list_constraint(constraint: &collection::Constraint, items: &[i32]) -> Option<StructuredListConstraint> {
-    let collection::Iterable::Items(list) = &constraint.reduction.iterable else {
-        return None;
-    };
-    let list = *list;
-
-    if matches!(constraint.reduction.op, collection::ReduceOp::Used) {
-        return used_constraint_as_length(list, constraint.op, constraint.rhs, items.len());
-    }
-
-    if matches!(constraint.reduction.op, collection::ReduceOp::Count) {
-        let body = constraint.reduction.arena.exprs.get(constraint.reduction.body.0 as usize)?;
-        let collection::Expr::Const(value) = body else {
-            return None;
-        };
-        if *value == 0 {
-            return None;
-        }
-
-        let n = items.len() as i64;
-        let rhs = constraint.rhs;
-        let (min, max) = match constraint.op {
-            collection::Op::Le => (0, rhs),
-            collection::Op::Ge => (rhs, n),
-            collection::Op::Eq => (rhs, rhs),
-        };
-        if max < 0 || min > n {
-            return Some(StructuredListConstraint::Impossible);
-        }
-
-        let min = min.max(0) as usize;
-        let max = max.min(n) as usize;
-        return if min > max {
-            Some(StructuredListConstraint::Impossible)
-        } else {
-            Some(StructuredListConstraint::Length { list, min, max })
-        };
-    }
-
-    if matches!(constraint.reduction.op, collection::ReduceOp::Sum) {
-        let mut weights = Vec::with_capacity(items.len());
-        for &item in items {
-            weights.push((item, eval_collection_expr_one(&constraint.reduction.arena.exprs, constraint.reduction.body, i64::from(item))?));
-        }
-        let (min, max) = match constraint.op {
-            collection::Op::Le => (i64::MIN / 4, constraint.rhs),
-            collection::Op::Ge => (constraint.rhs, i64::MAX / 4),
-            collection::Op::Eq => (constraint.rhs, constraint.rhs),
-        };
-        return Some(StructuredListConstraint::ItemSum { list, weights, min, max });
-    }
-
-    None
-}
-
-fn used_constraint_as_length(list: usize, op: collection::Op, rhs: i64, item_count: usize) -> Option<StructuredListConstraint> {
-    let (min, max) = match op {
-        collection::Op::Le if rhs < 0 => return Some(StructuredListConstraint::Impossible),
-        collection::Op::Le if rhs == 0 => (0, 0),
-        collection::Op::Le => (0, item_count),
-        collection::Op::Ge if rhs <= 0 => (0, item_count),
-        collection::Op::Ge if rhs == 1 => (1, item_count),
-        collection::Op::Ge => return Some(StructuredListConstraint::Impossible),
-        collection::Op::Eq if rhs == 0 => (0, 0),
-        collection::Op::Eq if rhs == 1 => (1, item_count),
-        collection::Op::Eq => return Some(StructuredListConstraint::Impossible),
-    };
-    Some(StructuredListConstraint::Length { list, min, max })
-}
-
-fn eval_collection_expr_one(arena: &[collection::Expr], id: collection::ExprId, arg0: i64) -> Option<i64> {
-    let node = arena.get(id.0 as usize)?;
-    Some(match node {
-        collection::Expr::Const(value) => *value,
-        collection::Expr::Arg(0) => arg0,
-        collection::Expr::Arg(_) => return None,
-        collection::Expr::Array(values, index) => {
-            let index = eval_collection_expr_one(arena, *index, arg0)?;
-            *values.get(usize::try_from(index).ok()?)?
-        }
-        collection::Expr::Matrix(_, _, _) => return None,
-        collection::Expr::Add(a, b) => {
-            eval_collection_expr_one(arena, *a, arg0)?.checked_add(eval_collection_expr_one(arena, *b, arg0)?)?
-        }
-        collection::Expr::Sub(a, b) => {
-            eval_collection_expr_one(arena, *a, arg0)?.checked_sub(eval_collection_expr_one(arena, *b, arg0)?)?
-        }
-        collection::Expr::Mul(a, b) => {
-            eval_collection_expr_one(arena, *a, arg0)?.checked_mul(eval_collection_expr_one(arena, *b, arg0)?)?
-        }
-        collection::Expr::Min(a, b) => eval_collection_expr_one(arena, *a, arg0)?.min(eval_collection_expr_one(arena, *b, arg0)?),
-        collection::Expr::Max(a, b) => eval_collection_expr_one(arena, *a, arg0)?.max(eval_collection_expr_one(arena, *b, arg0)?),
-        collection::Expr::Div(a, b) => {
-            let numerator = eval_collection_expr_one(arena, *a, arg0)?;
-            let denominator = eval_collection_expr_one(arena, *b, arg0)?;
-            if denominator == 0 {
-                0
-            } else {
-                numerator.checked_div(denominator)?
-            }
-        }
-        collection::Expr::Abs(a) => eval_collection_expr_one(arena, *a, arg0)?.saturating_abs(),
-        collection::Expr::Lt(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? < eval_collection_expr_one(arena, *b, arg0)?),
-        collection::Expr::Le(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? <= eval_collection_expr_one(arena, *b, arg0)?),
-        collection::Expr::Eq(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? == eval_collection_expr_one(arena, *b, arg0)?),
-        collection::Expr::Ne(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? != eval_collection_expr_one(arena, *b, arg0)?),
-        collection::Expr::IfThenElse(c, a, b) => {
-            if eval_collection_expr_one(arena, *c, arg0)? != 0 {
-                eval_collection_expr_one(arena, *a, arg0)?
-            } else {
-                eval_collection_expr_one(arena, *b, arg0)?
-            }
-        }
-    })
 }
 
 #[pymethods]
@@ -912,7 +789,7 @@ impl PyModel {
         // A term comparison is a constraint on the list it references.
         if let Ok(lc) = constraint.extract::<PyRef<'_, PyListConstraint>>() {
             self.check_term_scope(lc.model_id, lc.gen)?;
-            self.col_constraints.push(collection::Constraint { reduction: lc.reduction.clone(), op: lc.op, rhs: lc.rhs });
+            self.col_constraints.push(list::Constraint { reduction: lc.reduction.clone(), op: lc.op, rhs: lc.rhs });
             return Ok(());
         }
         if let Ok(constraint) = constraint_from_py(constraint) {
@@ -1264,7 +1141,7 @@ impl PyModel {
             self.check_term_scope(term.model_id, term.gen)?;
             let minimize = parse_objective_sense(sense)?;
             self.col_objectives.clear();
-            self.col_objectives.push(collection::ObjectiveTier { minimize, terms: term.reductions.clone() });
+            self.col_objectives.push(list::ObjectiveTier { minimize, terms: term.reductions.clone() });
             return Ok(());
         }
         let expr = expr_from_py(objective)?;
@@ -1291,11 +1168,11 @@ impl PyModel {
             .extract::<PyRef<'_, PyTerm>>()
             .map_err(|_| PyTypeError::new_err("add_objective expects a list term; use objective(...) for an integer expression"))?;
         self.check_term_scope(term.model_id, term.gen)?;
-        if self.col_objectives.len() >= collection::MAX_TIERS {
-            return Err(PyValueError::new_err(format!("at most {} objective tiers are supported", collection::MAX_TIERS)));
+        if self.col_objectives.len() >= list::MAX_TIERS {
+            return Err(PyValueError::new_err(format!("at most {} objective tiers are supported", list::MAX_TIERS)));
         }
         let minimize = parse_objective_sense(sense)?;
-        self.col_objectives.push(collection::ObjectiveTier { minimize, terms: term.reductions.clone() });
+        self.col_objectives.push(list::ObjectiveTier { minimize, terms: term.reductions.clone() });
         Ok(())
     }
 
@@ -1303,12 +1180,12 @@ impl PyModel {
     /// index is no greater than item `after`'s. Used for assembly-line task
     /// precedence (a task is in a station no later than each successor).
     fn precedence(&mut self, before: i32, after: i32) {
-        self.col_globals.push(collection::GlobalConstraint::ListLe { before, after });
+        self.col_globals.push(list::GlobalConstraint::ListLe { before, after });
     }
 
     /// Require two items to share a list (same vehicle, same bin).
     fn same_list(&mut self, a: i32, b: i32) {
-        self.col_globals.push(collection::GlobalConstraint::SameList { a, b });
+        self.col_globals.push(list::GlobalConstraint::SameList { a, b });
     }
 
     /// Declare interval (scheduling) decision variables: one per duration, each
@@ -1316,9 +1193,9 @@ impl PyModel {
     /// Starts a fresh schedule; mutually exclusive with `list_vars`.
     fn interval_vars(&mut self, durations: Vec<i64>, horizon: i64) -> PyResult<Vec<PyIntervalVar>> {
         self.enter_schedule_mode()?;
-        let intervals = durations.iter().map(|&d| collection::IntervalVar { duration: d, horizon, modes: Vec::new() }).collect();
+        let intervals = durations.iter().map(|&d| list::IntervalVar { duration: d, horizon, modes: Vec::new() }).collect();
         self.col_schedule =
-            Some(collection::Schedule { intervals, precedences: Vec::new(), resources: Vec::new(), minimize_makespan: true });
+            Some(list::Schedule { intervals, precedences: Vec::new(), resources: Vec::new(), minimize_makespan: true });
         let gen = self.col_sched_gen;
         Ok((0..durations.len()).map(|i| PyIntervalVar { model_id: self.id, gen, index: i as u32 }).collect())
     }
@@ -1334,14 +1211,14 @@ impl PyModel {
         self.enter_schedule_mode()?;
         let intervals = modes
             .iter()
-            .map(|opts| collection::IntervalVar {
+            .map(|opts| list::IntervalVar {
                 duration: 0,
                 horizon,
-                modes: opts.iter().map(|&(machine, duration)| collection::Mode { machine, duration }).collect(),
+                modes: opts.iter().map(|&(machine, duration)| list::Mode { machine, duration }).collect(),
             })
             .collect();
         self.col_schedule =
-            Some(collection::Schedule { intervals, precedences: Vec::new(), resources: Vec::new(), minimize_makespan: true });
+            Some(list::Schedule { intervals, precedences: Vec::new(), resources: Vec::new(), minimize_makespan: true });
         let gen = self.col_sched_gen;
         Ok((0..modes.len()).map(|i| PyIntervalVar { model_id: self.id, gen, index: i as u32 }).collect())
     }
@@ -1350,7 +1227,7 @@ impl PyModel {
     /// chosen machine never overlap (flexible job shop).
     fn machine_no_overlap(&mut self) -> PyResult<()> {
         let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("call interval_modes before machine_no_overlap"))?;
-        sched.resources.push(collection::Resource::MachineNoOverlap);
+        sched.resources.push(list::Resource::MachineNoOverlap);
         Ok(())
     }
 
@@ -1370,7 +1247,7 @@ impl PyModel {
         }
         let idx = intervals.iter().map(|iv| iv.index as usize).collect();
         let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("call interval_vars before disjunctive"))?;
-        sched.resources.push(collection::Resource::NoOverlap(idx));
+        sched.resources.push(list::Resource::NoOverlap(idx));
         Ok(())
     }
 
@@ -1382,7 +1259,7 @@ impl PyModel {
         }
         let demands = demands.iter().map(|(iv, amount)| (iv.index as usize, *amount)).collect();
         let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("call interval_vars before resource"))?;
-        sched.resources.push(collection::Resource::Cumulative { demands, capacity });
+        sched.resources.push(list::Resource::Cumulative { demands, capacity });
         Ok(())
     }
 
@@ -1517,10 +1394,10 @@ impl PyModel {
         self.check_term_scope(term.model_id, term.gen)?;
         if replace {
             self.col_objectives.clear();
-        } else if self.col_objectives.len() >= collection::MAX_TIERS {
-            return Err(PyValueError::new_err(format!("at most {} objective tiers are supported", collection::MAX_TIERS)));
+        } else if self.col_objectives.len() >= list::MAX_TIERS {
+            return Err(PyValueError::new_err(format!("at most {} objective tiers are supported", list::MAX_TIERS)));
         }
-        self.col_objectives.push(collection::ObjectiveTier { minimize, terms: term.reductions.clone() });
+        self.col_objectives.push(list::ObjectiveTier { minimize, terms: term.reductions.clone() });
         Ok(())
     }
 
@@ -1550,26 +1427,26 @@ impl PyModel {
         Ok(())
     }
 
-    fn try_solve_structured_collection(
+    fn try_solve_domain_collection(
         &self,
-        model: &collection::CollectionModel,
+        model: &list::CollectionModel,
         selection: &shared_model::BackendSelection,
         time_limit: Option<u64>,
         seed: u64,
         verbose: bool,
     ) -> PyResult<Option<PySolution>> {
-        if selection.backend != shared_model::Backend::StructuredExact {
+        if selection.backend != shared_model::Backend::DomainExact {
             return Ok(None);
         }
         if let Some(schedule) = &model.schedule {
-            return self.try_solve_structured_schedule(schedule, model, selection, time_limit, seed, verbose);
+            return self.try_solve_domain_schedule(schedule, model, selection, time_limit, seed, verbose);
         }
-        self.try_solve_structured_lists(model, selection, time_limit, verbose)
+        self.try_solve_domain_lists(model, selection, time_limit, verbose)
     }
 
     fn try_solve_routing_integer(
         &self,
-        model: &collection::CollectionModel,
+        model: &list::CollectionModel,
         selection: &shared_model::BackendSelection,
         time_limit: Option<u64>,
         seed: u64,
@@ -1642,33 +1519,26 @@ impl PyModel {
         }))
     }
 
-    fn try_solve_structured_lists(
+    fn try_solve_domain_lists(
         &self,
-        model: &collection::CollectionModel,
+        model: &list::CollectionModel,
         selection: &shared_model::BackendSelection,
         time_limit: Option<u64>,
         verbose: bool,
     ) -> PyResult<Option<PySolution>> {
-        if selection.backend != shared_model::Backend::StructuredExact {
+        if selection.backend != shared_model::Backend::DomainExact {
             return Ok(None);
         }
-        let Some(objective_tiers) = shared_model::structured_list_objective_tiers(&model.objectives, &model.items) else {
+        let Some(objective_tiers) = shared_model::list_objective_tiers(&model.objectives, &model.items) else {
             return Ok(None);
         };
         let has_objective = !objective_tiers.is_empty();
-
-        let mut list_constraints = Vec::with_capacity(model.constraints.len());
-        for constraint in &model.constraints {
-            let Some(parsed) = structured_list_constraint(constraint, &model.items) else {
-                return Ok(None);
-            };
-            list_constraints.push(parsed);
-        }
+        let minimize = objective_tiers.first().is_none_or(|tier| tier.minimize);
 
         let limit = time_limit.unwrap_or(5);
         let constraint_count = 1 + model.constraints.len() + model.globals.len();
         if verbose {
-            println!("qayd solve (structured)");
+            println!("qayd solve (domain exact)");
             println!("  class: {}", selection.class.name());
             println!("  backend: {}", selection.backend.name());
             println!("  reason: {}", selection.reason);
@@ -1680,120 +1550,49 @@ impl PyModel {
             println!("  time limit: {limit}s");
         }
 
-        if list_constraints.iter().any(|constraint| matches!(constraint, StructuredListConstraint::Impossible)) {
-            if verbose {
-                println!("qayd result (structured)");
-                println!("  status: UNSATISFIABLE");
-                println!("  solutions: 0");
-                println!("  nodes: 0");
-                println!("  failures: 0");
-            }
-            return Ok(Some(PySolution {
-                status: "UNSATISFIABLE".to_string(),
-                objective: None,
-                objective_sense: None,
-                objective_expr: None,
-                values: Vec::new(),
-                stats: SolveStats::default().into(),
-                routes: None,
-                objectives: Vec::new(),
-                starts: Vec::new(),
-                machines: Vec::new(),
-            }));
-        }
-
-        let mut solver = Solver::new();
-        let lists: Vec<ListId> = (0..model.lists).map(|_| solver.store.new_list(model.items.clone())).collect();
-        structured_constraints::partition(&mut solver, &lists, &model.items);
-        for constraint in list_constraints {
-            match constraint {
-                StructuredListConstraint::Length { list, min, max } => {
-                    structured_constraints::list_len(&mut solver, lists[list], min, max);
-                }
-                StructuredListConstraint::ItemSum { list, weights, min, max } => {
-                    structured_constraints::list_item_sum(&mut solver, lists[list], weights, min, max);
-                }
-                StructuredListConstraint::Impossible => {}
-            }
-        }
-        for global in &model.globals {
-            match *global {
-                collection::GlobalConstraint::ListLe { before, after } => {
-                    structured_constraints::item_precedence(&mut solver, &lists, before, after);
-                }
-                collection::GlobalConstraint::SameList { a, b } => {
-                    structured_constraints::same_list(&mut solver, &lists, a, b);
-                }
-            }
-        }
-
         let stop = stop_after(limit);
-        let mut solution = None;
-        let mut best_objectives = Vec::new();
-        let (stats, complete) = search::solve_structured_interruptible(
-            &mut solver,
-            |_, structured| {
-                if !has_objective {
-                    solution = Some(structured.clone());
-                    return SearchControl::Stop;
-                }
-
-                let candidate_objectives = shared_model::evaluate_structured_list_objectives(&objective_tiers, &structured.lists);
-                if solution.is_none()
-                    || shared_model::structured_list_objectives_better(&candidate_objectives, &best_objectives, &objective_tiers)
-                {
-                    if verbose {
-                        let sense = if objective_tiers[0].minimize { "min" } else { "max" };
-                        println!("  o {}  ({sense})", candidate_objectives[0]);
-                    }
-                    solution = Some(structured.clone());
-                    best_objectives = candidate_objectives;
-                }
-                SearchControl::Continue
-            },
-            &stop,
-        );
-        let status = if solution.is_some() {
-            if has_objective && complete {
-                "OPTIMAL"
-            } else {
-                "SATISFIABLE"
+        let outcome = match list_exact_engine::solve(model, &objective_tiers, &stop, |candidate| {
+            if verbose {
+                println!("  o {}  ({})", candidate[0], if minimize { "min" } else { "max" });
             }
-        } else if complete {
-            "UNSATISFIABLE"
-        } else {
-            "UNKNOWN"
+        })
+        .map_err(PyValueError::new_err)?
+        {
+            Some(outcome) => outcome,
+            None => return Ok(None),
         };
+
+        let status = outcome.status.as_str();
         if verbose {
-            println!("qayd result (structured)");
+            println!("qayd result (domain exact)");
             println!("  status: {status}");
-            if has_objective && !best_objectives.is_empty() {
-                println!("  objectives: {best_objectives:?}");
+            if has_objective && !outcome.objectives.is_empty() {
+                println!("  objectives: {:?}", outcome.objectives);
             }
-            println!("  solutions: {}", stats.solutions);
-            println!("  nodes: {}", stats.nodes);
-            println!("  failures: {}", stats.failures);
+            println!("  solutions: {}", outcome.stats.solutions);
+            println!("  nodes: {}", outcome.stats.nodes);
+            println!("  failures: {}", outcome.stats.failures);
         }
 
-        let objective = best_objectives.first().copied();
+        let objective = outcome.objectives.first().copied();
         Ok(Some(PySolution {
             status: status.to_string(),
             objective,
-            objective_sense: has_objective.then(|| if objective_tiers[0].minimize { "min" } else { "max" }.to_string()),
-            objective_expr: has_objective.then(|| "structured list objective".to_string()),
+            objective_sense: has_objective.then(|| if minimize { "min" } else { "max" }.to_string()),
+            objective_expr: has_objective.then(|| "list objective".to_string()),
             values: Vec::new(),
-            stats: stats.into(),
-            routes: solution.map(|structured| structured.lists),
-            objectives: best_objectives,
+            stats: outcome.stats.into(),
+            routes: outcome.solution,
+            objectives: outcome.objectives,
             starts: Vec::new(),
             machines: Vec::new(),
         }))
     }
 
-    fn try_solve_structured_schedule(
+    fn try_solve_domain_schedule(
         &self,
-        schedule: &collection::Schedule,
-        model: &collection::CollectionModel,
+        schedule: &list::Schedule,
+        model: &list::CollectionModel,
         selection: &shared_model::BackendSelection,
         time_limit: Option<u64>,
         seed: u64,
@@ -1806,7 +1605,7 @@ impl PyModel {
         let limit = time_limit.unwrap_or(5);
         let moded = schedule.intervals.iter().any(|iv| !iv.modes.is_empty());
         if verbose {
-            println!("qayd solve (structured)");
+            println!("qayd solve (domain exact)");
             println!("  class: {}", selection.class.name());
             println!("  backend: {}", selection.backend.name());
             println!("  reason: {}", selection.reason);
@@ -1834,7 +1633,7 @@ impl PyModel {
         };
 
         if verbose {
-            println!("qayd result (structured)");
+            println!("qayd result (domain exact)");
             println!("  status: {}", outcome.status.as_str());
             if let Some(objective) = outcome.objective {
                 println!("  objective: {objective}");
@@ -1859,7 +1658,7 @@ impl PyModel {
     }
 
     fn solve_collection(&self, time_limit: Option<u64>, seed: u64, verbose: bool) -> PyResult<PySolution> {
-        let model = collection::CollectionModel {
+        let model = list::CollectionModel {
             items: self.col_universe.clone().unwrap_or_default(),
             lists: self.col_lists,
             objectives: self.col_objectives.clone(),
@@ -1873,7 +1672,7 @@ impl PyModel {
         if let Some(solution) = self.try_solve_routing_integer(&model, &selection, time_limit, seed, verbose)? {
             return Ok(solution);
         }
-        if let Some(solution) = self.try_solve_structured_collection(&model, &selection, time_limit, seed, verbose)? {
+        if let Some(solution) = self.try_solve_domain_collection(&model, &selection, time_limit, seed, verbose)? {
             return Ok(solution);
         }
         let limit = time_limit.unwrap_or(5);
@@ -1899,7 +1698,7 @@ impl PyModel {
                 println!("  o {objective}  ({primary_sense}, {:.2}s)", start.elapsed().as_secs_f64());
             }
         };
-        let sol = list_ls::solve_collection(&model, seed, &stop, &mut report);
+        let sol = lists::solve_collection(&model, seed, &stop, &mut report);
         if verbose {
             println!("qayd result (collection)");
             println!("  status: {}", if sol.feasible { "SATISFIABLE" } else { "UNKNOWN" });
@@ -1926,8 +1725,8 @@ impl PyModel {
         })
     }
 
-    /// Solve a COP with the local-search engine (`solve_fast_cop`) - the same
-    /// incumbent-only LS that powers `--turbo`. Requires an objective and a time
+    /// Solve a COP with the local-search engine (`solve_ls`) - the same
+    /// incumbent-only LS that powers `--ls`. Requires an objective and a time
     /// limit (defaults to 10s, since LS never terminates on its own).
     fn solve_local_search(
         &self,
@@ -1965,7 +1764,7 @@ impl PyModel {
             });
         }
         let config = LsConfig { gls: true, min_conflicts: true, kick_bandit: false };
-        let outcome = solve_fast_cop(problem, self.local.clone(), &stop, seed, config, |value, _solution, _source| {
+        let outcome = solve_ls(problem, self.local.clone(), &stop, seed, config, |value, _solution, _source| {
             if verbose {
                 println!("  incumbent: {value}");
             }
@@ -2178,7 +1977,7 @@ fn domain(values: Vec<i64>) -> PyResult<Vec<i32>> {
 /// A node of a lambda body, built by the Python lambda at model-construction
 /// time. Held as an `Arc` tree so subexpressions and constant tables are shared
 /// rather than copied. Never executed as Python during solving; it is lowered
-/// to a [`collection::ExprArena`] when the term joins the model.
+/// to a [`list::ExprArena`] when the term joins the model.
 enum PyNode {
     Const(i64),
     Arg(u8),
@@ -2320,7 +2119,7 @@ impl PyMatrixRow {
 struct PyTerm {
     model_id: u64,
     gen: u64,
-    reductions: Vec<collection::Reduction>,
+    reductions: Vec<list::Reduction>,
 }
 
 /// A constraint `term <op> rhs` over a single list reduction.
@@ -2329,8 +2128,8 @@ struct PyTerm {
 struct PyListConstraint {
     model_id: u64,
     gen: u64,
-    reduction: collection::Reduction,
-    op: collection::Op,
+    reduction: list::Reduction,
+    op: list::Op,
     rhs: i64,
 }
 
@@ -2361,9 +2160,9 @@ impl PyTerm {
     fn __richcmp__(&self, other: &Bound<'_, PyAny>, op: CompareOp) -> PyResult<PyListConstraint> {
         let rhs = other.extract::<i64>().map_err(|_| PyTypeError::new_err("a term can only be compared to an integer bound"))?;
         let op = match op {
-            CompareOp::Le => collection::Op::Le,
-            CompareOp::Ge => collection::Op::Ge,
-            CompareOp::Eq => collection::Op::Eq,
+            CompareOp::Le => list::Op::Le,
+            CompareOp::Ge => list::Op::Ge,
+            CompareOp::Eq => list::Op::Eq,
             _ => return Err(PyValueError::new_err("a term supports only <=, >=, ==")),
         };
         if self.reductions.len() != 1 {
@@ -2374,7 +2173,7 @@ impl PyTerm {
 }
 
 /// Lower a Python lambda-body tree into a reduction's flat expression arena.
-fn lower(n: &PyNode, arena: &mut collection::ExprArena) -> collection::ExprId {
+fn lower(n: &PyNode, arena: &mut list::ExprArena) -> list::ExprId {
     match n {
         PyNode::Const(c) => arena.constant(*c),
         PyNode::Arg(k) => arena.arg(*k),
@@ -2450,16 +2249,16 @@ fn lower(n: &PyNode, arena: &mut collection::ExprArena) -> collection::ExprId {
     }
 }
 
-fn single_term(route: &PyListVar, reduction: collection::Reduction) -> PyTerm {
+fn single_term(route: &PyListVar, reduction: list::Reduction) -> PyTerm {
     PyTerm { model_id: route.model_id, gen: route.gen, reductions: vec![reduction] }
 }
 
 /// Build a per-item reduction `op(route, i => body)` from a Python lambda.
-fn build_items_reduction(route: &PyListVar, op: collection::ReduceOp, func: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
+fn build_items_reduction(route: &PyListVar, op: list::ReduceOp, func: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
     let body = coerce_node(&func.call1((node(PyNode::Arg(0)),))?)?;
-    let mut arena = collection::ExprArena::default();
+    let mut arena = list::ExprArena::default();
     let body_id = lower(&body, &mut arena);
-    Ok(single_term(route, collection::Reduction { op, iterable: collection::Iterable::Items(route.index as usize), arena, body: body_id }))
+    Ok(single_term(route, list::Reduction { op, iterable: list::Iterable::Items(route.index as usize), arena, body: body_id }))
 }
 
 /// `sum(route, i => body)`, or `sum(terms)` to add a collection of terms.
@@ -2470,7 +2269,7 @@ fn sum(arg: &Bound<'_, PyAny>, func: Option<&Bound<'_, PyAny>>) -> PyResult<PyTe
         let route = arg
             .extract::<PyRef<'_, PyListVar>>()
             .map_err(|_| PyTypeError::new_err("sum(route, lambda): the first argument must be a list variable"))?;
-        return build_items_reduction(&route, collection::ReduceOp::Sum, f);
+        return build_items_reduction(&route, list::ReduceOp::Sum, f);
     }
     let mut acc: Option<PyTerm> = None;
     for item in arg.try_iter()? {
@@ -2487,13 +2286,13 @@ fn sum(arg: &Bound<'_, PyAny>, func: Option<&Bound<'_, PyAny>>) -> PyResult<PyTe
 /// for an empty route).
 #[pyfunction]
 fn minimum(route: &PyListVar, func: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
-    build_items_reduction(route, collection::ReduceOp::Min, func)
+    build_items_reduction(route, list::ReduceOp::Min, func)
 }
 
 /// `max(route, i => body)` over a route's items.
 #[pyfunction]
 fn maximum(route: &PyListVar, func: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
-    build_items_reduction(route, collection::ReduceOp::Max, func)
+    build_items_reduction(route, list::ReduceOp::Max, func)
 }
 
 /// `count(route, i => predicate)`: items whose body is non-zero. With no lambda,
@@ -2502,15 +2301,15 @@ fn maximum(route: &PyListVar, func: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
 #[pyo3(signature = (route, func=None))]
 fn count_reduction(route: &PyListVar, func: Option<&Bound<'_, PyAny>>) -> PyResult<PyTerm> {
     match func {
-        Some(f) => build_items_reduction(route, collection::ReduceOp::Count, f),
+        Some(f) => build_items_reduction(route, list::ReduceOp::Count, f),
         None => {
-            let mut arena = collection::ExprArena::default();
+            let mut arena = list::ExprArena::default();
             let body = arena.constant(1);
             Ok(single_term(
                 route,
-                collection::Reduction {
-                    op: collection::ReduceOp::Count,
-                    iterable: collection::Iterable::Items(route.index as usize),
+                list::Reduction {
+                    op: list::ReduceOp::Count,
+                    iterable: list::Iterable::Items(route.index as usize),
                     arena,
                     body,
                 },
@@ -2525,17 +2324,17 @@ fn count_reduction(route: &PyListVar, func: Option<&Bound<'_, PyAny>>) -> PyResu
 #[pyo3(signature = (route, func, *, start=0, end=0))]
 fn sum_edges(route: &PyListVar, func: &Bound<'_, PyAny>, start: i32, end: i32) -> PyResult<PyTerm> {
     let body = coerce_node(&func.call1((node(PyNode::Arg(0)), node(PyNode::Arg(1))))?)?;
-    let mut arena = collection::ExprArena::default();
+    let mut arena = list::ExprArena::default();
     let body_id = lower(&body, &mut arena);
-    let iterable = collection::Iterable::Edges { list: route.index as usize, start, end };
-    Ok(single_term(route, collection::Reduction { op: collection::ReduceOp::Sum, iterable, arena, body: body_id }))
+    let iterable = list::Iterable::Edges { list: route.index as usize, start, end };
+    Ok(single_term(route, list::Reduction { op: list::ReduceOp::Sum, iterable, arena, body: body_id }))
 }
 
 fn pairs_term(route: &PyListVar, body: Arc<PyNode>) -> PyTerm {
-    let mut arena = collection::ExprArena::default();
+    let mut arena = list::ExprArena::default();
     let body_id = lower(&body, &mut arena);
-    let iterable = collection::Iterable::Pairs(route.index as usize);
-    single_term(route, collection::Reduction { op: collection::ReduceOp::Sum, iterable, arena, body: body_id })
+    let iterable = list::Iterable::Pairs(route.index as usize);
+    single_term(route, list::Reduction { op: list::ReduceOp::Sum, iterable, arena, body: body_id })
 }
 
 /// `item_pairs(route, (a, b) => body)`: sum the body over every ordered pair of
@@ -2603,11 +2402,11 @@ fn ne_expr(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr>
 fn scan_sum(route: &PyListVar, step: &Bound<'_, PyAny>, emit: &Bound<'_, PyAny>, init: i64, boundary: i32) -> PyResult<PyTerm> {
     let step_body = coerce_node(&step.call1((node(PyNode::Arg(0)), node(PyNode::Arg(1)), node(PyNode::Arg(2))))?)?;
     let emit_body = coerce_node(&emit.call1((node(PyNode::Arg(0)), node(PyNode::Arg(1)), node(PyNode::Arg(2))))?)?;
-    let mut arena = collection::ExprArena::default();
+    let mut arena = list::ExprArena::default();
     let step_id = lower(&step_body, &mut arena);
     let emit_id = lower(&emit_body, &mut arena);
-    let iterable = collection::Iterable::Scan { list: route.index as usize, init, boundary, step: step_id };
-    Ok(single_term(route, collection::Reduction { op: collection::ReduceOp::Sum, iterable, arena, body: emit_id }))
+    let iterable = list::Iterable::Scan { list: route.index as usize, init, boundary, step: step_id };
+    Ok(single_term(route, list::Reduction { op: list::ReduceOp::Sum, iterable, arena, body: emit_id }))
 }
 
 /// `select_kth(route, k, step, emit, init=, boundary=)`: the `k`-th smallest
@@ -2622,11 +2421,11 @@ fn scan_sum(route: &PyListVar, step: &Bound<'_, PyAny>, emit: &Bound<'_, PyAny>,
 fn select_kth(route: &PyListVar, k: usize, step: &Bound<'_, PyAny>, emit: &Bound<'_, PyAny>, init: i64, boundary: i32) -> PyResult<PyTerm> {
     let step_body = coerce_node(&step.call1((node(PyNode::Arg(0)), node(PyNode::Arg(1)), node(PyNode::Arg(2))))?)?;
     let emit_body = coerce_node(&emit.call1((node(PyNode::Arg(0)), node(PyNode::Arg(1)), node(PyNode::Arg(2))))?)?;
-    let mut arena = collection::ExprArena::default();
+    let mut arena = list::ExprArena::default();
     let step_id = lower(&step_body, &mut arena);
     let emit_id = lower(&emit_body, &mut arena);
-    let iterable = collection::Iterable::Scan { list: route.index as usize, init, boundary, step: step_id };
-    Ok(single_term(route, collection::Reduction { op: collection::ReduceOp::SelectKth(k), iterable, arena, body: emit_id }))
+    let iterable = list::Iterable::Scan { list: route.index as usize, init, boundary, step: step_id };
+    Ok(single_term(route, list::Reduction { op: list::ReduceOp::SelectKth(k), iterable, arena, body: emit_id }))
 }
 
 /// `windows(route, size, inner, emit)`: for each window of `size` consecutive
@@ -2637,11 +2436,11 @@ fn select_kth(route: &PyListVar, k: usize, step: &Bound<'_, PyAny>, emit: &Bound
 fn windows(route: &PyListVar, size: usize, inner: &Bound<'_, PyAny>, emit: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
     let inner_body = coerce_node(&inner.call1((node(PyNode::Arg(0)),))?)?;
     let emit_body = coerce_node(&emit.call1((node(PyNode::Arg(1)),))?)?;
-    let mut arena = collection::ExprArena::default();
+    let mut arena = list::ExprArena::default();
     let inner_id = lower(&inner_body, &mut arena);
     let emit_id = lower(&emit_body, &mut arena);
-    let iterable = collection::Iterable::Windows { list: route.index as usize, size, inner: inner_id };
-    Ok(single_term(route, collection::Reduction { op: collection::ReduceOp::Sum, iterable, arena, body: emit_id }))
+    let iterable = list::Iterable::Windows { list: route.index as usize, size, inner: inner_id };
+    Ok(single_term(route, list::Reduction { op: list::ReduceOp::Sum, iterable, arena, body: emit_id }))
 }
 
 /// Wrap a constant integer array / matrix for use inside lambdas.
@@ -2662,46 +2461,46 @@ fn matrix(data: Vec<Vec<i64>>) -> PyMatrix {
 #[pyfunction]
 #[pyo3(signature = (route, matrix, *, depot=0))]
 fn route_cost(route: &PyListVar, matrix: Vec<Vec<i64>>, depot: i32) -> PyTerm {
-    let mut arena = collection::ExprArena::default();
+    let mut arena = list::ExprArena::default();
     let i = arena.arg(0);
     let j = arena.arg(1);
     let body = arena.matrix(Arc::new(matrix), i, j);
-    let iterable = collection::Iterable::Edges { list: route.index as usize, start: depot, end: depot };
-    single_term(route, collection::Reduction { op: collection::ReduceOp::Sum, iterable, arena, body })
+    let iterable = list::Iterable::Edges { list: route.index as usize, start: depot, end: depot };
+    single_term(route, list::Reduction { op: list::ReduceOp::Sum, iterable, arena, body })
 }
 
-fn over_items_raw(route: &PyListVar, op: collection::ReduceOp, values: Vec<i64>) -> PyTerm {
-    let mut arena = collection::ExprArena::default();
+fn over_items_raw(route: &PyListVar, op: list::ReduceOp, values: Vec<i64>) -> PyTerm {
+    let mut arena = list::ExprArena::default();
     let i = arena.arg(0);
     let body = arena.array(Arc::new(values), i);
-    single_term(route, collection::Reduction { op, iterable: collection::Iterable::Items(route.index as usize), arena, body })
+    single_term(route, list::Reduction { op, iterable: list::Iterable::Items(route.index as usize), arena, body })
 }
 
 /// Sum of `values[item]` over `route`'s items.
 #[pyfunction]
 fn list_sum(route: &PyListVar, values: Vec<i64>) -> PyTerm {
-    over_items_raw(route, collection::ReduceOp::Sum, values)
+    over_items_raw(route, list::ReduceOp::Sum, values)
 }
 
 /// Minimum / maximum of `values[item]` over `route`'s items.
 #[pyfunction]
 fn list_min(route: &PyListVar, values: Vec<i64>) -> PyTerm {
-    over_items_raw(route, collection::ReduceOp::Min, values)
+    over_items_raw(route, list::ReduceOp::Min, values)
 }
 
 #[pyfunction]
 fn list_max(route: &PyListVar, values: Vec<i64>) -> PyTerm {
-    over_items_raw(route, collection::ReduceOp::Max, values)
+    over_items_raw(route, list::ReduceOp::Max, values)
 }
 
 /// Number of items in `route`.
 #[pyfunction]
 fn list_count(route: &PyListVar) -> PyTerm {
-    let mut arena = collection::ExprArena::default();
+    let mut arena = list::ExprArena::default();
     let body = arena.constant(1);
     single_term(
         route,
-        collection::Reduction { op: collection::ReduceOp::Count, iterable: collection::Iterable::Items(route.index as usize), arena, body },
+        list::Reduction { op: list::ReduceOp::Count, iterable: list::Iterable::Items(route.index as usize), arena, body },
     )
 }
 
@@ -2710,11 +2509,11 @@ fn list_count(route: &PyListVar) -> PyTerm {
 /// for a "minimise the fleet" or "minimise open bins" objective tier.
 #[pyfunction]
 fn used(route: &PyListVar) -> PyTerm {
-    let mut arena = collection::ExprArena::default();
+    let mut arena = list::ExprArena::default();
     let body = arena.constant(0);
     single_term(
         route,
-        collection::Reduction { op: collection::ReduceOp::Used, iterable: collection::Iterable::Items(route.index as usize), arena, body },
+        list::Reduction { op: list::ReduceOp::Used, iterable: list::Iterable::Items(route.index as usize), arena, body },
     )
 }
 

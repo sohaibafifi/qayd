@@ -5,10 +5,11 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::domain::Domain;
+use crate::domains::int::Domain;
 use crate::ids::{IntervalId, ListId, PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Propagator};
-use crate::structured::{IntervalDomain, IntervalEvent, IntervalPresence, ListDomain, ListEvent};
+use crate::domains::interval::{IntervalDomain, IntervalEvent, IntervalPresence};
+use crate::domains::list::{ListDomain, ListEvent};
 use crate::trail::{ReversibleInt, Trail};
 
 /// Per-variable subscriptions and their event granularity.
@@ -240,7 +241,7 @@ impl Store {
         id
     }
 
-    /// Create a structured list domain over a fixed item universe.
+    /// Create a list domain over a fixed item universe.
     pub fn new_list(&mut self, universe: Vec<i32>) -> ListId {
         let id = ListId(self.list_domains.len() as u32);
         let dom = ListDomain::new(universe, &mut self.trail);
@@ -284,12 +285,12 @@ impl Store {
         self.domains.len()
     }
 
-    /// Number of structured list domains.
+    /// Number of list domains.
     pub fn num_lists(&self) -> usize {
         self.list_domains.len()
     }
 
-    /// Number of structured interval domains.
+    /// Number of interval domains.
     pub fn num_intervals(&self) -> usize {
         self.interval_domains.len()
     }
@@ -342,7 +343,7 @@ impl Store {
         self.domains[var.index()].values(&self.trail)
     }
 
-    /// Immutable universe of a structured list.
+    /// Immutable universe of a list.
     pub fn list_universe(&self, list: ListId) -> &[i32] {
         self.list_domains[list.index()].universe()
     }
@@ -478,7 +479,7 @@ impl Store {
         Ok(())
     }
 
-    /// Require an item in a structured list.
+    /// Require an item in a list.
     pub fn require_list_item(&mut self, list: ListId, item: i32) -> Result<bool, Inconsistency> {
         let before = self.list_state(list);
         let changed = self.list_domains[list.index()].require_item(item, &mut self.trail)?;
@@ -488,7 +489,7 @@ impl Store {
         Ok(changed)
     }
 
-    /// Forbid an item from a structured list.
+    /// Forbid an item from a list.
     pub fn forbid_list_item(&mut self, list: ListId, item: i32) -> Result<bool, Inconsistency> {
         let before = self.list_state(list);
         let changed = self.list_domains[list.index()].forbid_item(item, &mut self.trail)?;
@@ -498,7 +499,7 @@ impl Store {
         Ok(changed)
     }
 
-    /// Raise a structured list length lower bound.
+    /// Raise a list length lower bound.
     pub fn set_list_len_min(&mut self, list: ListId, min: usize) -> Result<bool, Inconsistency> {
         let before = self.list_state(list);
         let changed = self.list_domains[list.index()].set_len_min(min, &mut self.trail)?;
@@ -508,7 +509,7 @@ impl Store {
         Ok(changed)
     }
 
-    /// Lower a structured list length upper bound.
+    /// Lower a list length upper bound.
     pub fn set_list_len_max(&mut self, list: ListId, max: usize) -> Result<bool, Inconsistency> {
         let before = self.list_state(list);
         let changed = self.list_domains[list.index()].set_len_max(max, &mut self.trail)?;
@@ -798,7 +799,7 @@ impl Store {
         }
     }
 
-    /// Subscribe `prop` to structured list changes at the given granularity.
+    /// Subscribe `prop` to list changes at the given granularity.
     /// Idempotent per (list, prop, event).
     pub fn subscribe_list(&mut self, list: ListId, prop: PropId, event: ListEvent) {
         let s = &mut self.list_subs[list.index()];
@@ -807,7 +808,7 @@ impl Store {
         }
     }
 
-    /// Subscribe `prop` to structured interval changes. Interval facts are backed
+    /// Subscribe `prop` to interval changes. Interval facts are backed
     /// by integer variables, so this maps onto the variable event system: start/
     /// end bound changes are the start variable's bound changes, presence changes
     /// are the presence variable being fixed.
@@ -903,7 +904,7 @@ impl Store {
         }
     }
 
-    /// Wake subscribers of a structured list event.
+    /// Wake subscribers of a list event.
     fn notify_list(&mut self, list: ListId, changed: ListEvent) {
         let Store { list_subs, queue, enqueued, current, .. } = self;
         let s = &list_subs[list.index()];
@@ -914,7 +915,7 @@ impl Store {
         }
     }
 
-    /// Wake subscribers of a structured interval event.
+    /// Wake subscribers of a interval event.
     /// Enqueue `p` unless it is the running propagator or already queued.
     fn wake(queue: &mut VecDeque<PropId>, enqueued: &mut [bool], current: Option<PropId>, p: PropId) {
         if current == Some(p) {

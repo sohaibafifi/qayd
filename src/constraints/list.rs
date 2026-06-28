@@ -1,13 +1,13 @@
-//! Propagators over structured list domains.
+//! Propagators over list domains.
 
 use crate::domains::list::ListEvent;
 use crate::ids::{ListId, PropId};
 use crate::propagator::{Inconsistency, Propagator};
 use crate::store::{Solver, Store};
 
-/// Exact partition over structured list membership.
+/// Exact partition over list membership.
 ///
-/// Every item must be required by exactly one list. This first structured-list
+/// Every item must be required by exactly one list. This first list
 /// propagator reasons only about membership, not order, arcs, or positions.
 #[derive(Clone)]
 pub struct Partition {
@@ -57,7 +57,7 @@ impl Propagator for Partition {
     }
 }
 
-/// Post a structured list partition.
+/// Post a list partition.
 pub fn partition(solver: &mut Solver, lists: &[ListId], items: &[i32]) -> PropId {
     solver.post(Box::new(Partition { lists: lists.to_vec(), items: items.to_vec() }))
 }

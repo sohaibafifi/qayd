@@ -11,5 +11,4 @@ pub mod linear;
 pub mod list;
 pub mod primitives;
 pub mod scheduling;
-pub mod structured;
 pub mod table;

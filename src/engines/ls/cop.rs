@@ -1,4 +1,4 @@
-//! Incumbent-only local search for `--fast-cop` runs.
+//! Incumbent-only local search for the `--ls` COP engine.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1895,7 +1895,7 @@ fn bump_gls_weights(weights: &mut [i64], con_viol: &[i64], viol_sum: &mut i128, 
     bumped
 }
 
-pub(crate) fn solve_fast_cop<F>(
+pub(crate) fn solve_ls<F>(
     problem: Problem,
     spec: LocalSearchSpec,
     stop: &AtomicBool,

@@ -1,22 +1,22 @@
 //! Structured interval scheduling backend.
 //!
 //! This module owns the reusable scheduling-engine orchestration: lowering the
-//! schedule IR to structured intervals, choosing the exact CDCL or chronological
+//! schedule IR to intervals, choosing the exact CDCL or chronological
 //! backend, maintaining makespan bounds, and replaying optional-mode incumbents.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 
-use crate::collection::{Resource, Schedule};
+use crate::model::list::{Resource, Schedule};
 use crate::constraints::intension;
-use crate::constraints::structured as structured_constraints;
+use crate::constraints::interval as interval_constraints;
 use crate::expr;
 use crate::ids::{IntervalId, VarId};
 use crate::search::{self, Objective as SearchObjective, SearchControl, SolveStats};
 use crate::Solver;
 
-/// Runtime options for the structured scheduling engine.
+/// Runtime options for the domain scheduling engine.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Options {
     /// Seed for CDCL-backed searches.
@@ -69,7 +69,7 @@ struct ModedBuild {
     all_durations: Vec<i32>,
 }
 
-/// Solve a supported structured interval schedule. Returns `Ok(None)` when the
+/// Solve a supported interval schedule. Returns `Ok(None)` when the
 /// schedule shape is not supported by this exact backend.
 pub fn solve<F>(schedule: &Schedule, stop: &AtomicBool, options: Options, on_improve: F) -> Result<Option<Outcome>, String>
 where
@@ -106,7 +106,7 @@ where
     for &(before, after) in &schedule.precedences {
         let before = *intervals.get(before).ok_or("schedule precedence references a missing interval")?;
         let after = *intervals.get(after).ok_or("schedule precedence references a missing interval")?;
-        structured_constraints::interval_precedence(&mut solver, before, after);
+        interval_constraints::interval_precedence(&mut solver, before, after);
     }
     for resource in &schedule.resources {
         match resource {
@@ -115,7 +115,7 @@ where
                     .iter()
                     .map(|&index| intervals.get(index).copied().ok_or("no-overlap references a missing interval"))
                     .collect::<Result<Vec<_>, _>>()?;
-                structured_constraints::no_overlap(&mut solver, &group_ids);
+                interval_constraints::no_overlap(&mut solver, &group_ids);
             }
             Resource::Cumulative { demands, capacity } => {
                 let group_ids = demands
@@ -125,7 +125,7 @@ where
                 let group_demands =
                     demands.iter().map(|&(_, demand)| checked_i32(demand, "cumulative demand")).collect::<Result<Vec<_>, _>>()?;
                 let cap = checked_i32(*capacity, "cumulative capacity")?;
-                structured_constraints::cumulative(&mut solver, &group_ids, &group_demands, cap);
+                interval_constraints::cumulative(&mut solver, &group_ids, &group_demands, cap);
             }
             Resource::MachineNoOverlap => {}
         }
@@ -171,10 +171,10 @@ where
     }
 
     let mut starts: Option<Vec<i64>> = None;
-    let (stats, complete) = search::solve_structured_interruptible(
+    let (stats, complete) = search::solve_domains_interruptible(
         &mut solver,
-        |_, structured| {
-            starts = Some(structured.interval_starts.iter().map(|start| i64::from(start.unwrap_or(0))).collect());
+        |_, domain| {
+            starts = Some(domain.interval_starts.iter().map(|start| i64::from(start.unwrap_or(0))).collect());
             SearchControl::Stop
         },
         stop,
@@ -210,21 +210,21 @@ where
     let minimize = schedule.minimize_makespan;
     let makespan_ub = Arc::new(AtomicI32::new(i32::MAX));
     if minimize {
-        structured_constraints::makespan_bound(&mut solver, &all_modes, &all_durations, Arc::clone(&makespan_ub));
+        interval_constraints::makespan_bound(&mut solver, &all_modes, &all_durations, Arc::clone(&makespan_ub));
     }
     let bound_on_improve = Arc::clone(&makespan_ub);
     let op_index: Vec<Vec<(usize, usize, i32)>> =
         op_modes.iter().map(|modes| modes.iter().map(|&(machine, id, duration)| (machine, id.index(), duration)).collect()).collect();
     let mut best: Option<(i64, Vec<i64>, Vec<i64>)> = None;
-    let (stats, complete) = search::solve_structured_interruptible(
+    let (stats, complete) = search::solve_domains_interruptible(
         &mut solver,
-        |_, structured| {
+        |_, domain| {
             let mut starts = vec![0i64; op_count];
             let mut chosen = vec![-1i64; op_count];
             let mut makespan = 0i64;
             for (op, modes) in op_index.iter().enumerate() {
                 for &(machine, idx, duration) in modes {
-                    if let Some(start) = structured.interval_starts[idx] {
+                    if let Some(start) = domain.interval_starts[idx] {
                         starts[op] = i64::from(start);
                         chosen[op] = machine as i64;
                         makespan = makespan.max(i64::from(start) + i64::from(duration));
@@ -388,7 +388,7 @@ fn build_moded_schedule(schedule: &Schedule, solver: &mut Solver) -> Result<Mode
         if ids.is_empty() {
             return Err("mode schedule operation has no eligible mode".to_string());
         }
-        structured_constraints::exactly_one_mode(solver, &ids);
+        interval_constraints::exactly_one_mode(solver, &ids);
         op_modes.push(modes);
     }
     let mut machines: BTreeSet<usize> = BTreeSet::new();
@@ -399,14 +399,14 @@ fn build_moded_schedule(schedule: &Schedule, solver: &mut Solver) -> Result<Mode
     }
     for machine in machines {
         let group: Vec<IntervalId> = op_modes.iter().flatten().filter(|&&(m, _, _)| m == machine).map(|&(_, id, _)| id).collect();
-        structured_constraints::no_overlap(solver, &group);
+        interval_constraints::no_overlap(solver, &group);
     }
     for &(before, after) in &schedule.precedences {
         let before_modes = op_modes.get(before).ok_or("schedule precedence references a missing interval")?;
         let after_modes = op_modes.get(after).ok_or("schedule precedence references a missing interval")?;
         for &(_, ib, _) in before_modes {
             for &(_, ia, _) in after_modes {
-                structured_constraints::interval_precedence(solver, ib, ia);
+                interval_constraints::interval_precedence(solver, ib, ia);
             }
         }
     }

@@ -1,3 +1,9 @@
+//! List-reduction IR: a model partitions a universe of item ids among ordered
+//! list variables, with objectives and constraints expressed as lambda
+//! reductions over a list (an aggregate of a body evaluated at each item, or at
+//! each edge of a route). One representation covers routing, sequencing,
+//! assignment, and packing by changing only the reductions.
+
 use std::sync::Arc;
 
 /// Maximum number of lexicographic objective tiers a model may declare.

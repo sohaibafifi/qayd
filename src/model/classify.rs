@@ -1,7 +1,7 @@
 //! Backend selection: model classification and engine choice.
 
 use super::*;
-use crate::collection;
+use crate::model::list;
 
 type ItemSumBound = (usize, Vec<(i32, i64)>, i64, i64);
 const MAX_INTEGER_ROUTING_NODES: usize = 600;
@@ -39,8 +39,8 @@ impl ModelClass {
 pub enum Backend {
     /// Exact finite-domain integer search.
     IntegerExact,
-    /// Exact structured list / interval search.
-    StructuredExact,
+    /// Exact list / interval search.
+    DomainExact,
     /// Heuristic list local search.
     ListLocalSearch,
     /// Heuristic interval schedule search.
@@ -52,7 +52,7 @@ impl Backend {
     pub fn name(self) -> &'static str {
         match self {
             Self::IntegerExact => "integer exact",
-            Self::StructuredExact => "structured exact",
+            Self::DomainExact => "domain exact",
             Self::ListLocalSearch => "list local search",
             Self::ScheduleLocalSearch => "schedule local search",
         }
@@ -60,7 +60,7 @@ impl Backend {
 
     /// Whether this backend is exact.
     pub fn is_exact(self) -> bool {
-        matches!(self, Self::IntegerExact | Self::StructuredExact)
+        matches!(self, Self::IntegerExact | Self::DomainExact)
     }
 
     /// Whether this backend is heuristic.
@@ -71,7 +71,7 @@ impl Backend {
     /// Stable role description for architecture checks and diagnostics.
     pub fn role(self) -> &'static str {
         match self {
-            Self::IntegerExact | Self::StructuredExact => "semantic exact solver",
+            Self::IntegerExact | Self::DomainExact => "semantic exact solver",
             Self::ListLocalSearch => "fallback / incumbent / routing heuristic",
             Self::ScheduleLocalSearch => "fallback schedule heuristic",
         }
@@ -125,24 +125,24 @@ impl BackendSelection {
                     matches!(
                         constraint,
                         Constraint::IntervalPrecedence { .. }
-                            | Constraint::IntervalResource(collection::Resource::NoOverlap(_))
-                            | Constraint::IntervalResource(collection::Resource::Cumulative { .. })
+                            | Constraint::IntervalResource(list::Resource::NoOverlap(_))
+                            | Constraint::IntervalResource(list::Resource::Cumulative { .. })
                     )
                 })
             } else {
                 model.constraints.iter().all(|constraint| {
                     matches!(
                         constraint,
-                        Constraint::IntervalPrecedence { .. } | Constraint::IntervalResource(collection::Resource::MachineNoOverlap)
+                        Constraint::IntervalPrecedence { .. } | Constraint::IntervalResource(list::Resource::MachineNoOverlap)
                     )
                 })
             };
-            let structured_schedule =
+            let interval_schedule =
                 constraints_ok && model.objectives.iter().all(|objective| matches!(objective, Objective::Makespan { minimize: true, .. }));
-            if structured_schedule {
+            if interval_schedule {
                 return Self {
                     class: ModelClass::Schedule,
-                    backend: Backend::StructuredExact,
+                    backend: Backend::DomainExact,
                     reason: if all_fixed {
                         "fixed intervals: precedence, no-overlap, cumulative"
                     } else {
@@ -161,7 +161,7 @@ impl BackendSelection {
 
         if !model.lists.is_empty() {
             let summary = ListSummary::for_model(model);
-            let structured_constraints = model.constraints.iter().all(|constraint| {
+            let interval_constraints = model.constraints.iter().all(|constraint| {
                 matches!(
                     constraint,
                     Constraint::ListPartition { .. }
@@ -198,16 +198,16 @@ impl BackendSelection {
                 };
             }
 
-            let structured_list = structured_constraints && (model.objectives.is_empty() || objectives_are_structured_simple(model));
+            let list_exact = interval_constraints && (model.objectives.is_empty() || objectives_are_list_simple(model));
 
-            if structured_list {
+            if list_exact {
                 return Self {
                     class: ModelClass::ListAssignmentPacking,
-                    backend: Backend::StructuredExact,
+                    backend: Backend::DomainExact,
                     reason: if model.objectives.is_empty() {
                         "list model uses only partition, length bounds, item-sum bounds, same-list, and item precedence"
                     } else {
-                        "list model uses structured constraints and simple list objectives"
+                        "list model uses list constraints and simple list objectives"
                     },
                     routing: summary.routing_shape(model.lists.len()),
                 };
@@ -216,7 +216,7 @@ impl BackendSelection {
             return Self {
                 class: ModelClass::ListAssignmentPacking,
                 backend: Backend::ListLocalSearch,
-                reason: "constraints or objectives are not yet covered by structured exact search",
+                reason: "constraints or objectives are not yet covered by domain exact search",
                 routing: None,
             };
         }
@@ -225,7 +225,7 @@ impl BackendSelection {
     }
 
     /// Select a backend for the current collection model shape.
-    pub fn for_collection(model: &collection::CollectionModel) -> Self {
+    pub fn for_collection(model: &list::CollectionModel) -> Self {
         Self::for_model(&Model::from_collection(model))
     }
 }
@@ -248,7 +248,7 @@ impl ListSummary {
             if let Objective::ListTerms { terms, .. } = objective {
                 for reduction in terms {
                     summary.visit_reduction(reduction);
-                    summary.has_fleet_objective |= matches!(reduction.op, collection::ReduceOp::Used);
+                    summary.has_fleet_objective |= matches!(reduction.op, list::ReduceOp::Used);
                 }
             }
         }
@@ -271,14 +271,14 @@ impl ListSummary {
         summary
     }
 
-    fn visit_reduction(&mut self, reduction: &collection::Reduction) {
+    fn visit_reduction(&mut self, reduction: &list::Reduction) {
         match &reduction.iterable {
-            collection::Iterable::Edges { .. } => self.has_edges = true,
-            collection::Iterable::Pairs(_) | collection::Iterable::Scan { .. } | collection::Iterable::Windows { .. } => {
+            list::Iterable::Edges { .. } => self.has_edges = true,
+            list::Iterable::Pairs(_) | list::Iterable::Scan { .. } | list::Iterable::Windows { .. } => {
                 self.has_sequence_reduction = true;
-                self.has_scan |= matches!(&reduction.iterable, collection::Iterable::Scan { .. });
+                self.has_scan |= matches!(&reduction.iterable, list::Iterable::Scan { .. });
             }
-            collection::Iterable::Items(_) => {}
+            list::Iterable::Items(_) => {}
         }
     }
 
@@ -295,19 +295,19 @@ impl ListSummary {
     }
 }
 
-fn objectives_are_structured_simple(model: &Model) -> bool {
+fn objectives_are_list_simple(model: &Model) -> bool {
     model.objectives.iter().all(|objective| match objective {
-        Objective::ListTerms { terms, .. } => terms.iter().all(is_structured_simple_objective_reduction),
+        Objective::ListTerms { terms, .. } => terms.iter().all(is_list_simple_objective_reduction),
         Objective::IntExpr { .. } | Objective::Makespan { .. } => false,
     })
 }
 
-fn is_structured_simple_objective_reduction(reduction: &collection::Reduction) -> bool {
-    matches!(&reduction.iterable, collection::Iterable::Items(_))
+fn is_list_simple_objective_reduction(reduction: &list::Reduction) -> bool {
+    matches!(&reduction.iterable, list::Iterable::Items(_))
         && match reduction.op {
-            collection::ReduceOp::Sum | collection::ReduceOp::Count => expr_uses_at_most_first_arg(&reduction.arena.exprs, reduction.body),
-            collection::ReduceOp::Used => true,
-            collection::ReduceOp::Min | collection::ReduceOp::Max | collection::ReduceOp::SelectKth(_) => false,
+            list::ReduceOp::Sum | list::ReduceOp::Count => expr_uses_at_most_first_arg(&reduction.arena.exprs, reduction.body),
+            list::ReduceOp::Used => true,
+            list::ReduceOp::Min | list::ReduceOp::Max | list::ReduceOp::SelectKth(_) => false,
         }
 }
 
@@ -335,7 +335,7 @@ struct EdgeSignature<'a> {
     matrix: &'a [Vec<i64>],
 }
 
-fn direct_closed_edge_objective(terms: &[collection::Reduction], list_count: usize, items: &[i32]) -> bool {
+fn direct_closed_edge_objective(terms: &[list::Reduction], list_count: usize, items: &[i32]) -> bool {
     if terms.len() != list_count {
         return false;
     }
@@ -361,18 +361,18 @@ fn direct_closed_edge_objective(terms: &[collection::Reduction], list_count: usi
     })
 }
 
-fn direct_closed_edge_signature<'a>(reduction: &'a collection::Reduction, items: &[i32]) -> Option<(usize, EdgeSignature<'a>)> {
-    if !matches!(reduction.op, collection::ReduceOp::Sum) {
+fn direct_closed_edge_signature<'a>(reduction: &'a list::Reduction, items: &[i32]) -> Option<(usize, EdgeSignature<'a>)> {
+    if !matches!(reduction.op, list::ReduceOp::Sum) {
         return None;
     }
-    let collection::Iterable::Edges { list: reduction_list, start, end } = &reduction.iterable else {
+    let list::Iterable::Edges { list: reduction_list, start, end } = &reduction.iterable else {
         return None;
     };
     if start != end || items.contains(start) {
         return None;
     }
     match reduction.arena.exprs.get(reduction.body.0 as usize) {
-        Some(collection::Expr::Matrix(matrix, row, col)) => {
+        Some(list::Expr::Matrix(matrix, row, col)) => {
             let direct = expr_is_arg(&reduction.arena.exprs, *row, 0) && expr_is_arg(&reduction.arena.exprs, *col, 1);
             let reversed = expr_is_arg(&reduction.arena.exprs, *row, 1) && expr_is_arg(&reduction.arena.exprs, *col, 0);
             if !(direct || reversed) || !matrix_covers_nodes(matrix, *start, items) || !matrix_values_fit_i32(matrix, *start, items) {
@@ -437,8 +437,8 @@ fn capacity_values_for_items(weights: &[(i32, i64)], items: &[i32]) -> Option<Ve
     Some(values)
 }
 
-fn expr_is_arg(exprs: &[collection::Expr], id: collection::ExprId, arg: u8) -> bool {
-    matches!(exprs.get(id.0 as usize), Some(collection::Expr::Arg(found)) if *found == arg)
+fn expr_is_arg(exprs: &[list::Expr], id: list::ExprId, arg: u8) -> bool {
+    matches!(exprs.get(id.0 as usize), Some(list::Expr::Arg(found)) if *found == arg)
 }
 
 fn items_are_unique(items: &[i32]) -> bool {
@@ -484,52 +484,52 @@ fn matrix_values_fit_i32(matrix: &[Vec<i64>], depot: i32, items: &[i32]) -> bool
     })
 }
 
-fn expr_uses_at_most_first_arg(arena: &[collection::Expr], id: collection::ExprId) -> bool {
+fn expr_uses_at_most_first_arg(arena: &[list::Expr], id: list::ExprId) -> bool {
     let Some(expr) = arena.get(id.0 as usize) else {
         return false;
     };
     match expr {
-        collection::Expr::Const(_) | collection::Expr::Arg(0) => true,
-        collection::Expr::Arg(_) | collection::Expr::Matrix(_, _, _) => false,
-        collection::Expr::Array(_, index) | collection::Expr::Abs(index) => expr_uses_at_most_first_arg(arena, *index),
-        collection::Expr::Add(a, b)
-        | collection::Expr::Sub(a, b)
-        | collection::Expr::Mul(a, b)
-        | collection::Expr::Min(a, b)
-        | collection::Expr::Max(a, b)
-        | collection::Expr::Div(a, b)
-        | collection::Expr::Lt(a, b)
-        | collection::Expr::Le(a, b)
-        | collection::Expr::Eq(a, b)
-        | collection::Expr::Ne(a, b) => expr_uses_at_most_first_arg(arena, *a) && expr_uses_at_most_first_arg(arena, *b),
-        collection::Expr::IfThenElse(c, a, b) => {
+        list::Expr::Const(_) | list::Expr::Arg(0) => true,
+        list::Expr::Arg(_) | list::Expr::Matrix(_, _, _) => false,
+        list::Expr::Array(_, index) | list::Expr::Abs(index) => expr_uses_at_most_first_arg(arena, *index),
+        list::Expr::Add(a, b)
+        | list::Expr::Sub(a, b)
+        | list::Expr::Mul(a, b)
+        | list::Expr::Min(a, b)
+        | list::Expr::Max(a, b)
+        | list::Expr::Div(a, b)
+        | list::Expr::Lt(a, b)
+        | list::Expr::Le(a, b)
+        | list::Expr::Eq(a, b)
+        | list::Expr::Ne(a, b) => expr_uses_at_most_first_arg(arena, *a) && expr_uses_at_most_first_arg(arena, *b),
+        list::Expr::IfThenElse(c, a, b) => {
             expr_uses_at_most_first_arg(arena, *c) && expr_uses_at_most_first_arg(arena, *a) && expr_uses_at_most_first_arg(arena, *b)
         }
     }
 }
 
-pub(crate) fn length_bound_from_collection_constraint(constraint: &collection::Constraint, item_count: usize) -> Option<(usize, usize, usize)> {
-    let collection::Iterable::Items(list) = &constraint.reduction.iterable else {
+pub(crate) fn length_bound_from_collection_constraint(constraint: &list::Constraint, item_count: usize) -> Option<(usize, usize, usize)> {
+    let list::Iterable::Items(list) = &constraint.reduction.iterable else {
         return None;
     };
-    if matches!(constraint.reduction.op, collection::ReduceOp::Used) {
+    if matches!(constraint.reduction.op, list::ReduceOp::Used) {
         return used_bound_as_length(*list, constraint.op, constraint.rhs, item_count);
     }
-    if !matches!(constraint.reduction.op, collection::ReduceOp::Count) {
+    if !matches!(constraint.reduction.op, list::ReduceOp::Count) {
         return None;
     }
     if !matches!(
         constraint.reduction.arena.exprs.get(constraint.reduction.body.0 as usize),
-        Some(collection::Expr::Const(value)) if *value != 0
+        Some(list::Expr::Const(value)) if *value != 0
     ) {
         return None;
     }
 
     let n = item_count as i64;
     let (min, max) = match constraint.op {
-        collection::Op::Le => (0, constraint.rhs),
-        collection::Op::Ge => (constraint.rhs, n),
-        collection::Op::Eq => (constraint.rhs, constraint.rhs),
+        list::Op::Le => (0, constraint.rhs),
+        list::Op::Ge => (constraint.rhs, n),
+        list::Op::Eq => (constraint.rhs, constraint.rhs),
     };
     if max < 0 || min > n || min > max {
         return Some((*list, 1, 0));
@@ -537,33 +537,33 @@ pub(crate) fn length_bound_from_collection_constraint(constraint: &collection::C
     Some((*list, min.max(0) as usize, max.min(n) as usize))
 }
 
-fn used_bound_as_length(list: usize, op: collection::Op, rhs: i64, item_count: usize) -> Option<(usize, usize, usize)> {
+fn used_bound_as_length(list: usize, op: list::Op, rhs: i64, item_count: usize) -> Option<(usize, usize, usize)> {
     let n = item_count;
     let (min, max) = match op {
-        collection::Op::Le if rhs < 0 => return Some((list, 1, 0)),
-        collection::Op::Le if rhs == 0 => (0, 0),
-        collection::Op::Le => (0, n),
-        collection::Op::Ge if rhs <= 0 => (0, n),
-        collection::Op::Ge if rhs == 1 => (1, n),
-        collection::Op::Ge => return Some((list, 1, 0)),
-        collection::Op::Eq if rhs == 0 => (0, 0),
-        collection::Op::Eq if rhs == 1 => (1, n),
-        collection::Op::Eq => return Some((list, 1, 0)),
+        list::Op::Le if rhs < 0 => return Some((list, 1, 0)),
+        list::Op::Le if rhs == 0 => (0, 0),
+        list::Op::Le => (0, n),
+        list::Op::Ge if rhs <= 0 => (0, n),
+        list::Op::Ge if rhs == 1 => (1, n),
+        list::Op::Ge => return Some((list, 1, 0)),
+        list::Op::Eq if rhs == 0 => (0, 0),
+        list::Op::Eq if rhs == 1 => (1, n),
+        list::Op::Eq => return Some((list, 1, 0)),
     };
     Some((list, min, max))
 }
 
-fn is_item_sum_upper_bound(constraint: &collection::Constraint) -> bool {
-    matches!(constraint.op, collection::Op::Le)
-        && matches!(constraint.reduction.op, collection::ReduceOp::Sum)
-        && matches!(&constraint.reduction.iterable, collection::Iterable::Items(_))
+fn is_item_sum_upper_bound(constraint: &list::Constraint) -> bool {
+    matches!(constraint.op, list::Op::Le)
+        && matches!(constraint.reduction.op, list::ReduceOp::Sum)
+        && matches!(&constraint.reduction.iterable, list::Iterable::Items(_))
 }
 
-pub(crate) fn item_sum_bound_from_collection_constraint(constraint: &collection::Constraint, items: &[i32]) -> Option<ItemSumBound> {
-    if !matches!(constraint.reduction.op, collection::ReduceOp::Sum) {
+pub(crate) fn item_sum_bound_from_collection_constraint(constraint: &list::Constraint, items: &[i32]) -> Option<ItemSumBound> {
+    if !matches!(constraint.reduction.op, list::ReduceOp::Sum) {
         return None;
     }
-    let collection::Iterable::Items(list) = &constraint.reduction.iterable else {
+    let list::Iterable::Items(list) = &constraint.reduction.iterable else {
         return None;
     };
     let mut weights = Vec::with_capacity(items.len());
@@ -571,36 +571,36 @@ pub(crate) fn item_sum_bound_from_collection_constraint(constraint: &collection:
         weights.push((item, eval_collection_expr_one(&constraint.reduction.arena.exprs, constraint.reduction.body, i64::from(item))?));
     }
     let (min, max) = match constraint.op {
-        collection::Op::Le => (i64::MIN / 4, constraint.rhs),
-        collection::Op::Ge => (constraint.rhs, i64::MAX / 4),
-        collection::Op::Eq => (constraint.rhs, constraint.rhs),
+        list::Op::Le => (i64::MIN / 4, constraint.rhs),
+        list::Op::Ge => (constraint.rhs, i64::MAX / 4),
+        list::Op::Eq => (constraint.rhs, constraint.rhs),
     };
     Some((*list, weights, min, max))
 }
 
-pub(crate) fn eval_collection_expr_one(arena: &[collection::Expr], id: collection::ExprId, arg0: i64) -> Option<i64> {
+pub(crate) fn eval_collection_expr_one(arena: &[list::Expr], id: list::ExprId, arg0: i64) -> Option<i64> {
     let node = arena.get(id.0 as usize)?;
     Some(match node {
-        collection::Expr::Const(value) => *value,
-        collection::Expr::Arg(0) => arg0,
-        collection::Expr::Arg(_) => return None,
-        collection::Expr::Array(values, index) => {
+        list::Expr::Const(value) => *value,
+        list::Expr::Arg(0) => arg0,
+        list::Expr::Arg(_) => return None,
+        list::Expr::Array(values, index) => {
             let index = eval_collection_expr_one(arena, *index, arg0)?;
             *values.get(usize::try_from(index).ok()?)?
         }
-        collection::Expr::Matrix(_, _, _) => return None,
-        collection::Expr::Add(a, b) => {
+        list::Expr::Matrix(_, _, _) => return None,
+        list::Expr::Add(a, b) => {
             eval_collection_expr_one(arena, *a, arg0)?.checked_add(eval_collection_expr_one(arena, *b, arg0)?)?
         }
-        collection::Expr::Sub(a, b) => {
+        list::Expr::Sub(a, b) => {
             eval_collection_expr_one(arena, *a, arg0)?.checked_sub(eval_collection_expr_one(arena, *b, arg0)?)?
         }
-        collection::Expr::Mul(a, b) => {
+        list::Expr::Mul(a, b) => {
             eval_collection_expr_one(arena, *a, arg0)?.checked_mul(eval_collection_expr_one(arena, *b, arg0)?)?
         }
-        collection::Expr::Min(a, b) => eval_collection_expr_one(arena, *a, arg0)?.min(eval_collection_expr_one(arena, *b, arg0)?),
-        collection::Expr::Max(a, b) => eval_collection_expr_one(arena, *a, arg0)?.max(eval_collection_expr_one(arena, *b, arg0)?),
-        collection::Expr::Div(a, b) => {
+        list::Expr::Min(a, b) => eval_collection_expr_one(arena, *a, arg0)?.min(eval_collection_expr_one(arena, *b, arg0)?),
+        list::Expr::Max(a, b) => eval_collection_expr_one(arena, *a, arg0)?.max(eval_collection_expr_one(arena, *b, arg0)?),
+        list::Expr::Div(a, b) => {
             let numerator = eval_collection_expr_one(arena, *a, arg0)?;
             let denominator = eval_collection_expr_one(arena, *b, arg0)?;
             if denominator == 0 {
@@ -609,12 +609,12 @@ pub(crate) fn eval_collection_expr_one(arena: &[collection::Expr], id: collectio
                 numerator.checked_div(denominator)?
             }
         }
-        collection::Expr::Abs(a) => eval_collection_expr_one(arena, *a, arg0)?.saturating_abs(),
-        collection::Expr::Lt(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? < eval_collection_expr_one(arena, *b, arg0)?),
-        collection::Expr::Le(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? <= eval_collection_expr_one(arena, *b, arg0)?),
-        collection::Expr::Eq(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? == eval_collection_expr_one(arena, *b, arg0)?),
-        collection::Expr::Ne(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? != eval_collection_expr_one(arena, *b, arg0)?),
-        collection::Expr::IfThenElse(c, a, b) => {
+        list::Expr::Abs(a) => eval_collection_expr_one(arena, *a, arg0)?.saturating_abs(),
+        list::Expr::Lt(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? < eval_collection_expr_one(arena, *b, arg0)?),
+        list::Expr::Le(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? <= eval_collection_expr_one(arena, *b, arg0)?),
+        list::Expr::Eq(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? == eval_collection_expr_one(arena, *b, arg0)?),
+        list::Expr::Ne(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? != eval_collection_expr_one(arena, *b, arg0)?),
+        list::Expr::IfThenElse(c, a, b) => {
             if eval_collection_expr_one(arena, *c, arg0)? != 0 {
                 eval_collection_expr_one(arena, *a, arg0)?
             } else {

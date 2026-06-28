@@ -1,4 +1,4 @@
-use super::model::{CollectionModel, Expr, ExprId, Iterable, Reduction, Resource, MAX_TIERS};
+use super::ir::{CollectionModel, Expr, ExprId, Iterable, Reduction, Resource, MAX_TIERS};
 
 fn eval_expr_checked(arena: &[Expr], id: ExprId, args: &[i64]) -> Result<i64, String> {
     let node = arena.get(id.0 as usize).ok_or_else(|| format!("expr id {} out of arena range", id.0))?;
@@ -50,15 +50,13 @@ fn eval_expr_checked(arena: &[Expr], id: ExprId, args: &[i64]) -> Result<i64, St
         Expr::Eq(a, b) => i64::from(eval_expr_checked(arena, *a, args)? == eval_expr_checked(arena, *b, args)?),
         Expr::Ne(a, b) => i64::from(eval_expr_checked(arena, *a, args)? != eval_expr_checked(arena, *b, args)?),
         Expr::IfThenElse(c, a, b) => {
-            // Evaluate both branches so an out-of-range index in either is
-            // reported regardless of which the condition would pick.
-            let cond = eval_expr_checked(arena, *c, args)?;
-            let then = eval_expr_checked(arena, *a, args)?;
-            let other = eval_expr_checked(arena, *b, args)?;
-            if cond != 0 {
-                then
+            // Lazy, matching solve semantics: evaluate only the selected branch,
+            // so a guarded out-of-range index in the branch the condition never
+            // picks is accepted here exactly as it is at solve time.
+            if eval_expr_checked(arena, *c, args)? != 0 {
+                eval_expr_checked(arena, *a, args)?
             } else {
-                other
+                eval_expr_checked(arena, *b, args)?
             }
         }
     })
@@ -204,6 +202,29 @@ fn validate_reduction(reduction: &Reduction, items: &[i32], lists: usize) -> Res
             vec![&items_i, &acc_dummy]
         }
     };
+
+    // A conditional body is evaluated lazily at solve (only the selected branch
+    // runs), so a guarded out-of-range index in an unselected branch is never
+    // reached. Validate it the same way -- lazily, over every argument combination
+    // -- instead of checking each index in isolation, which cannot see the guard.
+    //
+    // This is sound only when `body` is the single evaluated root and every binder
+    // has a finite domain. `Scan`/`Windows` also evaluate `step`/`inner` and carry
+    // an unbounded accumulator binder (`Arg(1)`), whose dummy domain would let lazy
+    // evaluation miss an out-of-range access; they keep the conservative static
+    // check below.
+    let has_conditional = arena.iter().any(|node| matches!(node, Expr::IfThenElse(..)));
+    let single_finite_root = matches!(reduction.iterable, Iterable::Items(_) | Iterable::Edges { .. } | Iterable::Pairs(_));
+    if has_conditional && single_finite_root {
+        let mask = args_used(arena, reduction.body);
+        let varying: Vec<usize> = (0..domains.len()).filter(|&s| mask & (1u8 << s) != 0).collect();
+        let mut args = vec![0i64; domains.len()];
+        for_each_combo(&domains, &varying, &mut args, 0, &mut |a| {
+            eval_expr_checked(arena, reduction.body, a)?;
+            Ok(())
+        })?;
+        return Ok(());
+    }
 
     for node in arena {
         match node {

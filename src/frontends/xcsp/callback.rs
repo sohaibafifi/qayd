@@ -24,7 +24,7 @@ use crate::constraints::table::{
 };
 use crate::expr::{self, Expr};
 use crate::ids::VarId;
-use crate::ls::{LocalRhs, LocalSearchSpec};
+use crate::engines::ls::cop::{LocalRhs, LocalSearchSpec};
 use crate::problem::Objective;
 use crate::store::Solver;
 

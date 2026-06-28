@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::collection::{CollectionSolution, IntervalVar, Resource, Schedule};
+use crate::model::list::{CollectionSolution, IntervalVar, Resource, Schedule};
 use crate::mix64;
 
 /// Score of an interval schedule: total constraint violation (bound, precedence,

@@ -8,5 +8,5 @@ mod local_search;
 mod moves;
 mod schedule_ls;
 
-pub(crate) use local_search::solve_collection;
+pub use local_search::solve_collection;
 pub use moves::audit_incremental;

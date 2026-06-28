@@ -12,7 +12,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use crate::collection::{CollectionModel, CollectionSolution, Constraint, Expr, ExprId, Iterable, Op, ReduceOp, Reduction};
+use crate::model::list::{CollectionModel, CollectionSolution, Constraint, Expr, ExprId, Iterable, Op, ReduceOp, Reduction};
 use crate::constraints::graph;
 use crate::constraints::intension;
 use crate::constraints::primitives;
@@ -512,7 +512,7 @@ fn eval_collection_expr_one(arena: &[Expr], id: ExprId, arg0: i64) -> Option<i64
 mod tests {
     use std::sync::{atomic::AtomicBool, Arc};
 
-    use crate::collection::{CollectionModel, Constraint, ExprArena, Iterable, ObjectiveTier, Op, ReduceOp, Reduction};
+    use crate::model::list::{CollectionModel, Constraint, ExprArena, Iterable, ObjectiveTier, Op, ReduceOp, Reduction};
 
     use super::solve_collection;
 

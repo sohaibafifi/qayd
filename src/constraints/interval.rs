@@ -1,4 +1,4 @@
-//! Propagators over structured interval domains (scheduling).
+//! Propagators over interval domains (scheduling).
 
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
@@ -91,12 +91,12 @@ fn present_premise(store: &Store, interval: IntervalId) -> Option<Premise> {
     store.interval_presence_var(interval).map(|var| Premise::Eq { var, val: 1 })
 }
 
-/// Post structured interval precedence.
+/// Post interval precedence.
 pub fn interval_precedence(solver: &mut Solver, before: IntervalId, after: IntervalId) -> PropId {
     solver.post(Box::new(IntervalPrecedence { before, after }))
 }
 
-/// Post structured interval precedence.
+/// Post interval precedence.
 pub fn precedence(solver: &mut Solver, before: IntervalId, after: IntervalId) -> PropId {
     interval_precedence(solver, before, after)
 }
@@ -326,7 +326,7 @@ impl NoOverlap {
     }
 }
 
-/// Post a structured unary-resource no-overlap over the given intervals.
+/// Post a unary-resource no-overlap over the given intervals.
 pub fn no_overlap(solver: &mut Solver, intervals: &[IntervalId]) -> PropId {
     solver.post(Box::new(NoOverlap {
         intervals: intervals.to_vec(),
@@ -498,7 +498,7 @@ impl Propagator for Cumulative {
     }
 }
 
-/// Post a structured cumulative resource: `intervals[k]` uses `demands[k]` units
+/// Post a cumulative resource: `intervals[k]` uses `demands[k]` units
 /// of a resource of `capacity` while running.
 pub fn cumulative(solver: &mut Solver, intervals: &[IntervalId], demands: &[i32], capacity: i32) -> PropId {
     solver.post(Box::new(Cumulative { intervals: intervals.to_vec(), demands: demands.to_vec(), capacity, profile: Vec::new() }))

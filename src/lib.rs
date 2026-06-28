@@ -20,44 +20,33 @@
 //! assert_eq!(count_solutions(&mut solver, &q), 2);
 //! ```
 
-pub mod collection;
 pub mod constraints;
 pub mod domains;
-/// Temporary alias: the integer domain now lives at [`domains::int`]. Kept so
-/// existing `crate::domain::` imports keep working until they migrate.
-pub use domains::int as domain;
 pub mod engines;
 pub mod expr;
+pub mod frontends;
 pub mod ids;
 pub mod lcg;
-pub mod list_ls;
 mod lns;
-/// Temporary alias: the COP local-search engine now lives at
-/// [`engines::ls::cop`]. Kept so existing `crate::ls::` imports keep working
-/// until they migrate.
-pub(crate) use engines::ls::cop as ls;
 pub mod model;
-mod frontends;
 mod parallel;
 mod problem;
 pub mod propagator;
 pub mod search;
 pub mod store;
-pub mod structured;
 pub mod trail;
-/// Temporary alias: the XCSP frontend now lives at [`frontends::xcsp`]. Kept so
-/// existing `qayd::xcsp::` paths (the CLI, tests) keep working.
-pub use frontends::xcsp;
 
+pub use domains::interval::{IntervalEvent, IntervalPresence};
+pub use domains::list::ListEvent;
 pub use expr::Expr;
 pub use ids::{IntervalId, ListId, PropId, VarId};
-pub use structured::{IntervalEvent, IntervalPresence, ListEvent};
-// The collection (list/lambda) IR lives under `qayd::collection::*`; it is not
-// re-exported here because its `Expr` would clash with the intension `Expr`.
+// The list-reduction (list/lambda) IR lives under `qayd::model::list::*`; its
+// `Expr` is intentionally not surfaced at the crate root, where it would clash
+// with the intension `Expr`.
 pub use propagator::{Event, Inconsistency, Propagator};
 pub use search::{
-    count_solutions, first_solution, first_structured_solution, maximize, minimize, optimize_with, solve, solve_interruptible,
-    solve_structured, solve_structured_interruptible, SearchControl, SolveStats, StructuredSolution,
+    count_solutions, first_solution, first_domain_solution, maximize, minimize, optimize_with, solve, solve_interruptible,
+    solve_domains, solve_domains_interruptible, SearchControl, SolveStats, DomainSolution,
 };
 pub use store::{Solver, Store};
 pub use trail::{ReversibleInt, Trail};

@@ -1,6 +1,6 @@
 //! Interval variable declarations.
 
-/// Reference to a structured interval declaration inside [`Model`].
+/// Reference to a interval declaration inside [`Model`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct IntervalVarRef(pub usize);
 

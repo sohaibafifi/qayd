@@ -13,10 +13,10 @@ use std::time::Instant;
 use xcsp3_rust_parser::xcsp_runner::XcspRunner;
 
 use crate::ids::VarId;
-use crate::ls::{solve_fast_cop, LocalSearchOutcome, LocalSearchSpec, LsConfig};
+use crate::engines::ls::cop::{solve_ls, LocalSearchOutcome, LocalSearchSpec, LsConfig};
 use crate::parallel::{normalize_options, solve_cop, solve_csp, worker_roles, CspOutcome, ParallelOutcome};
 use crate::problem::{Objective, Problem};
-use crate::search::{decide_sat_seeded, optimize_fast_seeded, optimize_seeded, SolveStats};
+use crate::search::{decide_sat_seeded, optimize_seeded, SolveStats};
 
 pub use crate::parallel::{Mode, RunOptions};
 
@@ -244,7 +244,7 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
     let has_objective = xcsp.problem.objective.is_some();
     let var_objective = xcsp.problem.var_objective().is_some();
     if options.local_search() && !has_objective {
-        return Err("--fast-cop/--turbo requires a COP instance".to_string());
+        return Err("--ls requires a COP instance".to_string());
     }
     let symbolic_probes_disabled = has_objective && !var_objective && options.probes > 0;
     let options = normalize_options(has_objective, var_objective, options);
@@ -257,7 +257,7 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
         writeln!(w, "c qayd XCSP3").map_err(io_err)?;
         writeln!(w, "c type {kind}").map_err(io_err)?;
         if options.local_search() {
-            writeln!(w, "c mode {}", if options.turbo() { "turbo" } else { "fast-cop" }).map_err(io_err)?;
+            writeln!(w, "c mode ls").map_err(io_err)?;
             writeln!(w, "c effort incumbent").map_err(io_err)?;
         }
         writeln!(w, "c variables {}", xcsp.problem.solver.store.num_vars()).map_err(io_err)?;
@@ -299,13 +299,11 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
         return Ok(());
     }
 
-    // `--turbo` is local-search-first: always run the LS engine (even single
-    // worker). `--fast-cop` keeps its existing dispatch (CP fast path at one
-    // worker, LS portfolio above that).
-    if options.turbo() || (options.local_search() && options.workers > 1) {
+    // `--ls` is local-search-first: always run the LS engine, even single worker.
+    if options.local_search() {
         let XcspProblem { problem, local, output } = xcsp;
-        let result = solve_fast_cop_parallel(problem, local, verbose, stop, w, options)?;
-        write_fast_cop_result(w, &output, result, verbose)?;
+        let result = solve_ls_parallel(problem, local, verbose, stop, w, options)?;
+        write_ls_result(w, &output, result, verbose)?;
     } else if options.workers == 1 {
         solve_single(xcsp, verbose, stop, w, options)?;
     } else if !has_objective {
@@ -328,12 +326,12 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
     Ok(())
 }
 
-enum FastCopMsg {
+enum LsMsg {
     Improved { value: i64, source: &'static str, worker: usize },
     Done(LocalSearchOutcome),
 }
 
-fn solve_fast_cop_parallel<W: Write>(
+fn solve_ls_parallel<W: Write>(
     problem: Problem,
     local: LocalSearchSpec,
     verbose: bool,
@@ -342,9 +340,9 @@ fn solve_fast_cop_parallel<W: Write>(
     options: RunOptions,
 ) -> Result<LocalSearchOutcome, String> {
     let minimizing = problem.objective.as_ref().is_none_or(Objective::minimizing);
-    // `--turbo` turns on the autonomous local-search upgrades (GLS, …); `--fast-cop`
-    // keeps the plain min-conflicts descent.
-    let ls_config = LsConfig { gls: options.turbo(), min_conflicts: options.turbo(), kick_bandit: false };
+    // The `--ls` engine runs the autonomous local-search upgrades: GLS to escape
+    // local minima and min-conflicts value selection on large domains.
+    let ls_config = LsConfig { gls: true, min_conflicts: true, kick_bandit: false };
     let (tx, rx) = mpsc::channel();
     let mut printed = None;
     let mut summary = None;
@@ -357,17 +355,17 @@ fn solve_fast_cop_parallel<W: Write>(
             let local = local.clone();
             scope.spawn(move || {
                 let seed = options.seed.wrapping_add(worker as u64);
-                let result = solve_fast_cop(problem, local, stop, seed, ls_config, |value, _, source| {
-                    let _ = tx.send(FastCopMsg::Improved { value, source, worker });
+                let result = solve_ls(problem, local, stop, seed, ls_config, |value, _, source| {
+                    let _ = tx.send(LsMsg::Improved { value, source, worker });
                 });
-                let _ = tx.send(FastCopMsg::Done(result));
+                let _ = tx.send(LsMsg::Done(result));
             });
         }
         drop(tx);
 
         for msg in rx {
             match msg {
-                FastCopMsg::Improved { value, source, worker, .. }
+                LsMsg::Improved { value, source, worker, .. }
                     if printed.is_none_or(|old| if minimizing { value < old } else { value > old }) =>
                 {
                     printed = Some(value);
@@ -381,8 +379,8 @@ fn solve_fast_cop_parallel<W: Write>(
                         }
                     }
                 }
-                FastCopMsg::Improved { .. } => {}
-                FastCopMsg::Done(result) => merge_fast_cop_result(&mut summary, result, minimizing),
+                LsMsg::Improved { .. } => {}
+                LsMsg::Done(result) => merge_ls_result(&mut summary, result, minimizing),
             }
         }
     });
@@ -401,7 +399,7 @@ fn solve_fast_cop_parallel<W: Write>(
     }))
 }
 
-fn merge_fast_cop_result(summary: &mut Option<LocalSearchOutcome>, mut result: LocalSearchOutcome, minimizing: bool) {
+fn merge_ls_result(summary: &mut Option<LocalSearchOutcome>, mut result: LocalSearchOutcome, minimizing: bool) {
     let Some(current) = summary else {
         *summary = Some(result);
         return;
@@ -419,7 +417,7 @@ fn merge_fast_cop_result(summary: &mut Option<LocalSearchOutcome>, mut result: L
     }
 }
 
-fn write_fast_cop_result<W: Write>(w: &mut W, output: &SolutionOutput, result: LocalSearchOutcome, verbose: bool) -> Result<(), String> {
+fn write_ls_result<W: Write>(w: &mut W, output: &SolutionOutput, result: LocalSearchOutcome, verbose: bool) -> Result<(), String> {
     if verbose {
         writeln!(w, "c local constraints {} functionals {}", result.constraints, result.functionals).map_err(io_err)?;
         if result.unsupported > 0 {
@@ -461,31 +459,17 @@ fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w
         Some(objective) => {
             let minimizing = objective.minimizing();
             let mut io_err: Option<std::io::Error> = None;
-            let source = if options.local_search() { "cp" } else { "sequential" };
-            let (best, stats, complete) = if options.local_search() {
-                optimize_fast_seeded(
-                    &mut solver,
-                    &vars,
-                    objective.search(),
-                    minimizing,
-                    stop,
-                    options.seed,
-                    None,
-                    None,
-                    &[],
-                    None,
-                    |v, _| write_improvement_from(w, verbose, &mut io_err, v, source),
-                )
-            } else {
+            // Single-worker COP is always the proof engine here; `--ls` routes to
+            // the local-search portfolio before reaching this path.
+            let (best, stats, complete) =
                 optimize_seeded(&mut solver, &vars, objective.search(), minimizing, stop, options.seed, None, None, &[], None, |v, _| {
-                    write_improvement_from(w, verbose, &mut io_err, v, source)
-                })
-            };
+                    write_improvement_from(w, verbose, &mut io_err, v, "sequential")
+                });
             if let Some(e) = io_err {
                 return Err(e.to_string());
             }
             let interrupted = stop.load(Ordering::Relaxed);
-            write_optimization_result(w, &output, best, stats, complete && !options.local_search(), interrupted, verbose)
+            write_optimization_result(w, &output, best, stats, complete, interrupted, verbose)
         }
     }
 }

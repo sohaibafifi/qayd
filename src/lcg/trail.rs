@@ -410,14 +410,9 @@ impl<'s> Cdcl<'s> {
         self.clause_sharing = Some(sharing);
     }
 
-    /// Use a shorter restart schedule for incumbent-oriented fast COP search.
+    /// Use a shorter restart schedule to diversify a CSP portfolio worker.
     pub(crate) fn use_fast_restarts(&mut self) {
         self.restart = RestartPolicy::fast();
-    }
-
-    /// Restore the default proof-oriented restart schedule.
-    pub(crate) fn use_default_restarts(&mut self) {
-        self.restart = RestartPolicy::new();
     }
 
     /// Scope exported clauses to the current search cube.

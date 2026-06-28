@@ -1,9 +1,8 @@
 //! Shared Rust model surface: the canonical IR frontends build and engines
 //! read. Declarations split by concern into [`int`], [`list`], [`interval`],
-//! [`objective`]; [`classify`] picks a backend. List reductions still bridge to
-//! `collection` during the migration.
+//! [`objective`]; [`classify`] picks a backend. The list-reduction IR lives
+//! under [`list`].
 
-use crate::collection;
 use crate::expr::Expr;
 
 pub mod classify;
@@ -15,8 +14,14 @@ pub mod objective;
 pub use classify::*;
 pub use int::*;
 pub use interval::*;
-pub use list::*;
 pub use objective::*;
+// The list-reduction IR (CollectionModel, Reduction, Expr, ...) stays under
+// `list::` so its `Expr` does not clash with the intension `Expr`; only the
+// model-level list surface is re-exported at the model root.
+pub use list::{
+    evaluate_list_objectives, list_objective_tiers, list_objectives_better, ListDecl, ListIterable,
+    ListReduceOp, ListReduction, ListReductionConstraint, ListVarRef, ListObjectiveTerm, ListObjectiveTier,
+};
 
 /// Constraint declarations owned by the shared model.
 #[derive(Clone)]
@@ -36,7 +41,7 @@ pub enum Constraint {
     /// Fixed-duration interval precedence.
     IntervalPrecedence { before: IntervalVarRef, after: IntervalVarRef },
     /// Current scheduling resource bridge during migration.
-    IntervalResource(collection::Resource),
+    IntervalResource(list::Resource),
     /// Integer expression constraint.
     Intension(Expr),
 }
@@ -76,7 +81,7 @@ impl Model {
         id
     }
 
-    /// Declare a structured list variable.
+    /// Declare a list variable.
     pub fn list(&mut self, universe: Vec<i32>) -> ListVarRef {
         let id = ListVarRef(self.lists.len());
         self.lists.push(ListDecl { universe });
@@ -104,7 +109,7 @@ impl Model {
     }
 
     /// Mirror the current collection model into the shared model surface.
-    pub fn from_collection(collection_model: &collection::CollectionModel) -> Self {
+    pub fn from_collection(collection_model: &list::CollectionModel) -> Self {
         let mut model = Self::new();
         if let Some(schedule) = &collection_model.schedule {
             let intervals = schedule
@@ -155,10 +160,10 @@ impl Model {
         }
         for global in &collection_model.globals {
             match *global {
-                collection::GlobalConstraint::ListLe { before, after } => {
+                list::GlobalConstraint::ListLe { before, after } => {
                     model.add_constraint(Constraint::ItemPrecedence { lists: lists.clone(), before, after });
                 }
-                collection::GlobalConstraint::SameList { a, b } => {
+                list::GlobalConstraint::SameList { a, b } => {
                     model.add_constraint(Constraint::SameList { lists: lists.clone(), a, b });
                 }
             }
@@ -176,8 +181,8 @@ impl Model {
     }
 }
 
-impl From<&collection::CollectionModel> for Model {
-    fn from(collection_model: &collection::CollectionModel) -> Self {
+impl From<&list::CollectionModel> for Model {
+    fn from(collection_model: &list::CollectionModel) -> Self {
         Self::from_collection(collection_model)
     }
 }

@@ -4,11 +4,11 @@
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct VarId(pub u32);
 
-/// Identifies a structured list domain owned by the [`Store`](crate::store::Store).
+/// Identifies a list domain owned by the [`Store`](crate::store::Store).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct ListId(pub u32);
 
-/// Identifies a structured interval domain owned by the [`Store`](crate::store::Store).
+/// Identifies a interval domain owned by the [`Store`](crate::store::Store).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct IntervalId(pub u32);
 
