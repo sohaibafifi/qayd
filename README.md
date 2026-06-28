@@ -24,7 +24,7 @@ Priority order: correct, simple, fast.
 - **Finite-domain kernel.** Trailed integer domains use sparse sets for compact
   domains, explicit support storage for sparse domains, and reversible bounds
   with trailed holes for wide contiguous ranges.
-- **Support for lists, Intervals and lamdas** 
+- **Lists, intervals, and lambdas.**
 - **XCSP3-core front-end.** Reads CSP and mono-objective COP instances from XML,
   `.lzma`, and `.xz` files and emits XCSP3 competition output. Supported
   families include `intension`, `extension`, `regular`, `mdd`, `allDifferent`,
@@ -64,10 +64,10 @@ Priority order: correct, simple, fast.
   dedicates materialized-objective workers to optimistic probes. `--lns`
   dedicates workers to bounded incumbent-driven [Large Neighborhood
   Search](https://doi.org/10.1007/978-3-319-91086-4_4).
-- **Fast COP mode.** `--fast-cop` is an incumbent-only mode for the Fast COP style of use:
-  it searches for feasible solutions and objective improvements, without trying to prove optimality.
-  It uses local scoring for common constraints, constructive starts for guarded table/element patterns,
-  and  focused repair for simple Boolean exact-cover rows.
+- **Local-search COP engine.** `--ls` searches for feasible COP incumbents and
+  objective improvements without proving optimality. It uses local scoring for
+  common constraints, constructive starts for guarded table/element patterns,
+  guided local search, and focused repair for simple Boolean exact-cover rows.
 - **A beta support for MiniZinc.** The `qayd-fzn` driver speaks the MiniZinc solver protocol,
   so it can be used as a backend for the MiniZinc CLI and IDE. The `--mzn` flag enables some
   MiniZinc-specific behaviour. (see [for details](frontends/flatzinc/minizinc/README.md)).
@@ -106,8 +106,7 @@ Common options:
 - `-v`, `--verbose`: print progress and search statistics.
 - `--seed SEED`: set a reproducible search seed.
 - `-p`, `--threads N`: set worker count.
-- `--fast-cop`: search for good COP incumbents without proving optimality.
-- `--turbo`: use the faster incumbent-focused COP path when applicable.
+- `--ls`: search for good COP incumbents without proving optimality.
 - `--split`, `--probe N`, `--lns N`: optional parallel COP strategies.
 
 ## Python Examples

@@ -151,10 +151,7 @@ pub(crate) struct LocalSearchSpec {
     unsupported: usize,
 }
 
-/// Behaviour toggles for the local-search engine. `--fast-cop` uses the default
-/// (everything off: plain min-conflicts descent); `--turbo` switches on the
-/// autonomous upgrades. New toggles are added here as
-/// each Tier-B feature lands.
+/// Behaviour toggles for the local-search engine selected by `--ls`.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct LsConfig {
     /// Guided Local Search: at a local minimum, penalise the still-violated
@@ -1941,7 +1938,7 @@ where
     let objective_kicks = model.objective_kicks();
     let constructive_start = model.has_extension();
     // GLS penalty weights, one per constraint (all 1 = unweighted min-conflicts).
-    // Only mutated when `config.gls` is on (i.e. `--turbo`); they persist across
+    // Only mutated when `config.gls` is on; they persist across
     // restarts so effort keeps accumulating on the genuinely hard constraints.
     let mut weights: Vec<i64> = vec![1; model.constraints.len()];
     let mut assignment = if constructive_start { model.constructive_assignment(seed) } else { model.random_assignment(seed) };
