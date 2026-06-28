@@ -91,6 +91,27 @@ fn present_premise(store: &Store, interval: IntervalId) -> Option<Premise> {
     store.interval_presence_var(interval).map(|var| Premise::Eq { var, val: 1 })
 }
 
+/// Premises fixing the cumulative mandatory-part profile over `[lo, hi)`: every
+/// present interval (except `except`) whose compulsory region intersects the
+/// window, citing its presence and start bounds. A superset of the minimal cause
+/// is still sound (it only weakens the learned clause), and pinning each start's
+/// bounds pins its compulsory region and hence its contribution to the profile.
+fn cumulative_profile_premises(store: &Store, intervals: &[IntervalId], lo: i32, hi: i32, except: IntervalId) -> Vec<Premise> {
+    let mut why = Vec::new();
+    for &iv in intervals {
+        if iv == except || store.interval_presence(iv) != IntervalPresence::Present {
+            continue;
+        }
+        let (cp_lo, cp_hi) = (store.interval_start_max(iv), store.interval_end_min(iv));
+        if cp_lo < hi && lo < cp_hi {
+            why.extend(present_premise(store, iv));
+            why.push(Premise::Ge { var: store.interval_start_var(iv), bound: store.interval_start_min(iv) });
+            why.push(Premise::Le { var: store.interval_start_var(iv), bound: store.interval_start_max(iv) });
+        }
+    }
+    why
+}
+
 /// Post interval precedence.
 pub fn interval_precedence(solver: &mut Solver, before: IntervalId, after: IntervalId) -> PropId {
     solver.post(Box::new(IntervalPrecedence { before, after }))
@@ -128,6 +149,19 @@ fn decided_before(store: &Store, pair_index: &[Vec<usize>], i: usize, j: usize) 
     let (lo, hi, want) = if i < j { (i, j, 1) } else { (j, i, 2) };
     let order = pair_index[lo][hi];
     order != usize::MAX && store.disjunctive_order(order) == want
+}
+
+/// `[before(i, j)]` as a premise when that order is decided: cites the pair's
+/// boolean order variable at its decided value. `None` if the order is not
+/// decided in the `i`-before-`j` direction.
+fn decided_before_premise(store: &Store, pair_index: &[Vec<usize>], i: usize, j: usize) -> Option<Premise> {
+    let (lo, hi, want) = if i < j { (i, j, 1) } else { (j, i, 2) };
+    let order = pair_index[lo][hi];
+    if order == usize::MAX || store.disjunctive_order(order) != want {
+        return None;
+    }
+    // order() == 1 means the var is 1 (first-before-second); == 2 means var 0.
+    Some(Premise::Eq { var: store.disjunctive_order_var(order), val: if want == 1 { 1 } else { 0 } })
 }
 
 /// Enforce `before` ends no later than `after` starts on the start bounds (both
@@ -320,7 +354,27 @@ impl NoOverlap {
                 let i = self.intervals[pi];
                 ect = ect.max(store.interval_start_min(i)).saturating_add(store.interval_duration(i));
             }
-            changed |= store.set_interval_start_min(j, ect)?;
+            // j must start no earlier than the set's earliest completion. Cite j
+            // present; for each predecessor, its presence, why it precedes j (a
+            // decided order, or it cannot fit after j -- its latest start is before
+            // j's earliest end), and its start lower bound, which feeds the ECT.
+            let mut why: Vec<Premise> = present_premise(store, j).into_iter().collect();
+            let mut uses_j_end_min = false;
+            for &pi in &self.prec {
+                let i = self.intervals[pi];
+                why.extend(present_premise(store, i));
+                if let Some(order) = decided_before_premise(store, &self.pair_index, pi, qj) {
+                    why.push(order);
+                } else {
+                    why.push(Premise::Le { var: store.interval_start_var(i), bound: store.interval_start_max(i) });
+                    uses_j_end_min = true;
+                }
+                why.push(Premise::Ge { var: store.interval_start_var(i), bound: store.interval_start_min(i) });
+            }
+            if uses_j_end_min {
+                why.push(Premise::Ge { var: store.interval_start_var(j), bound: store.interval_start_min(j) });
+            }
+            changed |= store.set_interval_start_min_because(j, ect, why)?;
         }
         Ok(changed)
     }
@@ -436,9 +490,25 @@ impl Propagator for Cumulative {
                     self.profile[(t - hmin) as usize] += self.demands[idx];
                 }
             }
-            for &usage in &self.profile {
+            for (offset, &usage) in self.profile.iter().enumerate() {
                 if usage > self.capacity {
-                    return Err(Inconsistency);
+                    // Overload at instant `t`: cite every present interval whose
+                    // compulsory region must cover `t` (it is present, its start is
+                    // at most `start_max`, and at least `start_min`, which together
+                    // force it to run at `t`). Their demands exceed the capacity.
+                    let t = hmin + offset as i32;
+                    let mut why = Vec::new();
+                    for &interval in &self.intervals {
+                        if store.interval_presence(interval) != IntervalPresence::Present {
+                            continue;
+                        }
+                        if store.interval_start_max(interval) <= t && t < store.interval_end_min(interval) {
+                            why.extend(present_premise(store, interval));
+                            why.push(Premise::Ge { var: store.interval_start_var(interval), bound: store.interval_start_min(interval) });
+                            why.push(Premise::Le { var: store.interval_start_var(interval), bound: store.interval_start_max(interval) });
+                        }
+                    }
+                    return Err(store.fail_because(why));
                 }
             }
 
@@ -478,14 +548,35 @@ impl Propagator for Cumulative {
                     break;
                 }
 
+                let present = store.interval_presence(interval) == IntervalPresence::Present;
                 match feasible {
                     Some(start) => {
                         if start > smin {
-                            changed |= store.set_interval_start_min(interval, start)?;
+                            if present {
+                                // Positions `[smin, start)` overload, so a present
+                                // interval must start no earlier than `start`. Cite
+                                // its presence, its current lower bound, and the
+                                // present intervals fixing the profile there.
+                                let mut why = cumulative_profile_premises(store, &self.intervals, smin, start + duration, interval);
+                                why.extend(present_premise(store, interval));
+                                why.push(Premise::Ge { var: store.interval_start_var(interval), bound: smin });
+                                changed |= store.set_interval_start_min_because(interval, start, why)?;
+                            } else {
+                                // Optional, undecided: the bound is conditional on a
+                                // presence not yet asserted; keep the loose reason.
+                                changed |= store.set_interval_start_min(interval, start)?;
+                            }
                         }
                     }
                     None => match store.interval_presence(interval) {
-                        IntervalPresence::Present => return Err(Inconsistency),
+                        IntervalPresence::Present => {
+                            // A present interval fits nowhere in its window.
+                            let mut why = cumulative_profile_premises(store, &self.intervals, smin, smax + duration, interval);
+                            why.extend(present_premise(store, interval));
+                            why.push(Premise::Ge { var: store.interval_start_var(interval), bound: smin });
+                            why.push(Premise::Le { var: store.interval_start_var(interval), bound: smax });
+                            return Err(store.fail_because(why));
+                        }
                         IntervalPresence::Optional => changed |= store.forbid_interval_presence(interval)?,
                         IntervalPresence::Absent => {}
                     },
@@ -542,20 +633,45 @@ impl Propagator for ExactlyOneMode {
                     IntervalPresence::Absent => {}
                 }
             }
-            if present > 1 || non_absent == 0 {
-                return Err(Inconsistency);
+            if present > 1 {
+                // Two modes present at once: cite each present mode's presence.
+                let why = self
+                    .modes
+                    .iter()
+                    .filter(|&&m| store.interval_presence(m) == IntervalPresence::Present)
+                    .filter_map(|&m| store.interval_presence_var(m).map(|var| Premise::Eq { var, val: 1 }))
+                    .collect();
+                return Err(store.fail_because(why));
+            }
+            if non_absent == 0 {
+                // Every mode forbidden: cite each mode's absence.
+                let why =
+                    self.modes.iter().filter_map(|&m| store.interval_presence_var(m).map(|var| Premise::Eq { var, val: 0 })).collect();
+                return Err(store.fail_because(why));
             }
             let mut changed = false;
             if present == 1 {
-                // A mode is chosen: forbid every other (still optional) mode.
+                // A mode is chosen: forbid every other (still optional) mode,
+                // because that mode is present.
+                let chosen = self.modes.iter().copied().find(|&m| store.interval_presence(m) == IntervalPresence::Present).unwrap();
+                let chosen_present: Vec<Premise> =
+                    store.interval_presence_var(chosen).map(|var| Premise::Eq { var, val: 1 }).into_iter().collect();
                 for &mode in &self.modes {
                     if store.interval_presence(mode) == IntervalPresence::Optional {
-                        changed |= store.forbid_interval_presence(mode)?;
+                        changed |= store.forbid_interval_presence_because(mode, chosen_present.clone())?;
                     }
                 }
             } else if non_absent == 1 {
-                // Only one candidate remains: it must be present.
-                changed |= store.require_interval_presence(self.modes[last_non_absent.unwrap()])?;
+                // Only one candidate remains: it must be present, because every
+                // other mode is absent.
+                let last = self.modes[last_non_absent.unwrap()];
+                let why = self
+                    .modes
+                    .iter()
+                    .filter(|&&m| m != last)
+                    .filter_map(|&m| store.interval_presence_var(m).map(|var| Premise::Eq { var, val: 0 }))
+                    .collect();
+                changed |= store.require_interval_presence_because(last, why)?;
             }
             if !changed {
                 return Ok(());

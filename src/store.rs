@@ -18,12 +18,6 @@ struct VarSubs {
     entries: Vec<(Event, PropId)>,
 }
 
-/// Per-list subscriptions and their event granularity.
-#[derive(Clone, Default)]
-struct ListSubs {
-    entries: Vec<(ListEvent, PropId)>,
-}
-
 /// A primary domain change, in domain terms, for the LCG layer to pick up.
 /// Inert unless an LCG engine drains it; plain FD search never reads it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -99,7 +93,6 @@ pub struct Store {
     interval_domains: Vec<IntervalDomain>,
     trail: Trail,
     subs: Vec<VarSubs>,
-    list_subs: Vec<ListSubs>,
     /// Variables used by at least one propagator, including root-only filters.
     relevant: Vec<bool>,
     /// Propagators waiting to run.
@@ -243,10 +236,18 @@ impl Store {
 
     /// Create a list domain over a fixed item universe.
     pub fn new_list(&mut self, universe: Vec<i32>) -> ListId {
+        assert!(i32::try_from(universe.len()).is_ok(), "list universe is too large");
+        let mut sorted = universe.clone();
+        sorted.sort_unstable();
+        assert!(sorted.windows(2).all(|w| w[0] != w[1]), "list universe contains duplicate items");
+        let n = universe.len();
+        // One boolean membership variable per item: 1 = in the list, 0 = excluded.
+        let members: Vec<VarId> = (0..n).map(|_| self.new_var_range(0, 1)).collect();
+        // The length variable; `sum(members) == length` is the ListCardinality
+        // propagator's job, posted per list at build time.
+        let length = self.new_var_range(0, n as i32);
         let id = ListId(self.list_domains.len() as u32);
-        let dom = ListDomain::new(universe, &mut self.trail);
-        self.list_domains.push(dom);
-        self.list_subs.push(ListSubs::default());
+        self.list_domains.push(ListDomain { universe, members, length });
         id
     }
 
@@ -350,32 +351,41 @@ impl Store {
 
     /// Structured list length lower bound.
     pub fn list_len_min(&self, list: ListId) -> usize {
-        self.list_domains[list.index()].len_min(&self.trail)
+        self.min(self.list_domains[list.index()].length).max(0) as usize
     }
 
     /// Structured list length upper bound.
     pub fn list_len_max(&self, list: ListId) -> usize {
-        self.list_domains[list.index()].len_max(&self.trail)
+        self.max(self.list_domains[list.index()].length).max(0) as usize
     }
 
-    /// Whether `item` can still appear in `list`.
+    /// The integer length variable backing `list`.
+    pub fn list_length_var(&self, list: ListId) -> VarId {
+        self.list_domains[list.index()].length
+    }
+
+    /// Whether `item` can still appear in `list` (its membership variable still
+    /// admits `1`).
     pub fn list_possible(&self, list: ListId, item: i32) -> bool {
-        self.list_domains[list.index()].is_possible(item, &self.trail)
+        self.list_domains[list.index()].index_of(item).is_some_and(|i| self.contains(self.list_domains[list.index()].members[i], 1))
     }
 
-    /// Whether `item` must appear in `list`.
+    /// Whether `item` must appear in `list` (its membership variable is fixed to `1`).
     pub fn list_required(&self, list: ListId, item: i32) -> bool {
-        self.list_domains[list.index()].is_required(item, &self.trail)
+        self.list_domains[list.index()].index_of(item).is_some_and(|i| {
+            let var = self.list_domains[list.index()].members[i];
+            self.is_fixed(var) && self.value(var) == 1
+        })
     }
 
     /// Current count of possible items in `list`.
     pub fn list_possible_count(&self, list: ListId) -> usize {
-        self.list_domains[list.index()].possible_count(&self.trail)
+        self.list_domains[list.index()].members.iter().filter(|&&m| self.contains(m, 1)).count()
     }
 
     /// Current count of required items in `list`.
     pub fn list_required_count(&self, list: ListId) -> usize {
-        self.list_domains[list.index()].required_count(&self.trail)
+        self.list_domains[list.index()].members.iter().filter(|&&m| self.is_fixed(m) && self.value(m) == 1).count()
     }
 
     /// Interval start lower bound.
@@ -479,44 +489,92 @@ impl Store {
         Ok(())
     }
 
-    /// Require an item in a list.
+    /// Require an item in a list (fix its membership variable to `1`). The
+    /// length/membership coupling is enforced separately by `ListCardinality`.
     pub fn require_list_item(&mut self, list: ListId, item: i32) -> Result<bool, Inconsistency> {
-        let before = self.list_state(list);
-        let changed = self.list_domains[list.index()].require_item(item, &mut self.trail)?;
-        if changed {
-            self.after_list_change(list, before);
+        let Some(i) = self.list_domains[list.index()].index_of(item) else {
+            return Err(Inconsistency);
+        };
+        let member = self.list_domains[list.index()].members[i];
+        if self.is_fixed(member) {
+            return if self.value(member) == 1 { Ok(false) } else { Err(Inconsistency) };
         }
-        Ok(changed)
+        self.fix(member, 1)?;
+        Ok(true)
     }
 
-    /// Forbid an item from a list.
+    /// Forbid an item from a list (fix its membership variable to `0`).
     pub fn forbid_list_item(&mut self, list: ListId, item: i32) -> Result<bool, Inconsistency> {
-        let before = self.list_state(list);
-        let changed = self.list_domains[list.index()].forbid_item(item, &mut self.trail)?;
-        if changed {
-            self.after_list_change(list, before);
+        let Some(i) = self.list_domains[list.index()].index_of(item) else {
+            return Ok(false);
+        };
+        let member = self.list_domains[list.index()].members[i];
+        if self.is_fixed(member) {
+            return if self.value(member) == 0 { Ok(false) } else { Err(Inconsistency) };
         }
-        Ok(changed)
+        self.fix(member, 0)?;
+        Ok(true)
     }
 
-    /// Raise a list length lower bound.
+    /// Raise a list length lower bound (on the length variable).
     pub fn set_list_len_min(&mut self, list: ListId, min: usize) -> Result<bool, Inconsistency> {
-        let before = self.list_state(list);
-        let changed = self.list_domains[list.index()].set_len_min(min, &mut self.trail)?;
-        if changed {
-            self.after_list_change(list, before);
-        }
-        Ok(changed)
+        let length = self.list_domains[list.index()].length;
+        let before = self.min(length);
+        self.remove_below(length, min as i32)?;
+        Ok(self.min(length) != before)
     }
 
-    /// Lower a list length upper bound.
+    /// Lower a list length upper bound (on the length variable).
     pub fn set_list_len_max(&mut self, list: ListId, max: usize) -> Result<bool, Inconsistency> {
-        let before = self.list_state(list);
-        let changed = self.list_domains[list.index()].set_len_max(max, &mut self.trail)?;
-        if changed {
-            self.after_list_change(list, before);
+        let length = self.list_domains[list.index()].length;
+        let before = self.max(length);
+        self.remove_above(length, max as i32)?;
+        Ok(self.max(length) != before)
+    }
+
+    /// The boolean membership variable of `item` in `list` (`None` if `item` is
+    /// not in the list's universe).
+    pub fn list_member_var(&self, list: ListId, item: i32) -> Option<VarId> {
+        let dom = &self.list_domains[list.index()];
+        dom.index_of(item).map(|i| dom.members[i])
+    }
+
+    /// [`require_list_item`](Store::require_list_item), explained by `why`. The
+    /// opposite-of-decided conflict cites the current membership, like the
+    /// explained interval presence mutator.
+    pub fn require_list_item_because(&mut self, list: ListId, item: i32, why: Vec<Premise>) -> Result<bool, Inconsistency> {
+        let Some(i) = self.list_domains[list.index()].index_of(item) else {
+            return Err(self.fail_because(why));
+        };
+        let member = self.list_domains[list.index()].members[i];
+        if self.is_fixed(member) {
+            if self.value(member) == 1 {
+                return Ok(false);
+            }
+            let mut conflict = why;
+            conflict.push(Premise::Eq { var: member, val: 0 });
+            return Err(self.fail_because(conflict));
         }
-        Ok(changed)
+        self.fix_because(member, 1, why)?;
+        Ok(true)
+    }
+
+    /// [`forbid_list_item`](Store::forbid_list_item), explained by `why`.
+    pub fn forbid_list_item_because(&mut self, list: ListId, item: i32, why: Vec<Premise>) -> Result<bool, Inconsistency> {
+        let Some(i) = self.list_domains[list.index()].index_of(item) else {
+            return Ok(false);
+        };
+        let member = self.list_domains[list.index()].members[i];
+        if self.is_fixed(member) {
+            if self.value(member) == 0 {
+                return Ok(false);
+            }
+            let mut conflict = why;
+            conflict.push(Premise::Eq { var: member, val: 1 });
+            return Err(self.fail_because(conflict));
+        }
+        self.fix_because(member, 0, why)?;
+        Ok(true)
     }
 
     /// Raise an interval start lower bound.
@@ -747,23 +805,6 @@ impl Store {
         Ok(())
     }
 
-    fn list_state(&self, list: ListId) -> (usize, usize, usize, usize) {
-        (self.list_possible_count(list), self.list_required_count(list), self.list_len_min(list), self.list_len_max(list))
-    }
-
-    fn after_list_change(&mut self, list: ListId, before: (usize, usize, usize, usize)) {
-        let after = self.list_state(list);
-        if after.0 != before.0 {
-            self.notify_list(list, ListEvent::PossibleChange);
-        }
-        if after.1 != before.1 {
-            self.notify_list(list, ListEvent::RequiredChange);
-        }
-        if after.2 != before.2 || after.3 != before.3 {
-            self.notify_list(list, ListEvent::LengthChange);
-        }
-    }
-
     // --- propagator-owned reversible state ---
     //
     // Incremental propagator state that must be restored on backtrack.
@@ -802,9 +843,24 @@ impl Store {
     /// Subscribe `prop` to list changes at the given granularity.
     /// Idempotent per (list, prop, event).
     pub fn subscribe_list(&mut self, list: ListId, prop: PropId, event: ListEvent) {
-        let s = &mut self.list_subs[list.index()];
-        if !s.entries.contains(&(event, prop)) {
-            s.entries.push((event, prop));
+        match event {
+            // Membership facts are backed by the per-item variables, so wake on
+            // their `Fix` events (set by the brancher or the learning engine).
+            ListEvent::PossibleChange | ListEvent::RequiredChange => {
+                let members = self.list_domains[list.index()].members.clone();
+                for member in members {
+                    self.subscribe(member, prop, Event::Fix);
+                }
+            }
+            // The length is backed by a variable, so wake on its bound changes.
+            ListEvent::LengthChange => {
+                let length = self.list_domains[list.index()].length;
+                self.subscribe(length, prop, Event::BoundChange);
+            }
+            // Order events are not wired to any backing variable yet (no order
+            // propagator subscribes to them); they will map onto position/successor
+            // variables when list order lands.
+            ListEvent::ArcChange | ListEvent::PositionChange => {}
         }
     }
 
@@ -899,17 +955,6 @@ impl Store {
         let s = &subs[var.index()];
         for &(event, p) in &s.entries {
             if event == Event::DomainChange || (bounds_moved && event == Event::BoundChange) || (fixed && event == Event::Fix) {
-                Self::wake(queue, enqueued, *current, p);
-            }
-        }
-    }
-
-    /// Wake subscribers of a list event.
-    fn notify_list(&mut self, list: ListId, changed: ListEvent) {
-        let Store { list_subs, queue, enqueued, current, .. } = self;
-        let s = &list_subs[list.index()];
-        for &(event, p) in &s.entries {
-            if event == changed {
                 Self::wake(queue, enqueued, *current, p);
             }
         }
