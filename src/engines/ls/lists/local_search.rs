@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::eval::{eval_reduction, violation_of, INFEASIBLE};
-use super::model::{
+use crate::collection::{
     CollectionModel, CollectionSolution, Constraint, Expr, ExprId, GlobalConstraint, Iterable, ReduceOp, Reduction, MAX_TIERS,
 };
 use super::moves::{apply_move, best_improving_move, better, random_kick, shuffle, snapshot, SearchMemory};

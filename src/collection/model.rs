@@ -198,7 +198,7 @@ pub enum GlobalConstraint {
 }
 
 impl GlobalConstraint {
-    pub(super) fn items(&self) -> [i32; 2] {
+    pub(crate) fn items(&self) -> [i32; 2] {
         match *self {
             GlobalConstraint::ListLe { before, after } => [before, after],
             GlobalConstraint::SameList { a, b } => [a, b],

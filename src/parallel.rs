@@ -19,7 +19,7 @@ use crate::store::Solver;
 
 /// Search strategy selected on the command line. `FastCop` and `Turbo` are both
 /// local-search-first incumbent modes (no optimality proof); `Turbo` additionally
-/// enables the autonomous local-search upgrades (see TURBO.md). They are mutually
+/// enables the autonomous local-search upgrades. They are mutually
 /// exclusive, so they live in one enum rather than separate booleans.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Mode {
@@ -28,7 +28,7 @@ pub enum Mode {
     Default,
     /// Incumbent-only local search; do not try to prove optimality.
     FastCop,
-    /// Autonomous local-search-first mode (incumbent-only). See TURBO.md.
+    /// Autonomous local-search-first mode (incumbent-only).
     Turbo,
 }
 

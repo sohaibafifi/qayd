@@ -22,14 +22,20 @@
 
 pub mod collection;
 pub mod constraints;
-pub mod domain;
+pub mod domains;
+/// Temporary alias: the integer domain now lives at [`domains::int`]. Kept so
+/// existing `crate::domain::` imports keep working until they migrate.
+pub use domains::int as domain;
 pub mod engines;
 pub mod expr;
 pub mod ids;
 pub mod lcg;
 pub mod list_ls;
 mod lns;
-mod ls;
+/// Temporary alias: the COP local-search engine now lives at
+/// [`engines::ls::cop`]. Kept so existing `crate::ls::` imports keep working
+/// until they migrate.
+pub(crate) use engines::ls::cop as ls;
 pub mod model;
 mod parallel;
 mod problem;

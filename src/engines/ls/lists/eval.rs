@@ -1,4 +1,4 @@
-use super::model::{Expr, ExprId, Iterable, Op, ReduceOp, Reduction};
+use crate::collection::{Expr, ExprId, Iterable, Op, ReduceOp, Reduction};
 
 /// Violation weight for an undefined reduction (empty `min`/`max`) or a broken
 /// constraint operand, large enough to dominate any real objective.

@@ -153,20 +153,20 @@ pub(crate) struct LocalSearchSpec {
 
 /// Behaviour toggles for the local-search engine. `--fast-cop` uses the default
 /// (everything off: plain min-conflicts descent); `--turbo` switches on the
-/// autonomous upgrades. See TURBO.md (Tier-B). New toggles are added here as
+/// autonomous upgrades. New toggles are added here as
 /// each Tier-B feature lands.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct LsConfig {
     /// Guided Local Search: at a local minimum, penalise the still-violated
     /// constraints (bump their weights) so search is pushed off the plateau and
-    /// toward the genuinely hard constraints. TURBO.md §4.2 / #2.
+    /// toward the genuinely hard constraints.
     pub(crate) gls: bool,
     /// Min-conflicts value selection: on large domains, evaluate a small candidate
     /// set (current value + structure-suggested values + random samples) instead
     /// of scanning the whole domain, so more variables are tried per iteration.
-    /// Only bites when a domain exceeds `MIN_CONFLICTS_FULL`. TURBO.md #1b.
+    /// Only bites when a domain exceeds `MIN_CONFLICTS_FULL`.
     pub(crate) min_conflicts: bool,
-    /// Adaptive operator selection over the existing LS kicks. TURBO.md #5b.
+    /// Adaptive operator selection over the existing LS kicks.
     pub(crate) kick_bandit: bool,
 }
 
@@ -2136,7 +2136,7 @@ where
         // constraints in `affected[j]` against a reused `work` buffer, instead of
         // cloning the assignment and rescoring every constraint. `complete()` still
         // runs in full (functional targets are folded into `affected[j]`, so the
-        // delta over those constraints is exact). See TURBO.md §4.1 / first PR.
+        // delta over those constraints is exact).
         let best_move = best_single_variable_move(
             &model,
             &assignment,
