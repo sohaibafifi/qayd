@@ -6,19 +6,25 @@
 
 <p align="center">Yet another constraint-programming solver, in Rust.</p>
 
----
+## What It Is
 
-`qayd` solves CSP and COP instances over **integer variables with finite domains**.
-It pairs a finite-domain propagation engine with a CDCL search that learns from
-conflicts. The target constraint catalogue is [XCSP3-core](https://xcsp.org).
+`qayd` solves constraint satisfaction and optimization problems over finite
+integer domains. The core solver has trailed domains, propagators, search, Lazy
+Clause Generation, and optional parallel search.
 
-Priorities, in order: **correct, then simple, then fast.**
+The project also has an experimental list-domain engine for list-style models:
+routes, bins, ordered assignments, and scheduling prototypes. That engine is
+used by the Python examples and is being shaped toward list, lambda, and
+partition modeling.
+
+Priority order: correct, simple, fast.
 
 ## Features
 
 - **Finite-domain kernel.** Trailed integer domains use sparse sets for compact
   domains, explicit support storage for sparse domains, and reversible bounds
   with trailed holes for wide contiguous ranges.
+- **Support for lists, Intervals and lamdas** 
 - **XCSP3-core front-end.** Reads CSP and mono-objective COP instances from XML,
   `.lzma`, and `.xz` files and emits XCSP3 competition output. Supported
   families include `intension`, `extension`, `regular`, `mdd`, `allDifferent`,
@@ -40,8 +46,8 @@ Priorities, in order: **correct, then simple, then fast.**
   watched clauses, [LBD](https://www.ijcai.org/Proceedings/09/Papers/074.pdf)
   reduction, [dom/wdeg](https://dl.acm.org/doi/10.5555/3000001.3000033),
   [VSIDS](https://doi.org/10.1145/378239.379017), phase saving, and restarts.
-  A lone sequential search periodically *rephases* — every few restarts it
-  ignores saved phases and dives with the inverted polarity — to escape regions
+  A lone sequential search periodically *rephases*: every few restarts it
+  ignores saved phases and dives with the inverted polarity to escape regions
   the saved phase keeps pulling it back to (this finds first solutions on
   feasibility-hard COP instances that otherwise time out). Sparse domains
   allocate atoms by support; wide domains allocate shared atoms on demand. Short
@@ -58,57 +64,77 @@ Priorities, in order: **correct, then simple, then fast.**
   dedicates materialized-objective workers to optimistic probes. `--lns`
   dedicates workers to bounded incumbent-driven [Large Neighborhood
   Search](https://doi.org/10.1007/978-3-319-91086-4_4).
-- **Fast COP mode.** `--fast-cop` is an incumbent-only mode for the Fast COP style of use: 
-it searches for feasible solutions and objective improvements, without trying to prove optimality. 
-It uses local scoring for common constraints, constructive starts for guarded table/element patterns, 
-and  focused repair for simple Boolean exact-cover rows.
-- **A beta support for MiniZinc.** The `qayd-fzn` driver speaks the MiniZinc solver protocol, 
-so it can be used as a backend for the MiniZinc CLI and IDE. The `--mzn` flag enables some 
-MiniZinc-specific behaviour. (see [for details](frontends/flatzinc/minizinc/README.md)).
+- **Fast COP mode.** `--fast-cop` is an incumbent-only mode for the Fast COP style of use:
+  it searches for feasible solutions and objective improvements, without trying to prove optimality.
+  It uses local scoring for common constraints, constructive starts for guarded table/element patterns,
+  and  focused repair for simple Boolean exact-cover rows.
+- **A beta support for MiniZinc.** The `qayd-fzn` driver speaks the MiniZinc solver protocol,
+  so it can be used as a backend for the MiniZinc CLI and IDE. The `--mzn` flag enables some
+  MiniZinc-specific behaviour. (see [for details](frontends/flatzinc/minizinc/README.md)).
 
-## Build
+## Entry Points
+
+- `qayd`: CLI for XCSP3 instances, including `.xml`, `.xml.lzma`, and `.xz`.
+- `qayd-fzn`: beta FlatZinc driver for MiniZinc.
+- Rust crate: direct finite-domain modeling and solver internals.
+- Python module: modeling experiments, especially list, lambda, and routing
+  examples.
+
+## Build And Test
 
 ```bash
-cargo build --release
+cargo build
 cargo test
+cargo clippy --all-targets -- -D warnings
 ```
 
-## Solve an instance
+Python extension checks:
 
 ```bash
-qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--fast-cop] [--split] [--probe N] [--lns N] [--learn-csp] <instance.xml[.lzma|.xz]>
+cargo clippy --all-targets --features python -- -D warnings
 ```
 
-- `-h`, `--help` prints the usage.
-- `-v`, `--verbose` emits `c` comment lines (model size, search stats, wall time, incumbent source).
-- `-t SECONDS`, `--time SECONDS` stops after a time budget, reporting the best solution so far.
-- `--seed SEED` sets the reproducible search seed. It defaults to `RANDOMSEED`, then `0`.
-- `-p THREADS`, `--threads THREADS` sets the portfolio worker count (CSP and COP). It defaults to `NBCORE`, then `1`.
-- `--fast-cop` searches for good COP incumbents only. It does not prove optimality and defaults to a 240 second limit when `-t` is omitted.
-- `--split` divides COP proof search into disjoint jobs for worker stealing.
-- `--probe N` dedicates up to `N` COP workers to optimistic objective probes.
-- `--lns N` dedicates up to `N` COP workers to bounded Large Neighborhood Search.
-- `--learn-csp` is accepted for compatibility but has no effect: CSP find-one/UNSAT always uses CDCL learning and restarts.
+## CLI
 
-## As a library
+```bash
+cargo run --bin qayd -- [options] <instance.xml[.lzma|.xz]>
+```
 
-```rust
-use qayd::constraints::primitives::not_equal_offset;
-use qayd::{count_solutions, Solver, VarId};
+Common options:
 
-// 4-Queens: count the solutions.
-let n = 4;
-let mut solver = Solver::new();
-let q: Vec<VarId> = (0..n).map(|_| solver.new_var_range(0, n - 1)).collect();
-for i in 0..n as usize {
-    for j in (i + 1)..n as usize {
-        let (di, dj) = (i as i32, j as i32);
-        not_equal_offset(&mut solver, q[i], q[j], 0);
-        not_equal_offset(&mut solver, q[i], q[j], di - dj);
-        not_equal_offset(&mut solver, q[i], q[j], dj - di);
-    }
-}
-assert_eq!(count_solutions(&mut solver, &q), 2);
+- `-t`, `--time SECONDS`: stop after a time limit.
+- `-v`, `--verbose`: print progress and search statistics.
+- `--seed SEED`: set a reproducible search seed.
+- `-p`, `--threads N`: set worker count.
+- `--fast-cop`: search for good COP incumbents without proving optimality.
+- `--turbo`: use the faster incumbent-focused COP path when applicable.
+- `--split`, `--probe N`, `--lns N`: optional parallel COP strategies.
+
+## Python Examples
+
+The Python examples are the easiest way to inspect the list-domain modeling API:
+
+```bash
+uv run examples/python/vrp.py
+uv run examples/python/cvrptw.py
+uv run examples/python/bin_packing.py
+```
+
+Typical list model shape:
+
+```python
+import qayd as cp
+
+model = cp.Model()
+routes = model.list_vars(customers, count=k)
+
+for route in routes:
+    model.add(cp.sum(route, lambda i: demand[i]) <= capacity)
+
+model.minimize(
+    cp.sum(cp.sum_edges(r, lambda i, j: dist[i][j], start=0, end=0) for r in routes)
+)
+solution = model.solve(time_limit=30)
 ```
 
 ## License

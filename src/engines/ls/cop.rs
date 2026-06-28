@@ -1,4 +1,4 @@
-//! Incumbent-only local search for `--fast-cop` runs.
+//! Incumbent-only local search for the `--ls` COP engine.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -105,6 +105,7 @@ pub(crate) enum LocalConstraint {
     Precedence {
         vars: Vec<VarId>,
         values: Vec<i32>,
+        covered: bool,
     },
     Circuit(Vec<VarId>),
     BinPacking {
@@ -152,19 +153,21 @@ pub(crate) struct LocalSearchSpec {
 
 /// Behaviour toggles for the local-search engine. `--fast-cop` uses the default
 /// (everything off: plain min-conflicts descent); `--turbo` switches on the
-/// autonomous upgrades. See TURBO.md (Tier-B). New toggles are added here as
+/// autonomous upgrades. New toggles are added here as
 /// each Tier-B feature lands.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct LsConfig {
     /// Guided Local Search: at a local minimum, penalise the still-violated
     /// constraints (bump their weights) so search is pushed off the plateau and
-    /// toward the genuinely hard constraints. TURBO.md §4.2 / #2.
+    /// toward the genuinely hard constraints.
     pub(crate) gls: bool,
     /// Min-conflicts value selection: on large domains, evaluate a small candidate
     /// set (current value + structure-suggested values + random samples) instead
     /// of scanning the whole domain, so more variables are tried per iteration.
-    /// Only bites when a domain exceeds `MIN_CONFLICTS_FULL`. TURBO.md #1b.
+    /// Only bites when a domain exceeds `MIN_CONFLICTS_FULL`.
     pub(crate) min_conflicts: bool,
+    /// Adaptive operator selection over the existing LS kicks.
+    pub(crate) kick_bandit: bool,
 }
 
 pub(crate) struct LocalSearchOutcome {
@@ -181,6 +184,77 @@ pub(crate) struct LocalSearchOutcome {
 struct Score {
     violation: i64,
     objective: i64,
+}
+
+// Restart is deliberately NOT a bandit operator - see the stagnation fallback in
+// the search loop. These are the refine operators the bandit chooses among.
+const KICK_OPERATOR_COUNT: usize = 3;
+
+#[derive(Clone, Copy)]
+enum KickOperator {
+    Repair,
+    Objective,
+    Constructive,
+}
+
+impl KickOperator {
+    fn index(self) -> usize {
+        match self {
+            Self::Repair => 0,
+            Self::Objective => 1,
+            Self::Constructive => 2,
+        }
+    }
+
+    fn source(self) -> &'static str {
+        match self {
+            Self::Repair | Self::Objective => "local-search",
+            Self::Constructive => "constructive",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct KickBandit {
+    pulls: [u64; KICK_OPERATOR_COUNT],
+    rewards: [f64; KICK_OPERATOR_COUNT],
+    total: u64,
+}
+
+impl KickBandit {
+    fn new() -> Self {
+        Self { pulls: [0; KICK_OPERATOR_COUNT], rewards: [0.0; KICK_OPERATOR_COUNT], total: 0 }
+    }
+
+    fn select(&self, available: &[KickOperator], seed: u64, iter: u64) -> KickOperator {
+        let untried = available.iter().copied().filter(|op| self.pulls[op.index()] == 0).collect::<Vec<_>>();
+        if !untried.is_empty() {
+            return untried[mix64(seed ^ iter ^ 0x5B) as usize % untried.len()];
+        }
+        let total = self.total.max(1) as f64;
+        available
+            .iter()
+            .copied()
+            .max_by(|&a, &b| {
+                let sa = self.ucb_score(a, total);
+                let sb = self.ucb_score(b, total);
+                sa.total_cmp(&sb)
+            })
+            .unwrap_or(KickOperator::Repair)
+    }
+
+    fn record(&mut self, op: KickOperator, reward: f64) {
+        let i = op.index();
+        self.pulls[i] += 1;
+        self.rewards[i] += reward;
+        self.total += 1;
+    }
+
+    fn ucb_score(&self, op: KickOperator, total: f64) -> f64 {
+        let i = op.index();
+        let pulls = self.pulls[i] as f64;
+        self.rewards[i] / pulls + (2.0 * total.ln() / pulls).sqrt()
+    }
 }
 
 #[derive(Clone)]
@@ -668,8 +742,8 @@ impl LocalSearchSpec {
         self.constraints.push(LocalConstraint::ChannelOneHot { xs, value, start_index });
     }
 
-    pub(crate) fn add_precedence(&mut self, vars: Vec<VarId>, values: Vec<i32>) {
-        self.constraints.push(LocalConstraint::Precedence { vars, values });
+    pub(crate) fn add_precedence(&mut self, vars: Vec<VarId>, values: Vec<i32>, covered: bool) {
+        self.constraints.push(LocalConstraint::Precedence { vars, values, covered });
     }
 
     pub(crate) fn add_circuit(&mut self, vars: Vec<VarId>) {
@@ -694,6 +768,15 @@ impl LocalSearchSpec {
 
     pub(crate) fn unsupported(&self) -> usize {
         self.unsupported
+    }
+
+    /// Flag a constraint with no local-search encoding. The engine then declines to
+    /// run (returns no incumbent) rather than searching an incomplete model. Only
+    /// the Python front-end currently posts constraints the LS model can't represent
+    /// (channel, knapsack); the XCSP builder covers everything it posts.
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
+    pub(crate) fn mark_unsupported(&mut self) {
+        self.unsupported += 1;
     }
 
     fn ensure(&mut self, var: VarId) {
@@ -1229,7 +1312,7 @@ impl LocalModel {
                 channel_inverse_violation(xs, *x_start, ys, *y_start, assignment)
             }
             LocalConstraint::ChannelOneHot { xs, value, start_index } => channel_onehot_violation(xs, *value, *start_index, assignment),
-            LocalConstraint::Precedence { vars, values } => precedence_violation(vars, values, assignment),
+            LocalConstraint::Precedence { vars, values, covered } => precedence_violation(vars, values, *covered, assignment),
             LocalConstraint::Circuit(vars) => circuit_violation(vars, assignment),
             LocalConstraint::BinPacking { items, sizes, limits, exact } => bin_packing_violation(items, sizes, limits, *exact, assignment),
             LocalConstraint::NoOverlap { origins, lengths, zero_ignored } => {
@@ -1345,7 +1428,7 @@ fn cumulative_violation(starts: &[VarId], durations: &[VarId], heights: &[VarId]
     }
     points.sort_unstable();
     points.dedup();
-    let mut violation = 0i64;
+    let mut violation = (-cap).max(0);
     for window in points.windows(2) {
         let lo = window[0];
         let hi = window[1];
@@ -1398,7 +1481,7 @@ fn channel_onehot_violation(xs: &[VarId], value: VarId, start_index: i32, assign
     violation + (ones - 1).abs()
 }
 
-fn precedence_violation(vars: &[VarId], values: &[i32], assignment: &[i32]) -> i64 {
+fn precedence_violation(vars: &[VarId], values: &[i32], covered: bool, assignment: &[i32]) -> i64 {
     let first_pos = |value| vars.iter().position(|&var| assignment[var.index()] == value);
     let mut violation = 0;
     for pair in values.windows(2) {
@@ -1409,6 +1492,9 @@ fn precedence_violation(vars: &[VarId], values: &[i32], assignment: &[i32]) -> i
                 violation += 1;
             }
         }
+    }
+    if covered {
+        violation += values.iter().filter(|&&value| first_pos(value).is_none()).count() as i64;
     }
     violation
 }
@@ -1536,19 +1622,25 @@ fn regular_violation(vars: &[VarId], dfa: &Dfa, assignment: &[i32]) -> i64 {
 }
 
 fn mdd_violation(vars: &[VarId], mdd: &Mdd, assignment: &[i32]) -> i64 {
-    let mut node = 0usize;
+    let mut frontier = HashSet::from([0usize]);
     for (layer, &var) in vars.iter().enumerate() {
         let value = assignment[var.index()];
         let Some(arcs) = mdd.layers.get(layer) else {
             return (vars.len() - layer + 1) as i64;
         };
-        let Some(arc) = arcs.iter().find(|arc| arc.from == node && arc.value == value) else {
+        let mut next = HashSet::new();
+        for arc in arcs {
+            if frontier.contains(&arc.from) && arc.value == value {
+                next.insert(arc.to);
+            }
+        }
+        if next.is_empty() {
             return (vars.len() - layer) as i64 + 1;
-        };
-        node = arc.to;
+        }
+        frontier = next;
     }
     let final_nodes = mdd.nodes_per_layer.last().copied().unwrap_or(0);
-    i64::from(node >= final_nodes)
+    i64::from(!frontier.iter().any(|&node| node < final_nodes))
 }
 
 fn exact_cover_rows(constraints: &[LocalConstraint], domains: &[LocalDomain]) -> Vec<Vec<VarId>> {
@@ -1641,8 +1733,8 @@ fn candidate_vars(vars: &[VarId], seed: u64, iter: u64) -> Vec<VarId> {
     (0..MAX_SAMPLED_VARS).map(|i| vars[mix64(seed ^ iter ^ i as u64) as usize % vars.len()]).collect()
 }
 
-fn objective_kick(model: &LocalModel, assignment: &[i32], kicks: &[(VarId, i32)], seed: u64, iter: u64) -> Option<Vec<i32>> {
-    if !iter.is_multiple_of(RANDOM_WALK_PERIOD) || kicks.is_empty() {
+fn objective_kick_trial(model: &LocalModel, assignment: &[i32], kicks: &[(VarId, i32)], seed: u64, iter: u64) -> Option<Vec<i32>> {
+    if kicks.is_empty() {
         return None;
     }
     let start = mix64(seed ^ iter) as usize % kicks.len();
@@ -1659,7 +1751,151 @@ fn objective_kick(model: &LocalModel, assignment: &[i32], kicks: &[(VarId, i32)]
     None
 }
 
-pub(crate) fn solve_fast_cop<F>(
+fn objective_kick(model: &LocalModel, assignment: &[i32], kicks: &[(VarId, i32)], seed: u64, iter: u64) -> Option<Vec<i32>> {
+    if iter.is_multiple_of(RANDOM_WALK_PERIOD) {
+        objective_kick_trial(model, assignment, kicks, seed, iter)
+    } else {
+        None
+    }
+}
+
+fn signed_log_delta(delta: i128) -> f64 {
+    let magnitude = (delta.unsigned_abs().min(u128::from(u64::MAX)) as f64).ln_1p();
+    if delta >= 0 {
+        magnitude
+    } else {
+        -magnitude
+    }
+}
+
+fn kick_reward(before: Score, after: Score) -> f64 {
+    let violation = i128::from(before.violation) - i128::from(after.violation);
+    let objective = i128::from(before.objective) - i128::from(after.objective);
+    100.0 * signed_log_delta(violation) + signed_log_delta(objective)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn best_single_variable_move(
+    model: &LocalModel,
+    assignment: &[i32],
+    work: &mut [i32],
+    weights: &[i64],
+    con_viol: &[i64],
+    viol_sum: i128,
+    minimizing: bool,
+    config: LsConfig,
+    value_sets: &[Option<HashSet<i32>>],
+    cand_values: &mut Vec<i32>,
+    seed: u64,
+    iter: u64,
+) -> Option<(Score, usize, i32)> {
+    let focused = model.focused_repair_vars(assignment, seed, iter);
+    let candidates = if focused.is_empty() { candidate_vars(&model.mutable, seed, iter) } else { focused };
+    let mut best_move: Option<(Score, usize, i32)> = None;
+    for var in candidates {
+        let j = var.index();
+        let old_val = assignment[j];
+        let affected = &model.affected[j];
+        let candidate_values: &[i32] = if config.min_conflicts && value_sets.get(j).and_then(Option::as_ref).is_some() {
+            min_conflict_candidates(model, var, assignment, value_sets[j].as_ref().unwrap(), seed, iter, cand_values);
+            cand_values
+        } else {
+            &model.domains[j].values
+        };
+        for &value in candidate_values {
+            if value == old_val {
+                continue;
+            }
+            work.copy_from_slice(assignment);
+            work[j] = value;
+            let trial_complete = model.complete(work);
+            let mut delta: i128 = 0;
+            for &c in affected {
+                delta += (i128::from(model.violation(&model.constraints[c], work)) - i128::from(con_viol[c])) * i128::from(weights[c]);
+            }
+            let trial_penalty = i128::from(!trial_complete) * 1_000_000;
+            let violation = combine_violation(trial_penalty, viol_sum + delta);
+            let objective = model.objective_value(work).unwrap_or(i64::MAX / 4);
+            let objective = if minimizing { objective } else { -objective };
+            let score = Score { violation, objective };
+            if best_move.as_ref().is_none_or(|&(best, _, _)| score < best) {
+                best_move = Some((score, j, value));
+            }
+        }
+    }
+    best_move
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_single_variable_move(
+    model: &LocalModel,
+    assignment: &mut [i32],
+    con_viol: &mut [i64],
+    viol_sum: &mut i128,
+    complete_now: &mut bool,
+    current: &mut Score,
+    weights: &[i64],
+    score: Score,
+    j: usize,
+    value: i32,
+) {
+    assignment[j] = value;
+    *complete_now = model.complete(assignment);
+    for &c in &model.affected[j] {
+        let updated = model.violation(&model.constraints[c], assignment);
+        *viol_sum += (i128::from(updated) - i128::from(con_viol[c])) * i128::from(weights[c]);
+        con_viol[c] = updated;
+    }
+    *current = score;
+    #[cfg(debug_assertions)]
+    {
+        let mut check = assignment.to_vec();
+        let (full, _, full_complete) = model.score_breakdown(&mut check, weights);
+        debug_assert_eq!(full, *current, "incremental LS score drifted from full recompute");
+        debug_assert_eq!(full_complete, *complete_now, "LS completeness cache drifted");
+        debug_assert_eq!(
+            full.violation,
+            combine_violation(i128::from(!*complete_now) * 1_000_000, *viol_sum),
+            "LS violation-sum cache drifted"
+        );
+    }
+}
+
+fn refresh_score(
+    model: &LocalModel,
+    assignment: &mut [i32],
+    weights: &[i64],
+    current: &mut Score,
+    con_viol: &mut Vec<i64>,
+    complete_now: &mut bool,
+    viol_sum: &mut i128,
+) {
+    let (score, next_con_viol, complete) = model.score_breakdown(assignment, weights);
+    *current = score;
+    *con_viol = next_con_viol;
+    *complete_now = complete;
+    *viol_sum = weighted_sum(con_viol, weights);
+}
+
+fn bump_gls_weights(weights: &mut [i64], con_viol: &[i64], viol_sum: &mut i128, current: &mut Score, complete_now: bool) -> bool {
+    if !complete_now || current.violation <= 0 {
+        return false;
+    }
+    let mut bumped = false;
+    for (c, weight) in weights.iter_mut().enumerate() {
+        if con_viol[c] > 0 {
+            *weight += 1;
+            bumped = true;
+        }
+    }
+    if bumped {
+        *viol_sum = weighted_sum(con_viol, weights);
+        *current = Score { violation: combine_violation(0, *viol_sum), objective: current.objective };
+    }
+    bumped
+}
+
+pub(crate) fn solve_ls<F>(
     problem: Problem,
     spec: LocalSearchSpec,
     stop: &AtomicBool,
@@ -1727,6 +1963,7 @@ where
     let mut moves = 0;
     let mut restarts = 0;
     let mut stagnant = 0;
+    let mut kick_bandit = KickBandit::new();
 
     while !stop.load(Ordering::Relaxed) {
         iterations += 1;
@@ -1738,6 +1975,123 @@ where
                     best_solution = Some((solution, value));
                 }
             }
+        }
+
+        if config.kick_bandit {
+            // Restart is a stagnation fallback, not a bandit arm: as a reward-
+            // competing operator it always "moves" onto a fresh optimum and gets
+            // over-selected, discarding accumulated search (it regressed coverage
+            // 9 -> 5/7). Fire it only when genuinely stuck; the bandit chooses
+            // among the refine operators (Repair / Objective / Constructive).
+            if stagnant >= RESTART_AFTER {
+                restarts += 1;
+                let restart_seed = seed ^ mix64(iterations);
+                let mut trial =
+                    if constructive_start { model.constructive_assignment(restart_seed) } else { model.random_assignment(restart_seed) };
+                let (mut trial_score, mut trial_con_viol, mut trial_complete) = model.score_breakdown(&mut trial, &weights);
+                let mut min_trial = model.min_assignment();
+                let (min_score, min_con_viol, min_complete) = model.score_breakdown(&mut min_trial, &weights);
+                if min_score < trial_score {
+                    trial = min_trial;
+                    trial_score = min_score;
+                    trial_con_viol = min_con_viol;
+                    trial_complete = min_complete;
+                }
+                assignment = trial;
+                current = trial_score;
+                con_viol = trial_con_viol;
+                complete_now = trial_complete;
+                viol_sum = weighted_sum(&con_viol, &weights);
+                source = if constructive_start { "constructive" } else { "local-search" };
+                stagnant = 0;
+                continue;
+            }
+
+            let mut available = Vec::with_capacity(KICK_OPERATOR_COUNT);
+            available.push(KickOperator::Repair);
+            if !objective_kicks.is_empty() {
+                available.push(KickOperator::Objective);
+            }
+            if constructive_start {
+                available.push(KickOperator::Constructive);
+            }
+
+            let op = kick_bandit.select(&available, seed, iterations);
+            let before = current;
+            let mut moved = false;
+            match op {
+                KickOperator::Repair => {
+                    // Descent-only: apply the best single-variable move only when it
+                    // improves. (Adding random-walk sideways moves here was tested and
+                    // both diluted the exploration that helps timetabling and did not
+                    // recover the descent-bound regression - net worse on both.)
+                    if let Some((score, j, value)) = best_single_variable_move(
+                        &model,
+                        &assignment,
+                        &mut work,
+                        &weights,
+                        &con_viol,
+                        viol_sum,
+                        minimizing,
+                        config,
+                        &value_sets,
+                        &mut cand_values,
+                        seed,
+                        iterations,
+                    ) {
+                        if score < current {
+                            apply_single_variable_move(
+                                &model,
+                                &mut assignment,
+                                &mut con_viol,
+                                &mut viol_sum,
+                                &mut complete_now,
+                                &mut current,
+                                &weights,
+                                score,
+                                j,
+                                value,
+                            );
+                            source = op.source();
+                            moves += 1;
+                            moved = true;
+                        }
+                    }
+                }
+                KickOperator::Objective => {
+                    if let Some(mut trial) = objective_kick_trial(&model, &assignment, &objective_kicks, seed, iterations) {
+                        refresh_score(&model, &mut trial, &weights, &mut current, &mut con_viol, &mut complete_now, &mut viol_sum);
+                        assignment = trial;
+                        source = op.source();
+                        moves += 1;
+                        moved = true;
+                    }
+                }
+                KickOperator::Constructive => {
+                    let mut trial = model.constructive_assignment(seed ^ mix64(iterations));
+                    let (score, trial_con_viol, trial_complete) = model.score_breakdown(&mut trial, &weights);
+                    if score < current {
+                        assignment = trial;
+                        con_viol = trial_con_viol;
+                        viol_sum = weighted_sum(&con_viol, &weights);
+                        complete_now = trial_complete;
+                        current = score;
+                        source = op.source();
+                        moves += 1;
+                        moved = true;
+                    }
+                }
+            }
+            kick_bandit.record(op, kick_reward(before, current));
+            if moved {
+                stagnant = 0;
+            } else {
+                stagnant += 1;
+                if config.gls {
+                    bump_gls_weights(&mut weights, &con_viol, &mut viol_sum, &mut current, complete_now);
+                }
+            }
+            continue;
         }
 
         if stagnant >= RESTART_AFTER {
@@ -1778,75 +2132,45 @@ where
             continue;
         }
 
-        let focused = model.focused_repair_vars(&assignment, seed, iterations);
-        let candidates = if focused.is_empty() { candidate_vars(&model.mutable, seed, iterations) } else { focused };
         // Incremental delta scoring: evaluate `x_j := value` by re-running only the
         // constraints in `affected[j]` against a reused `work` buffer, instead of
         // cloning the assignment and rescoring every constraint. `complete()` still
         // runs in full (functional targets are folded into `affected[j]`, so the
-        // delta over those constraints is exact). See TURBO.md §4.1 / first PR.
-        let mut best_move: Option<(Score, usize, i32)> = None;
-        for var in candidates {
-            let j = var.index();
-            let old_val = assignment[j];
-            let affected = &model.affected[j];
-            // On large domains (#1b) score only a bounded candidate set; otherwise
-            // scan the full domain as before.
-            let candidate_values: &[i32] = if config.min_conflicts && value_sets.get(j).and_then(Option::as_ref).is_some() {
-                min_conflict_candidates(&model, var, &assignment, value_sets[j].as_ref().unwrap(), seed, iterations, &mut cand_values);
-                &cand_values
-            } else {
-                &model.domains[j].values
-            };
-            for &value in candidate_values {
-                if value == old_val {
-                    continue;
-                }
-                work.copy_from_slice(&assignment);
-                work[j] = value;
-                let trial_complete = model.complete(&mut work);
-                let mut delta: i128 = 0;
-                for &c in affected {
-                    delta += (i128::from(model.violation(&model.constraints[c], &work)) - i128::from(con_viol[c])) * i128::from(weights[c]);
-                }
-                let trial_penalty = i128::from(!trial_complete) * 1_000_000;
-                let violation = combine_violation(trial_penalty, viol_sum + delta);
-                let objective = model.objective_value(&work).unwrap_or(i64::MAX / 4);
-                let objective = if minimizing { objective } else { -objective };
-                let score = Score { violation, objective };
-                if best_move.as_ref().is_none_or(|&(best, _, _)| score < best) {
-                    best_move = Some((score, j, value));
-                }
-            }
-        }
+        // delta over those constraints is exact).
+        let best_move = best_single_variable_move(
+            &model,
+            &assignment,
+            &mut work,
+            &weights,
+            &con_viol,
+            viol_sum,
+            minimizing,
+            config,
+            &value_sets,
+            &mut cand_values,
+            seed,
+            iterations,
+        );
 
         let random_walk = iterations.is_multiple_of(RANDOM_WALK_PERIOD);
         let mut moved = false;
         if let Some((score, j, value)) = best_move {
             if score < current || random_walk {
-                assignment[j] = value;
-                complete_now = model.complete(&mut assignment);
-                for &c in &model.affected[j] {
-                    let updated = model.violation(&model.constraints[c], &assignment);
-                    viol_sum += (i128::from(updated) - i128::from(con_viol[c])) * i128::from(weights[c]);
-                    con_viol[c] = updated;
-                }
-                current = score;
+                apply_single_variable_move(
+                    &model,
+                    &mut assignment,
+                    &mut con_viol,
+                    &mut viol_sum,
+                    &mut complete_now,
+                    &mut current,
+                    &weights,
+                    score,
+                    j,
+                    value,
+                );
                 source = "local-search";
                 moves += 1;
                 moved = true;
-                #[cfg(debug_assertions)]
-                {
-                    let mut check = assignment.clone();
-                    let (full, _, full_complete) = model.score_breakdown(&mut check, &weights);
-                    debug_assert_eq!(full, current, "incremental LS score drifted from full recompute");
-                    debug_assert_eq!(full_complete, complete_now, "LS completeness cache drifted");
-                    debug_assert_eq!(
-                        full.violation,
-                        combine_violation(i128::from(!complete_now) * 1_000_000, viol_sum),
-                        "LS violation-sum cache drifted"
-                    );
-                }
             }
         }
 
@@ -1857,18 +2181,8 @@ where
             // Guided Local Search: stuck at a local minimum while still infeasible.
             // Penalise every currently-violated constraint, reshaping the weighted
             // landscape so the next descent is pushed toward the hard constraints.
-            if config.gls && complete_now && current.violation > 0 {
-                let mut bumped = false;
-                for (c, weight) in weights.iter_mut().enumerate() {
-                    if con_viol[c] > 0 {
-                        *weight += 1;
-                        bumped = true;
-                    }
-                }
-                if bumped {
-                    viol_sum = weighted_sum(&con_viol, &weights);
-                    current = Score { violation: combine_violation(0, viol_sum), objective: current.objective };
-                }
+            if config.gls {
+                bump_gls_weights(&mut weights, &con_viol, &mut viol_sum, &mut current, complete_now);
             }
         }
     }

@@ -6,30 +6,26 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::engines::ls::cop::{solve_ls, LocalSearchSpec, LsConfig};
 use crate::ids::VarId;
 use crate::lcg::clause::{ClauseSharing, SharedClausePool};
 use crate::lcg::lit::Lit;
 use crate::lns::{fix_neighborhood, LnsState};
-use crate::ls::{solve_fast_cop, LocalSearchSpec, LsConfig};
 use crate::problem::{Objective, Problem};
 use crate::search::{
     decide_sat_shared_seeded, find_one_seeded, optimize_seeded, probe_seeded, split_cube_seeded, Objective as SearchObjective, SolveStats,
 };
 use crate::store::Solver;
 
-/// Search strategy selected on the command line. `FastCop` and `Turbo` are both
-/// local-search-first incumbent modes (no optimality proof); `Turbo` additionally
-/// enables the autonomous local-search upgrades (see TURBO.md). They are mutually
-/// exclusive, so they live in one enum rather than separate booleans.
+/// Search strategy selected on the command line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Mode {
     /// Full solver: propagation + branch-and-bound / LCG; proves optimality.
     #[default]
     Default,
-    /// Incumbent-only local search; do not try to prove optimality.
-    FastCop,
-    /// Autonomous local-search-first mode (incumbent-only). See TURBO.md.
-    Turbo,
+    /// Local-search-first incumbent mode (GLS + min-conflicts); does not prove
+    /// optimality.
+    Ls,
 }
 
 /// Solver execution settings. Parallel search is opt-in with `workers > 1`.
@@ -52,19 +48,9 @@ pub struct RunOptions {
 }
 
 impl RunOptions {
-    /// Incumbent-only local-search dispatch (either `--fast-cop` or `--turbo`).
+    /// Whether the local-search engine is selected (`--ls`).
     pub(crate) fn local_search(&self) -> bool {
-        matches!(self.mode, Mode::FastCop | Mode::Turbo)
-    }
-
-    /// The classic `--fast-cop` mode specifically.
-    pub(crate) fn fast_cop(&self) -> bool {
-        self.mode == Mode::FastCop
-    }
-
-    /// The autonomous `--turbo` mode specifically.
-    pub(crate) fn turbo(&self) -> bool {
-        self.mode == Mode::Turbo
+        self.mode == Mode::Ls
     }
 }
 
@@ -115,20 +101,13 @@ pub(crate) fn normalize_options(has_objective: bool, var_objective: bool, option
 
 pub(crate) fn worker_roles(has_objective: bool, options: RunOptions) -> String {
     if has_objective && options.local_search() {
-        return format!("{} {}", if options.turbo() { "turbo" } else { "incumbent" }, options.workers);
+        return format!("ls {}", options.workers);
     }
     if !has_objective {
         return if options.workers == 1 { "sequential 1".to_string() } else { format!("portfolio {}", options.workers) };
     }
     if options.workers == 1 {
-        let label = if options.turbo() {
-            "turbo"
-        } else if options.fast_cop() {
-            "incumbent"
-        } else {
-            "sequential"
-        };
-        return format!("{label} 1");
+        return "sequential 1".to_string();
     }
     let incumbent = fast_incumbent_workers(has_objective, options);
     let regular = options.workers - options.probes - options.lns - incumbent;
@@ -498,7 +477,7 @@ fn run_incumbent_worker(
     tx: &mpsc::Sender<WorkerMsg>,
 ) {
     let validator = model.clone();
-    solve_fast_cop(model, local, &shared.cancel, seed, LsConfig::default(), |_, solution, _| {
+    solve_ls(model, local, &shared.cancel, seed, LsConfig::default(), |_, solution, _| {
         if let Some((solution, value)) = validated_incumbent(&validator, solution) {
             shared.report_improvement(tx, value, &solution, WorkerSource { kind: "incumbent", worker });
         }

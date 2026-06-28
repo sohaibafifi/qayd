@@ -5,8 +5,10 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::domain::Domain;
-use crate::ids::{PropId, VarId};
+use crate::domains::int::Domain;
+use crate::domains::interval::{IntervalDomain, IntervalEvent, IntervalPresence};
+use crate::domains::list::{ListDomain, ListEvent};
+use crate::ids::{IntervalId, ListId, PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::trail::{ReversibleInt, Trail};
 
@@ -14,6 +16,12 @@ use crate::trail::{ReversibleInt, Trail};
 #[derive(Clone, Default)]
 struct VarSubs {
     entries: Vec<(Event, PropId)>,
+}
+
+/// Per-list subscriptions and their event granularity.
+#[derive(Clone, Default)]
+struct ListSubs {
+    entries: Vec<(ListEvent, PropId)>,
 }
 
 /// A primary domain change, in domain terms, for the LCG layer to pick up.
@@ -87,8 +95,11 @@ pub enum StepOutcome {
 #[derive(Clone, Default)]
 pub struct Store {
     domains: Vec<Domain>,
+    list_domains: Vec<ListDomain>,
+    interval_domains: Vec<IntervalDomain>,
     trail: Trail,
     subs: Vec<VarSubs>,
+    list_subs: Vec<ListSubs>,
     /// Variables used by at least one propagator, including root-only filters.
     relevant: Vec<bool>,
     /// Propagators waiting to run.
@@ -112,12 +123,100 @@ pub struct Store {
     /// Ablation switch: always explain with the whole-scope snapshot, ignoring
     /// propagator-supplied premises. Off in normal use.
     force_scope_reasons: bool,
+    /// Unary-resource interval pairs registered by `no_overlap`. Each pair's order
+    /// is a boolean variable (`1` = first-before-second, `0` = second-before-first,
+    /// unfixed = undecided), so the order decision is a first-class atom the
+    /// learning engine can branch on and learn over. `no_overlap` subscribes to it
+    /// and enforces the decided precedence.
+    disjunctive_pairs: Vec<(IntervalId, IntervalId)>,
+    disjunctive_order_vars: Vec<VarId>,
 }
 
 impl Store {
     /// An empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Register a unary-resource pair owned by propagator `prop`, returning its
+    /// index. The order is a boolean variable, undecided until fixed; `prop` is
+    /// woken whenever it is decided (including by a learning-engine branch).
+    pub fn register_disjunctive_pair(&mut self, a: IntervalId, b: IntervalId, prop: PropId) -> usize {
+        let order = self.new_var_range(0, 1);
+        self.subscribe(order, prop, Event::Fix);
+        let index = self.disjunctive_pairs.len();
+        self.disjunctive_pairs.push((a, b));
+        self.disjunctive_order_vars.push(order);
+        index
+    }
+
+    /// Number of registered unary-resource pairs.
+    pub fn disjunctive_pair_count(&self) -> usize {
+        self.disjunctive_pairs.len()
+    }
+
+    /// The intervals of registered pair `index`.
+    pub fn disjunctive_pair(&self, index: usize) -> (IntervalId, IntervalId) {
+        self.disjunctive_pairs[index]
+    }
+
+    /// The boolean order variable of pair `index` (`1` a->b, `0` b->a).
+    pub fn disjunctive_order_var(&self, index: usize) -> VarId {
+        self.disjunctive_order_vars[index]
+    }
+
+    /// Current order decision of pair `index` (0 undecided, 1 a->b, 2 b->a).
+    pub fn disjunctive_order(&self, index: usize) -> i32 {
+        let var = self.disjunctive_order_vars[index];
+        if !self.is_fixed(var) {
+            0
+        } else if self.value(var) == 1 {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Decide the order of pair `index`: `1` (a->b) fixes the variable to 1, `2`
+    /// (b->a) to 0. Fixing it wakes the owning propagator (a subscriber). The
+    /// opposite of an already-decided order is inconsistent. Returns whether it
+    /// changed.
+    pub fn set_disjunctive_order(&mut self, index: usize, order: i32) -> Result<bool, Inconsistency> {
+        debug_assert!(order == 1 || order == 2, "order decision must be 1 or 2");
+        let var = self.disjunctive_order_vars[index];
+        let target = if order == 1 { 1 } else { 0 };
+        if self.is_fixed(var) {
+            if self.value(var) == target {
+                Ok(false)
+            } else {
+                Err(Inconsistency) // opposite order already decided
+            }
+        } else {
+            self.fix(var, target)?;
+            Ok(true)
+        }
+    }
+
+    /// [`set_disjunctive_order`](Store::set_disjunctive_order), explained by `why`
+    /// (the reason the order is forced). The opposite-of-decided conflict cites
+    /// the current order, like the explained presence mutator.
+    pub fn set_disjunctive_order_because(&mut self, index: usize, order: i32, why: Vec<Premise>) -> Result<bool, Inconsistency> {
+        debug_assert!(order == 1 || order == 2, "order decision must be 1 or 2");
+        let var = self.disjunctive_order_vars[index];
+        let target = if order == 1 { 1 } else { 0 };
+        if self.is_fixed(var) {
+            if self.value(var) == target {
+                Ok(false)
+            } else {
+                let opposite = self.value(var);
+                let mut conflict = why;
+                conflict.push(Premise::Eq { var, val: opposite });
+                Err(self.fail_because(conflict))
+            }
+        } else {
+            self.fix_because(var, target, why)?;
+            Ok(true)
+        }
     }
 
     // --- variable creation ---
@@ -142,9 +241,58 @@ impl Store {
         id
     }
 
+    /// Create a list domain over a fixed item universe.
+    pub fn new_list(&mut self, universe: Vec<i32>) -> ListId {
+        let id = ListId(self.list_domains.len() as u32);
+        let dom = ListDomain::new(universe, &mut self.trail);
+        self.list_domains.push(dom);
+        self.list_subs.push(ListSubs::default());
+        id
+    }
+
+    /// Create a mandatory fixed-duration interval.
+    pub fn new_interval(&mut self, start_min: i32, start_max: i32, duration: i32) -> IntervalId {
+        self.new_interval_with_presence(start_min, start_max, duration, IntervalPresence::Present)
+    }
+
+    /// Create an optional fixed-duration interval.
+    pub fn new_optional_interval(&mut self, start_min: i32, start_max: i32, duration: i32) -> IntervalId {
+        self.new_interval_with_presence(start_min, start_max, duration, IntervalPresence::Optional)
+    }
+
+    fn new_interval_with_presence(&mut self, start_min: i32, start_max: i32, duration: i32, presence: IntervalPresence) -> IntervalId {
+        assert!(start_min <= start_max, "interval start_min must be <= start_max");
+        assert!(duration >= 0, "interval duration must be non-negative");
+        // The start is a real integer variable; an optional interval gets a bool
+        // presence variable. This makes start bounds and presence first-class
+        // atoms for the learning engine.
+        let start = self.new_var_range(start_min, start_max);
+        let presence = match presence {
+            IntervalPresence::Present => None,
+            IntervalPresence::Optional => Some(self.new_var_range(0, 1)),
+            IntervalPresence::Absent => {
+                let var = self.new_var_range(0, 0);
+                Some(var)
+            }
+        };
+        let id = IntervalId(self.interval_domains.len() as u32);
+        self.interval_domains.push(IntervalDomain { start, duration, presence });
+        id
+    }
+
     /// Number of variables.
     pub fn num_vars(&self) -> usize {
         self.domains.len()
+    }
+
+    /// Number of list domains.
+    pub fn num_lists(&self) -> usize {
+        self.list_domains.len()
+    }
+
+    /// Number of interval domains.
+    pub fn num_intervals(&self) -> usize {
+        self.interval_domains.len()
     }
 
     /// Number of domains using cardinality-sized sparse storage.
@@ -193,6 +341,78 @@ impl Store {
     /// Iterate the present values of `var` (arbitrary order).
     pub fn values(&self, var: VarId) -> impl Iterator<Item = i32> + '_ {
         self.domains[var.index()].values(&self.trail)
+    }
+
+    /// Immutable universe of a list.
+    pub fn list_universe(&self, list: ListId) -> &[i32] {
+        self.list_domains[list.index()].universe()
+    }
+
+    /// Structured list length lower bound.
+    pub fn list_len_min(&self, list: ListId) -> usize {
+        self.list_domains[list.index()].len_min(&self.trail)
+    }
+
+    /// Structured list length upper bound.
+    pub fn list_len_max(&self, list: ListId) -> usize {
+        self.list_domains[list.index()].len_max(&self.trail)
+    }
+
+    /// Whether `item` can still appear in `list`.
+    pub fn list_possible(&self, list: ListId, item: i32) -> bool {
+        self.list_domains[list.index()].is_possible(item, &self.trail)
+    }
+
+    /// Whether `item` must appear in `list`.
+    pub fn list_required(&self, list: ListId, item: i32) -> bool {
+        self.list_domains[list.index()].is_required(item, &self.trail)
+    }
+
+    /// Current count of possible items in `list`.
+    pub fn list_possible_count(&self, list: ListId) -> usize {
+        self.list_domains[list.index()].possible_count(&self.trail)
+    }
+
+    /// Current count of required items in `list`.
+    pub fn list_required_count(&self, list: ListId) -> usize {
+        self.list_domains[list.index()].required_count(&self.trail)
+    }
+
+    /// Interval start lower bound.
+    pub fn interval_start_min(&self, interval: IntervalId) -> i32 {
+        self.min(self.interval_domains[interval.index()].start)
+    }
+
+    /// Interval start upper bound.
+    pub fn interval_start_max(&self, interval: IntervalId) -> i32 {
+        self.max(self.interval_domains[interval.index()].start)
+    }
+
+    /// Interval end lower bound.
+    pub fn interval_end_min(&self, interval: IntervalId) -> i32 {
+        let dom = self.interval_domains[interval.index()];
+        self.min(dom.start).saturating_add(dom.duration)
+    }
+
+    /// Interval end upper bound.
+    pub fn interval_end_max(&self, interval: IntervalId) -> i32 {
+        let dom = self.interval_domains[interval.index()];
+        self.max(dom.start).saturating_add(dom.duration)
+    }
+
+    /// Fixed interval duration.
+    pub fn interval_duration(&self, interval: IntervalId) -> i32 {
+        self.interval_domains[interval.index()].duration
+    }
+
+    /// Interval presence state.
+    pub fn interval_presence(&self, interval: IntervalId) -> IntervalPresence {
+        match self.interval_domains[interval.index()].presence {
+            None => IntervalPresence::Present,
+            Some(var) if !self.is_fixed(var) => IntervalPresence::Optional,
+            Some(var) if self.value(var) == 1 => IntervalPresence::Present,
+            Some(_) => IntervalPresence::Absent,
+        }
     }
 
     /// Root support when `var` uses cardinality-sized sparse storage.
@@ -257,6 +477,167 @@ impl Store {
             self.emit(DomEvent::LeTrue { var, bound }, cause);
         }
         Ok(())
+    }
+
+    /// Require an item in a list.
+    pub fn require_list_item(&mut self, list: ListId, item: i32) -> Result<bool, Inconsistency> {
+        let before = self.list_state(list);
+        let changed = self.list_domains[list.index()].require_item(item, &mut self.trail)?;
+        if changed {
+            self.after_list_change(list, before);
+        }
+        Ok(changed)
+    }
+
+    /// Forbid an item from a list.
+    pub fn forbid_list_item(&mut self, list: ListId, item: i32) -> Result<bool, Inconsistency> {
+        let before = self.list_state(list);
+        let changed = self.list_domains[list.index()].forbid_item(item, &mut self.trail)?;
+        if changed {
+            self.after_list_change(list, before);
+        }
+        Ok(changed)
+    }
+
+    /// Raise a list length lower bound.
+    pub fn set_list_len_min(&mut self, list: ListId, min: usize) -> Result<bool, Inconsistency> {
+        let before = self.list_state(list);
+        let changed = self.list_domains[list.index()].set_len_min(min, &mut self.trail)?;
+        if changed {
+            self.after_list_change(list, before);
+        }
+        Ok(changed)
+    }
+
+    /// Lower a list length upper bound.
+    pub fn set_list_len_max(&mut self, list: ListId, max: usize) -> Result<bool, Inconsistency> {
+        let before = self.list_state(list);
+        let changed = self.list_domains[list.index()].set_len_max(max, &mut self.trail)?;
+        if changed {
+            self.after_list_change(list, before);
+        }
+        Ok(changed)
+    }
+
+    /// Raise an interval start lower bound.
+    pub fn set_interval_start_min(&mut self, interval: IntervalId, min: i32) -> Result<bool, Inconsistency> {
+        let start = self.interval_domains[interval.index()].start;
+        let before = self.min(start);
+        self.remove_below(start, min)?;
+        Ok(self.min(start) != before)
+    }
+
+    /// Lower an interval start upper bound.
+    pub fn set_interval_start_max(&mut self, interval: IntervalId, max: i32) -> Result<bool, Inconsistency> {
+        let start = self.interval_domains[interval.index()].start;
+        let before = self.max(start);
+        self.remove_above(start, max)?;
+        Ok(self.max(start) != before)
+    }
+
+    /// Require an optional interval to be present.
+    pub fn require_interval_presence(&mut self, interval: IntervalId) -> Result<bool, Inconsistency> {
+        self.fix_interval_presence(interval, 1)
+    }
+
+    /// Mark an optional interval absent.
+    pub fn forbid_interval_presence(&mut self, interval: IntervalId) -> Result<bool, Inconsistency> {
+        self.fix_interval_presence(interval, 0)
+    }
+
+    fn fix_interval_presence(&mut self, interval: IntervalId, value: i32) -> Result<bool, Inconsistency> {
+        match self.interval_domains[interval.index()].presence {
+            // A mandatory interval is permanently present: requiring is a no-op,
+            // forbidding is inconsistent.
+            None => {
+                if value == 1 {
+                    Ok(false)
+                } else {
+                    Err(Inconsistency)
+                }
+            }
+            Some(var) => {
+                if self.is_fixed(var) {
+                    if self.value(var) == value {
+                        Ok(false)
+                    } else {
+                        Err(Inconsistency)
+                    }
+                } else {
+                    self.fix(var, value)?;
+                    Ok(true)
+                }
+            }
+        }
+    }
+
+    // --- integer-backing accessors and explained interval mutators (LCG) ---
+
+    /// The integer start variable backing an interval.
+    pub fn interval_start_var(&self, interval: IntervalId) -> VarId {
+        self.interval_domains[interval.index()].start
+    }
+
+    /// The boolean presence variable backing an optional interval (`None` if the
+    /// interval is mandatory).
+    pub fn interval_presence_var(&self, interval: IntervalId) -> Option<VarId> {
+        self.interval_domains[interval.index()].presence
+    }
+
+    /// [`set_interval_start_min`](Store::set_interval_start_min), explained by `why`.
+    pub fn set_interval_start_min_because(&mut self, interval: IntervalId, min: i32, why: Vec<Premise>) -> Result<bool, Inconsistency> {
+        let start = self.interval_domains[interval.index()].start;
+        let before = self.min(start);
+        self.remove_below_because(start, min, why)?;
+        Ok(self.min(start) != before)
+    }
+
+    /// [`set_interval_start_max`](Store::set_interval_start_max), explained by `why`.
+    pub fn set_interval_start_max_because(&mut self, interval: IntervalId, max: i32, why: Vec<Premise>) -> Result<bool, Inconsistency> {
+        let start = self.interval_domains[interval.index()].start;
+        let before = self.max(start);
+        self.remove_above_because(start, max, why)?;
+        Ok(self.max(start) != before)
+    }
+
+    /// [`require_interval_presence`](Store::require_interval_presence), explained by `why`.
+    pub fn require_interval_presence_because(&mut self, interval: IntervalId, why: Vec<Premise>) -> Result<bool, Inconsistency> {
+        self.fix_interval_presence_because(interval, 1, why)
+    }
+
+    /// [`forbid_interval_presence`](Store::forbid_interval_presence), explained by `why`.
+    pub fn forbid_interval_presence_because(&mut self, interval: IntervalId, why: Vec<Premise>) -> Result<bool, Inconsistency> {
+        self.fix_interval_presence_because(interval, 0, why)
+    }
+
+    fn fix_interval_presence_because(&mut self, interval: IntervalId, value: i32, why: Vec<Premise>) -> Result<bool, Inconsistency> {
+        match self.interval_domains[interval.index()].presence {
+            None => {
+                if value == 1 {
+                    Ok(false)
+                } else {
+                    Err(self.fail_because(why))
+                }
+            }
+            Some(var) => {
+                if self.is_fixed(var) {
+                    if self.value(var) == value {
+                        Ok(false)
+                    } else {
+                        // The conflict is `why AND presence = opposite`, not `why`
+                        // alone: cite the current (opposite) presence so the
+                        // engine cannot learn `not why` and prune valid branches.
+                        let opposite = self.value(var);
+                        let mut conflict = why;
+                        conflict.push(Premise::Eq { var, val: opposite });
+                        Err(self.fail_because(conflict))
+                    }
+                } else {
+                    self.fix_because(var, value, why)?;
+                    Ok(true)
+                }
+            }
+        }
     }
 
     /// Reason for an imminent change: staged premises if pending, else the
@@ -366,6 +747,23 @@ impl Store {
         Ok(())
     }
 
+    fn list_state(&self, list: ListId) -> (usize, usize, usize, usize) {
+        (self.list_possible_count(list), self.list_required_count(list), self.list_len_min(list), self.list_len_max(list))
+    }
+
+    fn after_list_change(&mut self, list: ListId, before: (usize, usize, usize, usize)) {
+        let after = self.list_state(list);
+        if after.0 != before.0 {
+            self.notify_list(list, ListEvent::PossibleChange);
+        }
+        if after.1 != before.1 {
+            self.notify_list(list, ListEvent::RequiredChange);
+        }
+        if after.2 != before.2 || after.3 != before.3 {
+            self.notify_list(list, ListEvent::LengthChange);
+        }
+    }
+
     // --- propagator-owned reversible state ---
     //
     // Incremental propagator state that must be restored on backtrack.
@@ -398,6 +796,32 @@ impl Store {
         let scope = &mut self.scope[prop.index()];
         if !scope.contains(&var) {
             scope.push(var);
+        }
+    }
+
+    /// Subscribe `prop` to list changes at the given granularity.
+    /// Idempotent per (list, prop, event).
+    pub fn subscribe_list(&mut self, list: ListId, prop: PropId, event: ListEvent) {
+        let s = &mut self.list_subs[list.index()];
+        if !s.entries.contains(&(event, prop)) {
+            s.entries.push((event, prop));
+        }
+    }
+
+    /// Subscribe `prop` to interval changes. Interval facts are backed
+    /// by integer variables, so this maps onto the variable event system: start/
+    /// end bound changes are the start variable's bound changes, presence changes
+    /// are the presence variable being fixed.
+    pub fn subscribe_interval(&mut self, interval: IntervalId, prop: PropId, event: IntervalEvent) {
+        let dom = self.interval_domains[interval.index()];
+        match event {
+            IntervalEvent::StartBoundChange | IntervalEvent::EndBoundChange => self.subscribe(dom.start, prop, Event::BoundChange),
+            IntervalEvent::PresenceChange => {
+                if let Some(var) = dom.presence {
+                    self.subscribe(var, prop, Event::Fix);
+                }
+            }
+            IntervalEvent::ModeChange => {}
         }
     }
 
@@ -480,6 +904,18 @@ impl Store {
         }
     }
 
+    /// Wake subscribers of a list event.
+    fn notify_list(&mut self, list: ListId, changed: ListEvent) {
+        let Store { list_subs, queue, enqueued, current, .. } = self;
+        let s = &list_subs[list.index()];
+        for &(event, p) in &s.entries {
+            if event == changed {
+                Self::wake(queue, enqueued, *current, p);
+            }
+        }
+    }
+
+    /// Wake subscribers of a interval event.
     /// Enqueue `p` unless it is the running propagator or already queued.
     fn wake(queue: &mut VecDeque<PropId>, enqueued: &mut [bool], current: Option<PropId>, p: PropId) {
         if current == Some(p) {

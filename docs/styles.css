@@ -1,0 +1,577 @@
+:root {
+  color-scheme: light;
+  --bg: #f5f8f9;
+  --surface: #ffffff;
+  --surface-2: #eef4f5;
+  --ink: #07111f;
+  --muted: #4d5c6e;
+  --faint: #8493a1;
+  --line: #dde7ea;
+  --line-strong: #c2d0d6;
+  --accent: #0a8a83;
+  --accent-2: #1fc2b3;
+  --accent-ink: #0a6f69;
+  --accent-soft: #e2f4f1;
+  --warm: #c2702c;
+  --code-bg: #08121d;
+  --code-surface: #0d1b29;
+  --code-ink: #dbe9ee;
+  --code-faint: #7e94a3;
+  --dot: rgba(10, 138, 131, 0.12);
+  --ring: 0 0 0 3px color-mix(in srgb, var(--accent) 40%, transparent);
+  --r-sm: 10px;
+  --r: 14px;
+  --r-lg: 22px;
+  --r-pill: 999px;
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #060e15;
+  --surface: #0c1620;
+  --surface-2: #111f2b;
+  --ink: #edf7f7;
+  --muted: #a9b8c2;
+  --faint: #74879a;
+  --line: #1d2f3b;
+  --line-strong: #35505f;
+  --accent: #2fd3c6;
+  --accent-2: #62eadd;
+  --accent-ink: #57e6da;
+  --accent-soft: #0f2e2b;
+  --warm: #f0a35a;
+  --code-bg: #03090f;
+  --code-surface: #08131d;
+  --code-ink: #d7e8ed;
+  --code-faint: #6f8696;
+  --dot: rgba(98, 234, 221, 0.12);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  position: relative;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.65 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+}
+
+/* Faint graph-paper dot grid (flat, no color gradient). */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image: radial-gradient(var(--dot) 1.2px, transparent 1.3px);
+  background-size: 26px 26px;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+img,
+svg {
+  display: block;
+  max-width: 100%;
+}
+
+code,
+pre {
+  font-family: "SFMono-Regular", "Cascadia Code", "Liberation Mono", Consolas, monospace;
+  font-feature-settings: "ss01", "calt" 0;
+}
+
+pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-width: 100%;
+}
+
+:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+  border-radius: var(--r-sm);
+}
+
+.hero-copy,
+.hero-art,
+.code-card,
+.route-card,
+.feature-list,
+.command-card {
+  min-width: 0;
+}
+
+.site-header,
+.hero,
+.features,
+.start,
+.site-footer {
+  width: min(1180px, calc(100% - 48px));
+  margin-inline: auto;
+}
+
+/* Header: plain, quiet. */
+.site-header {
+  min-height: 82px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--ink);
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+
+.icon-button {
+  width: 42px;
+  height: 42px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  color: var(--ink);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  display: inline-grid;
+  place-items: center;
+  cursor: pointer;
+  transition: border-color 0.2s var(--ease), transform 0.2s var(--ease), background 0.2s var(--ease);
+}
+
+.icon-button:hover {
+  border-color: var(--line-strong);
+  transform: translateY(-1px);
+}
+
+.theme-glyph,
+.theme-glyph::before {
+  display: block;
+  border-radius: 999px;
+}
+
+.theme-glyph {
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--ink);
+  position: relative;
+}
+
+.theme-glyph::before {
+  content: "";
+  position: absolute;
+  inset: 3px 0 3px 7px;
+  background: var(--ink);
+}
+
+/* Eyebrow / kicker labels. */
+.eyebrow,
+.kicker {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent-ink);
+}
+
+.eyebrow::before,
+.kicker::before {
+  content: "";
+  width: 22px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.hero {
+  min-height: min(740px, calc(100vh - 92px));
+  display: grid;
+  grid-template-columns: minmax(320px, 0.92fr) minmax(440px, 1.08fr);
+  align-items: center;
+  gap: clamp(34px, 5vw, 76px);
+  padding: 48px 0 72px;
+}
+
+.hero .eyebrow {
+  margin-bottom: 18px;
+}
+
+.hero h1 {
+  margin: 0;
+  font-size: clamp(74px, 10vw, 132px);
+  line-height: 1.02;
+  padding-bottom: 0.06em;
+  letter-spacing: -0.04em;
+  color: var(--ink);
+}
+
+.lead {
+  margin: 24px 0 18px;
+  color: var(--ink);
+  font-size: clamp(27px, 3.4vw, 44px);
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  max-width: 680px;
+}
+
+.summary {
+  margin: 0;
+  color: var(--muted);
+  font-size: 18px;
+  max-width: 620px;
+}
+
+/* Hero art: one full-width tabbed code card + route preview, stacked. */
+.hero-art {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.code-card,
+.route-card,
+.command-card {
+  border-radius: var(--r-lg);
+}
+
+.code-card {
+  position: relative;
+  background: var(--code-bg);
+  color: var(--code-ink);
+  overflow: hidden;
+  border: 1px solid var(--line);
+}
+
+/* Tab strip. */
+.code-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 8px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.code-tab {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--code-faint);
+  font-family: "SFMono-Regular", "Cascadia Code", Consolas, monospace;
+  font-size: 12.5px;
+  letter-spacing: 0.01em;
+  padding: 11px 16px;
+  border-radius: var(--r-sm) var(--r-sm) 0 0;
+  cursor: pointer;
+  position: relative;
+  transition: color 0.18s var(--ease), background 0.18s var(--ease);
+}
+
+.code-tab:hover {
+  color: var(--code-ink);
+}
+
+.code-tab.is-active {
+  color: var(--code-ink);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+/* Active underline. */
+.code-tab.is-active::after {
+  content: "";
+  position: absolute;
+  inset: auto 12px -1px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+/* Fixed panel height so switching tabs never resizes the card. */
+.code-card pre {
+  padding: 22px;
+  min-height: 224px;
+  font-size: clamp(12px, 1vw, 13px);
+  line-height: 1.75;
+}
+
+.route-card {
+  min-height: 214px;
+  display: grid;
+  place-items: center;
+  padding: 22px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--accent);
+}
+
+.route-card svg g:first-of-type circle {
+  fill: var(--surface);
+  stroke: var(--accent);
+}
+
+/* Sections. */
+.features,
+.start {
+  padding: 92px 0;
+  border-top: 1px solid var(--line);
+}
+
+.section-head,
+.start-head {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 38px;
+}
+
+.section-head h2,
+.start-head h2 {
+  margin: 4px 0 0;
+  font-size: clamp(34px, 4.4vw, 56px);
+  line-height: 1;
+  letter-spacing: -0.03em;
+}
+
+.section-head p,
+.start-head p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 17px;
+  max-width: 60ch;
+}
+
+/* Feature table: one bordered list, row per feature with a right-aligned tag. */
+.feature-list {
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.feature-list article {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(190px, 300px);
+  gap: 24px;
+  align-items: center;
+  padding: 24px;
+  border-bottom: 1px solid var(--line);
+  transition: background 0.18s var(--ease);
+}
+
+.feature-list article:last-child {
+  border-bottom: 0;
+}
+
+.feature-list article:hover {
+  background: color-mix(in srgb, var(--accent-soft) 40%, var(--surface));
+}
+
+.feature-list h3 {
+  margin: 0 0 7px;
+  font-size: 20px;
+  line-height: 1.2;
+  letter-spacing: -0.015em;
+}
+
+.feature-list p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.feature-list article > span,
+.feature-list article > a {
+  color: var(--faint);
+  font-size: 13px;
+  text-align: right;
+}
+
+.feature-list a {
+  color: var(--accent-ink);
+}
+
+/* Start section. */
+.start {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.7fr) minmax(420px, 1.3fr);
+  gap: clamp(28px, 5vw, 72px);
+  align-items: start;
+}
+
+.start-head {
+  margin-bottom: 0;
+}
+
+.command-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.command-card {
+  min-height: 66px;
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr) auto;
+  gap: 14px;
+  align-items: center;
+  padding: 12px 12px 12px 18px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  transition: border-color 0.2s var(--ease);
+}
+
+.command-card:hover {
+  border-color: var(--line-strong);
+}
+
+.command-card span {
+  color: var(--accent-ink);
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.command-card code {
+  color: var(--ink);
+  font-size: 13px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.copy-button {
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  color: var(--muted);
+  padding: 0 14px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  transition: color 0.2s var(--ease), border-color 0.2s var(--ease), background 0.2s var(--ease);
+}
+
+.copy-button:hover,
+.copy-button.copied {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Footer. */
+.site-footer {
+  min-height: 92px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.site-footer span {
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.site-footer a {
+  position: relative;
+  color: var(--muted);
+  transition: color 0.2s var(--ease);
+}
+
+.site-footer a:hover {
+  color: var(--accent-ink);
+}
+
+@media (max-width: 1080px) {
+  .hero,
+  .start {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .hero {
+    min-height: 0;
+    padding-top: 52px;
+  }
+}
+
+@media (max-width: 760px) {
+  .site-header,
+  .hero,
+  .features,
+  .start,
+  .site-footer {
+    width: min(1180px, calc(100% - 32px));
+  }
+
+  .hero h1 {
+    font-size: clamp(66px, 22vw, 108px);
+  }
+
+  .hero-copy,
+  .hero-art {
+    width: calc(100vw - 32px);
+    max-width: 100%;
+  }
+
+  .lead {
+    font-size: clamp(26px, 8vw, 38px);
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
+
+  .summary {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
+
+  .features,
+  .start {
+    padding: 64px 0;
+  }
+
+  .feature-list article,
+  .command-card {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .feature-list article > span,
+  .feature-list article > a {
+    text-align: left;
+  }
+
+  .site-footer {
+    flex-wrap: wrap;
+    padding: 22px 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}

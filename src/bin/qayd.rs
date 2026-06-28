@@ -1,4 +1,4 @@
-//! `qayd` CLI: `qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--fast-cop] [--split] [--probe N] [--lns N] [--learn-csp] <instance.xml[.lzma|.xz]>`.
+//! `qayd` CLI: `qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--ls] [--split] [--probe N] [--lns N] [--learn-csp] <instance.xml[.lzma|.xz]>`.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -23,7 +23,7 @@ fn read_instance(path: &str) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|e| e.to_string())
 }
 
-fn run_instance(path: &str, verbose: bool, stop: &AtomicBool, options: qayd::xcsp::RunOptions) {
+fn run_instance(path: &str, verbose: bool, stop: &AtomicBool, options: qayd::frontends::xcsp::RunOptions) {
     let xml = match read_instance(path) {
         Ok(x) => x,
         Err(e) => {
@@ -33,7 +33,7 @@ fn run_instance(path: &str, verbose: bool, stop: &AtomicBool, options: qayd::xcs
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    if let Err(e) = qayd::xcsp::run_to_with_options(&xml, verbose, stop, &mut lock, options) {
+    if let Err(e) = qayd::frontends::xcsp::run_to_with_options(&xml, verbose, stop, &mut lock, options) {
         eprintln!("error: {e}");
         std::process::exit(2);
     }
@@ -44,7 +44,7 @@ fn is_instance(arg: &str) -> bool {
 }
 
 const USAGE: &str =
-    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--fast-cop] [--turbo] [--split] [--probe N] [--lns N] [--learn-csp] <instance.xml[.lzma|.xz]>";
+    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--ls] [--split] [--probe N] [--lns N] [--learn-csp] <instance.xml[.lzma|.xz]>";
 
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
@@ -78,8 +78,7 @@ fn main() {
     let mut time_limit: Option<u64> = None;
     let mut seed: Option<u64> = None;
     let mut workers: Option<usize> = None;
-    let mut fast_cop = false;
-    let mut turbo = false;
+    let mut ls = false;
     let mut split = false;
     let mut probes = 0;
     let mut lns = 0;
@@ -94,8 +93,7 @@ fn main() {
             "-t" | "--time" => time_limit = Some(parse(it.next().map(String::as_str), "-t/--time needs a number of seconds")),
             "--seed" => seed = Some(parse(it.next().map(String::as_str), "--seed needs an unsigned integer")),
             "-p" | "--threads" => workers = Some(positive(it.next().map(String::as_str), "-p/--threads needs a positive integer")),
-            "--fast-cop" => fast_cop = true,
-            "--turbo" => turbo = true,
+            "--ls" => ls = true,
             "--split" => split = true,
             "--probe" => probes = positive(it.next().map(String::as_str), "--probe needs a positive integer"),
             "--lns" => lns = positive(it.next().map(String::as_str), "--lns needs a positive integer"),
@@ -114,15 +112,11 @@ fn main() {
         usage();
     }
     let seed = seed.unwrap_or_else(|| std::env::var("RANDOMSEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
-    if fast_cop && turbo {
-        fail("--fast-cop and --turbo are mutually exclusive");
-    }
-    if (fast_cop || turbo) && time_limit.is_none() {
+    if ls && time_limit.is_none() {
         time_limit = Some(240);
     }
     let workers = match workers {
         Some(workers) => workers,
-        None if fast_cop => 1,
         None => match std::env::var("NBCORE") {
             Ok(s) => positive(Some(&s), "NBCORE needs a positive integer"),
             Err(_) => 1,
@@ -142,12 +136,6 @@ fn main() {
         });
     }
 
-    let mode = if turbo {
-        qayd::xcsp::Mode::Turbo
-    } else if fast_cop {
-        qayd::xcsp::Mode::FastCop
-    } else {
-        qayd::xcsp::Mode::Default
-    };
-    run_instance(&path, verbose, &stop, qayd::xcsp::RunOptions { seed, workers, mode, split, probes, lns, learn_csp });
+    let mode = if ls { qayd::frontends::xcsp::Mode::Ls } else { qayd::frontends::xcsp::Mode::Default };
+    run_instance(&path, verbose, &stop, qayd::frontends::xcsp::RunOptions { seed, workers, mode, split, probes, lns, learn_csp });
 }

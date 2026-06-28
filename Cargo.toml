@@ -7,17 +7,20 @@ license = "MIT"
 
 [workspace]
 members = [".", "frontends/flatzinc"]
-# Both packages take part in plain `cargo build --bin ...` at the root — the
+# Both packages take part in plain `cargo build --bin ...` at the root - the
 # release workflow builds `qayd` and `qayd-fzn` in one invocation.
 default-members = [".", "frontends/flatzinc"]
 
 [workspace.package]
 # Single source of truth: qayd and qayd-fzn release under the same version.
-version = "0.7.1"
+version = "0.9.0"
 
 [lib]
 name = "qayd"
 path = "src/lib.rs"
+# `cdylib` for the optional PyO3 extension module (built under `--features python`
+# by maturin); `rlib` keeps the binary and the flatzinc frontend linking normally.
+crate-type = ["rlib", "cdylib"]
 
 [[bin]]
 name = "qayd"
@@ -35,10 +38,17 @@ panic = "abort"
 [dependencies]
 ctrlc = "3.5.2"
 lzma-rs = "0.3.0"
+pyo3 = { version = "0.29.0", features = ["extension-module", "abi3-py38"], optional = true }
 # Patched fork: cardinality mixed occurs, %N group injection, notin, stray stdout
 # prints, lex constant tuples, bare-array/slice expansion in objective expr lists.
 # Rev-pinned for reproducibility.
 xcsp3-rust-parser = { git = "https://github.com/sohaibafifi/XCSP3-Rust-Parser", rev = "e0289254951124f6a6f92ee5832759bc70cf5c6a" }
+
+[features]
+default = []
+# Build the PyO3 Python extension module (`qayd._core`). Off by default so the
+# normal solver build and tests don't pull in pyo3.
+python = ["dep:pyo3"]
 
 
 # Cold parse/decompress stack: runs once per instance, never in the solve loop.

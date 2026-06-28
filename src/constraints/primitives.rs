@@ -402,6 +402,56 @@ pub fn element(solver: &mut Solver, array: &[VarId], idx: VarId, value: VarId) {
     solver.post(Box::new(Element { array: array.to_vec(), idx, value, buf: Vec::new() }));
 }
 
+/// `value = array[idx]`, 0-based, where `array` is constant.
+#[derive(Clone)]
+struct ElementConst {
+    array: Vec<i32>,
+    idx: VarId,
+    value: VarId,
+    buf: Vec<i32>,
+}
+
+impl Propagator for ElementConst {
+    fn register(&mut self, store: &mut Store, me: PropId) {
+        store.subscribe(self.idx, me, Event::DomainChange);
+        store.subscribe(self.value, me, Event::DomainChange);
+    }
+
+    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+        let n = self.array.len() as i32;
+        store.remove_below(self.idx, 0)?;
+        store.remove_above(self.idx, n - 1)?;
+
+        self.buf.clear();
+        self.buf.extend(store.values(self.idx));
+        for &i in &self.buf {
+            if !store.contains(self.value, self.array[i as usize]) {
+                store.remove(self.idx, i)?;
+            }
+        }
+
+        if store.is_fixed(self.idx) {
+            store.fix(self.value, self.array[store.value(self.idx) as usize])?;
+        } else {
+            self.buf.clear();
+            self.buf.extend(store.values(self.value));
+            for &val in &self.buf {
+                let supported = store.values(self.idx).any(|i| self.array[i as usize] == val);
+                if !supported {
+                    store.remove(self.value, val)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Post `value = array[idx]` for a constant array.
+pub fn element_const(solver: &mut Solver, array: &[i32], idx: VarId, value: VarId) {
+    assert!(!array.is_empty(), "elementConst: empty array");
+    solver.post(Box::new(ElementConst { array: array.to_vec(), idx, value, buf: Vec::new() }));
+}
+
 // ---------------------------------------------------------------------------
 // allDifferent (Régin, domain-consistent)
 // ---------------------------------------------------------------------------
@@ -589,11 +639,23 @@ pub fn all_different(solver: &mut Solver, vars: &[VarId]) {
 /// Value precedence: for each consecutive pair `(s, t)`, the first `s` must
 /// precede the first `t`. Decomposed through `intension`.
 pub fn precedence(solver: &mut Solver, list: &[VarId], values: &[i32]) {
+    precedence_with_covered(solver, list, values, false);
+}
+
+/// Value precedence with optional coverage: when `covered` is true, every value
+/// in `values` must occur at least once in `list`.
+pub fn precedence_with_covered(solver: &mut Solver, list: &[VarId], values: &[i32], covered: bool) {
     for w in values.windows(2) {
         let (s, t) = (w[0], w[1]);
         for i in 0..list.len() {
             let earlier_s: Vec<_> = (0..i).map(|p| eq(var(list[p]), int(s as i64))).collect();
             intension(solver, imp(eq(var(list[i]), int(t as i64)), or(earlier_s)));
+        }
+    }
+    if covered {
+        for &value in values {
+            let occurs = list.iter().map(|&v| eq(var(v), int(value as i64))).collect();
+            intension(solver, or(occurs));
         }
     }
 }

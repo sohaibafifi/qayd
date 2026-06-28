@@ -21,32 +21,39 @@
 //! ```
 
 pub mod constraints;
-pub mod domain;
+pub mod domains;
+pub mod engines;
 pub mod expr;
+pub mod frontends;
 pub mod ids;
 pub mod lcg;
 mod lns;
-mod ls;
+pub mod model;
 mod parallel;
 mod problem;
 pub mod propagator;
 pub mod search;
 pub mod store;
 pub mod trail;
-pub mod xcsp;
 
+pub use domains::interval::{IntervalEvent, IntervalPresence};
+pub use domains::list::ListEvent;
 pub use expr::Expr;
-pub use ids::{PropId, VarId};
+pub use ids::{IntervalId, ListId, PropId, VarId};
+// The list-reduction (list/lambda) IR lives under `qayd::model::list::*`; its
+// `Expr` is intentionally not surfaced at the crate root, where it would clash
+// with the intension `Expr`.
 pub use propagator::{Event, Inconsistency, Propagator};
 pub use search::{
-    count_solutions, first_solution, maximize, minimize, optimize_with, solve, solve_interruptible, SearchControl, SolveStats,
+    count_solutions, first_domain_solution, first_solution, maximize, minimize, optimize_with, solve, solve_domains,
+    solve_domains_interruptible, solve_interruptible, DomainSolution, SearchControl, SolveStats,
 };
 pub use store::{Solver, Store};
 pub use trail::{ReversibleInt, Trail};
 
 /// SplitMix64 finalizer: scrambles a counter/seed into a well-distributed
 /// `u64`. Shared so every seed-derived stream stays bit-identical across
-/// modules — determinism depends on it.
+/// modules - determinism depends on it.
 pub(crate) fn mix64(mut x: u64) -> u64 {
     x ^= x >> 30;
     x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
