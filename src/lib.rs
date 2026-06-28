@@ -37,16 +37,17 @@ mod lns;
 /// until they migrate.
 pub(crate) use engines::ls::cop as ls;
 pub mod model;
+mod frontends;
 mod parallel;
 mod problem;
 pub mod propagator;
-#[cfg(feature = "python")]
-mod python;
 pub mod search;
 pub mod store;
 pub mod structured;
 pub mod trail;
-pub mod xcsp;
+/// Temporary alias: the XCSP frontend now lives at [`frontends::xcsp`]. Kept so
+/// existing `qayd::xcsp::` paths (the CLI, tests) keep working.
+pub use frontends::xcsp;
 
 pub use expr::Expr;
 pub use ids::{IntervalId, ListId, PropId, VarId};
