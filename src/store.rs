@@ -6,10 +6,10 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::domains::int::Domain;
-use crate::ids::{IntervalId, ListId, PropId, VarId};
-use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::domains::interval::{IntervalDomain, IntervalEvent, IntervalPresence};
 use crate::domains::list::{ListDomain, ListEvent};
+use crate::ids::{IntervalId, ListId, PropId, VarId};
+use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::trail::{ReversibleInt, Trail};
 
 /// Per-variable subscriptions and their event granularity.

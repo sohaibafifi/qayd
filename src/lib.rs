@@ -45,8 +45,8 @@ pub use ids::{IntervalId, ListId, PropId, VarId};
 // with the intension `Expr`.
 pub use propagator::{Event, Inconsistency, Propagator};
 pub use search::{
-    count_solutions, first_solution, first_domain_solution, maximize, minimize, optimize_with, solve, solve_interruptible,
-    solve_domains, solve_domains_interruptible, SearchControl, SolveStats, DomainSolution,
+    count_solutions, first_domain_solution, first_solution, maximize, minimize, optimize_with, solve, solve_domains,
+    solve_domains_interruptible, solve_interruptible, DomainSolution, SearchControl, SolveStats,
 };
 pub use store::{Solver, Store};
 pub use trail::{ReversibleInt, Trail};

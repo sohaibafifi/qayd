@@ -4,7 +4,7 @@ Adds time windows to the CVRP model. The end-of-service time along each route is
 a prefix scan: ``end = max(earliest[cust], arrival) + service[cust]``, threaded
 with ``cp.scan_sum``. Lateness ``max(0, end - latest[cust])`` is summed per route
 and constrained to 0, so the violation-driven search drives windows to feasible
-with the same feasibility-first scoring used by the collection engine. The
+with the same feasibility-first scoring used by the list-domain engine. The
 objective is lexicographic: fewest vehicles, then shortest distance.
 
 Tune via ``QAYD_CVRPTW_N`` / ``QAYD_CVRPTW_T``; trace with ``QAYD_VERBOSE=1``.
@@ -36,7 +36,7 @@ k = min_k + 3
 D, Q, E, L, S = cp.matrix(dist), cp.array(demand), cp.array(earliest), cp.array(latest), cp.array(service)
 
 model = cp.Model()
-routes = model.list_vars(k, list(range(1, n + 1)))
+routes = model.list_vars(list(range(1, n + 1)), count=k)
 model.minimize(cp.sum(cp.used(r) for r in routes))                                  # fewest vehicles
 model.then_minimize(cp.sum(cp.sum_edges(r, lambda i, j: D[i][j], start=0, end=0) for r in routes))  # then distance
 for r in routes:
@@ -53,11 +53,11 @@ for r in routes:
 solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
 
 print(f"customers: {n}  vehicles<={k}  capacity: {capacity}  status: {solution.status}")
-if solution.routes is None:
+if solution.lists is None:
     raise SystemExit(f"status: {solution.status} - no feasible plan within {time_limit}s")
 fleet, distance = solution.objectives
 print(f"fleet: {fleet}  total distance: {distance}")
-for r, route in enumerate(solution.routes):
+for r, route in enumerate(solution.lists):
     if not route:
         continue
     # Replay the schedule to show every stop is on time.
@@ -68,4 +68,4 @@ for r, route in enumerate(solution.routes):
         prev = c
     print(f"  route {r}: load {sum(demand[c] for c in route):3d}  {[0, *route, 0]}")
 
-assert sorted(c for route in solution.routes for c in route) == list(range(1, n + 1))
+assert sorted(c for route in solution.lists for c in route) == list(range(1, n + 1))

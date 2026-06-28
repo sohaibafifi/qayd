@@ -4,8 +4,8 @@ use super::eval::{eval_expr, violation_of};
 use super::local_search::{
     base_totals, compute_con_vals, full_score, list_score, signed, ListScore, PerList, ReductionDeltaKind, Score, State,
 };
-use crate::model::list::{CollectionModel, Iterable, Reduction, MAX_TIERS};
 use crate::mix64;
+use crate::model::list::{CollectionModel, Iterable, Reduction, MAX_TIERS};
 
 pub(super) fn snapshot(per: &PerList, state: &State) -> (Vec<Vec<i32>>, Score, bool) {
     let score = full_score(per, state);

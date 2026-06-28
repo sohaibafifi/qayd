@@ -28,7 +28,7 @@ k = n  # at most one station per task
 
 P = cp.array(proc)
 model = cp.Model()
-stations = model.list_vars(k, tasks)
+stations = model.list_vars(tasks, count=k)
 model.minimize(cp.sum(cp.used(s) for s in stations))  # minimise stations
 for s in stations:
     model.add(cp.sum(s, lambda i: P[i]) <= cycle)
@@ -38,16 +38,16 @@ for a, b in precedences:
 solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
 
 print(f"tasks: {n}  cycle time: {cycle}  precedences: {len(precedences)}  status: {solution.status}")
-if solution.routes is None:
+if solution.lists is None:
     raise SystemExit(f"status: {solution.status} - no feasible line within {time_limit}s")
 print(f"stations used: {solution.objective}")
-station_of = {t: s for s, station in enumerate(solution.routes) for t in station}
-for s, station in enumerate(solution.routes):
+station_of = {t: s for s, station in enumerate(solution.lists) for t in station}
+for s, station in enumerate(solution.lists):
     if station:
         print(f"  station {s}: load {sum(proc[t] for t in station):2d}  {station}")
 
 for a, b in precedences:
     assert station_of[a] <= station_of[b], f"precedence {a} -> {b} respected"
-for station in solution.routes:
+for station in solution.lists:
     assert sum(proc[t] for t in station) <= cycle, "cycle time respected"
 assert sorted(station_of) == tasks, "every task assigned once"

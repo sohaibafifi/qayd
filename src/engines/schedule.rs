@@ -8,11 +8,11 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 
-use crate::model::list::{Resource, Schedule};
 use crate::constraints::intension;
 use crate::constraints::interval as interval_constraints;
 use crate::expr;
 use crate::ids::{IntervalId, VarId};
+use crate::model::list::{Resource, Schedule};
 use crate::search::{self, Objective as SearchObjective, SearchControl, SolveStats};
 use crate::Solver;
 

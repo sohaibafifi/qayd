@@ -7,6 +7,7 @@
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
+use crate::domains::interval::IntervalPresence;
 use crate::expr::Expr;
 use crate::ids::{IntervalId, ListId, VarId};
 use crate::lcg::clause::ClauseSharing;
@@ -14,7 +15,6 @@ use crate::lcg::lit::{LazyAtomRegistry, Lit};
 use crate::lcg::trail::Cdcl;
 use crate::propagator::Inconsistency;
 use crate::store::{Solver, Store};
-use crate::domains::interval::IntervalPresence;
 
 /// A stop flag that is never set; used by the non-interruptible entry points.
 static NEVER_STOP: AtomicBool = AtomicBool::new(false);
@@ -251,11 +251,7 @@ where
     let Some(decision) = choose_domain_decision(solver) else {
         stats.solutions += 1;
         let solution = collect_domain_solution(solver);
-        return if matches!(on_solution(solver, &solution), SearchControl::Stop) {
-            DomainExit::Stopped
-        } else {
-            DomainExit::Exhausted
-        };
+        return if matches!(on_solution(solver, &solution), SearchControl::Stop) { DomainExit::Stopped } else { DomainExit::Exhausted };
     };
 
     stats.nodes += 1;

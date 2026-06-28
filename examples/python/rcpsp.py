@@ -1,7 +1,7 @@
 """Resource-constrained project scheduling (RCPSP): minimise the makespan of
 tasks with durations, precedences, and renewable resources of fixed capacity.
 
-One interval variable per task; ``model.precedes`` for each precedence edge;
+One interval variable per task; ``model.precedence`` for each precedence edge;
 ``model.resource`` caps the total demand of overlapping tasks. Same interval
 primitives as the job shop.
 
@@ -26,11 +26,12 @@ precedences = [(rng.randint(0, t - 1), t) for t in range(1, n) if rng.random() <
 horizon = sum(duration)
 
 model = cp.Model()
-ivs = model.interval_vars(duration, horizon)
+ivs = model.intervals(duration, horizon)
 for a, b in precedences:
-    model.precedes(ivs[a], ivs[b])
+    model.precedence(ivs[a], ivs[b])
 for r in range(resources):
     model.resource([(ivs[t], demand[t][r]) for t in range(n) if demand[t][r] > 0], capacity[r])
+model.minimize_makespan(ivs)
 
 solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
 

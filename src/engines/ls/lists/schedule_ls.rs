@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::model::list::{CollectionSolution, IntervalVar, Resource, Schedule};
 use crate::mix64;
+use crate::model::list::{CollectionSolution, IntervalVar, Resource, Schedule};
 
 /// Score of an interval schedule: total constraint violation (bound, precedence,
 /// resource), then the makespan. Smaller is better, violation first.

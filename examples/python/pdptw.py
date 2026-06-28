@@ -34,7 +34,7 @@ D, Q, M = cp.matrix(dist), cp.array(demand), cp.matrix(is_del)
 k = reqs  # an upper bound on vehicles
 
 model = cp.Model()
-routes = model.list_vars(k, list(range(1, n + 1)))
+routes = model.list_vars(list(range(1, n + 1)), count=k)
 model.minimize(cp.sum(cp.used(r) for r in routes))
 model.then_minimize(cp.sum(cp.sum_edges(r, lambda i, j: D[i][j], start=0, end=0) for r in routes))
 for r in routes:
@@ -48,17 +48,17 @@ for p, d in pairs:
 solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
 
 print(f"requests: {reqs}  capacity: {capacity}  status: {solution.status}")
-if solution.routes is None:
+if solution.lists is None:
     raise SystemExit(f"status: {solution.status} - no feasible plan within {time_limit}s")
 fleet, distance = solution.objectives
 print(f"fleet: {fleet}  total distance: {distance}")
-list_of = {c: idx for idx, route in enumerate(solution.routes) for c in route}
-for r, route in enumerate(solution.routes):
+list_of = {c: idx for idx, route in enumerate(solution.lists) for c in route}
+for r, route in enumerate(solution.lists):
     if route:
         print(f"  route {r}: {[0, *route, 0]}")
 for p, d in pairs:
     assert list_of[p] == list_of[d], f"pair {p}/{d} same vehicle"
-    route = solution.routes[list_of[p]]
+    route = solution.lists[list_of[p]]
     assert route.index(p) < route.index(d), f"pickup {p} before delivery {d}"
     acc = 0
     for c in route:

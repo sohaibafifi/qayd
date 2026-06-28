@@ -27,7 +27,7 @@ colour = [rng.randint(0, colours - 1) for _ in range(n)] + [-1]
 paint_limit = 5  # no more than this many same-colour cars in a row
 
 model = cp.Model()
-(seq,) = model.list_vars(1, list(range(n)))
+(seq,) = model.list_vars(list(range(n)), count=1)
 penalty = 0
 for (p, q), flag in zip(rules, options):
     F = cp.array(flag)
@@ -50,9 +50,9 @@ model.add(
 solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
 
 print(f"cars: {n}  options: {len(rules)}  status: {solution.status}")
-if solution.routes is None:
+if solution.lists is None:
     raise SystemExit(f"status: {solution.status} - no sequence within {time_limit}s")
-order = solution.routes[0]
+order = solution.lists[0]
 print(f"total option overflow: {solution.objective}")
 
 # Replay the window penalties to confirm the reported objective.
@@ -69,4 +69,3 @@ run = 1
 for a, b in zip(order, order[1:]):
     run = run + 1 if colour[a] == colour[b] else 1
     assert run <= paint_limit, "paint run within the batch limit"
-

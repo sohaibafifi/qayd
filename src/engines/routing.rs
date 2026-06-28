@@ -12,12 +12,12 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use crate::model::list::{CollectionModel, CollectionSolution, Constraint, Expr, ExprId, Iterable, Op, ReduceOp, Reduction};
 use crate::constraints::graph;
 use crate::constraints::intension;
 use crate::constraints::primitives;
 use crate::expr;
 use crate::ids::{PropId, VarId};
+use crate::model::list::{CollectionModel, CollectionSolution, Constraint, Expr, ExprId, Iterable, Op, ReduceOp, Reduction};
 use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::search::{self, Objective as SearchObjective, SolveStats};
 use crate::store::{Solver, Store};

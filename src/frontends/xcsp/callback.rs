@@ -22,9 +22,9 @@ use crate::constraints::scheduling::{bin_packing, cumulative, cumulative_var, no
 use crate::constraints::table::{
     extension_from_template, extension_template as compile_extension_template, mdd, regular, Dfa, ExtensionTemplate, Mdd, MddArc, STAR,
 };
+use crate::engines::ls::cop::{LocalRhs, LocalSearchSpec};
 use crate::expr::{self, Expr};
 use crate::ids::VarId;
-use crate::engines::ls::cop::{LocalRhs, LocalSearchSpec};
 use crate::problem::Objective;
 use crate::store::Solver;
 

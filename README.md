@@ -12,7 +12,7 @@
 integer domains. The core solver has trailed domains, propagators, search, Lazy
 Clause Generation, and optional parallel search.
 
-The project also has an experimental collection engine for list-style models:
+The project also has an experimental list-domain engine for list-style models:
 routes, bins, ordered assignments, and scheduling prototypes. That engine is
 used by the Python examples and is being shaped toward list, lambda, and
 partition modeling.
@@ -112,7 +112,7 @@ Common options:
 
 ## Python Examples
 
-The Python examples are the easiest way to inspect the collection modeling API:
+The Python examples are the easiest way to inspect the list-domain modeling API:
 
 ```bash
 uv run examples/python/vrp.py
@@ -126,7 +126,7 @@ Typical list model shape:
 import qayd as cp
 
 model = cp.Model()
-routes = model.list_vars(k, customers)
+routes = model.list_vars(customers, count=k)
 
 for route in routes:
     model.add(cp.sum(route, lambda i: demand[i]) <= capacity)

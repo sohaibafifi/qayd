@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use xcsp3_rust_parser::xcsp_runner::XcspRunner;
 
-use crate::ids::VarId;
 use crate::engines::ls::cop::{solve_ls, LocalSearchOutcome, LocalSearchSpec, LsConfig};
+use crate::ids::VarId;
 use crate::parallel::{normalize_options, solve_cop, solve_csp, worker_roles, CspOutcome, ParallelOutcome};
 use crate::problem::{Objective, Problem};
 use crate::search::{decide_sat_seeded, optimize_seeded, SolveStats};

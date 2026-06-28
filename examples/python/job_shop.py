@@ -1,5 +1,4 @@
 import qayd as cp
-from qayd import schedule
 
 
 jobs = [
@@ -12,38 +11,25 @@ horizon = sum(duration for job in jobs for _, duration in job)
 n_machines = 1 + max(machine for job in jobs for machine, _ in job)
 
 model = cp.Model()
-operations = []
-machine_tasks = [[] for _ in range(n_machines)]
+durations = [duration for job in jobs for _, duration in job]
+machines = [machine for job in jobs for machine, _ in job]
+operations = model.intervals(durations, horizon)
 
-for job_id, job in enumerate(jobs):
-    row = []
-    for op_id, (machine, duration) in enumerate(job):
-        task = schedule.interval_var(
-            model,
-            start=(0, horizon),
-            size=duration,
-            name=f"J{job_id}O{op_id}_M{machine}",
-        )
-        row.append(task)
-        machine_tasks[machine].append(task)
-    operations.append(row)
+offset = 0
+for job in jobs:
+    for k in range(1, len(job)):
+        model.precedence(operations[offset + k - 1], operations[offset + k])
+    offset += len(job)
 
-for row in operations:
-    for before, after in zip(row, row[1:]):
-        model.add(schedule.end_before_start(before, after))
+for machine in range(n_machines):
+    model.no_overlap([op for op, mc in zip(operations, machines) if mc == machine])
 
-for machine, tasks in enumerate(machine_tasks):
-    sequence = schedule.sequence_var(tasks, name=f"machine[{machine}]")
-    schedule.no_overlap(model, sequence)
-
-makespan = schedule.makespan_var(model, [row[-1] for row in operations], horizon)
-model.objective(makespan)
+model.minimize_makespan(operations)
 solution = model.solve(verbose=True)
 
 print("status:", solution.status)
 print("makespan:", solution.objective)
-for row in operations:
-    print([schedule.interval_value(solution, task) for task in row])
+print("starts:", solution.starts)
 
 assert solution.status == "OPTIMAL"
 assert solution.objective == 11

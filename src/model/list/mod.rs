@@ -97,12 +97,8 @@ fn list_objective_term(reduction: &Reduction, items: &[i32]) -> Option<ListObjec
         return None;
     };
     match reduction.op {
-        ReduceOp::Sum => {
-            Some(ListObjectiveTerm::Sum { list: *list, weights: list_item_values(reduction, items)? })
-        }
-        ReduceOp::Count => {
-            Some(ListObjectiveTerm::Count { list: *list, weights: list_item_values(reduction, items)? })
-        }
+        ReduceOp::Sum => Some(ListObjectiveTerm::Sum { list: *list, weights: list_item_values(reduction, items)? }),
+        ReduceOp::Count => Some(ListObjectiveTerm::Count { list: *list, weights: list_item_values(reduction, items)? }),
         ReduceOp::Used => Some(ListObjectiveTerm::Used { list: *list }),
         ReduceOp::Min | ReduceOp::Max | ReduceOp::SelectKth(_) => None,
     }

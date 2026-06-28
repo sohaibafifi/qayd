@@ -31,7 +31,7 @@ boundary = n
 E, T, L, EC, TC, SEP = (cp.array(earliest), cp.array(target), cp.array(latest), cp.array(early_cost), cp.array(tardy_cost), cp.matrix(sep))
 
 model = cp.Model()
-(order,) = model.list_vars(1, list(range(n)))
+(order,) = model.list_vars(list(range(n)), count=1)
 
 def land(cur, acc, prev):
     return cp.max(E[cur], acc + SEP[prev][cur])
@@ -52,9 +52,9 @@ model.add(cp.scan_sum(order, step=land, emit=lambda cur, t, prev: cp.max(0, t - 
 solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
 
 print(f"planes: {n}  status: {solution.status}")
-if solution.routes is None:
+if solution.lists is None:
     raise SystemExit(f"status: {solution.status} - no on-time order within {time_limit}s")
-seq = solution.routes[0]
+seq = solution.lists[0]
 print(f"total earliness/tardiness cost: {solution.objective}")
 acc, prev, total = 0, boundary, 0
 for c in seq:

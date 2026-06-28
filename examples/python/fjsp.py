@@ -3,9 +3,9 @@ one of several eligible machines, with a machine-dependent processing time. The
 search decides both the machine (the op's mode) and the start, minimising the
 makespan.
 
-``model.interval_modes`` declares one moded interval per op (its eligible
-``(machine, duration)`` pairs); ``model.machine_no_overlap`` keeps ops that land
-on the same machine from overlapping; ``model.precedes`` posts the job-order
+``model.alternatives`` declares one moded interval per op (its eligible
+``(machine, duration)`` pairs); ``model.no_overlap_by_machine`` keeps ops that land
+on the same machine from overlapping; ``model.precedence`` posts the job-order
 chain. ``solution.machines`` reports the chosen machine per op.
 
 Tune via ``QAYD_FJSP_J`` / ``QAYD_FJSP_M`` / ``QAYD_FJSP_T``.
@@ -34,11 +34,12 @@ horizon = sum(max(d for _, d in op) for op in modes)
 proc = [{mc: d for mc, d in op} for op in modes]  # per-op machine -> duration
 
 model = cp.Model()
-ivs = model.interval_modes(modes, horizon)
+ivs = model.alternatives(modes, horizon)
 for j in range(jobs):
     for k in range(1, ops_per_job):
-        model.precedes(ivs[j * ops_per_job + k - 1], ivs[j * ops_per_job + k])
-model.machine_no_overlap()
+        model.precedence(ivs[j * ops_per_job + k - 1], ivs[j * ops_per_job + k])
+model.no_overlap_by_machine()
+model.minimize_makespan(ivs)
 
 solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
 

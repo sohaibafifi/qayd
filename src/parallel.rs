@@ -6,11 +6,11 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::engines::ls::cop::{solve_ls, LocalSearchSpec, LsConfig};
 use crate::ids::VarId;
 use crate::lcg::clause::{ClauseSharing, SharedClausePool};
 use crate::lcg::lit::Lit;
 use crate::lns::{fix_neighborhood, LnsState};
-use crate::engines::ls::cop::{solve_ls, LocalSearchSpec, LsConfig};
 use crate::problem::{Objective, Problem};
 use crate::search::{
     decide_sat_shared_seeded, find_one_seeded, optimize_seeded, probe_seeded, split_cube_seeded, Objective as SearchObjective, SolveStats,

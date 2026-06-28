@@ -19,8 +19,8 @@ pub use objective::*;
 // `list::` so its `Expr` does not clash with the intension `Expr`; only the
 // model-level list surface is re-exported at the model root.
 pub use list::{
-    evaluate_list_objectives, list_objective_tiers, list_objectives_better, ListDecl, ListIterable,
-    ListReduceOp, ListReduction, ListReductionConstraint, ListVarRef, ListObjectiveTerm, ListObjectiveTier,
+    evaluate_list_objectives, list_objective_tiers, list_objectives_better, ListDecl, ListIterable, ListObjectiveTerm, ListObjectiveTier,
+    ListReduceOp, ListReduction, ListReductionConstraint, ListVarRef,
 };
 
 /// Constraint declarations owned by the shared model.
@@ -152,7 +152,9 @@ impl Model {
         for constraint in &collection_model.constraints {
             if let Some((list, min, max)) = classify::length_bound_from_collection_constraint(constraint, collection_model.items.len()) {
                 model.add_constraint(Constraint::ListLength { list: lists[list], min, max });
-            } else if let Some((list, weights, min, max)) = classify::item_sum_bound_from_collection_constraint(constraint, &collection_model.items) {
+            } else if let Some((list, weights, min, max)) =
+                classify::item_sum_bound_from_collection_constraint(constraint, &collection_model.items)
+            {
                 model.add_constraint(Constraint::ListItemSum { list: lists[list], weights, min, max });
             } else {
                 model.add_constraint(Constraint::ListReduction(constraint.clone()));

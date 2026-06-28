@@ -25,7 +25,7 @@ budget = 200  # max length per route
 
 D, P = cp.matrix(dist), cp.array(profit)
 model = cp.Model()
-routes = model.list_vars(k, list(range(1, n + 1)), optional=True)  # unvisited go to the pool
+routes = model.list_vars(list(range(1, n + 1)), count=k, optional=True)  # unvisited go to the pool
 model.maximize(cp.sum(cp.sum(r, lambda i: P[i]) for r in routes))
 for r in routes:
     model.add(cp.sum_edges(r, lambda i, j: D[i][j], start=0, end=0) <= budget)
@@ -33,10 +33,10 @@ for r in routes:
 solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
 
 print(f"customers: {n}  vehicles: {k}  budget: {budget}  status: {solution.status}")
-if solution.routes is None:
+if solution.lists is None:
     raise SystemExit(f"status: {solution.status} - infeasible within {time_limit}s")
-served = solution.routes[:k]
-pool = solution.routes[k]
+served = solution.lists[:k]
+pool = solution.lists[k]
 collected = sum(profit[c] for route in served for c in route)
 print(f"collected profit: {solution.objective} (check {collected})  visited: {sum(len(r) for r in served)}/{n}")
 for r, route in enumerate(served):
@@ -45,4 +45,4 @@ for r, route in enumerate(served):
     assert length <= budget, "route within budget"
 
 assert solution.objective == collected
-assert sorted(c for route in solution.routes for c in route) == list(range(1, n + 1)), "every customer placed once"
+assert sorted(c for route in solution.lists for c in route) == list(range(1, n + 1)), "every customer placed once"

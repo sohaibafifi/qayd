@@ -2,9 +2,9 @@
 a chain of operations (one per machine, fixed order); each machine runs one
 operation at a time.
 
-One interval variable per operation; ``model.precedes`` posts the job-order
-chain; ``model.disjunctive`` posts each machine's no-overlap. No per-problem
-code -- the same interval/precedence/disjunctive blocks compose RCPSP too.
+One interval variable per operation; ``model.precedence`` posts the job-order
+chain; ``model.no_overlap`` posts each machine's no-overlap. No per-problem
+code. The same interval, precedence, and no-overlap blocks compose RCPSP too.
 
 Tune via ``QAYD_JSSP_J`` / ``QAYD_JSSP_M`` / ``QAYD_JSSP_T``.
 """
@@ -28,12 +28,13 @@ machine_of = [order[j][k] for j in range(jobs) for k in range(machines)]
 horizon = sum(duration)
 
 model = cp.Model()
-ivs = model.interval_vars(duration, horizon)
+ivs = model.intervals(duration, horizon)
 for j in range(jobs):
     for k in range(1, machines):
-        model.precedes(ivs[j * machines + k - 1], ivs[j * machines + k])
+        model.precedence(ivs[j * machines + k - 1], ivs[j * machines + k])
 for mc in range(machines):
-    model.disjunctive([ivs[op] for op in range(jobs * machines) if machine_of[op] == mc])
+    model.no_overlap([ivs[op] for op in range(jobs * machines) if machine_of[op] == mc])
+model.minimize_makespan(ivs)
 
 solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
 

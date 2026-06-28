@@ -27,7 +27,7 @@ k = n // 4  # a low quantile: value-at-risk
 
 G = cp.array(g)
 model = cp.Model()
-(seq,) = model.list_vars(1, list(range(n)))
+(seq,) = model.list_vars(list(range(n)), count=1)
 # scan accumulator = 1-indexed position; emit the realised (discounted) value.
 model.maximize(
     cp.select_kth(
@@ -43,9 +43,9 @@ model.maximize(
 solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
 
 print(f"blocks: {n}  rate: {rate}  quantile k: {k}  status: {solution.status}")
-if solution.routes is None:
+if solution.lists is None:
     raise SystemExit(f"status: {solution.status} - no ordering within {time_limit}s")
-order = solution.routes[0]
+order = solution.lists[0]
 var = solution.objective
 print(f"value-at-risk (k-th smallest realised value): {var}")
 

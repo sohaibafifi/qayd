@@ -8,7 +8,6 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyIterator, PyModule};
 
-use crate::model::list;
 use crate::constraints::count;
 use crate::constraints::graph;
 use crate::constraints::intension;
@@ -17,12 +16,13 @@ use crate::constraints::linear::{self, Relation};
 use crate::constraints::primitives;
 use crate::constraints::scheduling;
 use crate::constraints::table;
+use crate::engines::ls::cop::{solve_ls, LocalRhs, LocalSearchSpec, LsConfig};
+use crate::engines::ls::lists;
 use crate::engines::{list_exact as list_exact_engine, routing as routing_engine, schedule as schedule_engine};
 use crate::expr::{self, Expr};
 use crate::ids::VarId;
-use crate::engines::ls::lists;
-use crate::engines::ls::cop::{solve_ls, LocalRhs, LocalSearchSpec, LsConfig};
 use crate::model as shared_model;
+use crate::model::list;
 use crate::problem::{Objective as ProblemObjective, Problem};
 use crate::search::{self, Objective as SearchObjective, SearchControl, SolveStats};
 use crate::Solver;
@@ -85,7 +85,7 @@ impl PyListVar {
 
 /// An interval (scheduling) decision variable handle. Carries its owning model
 /// and the schedule generation that created it, so a stale interval (from an
-/// earlier `interval_vars`/`interval_modes` call) or one from another model is
+/// earlier `intervals`/`alternatives` call) or one from another model is
 /// rejected instead of silently aliasing a wrong interval by index.
 #[pyclass(name = "IntervalVar", module = "qayd", from_py_object)]
 #[derive(Clone)]
@@ -138,10 +138,9 @@ struct PySolution {
     objective_expr: Option<String>,
     values: Vec<Option<i32>>,
     stats: PySolveStats,
-    /// List variable contents, set only for collection (list) models.
-    routes: Option<Vec<Vec<i32>>>,
-    /// Value of each lexicographic objective tier, for collection models with
-    /// more than one objective; empty otherwise. `objective` is the first tier.
+    /// List variable contents, set only for list-domain models.
+    lists: Option<Vec<Vec<i32>>>,
+    /// Value of each lexicographic objective tier. `objective` is the first tier.
     objectives: Vec<i64>,
     /// Interval start times, for a schedule model (empty otherwise).
     starts: Vec<i64>,
@@ -163,11 +162,11 @@ struct PyModel {
     names: Vec<Option<String>>,
     objective: Option<ObjectiveSpec>,
     /// Local-search model built in parallel with the CP posts, so `--ls`-style
-    /// LS (`solve(local_search=True)`) can run on the same model.
+    /// LS (`solve(engine="ls")`) can run on the same model.
     local: LocalSearchSpec,
     /// Set once `list_vars` is called: the universe of items partitioned among
     /// the list variables. Its presence makes `solve()` dispatch to the
-    /// collection engine instead of the integer CP/LS path.
+    /// list-domain engine instead of the integer CP/LS path.
     col_universe: Option<Vec<i32>>,
     col_lists: usize,
     /// Bumped on each `list_vars` call so route handles from an earlier call (or
@@ -250,6 +249,15 @@ fn var_matrix_from_py(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<PyIntVar>>> {
     iter.map(|row| var_list_from_py(&row?)).collect()
 }
 
+fn interval_from_py(obj: &Bound<'_, PyAny>) -> PyResult<PyIntervalVar> {
+    obj.extract::<PyRef<'_, PyIntervalVar>>().map(|iv| iv.clone()).map_err(|_| PyTypeError::new_err("expected an IntervalVar"))
+}
+
+fn interval_list_from_py(obj: &Bound<'_, PyAny>) -> PyResult<Vec<PyIntervalVar>> {
+    let iter = PyIterator::from_object(obj)?;
+    iter.map(|item| interval_from_py(&item?)).collect()
+}
+
 fn ids_for(model_id: u64, vars: &[PyIntVar]) -> PyResult<Vec<VarId>> {
     let mut out = Vec::with_capacity(vars.len());
     for var in vars {
@@ -315,18 +323,26 @@ fn make_solution(
         objective_expr: objective_expr.map(str::to_string),
         values,
         stats: stats.into(),
-        routes: None,
+        lists: None,
         objectives: objective.map(|o| vec![o]).unwrap_or_default(),
         starts: Vec::new(),
         machines: Vec::new(),
     }
 }
 
-fn parse_objective_sense(sense: &str) -> PyResult<bool> {
-    match sense {
-        "min" | "minimize" | "minimum" => Ok(true),
-        "max" | "maximize" | "maximum" => Ok(false),
-        _ => Err(PyValueError::new_err("objective sense must be 'min' or 'max'")),
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PythonEngine {
+    Auto,
+    Exact,
+    Ls,
+}
+
+fn parse_engine(engine: &str) -> PyResult<PythonEngine> {
+    match engine {
+        "auto" => Ok(PythonEngine::Auto),
+        "exact" => Ok(PythonEngine::Exact),
+        "ls" => Ok(PythonEngine::Ls),
+        _ => Err(PyValueError::new_err("engine must be 'auto', 'exact', or 'ls'")),
     }
 }
 
@@ -663,11 +679,10 @@ impl PySolution {
         self.objective_expr.clone()
     }
 
-    /// List variable contents (one list per list variable), or `None` for an
-    /// integer model.
+    /// List variable contents (one list per list variable), or `None` otherwise.
     #[getter]
-    fn routes(&self) -> Option<Vec<Vec<i32>>> {
-        self.routes.clone()
+    fn lists(&self) -> Option<Vec<Vec<i32>>> {
+        self.lists.clone()
     }
 
     #[getter]
@@ -1001,15 +1016,27 @@ impl PyModel {
         Ok(())
     }
 
-    fn no_overlap(&mut self, starts: &Bound<'_, PyAny>, durations: Vec<i64>) -> PyResult<()> {
-        let starts = ids_for(self.id, &var_list_from_py(starts)?)?;
-        if starts.len() != durations.len() {
-            return Err(PyValueError::new_err("starts and durations must have the same length"));
+    #[pyo3(signature = (items, durations=None))]
+    fn no_overlap(&mut self, items: &Bound<'_, PyAny>, durations: Option<Vec<i64>>) -> PyResult<()> {
+        if let Some(durations) = durations {
+            let starts = ids_for(self.id, &var_list_from_py(items)?)?;
+            if starts.len() != durations.len() {
+                return Err(PyValueError::new_err("starts and durations must have the same length"));
+            }
+            let origins: Vec<Vec<VarId>> = starts.iter().map(|&s| vec![s]).collect();
+            let lengths: Vec<Vec<Expr>> = durations.iter().map(|&d| vec![expr::int(d)]).collect();
+            self.local.add_no_overlap(origins, lengths, false);
+            scheduling::no_overlap(&mut self.solver, &starts, &durations);
+            return Ok(());
         }
-        let origins: Vec<Vec<VarId>> = starts.iter().map(|&s| vec![s]).collect();
-        let lengths: Vec<Vec<Expr>> = durations.iter().map(|&d| vec![expr::int(d)]).collect();
-        self.local.add_no_overlap(origins, lengths, false);
-        scheduling::no_overlap(&mut self.solver, &starts, &durations);
+
+        let intervals = interval_list_from_py(items)?;
+        for iv in &intervals {
+            self.check_interval_scope(iv)?;
+        }
+        let idx = intervals.iter().map(|iv| iv.index as usize).collect();
+        let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("create intervals before no_overlap"))?;
+        sched.resources.push(list::Resource::NoOverlap(idx));
         Ok(())
     }
 
@@ -1092,95 +1119,57 @@ impl PyModel {
         Ok(())
     }
 
-    /// Declare `k` list variables that partition `universe` among them. Their
-    /// presence switches `solve()` to the collection engine. Objective and
-    /// constraints are added as reductions (e.g. `route_cost`, `list_sum`).
-    /// Create `k` ordered list variables partitioning `universe`. With
-    /// `optional=True`, an extra hidden "pool" list is added that no reduction
-    /// references, so items left there are unassigned (prize collecting); the `k`
-    /// returned handles are the real lists and `solution.routes[k]` is the pool.
-    #[pyo3(signature = (k, universe, *, optional=false))]
-    fn list_vars(&mut self, k: usize, universe: Vec<i32>, optional: bool) -> PyResult<Vec<PyListVar>> {
-        if universe.is_empty() {
-            return Err(PyValueError::new_err("list universe cannot be empty"));
+    /// Create `count` ordered list variables over `items`.
+    ///
+    /// With `optional=True`, an extra hidden pool list is added that no returned
+    /// handle references, so items may remain unassigned to the visible lists.
+    #[pyo3(signature = (items, count, *, optional=false))]
+    fn list_vars(&mut self, items: Vec<i32>, count: usize, optional: bool) -> PyResult<Vec<PyListVar>> {
+        if items.is_empty() {
+            return Err(PyValueError::new_err("list items cannot be empty"));
         }
-        if k == 0 {
+        if count == 0 {
             return Err(PyValueError::new_err("need at least one list"));
         }
         if !self.names.is_empty() || self.objective.is_some() {
             return Err(PyValueError::new_err("cannot mix integer variables with list_vars; use one modeling style per model"));
         }
         if self.col_schedule.is_some() {
-            return Err(PyValueError::new_err(
-                "model already has interval variables; use one collection mode per model (list or interval)",
-            ));
+            return Err(PyValueError::new_err("model already has interval variables; use one domain style per model (list or interval)"));
         }
-        // The universe is a set partitioned among the lists; duplicate ids would
+        // The item set is partitioned among the lists; duplicate ids would
         // be independent positions that share a value, which silently diverges
         // from set semantics (and from how reductions aggregate by value).
-        let mut seen = std::collections::HashSet::with_capacity(universe.len());
-        if let Some(dup) = universe.iter().find(|v| !seen.insert(**v)) {
-            return Err(PyValueError::new_err(format!("list universe has a duplicate item {dup}; items must be distinct")));
+        let mut seen = std::collections::HashSet::with_capacity(items.len());
+        if let Some(dup) = items.iter().find(|v| !seen.insert(**v)) {
+            return Err(PyValueError::new_err(format!("list items have a duplicate value {dup}; items must be distinct")));
         }
-        self.col_universe = Some(universe);
-        self.col_lists = if optional { k + 1 } else { k };
+        self.col_universe = Some(items);
+        self.col_lists = if optional { count + 1 } else { count };
         self.col_gen += 1;
         // Reset any reductions recorded against a previous `list_vars` generation.
         self.col_objectives.clear();
         self.col_constraints.clear();
         self.col_globals.clear();
         let gen = self.col_gen;
-        Ok((0..k).map(|i| PyListVar { model_id: self.id, gen, index: i as u32 }).collect())
+        Ok((0..count).map(|i| PyListVar { model_id: self.id, gen, index: i as u32 }).collect())
     }
 
-    #[pyo3(signature = (objective, *, sense="min"))]
-    fn objective(&mut self, objective: &Bound<'_, PyAny>, sense: &str) -> PyResult<()> {
-        // A term objective targets the list (collection) model. Replace, matching
-        // the integer path: a second objective() call restates the objective.
-        if let Ok(term) = objective.extract::<PyRef<'_, PyTerm>>() {
-            self.check_term_scope(term.model_id, term.gen)?;
-            let minimize = parse_objective_sense(sense)?;
-            self.col_objectives.clear();
-            self.col_objectives.push(list::ObjectiveTier { minimize, terms: term.reductions.clone() });
+    /// Precedence over list items or interval variables.
+    fn precedence(&mut self, before: &Bound<'_, PyAny>, after: &Bound<'_, PyAny>) -> PyResult<()> {
+        if let (Ok(a), Ok(b)) = (before.extract::<PyRef<'_, PyIntervalVar>>(), after.extract::<PyRef<'_, PyIntervalVar>>()) {
+            self.check_interval_scope(&a)?;
+            self.check_interval_scope(&b)?;
+            let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("create intervals before precedence"))?;
+            sched.precedences.push((a.index as usize, b.index as usize));
             return Ok(());
         }
-        let expr = expr_from_py(objective)?;
-        if let Some(model_id) = expr.model_id {
-            if model_id != self.id {
-                return Err(PyValueError::new_err("objective belongs to a different model"));
-            }
-        }
-        let mut objective_vars = Vec::new();
-        expr.expr.collect_vars(&mut objective_vars);
-        if objective_vars.is_empty() {
-            return Err(PyValueError::new_err("objective must reference at least one model variable"));
-        }
-        self.objective = Some(ObjectiveSpec { minimizing: parse_objective_sense(sense)?, expr });
-        Ok(())
-    }
-
-    /// Append a lexicographic objective tier to a list (collection) model. The
-    /// first tier added dominates the second, and so on (e.g. minimise fleet
-    /// size, then total distance). Up to `MAX_TIERS` tiers.
-    #[pyo3(signature = (objective, *, sense="min"))]
-    fn add_objective(&mut self, objective: &Bound<'_, PyAny>, sense: &str) -> PyResult<()> {
-        let term = objective
-            .extract::<PyRef<'_, PyTerm>>()
-            .map_err(|_| PyTypeError::new_err("add_objective expects a list term; use objective(...) for an integer expression"))?;
-        self.check_term_scope(term.model_id, term.gen)?;
-        if self.col_objectives.len() >= list::MAX_TIERS {
-            return Err(PyValueError::new_err(format!("at most {} objective tiers are supported", list::MAX_TIERS)));
-        }
-        let minimize = parse_objective_sense(sense)?;
-        self.col_objectives.push(list::ObjectiveTier { minimize, terms: term.reductions.clone() });
-        Ok(())
-    }
-
-    /// Precedence over the ordered lists: item `before` must land in a list whose
-    /// index is no greater than item `after`'s. Used for assembly-line task
-    /// precedence (a task is in a station no later than each successor).
-    fn precedence(&mut self, before: i32, after: i32) {
+        let before =
+            before.extract::<i32>().map_err(|_| PyTypeError::new_err("precedence expects two item ids or two IntervalVar handles"))?;
+        let after =
+            after.extract::<i32>().map_err(|_| PyTypeError::new_err("precedence expects two item ids or two IntervalVar handles"))?;
         self.col_globals.push(list::GlobalConstraint::ListLe { before, after });
+        Ok(())
     }
 
     /// Require two items to share a list (same vehicle, same bin).
@@ -1188,23 +1177,23 @@ impl PyModel {
         self.col_globals.push(list::GlobalConstraint::SameList { a, b });
     }
 
-    /// Declare interval (scheduling) decision variables: one per duration, each
-    /// with a start decided in `[0, horizon - duration]`. Returns their handles.
-    /// Starts a fresh schedule; mutually exclusive with `list_vars`.
-    fn interval_vars(&mut self, durations: Vec<i64>, horizon: i64) -> PyResult<Vec<PyIntervalVar>> {
+    /// Create one fixed-duration interval.
+    fn interval(&mut self, duration: i64, horizon: i64) -> PyResult<PyIntervalVar> {
+        let mut intervals = self.intervals(vec![duration], horizon)?;
+        Ok(intervals.remove(0))
+    }
+
+    /// Create fixed-duration intervals.
+    fn intervals(&mut self, durations: Vec<i64>, horizon: i64) -> PyResult<Vec<PyIntervalVar>> {
         self.enter_schedule_mode()?;
         let intervals = durations.iter().map(|&d| list::IntervalVar { duration: d, horizon, modes: Vec::new() }).collect();
-        self.col_schedule =
-            Some(list::Schedule { intervals, precedences: Vec::new(), resources: Vec::new(), minimize_makespan: true });
+        self.col_schedule = Some(list::Schedule { intervals, precedences: Vec::new(), resources: Vec::new(), minimize_makespan: true });
         let gen = self.col_sched_gen;
         Ok((0..durations.len()).map(|i| PyIntervalVar { model_id: self.id, gen, index: i as u32 }).collect())
     }
 
-    /// Declare flexible interval variables (flexible job shop): each op is given a
-    /// list of `(machine, duration)` modes the search picks among. `modes[i]` is
-    /// op `i`'s option list. Pair with `machine_no_overlap`. Starts a fresh
-    /// schedule. `solution.machines` reports the chosen machine per op.
-    fn interval_modes(&mut self, modes: Vec<Vec<(usize, i64)>>, horizon: i64) -> PyResult<Vec<PyIntervalVar>> {
+    /// Create intervals whose mode is selected from `(machine, duration)` pairs.
+    fn alternatives(&mut self, modes: Vec<Vec<(usize, i64)>>, horizon: i64) -> PyResult<Vec<PyIntervalVar>> {
         if modes.iter().any(|m| m.is_empty()) {
             return Err(PyValueError::new_err("each interval needs at least one (machine, duration) mode"));
         }
@@ -1217,37 +1206,29 @@ impl PyModel {
                 modes: opts.iter().map(|&(machine, duration)| list::Mode { machine, duration }).collect(),
             })
             .collect();
-        self.col_schedule =
-            Some(list::Schedule { intervals, precedences: Vec::new(), resources: Vec::new(), minimize_makespan: true });
+        self.col_schedule = Some(list::Schedule { intervals, precedences: Vec::new(), resources: Vec::new(), minimize_makespan: true });
         let gen = self.col_sched_gen;
         Ok((0..modes.len()).map(|i| PyIntervalVar { model_id: self.id, gen, index: i as u32 }).collect())
     }
 
-    /// Each machine runs one interval at a time: moded intervals that share a
-    /// chosen machine never overlap (flexible job shop).
-    fn machine_no_overlap(&mut self) -> PyResult<()> {
-        let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("call interval_modes before machine_no_overlap"))?;
+    /// Moded intervals that choose the same machine never overlap.
+    fn no_overlap_by_machine(&mut self) -> PyResult<()> {
+        let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("create alternatives before no_overlap_by_machine"))?;
         sched.resources.push(list::Resource::MachineNoOverlap);
         Ok(())
     }
 
-    /// Interval `a` must end before interval `b` starts (a precedence edge).
-    fn precedes(&mut self, a: &PyIntervalVar, b: &PyIntervalVar) -> PyResult<()> {
-        self.check_interval_scope(a)?;
-        self.check_interval_scope(b)?;
-        let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("call interval_vars before precedes"))?;
-        sched.precedences.push((a.index as usize, b.index as usize));
-        Ok(())
-    }
-
-    /// A unary machine: the given intervals never overlap.
-    fn disjunctive(&mut self, intervals: Vec<PyIntervalVar>) -> PyResult<()> {
-        for iv in &intervals {
-            self.check_interval_scope(iv)?;
+    /// Keep the makespan objective explicit in Python while the Rust model owns
+    /// the scheduling semantics.
+    #[pyo3(signature = (intervals=None))]
+    fn minimize_makespan(&mut self, intervals: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        if let Some(intervals) = intervals {
+            for iv in interval_list_from_py(intervals)? {
+                self.check_interval_scope(&iv)?;
+            }
         }
-        let idx = intervals.iter().map(|iv| iv.index as usize).collect();
-        let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("call interval_vars before disjunctive"))?;
-        sched.resources.push(list::Resource::NoOverlap(idx));
+        let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("create intervals before minimize_makespan"))?;
+        sched.minimize_makespan = true;
         Ok(())
     }
 
@@ -1258,39 +1239,34 @@ impl PyModel {
             self.check_interval_scope(iv)?;
         }
         let demands = demands.iter().map(|(iv, amount)| (iv.index as usize, *amount)).collect();
-        let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("call interval_vars before resource"))?;
+        let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("create intervals before resource"))?;
         sched.resources.push(list::Resource::Cumulative { demands, capacity });
         Ok(())
     }
 
-    fn clear_objective(&mut self) {
-        self.objective = None;
-    }
-
-    #[pyo3(signature = (*, search=None, verbose=false, local_search=false, time_limit=None, seed=0))]
+    #[pyo3(signature = (*, search=None, verbose=false, time_limit=None, seed=0, engine="auto"))]
     fn solve(
         &self,
         search: Option<&Bound<'_, PyAny>>,
         verbose: bool,
-        local_search: bool,
         time_limit: Option<u64>,
         seed: u64,
+        engine: &str,
     ) -> PyResult<PySolution> {
-        // List or interval (schedule) variables present: solved by the
-        // collection engine regardless of the integer-path options.
+        let engine = parse_engine(engine)?;
         if self.col_universe.is_some() || self.col_schedule.is_some() {
             if !self.names.is_empty() || self.objective.is_some() {
                 return Err(PyValueError::new_err(
                     "model mixes integer variables with list/interval variables; use one modeling style per model",
                 ));
             }
-            return self.solve_collection(time_limit, seed, verbose);
+            return self.solve_collection(time_limit, seed, verbose, engine);
         }
-        if local_search {
+        if engine == PythonEngine::Ls {
             let Some(objective) = &self.objective else {
-                return Err(PyValueError::new_err("local_search=True requires an objective (call model.objective(...))"));
+                return Err(PyValueError::new_err("engine='ls' requires an objective"));
             };
-            return self.solve_local_search(objective, search, verbose, time_limit, seed);
+            return self.solve_ls(objective, search, verbose, time_limit, seed);
         }
         if let Some(objective) = &self.objective {
             return self.solve_optimization(objective, search, verbose);
@@ -1320,30 +1296,22 @@ impl PyModel {
         Ok(search::count_solutions(&mut solver, &vars))
     }
 
-    /// Set the (primary) objective. For a list/interval model, a list term sets
-    /// the first lexicographic tier to be minimised and returns `None` (chain
-    /// `then_minimize`/`then_maximize` for further tiers, then `solve`). For an
-    /// integer model, an integer expression is minimised by a one-shot solve that
-    /// returns the solution.
-    #[pyo3(signature = (objective, *, search=None, verbose=false))]
-    fn minimize(&mut self, objective: &Bound<'_, PyAny>, search: Option<&Bound<'_, PyAny>>, verbose: bool) -> PyResult<Option<PySolution>> {
+    /// Set the primary minimization objective.
+    fn minimize(&mut self, objective: &Bound<'_, PyAny>) -> PyResult<()> {
         if let Ok(term) = objective.extract::<PyRef<'_, PyTerm>>() {
             self.push_collection_tier(&term, true, true)?;
-            return Ok(None);
+            return Ok(());
         }
-        let spec = ObjectiveSpec { minimizing: true, expr: expr_from_py(objective)? };
-        Ok(Some(self.solve_optimization(&spec, search, verbose)?))
+        self.set_integer_objective(objective, true)
     }
 
-    /// Maximising counterpart of [`minimize`](Self::minimize).
-    #[pyo3(signature = (objective, *, search=None, verbose=false))]
-    fn maximize(&mut self, objective: &Bound<'_, PyAny>, search: Option<&Bound<'_, PyAny>>, verbose: bool) -> PyResult<Option<PySolution>> {
+    /// Set the primary maximization objective.
+    fn maximize(&mut self, objective: &Bound<'_, PyAny>) -> PyResult<()> {
         if let Ok(term) = objective.extract::<PyRef<'_, PyTerm>>() {
             self.push_collection_tier(&term, false, true)?;
-            return Ok(None);
+            return Ok(());
         }
-        let spec = ObjectiveSpec { minimizing: false, expr: expr_from_py(objective)? };
-        Ok(Some(self.solve_optimization(&spec, search, verbose)?))
+        self.set_integer_objective(objective, false)
     }
 
     /// Append a lower-priority lexicographic tier to a list/interval objective: a
@@ -1373,16 +1341,16 @@ impl PyModel {
         id
     }
 
-    /// Solve the recorded collection model (list variables + reductions) with the
+    /// Solve the recorded list-domain model (list variables + reductions) with the
     /// collection local-search engine, time-limited (default 5s).
     /// Reject a term that belongs to a different model or to a superseded
     /// `list_vars` generation.
     fn check_term_scope(&self, model_id: u64, gen: u64) -> PyResult<()> {
         if model_id != self.id {
-            return Err(PyValueError::new_err("this term/route belongs to a different model"));
+            return Err(PyValueError::new_err("this list term belongs to a different model"));
         }
         if gen != self.col_gen {
-            return Err(PyValueError::new_err("this term/route is stale; rebuild it from the current list_vars()"));
+            return Err(PyValueError::new_err("this list term is stale; rebuild it from the current list_vars()"));
         }
         Ok(())
     }
@@ -1401,15 +1369,31 @@ impl PyModel {
         Ok(())
     }
 
+    fn set_integer_objective(&mut self, objective: &Bound<'_, PyAny>, minimizing: bool) -> PyResult<()> {
+        let expr = expr_from_py(objective)?;
+        if let Some(model_id) = expr.model_id {
+            if model_id != self.id {
+                return Err(PyValueError::new_err("objective belongs to a different model"));
+            }
+        }
+        let mut objective_vars = Vec::new();
+        expr.expr.collect_vars(&mut objective_vars);
+        if objective_vars.is_empty() {
+            return Err(PyValueError::new_err("objective must reference at least one model variable"));
+        }
+        self.objective = Some(ObjectiveSpec { minimizing, expr });
+        Ok(())
+    }
+
     /// Begin (or restart) interval-schedule mode. Rejects mixing with integer or
     /// list variables, and bumps the schedule generation so handles from an
-    /// earlier `interval_vars`/`interval_modes` call become stale.
+    /// earlier `intervals`/`alternatives` call become stale.
     fn enter_schedule_mode(&mut self) -> PyResult<()> {
         if !self.names.is_empty() || self.objective.is_some() {
             return Err(PyValueError::new_err("cannot mix integer variables with interval variables; use one modeling style per model"));
         }
         if self.col_universe.is_some() {
-            return Err(PyValueError::new_err("model already has list variables; use one collection mode per model (list or interval)"));
+            return Err(PyValueError::new_err("model already has list variables; use one domain style per model (list or interval)"));
         }
         self.col_sched_gen += 1;
         Ok(())
@@ -1422,7 +1406,7 @@ impl PyModel {
             return Err(PyValueError::new_err("this interval belongs to a different model"));
         }
         if iv.gen != self.col_sched_gen {
-            return Err(PyValueError::new_err("this interval is stale; rebuild it from the current interval_vars()/interval_modes()"));
+            return Err(PyValueError::new_err("this interval is stale; rebuild it from the current intervals()/alternatives()"));
         }
         Ok(())
     }
@@ -1512,7 +1496,7 @@ impl PyModel {
             objective_expr: Some("integer routing edge-sum".to_string()),
             values: Vec::new(),
             stats: outcome.stats.into(),
-            routes: sol.feasible.then(|| sol.lists.clone()),
+            lists: sol.feasible.then(|| sol.lists.clone()),
             objectives,
             starts: Vec::new(),
             machines: Vec::new(),
@@ -1582,7 +1566,7 @@ impl PyModel {
             objective_expr: has_objective.then(|| "list objective".to_string()),
             values: Vec::new(),
             stats: outcome.stats.into(),
-            routes: outcome.solution,
+            lists: outcome.solution,
             objectives: outcome.objectives,
             starts: Vec::new(),
             machines: Vec::new(),
@@ -1650,14 +1634,14 @@ impl PyModel {
             objective_expr: schedule.minimize_makespan.then(|| "makespan".to_string()),
             values: Vec::new(),
             stats: outcome.stats.into(),
-            routes: None,
+            lists: None,
             objectives: outcome.objective.map(|value| vec![value]).unwrap_or_default(),
             starts: outcome.starts,
             machines: outcome.machines,
         }))
     }
 
-    fn solve_collection(&self, time_limit: Option<u64>, seed: u64, verbose: bool) -> PyResult<PySolution> {
+    fn solve_collection(&self, time_limit: Option<u64>, seed: u64, verbose: bool, engine: PythonEngine) -> PyResult<PySolution> {
         let model = list::CollectionModel {
             items: self.col_universe.clone().unwrap_or_default(),
             lists: self.col_lists,
@@ -1669,11 +1653,16 @@ impl PyModel {
         model.validate().map_err(PyValueError::new_err)?;
         let shared = shared_model::Model::from_collection(&model);
         let selection = shared_model::BackendSelection::for_model(&shared);
-        if let Some(solution) = self.try_solve_routing_integer(&model, &selection, time_limit, seed, verbose)? {
-            return Ok(solution);
-        }
-        if let Some(solution) = self.try_solve_domain_collection(&model, &selection, time_limit, seed, verbose)? {
-            return Ok(solution);
+        if engine != PythonEngine::Ls {
+            if let Some(solution) = self.try_solve_routing_integer(&model, &selection, time_limit, seed, verbose)? {
+                return Ok(solution);
+            }
+            if let Some(solution) = self.try_solve_domain_collection(&model, &selection, time_limit, seed, verbose)? {
+                return Ok(solution);
+            }
+            if engine == PythonEngine::Exact {
+                return Err(PyValueError::new_err(format!("model is not supported by an exact engine: {}", selection.reason)));
+            }
         }
         let limit = time_limit.unwrap_or(5);
         // The first tier drives the progress line; report its sense.
@@ -1707,7 +1696,7 @@ impl PyModel {
             }
             println!("  improvements: {improvements}");
         }
-        // Only expose objectives and routes for a feasible incumbent. An
+        // Only expose objectives and lists for a feasible incumbent. An
         // infeasible best-effort partition may violate constraints, so hiding
         // it stops a caller from accidentally consuming an invalid solution.
         let objectives = if sol.feasible { sol.objectives.clone() } else { Vec::new() };
@@ -1718,7 +1707,7 @@ impl PyModel {
             objective_expr: None,
             values: Vec::new(),
             stats: SolveStats::default().into(),
-            routes: sol.feasible.then(|| sol.lists.clone()),
+            lists: sol.feasible.then(|| sol.lists.clone()),
             objectives,
             starts: if sol.feasible { sol.starts.clone() } else { Vec::new() },
             machines: if sol.feasible { sol.machines.clone() } else { Vec::new() },
@@ -1728,7 +1717,7 @@ impl PyModel {
     /// Solve a COP with the local-search engine (`solve_ls`) - the same
     /// incumbent-only LS that powers `--ls`. Requires an objective and a time
     /// limit (defaults to 10s, since LS never terminates on its own).
-    fn solve_local_search(
+    fn solve_ls(
         &self,
         objective: &ObjectiveSpec,
         search: Option<&Bound<'_, PyAny>>,
@@ -2307,12 +2296,7 @@ fn count_reduction(route: &PyListVar, func: Option<&Bound<'_, PyAny>>) -> PyResu
             let body = arena.constant(1);
             Ok(single_term(
                 route,
-                list::Reduction {
-                    op: list::ReduceOp::Count,
-                    iterable: list::Iterable::Items(route.index as usize),
-                    arena,
-                    body,
-                },
+                list::Reduction { op: list::ReduceOp::Count, iterable: list::Iterable::Items(route.index as usize), arena, body },
             ))
         }
     }
@@ -2454,56 +2438,6 @@ fn matrix(data: Vec<Vec<i64>>) -> PyMatrix {
     PyMatrix { data: Arc::new(data) }
 }
 
-// --- convenience builders for the common raw-array cases ---
-
-/// Closed-tour cost of `route`: `sum_edges(route, (i, j) => matrix[i][j])` with
-/// `depot` at both ends.
-#[pyfunction]
-#[pyo3(signature = (route, matrix, *, depot=0))]
-fn route_cost(route: &PyListVar, matrix: Vec<Vec<i64>>, depot: i32) -> PyTerm {
-    let mut arena = list::ExprArena::default();
-    let i = arena.arg(0);
-    let j = arena.arg(1);
-    let body = arena.matrix(Arc::new(matrix), i, j);
-    let iterable = list::Iterable::Edges { list: route.index as usize, start: depot, end: depot };
-    single_term(route, list::Reduction { op: list::ReduceOp::Sum, iterable, arena, body })
-}
-
-fn over_items_raw(route: &PyListVar, op: list::ReduceOp, values: Vec<i64>) -> PyTerm {
-    let mut arena = list::ExprArena::default();
-    let i = arena.arg(0);
-    let body = arena.array(Arc::new(values), i);
-    single_term(route, list::Reduction { op, iterable: list::Iterable::Items(route.index as usize), arena, body })
-}
-
-/// Sum of `values[item]` over `route`'s items.
-#[pyfunction]
-fn list_sum(route: &PyListVar, values: Vec<i64>) -> PyTerm {
-    over_items_raw(route, list::ReduceOp::Sum, values)
-}
-
-/// Minimum / maximum of `values[item]` over `route`'s items.
-#[pyfunction]
-fn list_min(route: &PyListVar, values: Vec<i64>) -> PyTerm {
-    over_items_raw(route, list::ReduceOp::Min, values)
-}
-
-#[pyfunction]
-fn list_max(route: &PyListVar, values: Vec<i64>) -> PyTerm {
-    over_items_raw(route, list::ReduceOp::Max, values)
-}
-
-/// Number of items in `route`.
-#[pyfunction]
-fn list_count(route: &PyListVar) -> PyTerm {
-    let mut arena = list::ExprArena::default();
-    let body = arena.constant(1);
-    single_term(
-        route,
-        list::Reduction { op: list::ReduceOp::Count, iterable: list::Iterable::Items(route.index as usize), arena, body },
-    )
-}
-
 /// `1` if `route` has any item, else `0`. Summed over routes (e.g.
 /// `sum(cp.used(r) for r in routes)`) this is the number of used routes/bins,
 /// for a "minimise the fleet" or "minimise open bins" objective tier.
@@ -2511,10 +2445,7 @@ fn list_count(route: &PyListVar) -> PyTerm {
 fn used(route: &PyListVar) -> PyTerm {
     let mut arena = list::ExprArena::default();
     let body = arena.constant(0);
-    single_term(
-        route,
-        list::Reduction { op: list::ReduceOp::Used, iterable: list::Iterable::Items(route.index as usize), arena, body },
-    )
+    single_term(route, list::Reduction { op: list::ReduceOp::Used, iterable: list::Iterable::Items(route.index as usize), arena, body })
 }
 
 #[pymodule]
@@ -2560,11 +2491,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scan_sum, m)?)?;
     m.add_function(wrap_pyfunction!(select_kth, m)?)?;
     m.add_function(wrap_pyfunction!(windows, m)?)?;
-    m.add_function(wrap_pyfunction!(route_cost, m)?)?;
-    m.add_function(wrap_pyfunction!(list_sum, m)?)?;
-    m.add_function(wrap_pyfunction!(list_min, m)?)?;
-    m.add_function(wrap_pyfunction!(list_max, m)?)?;
-    m.add_function(wrap_pyfunction!(list_count, m)?)?;
     m.add_function(wrap_pyfunction!(used, m)?)?;
     m.add("STAR", table::STAR)?;
     Ok(())
