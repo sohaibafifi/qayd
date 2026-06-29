@@ -22,7 +22,7 @@ use crate::ids::{ListId, PropId, VarId};
 use crate::model::list::{CollectionModel, CollectionSolution, Constraint, Expr, ExprId, GlobalConstraint, Iterable, Op, ReduceOp, Reduction};
 use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::search::{self, Objective as SearchObjective, SolveStats};
-use crate::store::{Solver, Store};
+use crate::store::{Premise, Solver, Store};
 
 const MAX_INTEGER_ROUTING_NODES: usize = 32;
 
@@ -458,11 +458,13 @@ struct RouteSegmentChannel {
 
 impl RouteSegmentChannel {
     /// Customer `j` is proven to sit in depot segment `r`: fix its derived view and
-    /// require the matching membership (partition forbids the other lists). Plain
-    /// (scope-snapshot) reasons -- sound, and enough while `circuit` is unexplained.
-    fn assign_segment(&self, store: &mut Store, j: usize, r: usize) -> Result<(), Inconsistency> {
-        store.fix(self.segment_of[j], r as i32)?;
-        store.require_list_item(self.lists[r], self.items[j])?;
+    /// require the matching membership (partition forbids the other lists). The
+    /// reason is the fixed arcs of the path `depot r -> ... -> customer`, so a clash
+    /// with `same_list`/`list_len`/`item_sum` (via the membership) learns a clause
+    /// over those arcs rather than a whole-scope snapshot.
+    fn assign_segment(&self, store: &mut Store, j: usize, r: usize, reason: &[Premise]) -> Result<(), Inconsistency> {
+        store.fix_because(self.segment_of[j], r as i32, reason.to_vec())?;
+        store.require_list_item_because(self.lists[r], self.items[j], reason.to_vec())?;
         Ok(())
     }
 }
@@ -489,17 +491,21 @@ impl Propagator for RouteSegmentChannel {
         for r in 0..self.depot_count {
             let mut cur = r;
             let mut steps = 0usize;
+            // Accumulate the fixed arcs walked from depot `r`; they are the reason
+            // every customer reached on this prefix sits in segment `r`.
+            let mut reason: Vec<Premise> = Vec::new();
             while store.is_fixed(self.succ[cur]) {
                 steps += 1;
                 if steps > n {
                     break; // malformed partial state; let `circuit` narrow first
                 }
                 let next = store.value(self.succ[cur]) as usize;
+                reason.push(Premise::Eq { var: self.succ[cur], val: next as i32 });
                 if next >= n || next < self.depot_count {
                     break; // segment ends at the next depot copy (or out of range)
                 }
                 let j = next - self.depot_count;
-                self.assign_segment(store, j, r)?;
+                self.assign_segment(store, j, r, &reason)?;
                 assigned[j] = true;
                 cur = next;
             }
