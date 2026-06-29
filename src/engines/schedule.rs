@@ -154,6 +154,7 @@ where
             None,
             &[],
             None,
+            Vec::new(),
             |value, _| on_improve(value),
         );
         let outcome = match (best, complete) {
@@ -318,6 +319,7 @@ where
         None,
         &[],
         None,
+        Vec::new(),
         |value, _| on_improve(value),
     );
 

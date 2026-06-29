@@ -4,7 +4,8 @@ use super::*;
 use crate::model::list;
 
 type ItemSumBound = (usize, Vec<(i32, i64)>, i64, i64);
-const MAX_INTEGER_ROUTING_NODES: usize = 600;
+type ItemSumSignature = (Vec<(i32, i64)>, i64, i64);
+const MAX_INTEGER_ROUTING_NODES: usize = 32;
 
 /// High-level model shape used to choose a solver engine.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -386,47 +387,80 @@ fn direct_closed_edge_signature<'a>(reduction: &'a list::Reduction, items: &[i32
 
 fn list_constraints_are_integer_routing_supported(model: &Model, items: &[i32]) -> bool {
     let mut capacities: Vec<Option<(Vec<i64>, i64)>> = (0..model.lists.len()).map(|_| None).collect();
-    let mut saw_capacity = false;
+    let mut lengths: Vec<Option<(usize, usize)>> = (0..model.lists.len()).map(|_| None).collect();
+    let mut item_sums: Vec<Option<ItemSumSignature>> = (0..model.lists.len()).map(|_| None).collect();
     for constraint in &model.constraints {
         match constraint {
             Constraint::ListPartition { .. } => {}
+            Constraint::SameList { a, b, .. } => {
+                if !items.contains(a) || !items.contains(b) {
+                    return false;
+                }
+            }
+            Constraint::ListLength { list, min, max } => {
+                if list.0 >= lengths.len() || lengths[list.0].is_some() || min > max || *max > items.len() {
+                    return false;
+                }
+                lengths[list.0] = Some((*min, *max));
+            }
             Constraint::ListItemSum { list, weights, min, max } => {
                 if list.0 >= capacities.len() {
                     return false;
                 }
-                if *min > 0 || *max < 0 || i32::try_from(*max).is_err() {
-                    return false;
+                if let Some(capacity) = capacity_signature_from_item_sum(weights, *min, *max, items) {
+                    let slot = &mut capacities[list.0];
+                    if slot.is_some() {
+                        return false;
+                    }
+                    *slot = Some(capacity);
+                } else {
+                    let Some(item_sum) = item_sum_signature(weights, *min, *max, items) else {
+                        return false;
+                    };
+                    let slot = &mut item_sums[list.0];
+                    if slot.is_some() {
+                        return false;
+                    }
+                    *slot = Some(item_sum);
                 }
-                let Some(values) = capacity_values_for_items(weights, items) else {
-                    return false;
-                };
-                if values.iter().any(|&value| value < 0 || value > *max || i32::try_from(value).is_err()) {
-                    return false;
-                }
-                let slot = &mut capacities[list.0];
-                if slot.is_some() {
-                    return false;
-                }
-                *slot = Some((values, *max));
-                saw_capacity = true;
             }
-            Constraint::SameList { .. }
-            | Constraint::ItemPrecedence { .. }
-            | Constraint::ListLength { .. }
+            Constraint::ItemPrecedence { .. }
             | Constraint::ListReduction(_)
             | Constraint::IntervalPrecedence { .. }
             | Constraint::IntervalResource(_)
             | Constraint::Intension(_) => return false,
         }
     }
-    if !saw_capacity {
+    homogeneous_present(&capacities) && homogeneous_present(&lengths) && homogeneous_present(&item_sums)
+}
+
+fn homogeneous_present<T: PartialEq>(by_list: &[Option<T>]) -> bool {
+    let present = by_list.iter().filter(|x| x.is_some()).count();
+    if present == 0 {
         return true;
     }
-    let mut iter = capacities.into_iter();
-    let Some(Some(first)) = iter.next() else {
+    if present != by_list.len() {
         return false;
-    };
-    iter.all(|item| matches!(item, Some(ref other) if *other == first))
+    }
+    let first = by_list[0].as_ref().expect("all present");
+    by_list.iter().all(|item| item.as_ref().expect("all present") == first)
+}
+
+fn capacity_signature_from_item_sum(weights: &[(i32, i64)], min: i64, max: i64, items: &[i32]) -> Option<(Vec<i64>, i64)> {
+    if min > 0 || max < 0 || i32::try_from(max).is_err() {
+        return None;
+    }
+    let values = capacity_values_for_items(weights, items)?;
+    if values.iter().any(|&value| value < 0 || value > max || i32::try_from(value).is_err()) {
+        return None;
+    }
+    Some((values, max))
+}
+
+fn item_sum_signature(weights: &[(i32, i64)], min: i64, max: i64, items: &[i32]) -> Option<ItemSumSignature> {
+    let values = capacity_values_for_items(weights, items)?;
+    let weights = items.iter().copied().zip(values).collect::<Vec<_>>();
+    Some((weights, min, max))
 }
 
 fn capacity_values_for_items(weights: &[(i32, i64)], items: &[i32]) -> Option<Vec<i64>> {

@@ -456,7 +456,13 @@ impl Cdcl<'_> {
             self.copy_inprocessing_stats(&mut stats);
             return (best, stats, true);
         }
-        let mut phase: Vec<Option<i32>> = vec![None; self.solver.store.num_vars()];
+        // Seed the saved-phase array with the caller's value-ordering hint (e.g.
+        // nearest-neighbour successors) when supplied, else start blank.
+        let mut phase: Vec<Option<i32>> = if self.initial_phase.len() == self.solver.store.num_vars() {
+            self.initial_phase.clone()
+        } else {
+            vec![None; self.solver.store.num_vars()]
+        };
         let objective_impact = ObjectiveImpact::new(objective, self.solver.store.num_vars(), minimizing);
         let mut enforced = None;
         let mut complete = true;

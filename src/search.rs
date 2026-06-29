@@ -400,7 +400,7 @@ pub fn optimize_with(
 ) -> (Option<(Vec<i32>, i32)>, SolveStats) {
     let mut on_improve = on_improve;
     let (best, stats, _) =
-        optimize_seeded(solver, vars, Objective::Var(obj), minimizing, stop, 0, None, None, &[], None, |value, _| on_improve(value as i32));
+        optimize_seeded(solver, vars, Objective::Var(obj), minimizing, stop, 0, None, None, &[], None, Vec::new(), |value, _| on_improve(value as i32));
     (best.map(|(solution, value)| (solution, value as i32)), stats)
 }
 
@@ -418,6 +418,7 @@ pub(crate) fn optimize_seeded(
     clause_sharing: Option<ClauseSharing>,
     cube: &[Lit],
     conflict_budget: Option<u64>,
+    initial_phase: Vec<Option<i32>>,
     on_improve: impl FnMut(i64, &[i32]),
 ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
     let lazy_atoms = clause_sharing.as_ref().map(ClauseSharing::lazy_atoms);
@@ -427,6 +428,7 @@ pub(crate) fn optimize_seeded(
     if let Some(sharing) = clause_sharing {
         cdcl.set_clause_sharing(sharing);
     }
+    cdcl.initial_phase = initial_phase;
     cdcl.optimize(vars, objective, minimizing, stop, shared_bound, cube, conflict_budget, on_improve)
 }
 

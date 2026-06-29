@@ -360,6 +360,7 @@ fn optimize_linear_tier(
         None,
         &[],
         None,
+        Vec::new(),
         |value, _| on_improve(&[value]),
     );
     match best {

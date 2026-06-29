@@ -41,6 +41,11 @@ struct CapacitySpec {
     capacity: i32,
 }
 
+/// A homogeneous per-route weighted item sum: `(weights, min, max)`, where each
+/// weight is `(item, coefficient)` and the route's weighted membership sum must
+/// lie in `[min, max]`.
+type ItemSumSpec = (Vec<(i32, i64)>, i64, i64);
+
 struct RoutingSpec {
     depot_count: usize,
     depot: i32,
@@ -49,6 +54,21 @@ struct RoutingSpec {
     capacity: Option<CapacitySpec>,
     /// Label-free same-route requirements: each pair of items must share a route.
     same_list: Vec<(i32, i32)>,
+    /// Homogeneous per-route length bounds (every route has `[min, max]` customers),
+    /// or `None`. Route-specific lengths are unsafe under depot symmetry, so only the
+    /// all-routes-identical form is accepted.
+    length: Option<(usize, usize)>,
+    /// Homogeneous per-route weighted item sum `(weights, min, max)`, or `None`. The
+    /// non-capacity `Sum` shape (`>=`, `==`, or negative weights); a `Sum(nonneg) <=
+    /// cap` is parsed as capacity instead. Route-specific bounds are rejected.
+    item_sum: Option<ItemSumSpec>,
+}
+
+/// The model's homogeneous per-route side constraints, classified.
+struct RouteSideConstraints {
+    capacity: Option<CapacitySpec>,
+    length: Option<(usize, usize)>,
+    item_sum: Option<ItemSumSpec>,
 }
 
 pub(crate) struct RoutingIntegerOutcome {
@@ -64,6 +84,10 @@ struct LoweredProblem {
     cost_vars: Vec<VarId>,
     nodes: Vec<i32>,
     depot_count: usize,
+    /// Nearest-neighbour value-ordering seed for the successor variables (indexed
+    /// by `VarId`); biases the first dive toward cheap arcs without changing the
+    /// search space.
+    initial_phase: Vec<Option<i32>>,
 }
 
 impl DirectEdgeMatrix {
@@ -115,8 +139,17 @@ impl RoutingSpec {
         let mut nodes = Vec::with_capacity(model.items.len() + 1);
         nodes.push(depot);
         nodes.extend_from_slice(&model.items);
-        let capacity = parse_capacity_constraints(model)?;
-        edge.covers_i32_costs(&nodes).then_some(Self { depot_count: model.lists, depot, items: model.items.clone(), edge, capacity, same_list })
+        let sides = parse_route_side_constraints(model)?;
+        edge.covers_i32_costs(&nodes).then_some(Self {
+            depot_count: model.lists,
+            depot,
+            items: model.items.clone(),
+            edge,
+            capacity: sides.capacity,
+            same_list,
+            length: sides.length,
+            item_sum: sides.item_sum,
+        })
     }
 
     fn lower(&self) -> LoweredProblem {
@@ -151,7 +184,7 @@ impl RoutingSpec {
         // (R1). Order stays the source of truth: `segment_of`/membership are derived
         // views, never branched (search stays on succ + cost), and the decoded
         // solution is read from `succ`, not from the membership vars.
-        if !self.same_list.is_empty() && self.depot_count >= 2 {
+        if !self.same_list.is_empty() || self.length.is_some() || self.item_sum.is_some() {
             let lists: Vec<ListId> = (0..self.depot_count).map(|_| solver.store.new_list(self.items.clone())).collect();
             for &list in &lists {
                 list_constraints::list_cardinality(&mut solver, list);
@@ -159,6 +192,18 @@ impl RoutingSpec {
             list_constraints::partition(&mut solver, &lists, &self.items);
             for &(a, b) in &self.same_list {
                 list_constraints::same_list(&mut solver, &lists, a, b);
+            }
+            // Homogeneous per-route length applies the same bound to every route.
+            if let Some((min, max)) = self.length {
+                for &list in &lists {
+                    list_constraints::list_len(&mut solver, list, min, max);
+                }
+            }
+            // Homogeneous per-route weighted item sum applies to every route.
+            if let Some((weights, min, max)) = &self.item_sum {
+                for &list in &lists {
+                    list_constraints::list_item_sum(&mut solver, list, weights.clone(), *min, *max);
+                }
             }
             let segment_of: Vec<VarId> = (0..self.items.len()).map(|_| solver.new_var_range(0, self.depot_count as i32 - 1)).collect();
             solver.post(Box::new(RouteSegmentChannel {
@@ -170,9 +215,24 @@ impl RoutingSpec {
             }));
         }
 
-        let mut search_vars = succ;
-        search_vars.extend(cost_vars.iter().copied());
-        LoweredProblem { solver, search_vars, cost_vars, nodes, depot_count: self.depot_count }
+        // Nearest-neighbour seed: each node's successor defaults to its cheapest
+        // outgoing arc. A value-ordering hint only -- circuit/symmetry refine it,
+        // and the saved phase takes over after the first dive. `QAYD_ROUTING_NN=0`
+        // disables it (ablation).
+        let mut initial_phase = vec![None; solver.store.num_vars()];
+        if std::env::var("QAYD_ROUTING_NN").as_deref() != Ok("0") {
+            for from in 0..n {
+                if let Some(to) = (0..n).filter(|&to| to != from).min_by_key(|&to| self.edge.cost(nodes[from], nodes[to]).expect("validated edge cost")) {
+                    initial_phase[succ[from].index()] = Some(to as i32);
+                }
+            }
+        }
+
+        // Branch only the successor variables; per-node costs are functionally
+        // determined from them by `element_const`, and branching them (they carry
+        // the objective impact) would bypass the nearest-neighbour value ordering.
+        let search_vars = succ;
+        LoweredProblem { solver, search_vars, cost_vars, nodes, depot_count: self.depot_count, initial_phase }
     }
 
     fn node_demands(&self, capacity: &CapacitySpec) -> Vec<i32> {
@@ -216,7 +276,7 @@ pub(crate) fn solve_collection(
 ) -> Option<RoutingIntegerOutcome> {
     let spec = RoutingSpec::from_model(model)?;
     let lowered = spec.lower();
-    let LoweredProblem { mut solver, search_vars, cost_vars, nodes, depot_count } = lowered;
+    let LoweredProblem { mut solver, search_vars, cost_vars, nodes, depot_count, initial_phase } = lowered;
     let coeffs = vec![1i64; cost_vars.len()];
     let mut improvements = 0u64;
     let (best, stats, complete) = search::optimize_seeded(
@@ -230,6 +290,7 @@ pub(crate) fn solve_collection(
         None,
         &[],
         None,
+        initial_phase,
         |value, _assignment| {
             improvements += 1;
             report(value);
@@ -529,27 +590,144 @@ impl DirectEdgeMatrix {
     }
 }
 
-fn parse_capacity_constraints(model: &CollectionModel) -> Option<Option<CapacitySpec>> {
-    if model.constraints.is_empty() {
-        return Some(None);
-    }
-    let mut by_list: Vec<Option<CapacitySpec>> = (0..model.lists).map(|_| None).collect();
+/// Classify the model's side constraints into homogeneous per-route capacity
+/// (`Sum(demands) <= cap`), length (`Count == k`), and general weighted item sum
+/// (any other `Sum`). Each must be either absent or identical across every route --
+/// route-specific bounds are unsafe under depot-copy symmetry, so they cause a
+/// `None` (fall to LS). Precedence: `Count` -> length; `Sum(nonneg) <= cap` ->
+/// capacity (MTZ load); any other `Sum` -> item sum (membership channel).
+fn parse_route_side_constraints(model: &CollectionModel) -> Option<RouteSideConstraints> {
+    let mut cap_by_list: Vec<Option<CapacitySpec>> = (0..model.lists).map(|_| None).collect();
+    let mut len_by_list: Vec<Option<(usize, usize)>> = (0..model.lists).map(|_| None).collect();
+    let mut sum_by_list: Vec<Option<ItemSumSpec>> = (0..model.lists).map(|_| None).collect();
     for constraint in &model.constraints {
-        let (list, capacity) = parse_capacity_constraint(constraint, &model.items)?;
-        if list >= model.lists || by_list[list].is_some() {
+        if let Some((list, min, max)) = parse_length_constraint(constraint, model.items.len()) {
+            if list >= model.lists || len_by_list[list].is_some() {
+                return None;
+            }
+            len_by_list[list] = Some((min, max));
+        } else if let Some((list, capacity)) = parse_capacity_constraint(constraint, &model.items) {
+            if list >= model.lists || cap_by_list[list].is_some() {
+                return None;
+            }
+            cap_by_list[list] = Some(capacity);
+        } else if let Some((list, spec)) = parse_item_sum_constraint(constraint, &model.items) {
+            if list >= model.lists || sum_by_list[list].is_some() {
+                return None;
+            }
+            sum_by_list[list] = Some(spec);
+        } else {
             return None;
         }
-        by_list[list] = Some(capacity);
     }
-    let mut parsed = by_list.into_iter();
-    let first = parsed.next()??;
-    for item in parsed {
-        let other = item?;
+    Some(RouteSideConstraints {
+        capacity: homogeneous_capacity(cap_by_list)?,
+        length: homogeneous_length(&len_by_list)?,
+        item_sum: homogeneous_item_sum(sum_by_list)?,
+    })
+}
+
+/// `Some(None)` = absent, `Some(Some(v))` = the shared value, `None` = route-named
+/// or inconsistent (reject).
+fn homogeneous_item_sum(by_list: Vec<Option<ItemSumSpec>>) -> Option<Option<ItemSumSpec>> {
+    let present = by_list.iter().filter(|x| x.is_some()).count();
+    if present == 0 {
+        return Some(None);
+    }
+    if present != by_list.len() {
+        return None;
+    }
+    let mut iter = by_list.into_iter().map(|x| x.expect("all present"));
+    let first = iter.next().expect("at least one");
+    for other in iter {
+        if other != first {
+            return None;
+        }
+    }
+    Some(Some(first))
+}
+
+/// A general weighted item sum `Sum(weight(item)) <op> rhs` over one route's items.
+/// Returns `(list, weights, min, max)`. Distinct from capacity (which is the
+/// `<=`-with-nonnegative-demands special case handled by the MTZ load).
+fn parse_item_sum_constraint(constraint: &Constraint, items: &[i32]) -> Option<(usize, ItemSumSpec)> {
+    if !matches!(constraint.reduction.op, ReduceOp::Sum) {
+        return None;
+    }
+    let Iterable::Items(list) = &constraint.reduction.iterable else {
+        return None;
+    };
+    let mut weights = Vec::with_capacity(items.len());
+    for &item in items {
+        let weight = eval_collection_expr_one(&constraint.reduction.arena.exprs, constraint.reduction.body, i64::from(item))?;
+        weights.push((item, weight));
+    }
+    let (min, max) = match constraint.op {
+        Op::Le => (i64::MIN / 4, constraint.rhs),
+        Op::Ge => (constraint.rhs, i64::MAX / 4),
+        Op::Eq => (constraint.rhs, constraint.rhs),
+    };
+    Some((*list, (weights, min, max)))
+}
+
+/// `Some(None)` = absent, `Some(Some(v))` = the shared value, `None` = route-named
+/// or inconsistent (reject).
+fn homogeneous_length(by_list: &[Option<(usize, usize)>]) -> Option<Option<(usize, usize)>> {
+    let present = by_list.iter().filter(|x| x.is_some()).count();
+    if present == 0 {
+        return Some(None);
+    }
+    if present != by_list.len() {
+        return None;
+    }
+    let first = by_list[0].expect("all present");
+    by_list.iter().all(|x| x.expect("all present") == first).then_some(Some(first))
+}
+
+fn homogeneous_capacity(by_list: Vec<Option<CapacitySpec>>) -> Option<Option<CapacitySpec>> {
+    let present = by_list.iter().filter(|x| x.is_some()).count();
+    if present == 0 {
+        return Some(None);
+    }
+    if present != by_list.len() {
+        return None;
+    }
+    let mut iter = by_list.into_iter().map(|x| x.expect("all present"));
+    let first = iter.next().expect("at least one");
+    for other in iter {
         if other.capacity != first.capacity || other.demands != first.demands {
             return None;
         }
     }
     Some(Some(first))
+}
+
+/// A homogeneous-capable length constraint `Count(items in list) <op> k` with a
+/// non-zero constant body (so it counts membership). Returns `(list, min, max)`.
+fn parse_length_constraint(constraint: &Constraint, item_count: usize) -> Option<(usize, usize, usize)> {
+    if !matches!(constraint.reduction.op, ReduceOp::Count) {
+        return None;
+    }
+    let Iterable::Items(list) = &constraint.reduction.iterable else {
+        return None;
+    };
+    let body = constraint.reduction.arena.exprs.get(constraint.reduction.body.0 as usize)?;
+    let Expr::Const(value) = body else {
+        return None;
+    };
+    if *value == 0 {
+        return None;
+    }
+    let n = item_count as i64;
+    let (min, max) = match constraint.op {
+        Op::Le => (0, constraint.rhs),
+        Op::Ge => (constraint.rhs, n),
+        Op::Eq => (constraint.rhs, constraint.rhs),
+    };
+    if max < 0 || min > n || min > max {
+        return None;
+    }
+    Some((*list, min.max(0) as usize, max.min(n) as usize))
 }
 
 fn parse_capacity_constraint(constraint: &Constraint, items: &[i32]) -> Option<(usize, CapacitySpec)> {
@@ -753,6 +931,30 @@ mod tests {
         best
     }
 
+    #[test]
+    #[ignore = "measurement, run explicitly with --ignored --nocapture"]
+    fn measure_nn_seed() {
+        let coords: [(i64, i64); 10] = [(0, 0), (1, 5), (2, 3), (5, 1), (8, 8), (3, 7), (7, 2), (6, 6), (4, 4), (9, 5)];
+        let n = coords.len();
+        let dist: Vec<Vec<i64>> = (0..n)
+            .map(|i| (0..n).map(|j| (coords[i].0 - coords[j].0).abs() + (coords[i].1 - coords[j].1).abs()).collect())
+            .collect();
+        let items: Vec<i32> = (1..n as i32).collect();
+        let model = closed_tsp_model(items, 0, &Arc::new(dist));
+        let stop = AtomicBool::new(false);
+        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported");
+        eprintln!(
+            "NN={:?} nodes={} failures={} solutions={} obj={:?} complete={}",
+            std::env::var("QAYD_ROUTING_NN").ok(),
+            outcome.stats.nodes,
+            outcome.stats.failures,
+            outcome.stats.solutions,
+            outcome.solution.objectives,
+            outcome.complete,
+        );
+        assert!(outcome.complete);
+    }
+
     fn closed_tsp_model(items: Vec<i32>, depot: i32, dist: &Arc<Vec<Vec<i64>>>) -> CollectionModel {
         let mut arena = ExprArena::default();
         let i = arena.arg(0);
@@ -881,15 +1083,15 @@ mod tests {
         let mut best: Option<i64> = None;
         for combo in 0..combos {
             let mut routes: Vec<Vec<i32>> = vec![Vec::new(); n_routes];
-            let mut route_of: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+            let mut segment_by_item: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
             let mut code = combo;
             for &item in items {
                 let route = (code % n_routes as u64) as usize;
                 code /= n_routes as u64;
                 routes[route].push(item);
-                route_of.insert(item, route);
+                segment_by_item.insert(item, route);
             }
-            if same.iter().any(|&(a, b)| route_of[&a] != route_of[&b]) {
+            if same.iter().any(|&(a, b)| segment_by_item[&a] != segment_by_item[&b]) {
                 continue;
             }
             if routes.iter().any(|r| r.iter().map(|&node| demand[node as usize]).sum::<i64>() > capacity) {
@@ -953,8 +1155,8 @@ mod tests {
 
         assert!(outcome.complete, "exhausted the search");
         assert_eq!(outcome.solution.objectives, vec![brute], "engine optimum equals the same-list-filtered minimum");
-        let route_of = |item: i32| outcome.solution.lists.iter().position(|r| r.contains(&item)).expect("served");
-        assert_eq!(route_of(1), route_of(3), "same_list keeps 1 and 3 in the same route");
+        let segment_of_item = |item: i32| outcome.solution.lists.iter().position(|r| r.contains(&item)).expect("served");
+        assert_eq!(segment_of_item(1), segment_of_item(3), "same_list keeps 1 and 3 in the same route");
     }
 
     #[test]
@@ -979,5 +1181,218 @@ mod tests {
 
         assert!(outcome.complete, "search exhausted");
         assert!(!outcome.solution.feasible, "same_list(1,2) over-capacity is UNSAT");
+    }
+
+    /// General exhaustive multi-route minimum under optional capacity, same-list,
+    /// and per-route length filters. `None` if no assignment is feasible.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn min_routes(
+        depot: i32,
+        items: &[i32],
+        dist: &[Vec<i64>],
+        demand: &[i64],
+        n_routes: usize,
+        capacity: Option<i64>,
+        same: &[(i32, i32)],
+        length: Option<(usize, usize)>,
+        item_sum: Option<(&[(i32, i64)], i64, i64)>,
+    ) -> Option<i64> {
+        let n = items.len();
+        let combos = (n_routes as u64).pow(n as u32);
+        let mut best: Option<i64> = None;
+        for combo in 0..combos {
+            let mut routes: Vec<Vec<i32>> = vec![Vec::new(); n_routes];
+            let mut segment_by_item: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+            let mut code = combo;
+            for &item in items {
+                let route = (code % n_routes as u64) as usize;
+                code /= n_routes as u64;
+                routes[route].push(item);
+                segment_by_item.insert(item, route);
+            }
+            if same.iter().any(|&(a, b)| segment_by_item[&a] != segment_by_item[&b]) {
+                continue;
+            }
+            if let Some(cap) = capacity {
+                if routes.iter().any(|r| r.iter().map(|&node| demand[node as usize]).sum::<i64>() > cap) {
+                    continue;
+                }
+            }
+            if let Some((lo, hi)) = length {
+                if routes.iter().any(|r| r.len() < lo || r.len() > hi) {
+                    continue;
+                }
+            }
+            if let Some((weights, lo, hi)) = item_sum {
+                let wmap: std::collections::HashMap<i32, i64> = weights.iter().copied().collect();
+                if routes.iter().any(|r| {
+                    let sum: i64 = r.iter().map(|&node| wmap.get(&node).copied().unwrap_or(0)).sum();
+                    sum < lo || sum > hi
+                }) {
+                    continue;
+                }
+            }
+            let cost: i64 = routes.iter().map(|r| min_closed_tour(depot, r, dist)).sum();
+            best = Some(best.map_or(cost, |b| b.min(cost)));
+        }
+        best
+    }
+
+    fn count_eq(list: usize, k: i64) -> Constraint {
+        let mut arena = ExprArena::default();
+        let body = arena.constant(1); // count of items present = route length
+        Constraint { reduction: Reduction { op: ReduceOp::Count, iterable: Iterable::Items(list), arena, body }, op: Op::Eq, rhs: k }
+    }
+
+    #[test]
+    fn list_len_exact_route_size_matches_brute_force() {
+        // Free optimum is unbalanced (one customer alone), but `list_len` forces
+        // exactly 2 customers per route. The engine optimum must equal the
+        // size-filtered exhaustive minimum and exceed the free optimum.
+        let dist = vec![
+            vec![0, 1, 10, 10, 10],
+            vec![1, 0, 10, 10, 10],
+            vec![10, 10, 0, 1, 1],
+            vec![10, 10, 1, 0, 1],
+            vec![10, 10, 1, 1, 0],
+        ];
+        let zero = vec![0i64; 5];
+        let items = vec![1, 2, 3, 4];
+        let free = min_routes(0, &items, &dist, &zero, 2, None, &[], None, None).expect("feasible");
+        let balanced = min_routes(0, &items, &dist, &zero, 2, None, &[], Some((2, 2)), None).expect("feasible balanced");
+        assert!(balanced > free, "forcing two-per-route is costlier than the free optimum");
+
+        let dist_arc = Arc::new(dist);
+        let edge = |list| {
+            let mut arena = ExprArena::default();
+            let i = arena.arg(0);
+            let j = arena.arg(1);
+            let body = arena.matrix(Arc::clone(&dist_arc), i, j);
+            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body }
+        };
+        let model = CollectionModel {
+            items: items.clone(),
+            lists: 2,
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)] }],
+            constraints: vec![count_eq(0, 2), count_eq(1, 2)],
+            globals: Vec::new(),
+            schedule: None,
+        };
+        let stop = AtomicBool::new(false);
+        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported route length model");
+
+        assert!(outcome.complete, "exhausted the search");
+        assert_eq!(outcome.solution.objectives, vec![balanced], "engine optimum equals the size-filtered minimum");
+        for route in &outcome.solution.lists {
+            assert_eq!(route.len(), 2, "every route holds exactly two customers");
+        }
+    }
+
+    #[test]
+    fn same_list_length_and_capacity_compose() {
+        // same_list(1,3) + each route exactly 2 + capacity 2: the three constraints
+        // coexist; the engine optimum equals the jointly-filtered exhaustive minimum.
+        let dist = vec![
+            vec![0, 1, 1, 1, 1],
+            vec![1, 0, 1, 50, 50],
+            vec![1, 1, 0, 50, 50],
+            vec![1, 50, 50, 0, 1],
+            vec![1, 50, 50, 1, 0],
+        ];
+        let demand = vec![0i64, 1, 1, 1, 1];
+        let items = vec![1, 2, 3, 4];
+        let same = [(1, 3)];
+        let brute = min_routes(0, &items, &dist, &demand, 2, Some(2), &same, Some((2, 2)), None).expect("feasible");
+
+        let dist_arc = Arc::new(dist);
+        let demand_arc = Arc::new(demand);
+        let edge = |list| {
+            let mut arena = ExprArena::default();
+            let i = arena.arg(0);
+            let j = arena.arg(1);
+            let body = arena.matrix(Arc::clone(&dist_arc), i, j);
+            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body }
+        };
+        let load = |list| {
+            let mut arena = ExprArena::default();
+            let i = arena.arg(0);
+            let body = arena.array(Arc::clone(&demand_arc), i);
+            Constraint { reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body }, op: Op::Le, rhs: 2 }
+        };
+        let model = CollectionModel {
+            items: items.clone(),
+            lists: 2,
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)] }],
+            constraints: vec![load(0), load(1), count_eq(0, 2), count_eq(1, 2)],
+            globals: vec![GlobalConstraint::SameList { a: 1, b: 3 }],
+            schedule: None,
+        };
+        let stop = AtomicBool::new(false);
+        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported combined model");
+
+        assert!(outcome.complete, "exhausted the search");
+        assert_eq!(outcome.solution.objectives, vec![brute], "engine optimum equals the jointly-filtered minimum");
+        let segment_of_item = |item: i32| outcome.solution.lists.iter().position(|r| r.contains(&item)).expect("served");
+        assert_eq!(segment_of_item(1), segment_of_item(3), "same_list keeps 1 and 3 together");
+        for route in &outcome.solution.lists {
+            assert_eq!(route.len(), 2, "every route holds exactly two customers");
+        }
+    }
+
+    #[test]
+    fn route_item_sum_ge_matches_brute_force() {
+        // Each route must reach a value sum >= 11 (a non-capacity `Sum`, so it routes
+        // through the membership channel, not the MTZ load). The cheap free optimum
+        // groups the two low-value customers together, which the bound forbids, so
+        // the engine optimum must equal the value-filtered exhaustive minimum and
+        // exceed the free optimum.
+        let dist = vec![
+            vec![0, 1, 1, 1, 1],
+            vec![1, 0, 1, 50, 50],
+            vec![1, 1, 0, 50, 50],
+            vec![1, 50, 50, 0, 1],
+            vec![1, 50, 50, 1, 0],
+        ];
+        let value = vec![0i64, 1, 1, 10, 10]; // indexed by node; customers 3,4 are high value
+        let weights = vec![(1i32, 1i64), (2, 1), (3, 10), (4, 10)];
+        let items = vec![1, 2, 3, 4];
+        let zero = vec![0i64; 5];
+        let free = min_routes(0, &items, &dist, &zero, 2, None, &[], None, None).expect("feasible");
+        let bound = (weights.as_slice(), 11i64, i64::MAX / 4);
+        let constrained = min_routes(0, &items, &dist, &zero, 2, None, &[], None, Some(bound)).expect("feasible under value bound");
+        assert!(constrained > free, "the per-route value floor is costlier than the free optimum");
+
+        let dist_arc = Arc::new(dist);
+        let value_arc = Arc::new(value);
+        let edge = |list| {
+            let mut arena = ExprArena::default();
+            let i = arena.arg(0);
+            let j = arena.arg(1);
+            let body = arena.matrix(Arc::clone(&dist_arc), i, j);
+            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body }
+        };
+        let value_sum = |list| {
+            let mut arena = ExprArena::default();
+            let i = arena.arg(0);
+            let body = arena.array(Arc::clone(&value_arc), i);
+            Constraint { reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body }, op: Op::Ge, rhs: 11 }
+        };
+        let model = CollectionModel {
+            items: items.clone(),
+            lists: 2,
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)] }],
+            constraints: vec![value_sum(0), value_sum(1)],
+            globals: Vec::new(),
+            schedule: None,
+        };
+        let stop = AtomicBool::new(false);
+        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported route item-sum model");
+
+        assert!(outcome.complete, "exhausted the search");
+        assert_eq!(outcome.solution.objectives, vec![constrained], "engine optimum equals the value-filtered minimum");
+        for route in &outcome.solution.lists {
+            let sum: i64 = route.iter().map(|&node| value_arc[node as usize]).sum();
+            assert!(sum >= 11, "every route reaches the value floor");
+        }
     }
 }

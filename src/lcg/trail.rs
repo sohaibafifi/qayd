@@ -303,6 +303,10 @@ pub struct Cdcl<'s> {
     stop: &'s AtomicBool,
     /// Reproducible search diversification seed.
     pub(crate) seed: u64,
+    /// Optional initial branching phase per variable (value-ordering hint, e.g.
+    /// nearest-neighbour successors for routing). Empty = none; otherwise indexed
+    /// by `VarId` and used to seed the saved-phase array at the start of `optimize`.
+    pub(crate) initial_phase: Vec<Option<i32>>,
     /// Live (non-tombstone) deletable learned clauses.
     num_learned: usize,
     /// Soft cap on live learned clauses; grows after each reduction.
@@ -378,6 +382,7 @@ impl<'s> Cdcl<'s> {
             var_inc: 1.0,
             stop: &NEVER_STOP,
             seed: 0,
+            initial_phase: Vec::new(),
             num_learned: 0,
             max_learned: 2000,
             conflicts: 0,

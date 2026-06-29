@@ -1817,6 +1817,7 @@ impl PyModel {
             None,
             &[],
             None,
+            Vec::new(),
             |value, _| {
                 if verbose {
                     println!("  incumbent: {value}");

@@ -383,6 +383,7 @@ fn optimize_worker(
         sharing,
         &[],
         conflict_budget,
+        Vec::new(),
         |value, solution| improved |= shared.report_improvement(tx, value, solution, source),
     );
     (stats, complete, improved)
@@ -717,6 +718,7 @@ pub(crate) fn solve_cop<W: Write>(
                             Some(ClauseSharing::new(Arc::clone(&shared.clauses), worker)),
                             &cube,
                             None,
+                            Vec::new(),
                             |value, solution| {
                                 shared.report_improvement(&tx, value, solution, WorkerSource { kind: "split", worker });
                             },
