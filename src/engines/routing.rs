@@ -14,10 +14,11 @@ use std::sync::Arc;
 
 use crate::constraints::graph;
 use crate::constraints::intension;
+use crate::constraints::list as list_constraints;
 use crate::constraints::primitives;
 use crate::expr;
-use crate::ids::{PropId, VarId};
-use crate::model::list::{CollectionModel, CollectionSolution, Constraint, Expr, ExprId, Iterable, Op, ReduceOp, Reduction};
+use crate::ids::{ListId, PropId, VarId};
+use crate::model::list::{CollectionModel, CollectionSolution, Constraint, Expr, ExprId, GlobalConstraint, Iterable, Op, ReduceOp, Reduction};
 use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::search::{self, Objective as SearchObjective, SolveStats};
 use crate::store::{Solver, Store};
@@ -46,6 +47,8 @@ struct RoutingSpec {
     items: Vec<i32>,
     edge: DirectEdgeMatrix,
     capacity: Option<CapacitySpec>,
+    /// Label-free same-route requirements: each pair of items must share a route.
+    same_list: Vec<(i32, i32)>,
 }
 
 pub(crate) struct RoutingIntegerOutcome {
@@ -81,8 +84,17 @@ impl DirectEdgeMatrix {
 
 impl RoutingSpec {
     fn from_model(model: &CollectionModel) -> Option<Self> {
-        if model.schedule.is_some() || model.lists == 0 || !model.globals.is_empty() || model.objectives.len() != 1 {
+        if model.schedule.is_some() || model.lists == 0 || model.objectives.len() != 1 {
             return None;
+        }
+        // Only label-free `SameList` globals are channeled (others -- e.g. ListLe --
+        // are route-named and unsafe under depot-copy symmetry, so leave them to LS).
+        let mut same_list = Vec::new();
+        for global in &model.globals {
+            match *global {
+                GlobalConstraint::SameList { a, b } => same_list.push((a, b)),
+                _ => return None,
+            }
         }
         let node_count = model.lists.checked_add(model.items.len())?;
         if node_count > MAX_INTEGER_ROUTING_NODES {
@@ -96,11 +108,15 @@ impl RoutingSpec {
         if model.items.contains(&depot) || !items_are_unique(&model.items) {
             return None;
         }
+        // SameList references items that must be in the universe.
+        if same_list.iter().any(|&(a, b)| !model.items.contains(&a) || !model.items.contains(&b)) {
+            return None;
+        }
         let mut nodes = Vec::with_capacity(model.items.len() + 1);
         nodes.push(depot);
         nodes.extend_from_slice(&model.items);
         let capacity = parse_capacity_constraints(model)?;
-        edge.covers_i32_costs(&nodes).then_some(Self { depot_count: model.lists, depot, items: model.items.clone(), edge, capacity })
+        edge.covers_i32_costs(&nodes).then_some(Self { depot_count: model.lists, depot, items: model.items.clone(), edge, capacity, same_list })
     }
 
     fn lower(&self) -> LoweredProblem {
@@ -128,6 +144,31 @@ impl RoutingSpec {
         }
 
         post_depot_symmetry(&mut solver, &succ, self.depot_count, n);
+
+        // Membership <-> route-order channel. Built only for same-list requirements
+        // over >= 2 routes (one route makes `same_list` trivially true). The list
+        // domains live in THIS solver so membership and successors share one trail
+        // (R1). Order stays the source of truth: `segment_of`/membership are derived
+        // views, never branched (search stays on succ + cost), and the decoded
+        // solution is read from `succ`, not from the membership vars.
+        if !self.same_list.is_empty() && self.depot_count >= 2 {
+            let lists: Vec<ListId> = (0..self.depot_count).map(|_| solver.store.new_list(self.items.clone())).collect();
+            for &list in &lists {
+                list_constraints::list_cardinality(&mut solver, list);
+            }
+            list_constraints::partition(&mut solver, &lists, &self.items);
+            for &(a, b) in &self.same_list {
+                list_constraints::same_list(&mut solver, &lists, a, b);
+            }
+            let segment_of: Vec<VarId> = (0..self.items.len()).map(|_| solver.new_var_range(0, self.depot_count as i32 - 1)).collect();
+            solver.post(Box::new(RouteSegmentChannel {
+                succ: succ.clone(),
+                segment_of,
+                lists,
+                items: self.items.clone(),
+                depot_count: self.depot_count,
+            }));
+        }
 
         let mut search_vars = succ;
         search_vars.extend(cost_vars.iter().copied());
@@ -253,6 +294,83 @@ impl Propagator for RouteCapacityCheck {
 
 fn post_route_capacity_check(solver: &mut Solver, succ: &[VarId], depot_count: usize, demands: Vec<i32>, capacity: i32) {
     solver.post(Box::new(RouteCapacityCheck { succ: succ.to_vec(), depot_count, demands, capacity }));
+}
+
+/// Channels the successor circuit onto list membership: derives, for each customer,
+/// which depot segment it sits in (`segment_of`), and requires the matching list
+/// membership so the explained list propagators (`partition`, `same_list`) apply.
+///
+/// One-way only (R-guardrails): `succ (fixed prefix) -> segment_of -> member`. It
+/// never pushes membership back onto `segment_of`/`succ`, and nothing branches on
+/// `segment_of`/membership. When every successor is fixed, the leaf backstop must
+/// have placed every customer on exactly one segment; a clash with `same_list`
+/// surfaces as the `require`/`partition` conflict.
+#[derive(Clone)]
+struct RouteSegmentChannel {
+    succ: Vec<VarId>,
+    /// One length-`items.len()` view: `segment_of[j]` is the depot segment of `items[j]`.
+    segment_of: Vec<VarId>,
+    /// `lists[r]` is the list domain for depot copy `r`.
+    lists: Vec<ListId>,
+    items: Vec<i32>,
+    depot_count: usize,
+}
+
+impl RouteSegmentChannel {
+    /// Customer `j` is proven to sit in depot segment `r`: fix its derived view and
+    /// require the matching membership (partition forbids the other lists). Plain
+    /// (scope-snapshot) reasons -- sound, and enough while `circuit` is unexplained.
+    fn assign_segment(&self, store: &mut Store, j: usize, r: usize) -> Result<(), Inconsistency> {
+        store.fix(self.segment_of[j], r as i32)?;
+        store.require_list_item(self.lists[r], self.items[j])?;
+        Ok(())
+    }
+}
+
+impl Propagator for RouteSegmentChannel {
+    fn register(&mut self, store: &mut Store, me: PropId) {
+        for &var in &self.succ {
+            store.subscribe(var, me, Event::Fix);
+        }
+        // Subscribe to the derived views too: this marks them relevant (so the LCG
+        // gives them literals when we fix/cite them), without putting them in the
+        // branched `search_vars`. They are derived from `succ`, never branched.
+        for &var in &self.segment_of {
+            store.subscribe(var, me, Event::Fix);
+        }
+    }
+
+    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+        let n = self.succ.len();
+        let all_fixed = self.succ.iter().all(|&var| store.is_fixed(var));
+        let mut assigned = vec![false; self.items.len()];
+        // Walk each depot copy's fixed successor prefix; customers on it are proven
+        // to be in that depot's segment.
+        for r in 0..self.depot_count {
+            let mut cur = r;
+            let mut steps = 0usize;
+            while store.is_fixed(self.succ[cur]) {
+                steps += 1;
+                if steps > n {
+                    break; // malformed partial state; let `circuit` narrow first
+                }
+                let next = store.value(self.succ[cur]) as usize;
+                if next >= n || next < self.depot_count {
+                    break; // segment ends at the next depot copy (or out of range)
+                }
+                let j = next - self.depot_count;
+                self.assign_segment(store, j, r)?;
+                assigned[j] = true;
+                cur = next;
+            }
+        }
+        // Leaf backstop: with all successors fixed, every customer must lie on
+        // exactly one segment, so all `segment_of`/membership are now determined.
+        if all_fixed && assigned.iter().any(|&seen| !seen) {
+            return Err(Inconsistency);
+        }
+        Ok(())
+    }
 }
 
 /// Break the `k!` symmetry between the interchangeable depot copies. Order routes
@@ -512,7 +630,7 @@ fn eval_collection_expr_one(arena: &[Expr], id: ExprId, arg0: i64) -> Option<i64
 mod tests {
     use std::sync::{atomic::AtomicBool, Arc};
 
-    use crate::model::list::{CollectionModel, Constraint, ExprArena, Iterable, ObjectiveTier, Op, ReduceOp, Reduction};
+    use crate::model::list::{CollectionModel, Constraint, ExprArena, GlobalConstraint, Iterable, ObjectiveTier, Op, ReduceOp, Reduction};
 
     use super::solve_collection;
 
@@ -593,5 +711,273 @@ mod tests {
         for route in &outcome.solution.lists {
             assert!(route.iter().map(|&node| demand[node as usize]).sum::<i64>() <= 2);
         }
+    }
+
+    // --- brute-force oracles ----------------------------------------------------
+    //
+    // These compare the engine's optimum against an independent exhaustive search,
+    // a stronger guard than the hand-computed-value tests above: they prove the
+    // engine finds the *true* optimum for the lowering, on arbitrary small matrices.
+
+    /// All permutations of `items` (each a distinct visiting order).
+    fn permutations(items: &[i32]) -> Vec<Vec<i32>> {
+        if items.is_empty() {
+            return vec![Vec::new()];
+        }
+        let mut out = Vec::new();
+        for i in 0..items.len() {
+            let mut rest = items.to_vec();
+            let head = rest.remove(i);
+            for mut tail in permutations(&rest) {
+                tail.insert(0, head);
+                out.push(tail);
+            }
+        }
+        out
+    }
+
+    /// Minimum closed-tour cost `depot -> ... -> depot` over all orderings of
+    /// `items` (directed, so asymmetric matrices are handled). Empty route = 0.
+    fn min_closed_tour(depot: i32, items: &[i32], dist: &[Vec<i64>]) -> i64 {
+        let mut best = i64::MAX;
+        for perm in permutations(items) {
+            let mut cost = 0i64;
+            let mut prev = depot;
+            for &node in &perm {
+                cost += dist[prev as usize][node as usize];
+                prev = node;
+            }
+            cost += dist[prev as usize][depot as usize];
+            best = best.min(cost);
+        }
+        best
+    }
+
+    fn closed_tsp_model(items: Vec<i32>, depot: i32, dist: &Arc<Vec<Vec<i64>>>) -> CollectionModel {
+        let mut arena = ExprArena::default();
+        let i = arena.arg(0);
+        let j = arena.arg(1);
+        let body = arena.matrix(Arc::clone(dist), i, j);
+        let reduction = Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list: 0, start: depot, end: depot }, arena, body };
+        CollectionModel {
+            items,
+            lists: 1,
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![reduction] }],
+            constraints: Vec::new(),
+            globals: Vec::new(),
+            schedule: None,
+        }
+    }
+
+    #[test]
+    fn closed_tsp_matches_brute_force() {
+        // depot = node 0, items = nodes 1..=3. Several matrices, including an
+        // asymmetric one, each checked against the exhaustive closed-tour minimum.
+        let cases: Vec<Vec<Vec<i64>>> = vec![
+            vec![vec![0, 10, 15, 20], vec![10, 0, 35, 25], vec![15, 35, 0, 30], vec![20, 25, 30, 0]],
+            vec![vec![0, 3, 7, 5], vec![5, 0, 2, 9], vec![6, 4, 0, 1], vec![8, 7, 3, 0]],
+            vec![vec![0, 2, 9, 1], vec![1, 0, 6, 4], vec![3, 8, 0, 2], vec![7, 5, 2, 0]],
+        ];
+        let items = vec![1, 2, 3];
+        for dist in cases {
+            let brute = min_closed_tour(0, &items, &dist);
+            let model = closed_tsp_model(items.clone(), 0, &Arc::new(dist));
+            let stop = AtomicBool::new(false);
+            let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported route lowering");
+
+            assert!(outcome.complete, "exhausted the search");
+            assert_eq!(outcome.solution.objectives, vec![brute], "engine optimum equals the exhaustive closed-tour minimum");
+            let mut route = outcome.solution.lists[0].clone();
+            route.sort_unstable();
+            assert_eq!(route, items, "route visits every item exactly once");
+        }
+    }
+
+    /// Minimum total cost of partitioning `items` across `n_routes` capacitated
+    /// closed tours: every assignment of items to routes, each route ordered
+    /// optimally, capacity respected. `None` if no assignment is feasible.
+    fn min_cvrp(depot: i32, items: &[i32], dist: &[Vec<i64>], demand: &[i64], n_routes: usize, capacity: i64) -> Option<i64> {
+        let n = items.len();
+        let combos = (n_routes as u64).pow(n as u32);
+        let mut best: Option<i64> = None;
+        for combo in 0..combos {
+            let mut routes: Vec<Vec<i32>> = vec![Vec::new(); n_routes];
+            let mut code = combo;
+            for &item in items {
+                let route = (code % n_routes as u64) as usize;
+                code /= n_routes as u64;
+                routes[route].push(item);
+            }
+            if routes.iter().any(|r| r.iter().map(|&node| demand[node as usize]).sum::<i64>() > capacity) {
+                continue;
+            }
+            let cost: i64 = routes.iter().map(|r| min_closed_tour(depot, r, dist)).sum();
+            best = Some(best.map_or(cost, |b| b.min(cost)));
+        }
+        best
+    }
+
+    #[test]
+    fn small_cvrp_matches_brute_force() {
+        // 2 routes, 4 customers, identical per-route capacity 2 (each customer
+        // demands 1). depot = node 0. Engine optimum must equal the exhaustive
+        // capacitated multi-route minimum.
+        let dist = vec![
+            vec![0, 1, 1, 1, 1],
+            vec![1, 0, 1, 50, 50],
+            vec![1, 1, 0, 50, 50],
+            vec![1, 50, 50, 0, 1],
+            vec![1, 50, 50, 1, 0],
+        ];
+        let demand = vec![0i64, 1, 1, 1, 1];
+        let items = vec![1, 2, 3, 4];
+        let brute = min_cvrp(0, &items, &dist, &demand, 2, 2).expect("a feasible packing exists");
+
+        let dist_arc = Arc::new(dist);
+        let demand_arc = Arc::new(demand.clone());
+        let edge = |list| {
+            let mut arena = ExprArena::default();
+            let i = arena.arg(0);
+            let j = arena.arg(1);
+            let body = arena.matrix(Arc::clone(&dist_arc), i, j);
+            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body }
+        };
+        let load = |list| {
+            let mut arena = ExprArena::default();
+            let i = arena.arg(0);
+            let body = arena.array(Arc::clone(&demand_arc), i);
+            Constraint { reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body }, op: Op::Le, rhs: 2 }
+        };
+        let model = CollectionModel {
+            items: items.clone(),
+            lists: 2,
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)] }],
+            constraints: vec![load(0), load(1)],
+            globals: Vec::new(),
+            schedule: None,
+        };
+        let stop = AtomicBool::new(false);
+        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported cvrp lowering");
+
+        assert!(outcome.complete, "exhausted the search");
+        assert_eq!(outcome.solution.objectives, vec![brute], "engine optimum equals the exhaustive CVRP minimum");
+        let mut served = outcome.solution.lists.iter().flatten().copied().collect::<Vec<_>>();
+        served.sort_unstable();
+        assert_eq!(served, items, "every customer served exactly once");
+    }
+
+    /// Like `min_cvrp`, but discard any assignment that splits a `same_list` pair.
+    fn min_cvrp_same_list(
+        depot: i32,
+        items: &[i32],
+        dist: &[Vec<i64>],
+        demand: &[i64],
+        n_routes: usize,
+        capacity: i64,
+        same: &[(i32, i32)],
+    ) -> Option<i64> {
+        let n = items.len();
+        let combos = (n_routes as u64).pow(n as u32);
+        let mut best: Option<i64> = None;
+        for combo in 0..combos {
+            let mut routes: Vec<Vec<i32>> = vec![Vec::new(); n_routes];
+            let mut route_of: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+            let mut code = combo;
+            for &item in items {
+                let route = (code % n_routes as u64) as usize;
+                code /= n_routes as u64;
+                routes[route].push(item);
+                route_of.insert(item, route);
+            }
+            if same.iter().any(|&(a, b)| route_of[&a] != route_of[&b]) {
+                continue;
+            }
+            if routes.iter().any(|r| r.iter().map(|&node| demand[node as usize]).sum::<i64>() > capacity) {
+                continue;
+            }
+            let cost: i64 = routes.iter().map(|r| min_closed_tour(depot, r, dist)).sum();
+            best = Some(best.map_or(cost, |b| b.min(cost)));
+        }
+        best
+    }
+
+    /// Build a 2-route CVRP-shaped model with capacity 2 and optional `same_list`
+    /// pairs, over the shared `dist`/`demand` tables.
+    fn cvrp_same_list_model(items: Vec<i32>, dist: &Arc<Vec<Vec<i64>>>, demand: &Arc<Vec<i64>>, capacity: i64, same: &[(i32, i32)]) -> CollectionModel {
+        let edge = |list| {
+            let mut arena = ExprArena::default();
+            let i = arena.arg(0);
+            let j = arena.arg(1);
+            let body = arena.matrix(Arc::clone(dist), i, j);
+            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body }
+        };
+        let load = |list| {
+            let mut arena = ExprArena::default();
+            let i = arena.arg(0);
+            let body = arena.array(Arc::clone(demand), i);
+            Constraint { reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body }, op: Op::Le, rhs: capacity }
+        };
+        CollectionModel {
+            items,
+            lists: 2,
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)] }],
+            constraints: vec![load(0), load(1)],
+            globals: same.iter().map(|&(a, b)| GlobalConstraint::SameList { a, b }).collect(),
+            schedule: None,
+        }
+    }
+
+    #[test]
+    fn same_list_changes_cvrp_optimum_and_matches_brute_force() {
+        // Unconstrained optimum pairs {1,2} and {3,4} (cost 6). same_list(1, 3)
+        // forces 1 and 3 together, which is far more expensive. The engine optimum
+        // must equal the same-list-filtered exhaustive minimum, and must exceed the
+        // unconstrained optimum (proving the channel actually bites).
+        let dist = vec![
+            vec![0, 1, 1, 1, 1],
+            vec![1, 0, 1, 50, 50],
+            vec![1, 1, 0, 50, 50],
+            vec![1, 50, 50, 0, 1],
+            vec![1, 50, 50, 1, 0],
+        ];
+        let demand = vec![0i64, 1, 1, 1, 1];
+        let items = vec![1, 2, 3, 4];
+        let unconstrained = min_cvrp(0, &items, &dist, &demand, 2, 2).expect("feasible");
+        let same = [(1, 3)];
+        let brute = min_cvrp_same_list(0, &items, &dist, &demand, 2, 2, &same).expect("feasible under same_list");
+        assert!(brute > unconstrained, "same_list(1,3) is more expensive than the free optimum");
+
+        let model = cvrp_same_list_model(items.clone(), &Arc::new(dist), &Arc::new(demand), 2, &same);
+        let stop = AtomicBool::new(false);
+        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported same_list cvrp");
+
+        assert!(outcome.complete, "exhausted the search");
+        assert_eq!(outcome.solution.objectives, vec![brute], "engine optimum equals the same-list-filtered minimum");
+        let route_of = |item: i32| outcome.solution.lists.iter().position(|r| r.contains(&item)).expect("served");
+        assert_eq!(route_of(1), route_of(3), "same_list keeps 1 and 3 in the same route");
+    }
+
+    #[test]
+    fn same_list_with_capacity_can_be_unsat() {
+        // Customer 1 demands the whole capacity (2). same_list(1, 2) forces 1 and 2
+        // into one route, whose combined demand 3 exceeds capacity 2: infeasible.
+        let dist = vec![
+            vec![0, 1, 1, 1, 1],
+            vec![1, 0, 1, 1, 1],
+            vec![1, 1, 0, 1, 1],
+            vec![1, 1, 1, 0, 1],
+            vec![1, 1, 1, 1, 0],
+        ];
+        let demand = vec![0i64, 2, 1, 1, 1];
+        let items = vec![1, 2, 3, 4];
+        let same = [(1, 2)];
+        assert!(min_cvrp_same_list(0, &items, &dist, &demand, 2, 2, &same).is_none(), "no feasible same_list packing exists");
+
+        let model = cvrp_same_list_model(items, &Arc::new(dist), &Arc::new(demand), 2, &same);
+        let stop = AtomicBool::new(false);
+        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported same_list cvrp");
+
+        assert!(outcome.complete, "search exhausted");
+        assert!(!outcome.solution.feasible, "same_list(1,2) over-capacity is UNSAT");
     }
 }
