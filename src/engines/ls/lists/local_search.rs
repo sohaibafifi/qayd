@@ -651,6 +651,14 @@ fn routing_lns(
 /// `report` is called with the objective each time a strictly better *feasible*
 /// incumbent is found, for progress output; pass `&mut |_| {}` to ignore it.
 pub fn solve_collection(model: &CollectionModel, seed: u64, stop: &AtomicBool, report: &mut dyn FnMut(i64)) -> CollectionSolution {
+    solve_collection_capped(model, seed, stop, u64::MAX, report)
+}
+
+/// Like [`solve_collection`], but stops after at most `max_iters` local-search
+/// iterations as well as when `stop` is set. Used to get a quick bounded
+/// incumbent (e.g. to warm-start the exact routing backend) even when no time
+/// limit / stop flag is in effect.
+pub fn solve_collection_capped(model: &CollectionModel, seed: u64, stop: &AtomicBool, max_iters: u64, report: &mut dyn FnMut(i64)) -> CollectionSolution {
     // Guard the search path: an invalid model would otherwise panic (bad list
     // index) or read silent zeros (out-of-range table index). Callers like the
     // Python frontend validate first to raise a precise error; this is the
@@ -689,7 +697,7 @@ pub fn solve_collection(model: &CollectionModel, seed: u64, stop: &AtomicBool, r
     let mut since_improve = 0u64;
     let mut iter = 0u64;
 
-    while !stop.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed) && iter < max_iters {
         iter += 1;
         match best_improving_move(&per, &state, stop, &mut memory) {
             Some(mv) => {

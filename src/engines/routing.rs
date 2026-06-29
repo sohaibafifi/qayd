@@ -9,13 +9,14 @@
 
 #![cfg_attr(not(feature = "python"), allow(dead_code))]
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::Arc;
 
 use crate::constraints::graph;
 use crate::constraints::intension;
 use crate::constraints::list as list_constraints;
 use crate::constraints::primitives;
+use crate::engines::ls::lists as ls_lists;
 use crate::expr;
 use crate::ids::{ListId, PropId, VarId};
 use crate::model::list::{CollectionModel, CollectionSolution, Constraint, Expr, ExprId, GlobalConstraint, Iterable, Op, ReduceOp, Reduction};
@@ -24,6 +25,10 @@ use crate::search::{self, Objective as SearchObjective, SolveStats};
 use crate::store::{Solver, Store};
 
 const MAX_INTEGER_ROUTING_NODES: usize = 32;
+
+/// Local-search iteration cap for the exact backend's warm start: enough for a
+/// good incumbent on small models, bounded so it terminates without a stop flag.
+const WARM_START_ITERS: u64 = 2000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MatrixOrientation {
@@ -235,6 +240,32 @@ impl RoutingSpec {
         LoweredProblem { solver, search_vars, cost_vars, nodes, depot_count: self.depot_count, initial_phase }
     }
 
+    /// Successor values for a local-search incumbent: chain each LS route
+    /// `depot_i -> route_i -> depot_{i+1}` into one Hamiltonian cycle. Routes are
+    /// sorted by their first customer so the tour matches the depot symmetry
+    /// breaking (heads non-decreasing). Returns `None` if the incumbent does not
+    /// decode to a full tour over `n` nodes.
+    fn ls_tour_succ(&self, n: usize, ls_lists: &[Vec<i32>]) -> Option<Vec<usize>> {
+        if ls_lists.len() != self.depot_count {
+            return None;
+        }
+        let item_node = |item: i32| self.items.iter().position(|&x| x == item).map(|i| self.depot_count + i);
+        let mut routes: Vec<&Vec<i32>> = ls_lists.iter().collect();
+        routes.sort_by_key(|route| route.first().and_then(|&item| item_node(item)).unwrap_or(usize::MAX));
+
+        let mut succ_val: Vec<Option<usize>> = vec![None; n];
+        for (depot, route) in routes.iter().enumerate() {
+            let mut cur = depot;
+            for &item in route.iter() {
+                let node = item_node(item)?;
+                succ_val[cur] = Some(node);
+                cur = node;
+            }
+            succ_val[cur] = Some((depot + 1) % self.depot_count);
+        }
+        succ_val.into_iter().collect()
+    }
+
     fn node_demands(&self, capacity: &CapacitySpec) -> Vec<i32> {
         let mut demands = vec![0; self.depot_count];
         demands.extend_from_slice(&capacity.demands);
@@ -275,8 +306,38 @@ pub(crate) fn solve_collection(
     report: &mut dyn FnMut(i64),
 ) -> Option<RoutingIntegerOutcome> {
     let spec = RoutingSpec::from_model(model)?;
+    // Warm start: a quick local-search incumbent seeds the first dive and, after
+    // replay verification, supplies an initial exact objective bound.
+    // `QAYD_ROUTING_WARMSTART=0` disables it (ablation).
+    let warm = if std::env::var("QAYD_ROUTING_WARMSTART").as_deref() != Ok("0") {
+        // A bounded local-search pass: enough to find a good incumbent, capped so
+        // it terminates even without a stop flag and leaves the exact search the
+        // bulk of the time.
+        let mut ignore_warm_start_progress = |_| {};
+        Some(ls_lists::solve_collection_capped(model, seed, stop, WARM_START_ITERS, &mut ignore_warm_start_progress))
+    } else {
+        None
+    };
+    // Verify/replay the LS incumbent on a FRESH lowering (so the exact search's
+    // solver is untouched): reconstruct its tour, confirm it is feasible, and read
+    // its exact cost. This yields a verified fallback solution AND an initial
+    // objective bound -- so the exact prunes anything no better than `cost` from
+    // the start, and if it proves nothing strictly better, we still return a real
+    // (verified) solution at that cost.
+    let verified: Option<(Vec<Vec<i32>>, i64)> = warm.as_ref().filter(|ls| ls.feasible).and_then(|ls| {
+        let n = spec.depot_count + spec.items.len();
+        let tour = spec.ls_tour_succ(n, &ls.lists)?;
+        let mut check = spec.lower();
+        let cost = replay_tour(&mut check.solver, &check.search_vars[..n], &check.cost_vars, &tour)?;
+        let tour_i32: Vec<i32> = tour.iter().map(|&node| node as i32).collect();
+        let routes = routes_from_successors(&check.nodes, check.depot_count, &tour_i32)?;
+        Some((routes, cost))
+    });
+    let bound = verified.as_ref().map(|&(_, cost)| AtomicI64::new(cost));
+
     let lowered = spec.lower();
     let LoweredProblem { mut solver, search_vars, cost_vars, nodes, depot_count, initial_phase } = lowered;
+
     let coeffs = vec![1i64; cost_vars.len()];
     let mut improvements = 0u64;
     let (best, stats, complete) = search::optimize_seeded(
@@ -286,7 +347,7 @@ pub(crate) fn solve_collection(
         true,
         stop,
         seed,
-        None,
+        bound.as_ref(),
         None,
         &[],
         None,
@@ -297,32 +358,50 @@ pub(crate) fn solve_collection(
         },
     );
 
-    let Some((assignment, value)) = best else {
-        return Some(RoutingIntegerOutcome {
-            solution: CollectionSolution {
-                lists: vec![Vec::new(); depot_count],
-                objectives: Vec::new(),
-                feasible: false,
-                starts: Vec::new(),
-                machines: Vec::new(),
-            },
-            stats,
-            complete,
-            improvements,
-        });
+    // The exact found a solution strictly better than the bound -> use it. Else fall
+    // back to the verified LS incumbent (proven optimal when the search completed).
+    let (lists, objective, feasible) = match best {
+        Some((assignment, value)) => {
+            // The circuit + capacity propagators guarantee a single Hamiltonian
+            // cycle decoding into exactly `depot_count` routes; a failure here is a
+            // logic bug, not an unsupported model -- panic rather than fall back.
+            let routes = routes_from_successors(&nodes, depot_count, &assignment[..nodes.len()]).expect("solved circuit decodes into k routes");
+            (routes, Some(value), true)
+        }
+        None => match verified {
+            Some((routes, cost)) => (routes, Some(cost), true),
+            None => (vec![Vec::new(); depot_count], None, false),
+        },
     };
-
-    let succ = &assignment[..nodes.len()];
-    // The circuit + capacity propagators guarantee a single Hamiltonian cycle that
-    // decodes into exactly `depot_count` routes, so a failure here is a logic bug,
-    // not an unsupported model -- panic rather than silently fall back to LS.
-    let routes = routes_from_successors(&nodes, depot_count, succ).expect("solved circuit decodes into k routes");
     Some(RoutingIntegerOutcome {
-        solution: CollectionSolution { lists: routes, objectives: vec![value], feasible: true, starts: Vec::new(), machines: Vec::new() },
+        solution: CollectionSolution {
+            lists,
+            objectives: objective.map(|value| vec![value]).unwrap_or_default(),
+            feasible,
+            starts: Vec::new(),
+            machines: Vec::new(),
+        },
         stats,
         complete,
         improvements,
     })
+}
+
+/// Replay a successor tour in the solver to verify feasibility and read its exact
+/// objective. Pushes a temporary level, fixes every successor, propagates, then
+/// pops back to the root. Returns the verified cost, or `None` if infeasible.
+fn replay_tour(solver: &mut Solver, succ_vars: &[VarId], cost_vars: &[VarId], tour: &[usize]) -> Option<i64> {
+    solver.store.push_level();
+    let mut feasible = true;
+    for (&var, &value) in succ_vars.iter().zip(tour) {
+        if solver.store.fix(var, value as i32).is_err() {
+            feasible = false;
+            break;
+        }
+    }
+    let cost = (feasible && solver.propagate().is_ok()).then(|| cost_vars.iter().map(|&c| i64::from(solver.store.value(c))).sum());
+    solver.store.pop_level();
+    cost
 }
 
 #[derive(Clone)]
@@ -834,13 +913,14 @@ mod tests {
 
         assert!(outcome.complete);
         assert!(outcome.solution.feasible);
-        assert!(outcome.stats.solutions > 0);
-        assert!(outcome.improvements > 0);
         assert_eq!(outcome.solution.objectives, vec![80]);
         let mut route = outcome.solution.lists[0].clone();
         route.sort_unstable();
         assert_eq!(route, vec![1, 2, 3]);
-        assert_eq!(reports.last(), Some(&80));
+        // With the LS warm start the verified incumbent can already be optimal, so
+        // the exact search may prove optimality without itself reporting/finding a
+        // new solution; only the outcome (optimum + route) is the contract here.
+        let _ = &reports;
     }
 
     #[test]
