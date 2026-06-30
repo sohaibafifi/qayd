@@ -219,6 +219,7 @@ impl RoutingSpec {
                 lists,
                 items: self.items.clone(),
                 depot_count: self.depot_count,
+                two_way: std::env::var("QAYD_ROUTING_TWOWAY").as_deref() != Ok("0"),
             }));
         }
 
@@ -469,6 +470,9 @@ struct RouteSegmentChannel {
     lists: Vec<ListId>,
     items: Vec<i32>,
     depot_count: usize,
+    /// Whether the reverse `member -> segment_of -> succ` pruning is enabled
+    /// (`QAYD_ROUTING_TWOWAY=0` disables it, for ablation/benchmarking).
+    two_way: bool,
 }
 
 impl RouteSegmentChannel {
@@ -497,10 +501,12 @@ impl Propagator for RouteSegmentChannel {
         }
         // Reverse channel: wake when membership is decided (e.g. same_list/list_len/
         // item_sum forbids a customer from a route), so we can prune `succ`.
-        for r in 0..self.depot_count {
-            for &item in &self.items {
-                if let Some(member) = store.list_member_var(self.lists[r], item) {
-                    store.subscribe(member, me, Event::Fix);
+        if self.two_way {
+            for r in 0..self.depot_count {
+                for &item in &self.items {
+                    if let Some(member) = store.list_member_var(self.lists[r], item) {
+                        store.subscribe(member, me, Event::Fix);
+                    }
                 }
             }
         }
@@ -538,6 +544,9 @@ impl Propagator for RouteSegmentChannel {
         // forbidden from route `r`, it cannot be in `r`'s segment, and no node known
         // to be in route `r` may point to it.
         for j in 0..self.items.len() {
+            if !self.two_way {
+                break;
+            }
             let nc = (self.depot_count + j) as i32;
             for r in 0..self.depot_count {
                 if store.list_possible(self.lists[r], self.items[j]) {
@@ -1089,6 +1098,55 @@ mod tests {
             best = best.min(cost);
         }
         best
+    }
+
+    #[test]
+    #[ignore = "benchmark, run with --ignored --nocapture; ablate QAYD_ROUTING_TWOWAY / QAYD_ROUTING_WARMSTART"]
+    fn measure_two_way() {
+        // Membership-routing instance: 2 routes, 8 customers, capacity 4 per route,
+        // two same_list pairs, and each route exactly 4 customers. Exercises the
+        // reverse member -> succ channel.
+        let coords: [(i64, i64); 9] = [(0, 0), (1, 1), (2, 5), (5, 2), (6, 6), (2, 2), (7, 1), (3, 7), (8, 5)];
+        let n = coords.len();
+        let dist: Vec<Vec<i64>> = (0..n)
+            .map(|i| (0..n).map(|j| (coords[i].0 - coords[j].0).abs() + (coords[i].1 - coords[j].1).abs()).collect())
+            .collect();
+        let items: Vec<i32> = (1..n as i32).collect();
+        let dist_arc = Arc::new(dist);
+        let demand_arc = Arc::new(vec![1i64; n]);
+        let edge = |list| {
+            let mut arena = ExprArena::default();
+            let i = arena.arg(0);
+            let j = arena.arg(1);
+            let body = arena.matrix(Arc::clone(&dist_arc), i, j);
+            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body }
+        };
+        let load = |list| {
+            let mut arena = ExprArena::default();
+            let i = arena.arg(0);
+            let body = arena.array(Arc::clone(&demand_arc), i);
+            Constraint { reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body }, op: Op::Le, rhs: 4 }
+        };
+        let model = CollectionModel {
+            items,
+            lists: 2,
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)] }],
+            constraints: vec![load(0), load(1), count_eq(0, 4), count_eq(1, 4)],
+            globals: vec![GlobalConstraint::SameList { a: 1, b: 5 }, GlobalConstraint::SameList { a: 2, b: 6 }],
+            schedule: None,
+        };
+        let stop = AtomicBool::new(false);
+        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported membership routing model");
+        eprintln!(
+            "TWOWAY={:?} WARM={:?} nodes={} failures={} learned_lits={} obj={:?} complete={}",
+            std::env::var("QAYD_ROUTING_TWOWAY").ok(),
+            std::env::var("QAYD_ROUTING_WARMSTART").ok(),
+            outcome.stats.nodes,
+            outcome.stats.failures,
+            outcome.stats.learned_lits,
+            outcome.solution.objectives,
+            outcome.complete,
+        );
     }
 
     #[test]
