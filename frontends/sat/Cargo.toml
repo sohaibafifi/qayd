@@ -1,0 +1,12 @@
+[package]
+name = "qayd-sat"
+version.workspace = true
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "qayd-sat"
+path = "src/main.rs"
+
+[dependencies]
+qayd = { path = "../.." }

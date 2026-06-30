@@ -6,10 +6,10 @@ description = "Yet another constraint-programming solver."
 license = "MIT"
 
 [workspace]
-members = [".", "frontends/flatzinc"]
+members = [".", "frontends/flatzinc", "frontends/sat"]
 # Both packages take part in plain `cargo build --bin ...` at the root - the
-# release workflow builds `qayd` and `qayd-fzn` in one invocation.
-default-members = [".", "frontends/flatzinc"]
+# release workflow builds `qayd`, `qayd-fzn`, and `qayd-sat` in one invocation.
+default-members = [".", "frontends/flatzinc", "frontends/sat"]
 
 [workspace.package]
 # Single source of truth: qayd and qayd-fzn release under the same version.
