@@ -38,8 +38,8 @@ pub struct SatResult {
 /// Parse a DIMACS CNF string.
 ///
 /// Supports comments (`c ...`), one `p cnf <vars> <clauses>` line, arbitrary
-/// whitespace, and clauses spanning multiple lines. Every clause must end with
-/// `0`.
+/// whitespace, clauses spanning multiple lines, and the SATLIB `%` end marker.
+/// Every clause must end with `0`.
 pub fn parse_dimacs(input: &str) -> Result<Cnf, String> {
     let mut declared: Option<(usize, usize)> = None;
     let mut tokens = Vec::new();
@@ -48,6 +48,9 @@ pub fn parse_dimacs(input: &str) -> Result<Cnf, String> {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('c') {
             continue;
+        }
+        if line.starts_with('%') {
+            break;
         }
         if line.starts_with('p') {
             if declared.is_some() {
