@@ -19,7 +19,9 @@ use crate::constraints::primitives;
 use crate::engines::ls::lists as ls_lists;
 use crate::expr;
 use crate::ids::{ListId, PropId, VarId};
-use crate::model::list::{CollectionModel, CollectionSolution, Constraint, Expr, ExprId, GlobalConstraint, Iterable, Op, ReduceOp, Reduction};
+use crate::model::list::{
+    CollectionModel, CollectionSolution, Constraint, Expr, ExprId, GlobalConstraint, Iterable, Op, ReduceOp, Reduction,
+};
 use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::search::{self, Objective as SearchObjective, SolveStats};
 use crate::store::{Premise, Solver, Store};
@@ -227,7 +229,9 @@ impl RoutingSpec {
         let mut initial_phase = vec![None; solver.store.num_vars()];
         if std::env::var("QAYD_ROUTING_NN").as_deref() != Ok("0") {
             for from in 0..n {
-                if let Some(to) = (0..n).filter(|&to| to != from).min_by_key(|&to| self.edge.cost(nodes[from], nodes[to]).expect("validated edge cost")) {
+                if let Some(to) =
+                    (0..n).filter(|&to| to != from).min_by_key(|&to| self.edge.cost(nodes[from], nodes[to]).expect("validated edge cost"))
+                {
                     initial_phase[succ[from].index()] = Some(to as i32);
                 }
             }
@@ -365,7 +369,8 @@ pub(crate) fn solve_collection(
             // The circuit + capacity propagators guarantee a single Hamiltonian
             // cycle decoding into exactly `depot_count` routes; a failure here is a
             // logic bug, not an unsupported model -- panic rather than fall back.
-            let routes = routes_from_successors(&nodes, depot_count, &assignment[..nodes.len()]).expect("solved circuit decodes into k routes");
+            let routes =
+                routes_from_successors(&nodes, depot_count, &assignment[..nodes.len()]).expect("solved circuit decodes into k routes");
             (routes, Some(value), true)
         }
         None => match verified {
@@ -424,10 +429,16 @@ impl Propagator for RouteCapacityCheck {
             return Ok(());
         }
         let succ = self.succ.iter().map(|&var| store.value(var)).collect::<Vec<_>>();
-        if route_capacity_ok(self.depot_count, &self.demands, self.capacity, &succ) {
-            Ok(())
-        } else {
-            Err(Inconsistency)
+        match route_capacity_check(self.depot_count, &self.demands, self.capacity, &succ) {
+            CapacityCheck::Ok => Ok(()),
+            CapacityCheck::Overflow(path) => {
+                // The fixed arcs of the overflowing segment force these customers
+                // into one route whose total demand exceeds capacity.
+                let why = path.windows(2).map(|w| Premise::Eq { var: self.succ[w[0]], val: w[1] as i32 }).collect();
+                Err(store.fail_because(why))
+            }
+            // Structural failure: `circuit` will (or did) reject it; plain conflict.
+            CapacityCheck::Malformed => Err(Inconsistency),
         }
     }
 }
@@ -480,6 +491,15 @@ impl Propagator for RouteSegmentChannel {
         for &var in &self.segment_of {
             store.subscribe(var, me, Event::Fix);
         }
+        // Reverse channel: wake when membership is decided (e.g. same_list/list_len/
+        // item_sum forbids a customer from a route), so we can prune `succ`.
+        for r in 0..self.depot_count {
+            for &item in &self.items {
+                if let Some(member) = store.list_member_var(self.lists[r], item) {
+                    store.subscribe(member, me, Event::Fix);
+                }
+            }
+        }
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
@@ -510,6 +530,37 @@ impl Propagator for RouteSegmentChannel {
                 cur = next;
             }
         }
+        // Reverse channel: membership -> segment_of -> succ. When a customer is
+        // forbidden from route `r`, it cannot be in `r`'s segment, and no node known
+        // to be in route `r` may point to it.
+        for j in 0..self.items.len() {
+            let nc = (self.depot_count + j) as i32;
+            for r in 0..self.depot_count {
+                if store.list_possible(self.lists[r], self.items[j]) {
+                    continue;
+                }
+                // member[r][customer] = 0.
+                let member0: Vec<Premise> = store
+                    .list_member_var(self.lists[r], self.items[j])
+                    .map(|var| Premise::Eq { var, val: 0 })
+                    .into_iter()
+                    .collect();
+                // membership -> segment_of: the customer is not in segment `r`.
+                store.remove_because(self.segment_of[j], r as i32, member0.clone())?;
+                // segment_of -> succ: depot `r` (definitely route `r`) cannot point to it.
+                store.remove_because(self.succ[r], nc, member0.clone())?;
+                // ...nor any customer already proven to be in route `r`.
+                for x in self.depot_count..n {
+                    let xj = x - self.depot_count;
+                    if store.is_fixed(self.segment_of[xj]) && store.value(self.segment_of[xj]) == r as i32 {
+                        let mut why = member0.clone();
+                        why.push(Premise::Eq { var: self.segment_of[xj], val: r as i32 });
+                        store.remove_because(self.succ[x], nc, why)?;
+                    }
+                }
+            }
+        }
+
         // Leaf backstop: with all successors fixed, every customer must lie on
         // exactly one segment, so all `segment_of`/membership are now determined.
         if all_fixed && assigned.iter().any(|&seen| !seen) {
@@ -545,40 +596,60 @@ fn post_depot_symmetry(solver: &mut Solver, succ: &[VarId], depot_count: usize, 
     }
 }
 
-fn route_capacity_ok(depot_count: usize, demands: &[i32], capacity: i32, succ: &[i32]) -> bool {
+/// Outcome of the leaf capacity check.
+enum CapacityCheck {
+    /// Every route is within capacity.
+    Ok,
+    /// A route's demand exceeds capacity; the node path `depot -> ... -> the
+    /// customer at which the load first overflowed`.
+    Overflow(Vec<usize>),
+    /// Structural problem (not a circuit at a valid leaf); `circuit` owns these.
+    Malformed,
+}
+
+fn route_capacity_check(depot_count: usize, demands: &[i32], capacity: i32, succ: &[i32]) -> CapacityCheck {
     if depot_count == 0 || demands.len() != succ.len() {
-        return false;
+        return CapacityCheck::Malformed;
     }
+    let cap = i64::from(capacity);
     let mut seen = vec![false; succ.len()];
     seen[0] = true;
     let mut routes = 0usize;
     let mut load = 0i64;
     let mut cur = 0usize;
+    // Node path of the route currently being walked, starting at its depot copy.
+    let mut path = vec![0usize];
     loop {
         let Ok(next) = usize::try_from(succ[cur]) else {
-            return false;
+            return CapacityCheck::Malformed;
         };
         if next >= succ.len() {
-            return false;
+            return CapacityCheck::Malformed;
         }
         if next == 0 {
+            // Closing the cycle: the last route's load is already within capacity
+            // (overflow is caught at the customer below), so this is structural.
             routes += 1;
-            return load <= i64::from(capacity) && routes == depot_count && seen.iter().all(|&x| x);
+            return if load <= cap && routes == depot_count && seen.iter().all(|&x| x) {
+                CapacityCheck::Ok
+            } else {
+                CapacityCheck::Malformed
+            };
         }
         if seen[next] {
-            return false;
+            return CapacityCheck::Malformed;
         }
         if next < depot_count {
+            // Route boundary: the finished route is within capacity; start a fresh one.
             routes += 1;
-            if load > i64::from(capacity) {
-                return false;
-            }
-            load = 0;
             seen[next] = true;
+            load = 0;
+            path = vec![next];
         } else {
             load += i64::from(demands[next]);
-            if load > i64::from(capacity) {
-                return false;
+            path.push(next);
+            if load > cap {
+                return CapacityCheck::Overflow(path);
             }
             seen[next] = true;
         }
@@ -891,11 +962,13 @@ fn eval_collection_expr_one(arena: &[Expr], id: ExprId, arg0: i64) -> Option<i64
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::{atomic::AtomicBool, Arc};
 
     use crate::model::list::{CollectionModel, Constraint, ExprArena, GlobalConstraint, Iterable, ObjectiveTier, Op, ReduceOp, Reduction};
+    use crate::search::{self, SearchControl};
 
-    use super::solve_collection;
+    use super::{routes_from_successors, solve_collection, CapacityCheck, RoutingSpec};
 
     #[test]
     fn lowers_closed_tsp_to_integer_circuit() {
@@ -1022,9 +1095,8 @@ mod tests {
     fn measure_nn_seed() {
         let coords: [(i64, i64); 10] = [(0, 0), (1, 5), (2, 3), (5, 1), (8, 8), (3, 7), (7, 2), (6, 6), (4, 4), (9, 5)];
         let n = coords.len();
-        let dist: Vec<Vec<i64>> = (0..n)
-            .map(|i| (0..n).map(|j| (coords[i].0 - coords[j].0).abs() + (coords[i].1 - coords[j].1).abs()).collect())
-            .collect();
+        let dist: Vec<Vec<i64>> =
+            (0..n).map(|i| (0..n).map(|j| (coords[i].0 - coords[j].0).abs() + (coords[i].1 - coords[j].1).abs()).collect()).collect();
         let items: Vec<i32> = (1..n as i32).collect();
         let model = closed_tsp_model(items, 0, &Arc::new(dist));
         let stop = AtomicBool::new(false);
@@ -1110,13 +1182,7 @@ mod tests {
         // 2 routes, 4 customers, identical per-route capacity 2 (each customer
         // demands 1). depot = node 0. Engine optimum must equal the exhaustive
         // capacitated multi-route minimum.
-        let dist = vec![
-            vec![0, 1, 1, 1, 1],
-            vec![1, 0, 1, 50, 50],
-            vec![1, 1, 0, 50, 50],
-            vec![1, 50, 50, 0, 1],
-            vec![1, 50, 50, 1, 0],
-        ];
+        let dist = vec![vec![0, 1, 1, 1, 1], vec![1, 0, 1, 50, 50], vec![1, 1, 0, 50, 50], vec![1, 50, 50, 0, 1], vec![1, 50, 50, 1, 0]];
         let demand = vec![0i64, 1, 1, 1, 1];
         let items = vec![1, 2, 3, 4];
         let brute = min_cvrp(0, &items, &dist, &demand, 2, 2).expect("a feasible packing exists");
@@ -1191,7 +1257,13 @@ mod tests {
 
     /// Build a 2-route CVRP-shaped model with capacity 2 and optional `same_list`
     /// pairs, over the shared `dist`/`demand` tables.
-    fn cvrp_same_list_model(items: Vec<i32>, dist: &Arc<Vec<Vec<i64>>>, demand: &Arc<Vec<i64>>, capacity: i64, same: &[(i32, i32)]) -> CollectionModel {
+    fn cvrp_same_list_model(
+        items: Vec<i32>,
+        dist: &Arc<Vec<Vec<i64>>>,
+        demand: &Arc<Vec<i64>>,
+        capacity: i64,
+        same: &[(i32, i32)],
+    ) -> CollectionModel {
         let edge = |list| {
             let mut arena = ExprArena::default();
             let i = arena.arg(0);
@@ -1203,7 +1275,11 @@ mod tests {
             let mut arena = ExprArena::default();
             let i = arena.arg(0);
             let body = arena.array(Arc::clone(demand), i);
-            Constraint { reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body }, op: Op::Le, rhs: capacity }
+            Constraint {
+                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body },
+                op: Op::Le,
+                rhs: capacity,
+            }
         };
         CollectionModel {
             items,
@@ -1221,13 +1297,7 @@ mod tests {
         // forces 1 and 3 together, which is far more expensive. The engine optimum
         // must equal the same-list-filtered exhaustive minimum, and must exceed the
         // unconstrained optimum (proving the channel actually bites).
-        let dist = vec![
-            vec![0, 1, 1, 1, 1],
-            vec![1, 0, 1, 50, 50],
-            vec![1, 1, 0, 50, 50],
-            vec![1, 50, 50, 0, 1],
-            vec![1, 50, 50, 1, 0],
-        ];
+        let dist = vec![vec![0, 1, 1, 1, 1], vec![1, 0, 1, 50, 50], vec![1, 1, 0, 50, 50], vec![1, 50, 50, 0, 1], vec![1, 50, 50, 1, 0]];
         let demand = vec![0i64, 1, 1, 1, 1];
         let items = vec![1, 2, 3, 4];
         let unconstrained = min_cvrp(0, &items, &dist, &demand, 2, 2).expect("feasible");
@@ -1249,13 +1319,7 @@ mod tests {
     fn same_list_with_capacity_can_be_unsat() {
         // Customer 1 demands the whole capacity (2). same_list(1, 2) forces 1 and 2
         // into one route, whose combined demand 3 exceeds capacity 2: infeasible.
-        let dist = vec![
-            vec![0, 1, 1, 1, 1],
-            vec![1, 0, 1, 1, 1],
-            vec![1, 1, 0, 1, 1],
-            vec![1, 1, 1, 0, 1],
-            vec![1, 1, 1, 1, 0],
-        ];
+        let dist = vec![vec![0, 1, 1, 1, 1], vec![1, 0, 1, 1, 1], vec![1, 1, 0, 1, 1], vec![1, 1, 1, 0, 1], vec![1, 1, 1, 1, 0]];
         let demand = vec![0i64, 2, 1, 1, 1];
         let items = vec![1, 2, 3, 4];
         let same = [(1, 2)];
@@ -1324,6 +1388,107 @@ mod tests {
         best
     }
 
+    fn successor_cycle_from_order(n: usize, order: &[usize]) -> Vec<i32> {
+        let mut succ = vec![0i32; n];
+        let mut prev = 0usize;
+        for &node in order {
+            succ[prev] = node as i32;
+            prev = node;
+        }
+        succ[prev] = 0;
+        succ
+    }
+
+    fn depot_symmetry_holds(succ: &[i32], depot_count: usize) -> bool {
+        let n = succ.len();
+        succ[..depot_count]
+            .iter()
+            .map(|&head| {
+                let head = head as usize;
+                if head < depot_count {
+                    n
+                } else {
+                    head
+                }
+            })
+            .collect::<Vec<_>>()
+            .windows(2)
+            .all(|w| w[0] <= w[1])
+    }
+
+    fn routes_satisfy_spec(spec: &RoutingSpec, routes: &[Vec<i32>], succ: &[i32]) -> bool {
+        if let Some(capacity) = &spec.capacity {
+            let demands = spec.node_demands(capacity);
+            if !matches!(super::route_capacity_check(spec.depot_count, &demands, capacity.capacity, succ), CapacityCheck::Ok) {
+                return false;
+            }
+        }
+        let segment_of = |item: i32| routes.iter().position(|route| route.contains(&item));
+        if spec.same_list.iter().any(|&(a, b)| segment_of(a) != segment_of(b)) {
+            return false;
+        }
+        if let Some((min, max)) = spec.length {
+            if routes.iter().any(|route| route.len() < min || route.len() > max) {
+                return false;
+            }
+        }
+        if let Some((weights, min, max)) = &spec.item_sum {
+            if routes.iter().any(|route| {
+                let sum = route
+                    .iter()
+                    .map(|item| weights.iter().find_map(|&(x, weight)| (x == *item).then_some(weight)).unwrap_or(0))
+                    .sum::<i64>();
+                sum < *min || sum > *max
+            }) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn chronological_successor_set(spec: &RoutingSpec) -> BTreeSet<Vec<i32>> {
+        let mut nodes = Vec::with_capacity(spec.depot_count + spec.items.len());
+        nodes.extend((0..spec.depot_count).map(|_| spec.depot));
+        nodes.extend_from_slice(&spec.items);
+        let n = nodes.len();
+        let mut order: Vec<usize> = (1..n).collect();
+        let mut out = BTreeSet::new();
+        fn rec(pos: usize, order: &mut [usize], nodes: &[i32], spec: &RoutingSpec, out: &mut BTreeSet<Vec<i32>>) {
+            if pos == order.len() {
+                let succ = successor_cycle_from_order(nodes.len(), order);
+                if !depot_symmetry_holds(&succ, spec.depot_count) {
+                    return;
+                }
+                let Some(routes) = routes_from_successors(nodes, spec.depot_count, &succ) else {
+                    return;
+                };
+                if routes_satisfy_spec(spec, &routes, &succ) {
+                    out.insert(succ);
+                }
+                return;
+            }
+            for i in pos..order.len() {
+                order.swap(pos, i);
+                rec(pos + 1, order, nodes, spec, out);
+                order.swap(pos, i);
+            }
+        }
+        rec(0, &mut order, &nodes, spec, &mut out);
+        out
+    }
+
+    fn cdcl_successor_set(model: &CollectionModel) -> BTreeSet<Vec<i32>> {
+        let spec = RoutingSpec::from_model(model).expect("supported route lowering");
+        let mut lowered = spec.lower();
+        let n = lowered.nodes.len();
+        let mut out = BTreeSet::new();
+        search::solve(&mut lowered.solver, &lowered.search_vars, |solver| {
+            out.insert(lowered.search_vars[..n].iter().map(|&var| solver.store.value(var)).collect::<Vec<_>>());
+            SearchControl::Continue
+        });
+        out
+    }
+
     fn count_eq(list: usize, k: i64) -> Constraint {
         let mut arena = ExprArena::default();
         let body = arena.constant(1); // count of items present = route length
@@ -1335,13 +1500,8 @@ mod tests {
         // Free optimum is unbalanced (one customer alone), but `list_len` forces
         // exactly 2 customers per route. The engine optimum must equal the
         // size-filtered exhaustive minimum and exceed the free optimum.
-        let dist = vec![
-            vec![0, 1, 10, 10, 10],
-            vec![1, 0, 10, 10, 10],
-            vec![10, 10, 0, 1, 1],
-            vec![10, 10, 1, 0, 1],
-            vec![10, 10, 1, 1, 0],
-        ];
+        let dist =
+            vec![vec![0, 1, 10, 10, 10], vec![1, 0, 10, 10, 10], vec![10, 10, 0, 1, 1], vec![10, 10, 1, 0, 1], vec![10, 10, 1, 1, 0]];
         let zero = vec![0i64; 5];
         let items = vec![1, 2, 3, 4];
         let free = min_routes(0, &items, &dist, &zero, 2, None, &[], None, None).expect("feasible");
@@ -1378,13 +1538,7 @@ mod tests {
     fn same_list_length_and_capacity_compose() {
         // same_list(1,3) + each route exactly 2 + capacity 2: the three constraints
         // coexist; the engine optimum equals the jointly-filtered exhaustive minimum.
-        let dist = vec![
-            vec![0, 1, 1, 1, 1],
-            vec![1, 0, 1, 50, 50],
-            vec![1, 1, 0, 50, 50],
-            vec![1, 50, 50, 0, 1],
-            vec![1, 50, 50, 1, 0],
-        ];
+        let dist = vec![vec![0, 1, 1, 1, 1], vec![1, 0, 1, 50, 50], vec![1, 1, 0, 50, 50], vec![1, 50, 50, 0, 1], vec![1, 50, 50, 1, 0]];
         let demand = vec![0i64, 1, 1, 1, 1];
         let items = vec![1, 2, 3, 4];
         let same = [(1, 3)];
@@ -1432,13 +1586,7 @@ mod tests {
         // groups the two low-value customers together, which the bound forbids, so
         // the engine optimum must equal the value-filtered exhaustive minimum and
         // exceed the free optimum.
-        let dist = vec![
-            vec![0, 1, 1, 1, 1],
-            vec![1, 0, 1, 50, 50],
-            vec![1, 1, 0, 50, 50],
-            vec![1, 50, 50, 0, 1],
-            vec![1, 50, 50, 1, 0],
-        ];
+        let dist = vec![vec![0, 1, 1, 1, 1], vec![1, 0, 1, 50, 50], vec![1, 1, 0, 50, 50], vec![1, 50, 50, 0, 1], vec![1, 50, 50, 1, 0]];
         let value = vec![0i64, 1, 1, 10, 10]; // indexed by node; customers 3,4 are high value
         let weights = vec![(1i32, 1i64), (2, 1), (3, 10), (4, 10)];
         let items = vec![1, 2, 3, 4];
@@ -1480,5 +1628,95 @@ mod tests {
             let sum: i64 = route.iter().map(|&node| value_arc[node as usize]).sum();
             assert!(sum >= 11, "every route reaches the value floor");
         }
+    }
+
+    #[test]
+    fn routing_cdcl_enumerates_chronological_successor_set() {
+        // A small mixed routing model: circuit + depot symmetry + capacity + channel
+        // constraints (`same_list`, homogeneous length, homogeneous item_sum). CDCL
+        // enumeration uses all routing explanations; the chronological set is an
+        // independent permutation scan over successor cycles with the same filters.
+        let dist = vec![vec![0, 1, 2, 3, 4], vec![1, 0, 1, 5, 5], vec![2, 1, 0, 5, 1], vec![3, 5, 5, 0, 1], vec![4, 5, 1, 1, 0]];
+        let demand = vec![0i64, 1, 1, 1, 1];
+        let value = vec![0i64, 1, 10, 10, 1];
+        let items = vec![1, 2, 3, 4];
+
+        let dist_arc = Arc::new(dist);
+        let demand_arc = Arc::new(demand);
+        let value_arc = Arc::new(value);
+        let edge = |list| {
+            let mut arena = ExprArena::default();
+            let i = arena.arg(0);
+            let j = arena.arg(1);
+            let body = arena.matrix(Arc::clone(&dist_arc), i, j);
+            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body }
+        };
+        let load = |list| {
+            let mut arena = ExprArena::default();
+            let i = arena.arg(0);
+            let body = arena.array(Arc::clone(&demand_arc), i);
+            Constraint { reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body }, op: Op::Le, rhs: 2 }
+        };
+        let value_sum = |list| {
+            let mut arena = ExprArena::default();
+            let i = arena.arg(0);
+            let body = arena.array(Arc::clone(&value_arc), i);
+            Constraint { reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body }, op: Op::Ge, rhs: 11 }
+        };
+        let model = CollectionModel {
+            items,
+            lists: 2,
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)] }],
+            constraints: vec![load(0), load(1), count_eq(0, 2), count_eq(1, 2), value_sum(0), value_sum(1)],
+            globals: vec![GlobalConstraint::SameList { a: 1, b: 3 }],
+            schedule: None,
+        };
+        let spec = RoutingSpec::from_model(&model).expect("supported mixed routing model");
+        let chronological = chronological_successor_set(&spec);
+        assert!(!chronological.is_empty(), "mixed routing model has feasible successor tours");
+
+        let cdcl = cdcl_successor_set(&model);
+        assert_eq!(cdcl, chronological, "CDCL routing enumeration matches chronological successor enumeration");
+    }
+
+    #[test]
+    fn route_capacity_overflow_is_unsat() {
+        // 3 customers each demand 2, capacity 3, 2 routes: any route with two or more
+        // customers overflows (>= 4 > 3), but three customers across two routes force
+        // one such route. The explained capacity check must make this infeasible,
+        // matching the exhaustive (capacity-filtered) result.
+        let dist = vec![vec![0, 1, 1, 1], vec![1, 0, 1, 1], vec![1, 1, 0, 1], vec![1, 1, 1, 0]];
+        let demand = vec![0i64, 2, 2, 2];
+        let items = vec![1, 2, 3];
+        assert!(min_routes(0, &items, &dist, &demand, 2, Some(3), &[], None, None).is_none(), "no capacity-feasible split exists");
+
+        let dist_arc = Arc::new(dist);
+        let demand_arc = Arc::new(demand);
+        let edge = |list| {
+            let mut arena = ExprArena::default();
+            let i = arena.arg(0);
+            let j = arena.arg(1);
+            let body = arena.matrix(Arc::clone(&dist_arc), i, j);
+            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body }
+        };
+        let load = |list| {
+            let mut arena = ExprArena::default();
+            let i = arena.arg(0);
+            let body = arena.array(Arc::clone(&demand_arc), i);
+            Constraint { reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body }, op: Op::Le, rhs: 3 }
+        };
+        let model = CollectionModel {
+            items,
+            lists: 2,
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)] }],
+            constraints: vec![load(0), load(1)],
+            globals: Vec::new(),
+            schedule: None,
+        };
+        let stop = AtomicBool::new(false);
+        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported cvrp lowering");
+
+        assert!(outcome.complete, "exhausted the search");
+        assert!(!outcome.solution.feasible, "capacity overflow makes the model infeasible");
     }
 }

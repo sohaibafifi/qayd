@@ -461,10 +461,20 @@ fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w
             let mut io_err: Option<std::io::Error> = None;
             // Single-worker COP is always the proof engine here; `--ls` routes to
             // the local-search portfolio before reaching this path.
-            let (best, stats, complete) =
-                optimize_seeded(&mut solver, &vars, objective.search(), minimizing, stop, options.seed, None, None, &[], None, Vec::new(), |v, _| {
-                    write_improvement_from(w, verbose, &mut io_err, v, "sequential")
-                });
+            let (best, stats, complete) = optimize_seeded(
+                &mut solver,
+                &vars,
+                objective.search(),
+                minimizing,
+                stop,
+                options.seed,
+                None,
+                None,
+                &[],
+                None,
+                Vec::new(),
+                |v, _| write_improvement_from(w, verbose, &mut io_err, v, "sequential"),
+            );
             if let Some(e) = io_err {
                 return Err(e.to_string());
             }

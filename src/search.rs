@@ -400,7 +400,9 @@ pub fn optimize_with(
 ) -> (Option<(Vec<i32>, i32)>, SolveStats) {
     let mut on_improve = on_improve;
     let (best, stats, _) =
-        optimize_seeded(solver, vars, Objective::Var(obj), minimizing, stop, 0, None, None, &[], None, Vec::new(), |value, _| on_improve(value as i32));
+        optimize_seeded(solver, vars, Objective::Var(obj), minimizing, stop, 0, None, None, &[], None, Vec::new(), |value, _| {
+            on_improve(value as i32)
+        });
     (best.map(|(solution, value)| (solution, value as i32)), stats)
 }
 

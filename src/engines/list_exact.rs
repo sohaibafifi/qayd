@@ -567,11 +567,8 @@ mod tests {
         use crate::model::list::{Constraint, ExprArena, Iterable, Op, ReduceOp, Reduction};
         let mut arena = ExprArena::default();
         let body = arena.constant(1);
-        let length_eq_two = Constraint {
-            reduction: Reduction { op: ReduceOp::Count, iterable: Iterable::Items(0), arena, body },
-            op: Op::Eq,
-            rhs: 2,
-        };
+        let length_eq_two =
+            Constraint { reduction: Reduction { op: ReduceOp::Count, iterable: Iterable::Items(0), arena, body }, op: Op::Eq, rhs: 2 };
         let model = CollectionModel {
             items: vec![10, 20, 30],
             lists: 2,
