@@ -447,15 +447,19 @@ fn post_route_capacity_check(solver: &mut Solver, succ: &[VarId], depot_count: u
     solver.post(Box::new(RouteCapacityCheck { succ: succ.to_vec(), depot_count, demands, capacity }));
 }
 
-/// Channels the successor circuit onto list membership: derives, for each customer,
-/// which depot segment it sits in (`segment_of`), and requires the matching list
-/// membership so the explained list propagators (`partition`, `same_list`) apply.
+/// Channels between the successor circuit and list membership. Fixed successor
+/// prefixes derive, for each customer, which depot segment it sits in
+/// (`segment_of`), then require the matching list membership so the explained
+/// list propagators (`partition`, `same_list`) apply. Conversely, when a list
+/// propagator forbids a customer from a segment, the channel removes that segment
+/// view and forbids arcs from nodes already known to be in that segment to the
+/// forbidden customer.
 ///
-/// One-way only (R-guardrails): `succ (fixed prefix) -> segment_of -> member`. It
-/// never pushes membership back onto `segment_of`/`succ`, and nothing branches on
-/// `segment_of`/membership. When every successor is fixed, the leaf backstop must
-/// have placed every customer on exactly one segment; a clash with `same_list`
-/// surfaces as the `require`/`partition` conflict.
+/// `succ` remains the source of truth and the only search surface here.
+/// `segment_of`/membership are propagated views, never branched. When every
+/// successor is fixed, the leaf backstop must have placed every customer on
+/// exactly one segment; a clash with `same_list` surfaces as the
+/// `require`/`partition` conflict.
 #[derive(Clone)]
 struct RouteSegmentChannel {
     succ: Vec<VarId>,
@@ -540,11 +544,8 @@ impl Propagator for RouteSegmentChannel {
                     continue;
                 }
                 // member[r][customer] = 0.
-                let member0: Vec<Premise> = store
-                    .list_member_var(self.lists[r], self.items[j])
-                    .map(|var| Premise::Eq { var, val: 0 })
-                    .into_iter()
-                    .collect();
+                let member0: Vec<Premise> =
+                    store.list_member_var(self.lists[r], self.items[j]).map(|var| Premise::Eq { var, val: 0 }).into_iter().collect();
                 // membership -> segment_of: the customer is not in segment `r`.
                 store.remove_because(self.segment_of[j], r as i32, member0.clone())?;
                 // segment_of -> succ: depot `r` (definitely route `r`) cannot point to it.
