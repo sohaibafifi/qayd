@@ -71,6 +71,7 @@ Priority order: correct, simple, fast.
 - **A beta support for MiniZinc.** The `qayd-fzn` driver speaks the MiniZinc solver protocol,
   so it can be used as a backend for the MiniZinc CLI and IDE. The `--mzn` flag enables some
   MiniZinc-specific behaviour. (see [for details](frontends/flatzinc/minizinc/README.md)).
+- **A beta SAT and Pseudo-Boolean solver.** 
 
 ## Entry Points
 
