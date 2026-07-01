@@ -6,3 +6,5 @@
 __pycache__/
 *.py[cod]
 *.so
+/bench/sat/
+/data/SAT/

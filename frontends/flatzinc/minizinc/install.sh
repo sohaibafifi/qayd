@@ -2,7 +2,7 @@
 # Register qayd as a MiniZinc solver (CLI + IDE).
 #
 # Builds the release binary and writes a solver configuration into
-# ~/.minizinc/solvers/ pointing straight at target/release/qayd-fzn —
+# ~/.minizinc/solvers/ pointing straight at target/release/qayd-fzn -
 # the binary speaks the MiniZinc protocol natively, and rebuilds are
 # picked up automatically. The config also points at the bundled mznlib,
 # which keeps supported globals (all_different, table, regular, ...) as

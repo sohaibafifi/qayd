@@ -11,8 +11,9 @@ use crate::domains::interval::IntervalPresence;
 use crate::expr::Expr;
 use crate::ids::{IntervalId, ListId, VarId};
 use crate::lcg::clause::ClauseSharing;
-use crate::lcg::lit::{LazyAtomRegistry, Lit};
+use crate::lcg::lit::{AtomKind, LazyAtomRegistry, Lit, LitOrConst};
 use crate::lcg::trail::Cdcl;
+use crate::lcg::view::Tri;
 use crate::propagator::Inconsistency;
 use crate::store::{Solver, Store};
 
@@ -43,6 +44,49 @@ pub struct SolveStats {
     pub vivified_clauses: u64,
     /// Literals removed by CP-aware vivification.
     pub vivified_lits: u64,
+    /// Binary clauses visited during CDCL unit propagation.
+    pub binary_clause_visits: u64,
+    /// Non-binary watched clauses visited during CDCL unit propagation.
+    pub watched_clause_visits: u64,
+    /// Non-watch literals scanned while looking for a replacement watch.
+    pub watched_literal_scans: u64,
+    /// Literals implied by the binary-clause fast path.
+    pub binary_implications: u64,
+}
+
+/// A Boolean literal over an integer variable encoded as `{0, 1}` or `{-1, 1}`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BoolLit {
+    /// The Boolean finite-domain variable.
+    pub var: VarId,
+    /// The logical value that satisfies the literal.
+    pub value: bool,
+}
+
+impl BoolLit {
+    /// Literal `var = 1`.
+    #[inline]
+    pub fn positive(var: VarId) -> Self {
+        Self { var, value: true }
+    }
+
+    /// Literal `var = 0`.
+    #[inline]
+    pub fn negative(var: VarId) -> Self {
+        Self { var, value: false }
+    }
+}
+
+/// Errors returned by the native Boolean CNF entry point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoolCnfError {
+    /// A clause references a variable whose root domain is not Boolean.
+    NonBooleanVar { var: VarId, min: i32, max: i32 },
+}
+
+struct BoolCnfHints {
+    activity: Vec<f64>,
+    phase: Vec<Option<i32>>,
 }
 
 /// Complete assignment for list and interval domains.
@@ -159,6 +203,222 @@ pub(crate) fn decide_sat_shared_seeded(
         cdcl.use_fast_restarts();
     }
     cdcl.decide_sat(vars, stop)
+}
+
+/// Find one solution or prove UNSAT for native Boolean CNF clauses.
+///
+/// This path injects clauses directly into the CDCL watched-clause database.
+/// It does not post linear clause constraints. `vars` is the set of Boolean
+/// variables to branch on, and every literal in `clauses` must reference one
+/// of those `{0, 1}` variables.
+pub fn solve_bool_cnf_interruptible(
+    solver: &mut Solver,
+    vars: &[VarId],
+    clauses: &[Vec<BoolLit>],
+    stop: &AtomicBool,
+) -> Result<(Option<Vec<i32>>, SolveStats, bool), BoolCnfError> {
+    solve_bool_cnf_seeded(solver, vars, clauses, stop, 0)
+}
+
+/// Like [`solve_bool_cnf_interruptible`], with reproducible search
+/// diversification.
+pub fn solve_bool_cnf_seeded(
+    solver: &mut Solver,
+    vars: &[VarId],
+    clauses: &[Vec<BoolLit>],
+    stop: &AtomicBool,
+    seed: u64,
+) -> Result<(Option<Vec<i32>>, SolveStats, bool), BoolCnfError> {
+    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, None) else {
+        return Ok((None, SolveStats::default(), false));
+    };
+    let Some(hints) = post_native_bool_clauses(&mut cdcl, vars, clauses)? else {
+        let mut stats = SolveStats { failures: cdcl.conflicts, ..SolveStats::default() };
+        cdcl.copy_inprocessing_stats(&mut stats);
+        return Ok((None, stats, true));
+    };
+    for (idx, activity) in hints.activity.into_iter().enumerate() {
+        cdcl.activity[idx] += activity;
+    }
+    cdcl.initial_phase = hints.phase;
+    cdcl.set_learned_clause_budget(clauses.len().saturating_mul(16).clamp(20_000, 200_000));
+    cdcl.use_fast_restarts();
+    Ok(cdcl.decide_sat(vars, stop))
+}
+
+/// Like [`solve_bool_cnf_seeded`], streaming learned clauses to `proof`.
+///
+/// The callback receives clauses in the public [`BoolLit`] vocabulary. It is
+/// intended for proof-producing CNF frontends; preprocessing proof logging is a
+/// separate responsibility.
+pub fn solve_bool_cnf_seeded_with_proof<F>(
+    solver: &mut Solver,
+    vars: &[VarId],
+    clauses: &[Vec<BoolLit>],
+    stop: &AtomicBool,
+    seed: u64,
+    mut proof: F,
+) -> Result<(Option<Vec<i32>>, SolveStats, bool), BoolCnfError>
+where
+    F: FnMut(&[BoolLit]),
+{
+    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, None) else {
+        return Ok((None, SolveStats::default(), false));
+    };
+    let lit_map = build_bool_lit_map(&cdcl, vars);
+    let mut proof_clause = Vec::new();
+    let mut logger = |lits: &[Lit]| {
+        proof_clause.clear();
+        proof_clause.extend(
+            lits.iter()
+                .map(|lit| lit_map.get(lit.code() as usize).and_then(|lit| *lit).expect("native SAT proof saw a non-Boolean literal")),
+        );
+        proof(&proof_clause);
+    };
+    cdcl.set_proof_logger(&mut logger);
+
+    let Some(hints) = post_native_bool_clauses(&mut cdcl, vars, clauses)? else {
+        let mut stats = SolveStats { failures: cdcl.conflicts, ..SolveStats::default() };
+        cdcl.copy_inprocessing_stats(&mut stats);
+        return Ok((None, stats, true));
+    };
+    for (idx, activity) in hints.activity.into_iter().enumerate() {
+        cdcl.activity[idx] += activity;
+    }
+    cdcl.initial_phase = hints.phase;
+    cdcl.set_learned_clause_budget(clauses.len().saturating_mul(16).clamp(20_000, 200_000));
+    cdcl.use_fast_restarts();
+    Ok(cdcl.decide_sat(vars, stop))
+}
+
+fn post_native_bool_clauses(cdcl: &mut Cdcl<'_>, vars: &[VarId], clauses: &[Vec<BoolLit>]) -> Result<Option<BoolCnfHints>, BoolCnfError> {
+    for &var in vars {
+        validate_bool_var(cdcl, var)?;
+    }
+
+    let mut activity = vec![0.0; cdcl.solver.store.num_vars()];
+    let mut positive_score = vec![0.0; cdcl.solver.store.num_vars()];
+    let mut negative_score = vec![0.0; cdcl.solver.store.num_vars()];
+
+    for clause in clauses {
+        match normalize_bool_clause(cdcl, clause)? {
+            None => {}
+            Some(lits) if lits.is_empty() => {
+                cdcl.log_proof_clause(&[]);
+                return Ok(None);
+            }
+            Some(lits) if lits.len() == 1 => {
+                record_bool_clause_hints(cdcl, &lits, &mut activity, &mut positive_score, &mut negative_score);
+                if !cdcl.assert_root_lit(lits[0]) {
+                    cdcl.log_proof_clause(&[]);
+                    return Ok(None);
+                }
+            }
+            Some(lits) => {
+                record_bool_clause_hints(cdcl, &lits, &mut activity, &mut positive_score, &mut negative_score);
+                cdcl.add_clause(lits, false, 0);
+            }
+        }
+    }
+    let mut phase = vec![None; cdcl.solver.store.num_vars()];
+    for &var in vars {
+        let idx = var.index();
+        if positive_score[idx] != 0.0 || negative_score[idx] != 0.0 {
+            phase[idx] = Some(bool_value(cdcl, var, positive_score[idx] >= negative_score[idx]));
+        }
+    }
+    Ok(Some(BoolCnfHints { activity, phase }))
+}
+
+fn normalize_bool_clause(cdcl: &Cdcl<'_>, clause: &[BoolLit]) -> Result<Option<Vec<Lit>>, BoolCnfError> {
+    let mut out = Vec::with_capacity(clause.len());
+    for &lit in clause {
+        validate_bool_var(cdcl, lit.var)?;
+        let l = match cdcl.atoms.eq(lit.var, bool_value(cdcl, lit.var, lit.value)) {
+            LitOrConst::True => return Ok(None),
+            LitOrConst::False => continue,
+            LitOrConst::Lit(l) => l,
+        };
+        match cdcl.value(l) {
+            Tri::True => return Ok(None),
+            Tri::False => continue,
+            Tri::Unknown => {}
+        }
+        if out.contains(&l) {
+            continue;
+        }
+        if out.contains(&l.negate()) {
+            return Ok(None);
+        }
+        out.push(l);
+    }
+    Ok(Some(out))
+}
+
+fn build_bool_lit_map(cdcl: &Cdcl<'_>, vars: &[VarId]) -> Vec<Option<BoolLit>> {
+    let mut selected = vec![false; cdcl.solver.store.num_vars()];
+    for &var in vars {
+        selected[var.index()] = true;
+    }
+
+    let mut map = vec![None; cdcl.atoms.num_atoms() * 2];
+    for atom in 0..cdcl.atoms.num_atoms() as u32 {
+        let (var, positive_is_true) = match cdcl.atoms.decode(atom) {
+            AtomKind::Ge { var, k } => {
+                debug_assert_eq!(k, 1, "Boolean order atoms should be the true endpoint");
+                (var, true)
+            }
+            AtomKind::Eq { var, v } => (var, v == 1),
+        };
+        if !selected.get(var.index()).copied().unwrap_or(false) {
+            continue;
+        }
+        let positive = Lit::positive(atom);
+        map[positive.code() as usize] = Some(BoolLit { var, value: positive_is_true });
+        map[positive.negate().code() as usize] = Some(BoolLit { var, value: !positive_is_true });
+    }
+    map
+}
+
+fn validate_bool_var(cdcl: &Cdcl<'_>, var: VarId) -> Result<(), BoolCnfError> {
+    let (min, max) = cdcl.atoms.var_span(var);
+    let is_zero_one = min == 0 && max == 1;
+    let is_signed = cdcl.atoms.is_sign(var);
+    if !is_zero_one && !is_signed {
+        return Err(BoolCnfError::NonBooleanVar { var, min, max });
+    }
+    Ok(())
+}
+
+fn bool_value(cdcl: &Cdcl<'_>, var: VarId, logical_true: bool) -> i32 {
+    if logical_true {
+        1
+    } else if cdcl.solver.store.contains(var, 0) {
+        0
+    } else {
+        -1
+    }
+}
+
+fn record_bool_clause_hints(cdcl: &Cdcl<'_>, lits: &[Lit], activity: &mut [f64], positive_score: &mut [f64], negative_score: &mut [f64]) {
+    let weight = 2.0_f64.powi(-(lits.len().min(32) as i32));
+    for &lit in lits {
+        let var = cdcl.atoms.var_of(lit.atom());
+        let idx = var.index();
+        activity[idx] += weight;
+        if lit_is_logically_positive(cdcl, lit) {
+            positive_score[idx] += weight;
+        } else {
+            negative_score[idx] += weight;
+        }
+    }
+}
+
+fn lit_is_logically_positive(cdcl: &Cdcl<'_>, lit: Lit) -> bool {
+    match cdcl.atoms.decode(lit.atom()) {
+        AtomKind::Ge { .. } => lit.is_positive(),
+        AtomKind::Eq { v, .. } => (v == 1) == lit.is_positive(),
+    }
 }
 
 /// Find one solution by non-learning chronological DFS, or report exhaustion.

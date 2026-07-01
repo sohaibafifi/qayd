@@ -49,15 +49,15 @@ jobs:
       - uses: actions/checkout@v4
 
       # Builds `--release --target <target>` (using `cross` for the Linux ARM
-      # target), archives both binaries as .tar.gz / .zip, writes a .sha256,
+      # target), archives the binaries as .tar.gz / .zip, writes a .sha256,
       # and uploads everything to the Release created above. All jobs upsert
       # into the same Release. `qayd-fzn` (the MiniZinc/FlatZinc frontend)
-      # shares the workspace version, so one tag releases both. The full
+      # and `qayd-sat` share the workspace version. The full
       # MiniZinc integration (solver config + mznlib + installer) ships as a
       # separate `qayd-minizinc-*` bundle assembled below.
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: qayd,qayd-fzn
+          bin: qayd,qayd-fzn,qayd-sat
           target: ${{ matrix.target }}
           archive: qayd-$tag-$target
           include: README.md,LICENSE
@@ -67,7 +67,7 @@ jobs:
 
   # Self-contained MiniZinc solver bundle per target: qayd-fzn + relocatable
   # qayd.msc + mznlib + standalone installer. The bare binary is not enough
-  # for MiniZinc users — the driver needs the solver config and the library.
+  # for MiniZinc users: the driver needs the solver config and the library.
   # Reuses the binary already built and uploaded by upload-assets.
   minizinc-bundle:
     name: minizinc ${{ matrix.target }}
@@ -178,7 +178,7 @@ jobs:
 
           # Round-tripping the archive means we reproduce taiki-e's exact member
           # layout; we only mutate the binaries themselves.
-          find ex -type f \( -name qayd -o -name qayd.exe -o -name qayd-fzn -o -name qayd-fzn.exe \) | while read -r binfile; do
+          find ex -type f \( -name qayd -o -name qayd.exe -o -name qayd-fzn -o -name qayd-fzn.exe -o -name qayd-sat -o -name qayd-sat.exe \) | while read -r binfile; do
             before=$(stat -c%s "$binfile")
             upx --best --lzma "$binfile"
             after=$(stat -c%s "$binfile")

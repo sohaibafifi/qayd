@@ -9,11 +9,11 @@
 //! Both are built from the *same* solver (`build_solver`); selection only
 //! changes how it is searched.
 //!
-//! - **member-var** (`run_member_var_search`) — branches the `item in list`
+//! - **member-var** (`run_member_var_search`) - branches the `item in list`
 //!   membership variables under the learning (CDCL) engine. A single linearizable
 //!   objective tier is integer-backed and branch-and-bounded (`optimize_linear_tier`),
 //!   so it prunes on an objective bound instead of enumerating every solution.
-//! - **chrono** (`run_domain_search`) — the non-learning chronological domain
+//! - **chrono** (`run_domain_search`) - the non-learning chronological domain
 //!   DFS, scoring each complete assignment externally. The fallback for everything
 //!   the member-var backend does not (yet) own.
 //!
@@ -55,7 +55,7 @@
 //! These need the list *order* domain, which does not exist yet: per-list item
 //! positions and successor arcs as integer variables, explained order/arc
 //! propagators over them, edge-cost lowering onto that order, and almost certainly
-//! a dedicated branching. That is the list-ordering domain, a separate tranche —
+//! a dedicated branching. That is the list-ordering domain, a separate tranche -
 //! not "one more constraint" over membership.
 
 use std::sync::atomic::AtomicBool;

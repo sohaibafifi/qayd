@@ -4,7 +4,7 @@
 //! records only assignment order and reasons. Backjump truncates the trail and
 //! pops the matching domain-trail levels, rolling truth back with it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -33,6 +33,9 @@ const VIVIFY_MAX_LEN: usize = 8;
 const VIVIFY_MAX_LBD: u32 = 4;
 const VIVIFY_MAX_REMOVED: usize = 2;
 const VIVIFY_MAX_VARS: usize = 50_000;
+const MINIMIZE_LEARNT_MAX_LEN: usize = 128;
+
+type ProofLogger<'s> = dyn FnMut(&[Lit]) + 's;
 
 /// Why an atom became assigned. Drives 1-UIP conflict analysis.
 #[derive(Clone)]
@@ -286,7 +289,10 @@ pub struct Cdcl<'s> {
     /// Clause database: learned and imported constraint clauses.
     pub(crate) clauses: ClauseDb,
     /// Two-watched-literal occurrence lists, indexed by literal code.
-    watches: HashMap<u32, Vec<ClauseRef>>,
+    watches: Vec<Vec<ClauseRef>>,
+    /// Binary implication lists, indexed by a true literal code. Each entry
+    /// `(b, c)` means this literal makes binary clause `c` unit on `b`.
+    binary_implications: Vec<Vec<(Lit, ClauseRef)>>,
     /// Reusable scratch for the pre-step scope snapshot of a conflict reason.
     conflict_scope: Vec<ScopeVar>,
     /// Reusable scratch for variables touched by one buffered FD step.
@@ -319,6 +325,14 @@ pub struct Cdcl<'s> {
     pub(crate) vivified_clauses: u64,
     /// Literals removed by CP-aware vivification.
     pub(crate) vivified_lits: u64,
+    /// Binary clauses visited during unit propagation.
+    pub(crate) binary_clause_visits: u64,
+    /// Non-binary watched clauses visited during unit propagation.
+    pub(crate) watched_clause_visits: u64,
+    /// Non-watch literals scanned while looking for a replacement watch.
+    pub(crate) watched_literal_scans: u64,
+    /// Literals implied by the binary-clause fast path.
+    pub(crate) binary_implications_count: u64,
     /// Restart schedule and LBD moving-average trigger.
     restart: RestartPolicy,
     /// Optional portfolio clause exchange.
@@ -337,6 +351,10 @@ pub struct Cdcl<'s> {
     /// 1 = inverted default, 2 = pseudo-random. Non-zero only on periodic
     /// rephasing segments, which diversify like a portfolio without a portfolio.
     pub(crate) rephase_mode: u8,
+    /// Optional proof sink for learned clauses.
+    proof_logger: Option<&'s mut ProofLogger<'s>>,
+    /// Whether the final empty clause was already sent to the proof sink.
+    proof_empty_logged: bool,
 }
 
 impl<'s> Cdcl<'s> {
@@ -373,7 +391,8 @@ impl<'s> Cdcl<'s> {
             tval: vec![Tri::Unknown; n],
             seen: vec![false; n],
             clauses: ClauseDb::new(),
-            watches: HashMap::new(),
+            watches: vec![Vec::new(); n * 2],
+            binary_implications: vec![Vec::new(); n * 2],
             conflict_scope: Vec::new(),
             changed_vars: Vec::new(),
             atom_scratch: Vec::new(),
@@ -389,6 +408,10 @@ impl<'s> Cdcl<'s> {
             learned_lits: 0,
             vivified_clauses: 0,
             vivified_lits: 0,
+            binary_clause_visits: 0,
+            watched_clause_visits: 0,
+            watched_literal_scans: 0,
+            binary_implications_count: 0,
             restart: RestartPolicy::new(),
             clause_sharing: None,
             shared_scratch: Vec::new(),
@@ -397,6 +420,8 @@ impl<'s> Cdcl<'s> {
             saved_phase: vec![None; nvars],
             restarts_done: 0,
             rephase_mode: 0,
+            proof_logger: None,
+            proof_empty_logged: false,
         }
     }
 
@@ -418,6 +443,34 @@ impl<'s> Cdcl<'s> {
     /// Use a shorter restart schedule to diversify a CSP portfolio worker.
     pub(crate) fn use_fast_restarts(&mut self) {
         self.restart = RestartPolicy::fast();
+    }
+
+    /// Raise the learned-clause database budget for pure SAT-style searches.
+    pub(crate) fn set_learned_clause_budget(&mut self, max_learned: usize) {
+        self.max_learned = self.max_learned.max(max_learned);
+    }
+
+    /// Stream learned clauses to an external proof writer.
+    pub(crate) fn set_proof_logger(&mut self, logger: &'s mut ProofLogger<'s>) {
+        self.proof_logger = Some(logger);
+    }
+
+    /// Send one proof clause to the optional proof sink.
+    pub(crate) fn log_proof_clause(&mut self, clause: &[Lit]) {
+        if clause.is_empty() {
+            if self.proof_empty_logged {
+                return;
+            }
+            self.proof_empty_logged = true;
+        }
+        if let Some(logger) = &mut self.proof_logger {
+            logger(clause);
+        }
+    }
+
+    /// Whether a proof sink is attached.
+    pub(crate) fn proof_logging_enabled(&self) -> bool {
+        self.proof_logger.is_some()
     }
 
     /// Scope exported clauses to the current search cube.
@@ -452,15 +505,20 @@ impl<'s> Cdcl<'s> {
                 cl.deletable && cl.lits.len() >= 2
             })
             .collect();
-        // Worst (highest LBD) first.
-        learned.sort_unstable_by_key(|&c| std::cmp::Reverse(self.clauses.get(c).lbd));
+        // Worst clauses first. Learned binary clauses are protected below, so
+        // length is mostly a tie-break among longer clauses.
+        learned.sort_unstable_by_key(|&c| {
+            let clause = self.clauses.get(c);
+            (std::cmp::Reverse(clause.lbd), std::cmp::Reverse(clause.lits.len()))
+        });
         let target = learned.len() / 2;
         let mut removed = 0;
         for &c in &learned {
             if removed >= target {
                 break;
             }
-            if self.clauses.get(c).lbd <= 2 {
+            let clause = self.clauses.get(c);
+            if clause.lbd <= 2 || clause.lits.len() == 2 {
                 continue;
             }
             self.delete_clause(c);
@@ -473,22 +531,47 @@ impl<'s> Cdcl<'s> {
     /// Tombstone a clause: unwatch it and free its literals; its slot remains so
     /// outstanding [`ClauseRef`]s stay valid.
     fn delete_clause(&mut self, c: ClauseRef) {
-        let (w0, w1) = {
-            let clause = self.clauses.get(c);
-            (clause.lits[clause.watch[0]], clause.lits[clause.watch[1]])
-        };
-        self.unwatch(w0, c);
-        self.unwatch(w1, c);
+        let lits = Arc::clone(&self.clauses.get(c).lits);
+        if lits.len() == 2 {
+            self.remove_binary_implication(lits[0].negate(), lits[1], c);
+            self.remove_binary_implication(lits[1].negate(), lits[0], c);
+        } else if lits.len() >= 2 {
+            let (w0, w1) = {
+                let clause = self.clauses.get(c);
+                (clause.lits[clause.watch[0]], clause.lits[clause.watch[1]])
+            };
+            self.unwatch(w0, c);
+            self.unwatch(w1, c);
+        }
         self.clauses.get_mut(c).lits = Arc::from([]);
     }
 
     fn unwatch(&mut self, lit: Lit, clause: ClauseRef) {
-        if let std::collections::hash_map::Entry::Occupied(mut entry) = self.watches.entry(lit.code()) {
-            entry.get_mut().retain(|&c| c != clause);
-            if entry.get().is_empty() {
-                entry.remove();
-            }
+        if let Some(list) = self.watches.get_mut(lit.code() as usize) {
+            list.retain(|&c| c != clause);
         }
+    }
+
+    fn add_watch(&mut self, lit: Lit, clause: ClauseRef) {
+        let idx = lit.code() as usize;
+        if idx >= self.watches.len() {
+            self.watches.resize_with(idx + 1, Vec::new);
+        }
+        self.watches[idx].push(clause);
+    }
+
+    fn remove_binary_implication(&mut self, from: Lit, implied: Lit, clause: ClauseRef) {
+        if let Some(list) = self.binary_implications.get_mut(from.code() as usize) {
+            list.retain(|&(other, cref)| other != implied || cref != clause);
+        }
+    }
+
+    fn add_binary_implication(&mut self, from: Lit, implied: Lit, clause: ClauseRef) {
+        let idx = from.code() as usize;
+        if idx >= self.binary_implications.len() {
+            self.binary_implications.resize_with(idx + 1, Vec::new);
+        }
+        self.binary_implications[idx].push((implied, clause));
     }
 
     /// Literal Block Distance: distinct decision levels among assigned literals.
@@ -503,6 +586,10 @@ impl<'s> Cdcl<'s> {
         stats.learned_lits = self.learned_lits;
         stats.vivified_clauses = self.vivified_clauses;
         stats.vivified_lits = self.vivified_lits;
+        stats.binary_clause_visits = self.binary_clause_visits;
+        stats.watched_clause_visits = self.watched_clause_visits;
+        stats.watched_literal_scans = self.watched_literal_scans;
+        stats.binary_implications = self.binary_implications_count;
     }
 
     /// Add a clause and watch two non-false literals when possible. Clauses with
@@ -512,6 +599,12 @@ impl<'s> Cdcl<'s> {
         self.add_shared_clause(Arc::from(lits), deletable, lbd)
     }
 
+    /// Add a derived clause that must be visible to proof logging.
+    pub(crate) fn add_derived_clause(&mut self, lits: Vec<Lit>, deletable: bool, lbd: u32) -> ClauseRef {
+        self.log_proof_clause(&lits);
+        self.add_clause(lits, deletable, lbd)
+    }
+
     /// Assert a non-deletable root unit and propagate it.
     pub(crate) fn assert_root_lit(&mut self, lit: Lit) -> bool {
         debug_assert_eq!(self.decision_level(), 0);
@@ -519,13 +612,26 @@ impl<'s> Cdcl<'s> {
         self.assign(lit, Reason::Clause(cref)).is_ok() && self.propagate_and_learn()
     }
 
+    /// Assert a derived root unit and expose it to proof logging.
+    pub(crate) fn assert_derived_root_lit(&mut self, lit: Lit) -> bool {
+        debug_assert_eq!(self.decision_level(), 0);
+        let cref = self.add_derived_clause(vec![lit], false, 0);
+        self.assign(lit, Reason::Clause(cref)).is_ok() && self.propagate_and_learn()
+    }
+
     fn add_shared_clause(&mut self, lits: Arc<[Lit]>, deletable: bool, lbd: u32) -> ClauseRef {
         let watch = self.initial_watches(&lits);
-        let (w0, w1) = if lits.len() >= 2 { (Some(lits[watch[0]]), Some(lits[watch[1]])) } else { (None, None) };
+        let (w0, w1) = if lits.len() >= 3 { (Some(lits[watch[0]]), Some(lits[watch[1]])) } else { (None, None) };
         let cref = self.clauses.add(lits, watch, deletable, lbd);
-        if let (Some(a), Some(b)) = (w0, w1) {
-            self.watches.entry(a.code()).or_default().push(cref);
-            self.watches.entry(b.code()).or_default().push(cref);
+        let clause = self.clauses.get(cref);
+        if clause.lits.len() == 2 {
+            let a = clause.lits[0];
+            let b = clause.lits[1];
+            self.add_binary_implication(a.negate(), b, cref);
+            self.add_binary_implication(b.negate(), a, cref);
+        } else if let (Some(a), Some(b)) = (w0, w1) {
+            self.add_watch(a, cref);
+            self.add_watch(b, cref);
         }
         if deletable {
             self.num_learned += 1;
@@ -777,9 +883,13 @@ impl<'s> Cdcl<'s> {
             }
             let q = self.trail[self.qhead];
             self.qhead += 1;
+            if let Some(c) = self.propagate_binary_implications(q) {
+                return Err(c);
+            }
             // Clauses watching `neg` (now false) may need a new watch or to fire.
             let neg = q.negate();
-            let mut ws = self.watches.remove(&neg.code()).unwrap_or_default();
+            let watch_idx = neg.code() as usize;
+            let mut ws = self.watches.get_mut(watch_idx).map(std::mem::take).unwrap_or_default();
             let mut keep = 0usize;
             let mut read = 0usize;
             let mut conflict: Option<ClauseRef> = None;
@@ -787,6 +897,7 @@ impl<'s> Cdcl<'s> {
             while read < ws.len() {
                 let cref = ws[read];
                 read += 1;
+                self.watched_clause_visits += 1;
                 let (slot, other) = {
                     let clause = self.clauses.get(cref);
                     if clause.lits[clause.watch[0]] == neg {
@@ -806,6 +917,7 @@ impl<'s> Cdcl<'s> {
                 {
                     let clause = self.clauses.get(cref);
                     for (k, &lit) in clause.lits.iter().enumerate() {
+                        self.watched_literal_scans += 1;
                         if k != clause.watch[0] && k != clause.watch[1] && self.tvalue(lit) != Tri::False {
                             new_watch = Some((k, lit));
                             break;
@@ -814,7 +926,7 @@ impl<'s> Cdcl<'s> {
                 }
                 if let Some((k, wl)) = new_watch {
                     self.clauses.get_mut(cref).watch[slot] = k;
-                    self.watches.entry(wl.code()).or_default().push(cref);
+                    self.add_watch(wl, cref);
                     continue;
                 }
                 // No replacement: the clause is unit on `other` (or a conflict).
@@ -832,14 +944,33 @@ impl<'s> Cdcl<'s> {
             }
 
             ws.truncate(keep);
-            if !ws.is_empty() {
-                self.watches.insert(neg.code(), ws);
+            if watch_idx >= self.watches.len() {
+                self.watches.resize_with(watch_idx + 1, Vec::new);
             }
+            self.watches[watch_idx] = ws;
             if let Some(c) = conflict {
                 return Err(c);
             }
         }
         Ok(())
+    }
+
+    fn propagate_binary_implications(&mut self, lit: Lit) -> Option<ClauseRef> {
+        let implications = self.binary_implications.get(lit.code() as usize).cloned().unwrap_or_default();
+        for (implied, cref) in implications {
+            self.binary_clause_visits += 1;
+            match self.tvalue(implied) {
+                Tri::True => {}
+                Tri::False => return Some(cref),
+                Tri::Unknown => {
+                    if self.assign(implied, Reason::Clause(cref)).is_err() {
+                        return Some(cref);
+                    }
+                    self.binary_implications_count += 1;
+                }
+            }
+        }
+        None
     }
 
     /// Propagate to a joint fixpoint of clause unit propagation and the FD
@@ -977,7 +1108,7 @@ impl<'s> Cdcl<'s> {
             let left = match self.probe_branch(decision, &mut added) {
                 ProbeOutcome::Consistent(branch) => branch,
                 ProbeOutcome::Failed => {
-                    if !self.assert_root_lit(decision.negate()) {
+                    if !self.assert_derived_root_lit(decision.negate()) {
                         return false;
                     }
                     continue;
@@ -990,14 +1121,15 @@ impl<'s> Cdcl<'s> {
             let right = match self.probe_branch(decision.negate(), &mut added) {
                 ProbeOutcome::Consistent(branch) => branch,
                 ProbeOutcome::Failed => {
-                    if !self.assert_root_lit(decision) {
+                    if !self.assert_derived_root_lit(decision) {
                         return false;
                     }
                     continue;
                 }
                 ProbeOutcome::RootUnsat => return false,
             };
-            if !self.assert_common_probe_lits(&left.lits, &right.lits) || !self.assert_common_probe_bounds(&left.domains, &right.domains) {
+            let bounds_ok = self.proof_logging_enabled() || self.assert_common_probe_bounds(&left.domains, &right.domains);
+            if !self.assert_common_probe_lits(&left.lits, &right.lits) || !bounds_ok {
                 return false;
             }
         }
@@ -1082,11 +1214,17 @@ impl<'s> Cdcl<'s> {
         }
         match (self.tvalue(guard), self.tvalue(implied)) {
             (Tri::False, Tri::False) => false,
-            (Tri::False, Tri::Unknown) => self.assert_root_lit(implied),
-            (Tri::Unknown, Tri::False) => self.assert_root_lit(guard),
+            (Tri::False, Tri::Unknown) => {
+                let cref = self.add_derived_clause(vec![guard, implied], true, 2);
+                self.assign(implied, Reason::Clause(cref)).is_ok() && self.propagate_and_learn()
+            }
+            (Tri::Unknown, Tri::False) => {
+                let cref = self.add_derived_clause(vec![guard, implied], true, 2);
+                self.assign(guard, Reason::Clause(cref)).is_ok() && self.propagate_and_learn()
+            }
             (Tri::Unknown, Tri::Unknown) => {
                 if added.insert((guard.code(), implied.code())) {
-                    self.add_clause(vec![guard, implied], true, 2);
+                    self.add_derived_clause(vec![guard, implied], true, 2);
                 }
                 true
             }
@@ -1106,7 +1244,7 @@ impl<'s> Cdcl<'s> {
                     self.sync_var(self.atoms.var_of(lit.atom()));
                     match self.tvalue(lit) {
                         Tri::True => {}
-                        Tri::Unknown if self.assert_root_lit(lit) => {}
+                        Tri::Unknown if self.assert_derived_root_lit(lit) => {}
                         Tri::Unknown | Tri::False => return false,
                     }
                     i += 1;
@@ -1277,8 +1415,10 @@ impl<'s> Cdcl<'s> {
     pub(crate) fn resolve_conflict(&mut self, conflict: Conflict) -> bool {
         self.conflicts += 1;
         let Some(mut learnt) = self.analyze(conflict) else {
+            self.log_proof_clause(&[]);
             return false;
         };
+        self.minimize_learnt(&mut learnt);
         self.vivify_learned(&mut learnt);
         // Backjump level recomputed here: vivification may have shortened the clause.
         let btlevel = learnt[1..].iter().map(|l| self.level_of(l.atom()) as usize).max().unwrap_or(0);
@@ -1287,6 +1427,7 @@ impl<'s> Cdcl<'s> {
         let lbd = self.lbd_of(&learnt);
         self.restart.on_conflict(self.conflicts, lbd);
         let deletable = learnt.len() >= 2;
+        self.log_proof_clause(&learnt);
         let learnt: Arc<[Lit]> = Arc::from(learnt);
         if let Some(sharing) = &self.clause_sharing {
             if self.cube_scope.is_empty() && self.bound_scope.is_none() {
@@ -1364,6 +1505,58 @@ impl<'s> Cdcl<'s> {
         }
         self.decay_activity();
         Some(learnt)
+    }
+
+    /// Recursively minimize a learned clause using the implication graph.
+    ///
+    /// A non-asserting literal `q` is redundant when the reason for the assigned
+    /// literal `not q` only depends on level-0 facts, literals already present in
+    /// the learned clause, or other recursively redundant literals.
+    fn minimize_learnt(&self, learnt: &mut Vec<Lit>) {
+        if learnt.len() < 3 || learnt.len() > MINIMIZE_LEARNT_MAX_LEN {
+            return;
+        }
+        let mut base_seen = vec![false; self.seen.len()];
+        for &lit in learnt.iter() {
+            base_seen[lit.atom() as usize] = true;
+        }
+
+        let mut i = 1;
+        while i < learnt.len() {
+            let mut seen = base_seen.clone();
+            if self.learnt_lit_redundant(learnt[i], &mut seen) {
+                base_seen[learnt[i].atom() as usize] = false;
+                learnt.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn learnt_lit_redundant(&self, lit: Lit, seen: &mut [bool]) -> bool {
+        let assigned = lit.negate();
+        if matches!(self.reason_of(assigned.atom()), Reason::Decision | Reason::Fact | Reason::Unset) {
+            return false;
+        }
+        let antecedents = self.reason_lits(assigned);
+        if antecedents.is_empty() {
+            return false;
+        }
+        for antecedent in antecedents {
+            let atom = antecedent.atom() as usize;
+            match self.level_of(antecedent.atom()) {
+                0 => continue,
+                UNSET => return false,
+                _ if seen.get(atom).copied().unwrap_or(false) => continue,
+                _ => {
+                    seen[atom] = true;
+                    if !self.learnt_lit_redundant(antecedent, seen) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Bump a variable's VSIDS activity, rescaling all if it overflows.

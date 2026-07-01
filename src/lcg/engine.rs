@@ -526,6 +526,9 @@ impl Cdcl<'_> {
             self.copy_inprocessing_stats(&mut stats);
             return (None, stats, true);
         }
+        if self.initial_phase.len() == self.solver.store.num_vars() {
+            self.saved_phase = self.initial_phase.clone();
+        }
         let mut complete = true;
         let solution = loop {
             if stop.load(Ordering::Relaxed) {

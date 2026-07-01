@@ -1108,9 +1108,8 @@ mod tests {
         // reverse member -> succ channel.
         let coords: [(i64, i64); 9] = [(0, 0), (1, 1), (2, 5), (5, 2), (6, 6), (2, 2), (7, 1), (3, 7), (8, 5)];
         let n = coords.len();
-        let dist: Vec<Vec<i64>> = (0..n)
-            .map(|i| (0..n).map(|j| (coords[i].0 - coords[j].0).abs() + (coords[i].1 - coords[j].1).abs()).collect())
-            .collect();
+        let dist: Vec<Vec<i64>> =
+            (0..n).map(|i| (0..n).map(|j| (coords[i].0 - coords[j].0).abs() + (coords[i].1 - coords[j].1).abs()).collect()).collect();
         let items: Vec<i32> = (1..n as i32).collect();
         let dist_arc = Arc::new(dist);
         let demand_arc = Arc::new(vec![1i64; n]);
