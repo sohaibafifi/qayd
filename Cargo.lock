@@ -233,6 +233,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "qayd-pb"
+version = "0.9.0"
+dependencies = [
+ "ctrlc",
+ "libc",
+ "qayd",
+]
+
+[[package]]
 name = "qayd-sat"
 version = "0.9.0"
 dependencies = [
