@@ -9,4 +9,6 @@ name = "qayd-sat"
 path = "src/main.rs"
 
 [dependencies]
+ctrlc = "3.5.2"
+libc = "0.2"
 qayd = { path = "../.." }
