@@ -561,16 +561,28 @@ fn candidate_cross_exchange(per: &PerList, state: &State, a: (usize, usize, usiz
     }
 }
 
-/// First-improvement local move: return the first relocate / swap / segment
-/// reversal that strictly lowers the score, or `None` at a local optimum (or
-/// when `stop` fires). Each candidate is scored in O(1) against the cached base
-/// totals and built into a reused scratch buffer, so no allocation happens per
-/// candidate. `stop` is polled per candidate (inside the innermost loops) so
-/// even an unbalanced state with very long lists honours the time limit.
+/// First-improvement local move: return the first relocate / swap / or-opt /
+/// 2-opt* / cross-exchange / reversal that strictly lowers the score, or `None`
+/// at a local optimum (or when `stop` fires). The neighbourhood is scanned one
+/// source route at a time: a route whose *entire* neighbourhood yields no
+/// improvement is marked inactive (don't-look bit) and skipped until a later
+/// applied move touches it again, so settled routes are not re-scanned every
+/// pass. Each candidate is scored in O(1) against the cached base totals and
+/// built into a reused scratch buffer, so no allocation happens per candidate.
+/// `stop` is polled per candidate so even very long lists honour the time limit.
 pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBool, memory: &mut SearchMemory) -> Option<Move> {
     let base = base_totals(&state.scores);
     let current = full_score(per, state);
+    // Repair-capable moves (relocate / or-opt insert filters) only prune by the
+    // geometric candidate lists once feasible: while a route still overflows, the
+    // repair destination may not be a geometric neighbour, so they need the full
+    // neighbourhood. Cost-refiner moves (2-opt* / cross / reverse) are the
+    // O(k²·len^…) cost of a pass and never the *only* way to repair load (plain
+    // relocate is a complete membership neighbourhood), so they prune by
+    // candidates even while infeasible - that is what lets an infeasible-heavy
+    // instance afford enough passes to reach feasibility.
     let use_candidates = per.has_edges && current.violation == 0 && per.candidates.is_some();
+    let cand_cost = if per.infeas_cand { per.has_edges && per.candidates.is_some() } else { use_candidates };
     let gviol = state.global_viol;
     let k = state.lists.len();
     let mut a = Vec::new();
@@ -585,7 +597,18 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
     // trial score, so cross-list constraints steer the search too.
     let with_global = |s: Score, gdelta: i64| Score { violation: s.violation.saturating_add(gviol).saturating_add(gdelta), tiers: s.tiers };
 
+    // Scan one source route at a time so a settled route can be skipped wholesale
+    // via its don't-look bit. A route is marked inactive only once its *entire*
+    // neighbourhood (relocate, swap, and for routing: or-opt, 2-opt*, cross,
+    // reverse, all originating from it) yields no improving move. Pair moves are
+    // scanned from both endpoints, so a pair (src, y) is still examined when src
+    // is active even if y is inactive; the redundant active/active double-scan is
+    // bounded because relocate returns early while the search is still dense.
     for src in 0..k {
+        if memory.skip(src) {
+            continue;
+        }
+        // --- Relocate a single item out of `src`. ---
         for src_pos in 0..state.lists[src].len() {
             let item = state.lists[src][src_pos];
             for dst in 0..k {
@@ -622,30 +645,29 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                 }
             }
         }
-    }
-    for x in 0..k {
-        for y in (x + 1)..k {
-            for xp in 0..state.lists[x].len() {
+        // --- Swap one item of `src` with one item of another route. ---
+        for y in 0..k {
+            if y == src {
+                continue;
+            }
+            for xp in 0..state.lists[src].len() {
                 for yp in 0..state.lists[y].len() {
                     if stopped() {
                         return None;
                     }
-                    let (vx, vy) = (state.lists[x][xp], state.lists[y][yp]);
-                    let na = trial_list_score(per, state, x, Edit::Replace { pos: xp, item: vy }, &mut a);
+                    let (vx, vy) = (state.lists[src][xp], state.lists[y][yp]);
+                    let na = trial_list_score(per, state, src, Edit::Replace { pos: xp, item: vy }, &mut a);
                     let nb = trial_list_score(per, state, y, Edit::Replace { pos: yp, item: vx }, &mut b);
-                    let gd = per.globals.delta(&state.item_list, &[(vx, y), (vy, x)]);
-                    if with_global(delta_two(per, base, &state.scores, x, na, y, nb), gd) < current {
-                        return Some(Move::Swap { a: x, a_pos: xp, b: y, b_pos: yp });
+                    let gd = per.globals.delta(&state.item_list, &[(vx, y), (vy, src)]);
+                    if with_global(delta_two(per, base, &state.scores, src, na, y, nb), gd) < current {
+                        return Some(Move::Swap { a: src, a_pos: xp, b: y, b_pos: yp });
                     }
                 }
             }
         }
-    }
-    if per.has_edges {
-        for src in 0..k {
-            if memory.skip(src) {
-                continue;
-            }
+        // --- Routing moves originating from `src` (need edge costs). ---
+        if per.has_edges {
+            // Or-opt: relocate a 2..=MAX_OR_OPT segment of `src`.
             let src_len = state.lists[src].len();
             for len in 2..=MAX_OR_OPT.min(src_len) {
                 for start in 0..=src_len - len {
@@ -688,11 +710,12 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                     }
                 }
             }
-            memory.mark_inactive(src);
-        }
-        for x in 0..k {
-            for y in (x + 1)..k {
-                let lx = state.lists[x].len();
+            // 2-opt*: swap the tails of `src` and another route.
+            for y in 0..k {
+                if y == src {
+                    continue;
+                }
+                let lx = state.lists[src].len();
                 let ly = state.lists[y].len();
                 for cut_x in 0..=lx {
                     for cut_y in 0..=ly {
@@ -702,26 +725,28 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                         if stopped() {
                             return None;
                         }
-                        if use_candidates && !candidate_two_opt_star(per, state, x, cut_x, y, cut_y) {
+                        if cand_cost && !candidate_two_opt_star(per, state, src, cut_x, y, cut_y) {
                             continue;
                         }
-                        build_two_opt_star(&mut a, &mut b, &state.lists[x], cut_x, &state.lists[y], cut_y);
-                        let na = list_score(per, x, &a);
+                        build_two_opt_star(&mut a, &mut b, &state.lists[src], cut_x, &state.lists[y], cut_y);
+                        let na = list_score(per, src, &a);
                         let nb = list_score(per, y, &b);
                         overrides.clear();
-                        overrides.extend(state.lists[x][cut_x..].iter().map(|&item| (item, y)));
-                        overrides.extend(state.lists[y][cut_y..].iter().map(|&item| (item, x)));
+                        overrides.extend(state.lists[src][cut_x..].iter().map(|&item| (item, y)));
+                        overrides.extend(state.lists[y][cut_y..].iter().map(|&item| (item, src)));
                         let gd = per.globals.delta(&state.item_list, &overrides);
-                        if with_global(delta_two(per, base, &state.scores, x, na, y, nb), gd) < current {
-                            return Some(Move::TwoOptStar { a: x, cut_a: cut_x, b: y, cut_b: cut_y });
+                        if with_global(delta_two(per, base, &state.scores, src, na, y, nb), gd) < current {
+                            return Some(Move::TwoOptStar { a: src, cut_a: cut_x, b: y, cut_b: cut_y });
                         }
                     }
                 }
             }
-        }
-        for x in 0..k {
-            for y in (x + 1)..k {
-                let lx = state.lists[x].len();
+            // Cross-exchange: swap a segment of `src` with a segment of another route.
+            for y in 0..k {
+                if y == src {
+                    continue;
+                }
+                let lx = state.lists[src].len();
                 let ly = state.lists[y].len();
                 for len_x in 1..=MAX_OR_OPT.min(lx) {
                     for start_x in 0..=lx - len_x {
@@ -733,19 +758,19 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                                 if stopped() {
                                     return None;
                                 }
-                                if use_candidates && !candidate_cross_exchange(per, state, (x, start_x, len_x), (y, start_y, len_y)) {
+                                if cand_cost && !candidate_cross_exchange(per, state, (src, start_x, len_x), (y, start_y, len_y)) {
                                     continue;
                                 }
-                                build_cross_exchange(&mut a, &mut b, (&state.lists[x], start_x, len_x), (&state.lists[y], start_y, len_y));
-                                let na = list_score(per, x, &a);
+                                build_cross_exchange(&mut a, &mut b, (&state.lists[src], start_x, len_x), (&state.lists[y], start_y, len_y));
+                                let na = list_score(per, src, &a);
                                 let nb = list_score(per, y, &b);
                                 overrides.clear();
-                                overrides.extend(state.lists[x][start_x..start_x + len_x].iter().map(|&item| (item, y)));
-                                overrides.extend(state.lists[y][start_y..start_y + len_y].iter().map(|&item| (item, x)));
+                                overrides.extend(state.lists[src][start_x..start_x + len_x].iter().map(|&item| (item, y)));
+                                overrides.extend(state.lists[y][start_y..start_y + len_y].iter().map(|&item| (item, src)));
                                 let gd = per.globals.delta(&state.item_list, &overrides);
-                                if with_global(delta_two(per, base, &state.scores, x, na, y, nb), gd) < current {
+                                if with_global(delta_two(per, base, &state.scores, src, na, y, nb), gd) < current {
                                     return Some(Move::CrossExchange {
-                                        a: x,
+                                        a: src,
                                         start_a: start_x,
                                         len_a: len_x,
                                         b: y,
@@ -758,29 +783,29 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                     }
                 }
             }
-        }
-    }
-    for list in 0..k {
-        let len = state.lists[list].len();
-        for i in 0..len {
-            for j in (i + 1)..len {
-                if stopped() {
-                    return None;
-                }
-                if use_candidates {
-                    let Some((before, after)) = route_before_after(per, state, list, i, j + 1 - i) else {
-                        continue;
-                    };
-                    if !candidate_edge(per, before, state.lists[list][j]) && !candidate_edge(per, state.lists[list][i], after) {
-                        continue;
+            // 2-opt: reverse a segment within `src`.
+            let len = state.lists[src].len();
+            for i in 0..len {
+                for j in (i + 1)..len {
+                    if stopped() {
+                        return None;
                     }
-                }
-                let nl = trial_list_score(per, state, list, Edit::Reverse { i, j }, &mut a);
-                if with_global(delta_one(per, base, &state.scores, list, nl), 0) < current {
-                    return Some(Move::Reverse { list, i, j });
+                    if cand_cost {
+                        let Some((before, after)) = route_before_after(per, state, src, i, j + 1 - i) else {
+                            continue;
+                        };
+                        if !candidate_edge(per, before, state.lists[src][j]) && !candidate_edge(per, state.lists[src][i], after) {
+                            continue;
+                        }
+                    }
+                    let nl = trial_list_score(per, state, src, Edit::Reverse { i, j }, &mut a);
+                    if with_global(delta_one(per, base, &state.scores, src, nl), 0) < current {
+                        return Some(Move::Reverse { list: src, i, j });
+                    }
                 }
             }
         }
+        memory.mark_inactive(src);
     }
     None
 }

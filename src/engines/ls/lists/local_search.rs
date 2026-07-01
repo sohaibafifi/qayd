@@ -5,7 +5,7 @@
 //! shared Rust model and backend classifier first, then teach this heuristic to
 //! search it as a fallback or incumbent generator.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -117,6 +117,11 @@ pub(super) struct PerList {
     /// Nearest-neighbor candidate edges for routing moves, when a direct matrix
     /// edge objective is available.
     pub(super) candidates: Option<CandidateNeighbors>,
+    /// Whether cost-refiner moves (2-opt* / cross / reverse) may prune by the
+    /// geometric candidate lists even while a route still overflows. On by
+    /// default (lets an infeasible-heavy instance afford more passes); set
+    /// `QAYD_LS_INFEAS_CAND=0` to revert to the conservative feasible-only gate.
+    pub(super) infeas_cand: bool,
 }
 
 pub(super) struct CandidateNeighbors {
@@ -179,6 +184,12 @@ impl CandidateNeighbors {
 
     pub(super) fn contains(&self, a: i32, b: i32) -> bool {
         self.map.get(&a).is_some_and(|near| near.contains(&b)) || self.map.get(&b).is_some_and(|near| near.contains(&a))
+    }
+
+    /// The nearest neighbour of `from` (by edge cost) that is currently present and
+    /// not already removed -- the relatedness ranking used by Shaw removal.
+    pub(super) fn nearest_present(&self, from: i32, removed: &HashSet<i32>, present: &HashSet<i32>) -> Option<i32> {
+        self.map.get(&from)?.iter().copied().find(|to| present.contains(to) && !removed.contains(to))
     }
 }
 
@@ -302,6 +313,7 @@ impl PerList {
             has_edges,
             route_bounds,
             candidates: candidate_matrix.flatten().and_then(|matrix| CandidateNeighbors::build(model, matrix)),
+            infeas_cand: std::env::var("QAYD_LS_INFEAS_CAND").as_deref() != Ok("0"),
         }
     }
 }
@@ -557,6 +569,47 @@ fn destroy_route_segments(lists: &mut [Vec<i32>], target: usize, seed: u64) -> V
     removed
 }
 
+/// Shaw removal: grow a cluster of *related* (here: nearby) customers. Seed with a
+/// random customer, then repeatedly remove the nearest still-present customer to a
+/// random already-removed one. Removing a related cluster (vs scattered random
+/// nodes) gives the repair room to re-route a whole neighbourhood.
+fn destroy_shaw(lists: &mut [Vec<i32>], candidates: &CandidateNeighbors, target: usize, seed: u64) -> Vec<i32> {
+    let present: HashSet<i32> = lists.iter().flatten().copied().collect();
+    if present.is_empty() {
+        return Vec::new();
+    }
+    let all: Vec<i32> = lists.iter().flatten().copied().collect();
+    let mut removed_set: HashSet<i32> = HashSet::with_capacity(target);
+    let mut order = Vec::with_capacity(target);
+    let seed_c = all[(mix64(seed) % all.len() as u64) as usize];
+    removed_set.insert(seed_c);
+    order.push(seed_c);
+    let mut step = 0u64;
+    while removed_set.len() < target && removed_set.len() < present.len() {
+        let pivot = order[(mix64(seed ^ mix64(step)) % order.len() as u64) as usize];
+        let next = candidates
+            .nearest_present(pivot, &removed_set, &present)
+            .or_else(|| all.iter().copied().find(|c| !removed_set.contains(c)));
+        let Some(next) = next else { break };
+        removed_set.insert(next);
+        order.push(next);
+        step = step.wrapping_add(1);
+    }
+    let mut removed = Vec::with_capacity(removed_set.len());
+    for list in lists.iter_mut() {
+        list.retain(|c| {
+            if removed_set.contains(c) {
+                removed.push(*c);
+                false
+            } else {
+                true
+            }
+        });
+    }
+    shuffle_values(&mut removed, seed ^ 0xD1B5_4A32_D192_ED03);
+    removed
+}
+
 fn repair_lns(per: &PerList, state: &mut State, removed: &[i32], seed: u64, stop: &AtomicBool) -> bool {
     let mut scratch = Vec::new();
     let mut polled = 0u32;
@@ -586,6 +639,80 @@ fn repair_lns(per: &PerList, state: &mut State, removed: &[i32], seed: u64, stop
         let Some((_, _, list, pos, score)) = best else {
             return false;
         };
+        state.lists[list].insert(pos, item);
+        state.scores[list] = score;
+        state.con_vals[list] = compute_con_vals(per, list, &state.lists[list]);
+        state.set_item_list(per, item, list);
+        state.global_viol = per.globals.total(&state.item_list);
+    }
+    true
+}
+
+/// Flatten a lexicographic [`Score`] into a single comparable cost for regret
+/// arithmetic: violation dominates (feasibility first), then the primary
+/// objective tier. Exact for the routing case (one tier); a heuristic ordering
+/// for multi-tier models, which is fine since regret only *orders* insertions.
+fn score_scalar(score: &Score) -> i128 {
+    (score.violation as i128) * (1i128 << 50) + score.tiers[0] as i128
+}
+
+/// Regret-`k` insertion: repeatedly place the removed item that would "regret"
+/// most if deferred -- the one whose cheapest insertion is far better than its
+/// next-best `k-1` alternatives, i.e. the item with the fewest good homes left.
+/// Items with fewer than `k` feasible spots get an inflated regret so they are
+/// placed while options remain. Stronger than greedy cheapest-insertion (which
+/// ignores the competition for each slot) at O(pending² · positions) cost, which
+/// is bounded because `removed` is a small fraction of the instance.
+fn repair_regret(per: &PerList, state: &mut State, removed: &[i32], k: usize, seed: u64, stop: &AtomicBool) -> bool {
+    let mut pending: Vec<i32> = removed.to_vec();
+    let mut scratch = Vec::new();
+    let mut polled = 0u32;
+    while !pending.is_empty() {
+        // The pending item with the largest regret, and its best placement.
+        let mut choice: Option<(usize, i128, u64, usize, usize, ListScore)> = None;
+        for (idx, &item) in pending.iter().enumerate() {
+            let mut topk: Vec<i128> = Vec::with_capacity(k + 1);
+            let mut best_place: Option<(i128, u64, usize, usize, ListScore)> = None;
+            for list in 0..state.lists.len() {
+                for pos in 0..=state.lists[list].len() {
+                    polled = polled.wrapping_add(1);
+                    if polled.is_multiple_of(1024) && stop.load(Ordering::Relaxed) {
+                        return false;
+                    }
+                    scratch.clear();
+                    scratch.extend_from_slice(&state.lists[list]);
+                    scratch.insert(pos, item);
+                    let next = list_score(per, list, &scratch);
+                    let global_delta = per.globals.delta(&state.item_list, &[(item, list)]);
+                    let cost = score_scalar(&score_with_replaced_list(per, state, list, next, global_delta));
+                    let tie = mix64(seed ^ (item as i64 as u64) ^ ((list as u64) << 32) ^ pos as u64);
+                    let ins = topk.partition_point(|&c| c <= cost);
+                    if ins < k {
+                        topk.insert(ins, cost);
+                        topk.truncate(k);
+                    }
+                    if best_place.as_ref().is_none_or(|&(bc, bt, _, _, _)| cost < bc || (cost == bc && tie < bt)) {
+                        best_place = Some((cost, tie, list, pos, next));
+                    }
+                }
+            }
+            let Some((bcost, btie, blist, bpos, bscore)) = best_place else {
+                return false; // nowhere to put this item -> repair fails
+            };
+            // Sum of (i-th best - best) over the next k-1 homes; a missing
+            // alternative is charged a large penalty so scarce-option items win.
+            const MISS: i128 = 1 << 60;
+            let mut regret: i128 = 0;
+            for i in 1..k {
+                let c = topk.get(i).copied().unwrap_or(bcost + MISS);
+                regret = regret.saturating_add(c - bcost);
+            }
+            if choice.as_ref().is_none_or(|&(_, r, t, _, _, _)| regret > r || (regret == r && btie < t)) {
+                choice = Some((idx, regret, btie, blist, bpos, bscore));
+            }
+        }
+        let (idx, _, _, list, pos, score) = choice.expect("pending is non-empty");
+        let item = pending.swap_remove(idx);
         state.lists[list].insert(pos, item);
         state.scores[list] = score;
         state.con_vals[list] = compute_con_vals(per, list, &state.lists[list]);
@@ -630,13 +757,25 @@ fn routing_lns(
     let destroy_pct = (12 + pressure + jitter).min(45);
     let target = (total * destroy_pct).div_ceil(100).clamp(1, total);
     let mut lists = incumbent.to_vec();
-    let removed = destroy_route_segments(&mut lists, target, seed);
+    // Shaw removal when a candidate (edge-distance) structure is available, else
+    // fall back to random segment destroy. `QAYD_ROUTING_SHAW=0` forces random.
+    let removed = match &per.candidates {
+        Some(candidates) if std::env::var("QAYD_ROUTING_SHAW").as_deref() != Ok("0") => destroy_shaw(&mut lists, candidates, target, seed),
+        _ => destroy_route_segments(&mut lists, target, seed),
+    };
     if removed.is_empty() {
         return None;
     }
 
     let mut state = State::from_lists(model, per, lists);
-    if !repair_lns(per, &mut state, &removed, seed ^ 0xA076_1D64_78BD_642F, stop) {
+    // Regret-k repair when `QAYD_ROUTING_REGRET=k` (k>=2); otherwise greedy
+    // cheapest-insertion. Regret looks ahead at the competition for each slot.
+    let repair_seed = seed ^ 0xA076_1D64_78BD_642F;
+    let repaired = match std::env::var("QAYD_ROUTING_REGRET").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(k) if k >= 2 => repair_regret(per, &mut state, &removed, k, repair_seed, stop),
+        _ => repair_lns(per, &mut state, &removed, repair_seed, stop),
+    };
+    if !repaired {
         return None;
     }
     state = State::from_lists(model, per, state.lists);
@@ -651,7 +790,13 @@ fn routing_lns(
 /// `report` is called with the objective each time a strictly better *feasible*
 /// incumbent is found, for progress output; pass `&mut |_| {}` to ignore it.
 pub fn solve_collection(model: &CollectionModel, seed: u64, stop: &AtomicBool, report: &mut dyn FnMut(i64)) -> CollectionSolution {
-    solve_collection_capped(model, seed, stop, u64::MAX, report)
+    // `QAYD_LS_MAX_ITERS` caps the local-search iterations for *deterministic,
+    // machine-load-independent* benchmarking: with a large time limit the
+    // iteration count (not the wall clock) becomes the binding budget, so the
+    // exact same trajectory runs every time regardless of host speed. Unset in
+    // normal use (the wall-clock stop flag is the only budget).
+    let max_iters = std::env::var("QAYD_LS_MAX_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX);
+    solve_collection_capped(model, seed, stop, max_iters, report)
 }
 
 /// Like [`solve_collection`], but stops after at most `max_iters` local-search
@@ -702,6 +847,16 @@ pub fn solve_collection_capped(
     const ROUTING_LNS_AFTER: u64 = 8;
     let mut since_improve = 0u64;
     let mut iter = 0u64;
+    // When eager (default), a non-improving LNS pass does NOT reset the stuck
+    // counter, so LNS keeps firing every local optimum in [8, 25) and the GRASP
+    // restart can still eventually trigger; `QAYD_LS_LNS_EAGER=0` restores the
+    // original "reset on any LNS pass" behaviour (LNS fires once per stuck cycle).
+    let lns_eager = std::env::var("QAYD_LS_LNS_EAGER").as_deref() != Ok("0");
+    // Env-gated (`QAYD_LS_DEBUG`) diagnostics: how often the search reaches a
+    // local optimum, and how the perturbation budget splits across LNS / restart
+    // / kick. Zero runtime cost when the counters are optimised out of the hot
+    // path; printed once at loop exit.
+    let (mut local_optima, mut lns_calls, mut lns_ok, mut restarts, mut kicks) = (0u64, 0u64, 0u64, 0u64, 0u64);
 
     while !stop.load(Ordering::Relaxed) && iter < max_iters {
         iter += 1;
@@ -717,28 +872,40 @@ pub fn solve_collection_capped(
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
+                local_optima += 1;
                 if record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report) {
                     since_improve = 0;
                 } else {
                     since_improve += 1;
                 }
                 if best_feasible && since_improve >= ROUTING_LNS_AFTER {
+                    lns_calls += 1;
                     if let Some(candidate) =
                         routing_lns(model, &per, &best_lists, seed ^ mix64(iter) ^ mix64(since_improve), since_improve, stop)
                     {
-                        record_state(&per, &candidate, &mut best_lists, &mut best_score, &mut best_feasible, report);
+                        lns_ok += 1;
+                        // Eager: reset the stuck counter ONLY when the LNS actually
+                        // improved the incumbent, so a run of non-improving passes lets
+                        // `since_improve` climb toward `RESTART_AFTER` instead of pinning
+                        // it below and starving the GRASP restart. Non-eager: reset on
+                        // any LNS pass (original behaviour, one LNS per stuck cycle).
+                        let improved = record_state(&per, &candidate, &mut best_lists, &mut best_score, &mut best_feasible, report);
+                        if improved || !lns_eager {
+                            since_improve = 0;
+                        }
                         state = candidate;
                         memory.reset_all();
-                        since_improve = 0;
                         continue;
                     }
                 }
                 if since_improve >= RESTART_AFTER {
+                    restarts += 1;
                     shuffle(&mut order, seed ^ mix64(iter));
                     state = State::greedy(model, &per, &order);
                     memory.reset_all();
                     since_improve = 0;
                 } else {
+                    kicks += 1;
                     let strength = 1 + (since_improve / 5) as usize;
                     random_kick(&per, &mut state, seed ^ mix64(iter), strength);
                     memory.reset_all();
@@ -748,6 +915,12 @@ pub fn solve_collection_capped(
     }
 
     record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report);
+
+    if std::env::var("QAYD_LS_DEBUG").is_ok() {
+        eprintln!(
+            "LS: iters={iter} local_optima={local_optima} lns_calls={lns_calls} lns_ok={lns_ok} restarts={restarts} kicks={kicks}"
+        );
+    }
 
     // Report the objective values from the same score that drove the search, so
     // they can never disagree with the accepted solution. When infeasible they
