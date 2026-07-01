@@ -21,4 +21,4 @@ dependencies = [
 [tool.maturin]
 features = ["python"]
 module-name = "qayd._core"
-python-source = "python"
+python-source = "frontends/python"
