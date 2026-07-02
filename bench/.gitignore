@@ -1,0 +1,8 @@
+# Downloaded benchmarks, run outputs, and baseline jars are large / reproducible.
+*/instances/
+*/results/
+solvers/*.jar
+
+# Python caches
+__pycache__/
+*.pyc
