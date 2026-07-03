@@ -16,7 +16,7 @@ use crate::engines::ls::cop::{solve_ls, LocalSearchOutcome, LocalSearchSpec, LsC
 use crate::ids::VarId;
 use crate::parallel::{normalize_options, solve_cop, solve_csp, worker_roles, CspOutcome, ParallelOutcome};
 use crate::problem::{Objective, Problem};
-use crate::search::{decide_sat_seeded, optimize_seeded, SolveStats};
+use crate::search::{decide_sat_seeded, find_one_seeded, optimize_seeded, SolveStats};
 
 pub use crate::parallel::{Mode, RunOptions};
 
@@ -268,7 +268,7 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
         writeln!(w, "c seed {}", options.seed).map_err(io_err)?;
         writeln!(w, "c workers {} ({})", options.workers, worker_roles(has_objective, options)).map_err(io_err)?;
         if !has_objective {
-            writeln!(w, "c csp learning true").map_err(io_err)?;
+            writeln!(w, "c csp learning {}", !options.no_learn_csp).map_err(io_err)?;
         }
         writeln!(w, "c split {}", options.split).map_err(io_err)?;
         if presolve.failed {
@@ -437,11 +437,16 @@ fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w
 
     match problem.objective {
         None => {
-            // Find-one CSP always learns: CDCL with restarts and root probing
+            // Find-one CSP learns by default: CDCL with restarts and root probing
             // dominates plain chronological DFS, and never enumerates, so the
             // soundness caveat on learned blocking clauses does not apply here.
             // (Enumeration/counting uses the separate non-learning `enumerate`.)
-            let (sol, stats, complete) = decide_sat_seeded(&mut solver, &vars, stop, options.seed);
+            // `--no-learn-csp` opts out to the non-learning DFS driver for ablation.
+            let (sol, stats, complete) = if options.no_learn_csp {
+                find_one_seeded(&mut solver, &vars, stop, options.seed)
+            } else {
+                decide_sat_seeded(&mut solver, &vars, stop, options.seed)
+            };
             if verbose {
                 writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(io_err)?;
                 write_inprocessing_stats(w, stats).map_err(io_err)?;

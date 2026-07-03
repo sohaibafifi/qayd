@@ -43,8 +43,10 @@ pub struct RunOptions {
     pub probes: usize,
     /// Number of workers dedicated to incumbent-driven LNS.
     pub lns: usize,
-    /// Use CDCL learning for CSP find-one/UNSAT solving.
-    pub learn_csp: bool,
+    /// Ablation opt-out: disable CDCL learning for CSP find-one/UNSAT solving,
+    /// routing every worker to the chronological-DFS driver. Learning is on by
+    /// default; plain DFS wins only on highly symmetric models.
+    pub no_learn_csp: bool,
 }
 
 impl RunOptions {
@@ -56,7 +58,7 @@ impl RunOptions {
 
 impl Default for RunOptions {
     fn default() -> Self {
-        Self { seed: 0, workers: 1, mode: Mode::Default, split: false, probes: 0, lns: 0, learn_csp: false }
+        Self { seed: 0, workers: 1, mode: Mode::Default, split: false, probes: 0, lns: 0, no_learn_csp: false }
     }
 }
 
@@ -81,7 +83,7 @@ pub(crate) fn normalize_options(has_objective: bool, var_objective: bool, option
         return RunOptions { workers, split: false, probes: 0, lns: 0, ..options };
     }
     if options.local_search() {
-        return RunOptions { workers, split: false, probes: 0, lns: 0, learn_csp: false, ..options };
+        return RunOptions { workers, split: false, probes: 0, lns: 0, ..options };
     }
     if workers == 1 {
         return RunOptions { workers, split: false, probes: 0, lns: 0, ..options };
@@ -556,8 +558,9 @@ pub(crate) fn solve_csp(problem: Problem, stop: &AtomicBool, options: RunOptions
                 let seed = options.seed.wrapping_add(worker as u64);
                 let mut solver = model.solver;
                 let vars = &model.search;
-                let (solution, worker_stats, complete) = if worker == 0 {
-                    // Strategy diversity: a non-learning DFS worker.
+                let (solution, worker_stats, complete) = if worker == 0 || options.no_learn_csp {
+                    // Strategy diversity: a non-learning DFS worker. `--no-learn-csp`
+                    // turns the whole portfolio into this ablation.
                     find_one_seeded(&mut solver, vars, &shared.cancel, seed)
                 } else {
                     let sharing = ClauseSharing::new(Arc::clone(&shared.clauses), worker);

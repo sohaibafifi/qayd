@@ -75,9 +75,19 @@ def main():
     only_a = only_b = both = neither = 0
     for i in common:
         sa, sb = A[i]["status"], B[i]["status"]
+        oaj, obj = A[i]["obj"], B[i]["obj"]
+        d = A[i]["dir"] if A[i]["dir"] != "?" else B[i]["dir"]
         hard = {"SAT", "OPTIMUM"}
         if (sa in hard and sb == "UNSAT") or (sb in hard and sa == "UNSAT"):
             contradictions.append((i, sa, sb))
+        elif sa == "OPTIMUM" and sb == "OPTIMUM" and oaj is not None and obj is not None and oaj != obj:
+            # both claim provable optimum but disagree -> one is unsound
+            contradictions.append((i, f"OPTIMUM={oaj}", f"OPTIMUM={obj}"))
+        elif d != "?" and sa == "OPTIMUM" and sb == "SAT" and better(obj, oaj, d) == 1:
+            # b has a feasible solution strictly better than a's claimed optimum
+            contradictions.append((i, f"OPTIMUM={oaj}", f"SAT={obj}"))
+        elif d != "?" and sb == "OPTIMUM" and sa == "SAT" and better(oaj, obj, d) == 1:
+            contradictions.append((i, f"SAT={oaj}", f"OPTIMUM={obj}"))
         oa, ob = A[i]["status"] in SOLVED, B[i]["status"] in SOLVED
         both += oa and ob
         only_a += oa and not ob

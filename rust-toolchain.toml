@@ -1,3 +1,5 @@
 [toolchain]
-channel = "nightly"
+# Pinned stable: nothing in the workspace needs nightly to compile.
+# rustfmt.toml uses unstable options, so format with `cargo +nightly fmt`.
+channel = "1.92.0"
 components = ["rustfmt", "clippy"]

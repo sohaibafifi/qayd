@@ -1422,6 +1422,13 @@ impl<'s> Cdcl<'s> {
         self.vivify_learned(&mut learnt);
         // Backjump level recomputed here: vivification may have shortened the clause.
         let btlevel = learnt[1..].iter().map(|l| self.level_of(l.atom()) as usize).max().unwrap_or(0);
+        // Two-watched-literal invariant: slot 1 must hold a btlevel literal so the
+        // two watched literals are the last two to be unassigned on backjump. Post
+        // backjump every learnt[1..] is still false, so `initial_watches` picks
+        // index 1 as the second watch; keep the max-level literal there.
+        if let Some(k) = (1..learnt.len()).find(|&i| self.level_of(learnt[i].atom()) as usize == btlevel) {
+            learnt.swap(1, k);
+        }
         self.learned_lits += learnt.len() as u64;
         // LBD measured at learn time, while every literal is still assigned.
         let lbd = self.lbd_of(&learnt);

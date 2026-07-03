@@ -1,4 +1,4 @@
-//! `qayd` CLI: `qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--ls] [--split] [--probe N] [--lns N] [--learn-csp] <instance.xml[.lzma|.xz]>`.
+//! `qayd` CLI: `qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--ls] [--split] [--probe N] [--lns N] [--no-learn-csp] <instance.xml[.lzma|.xz]>`.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -44,7 +44,7 @@ fn is_instance(arg: &str) -> bool {
 }
 
 const USAGE: &str =
-    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--ls] [--split] [--probe N] [--lns N] [--learn-csp] <instance.xml[.lzma|.xz]>";
+    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--ls] [--split] [--probe N] [--lns N] [--no-learn-csp] <instance.xml[.lzma|.xz]>";
 
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
@@ -82,7 +82,7 @@ fn main() {
     let mut split = false;
     let mut probes = 0;
     let mut lns = 0;
-    let mut learn_csp = false;
+    let mut no_learn_csp = false;
     let mut path: Option<String> = None;
 
     let mut it = args.iter();
@@ -97,7 +97,7 @@ fn main() {
             "--split" => split = true,
             "--probe" => probes = positive(it.next().map(String::as_str), "--probe needs a positive integer"),
             "--lns" => lns = positive(it.next().map(String::as_str), "--lns needs a positive integer"),
-            "--learn-csp" => learn_csp = true,
+            "--no-learn-csp" => no_learn_csp = true,
             other if other.starts_with('-') => {
                 eprintln!("unknown option {other}");
                 usage();
@@ -137,5 +137,5 @@ fn main() {
     }
 
     let mode = if ls { qayd::frontends::xcsp::Mode::Ls } else { qayd::frontends::xcsp::Mode::Default };
-    run_instance(&path, verbose, &stop, qayd::frontends::xcsp::RunOptions { seed, workers, mode, split, probes, lns, learn_csp });
+    run_instance(&path, verbose, &stop, qayd::frontends::xcsp::RunOptions { seed, workers, mode, split, probes, lns, no_learn_csp });
 }
