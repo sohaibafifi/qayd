@@ -43,6 +43,7 @@ struct DirectEdgeMatrix {
     orientation: MatrixOrientation,
 }
 
+#[derive(Clone, PartialEq)]
 struct CapacitySpec {
     demands: Vec<i32>,
     capacity: i32,
@@ -789,15 +790,16 @@ fn parse_route_side_constraints(model: &CollectionModel) -> Option<RouteSideCons
         }
     }
     Some(RouteSideConstraints {
-        capacity: homogeneous_capacity(cap_by_list)?,
-        length: homogeneous_length(&len_by_list)?,
-        item_sum: homogeneous_item_sum(sum_by_list)?,
+        capacity: homogeneous(&cap_by_list)?,
+        length: homogeneous(&len_by_list)?,
+        item_sum: homogeneous(&sum_by_list)?,
     })
 }
 
-/// `Some(None)` = absent, `Some(Some(v))` = the shared value, `None` = route-named
-/// or inconsistent (reject).
-fn homogeneous_item_sum(by_list: Vec<Option<ItemSumSpec>>) -> Option<Option<ItemSumSpec>> {
+/// `Some(None)` = absent from every route, `Some(Some(v))` = the shared value,
+/// `None` = mixed/route-named (reject). A spec folds into one homogeneous rule
+/// only if it is identical across every route.
+fn homogeneous<T: Clone + PartialEq>(by_list: &[Option<T>]) -> Option<Option<T>> {
     let present = by_list.iter().filter(|x| x.is_some()).count();
     if present == 0 {
         return Some(None);
@@ -805,14 +807,8 @@ fn homogeneous_item_sum(by_list: Vec<Option<ItemSumSpec>>) -> Option<Option<Item
     if present != by_list.len() {
         return None;
     }
-    let mut iter = by_list.into_iter().map(|x| x.expect("all present"));
-    let first = iter.next().expect("at least one");
-    for other in iter {
-        if other != first {
-            return None;
-        }
-    }
-    Some(Some(first))
+    let first = by_list[0].as_ref().expect("all present");
+    by_list.iter().all(|x| x.as_ref().expect("all present") == first).then(|| Some(first.clone()))
 }
 
 /// A general weighted item sum `Sum(weight(item)) <op> rhs` over one route's items.
@@ -836,38 +832,6 @@ fn parse_item_sum_constraint(constraint: &Constraint, items: &[i32]) -> Option<(
         Op::Eq => (constraint.rhs, constraint.rhs),
     };
     Some((*list, (weights, min, max)))
-}
-
-/// `Some(None)` = absent, `Some(Some(v))` = the shared value, `None` = route-named
-/// or inconsistent (reject).
-fn homogeneous_length(by_list: &[Option<(usize, usize)>]) -> Option<Option<(usize, usize)>> {
-    let present = by_list.iter().filter(|x| x.is_some()).count();
-    if present == 0 {
-        return Some(None);
-    }
-    if present != by_list.len() {
-        return None;
-    }
-    let first = by_list[0].expect("all present");
-    by_list.iter().all(|x| x.expect("all present") == first).then_some(Some(first))
-}
-
-fn homogeneous_capacity(by_list: Vec<Option<CapacitySpec>>) -> Option<Option<CapacitySpec>> {
-    let present = by_list.iter().filter(|x| x.is_some()).count();
-    if present == 0 {
-        return Some(None);
-    }
-    if present != by_list.len() {
-        return None;
-    }
-    let mut iter = by_list.into_iter().map(|x| x.expect("all present"));
-    let first = iter.next().expect("at least one");
-    for other in iter {
-        if other.capacity != first.capacity || other.demands != first.demands {
-            return None;
-        }
-    }
-    Some(Some(first))
 }
 
 /// A homogeneous-capable length constraint `Count(items in list) <op> k` with a

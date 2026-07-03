@@ -297,7 +297,7 @@ fn ceil_div(a: i64, b: i64) -> i64 {
 }
 
 /// Saturate an `i64` bound into the `i32` domain range.
-fn clamp_i32(x: i64) -> i32 {
+pub(crate) fn clamp_i32(x: i64) -> i32 {
     x.clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 

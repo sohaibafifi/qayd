@@ -217,9 +217,8 @@ fn competition_exit_code(status: Status) -> i32 {
 #[cfg(target_os = "linux")]
 fn set_memory_limit(memory_limit_mb: u64) -> io::Result<()> {
     let bytes = memory_limit_mb.saturating_mul(1024).saturating_mul(1024);
-    let resource = memory_limit_resource();
     let mut current = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-    let get_rc = unsafe { libc::getrlimit(resource, &mut current) };
+    let get_rc = unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut current) };
     if get_rc != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -228,17 +227,12 @@ fn set_memory_limit(memory_limit_mb: u64) -> io::Result<()> {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("requested limit exceeds hard limit {}", current.rlim_max)));
     }
     let limit = libc::rlimit { rlim_cur: requested, rlim_max: current.rlim_max };
-    let rc = unsafe { libc::setrlimit(memory_limit_resource(), &limit) };
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) };
     if rc == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
     }
-}
-
-#[cfg(target_os = "linux")]
-fn memory_limit_resource() -> libc::c_int {
-    libc::RLIMIT_AS
 }
 
 #[cfg(not(target_os = "linux"))]

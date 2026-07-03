@@ -1,14 +1,10 @@
 //! Scheduling constraints: `noOverlap`, `cumulative` (time-tabling),
 //! `binPacking` (Shaw load pruning), `knapsack` (two linear constraints).
 
-use crate::constraints::linear::{linear, Relation};
+use crate::constraints::linear::{clamp_i32, linear, Relation};
 use crate::ids::{PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::store::{Solver, Store};
-
-fn clamp_i32(x: i64) -> i32 {
-    x.clamp(i32::MIN as i64, i32::MAX as i64) as i32
-}
 
 /// Ceiling of `a / b` for `a >= 0`, `b > 0`.
 fn ceil_div_pos(a: i64, b: i64) -> i64 {

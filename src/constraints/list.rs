@@ -248,11 +248,6 @@ pub fn item_precedence(solver: &mut Solver, lists: &[ListId], before: i32, after
     solver.post(Box::new(ItemPrecedence { lists: lists.to_vec(), before, after }))
 }
 
-/// Alias for item precedence, matching list-model terminology.
-pub fn list_precedence(solver: &mut Solver, lists: &[ListId], before: i32, after: i32) -> PropId {
-    item_precedence(solver, lists, before, after)
-}
-
 /// The coupling `sum(members) == length` for one list: keeps the length
 /// variable within `[required, possible]` and, when the length is pinned to
 /// either bound, fixes the still-undecided memberships. This is the only place
@@ -403,11 +398,6 @@ pub fn list_len(solver: &mut Solver, list: ListId, min: usize, max: usize) -> Pr
     solver.post(Box::new(ListLength { list, min, max }))
 }
 
-/// Post list length bounds.
-pub fn list_length(solver: &mut Solver, list: ListId, min: usize, max: usize) -> PropId {
-    list_len(solver, list, min, max)
-}
-
 /// Bounds a weighted item sum over one list.
 #[derive(Clone)]
 pub struct ListItemSum {
@@ -533,11 +523,6 @@ impl ListItemSum {
 /// Post weighted item-sum bounds.
 pub fn list_item_sum(solver: &mut Solver, list: ListId, weights: Vec<(i32, i64)>, min: i64, max: i64) -> PropId {
     solver.post(Box::new(ListItemSum { list, weights, min, max }))
-}
-
-/// Post a capacity-style upper bound over weighted list items.
-pub fn list_item_sum_le(solver: &mut Solver, list: ListId, weights: Vec<(i32, i64)>, max: i64) -> PropId {
-    list_item_sum(solver, list, weights, i64::MIN / 4, max)
 }
 
 fn required_owner(store: &Store, lists: &[ListId], item: i32) -> Result<Option<usize>, Inconsistency> {

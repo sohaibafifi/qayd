@@ -239,21 +239,6 @@ fn parse_line_terminated_clauses(
     Ok(Some(clauses))
 }
 
-/// Solve a CNF instance with the default native clause backend.
-pub fn solve_cnf(cnf: &Cnf, stop: &AtomicBool) -> SatResult {
-    solve_cnf_with_backend(cnf, stop, SatBackend::Native)
-}
-
-/// Solve a CNF instance with the selected backend.
-pub fn solve_cnf_with_backend(cnf: &Cnf, stop: &AtomicBool, backend: SatBackend) -> SatResult {
-    solve_cnf_with_backend_seeded(cnf, stop, backend, 0)
-}
-
-/// Solve a CNF instance with the selected backend and reproducible seed.
-pub fn solve_cnf_with_backend_seeded(cnf: &Cnf, stop: &AtomicBool, backend: SatBackend, seed: u64) -> SatResult {
-    solve_cnf_with_backend_seeded_options(cnf, stop, backend, seed, PreprocessOptions::default())
-}
-
 /// Solve a CNF instance with explicit preprocessing options.
 pub fn solve_cnf_with_backend_seeded_options(
     cnf: &Cnf,
@@ -266,17 +251,6 @@ pub fn solve_cnf_with_backend_seeded_options(
         SatBackend::Native => solve_cnf_native_seeded_options(cnf, stop, seed, preprocess),
         SatBackend::Linear => solve_cnf_linear(cnf, stop),
     }
-}
-
-/// Solve a CNF instance by injecting native clauses into the CDCL engine.
-pub fn solve_cnf_native(cnf: &Cnf, stop: &AtomicBool) -> SatResult {
-    solve_cnf_native_seeded(cnf, stop, 0)
-}
-
-/// Solve a CNF instance by injecting native clauses into the CDCL engine with a
-/// reproducible search seed.
-pub fn solve_cnf_native_seeded(cnf: &Cnf, stop: &AtomicBool, seed: u64) -> SatResult {
-    solve_cnf_native_seeded_options(cnf, stop, seed, PreprocessOptions::default())
 }
 
 /// Solve a CNF instance through the native backend with explicit preprocessing

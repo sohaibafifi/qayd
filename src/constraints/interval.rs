@@ -117,11 +117,6 @@ pub fn interval_precedence(solver: &mut Solver, before: IntervalId, after: Inter
     solver.post(Box::new(IntervalPrecedence { before, after }))
 }
 
-/// Post interval precedence.
-pub fn precedence(solver: &mut Solver, before: IntervalId, after: IntervalId) -> PropId {
-    interval_precedence(solver, before, after)
-}
-
 /// Structured unary-resource no-overlap over fixed-duration intervals.
 ///
 /// Present intervals sharing the resource may not overlap: for any two present
