@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pyo3::class::basic::CompareOp;
-use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyIterator, PyModule};
 
@@ -375,6 +377,103 @@ fn stop_after(limit: u64) -> Arc<AtomicBool> {
         });
     }
     stop
+}
+
+/// Deadline flag for a solve: armed by a background timer when `time_limit` is
+/// set, otherwise never fires on its own (the search runs until it completes or
+/// is interrupted).
+fn deadline(time_limit: Option<u64>) -> Arc<AtomicBool> {
+    match time_limit {
+        Some(limit) => stop_after(limit),
+        None => Arc::new(AtomicBool::new(false)),
+    }
+}
+
+/// SIGINT (Ctrl-C), the same value on Unix and Windows.
+const SIGINT: c_int = 2;
+
+/// Set from our SIGINT handler while a solve is running. `check_signals` is a
+/// no-op off the main thread, and the main thread is detached in native compute,
+/// so an OS handler is the only thing that can observe Ctrl-C mid-solve.
+static SIGINT_TRIPPED: AtomicBool = AtomicBool::new(false);
+
+type SigHandler = unsafe extern "C" fn(c_int);
+
+struct SigintInstall {
+    /// Number of solves currently arming the handler; the interpreter's own
+    /// handler is saved on the first and restored on the last.
+    depth: usize,
+    prev: Option<SigHandler>,
+}
+
+static SIGINT_STATE: Mutex<SigintInstall> = Mutex::new(SigintInstall { depth: 0, prev: None });
+
+unsafe extern "C" fn handle_sigint(_sig: c_int) {
+    SIGINT_TRIPPED.store(true, Ordering::SeqCst);
+}
+
+/// Installs the SIGINT handler for the duration of a solve (nesting-safe), and
+/// restores the interpreter's handler when the last active solve finishes.
+struct SigintGuard;
+
+impl SigintGuard {
+    fn arm() -> Self {
+        let mut state = SIGINT_STATE.lock().unwrap();
+        if state.depth == 0 {
+            SIGINT_TRIPPED.store(false, Ordering::SeqCst);
+            state.prev = Some(unsafe { ffi::PyOS_setsig(SIGINT, handle_sigint) });
+        }
+        state.depth += 1;
+        SigintGuard
+    }
+}
+
+impl Drop for SigintGuard {
+    fn drop(&mut self) {
+        let mut state = SIGINT_STATE.lock().unwrap();
+        state.depth -= 1;
+        if state.depth == 0 {
+            if let Some(prev) = state.prev.take() {
+                unsafe { ffi::PyOS_setsig(SIGINT, prev) };
+            }
+        }
+    }
+}
+
+/// Run the pure-Rust `compute` region of a solve with the GIL released, so
+/// Python background threads keep running. A watcher thread bridges a Ctrl-C
+/// (caught by our OS SIGINT handler) into the shared `stop`, so the stop-aware
+/// search unwinds; a `KeyboardInterrupt` is then raised on return.
+fn with_interrupts<T, F>(py: Python<'_>, stop: &Arc<AtomicBool>, compute: F) -> PyResult<T>
+where
+    F: FnOnce() -> T + Send,
+    T: Send,
+{
+    let _sigint = SigintGuard::arm();
+    let done = Arc::new(AtomicBool::new(false));
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let stop = Arc::clone(stop);
+        let done = Arc::clone(&done);
+        let interrupted = Arc::clone(&interrupted);
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                if SIGINT_TRIPPED.load(Ordering::Relaxed) {
+                    interrupted.store(true, Ordering::SeqCst);
+                    stop.store(true, Ordering::SeqCst);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+    let result = py.detach(compute);
+    done.store(true, Ordering::SeqCst);
+    let _ = watcher.join();
+    if interrupted.load(Ordering::SeqCst) {
+        return Err(PyKeyboardInterrupt::new_err("solve interrupted"));
+    }
+    Ok(result)
 }
 
 fn binary_expr(lhs: ExprLike, rhs: &Bound<'_, PyAny>, op: &str, f: impl FnOnce(Expr, Expr) -> Expr) -> PyResult<PyExpr> {
@@ -1247,6 +1346,7 @@ impl PyModel {
     #[pyo3(signature = (*, search=None, verbose=false, time_limit=None, seed=0, engine="auto"))]
     fn solve(
         &self,
+        py: Python<'_>,
         search: Option<&Bound<'_, PyAny>>,
         verbose: bool,
         time_limit: Option<u64>,
@@ -1260,27 +1360,36 @@ impl PyModel {
                     "model mixes integer variables with list/interval variables; use one modeling style per model",
                 ));
             }
-            return self.solve_collection(time_limit, seed, verbose, engine);
+            return self.solve_collection(py, time_limit, seed, verbose, engine);
         }
         if engine == PythonEngine::Ls {
             let Some(objective) = &self.objective else {
                 return Err(PyValueError::new_err("engine='ls' requires an objective"));
             };
-            return self.solve_ls(objective, search, verbose, time_limit, seed);
+            return self.solve_ls(py, objective, search, verbose, time_limit, seed);
         }
         if let Some(objective) = &self.objective {
-            return self.solve_optimization(objective, search, verbose);
+            return self.solve_optimization(py, objective, search, verbose, time_limit, seed);
         }
         if verbose {
             verbose_start(self.names.len(), self.solver.num_propagators(), false);
         }
         let vars = search_ids(self, search, None)?;
         let mut solver = self.solver.clone();
+        let stop = deadline(time_limit);
         let mut assignment = None;
-        let stats = search::solve(&mut solver, &vars, |solver| {
-            assignment = Some(vars.iter().map(|&var| solver.store.value(var)).collect::<Vec<_>>());
-            SearchControl::Stop
-        });
+        let stats = with_interrupts(py, &stop, || {
+            search::solve_interruptible_seeded(
+                &mut solver,
+                &vars,
+                |solver| {
+                    assignment = Some(vars.iter().map(|&var| solver.store.value(var)).collect::<Vec<_>>());
+                    SearchControl::Stop
+                },
+                &stop,
+                seed,
+            )
+        })?;
         let status = if assignment.is_some() { "SATISFIABLE" } else { "UNSATISFIABLE" };
         let solution = make_solution(status, &vars, assignment.as_deref(), None, None, None, stats, self.names.len());
         if verbose {
@@ -1413,6 +1522,7 @@ impl PyModel {
 
     fn try_solve_domain_collection(
         &self,
+        py: Python<'_>,
         model: &list::CollectionModel,
         selection: &shared_model::BackendSelection,
         time_limit: Option<u64>,
@@ -1423,13 +1533,14 @@ impl PyModel {
             return Ok(None);
         }
         if let Some(schedule) = &model.schedule {
-            return self.try_solve_domain_schedule(schedule, model, selection, time_limit, seed, verbose);
+            return self.try_solve_domain_schedule(py, schedule, model, selection, time_limit, seed, verbose);
         }
-        self.try_solve_domain_lists(model, selection, time_limit, verbose)
+        self.try_solve_domain_lists(py, model, selection, time_limit, verbose)
     }
 
     fn try_solve_routing_integer(
         &self,
+        py: Python<'_>,
         model: &list::CollectionModel,
         selection: &shared_model::BackendSelection,
         time_limit: Option<u64>,
@@ -1461,7 +1572,7 @@ impl PyModel {
                 println!("  o {objective}  ({primary_sense}, {:.2}s)", start.elapsed().as_secs_f64());
             }
         };
-        let Some(outcome) = routing_engine::solve_collection(model, seed, &stop, &mut report) else {
+        let Some(outcome) = with_interrupts(py, &stop, || routing_engine::solve_collection(model, seed, &stop, &mut report))? else {
             return Ok(None);
         };
         let sol = outcome.solution;
@@ -1505,6 +1616,7 @@ impl PyModel {
 
     fn try_solve_domain_lists(
         &self,
+        py: Python<'_>,
         model: &list::CollectionModel,
         selection: &shared_model::BackendSelection,
         time_limit: Option<u64>,
@@ -1535,13 +1647,14 @@ impl PyModel {
         }
 
         let stop = stop_after(limit);
-        let outcome = match list_exact_engine::solve(model, &objective_tiers, &stop, |candidate| {
-            if verbose {
-                println!("  o {}  ({})", candidate[0], if minimize { "min" } else { "max" });
-            }
-        })
-        .map_err(PyValueError::new_err)?
-        {
+        let solved = with_interrupts(py, &stop, || {
+            list_exact_engine::solve(model, &objective_tiers, &stop, |candidate| {
+                if verbose {
+                    println!("  o {}  ({})", candidate[0], if minimize { "min" } else { "max" });
+                }
+            })
+        })?;
+        let outcome = match solved.map_err(PyValueError::new_err)? {
             Some(outcome) => outcome,
             None => return Ok(None),
         };
@@ -1573,8 +1686,10 @@ impl PyModel {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_solve_domain_schedule(
         &self,
+        py: Python<'_>,
         schedule: &list::Schedule,
         model: &list::CollectionModel,
         selection: &shared_model::BackendSelection,
@@ -1606,11 +1721,13 @@ impl PyModel {
             seed,
             optional_modes_cdcl: schedule.minimize_makespan && std::env::var_os("QAYD_SCHEDULE_CDCL").is_some(),
         };
-        let outcome = schedule_engine::solve(schedule, &stop, options, |value| {
-            if verbose {
-                println!("  o {value}  (min)");
-            }
-        })
+        let outcome = with_interrupts(py, &stop, || {
+            schedule_engine::solve(schedule, &stop, options, |value| {
+                if verbose {
+                    println!("  o {value}  (min)");
+                }
+            })
+        })?
         .map_err(PyValueError::new_err)?;
         let Some(outcome) = outcome else {
             return Ok(None);
@@ -1641,7 +1758,7 @@ impl PyModel {
         }))
     }
 
-    fn solve_collection(&self, time_limit: Option<u64>, seed: u64, verbose: bool, engine: PythonEngine) -> PyResult<PySolution> {
+    fn solve_collection(&self, py: Python<'_>, time_limit: Option<u64>, seed: u64, verbose: bool, engine: PythonEngine) -> PyResult<PySolution> {
         let model = list::CollectionModel {
             items: self.col_universe.clone().unwrap_or_default(),
             lists: self.col_lists,
@@ -1654,10 +1771,10 @@ impl PyModel {
         let shared = shared_model::Model::from_collection(&model);
         let selection = shared_model::BackendSelection::for_model(&shared);
         if engine != PythonEngine::Ls {
-            if let Some(solution) = self.try_solve_routing_integer(&model, &selection, time_limit, seed, verbose)? {
+            if let Some(solution) = self.try_solve_routing_integer(py, &model, &selection, time_limit, seed, verbose)? {
                 return Ok(solution);
             }
-            if let Some(solution) = self.try_solve_domain_collection(&model, &selection, time_limit, seed, verbose)? {
+            if let Some(solution) = self.try_solve_domain_collection(py, &model, &selection, time_limit, seed, verbose)? {
                 return Ok(solution);
             }
             if engine == PythonEngine::Exact {
@@ -1687,7 +1804,7 @@ impl PyModel {
                 println!("  o {objective}  ({primary_sense}, {:.2}s)", start.elapsed().as_secs_f64());
             }
         };
-        let sol = lists::solve_collection(&model, seed, &stop, &mut report);
+        let sol = with_interrupts(py, &stop, || lists::solve_collection(&model, seed, &stop, &mut report))?;
         if verbose {
             println!("qayd result (collection)");
             println!("  status: {}", if sol.feasible { "SATISFIABLE" } else { "UNKNOWN" });
@@ -1719,6 +1836,7 @@ impl PyModel {
     /// limit (defaults to 10s, since LS never terminates on its own).
     fn solve_ls(
         &self,
+        py: Python<'_>,
         objective: &ObjectiveSpec,
         search: Option<&Bound<'_, PyAny>>,
         verbose: bool,
@@ -1743,21 +1861,16 @@ impl PyModel {
             search: vars.clone(),
             objective: Some(ProblemObjective::Expr(objective.minimizing, objective.expr.expr.clone())),
         };
-        let stop = Arc::new(AtomicBool::new(false));
-        let limit = time_limit.unwrap_or(10);
-        {
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_secs(limit));
-                stop.store(true, Ordering::SeqCst);
-            });
-        }
+        let stop = stop_after(time_limit.unwrap_or(10));
         let config = LsConfig { gls: true, min_conflicts: true, kick_bandit: false };
-        let outcome = solve_ls(problem, self.local.clone(), &stop, seed, config, |value, _solution, _source| {
-            if verbose {
-                println!("  incumbent: {value}");
-            }
-        });
+        let local = self.local.clone();
+        let outcome = with_interrupts(py, &stop, || {
+            solve_ls(problem, local, &stop, seed, config, |value, _solution, _source| {
+                if verbose {
+                    println!("  incumbent: {value}");
+                }
+            })
+        })?;
         let sense = if objective.minimizing { "min" } else { "max" };
         let solution = match outcome.best {
             Some((assignment, objective_value)) => make_solution(
@@ -1787,7 +1900,15 @@ impl PyModel {
         Ok(solution)
     }
 
-    fn solve_optimization(&self, objective: &ObjectiveSpec, search: Option<&Bound<'_, PyAny>>, verbose: bool) -> PyResult<PySolution> {
+    fn solve_optimization(
+        &self,
+        py: Python<'_>,
+        objective: &ObjectiveSpec,
+        search: Option<&Bound<'_, PyAny>>,
+        verbose: bool,
+        time_limit: Option<u64>,
+        seed: u64,
+    ) -> PyResult<PySolution> {
         if let Some(model_id) = objective.expr.model_id {
             if model_id != self.id {
                 return Err(PyValueError::new_err("objective belongs to a different model"));
@@ -1801,32 +1922,38 @@ impl PyModel {
         let mut vars = search_ids(self, search, None)?;
         append_expr_vars(&mut vars, &objective.expr.expr);
         let mut solver = self.solver.clone();
-        let stop = AtomicBool::new(false);
-        let search_objective = match &objective.expr.expr {
-            Expr::Var(var) => SearchObjective::Var(*var),
-            expr => SearchObjective::Expr(expr),
-        };
-        let (best, stats, _) = search::optimize_seeded(
-            &mut solver,
-            &vars,
-            search_objective,
-            objective.minimizing,
-            &stop,
-            0,
-            None,
-            None,
-            &[],
-            None,
-            Vec::new(),
-            |value, _| {
-                if verbose {
-                    println!("  incumbent: {value}");
-                }
-            },
-        );
+        let stop = deadline(time_limit);
+        let minimizing = objective.minimizing;
+        let obj_expr = objective.expr.expr.clone();
+        let (best, stats, complete) = with_interrupts(py, &stop, || {
+            let search_objective = match &obj_expr {
+                Expr::Var(var) => SearchObjective::Var(*var),
+                expr => SearchObjective::Expr(expr),
+            };
+            search::optimize_seeded(
+                &mut solver,
+                &vars,
+                search_objective,
+                minimizing,
+                &stop,
+                seed,
+                None,
+                None,
+                &[],
+                None,
+                Vec::new(),
+                |value, _| {
+                    if verbose {
+                        println!("  incumbent: {value}");
+                    }
+                },
+            )
+        })?;
         let Some((assignment, objective_value)) = best else {
+            // No incumbent: a proven-infeasible search is UNSATISFIABLE; one cut
+            // short by the time limit or Ctrl-C is merely UNKNOWN.
             let solution = make_solution(
-                "UNSATISFIABLE",
+                if complete { "UNSATISFIABLE" } else { "UNKNOWN" },
                 &vars,
                 None,
                 None,
@@ -1840,8 +1967,10 @@ impl PyModel {
             }
             return Ok(solution);
         };
+        // An incumbent is OPTIMAL only when search finished; a stopped search
+        // yields a feasible-but-unproven SATISFIABLE.
         let solution = make_solution(
-            "OPTIMAL",
+            if complete { "OPTIMAL" } else { "SATISFIABLE" },
             &vars,
             Some(&assignment),
             Some(objective_value),

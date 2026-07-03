@@ -307,14 +307,17 @@ wheels = [
 name = "qayd"
 version = "0.9.0"
 source = { editable = "." }
-dependencies = [
+
+[package.optional-dependencies]
+examples = [
     { name = "vrplib", version = "1.3.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.9'" },
     { name = "vrplib", version = "1.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.9.*'" },
     { name = "vrplib", version = "2.2.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "vrplib", specifier = ">=1.3.0" }]
+requires-dist = [{ name = "vrplib", marker = "extra == 'examples'", specifier = ">=1.3.0" }]
+provides-extras = ["examples"]
 
 [[package]]
 name = "vrplib"

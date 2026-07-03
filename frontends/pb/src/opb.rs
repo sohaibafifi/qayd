@@ -122,13 +122,13 @@ pub fn parse(input: &str) -> Result<Opb, ParseError> {
             .map(str::trim)
             .ok_or_else(|| err(line, "statement must end with ';'"))?;
 
-        if let Some(rest) = strip_objective_keyword(body) {
+        if let Some((maximize, rest)) = strip_objective_keyword(body) {
             if opb.objective.is_some() {
                 return Err(err(line, "multiple objective lines"));
             }
             let (terms, nonlinear) = parse_terms(rest, line, &mut max_var)?;
             opb.nonlinear |= nonlinear;
-            opb.objective = Some(Objective { maximize: rest.starts_with("max"), terms });
+            opb.objective = Some(Objective { maximize, terms });
         } else {
             let (constraint, nonlinear) = parse_constraint(body, line, &mut max_var)?;
             opb.nonlinear |= nonlinear;
@@ -140,10 +140,10 @@ pub fn parse(input: &str) -> Result<Opb, ParseError> {
     Ok(opb)
 }
 
-fn strip_objective_keyword(body: &str) -> Option<&str> {
-    for kw in ["min:", "max:"] {
+fn strip_objective_keyword(body: &str) -> Option<(bool, &str)> {
+    for (kw, maximize) in [("min:", false), ("max:", true)] {
         if let Some(rest) = body.strip_prefix(kw) {
-            return Some(rest.trim());
+            return Some((maximize, rest.trim()));
         }
     }
     None

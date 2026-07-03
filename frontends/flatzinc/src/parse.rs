@@ -179,18 +179,24 @@ fn parse_decl(model: &mut Model, stmt: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The `i`th argument of a constraint item, or a typed error (instead of a
+/// panic) when the item supplies fewer arguments than its predicate needs.
+fn arg<'a>(name: &str, args: &'a [String], i: usize) -> Result<&'a str, String> {
+    args.get(i).map(String::as_str).ok_or_else(|| format!("{name} expects at least {} arguments", i + 1))
+}
+
 fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
     let body = strip_annotations(stmt.strip_prefix("constraint").unwrap()).trim();
     let open = body.find('(').ok_or("constraint without arguments")?;
     let name = body[..open].trim();
     let args = split_args(body[open + 1..].trim_end_matches(')'));
     match name {
-        "int_eq" => model.post_cmp(&args[0], &args[1], Relation::Eq),
-        "int_ne" => model.post_cmp(&args[0], &args[1], Relation::Ne),
-        "int_le" => model.post_cmp(&args[0], &args[1], Relation::Le),
-        "int_lt" => model.post_cmp(&args[0], &args[1], Relation::Lt),
-        "int_ge" => model.post_cmp(&args[0], &args[1], Relation::Ge),
-        "int_gt" => model.post_cmp(&args[0], &args[1], Relation::Gt),
+        "int_eq" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Eq),
+        "int_ne" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Ne),
+        "int_le" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Le),
+        "int_lt" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Lt),
+        "int_ge" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Ge),
+        "int_gt" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Gt),
         "int_lin_eq" => model.post_linear(&args, Relation::Eq),
         "int_lin_ne" => model.post_linear(&args, Relation::Ne),
         "int_lin_le" => model.post_linear(&args, Relation::Le),
@@ -243,27 +249,27 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
         "int_lin_gt_imp" => model.post_lin_reif(&args, Relation::Gt, Reif::Imp),
 
         // Boolean channelling and logic.
-        "bool2int" | "bool_eq" => model.post_cmp(&args[0], &args[1], Relation::Eq),
-        "bool_le" => model.post_cmp(&args[0], &args[1], Relation::Le),
-        "bool_lt" => model.post_cmp(&args[0], &args[1], Relation::Lt),
-        "bool_ge" => model.post_cmp(&args[0], &args[1], Relation::Ge),
-        "bool_gt" => model.post_cmp(&args[0], &args[1], Relation::Gt),
+        "bool2int" | "bool_eq" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Eq),
+        "bool_le" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Le),
+        "bool_lt" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Lt),
+        "bool_ge" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Ge),
+        "bool_gt" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Gt),
         "bool_not" => {
-            let x = model.var_atom(&args[0])?;
-            let y = model.var_atom(&args[1])?;
+            let x = model.var_atom(arg(name, &args, 0)?)?;
+            let y = model.var_atom(arg(name, &args, 1)?)?;
             linear(&mut model.solver, &[1, 1], &[x, y], Relation::Eq, 1);
             Ok(())
         }
         "bool_and" => {
-            let (a, b) = model.two_atoms(&args[0], &args[1])?;
-            model.post_reif(expr::and(vec![a, b]), &args[2], Reif::Iff)
+            let (a, b) = model.two_atoms(arg(name, &args, 0)?, arg(name, &args, 1)?)?;
+            model.post_reif(expr::and(vec![a, b]), arg(name, &args, 2)?, Reif::Iff)
         }
         "bool_or" => {
-            let (a, b) = model.two_atoms(&args[0], &args[1])?;
-            model.post_reif(expr::or(vec![a, b]), &args[2], Reif::Iff)
+            let (a, b) = model.two_atoms(arg(name, &args, 0)?, arg(name, &args, 1)?)?;
+            model.post_reif(expr::or(vec![a, b]), arg(name, &args, 2)?, Reif::Iff)
         }
         "bool_xor" => {
-            let (a, b) = model.two_atoms(&args[0], &args[1])?;
+            let (a, b) = model.two_atoms(arg(name, &args, 0)?, arg(name, &args, 1)?)?;
             if args.len() >= 3 {
                 model.post_reif(expr::ne(a, b), &args[2], Reif::Iff)
             } else {
@@ -272,8 +278,8 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
             }
         }
         "bool_imp" => {
-            let b = model.atom_expr(&args[1])?;
-            model.post_reif(b, &args[0], Reif::Imp)
+            let b = model.atom_expr(arg(name, &args, 1)?)?;
+            model.post_reif(b, arg(name, &args, 0)?, Reif::Imp)
         }
         "array_bool_and" => model.post_bool_nary(&args, true),
         "array_bool_or" => model.post_bool_nary(&args, false),
@@ -287,36 +293,36 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
 
         // Functional integer arithmetic.
         "int_times" => {
-            let (a, b) = model.two_atoms(&args[0], &args[1])?;
-            model.post_def(&args[2], expr::mul(vec![a, b]))
+            let (a, b) = model.two_atoms(arg(name, &args, 0)?, arg(name, &args, 1)?)?;
+            model.post_def(arg(name, &args, 2)?,expr::mul(vec![a, b]))
         }
         "int_plus" => {
-            let (a, b) = model.two_atoms(&args[0], &args[1])?;
-            model.post_def(&args[2], expr::add(vec![a, b]))
+            let (a, b) = model.two_atoms(arg(name, &args, 0)?, arg(name, &args, 1)?)?;
+            model.post_def(arg(name, &args, 2)?,expr::add(vec![a, b]))
         }
         "int_minus" => {
-            let (a, b) = model.two_atoms(&args[0], &args[1])?;
-            model.post_def(&args[2], expr::sub(a, b))
+            let (a, b) = model.two_atoms(arg(name, &args, 0)?, arg(name, &args, 1)?)?;
+            model.post_def(arg(name, &args, 2)?,expr::sub(a, b))
         }
         "int_max" => {
-            let (a, b) = model.two_atoms(&args[0], &args[1])?;
-            model.post_def(&args[2], expr::max_of(vec![a, b]))
+            let (a, b) = model.two_atoms(arg(name, &args, 0)?, arg(name, &args, 1)?)?;
+            model.post_def(arg(name, &args, 2)?,expr::max_of(vec![a, b]))
         }
         "int_min" => {
-            let (a, b) = model.two_atoms(&args[0], &args[1])?;
-            model.post_def(&args[2], expr::min_of(vec![a, b]))
+            let (a, b) = model.two_atoms(arg(name, &args, 0)?, arg(name, &args, 1)?)?;
+            model.post_def(arg(name, &args, 2)?,expr::min_of(vec![a, b]))
         }
         "int_div" => {
-            let (a, b) = model.two_atoms(&args[0], &args[1])?;
-            model.post_def(&args[2], expr::div(a, b))
+            let (a, b) = model.two_atoms(arg(name, &args, 0)?, arg(name, &args, 1)?)?;
+            model.post_def(arg(name, &args, 2)?,expr::div(a, b))
         }
         "int_mod" => {
-            let (a, b) = model.two_atoms(&args[0], &args[1])?;
-            model.post_def(&args[2], expr::rem(a, b))
+            let (a, b) = model.two_atoms(arg(name, &args, 0)?, arg(name, &args, 1)?)?;
+            model.post_def(arg(name, &args, 2)?,expr::rem(a, b))
         }
         "int_abs" => {
-            let a = model.atom_expr(&args[0])?;
-            model.post_def(&args[1], expr::abs(a))
+            let a = model.atom_expr(arg(name, &args, 0)?)?;
+            model.post_def(arg(name, &args, 1)?, expr::abs(a))
         }
         "int_pow" | "gecode_int_pow" => model.post_int_pow(&args),
 
@@ -350,17 +356,17 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
         "gecode_bin_packing_load" | "fzn_bin_packing_load" => model.post_bin_packing_load(&args),
         "gecode_maximum_arg_int_offset" => model.post_arg_max(&args),
         "gecode_precede" | "fzn_int_precede" => {
-            let list = model.var_list(&args[0])?;
-            let s = model.int_atom(&args[1])?;
-            let t = model.int_atom(&args[2])?;
+            let list = model.var_list(arg(name, &args, 0)?)?;
+            let s = model.int_atom(arg(name, &args, 1)?)?;
+            let t = model.int_atom(arg(name, &args, 2)?)?;
             precedence(&mut model.solver, &list, &[s, t]);
             Ok(())
         }
         "chuffed_value_precede" | "fzn_value_precede_int" => {
             // Same as `gecode_precede`, with the values first: `(s, t, x)`.
-            let s = model.int_atom(&args[0])?;
-            let t = model.int_atom(&args[1])?;
-            let list = model.var_list(&args[2])?;
+            let s = model.int_atom(arg(name, &args, 0)?)?;
+            let t = model.int_atom(arg(name, &args, 1)?)?;
+            let list = model.var_list(arg(name, &args, 2)?)?;
             precedence(&mut model.solver, &list, &[s, t]);
             Ok(())
         }

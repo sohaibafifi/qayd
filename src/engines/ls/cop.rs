@@ -10,7 +10,10 @@ use crate::ids::VarId;
 use crate::mix64;
 use crate::problem::{Objective, Problem};
 
-const MAX_DOMAIN_VALUES: usize = 4096;
+pub const MAX_DOMAIN_VALUES: usize = 4096;
+/// Move-candidate samples drawn from a range-only domain (one too large to
+/// materialise), alongside the two endpoints, per candidate evaluation.
+const RANGE_SAMPLE_VALUES: usize = 32;
 const MAX_SAMPLED_VARS: usize = 48;
 const RANDOM_WALK_PERIOD: u64 = 17;
 const RESTART_AFTER: u64 = 200;
@@ -144,7 +147,7 @@ pub(crate) enum LocalRhs {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct LocalSearchSpec {
+pub struct LocalSearchSpec {
     constraints: Vec<LocalConstraint>,
     functionals: Vec<Functional>,
     derived: Vec<bool>,
@@ -153,7 +156,7 @@ pub(crate) struct LocalSearchSpec {
 
 /// Behaviour toggles for the local-search engine selected by `--ls`.
 #[derive(Clone, Copy, Default)]
-pub(crate) struct LsConfig {
+pub struct LsConfig {
     /// Guided Local Search: at a local minimum, penalise the still-violated
     /// constraints (bump their weights) so search is pushed off the plateau and
     /// toward the genuinely hard constraints.
@@ -167,7 +170,7 @@ pub(crate) struct LsConfig {
     pub(crate) kick_bandit: bool,
 }
 
-pub(crate) struct LocalSearchOutcome {
+pub struct LocalSearchOutcome {
     pub(crate) best: Option<(Vec<i32>, i64)>,
     pub(crate) iterations: u64,
     pub(crate) moves: u64,
@@ -296,6 +299,38 @@ impl LocalDomain {
 
     fn is_bool(&self) -> bool {
         self.contains(0) && self.contains(1) && self.min_value() == 0 && self.max_value() == 1
+    }
+
+    /// Whether this variable offers more than one value to try: an explicit
+    /// domain with >1 member, or a range-only domain (too large to materialise)
+    /// spanning more than a single point.
+    fn is_searchable(&self) -> bool {
+        if self.values.is_empty() {
+            self.min < self.max
+        } else {
+            self.values.len() > 1
+        }
+    }
+
+    /// Move-candidate values for a range-only domain (`values` empty): both
+    /// endpoints plus a bounded set of uniform interior draws over `[min,max]`.
+    /// Every emitted value lies in `[min,max]`, which for a contiguous range
+    /// (verified in [`LocalModel::new`]) is a genuine domain member. Fills `out`;
+    /// callers with a materialised domain iterate `values` directly instead.
+    fn sample_range(&self, seed: u64, out: &mut Vec<i32>) {
+        out.clear();
+        out.push(self.min);
+        out.push(self.max);
+        let span = i64::from(self.max) - i64::from(self.min);
+        if span > 0 {
+            let span = span as u64;
+            for k in 0..RANGE_SAMPLE_VALUES as u64 {
+                let pick = mix64(seed.wrapping_add(k.wrapping_mul(0x9E37_79B9_7F4A_7C15)));
+                out.push((i64::from(self.min) + (pick % (span + 1)) as i64) as i32);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
     }
 }
 
@@ -650,7 +685,7 @@ impl LocalRhs {
 }
 
 impl LocalSearchSpec {
-    pub(crate) fn add_var(&mut self, var: VarId) {
+    pub fn add_var(&mut self, var: VarId) {
         self.ensure(var);
     }
 
@@ -661,7 +696,7 @@ impl LocalSearchSpec {
         self.constraints.push(LocalConstraint::Expr(expr));
     }
 
-    pub(crate) fn add_linear(&mut self, coeffs: Vec<i64>, vars: Vec<VarId>, rel: Relation, rhs: i64) {
+    pub fn add_linear(&mut self, coeffs: Vec<i64>, vars: Vec<VarId>, rel: Relation, rhs: i64) {
         if let Some(functional) = functional_from_linear(&coeffs, &vars, rel, rhs, &self.derived) {
             self.mark_functional(functional);
         }
@@ -803,7 +838,8 @@ impl LocalModel {
             let var = VarId(i as u32);
             let min = problem.solver.store.min(var);
             let max = problem.solver.store.max(var);
-            let values = if problem.solver.store.size(var) <= MAX_DOMAIN_VALUES {
+            let size = problem.solver.store.size(var);
+            let values = if size <= MAX_DOMAIN_VALUES {
                 problem.solver.store.values(var).collect::<Vec<_>>()
             } else {
                 Vec::new()
@@ -811,13 +847,21 @@ impl LocalModel {
             if values.is_empty() && min > max {
                 return Err(1);
             }
+            // A range-only (unmaterialised) domain is sampled over [min,max] during
+            // search, which is sound only if the range has no holes. `store.values`
+            // filters holes, so any holey domain small enough is materialised
+            // exactly; a large one is only left range-only when it is contiguous.
+            debug_assert!(
+                !values.is_empty() || i64::from(max) - i64::from(min) + 1 == size as i64,
+                "range-only LS domain has holes; [min,max] sampling would emit removed values"
+            );
             domains.push(LocalDomain { min, max, values });
         }
         let mutable = problem
             .search
             .iter()
             .copied()
-            .filter(|&var| domains[var.index()].values.len() > 1 && !spec.derived.get(var.index()).copied().unwrap_or(false))
+            .filter(|&var| domains[var.index()].is_searchable() && !spec.derived.get(var.index()).copied().unwrap_or(false))
             .collect();
         let constraints = spec.constraints;
         let functionals = order_functionals(spec.functionals);
@@ -1796,6 +1840,9 @@ fn best_single_variable_move(
         let candidate_values: &[i32] = if config.min_conflicts && value_sets.get(j).and_then(Option::as_ref).is_some() {
             min_conflict_candidates(model, var, assignment, value_sets[j].as_ref().unwrap(), seed, iter, cand_values);
             cand_values
+        } else if model.domains[j].values.is_empty() {
+            model.domains[j].sample_range(seed ^ iter ^ (j as u64), cand_values);
+            cand_values
         } else {
             &model.domains[j].values
         };
@@ -1892,7 +1939,7 @@ fn bump_gls_weights(weights: &mut [i64], con_viol: &[i64], viol_sum: &mut i128, 
     bumped
 }
 
-pub(crate) fn solve_ls<F>(
+pub fn solve_ls<F>(
     problem: Problem,
     spec: LocalSearchSpec,
     stop: &AtomicBool,

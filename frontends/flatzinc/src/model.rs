@@ -312,6 +312,7 @@ impl Model {
     /// `set_in` (and reified variants), over either a set *variable* or a
     /// constant set literal.
     pub(crate) fn post_set_in(&mut self, args: &[String], mode: Option<Reif>) -> Result<(), String> {
+        require(args.len() >= 2, "set_in expects at least 2 arguments")?;
         let set_s = args[1].trim();
         // Set variable: look the element up in the characteristic vector.
         if self.set_vars.contains_key(set_s) {

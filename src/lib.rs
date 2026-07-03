@@ -30,7 +30,8 @@ pub mod lcg;
 mod lns;
 pub mod model;
 mod parallel;
-mod problem;
+#[doc(hidden)]
+pub mod problem;
 pub mod propagator;
 pub mod search;
 pub mod store;

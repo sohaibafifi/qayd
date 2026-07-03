@@ -19,15 +19,15 @@ pub(crate) struct PresolveStats {
 
 /// Immutable root model cloned by portfolio workers.
 #[derive(Clone)]
-pub(crate) struct Problem {
-    pub(crate) solver: Solver,
-    pub(crate) search: Vec<VarId>,
-    pub(crate) objective: Option<Objective>,
+pub struct Problem {
+    pub solver: Solver,
+    pub search: Vec<VarId>,
+    pub objective: Option<Objective>,
 }
 
 /// Objective form consumed by the search layer.
 #[derive(Clone)]
-pub(crate) enum Objective {
+pub enum Objective {
     Var(bool, VarId),
     Linear(bool, Vec<i64>, Vec<VarId>),
     Expr(bool, Expr),
