@@ -36,7 +36,7 @@ pub(crate) enum FznDomain {
 }
 
 /// An item the model marks for output (`:: output_var` / `:: output_array`).
-/// Used by the MiniZinc output protocol (`--mzn`).
+/// Used by the MiniZinc output protocol.
 pub(crate) enum Output {
     /// `name = <value>;`
     Var { name: String, var: VarId, is_bool: bool },

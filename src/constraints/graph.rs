@@ -47,12 +47,12 @@ impl Circuit {
         let mut len = Vec::with_capacity(n);
         let mut linked = Vec::with_capacity(n);
         let mut nbr = Vec::with_capacity(n);
-        for i in 0..n {
+        for (i, &var) in succ.iter().enumerate() {
             dest.push(store.new_rev_int(i as i32));
             orig.push(store.new_rev_int(i as i32));
             len.push(store.new_rev_int(1));
             linked.push(store.new_rev_int(0));
-            nbr.push(store.values(succ[i]).collect::<Vec<i32>>());
+            nbr.push(store.values(var).collect::<Vec<i32>>());
         }
         let mut rnbr = vec![Vec::new(); n];
         for (i, ns) in nbr.iter().enumerate() {
@@ -385,10 +385,10 @@ mod tests {
                 for k in 0..n {
                     adj_set[perm[k]].insert(perm[(k + 1) % n] as i32);
                 }
-                for i in 0..n {
+                for (i, set) in adj_set.iter_mut().enumerate() {
                     for j in 0..n {
                         if i != j && next() % 3 == 0 {
-                            adj_set[i].insert(j as i32);
+                            set.insert(j as i32);
                         }
                     }
                 }

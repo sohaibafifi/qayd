@@ -1,5 +1,8 @@
 /target
 /.*/
+!/.github/
+!/.github/workflows/
+!/.github/workflows/*.yml
 /tests/
 /vendor/
 /frontends/flatzinc/tests/
@@ -7,3 +10,4 @@ __pycache__/
 *.py[cod]
 *.so
 /data/
+.DS_Store

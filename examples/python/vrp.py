@@ -4,16 +4,19 @@ Modeled the usual way: a Model with k list variables (one per vehicle), a total
 distance objective, and a per-route capacity constraint. solve() picks the
 list-domain engine because the model has list variables.
 
-Instance: set ``QAYD_VRP_INSTANCE`` to any CVRPLIB ``.vrp`` file; defaults to the
-bundled ``data/vrplib/CVRP/X-n101-k25.vrp`` (Uchoa et al.). More at
-http://vrp.galgos.inf.puc-rio.br. Tune time via ``QAYD_VRP_T``; trace with
-``QAYD_VERBOSE=1``.
+Instance: set ``QAYD_VRP_INSTANCE`` to any CVRPLIB ``.vrp`` file. If it is not
+set, the script tries the local scratch path
+``data/vrplib/CVRP/X-n101-k25.vrp``. More at http://vrp.galgos.inf.puc-rio.br.
+Tune time via ``QAYD_VRP_T``; trace with ``QAYD_VERBOSE=1``.
 """
 
 import os
 import re
 
-import vrplib
+try:
+    import vrplib
+except ImportError as exc:
+    raise SystemExit("install example dependencies with `uv run --extra examples ...`") from exc
 
 import qayd as cp
 
@@ -21,6 +24,9 @@ here = os.path.dirname(os.path.abspath(__file__))
 repo_root = os.path.abspath(os.path.join(here, "..", ".."))
 path = os.environ.get("QAYD_VRP_INSTANCE", os.path.join(repo_root, "data", "vrplib", "CVRP", "X-n101-k25.vrp"))
 time_limit = int(os.environ.get("QAYD_VRP_T", "10"))
+
+if not os.path.exists(path):
+    raise SystemExit("set QAYD_VRP_INSTANCE to a CVRPLIB .vrp file")
 
 inst = vrplib.read_instance(path)
 name = inst.get("name", os.path.basename(path))

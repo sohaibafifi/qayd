@@ -68,15 +68,17 @@ Priority order: correct, simple, fast.
   objective improvements without proving optimality. It uses local scoring for
   common constraints, constructive starts for guarded table/element patterns,
   guided local search, and focused repair for simple Boolean exact-cover rows.
-- **A beta support for MiniZinc.** The `qayd-fzn` driver speaks the MiniZinc solver protocol,
-  so it can be used as a backend for the MiniZinc CLI and IDE. The `--mzn` flag enables some
-  MiniZinc-specific behaviour. (see [for details](frontends/flatzinc/minizinc/README.md)).
-- **A beta SAT and Pseudo-Boolean solver.** 
+- **Beta MiniZinc support.** The `qayd-fzn` driver speaks the MiniZinc solver protocol,
+  so it can be used as a backend for the MiniZinc CLI and IDE. See
+  [the MiniZinc integration notes](frontends/flatzinc/minizinc/README.md).
+- **Beta SAT and Pseudo-Boolean frontends.**
 
 ## Entry Points
 
 - `qayd`: CLI for XCSP3 instances, including `.xml`, `.xml.lzma`, and `.xz`.
 - `qayd-fzn`: beta FlatZinc driver for MiniZinc.
+- `qayd-sat`: beta DIMACS CNF frontend.
+- `qayd-pb`: beta OPB frontend.
 - Rust crate: direct finite-domain modeling and solver internals.
 - Python module: modeling experiments, especially list, lambda, and routing
   examples.
@@ -115,10 +117,14 @@ Common options:
 The Python examples are the easiest way to inspect the list-domain modeling API:
 
 ```bash
-uv run examples/python/vrp.py
+QAYD_VRP_INSTANCE=/path/to/instance.vrp uv run --extra examples examples/python/vrp.py
 uv run examples/python/cvrptw.py
 uv run examples/python/bin_packing.py
 ```
+
+The VRP example uses `vrplib` and expects a local CVRPLIB file via
+`QAYD_VRP_INSTANCE`. Benchmark data under `data/` is local scratch data and is
+not part of the source release.
 
 Typical list model shape:
 

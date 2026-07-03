@@ -36,6 +36,10 @@ python3 cop/fetch.py --year 25 --limit 30
 ./sat/pipeline.sh 10 ; ./pb/pipeline.sh 10 ; ./csp/pipeline.sh 10 ; ./cop/pipeline.sh 10
 ```
 
+For CPU-tuned local benchmark binaries, prefix the build command with
+`RUSTFLAGS="-Ctarget-cpu=native"`. The repository does not force that flag so
+release and CI builds stay portable.
+
 `pipeline.sh [TIMEOUT_S] [LIMIT]` - per-instance wall-clock timeout and an
 optional instance cap (0 = all fetched).
 

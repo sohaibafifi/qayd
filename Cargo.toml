@@ -13,7 +13,7 @@ members = [".", "frontends/flatzinc", "frontends/sat", "frontends/pb"]
 default-members = [".", "frontends/flatzinc", "frontends/sat", "frontends/pb"]
 
 [workspace.package]
-# Single source of truth: qayd and qayd-fzn release under the same version.
+# Single source of truth for all workspace crates released together.
 version = "0.9.0"
 
 [lib]
