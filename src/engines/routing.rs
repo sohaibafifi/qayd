@@ -167,6 +167,8 @@ impl RoutingSpec {
         let n = nodes.len();
 
         let succ = (0..n).map(|_| solver.new_var_range(0, n as i32 - 1)).collect::<Vec<_>>();
+        // `circuit` auto-enables cut-set filtering only on sparse graphs; this
+        // lowering builds the complete graph, so it stays on the base rules.
         graph::circuit(&mut solver, &succ);
 
         let mut cost_vars = Vec::with_capacity(n);
