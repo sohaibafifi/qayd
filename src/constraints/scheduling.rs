@@ -4,7 +4,7 @@
 use crate::constraints::linear::{clamp_i32, linear, Relation};
 use crate::ids::{PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Priority, Propagator};
-use crate::store::{Solver, Store};
+use crate::store::{Premise, Solver, Store};
 
 /// Ceiling of `a / b` for `a >= 0`, `b > 0`.
 fn ceil_div_pos(a: i64, b: i64) -> i64 {
@@ -63,17 +63,42 @@ impl Propagator for NoOverlap {
                     let i_before_j = si_min + di <= sj_max;
                     let j_before_i = sj_min + dj <= si_max;
 
+                    // Bound premises pinning each start's live window; every emitted
+                    // reason is a subset of these four literals, so it can never
+                    // exceed the whole-scope fallback width (no guard needed).
+                    let ge_i = Premise::Ge { var: self.starts[i], bound: si_min as i32 };
+                    let le_i = Premise::Le { var: self.starts[i], bound: si_max as i32 };
+                    let ge_j = Premise::Ge { var: self.starts[j], bound: sj_min as i32 };
+                    let le_j = Premise::Le { var: self.starts[j], bound: sj_max as i32 };
                     match (i_before_j, j_before_i) {
-                        (false, false) => return Err(Inconsistency),
+                        (false, false) => {
+                            // Neither ordering fits: `si_min+di > sj_max` (ge_i+le_j
+                            // kill i-before-j) and `sj_min+dj > si_max` (ge_j+le_i
+                            // kill j-before-i); together no ordering survives.
+                            if store.explaining() {
+                                return Err(store.fail_because(vec![ge_i, le_i, ge_j, le_j]));
+                            }
+                            return Err(Inconsistency);
+                        }
                         (true, false) => {
-                            // i must precede j.
-                            store.remove_below(self.starts[j], clamp_i32(si_min + di))?;
-                            store.remove_above(self.starts[i], clamp_i32(sj_max - di))?;
+                            // i must precede j (j-before-i infeasible: sj_min+dj > si_max).
+                            if store.explaining() {
+                                store.remove_below_because(self.starts[j], clamp_i32(si_min + di), vec![ge_i, ge_j, le_i])?;
+                                store.remove_above_because(self.starts[i], clamp_i32(sj_max - di), vec![le_j, ge_j, le_i])?;
+                            } else {
+                                store.remove_below(self.starts[j], clamp_i32(si_min + di))?;
+                                store.remove_above(self.starts[i], clamp_i32(sj_max - di))?;
+                            }
                         }
                         (false, true) => {
-                            // j must precede i.
-                            store.remove_below(self.starts[i], clamp_i32(sj_min + dj))?;
-                            store.remove_above(self.starts[j], clamp_i32(si_max - dj))?;
+                            // j must precede i (i-before-j infeasible: si_min+di > sj_max).
+                            if store.explaining() {
+                                store.remove_below_because(self.starts[i], clamp_i32(sj_min + dj), vec![ge_j, ge_i, le_j])?;
+                                store.remove_above_because(self.starts[j], clamp_i32(si_max - dj), vec![le_i, ge_i, le_j])?;
+                            } else {
+                                store.remove_below(self.starts[i], clamp_i32(sj_min + dj))?;
+                                store.remove_above(self.starts[j], clamp_i32(si_max - dj))?;
+                            }
                         }
                         (true, true) => {}
                     }
@@ -110,6 +135,41 @@ struct Cumulative {
     by_est: Vec<usize>,
     by_lct: Vec<usize>,
     lb: Vec<i64>,
+}
+
+impl Cumulative {
+    /// Premises pinning a subset of tasks whose mandatory parts cover instant `t`
+    /// and whose heights (plus `extra`) cross `capacity`. Each cited task `k` gets
+    /// `Ge{min}`+`Le{max}`, forcing `[max, min+dur) ∋ t`, so `k` runs at `t`.
+    /// Stops once the running sum exceeds `capacity` — any covering subset with
+    /// height-sum > capacity is an unsatisfiable core, and the index-order stop
+    /// keeps it narrower than the full covering set. `except` (the task being
+    /// pushed) is skipped and its height passed as `extra`. Time-table pruning
+    /// only raises mins (and `remove` only lowers maxes), so mandatory parts only
+    /// grow within a pass; reading live bounds is thus a sound superset of the
+    /// stale-profile cause (reason_before_step demotes any bound this call moved).
+    fn overload_premises(&self, store: &Store, t: i64, except: Option<usize>, extra: i64) -> Vec<Premise> {
+        let mut why = Vec::new();
+        let mut sum = extra;
+        for k in 0..self.starts.len() {
+            // Zero-height tasks cover instants without consuming capacity:
+            // citing them widens the reason for nothing.
+            if Some(k) == except || self.height[k] == 0 {
+                continue;
+            }
+            let kmin = store.min(self.starts[k]) as i64;
+            let kmax = store.max(self.starts[k]) as i64;
+            if kmax <= t && t < kmin + self.dur[k] {
+                why.push(Premise::Ge { var: self.starts[k], bound: kmin as i32 });
+                why.push(Premise::Le { var: self.starts[k], bound: kmax as i32 });
+                sum += self.height[k];
+                if sum > self.capacity {
+                    break;
+                }
+            }
+        }
+        why
+    }
 }
 
 impl Propagator for Cumulative {
@@ -200,8 +260,14 @@ impl Propagator for Cumulative {
                         self.profile[(t - hmin) as usize] += self.height[i];
                     }
                 }
-                for &p in &self.profile {
+                for (offset, &p) in self.profile.iter().enumerate() {
                     if p > self.capacity {
+                        // Overload at instant t: cite a covering subset whose
+                        // mandatory parts force Σ height > capacity there.
+                        if store.explaining() {
+                            let t = hmin + offset as i64;
+                            return Err(store.fail_because(self.overload_premises(store, t, None, 0)));
+                        }
                         return Err(Inconsistency);
                     }
                 }
@@ -214,13 +280,30 @@ impl Propagator for Cumulative {
                     self.buf.extend(store.values(self.starts[i]));
                     for &start in &self.buf {
                         let s = start as i64;
-                        let conflict = (s..s + self.dur[i]).any(|t| {
+                        let conflict = (s..s + self.dur[i]).find(|&t| {
                             let idx = (t - hmin) as usize;
                             let own = if t >= mand_start && t < mand_end { hi } else { 0 };
                             self.profile[idx] - own + hi > self.capacity
                         });
-                        if conflict {
-                            store.remove(self.starts[i], start)?;
+                        if let Some(t_c) = conflict {
+                            // At t_c the other tasks' mandatory parts already leave
+                            // < hi free, so i cannot occupy `start`. Cite that
+                            // covering subset (i's own bound is not needed: the
+                            // subset alone fills t_c beyond capacity - hi).
+                            if store.explaining() {
+                                let why = self.overload_premises(store, t_c, Some(i), hi);
+                                // Empty premises only happen when `hi` alone busts the
+                                // capacity (degenerate height > capacity): root-implied,
+                                // but keep the scope fallback rather than an
+                                // antecedent-free reason at depth.
+                                if why.is_empty() {
+                                    store.remove(self.starts[i], start)?;
+                                } else {
+                                    store.remove_because(self.starts[i], start, why)?;
+                                }
+                            } else {
+                                store.remove(self.starts[i], start)?;
+                            }
                         }
                     }
                 }

@@ -33,6 +33,9 @@ strip = true
 codegen-units = 1
 opt-level = 3
 overflow-checks = false
+# NB: cargo ignores `panic` for test targets (cargo#6313), so a bare
+# `cargo test --release` fails linking the bins (abort bin vs unwind test lib).
+# Use `cargo test --release --test <name>`, which skips bin targets.
 panic = "abort"
 
 # Profile for the PyO3 extension module (`maturin --profile pyext`): identical
