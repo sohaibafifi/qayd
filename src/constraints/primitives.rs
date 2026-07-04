@@ -460,64 +460,130 @@ pub fn element_const(solver: &mut Solver, array: &[i32], idx: VarId, value: VarI
 ///
 /// Orientation: matching edges `var -> value`, non-matching `value -> var`,
 /// so a directed path is an alternating path.
-#[derive(Clone)]
+///
+/// All scratch buffers persist across `propagate()` calls (cleared and reused,
+/// never reallocated per call). `matching` warm-starts the maximum matching:
+/// the previous assignment is kept as a hint and validated against the current
+/// domains on each wake. It is deliberately not trailed — after a backtrack a
+/// stale pair is still a valid hint because domains only grow, and any pair no
+/// longer in the domain is simply re-augmented.
+#[derive(Clone, Default)]
 struct AllDifferent {
     vars: Vec<VarId>,
     buf: Vec<i32>,
+    /// Persistent matching hint: `matching[i]` = value assigned to `vars[i]`
+    /// (`i32::MIN` = unmatched / no hint yet).
+    matching: Vec<i32>,
+    values: Vec<i32>,
+    adj: Vec<Vec<usize>>,
+    var_to_val: Vec<i32>,
+    val_to_var: Vec<i32>,
+    seen: Vec<bool>,
+    g: Vec<Vec<usize>>,
+    reachable: Vec<bool>,
+    dfs_stack: Vec<usize>,
+    comp: Vec<usize>,
+    index: Vec<i64>,
+    low: Vec<i64>,
+    on_stack: Vec<bool>,
+    aug_stack: Vec<(usize, usize, usize)>,
+    scc_work: Vec<(usize, usize)>,
+    tj_stack: Vec<usize>,
 }
 
-/// Kuhn augmenting step for the bipartite matching.
-fn augment(u: usize, adj: &[Vec<usize>], val_to_var: &mut [i32], var_to_val: &mut [i32], seen: &mut [bool]) -> bool {
-    for &v in &adj[u] {
-        if !seen[v] {
-            seen[v] = true;
-            let w = val_to_var[v];
-            if w < 0 || augment(w as usize, adj, val_to_var, var_to_val, seen) {
-                val_to_var[v] = u as i32;
-                var_to_val[u] = v as i32;
-                return true;
-            }
+fn index_of(values: &[i32], val: i32) -> usize {
+    values.binary_search(&val).unwrap()
+}
+
+/// Iterative Kuhn augmenting step. `seen` must be reset by the caller; `stack`
+/// is scratch (var, next-adj-index, chosen-value) frames.
+fn augment(
+    start: usize,
+    adj: &[Vec<usize>],
+    val_to_var: &mut [i32],
+    var_to_val: &mut [i32],
+    seen: &mut [bool],
+    stack: &mut Vec<(usize, usize, usize)>,
+) -> bool {
+    stack.clear();
+    stack.push((start, 0, 0));
+    while let Some(&(u, idx, _)) = stack.last() {
+        if idx >= adj[u].len() {
+            stack.pop();
+            continue;
         }
+        let v = adj[u][idx];
+        stack.last_mut().unwrap().1 = idx + 1;
+        if seen[v] {
+            continue;
+        }
+        seen[v] = true;
+        stack.last_mut().unwrap().2 = v;
+        let w = val_to_var[v];
+        if w < 0 {
+            // Augmenting path found: assign every (var, chosen value) on the path.
+            for &(fu, _, fv) in stack.iter() {
+                var_to_val[fu] = fv as i32;
+                val_to_var[fv] = fu as i32;
+            }
+            return true;
+        }
+        stack.push((w as usize, 0, 0));
     }
     false
 }
 
-/// Tarjan strongly-connected-components DFS over the oriented graph.
+/// Iterative Tarjan strongly-connected-components over the oriented graph.
+/// `work` is scratch (node, next-edge-index) frames; `tj_stack` is the Tarjan
+/// component stack.
 #[allow(clippy::too_many_arguments)]
-fn scc_dfs(
-    u: usize,
+fn scc_visit(
+    start: usize,
     g: &[Vec<usize>],
     index: &mut [i64],
     low: &mut [i64],
     on_stack: &mut [bool],
-    stack: &mut Vec<usize>,
+    tj_stack: &mut Vec<usize>,
     comp: &mut [usize],
     counter: &mut i64,
     ncomp: &mut usize,
+    work: &mut Vec<(usize, usize)>,
 ) {
-    index[u] = *counter;
-    low[u] = *counter;
-    *counter += 1;
-    stack.push(u);
-    on_stack[u] = true;
-    for &v in &g[u] {
-        if index[v] < 0 {
-            scc_dfs(v, g, index, low, on_stack, stack, comp, counter, ncomp);
-            low[u] = low[u].min(low[v]);
-        } else if on_stack[v] {
-            low[u] = low[u].min(index[v]);
+    work.clear();
+    work.push((start, 0));
+    while let Some(&(u, i)) = work.last() {
+        if i == 0 {
+            index[u] = *counter;
+            low[u] = *counter;
+            *counter += 1;
+            tj_stack.push(u);
+            on_stack[u] = true;
         }
-    }
-    if low[u] == index[u] {
-        loop {
-            let w = stack.pop().unwrap();
-            on_stack[w] = false;
-            comp[w] = *ncomp;
-            if w == u {
-                break;
+        if i < g[u].len() {
+            work.last_mut().unwrap().1 = i + 1;
+            let v = g[u][i];
+            if index[v] < 0 {
+                work.push((v, 0));
+            } else if on_stack[v] {
+                low[u] = low[u].min(index[v]);
+            }
+        } else {
+            if low[u] == index[u] {
+                loop {
+                    let w = tj_stack.pop().unwrap();
+                    on_stack[w] = false;
+                    comp[w] = *ncomp;
+                    if w == u {
+                        break;
+                    }
+                }
+                *ncomp += 1;
+            }
+            work.pop();
+            if let Some(&(p, _)) = work.last() {
+                low[p] = low[p].min(low[u]);
             }
         }
-        *ncomp += 1;
     }
 }
 
@@ -533,10 +599,14 @@ impl Propagator for AllDifferent {
         if n == 0 {
             return Ok(());
         }
+        let AllDifferent {
+            vars, buf, matching, values, adj, var_to_val, val_to_var, seen, g, reachable,
+            dfs_stack, comp, index, low, on_stack, aug_stack, scc_work, tj_stack,
+        } = self;
 
         // Value universe (sorted, deduped); value index = position.
-        let mut values: Vec<i32> = Vec::new();
-        for &v in &self.vars {
+        values.clear();
+        for &v in vars.iter() {
             values.extend(store.values(v));
         }
         values.sort_unstable();
@@ -545,27 +615,62 @@ impl Propagator for AllDifferent {
         if m < n {
             return Err(Inconsistency); // pigeonhole
         }
-        let index_of = |val: i32| values.binary_search(&val).unwrap();
 
         // Variable -> value-index adjacency.
-        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
-        for (i, &v) in self.vars.iter().enumerate() {
-            adj[i] = store.values(v).map(&index_of).collect();
+        if adj.len() < n {
+            adj.resize(n, Vec::new());
+        }
+        for (i, &v) in vars.iter().enumerate() {
+            adj[i].clear();
+            adj[i].extend(store.values(v).map(|val| index_of(values, val)));
         }
 
-        // Maximum matching (Kuhn).
-        let mut var_to_val = vec![-1i32; n];
-        let mut val_to_var = vec![-1i32; m];
+        // Warm-start the matching from the previous call: keep each hinted pair
+        // that is still in the domain (validation makes the untrailed hint safe).
+        var_to_val.clear();
+        var_to_val.resize(n, -1);
+        val_to_var.clear();
+        val_to_var.resize(m, -1);
+        if matching.len() != n {
+            matching.clear();
+            matching.resize(n, i32::MIN);
+        }
         for i in 0..n {
-            let mut seen = vec![false; m];
-            if !augment(i, &adj, &mut val_to_var, &mut var_to_val, &mut seen) {
-                return Err(Inconsistency); // variable i uncoverable
+            let mv = matching[i];
+            if mv != i32::MIN && store.contains(vars[i], mv) {
+                let vidx = index_of(values, mv);
+                if val_to_var[vidx] < 0 {
+                    var_to_val[i] = vidx as i32;
+                    val_to_var[vidx] = i as i32;
+                }
             }
+        }
+
+        // Re-augment only the broken variables (Kuhn); the kept pairs stay.
+        seen.clear();
+        seen.resize(m, false);
+        for i in 0..n {
+            if var_to_val[i] < 0 {
+                seen.fill(false);
+                if !augment(i, adj, val_to_var, var_to_val, seen, aug_stack) {
+                    return Err(Inconsistency); // variable i uncoverable
+                }
+            }
+        }
+
+        // Persist the matching (as concrete values) for the next call.
+        for i in 0..n {
+            matching[i] = values[var_to_val[i] as usize];
         }
 
         // Oriented graph: nodes 0..n vars, n..n+m values.
         let total = n + m;
-        let mut g: Vec<Vec<usize>> = vec![Vec::new(); total];
+        while g.len() < total {
+            g.push(Vec::new());
+        }
+        for cell in g.iter_mut().take(total) {
+            cell.clear();
+        }
         for i in 0..n {
             let mv = var_to_val[i] as usize;
             g[i].push(n + mv); // matching: var -> value
@@ -577,44 +682,49 @@ impl Propagator for AllDifferent {
         }
 
         // Reachable from free (unmatched) values.
-        let mut reachable = vec![false; total];
-        let mut stack: Vec<usize> = Vec::new();
+        reachable.clear();
+        reachable.resize(total, false);
+        dfs_stack.clear();
         for vidx in 0..m {
             if val_to_var[vidx] < 0 {
                 reachable[n + vidx] = true;
-                stack.push(n + vidx);
+                dfs_stack.push(n + vidx);
             }
         }
-        while let Some(u) = stack.pop() {
+        while let Some(u) = dfs_stack.pop() {
             for &w in &g[u] {
                 if !reachable[w] {
                     reachable[w] = true;
-                    stack.push(w);
+                    dfs_stack.push(w);
                 }
             }
         }
 
         // Strongly-connected components.
-        let mut comp = vec![usize::MAX; total];
-        let mut index = vec![-1i64; total];
-        let mut low = vec![0i64; total];
-        let mut on_stack = vec![false; total];
-        let mut tj_stack = Vec::new();
+        comp.clear();
+        comp.resize(total, usize::MAX);
+        index.clear();
+        index.resize(total, -1);
+        low.clear();
+        low.resize(total, 0);
+        on_stack.clear();
+        on_stack.resize(total, false);
+        tj_stack.clear();
         let mut counter = 0i64;
         let mut ncomp = 0usize;
         for s in 0..total {
             if index[s] < 0 {
-                scc_dfs(s, &g, &mut index, &mut low, &mut on_stack, &mut tj_stack, &mut comp, &mut counter, &mut ncomp);
+                scc_visit(s, g, index, low, on_stack, tj_stack, comp, &mut counter, &mut ncomp, scc_work);
             }
         }
 
         // Remove every non-matching edge that lies in no maximum matching.
-        for (i, &var) in self.vars.iter().enumerate() {
+        for (i, &var) in vars.iter().enumerate() {
             let matched = var_to_val[i] as usize;
-            self.buf.clear();
-            self.buf.extend(store.values(var));
-            for &val in &self.buf {
-                let vidx = index_of(val);
+            buf.clear();
+            buf.extend(store.values(var));
+            for &val in buf.iter() {
+                let vidx = index_of(values, val);
                 if vidx == matched {
                     continue; // matching edge is always supported
                 }
@@ -629,7 +739,7 @@ impl Propagator for AllDifferent {
 
 /// Post `allDifferent(vars)` with Régin domain-consistent filtering.
 pub fn all_different(solver: &mut Solver, vars: &[VarId]) {
-    solver.post(Box::new(AllDifferent { vars: vars.to_vec(), buf: Vec::new() }));
+    solver.post(Box::new(AllDifferent { vars: vars.to_vec(), ..Default::default() }));
 }
 
 // ---------------------------------------------------------------------------

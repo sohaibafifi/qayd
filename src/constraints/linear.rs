@@ -2,7 +2,7 @@
 //! terms cannot overflow.
 
 use crate::ids::{PropId, VarId};
-use crate::propagator::{Event, Inconsistency, Propagator};
+use crate::propagator::{Event, Inconsistency, Priority, Propagator};
 use crate::store::{Premise, Solver, Store};
 
 /// Sentinel for "exclude no term" (conflict reason: every term contributes).
@@ -56,6 +56,8 @@ impl LinearLeq {
 }
 
 impl Propagator for LinearLeq {
+    fn priority(&self) -> Priority { Priority::Linear }
+
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &v in &self.vars {
             store.subscribe(v, me, Event::BoundChange);
@@ -156,6 +158,8 @@ impl LinearEq {
 }
 
 impl Propagator for LinearEq {
+    fn priority(&self) -> Priority { Priority::Linear }
+
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &v in &self.vars {
             store.subscribe(v, me, Event::BoundChange);
@@ -229,6 +233,8 @@ impl LinearNeq {
 }
 
 impl Propagator for LinearNeq {
+    fn priority(&self) -> Priority { Priority::Linear }
+
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &v in &self.vars {
             store.subscribe(v, me, Event::Fix);

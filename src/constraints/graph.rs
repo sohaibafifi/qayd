@@ -1,7 +1,7 @@
 //! Graph constraints: `circuit`.
 
 use crate::ids::{PropId, VarId};
-use crate::propagator::{Event, Inconsistency, Propagator};
+use crate::propagator::{Event, Inconsistency, Priority, Propagator};
 use crate::store::{Premise, Solver, Store};
 use crate::trail::ReversibleInt;
 
@@ -147,6 +147,8 @@ impl Circuit {
 }
 
 impl Propagator for Circuit {
+    fn priority(&self) -> Priority { Priority::Expensive }
+
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &v in &self.succ {
             store.subscribe(v, me, Event::Fix);

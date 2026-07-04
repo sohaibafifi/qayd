@@ -5,15 +5,17 @@
 //! [`Cdcl::optimize`] is the COP driver: CDCL branch-and-bound with restarts.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::Arc;
 
-use crate::constraints::intension::intension;
-use crate::constraints::linear::{linear, Relation};
+use crate::constraints::linear::clamp_i32;
 use crate::expr;
-use crate::ids::VarId;
+use crate::expr::Expr;
+use crate::ids::{PropId, VarId};
 use crate::lcg::lit::{Lit, LitOrConst};
 use crate::lcg::trail::{Cdcl, Reason};
+use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::search::{Objective, SearchControl, SolveStats};
-use crate::store::Solver;
+use crate::store::{Premise, Solver, Store};
 
 /// One in every `REPHASE_PERIOD` restart segments rephases (ignores saved phases
 /// and dives with a fresh polarity). The other segments keep saved phases, so
@@ -86,7 +88,6 @@ impl Cdcl<'_> {
     /// Branching heuristic: unfixed variable minimising `size / (wdeg + activity)`
     /// (dom/wdeg combined with VSIDS activity), or `None` if all fixed.
     fn select_var(&self, vars: &[VarId], objective: Option<&ObjectiveImpact>) -> Option<VarId> {
-        let weights = self.solver.weights();
         let mut best: Option<VarId> = None;
         let mut best_score = f64::INFINITY;
         let mut best_objective: Option<VarId> = None;
@@ -95,7 +96,7 @@ impl Cdcl<'_> {
         for &v in vars {
             let size = self.solver.store.size(v);
             if size > 1 {
-                let wdeg = self.solver.store.var_weight(v, weights) as f64;
+                let wdeg = self.solver.store.var_weight_cached(v) as f64;
                 let score = size as f64 / (wdeg + self.activity[v.index()]);
                 if let Some(objective) = objective {
                     let impact = objective.score(self.solver, v);
@@ -272,7 +273,13 @@ impl Cdcl<'_> {
     }
 
     /// Assert a strict improvement on a materialized or symbolic objective.
-    fn tighten_objective(&mut self, objective: Objective<'_>, minimizing: bool, incumbent: i64) -> bool {
+    ///
+    /// The `Var` path asserts a root literal on the existing objective atom, so
+    /// it never accumulates. `Linear`/`Expr` have no objective atom, so the bound
+    /// is enforced by ONE persistent propagator whose rhs lives in `cell`; each
+    /// improving incumbent updates the cell (bounds only ever tighten, keeping it
+    /// sound) and re-enqueues that propagator instead of posting a new one.
+    fn tighten_objective(&mut self, objective: Objective<'_>, minimizing: bool, incumbent: i64, cell: &mut ObjBoundCell) -> bool {
         match objective {
             Objective::Var(obj) => self.tighten_bound(obj, minimizing, incumbent as i32),
             Objective::Linear { coeffs, vars } => {
@@ -280,18 +287,42 @@ impl Cdcl<'_> {
                     return false;
                 };
                 self.backjump_to(0);
-                linear(self.solver, coeffs, vars, if minimizing { Relation::Le } else { Relation::Ge }, bound);
+                // Minimizing: ∑ coeffs·vars ≤ bound. Maximizing: negate both so it
+                // is still a `≤ c` constraint whose c falls as incumbents improve.
+                let c = if minimizing { bound } else { -bound };
+                match &cell.handle {
+                    Some((id, atom)) => {
+                        atom.store(c, Ordering::Relaxed);
+                        self.solver.store.enqueue(*id);
+                    }
+                    None => {
+                        let atom = Arc::new(AtomicI64::new(c));
+                        let coeffs = if minimizing { coeffs.to_vec() } else { coeffs.iter().map(|&a| -a).collect() };
+                        let id = self.solver.post(Box::new(ObjLinearLeq::new(coeffs, vars, Arc::clone(&atom))));
+                        cell.handle = Some((id, atom));
+                    }
+                }
                 self.propagate_and_learn()
             }
-            Objective::Expr(expr) => {
+            Objective::Expr(e) => {
                 let Some(bound) = strict_bound(incumbent, minimizing) else {
                     return false;
                 };
                 self.backjump_to(0);
-                intension(
-                    self.solver,
-                    if minimizing { expr::le(expr.clone(), expr::int(bound)) } else { expr::ge(expr.clone(), expr::int(bound)) },
-                );
+                let c = if minimizing { bound } else { -bound };
+                match &cell.handle {
+                    Some((id, atom)) => {
+                        atom.store(c, Ordering::Relaxed);
+                        self.solver.store.enqueue(*id);
+                    }
+                    None => {
+                        let atom = Arc::new(AtomicI64::new(c));
+                        // Maximizing (expr ≥ bound) as neg(expr) ≤ -bound.
+                        let e = if minimizing { e.clone() } else { expr::neg(e.clone()) };
+                        let id = self.solver.post(Box::new(ObjExprLeq::new(e, Arc::clone(&atom))));
+                        cell.handle = Some((id, atom));
+                    }
+                }
                 self.propagate_and_learn()
             }
         }
@@ -393,6 +424,7 @@ impl Cdcl<'_> {
         enforced: &mut Option<i64>,
         phase: &mut [Option<i32>],
         stats: &mut SolveStats,
+        cell: &mut ObjBoundCell,
         on_improve: &mut F,
     ) -> bool {
         let value = objective.value(self.solver);
@@ -404,7 +436,7 @@ impl Cdcl<'_> {
         on_improve(value, &assignment);
         *best = Some((assignment, value));
         *enforced = Some(value);
-        self.tighten_objective(objective, minimizing, value)
+        self.tighten_objective(objective, minimizing, value, cell)
     }
 
     /// CDCL branch-and-bound with restarts. Returns the best `(assignment,
@@ -465,6 +497,7 @@ impl Cdcl<'_> {
         };
         let objective_impact = ObjectiveImpact::new(objective, self.solver.store.num_vars(), minimizing);
         let mut enforced = None;
+        let mut obj_bound = ObjBoundCell::default();
         let mut complete = true;
         let conflict_limit = conflict_budget.map(|n| self.conflicts.saturating_add(n));
         if !self.sync_shared_clauses() {
@@ -484,7 +517,7 @@ impl Cdcl<'_> {
                     let stronger = enforced.is_none_or(|old| if minimizing { value < old } else { value > old });
                     if stronger {
                         enforced = Some(value);
-                        if !self.tighten_objective(objective, minimizing, value) {
+                        if !self.tighten_objective(objective, minimizing, value, &mut obj_bound) {
                             break;
                         }
                     }
@@ -496,7 +529,7 @@ impl Cdcl<'_> {
             match self.select_var(vars, objective_impact.as_ref()) {
                 None => {
                     let keep_searching =
-                        self.accept_solution(vars, objective, minimizing, &mut best, &mut enforced, &mut phase, &mut stats, on_improve);
+                        self.accept_solution(vars, objective, minimizing, &mut best, &mut enforced, &mut phase, &mut stats, &mut obj_bound, on_improve);
                     if !keep_searching {
                         break; // optimal
                     }
@@ -556,5 +589,191 @@ impl Cdcl<'_> {
         stats.failures = self.conflicts;
         self.copy_inprocessing_stats(&mut stats);
         (solution, stats, complete)
+    }
+}
+
+/// Handle to the single persistent objective-bound propagator (Linear/Expr).
+/// Owned by one `optimize` run; the propagator is posted lazily on the first
+/// improving incumbent, so a solver cloned from the immutable model template
+/// (parallel/cube workers, see `parallel.rs`) never aliases another worker's
+/// bound cell — each posts its own on its own first incumbent.
+// ponytail: per-run cell; no cross-run reuse needed since a solver runs one optimize.
+#[derive(Default)]
+struct ObjBoundCell {
+    handle: Option<(PropId, Arc<AtomicI64>)>,
+}
+
+/// `∑ coeffs·vars ≤ bound`, with `bound` read from a shared cell each run so it
+/// can tighten monotonically in place. Filtering mirrors `constraints::linear`'s
+/// `LinearLeq`; the only difference is the mutable rhs.
+#[derive(Clone)]
+struct ObjLinearLeq {
+    coeffs: Vec<i64>,
+    vars: Vec<VarId>,
+    bound: Arc<AtomicI64>,
+    term_min: Vec<i64>,
+}
+
+impl ObjLinearLeq {
+    fn new(coeffs: Vec<i64>, vars: &[VarId], bound: Arc<AtomicI64>) -> Self {
+        let n = vars.len();
+        Self { coeffs, vars: vars.to_vec(), bound, term_min: vec![0; n] }
+    }
+
+    fn min_side(&self, store: &Store, skip: usize) -> Vec<Premise> {
+        let mut why = Vec::new();
+        for (j, (&a, &v)) in self.coeffs.iter().zip(&self.vars).enumerate() {
+            if j == skip || a == 0 {
+                continue;
+            }
+            why.push(if a > 0 { Premise::Ge { var: v, bound: store.min(v) } } else { Premise::Le { var: v, bound: store.max(v) } });
+        }
+        why
+    }
+}
+
+impl Propagator for ObjLinearLeq {
+    fn register(&mut self, store: &mut Store, me: PropId) {
+        for &v in &self.vars {
+            store.subscribe(v, me, Event::BoundChange);
+        }
+    }
+
+    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+        let c = self.bound.load(Ordering::Relaxed);
+        loop {
+            let mut sum_min: i64 = 0;
+            let mut sum_max: i64 = 0;
+            for (slot, (&a, &v)) in self.term_min.iter_mut().zip(self.coeffs.iter().zip(&self.vars)) {
+                let lo = store.min(v) as i64;
+                let hi = store.max(v) as i64;
+                let (tmin, tmax) = if a >= 0 { (a * lo, a * hi) } else { (a * hi, a * lo) };
+                *slot = tmin;
+                sum_min += tmin;
+                sum_max += tmax;
+            }
+
+            if sum_min > c {
+                return Err(store.fail_because(self.min_side(store, usize::MAX)));
+            }
+            if sum_max <= c {
+                return Ok(()); // entailed
+            }
+
+            let mut changed = false;
+            for (idx, (&a, &v)) in self.coeffs.iter().zip(&self.vars).enumerate() {
+                if a == 0 {
+                    continue;
+                }
+                let allowed = c - (sum_min - self.term_min[idx]);
+                if a > 0 {
+                    let bound = clamp_i32(floor_div(allowed, a));
+                    if bound < store.max(v) {
+                        store.remove_above_because(v, bound, self.min_side(store, idx))?;
+                        changed = true;
+                    }
+                } else {
+                    let bound = clamp_i32(ceil_div(allowed, a));
+                    if bound > store.min(v) {
+                        store.remove_below_because(v, bound, self.min_side(store, idx))?;
+                        changed = true;
+                    }
+                }
+            }
+
+            if !changed {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// `expr ≤ bound`, with `bound` from a shared cell. Filtering mirrors
+/// `constraints::intension`'s `Intension` specialized to a `≤ c` root so the rhs
+/// can tighten in place (a maximizing objective is posted as `neg(expr) ≤ -c`).
+#[derive(Clone)]
+struct ObjExprLeq {
+    expr: Expr,
+    vars: Vec<VarId>,
+    bound: Arc<AtomicI64>,
+    scratch: Vec<i32>,
+}
+
+impl ObjExprLeq {
+    fn new(expr: Expr, bound: Arc<AtomicI64>) -> Self {
+        let mut vars = Vec::new();
+        expr.collect_vars(&mut vars);
+        vars.sort_unstable();
+        vars.dedup();
+        Self { expr, vars, bound, scratch: Vec::new() }
+    }
+}
+
+impl Propagator for ObjExprLeq {
+    fn register(&mut self, store: &mut Store, me: PropId) {
+        for &v in &self.vars {
+            store.subscribe(v, me, Event::DomainChange);
+        }
+    }
+
+    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+        let c = self.bound.load(Ordering::Relaxed);
+        let (lo, hi) = {
+            let dom = |x: VarId| (store.min(x) as i64, store.max(x) as i64);
+            self.expr.bounds(&dom)
+        };
+        if lo > c {
+            return Err(Inconsistency); // can never hold
+        }
+        if hi <= c {
+            return Ok(()); // entailed
+        }
+
+        for &v in &self.vars {
+            if store.is_fixed(v) {
+                continue;
+            }
+            self.scratch.clear();
+            self.scratch.extend(store.values(v));
+            for &val in &self.scratch {
+                let dead = {
+                    let dom = |x: VarId| if x == v { (val as i64, val as i64) } else { (store.min(x) as i64, store.max(x) as i64) };
+                    self.expr.bounds(&dom).0 > c
+                };
+                if dead {
+                    store.remove(v, val)?;
+                }
+            }
+        }
+
+        if self.vars.iter().all(|&x| store.is_fixed(x)) {
+            match self.expr.eval(&|x| store.value(x) as i64) {
+                Some(n) if n <= c => {}
+                _ => return Err(Inconsistency),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Floor of `a / b` for integers (Rust `/` truncates toward zero).
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b;
+    let r = a % b;
+    if r != 0 && ((r < 0) != (b < 0)) {
+        q - 1
+    } else {
+        q
+    }
+}
+
+/// Ceiling of `a / b` for integers.
+fn ceil_div(a: i64, b: i64) -> i64 {
+    let q = a / b;
+    let r = a % b;
+    if r != 0 && ((r < 0) == (b < 0)) {
+        q + 1
+    } else {
+        q
     }
 }

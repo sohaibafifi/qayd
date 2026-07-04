@@ -9,6 +9,11 @@ use crate::lcg::lit::{LazyAtomRegistry, Lit};
 const MAX_SHARED_LEN: usize = 8;
 const MAX_SHARED_LBD: u32 = 4;
 
+/// Ring capacity for the shared clause pool (power of two). Bounds memory on
+/// long runs; a lagging reader that falls further behind than this drops the
+/// oldest shared clauses, which is sound (sharing is best-effort pruning).
+const SHARED_POOL_CAP: usize = 1 << 14;
+
 /// A handle to a clause in the [`ClauseDb`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ClauseRef(pub u32);
@@ -37,6 +42,9 @@ pub struct Clause {
 #[derive(Default)]
 pub struct ClauseDb {
     clauses: Vec<Clause>,
+    /// Tombstoned slots available for reuse, so the arena tracks peak live
+    /// clauses instead of every clause ever created.
+    free: Vec<u32>,
 }
 
 impl ClauseDb {
@@ -45,10 +53,17 @@ impl ClauseDb {
         Self::default()
     }
 
-    /// Number of clauses.
+    /// Number of arena slots (live plus tombstoned).
     #[inline]
     pub fn len(&self) -> usize {
         self.clauses.len()
+    }
+
+    /// Number of live (non-tombstone) clauses. Bounded across learn/delete
+    /// cycles because deleted slots are reused rather than left dead.
+    #[inline]
+    pub fn live_len(&self) -> usize {
+        self.clauses.len() - self.free.len()
     }
 
     /// Whether the database is empty.
@@ -69,11 +84,26 @@ impl ClauseDb {
         &mut self.clauses[c.index()]
     }
 
-    /// Add a clause, returning its handle.
+    /// Add a clause, returning its handle. Reuses a tombstoned slot when one is
+    /// free, so a deleted slot's index is recycled with a fresh clause.
     pub fn add(&mut self, lits: Arc<[Lit]>, watch: [usize; 2], deletable: bool, lbd: u32) -> ClauseRef {
-        let r = ClauseRef(self.clauses.len() as u32);
-        self.clauses.push(Clause { lits, watch, deletable, lbd });
-        r
+        let clause = Clause { lits, watch, deletable, lbd };
+        if let Some(i) = self.free.pop() {
+            self.clauses[i as usize] = clause;
+            ClauseRef(i)
+        } else {
+            let r = ClauseRef(self.clauses.len() as u32);
+            self.clauses.push(clause);
+            r
+        }
+    }
+
+    /// Tombstone a slot and mark it for reuse. The index stays valid (empty
+    /// literals) until `add` recycles it. Sound only when no live watch,
+    /// binary-implication, or dereferenced reason still points at `c`.
+    pub fn remove(&mut self, c: ClauseRef) {
+        self.clauses[c.index()].lits = Arc::from([]);
+        self.free.push(c.0);
     }
 }
 
@@ -85,22 +115,48 @@ pub(crate) struct SharedClause {
     source: usize,
 }
 
-/// Append-only shared clause pool. Workers keep private watch state.
+/// Fixed-capacity ring of shared clauses with a monotonic write index.
+struct SharedRing {
+    slots: Vec<Option<SharedClause>>,
+    /// `capacity - 1`; capacity is a power of two so this is the index mask.
+    mask: usize,
+    /// Total clauses ever written; the live window is `[write - capacity, write)`.
+    write: u64,
+}
+
+/// Ring capacity from the environment (test hook), else [`SHARED_POOL_CAP`].
+/// Rounded down to a power of two; dropping old clauses is always sound, so a
+/// small forced capacity only reduces sharing, never changes any answer.
+fn shared_pool_cap() -> usize {
+    match std::env::var("QAYD_SHARED_POOL_CAP").ok().and_then(|s| s.parse::<usize>().ok()) {
+        Some(n) if n >= 1 => 1usize << (usize::BITS - 1 - n.leading_zeros()),
+        _ => SHARED_POOL_CAP,
+    }
+}
+
+/// Bounded shared clause pool. Workers keep private watch state and read
+/// cursors; the ring caps memory and drops old clauses under a lagging reader.
 pub(crate) struct SharedClausePool {
-    clauses: Mutex<Vec<SharedClause>>,
+    ring: Mutex<SharedRing>,
     imported: AtomicU64,
     lazy_atoms: Arc<LazyAtomRegistry>,
 }
 
 impl Default for SharedClausePool {
     fn default() -> Self {
-        Self { clauses: Mutex::new(Vec::new()), imported: AtomicU64::new(0), lazy_atoms: LazyAtomRegistry::new() }
+        let cap = shared_pool_cap();
+        Self {
+            ring: Mutex::new(SharedRing { slots: vec![None; cap], mask: cap - 1, write: 0 }),
+            imported: AtomicU64::new(0),
+            lazy_atoms: LazyAtomRegistry::new(),
+        }
     }
 }
 
 impl SharedClausePool {
+    /// Total clauses published to the pool (not the live window size).
     pub fn len(&self) -> usize {
-        self.clauses.lock().unwrap().len()
+        self.ring.lock().unwrap().write as usize
     }
 
     pub fn imported(&self) -> u64 {
@@ -116,7 +172,7 @@ impl SharedClausePool {
 pub(crate) struct ClauseSharing {
     pool: Arc<SharedClausePool>,
     worker: usize,
-    cursor: usize,
+    cursor: u64,
 }
 
 impl ClauseSharing {
@@ -128,14 +184,26 @@ impl ClauseSharing {
         if lits.is_empty() || lits.len() > MAX_SHARED_LEN || lbd > MAX_SHARED_LBD {
             return;
         }
-        self.pool.clauses.lock().unwrap().push(SharedClause { lits, lbd, source: self.worker });
+        let mut ring = self.pool.ring.lock().unwrap();
+        let idx = (ring.write as usize) & ring.mask;
+        ring.slots[idx] = Some(SharedClause { lits, lbd, source: self.worker });
+        ring.write += 1;
     }
 
     pub fn copy_new_into(&mut self, out: &mut Vec<SharedClause>) {
-        let clauses = self.pool.clauses.lock().unwrap();
         out.clear();
-        out.extend_from_slice(&clauses[self.cursor..]);
-        self.cursor = clauses.len();
+        let ring = self.pool.ring.lock().unwrap();
+        let write = ring.write;
+        let cap = ring.mask as u64 + 1;
+        // A reader lagging more than the ring holds skips forward to the oldest
+        // still-present clause; the gap's clauses are lost (sound: less pruning).
+        let start = self.cursor.max(write.saturating_sub(cap));
+        for i in start..write {
+            if let Some(c) = &ring.slots[(i as usize) & ring.mask] {
+                out.push(c.clone());
+            }
+        }
+        self.cursor = write;
     }
 
     pub fn is_own(&self, clause: &SharedClause) -> bool {

@@ -10,7 +10,12 @@ use std::sync::Arc;
 use crate::propagator::Inconsistency;
 use crate::trail::{ReversibleInt, Trail};
 
-const MAX_DENSE_VALUES: usize = 10_000_000;
+/// Contiguous ranges larger than this use bounds-only storage. Dense sparse-set
+/// storage is valuable for small enumerated domains, but large ranges are mostly
+/// pruned by moving bounds and should not allocate two vectors over the full
+/// span.
+const MAX_DENSE_RANGE_VALUES: usize = 4_096;
+const MAX_DENSE_SET_SPAN: usize = 10_000_000;
 const DENSE_SET_FACTOR: usize = 4;
 
 #[derive(Clone)]
@@ -20,7 +25,9 @@ enum ValueMap {
     /// Internal index `i` represents `values[i]`.
     Sparse { values: Arc<[i32]> },
     /// Wide contiguous range with a reusable prefix of removed interior values.
-    Bounds { holes: Vec<i32>, holes_len: ReversibleInt, empty: ReversibleInt },
+    /// `active_holes` counts holes in `holes[..holes_len]` currently inside
+    /// `[min, max]`, so `size = span_len(min, max) - active_holes` is O(1).
+    Bounds { holes: Vec<i32>, holes_len: ReversibleInt, empty: ReversibleInt, active_holes: ReversibleInt },
 }
 
 /// A finite-integer domain with storage selected from its root shape.
@@ -41,7 +48,7 @@ impl Domain {
     pub fn new_range(lo: i32, hi: i32, trail: &mut Trail) -> Self {
         assert!(lo <= hi, "empty domain range [{lo}, {hi}]");
         let size = span_len(lo, hi);
-        if size <= MAX_DENSE_VALUES {
+        if size <= MAX_DENSE_RANGE_VALUES {
             Self::from_dense_range(lo, hi, size, trail)
         } else {
             Self::from_bounds_range(lo, hi, trail)
@@ -57,7 +64,7 @@ impl Domain {
         let lo = vals[0];
         let hi = *vals.last().unwrap();
         let span = span_len(lo, hi);
-        if span <= MAX_DENSE_VALUES && span <= vals.len().saturating_mul(DENSE_SET_FACTOR) {
+        if span <= MAX_DENSE_SET_SPAN && span <= vals.len().saturating_mul(DENSE_SET_FACTOR) {
             Self::from_dense_set(vals, lo, hi, span, trail)
         } else {
             Self::from_sparse_set(vals, trail)
@@ -131,8 +138,9 @@ impl Domain {
     fn from_bounds_range(lo: i32, hi: i32, trail: &mut Trail) -> Self {
         let holes_len = trail.new_int(0);
         let empty = trail.new_int(0);
+        let active_holes = trail.new_int(0);
         Self {
-            values: ValueMap::Bounds { holes: Vec::new(), holes_len, empty },
+            values: ValueMap::Bounds { holes: Vec::new(), holes_len, empty, active_holes },
             dense: Vec::new(),
             sparse: Vec::new(),
             size: trail.new_int(0),
@@ -145,14 +153,11 @@ impl Domain {
     #[inline]
     pub fn size(&self, trail: &Trail) -> usize {
         match &self.values {
-            ValueMap::Bounds { holes, holes_len, empty } => {
+            ValueMap::Bounds { empty, active_holes, .. } => {
                 if trail.get(*empty) != 0 {
                     return 0;
                 }
-                let min = self.min(trail);
-                let max = self.max(trail);
-                let removed = holes[..trail.get(*holes_len) as usize].iter().filter(|&&v| min <= v && v <= max).count();
-                span_len(min, max) - removed
+                span_len(self.min(trail), self.max(trail)) - trail.get(*active_holes) as usize
             }
             _ => trail.get(self.size) as usize,
         }
@@ -180,7 +185,7 @@ impl Domain {
     #[inline]
     pub fn contains(&self, val: i32, trail: &Trail) -> bool {
         match &self.values {
-            ValueMap::Bounds { holes, holes_len, empty } => {
+            ValueMap::Bounds { holes, holes_len, empty, .. } => {
                 trail.get(*empty) == 0
                     && self.min(trail) <= val
                     && val <= self.max(trail)
@@ -221,11 +226,13 @@ impl Domain {
         }
     }
 
-    pub(crate) fn is_sparse(&self) -> bool {
+    /// Whether this domain uses cardinality-sized sparse storage.
+    pub fn is_sparse(&self) -> bool {
         matches!(&self.values, ValueMap::Sparse { .. })
     }
 
-    pub(crate) fn is_bounds(&self) -> bool {
+    /// Whether this domain uses bounds-only storage (no per-value arrays).
+    pub fn is_bounds(&self) -> bool {
         matches!(&self.values, ValueMap::Bounds { .. })
     }
 
@@ -295,6 +302,8 @@ impl Domain {
             let changed = self.size(trail) > 1;
             trail.set(self.min, val);
             trail.set(self.max, val);
+            let ValueMap::Bounds { active_holes, .. } = &self.values else { unreachable!() };
+            trail.set(*active_holes, 0);
             return Ok(changed);
         }
         let Some(i) = self.index_of(val) else {
@@ -431,14 +440,16 @@ impl Domain {
         } else if val == self.max(trail) {
             self.set_bounds_max(i64::from(val) - 1, trail);
         } else {
-            let ValueMap::Bounds { holes, holes_len, .. } = &mut self.values else { unreachable!() };
-            let len = trail.get(*holes_len) as usize;
+            let ValueMap::Bounds { holes, holes_len, active_holes, .. } = &mut self.values else { unreachable!() };
+            let (holes_len, active_holes) = (*holes_len, *active_holes);
+            let len = trail.get(holes_len) as usize;
             if len == holes.len() {
                 holes.push(val);
             } else {
                 holes[len] = val;
             }
-            trail.set(*holes_len, (len + 1) as i32);
+            trail.set(holes_len, (len + 1) as i32);
+            trail.set(active_holes, trail.get(active_holes) + 1);
         }
         true
     }
@@ -463,24 +474,36 @@ impl Domain {
 
     fn set_bounds_min(&mut self, mut val: i64, trail: &mut Trail) {
         let max = i64::from(self.max(trail));
+        let old_min = self.min(trail);
         while val <= max && self.is_bounds_hole(val as i32, trail) {
             val += 1;
         }
         if val > max {
             self.set_bounds_empty(trail);
         } else {
+            // Holes in [old_min, val) leave the range; drop them from the count.
+            let crossed = self.count_holes_in(old_min, (val - 1) as i32, trail) as i32;
+            let ValueMap::Bounds { active_holes, .. } = &self.values else { unreachable!() };
+            let active_holes = *active_holes;
+            trail.set(active_holes, trail.get(active_holes) - crossed);
             trail.set(self.min, val as i32);
         }
     }
 
     fn set_bounds_max(&mut self, mut val: i64, trail: &mut Trail) {
         let min = i64::from(self.min(trail));
+        let old_max = self.max(trail);
         while val >= min && self.is_bounds_hole(val as i32, trail) {
             val -= 1;
         }
         if val < min {
             self.set_bounds_empty(trail);
         } else {
+            // Holes in (val, old_max] leave the range; drop them from the count.
+            let crossed = self.count_holes_in((val + 1) as i32, old_max, trail) as i32;
+            let ValueMap::Bounds { active_holes, .. } = &self.values else { unreachable!() };
+            let active_holes = *active_holes;
+            trail.set(active_holes, trail.get(active_holes) - crossed);
             trail.set(self.max, val as i32);
         }
     }
@@ -488,6 +511,11 @@ impl Domain {
     fn is_bounds_hole(&self, val: i32, trail: &Trail) -> bool {
         let ValueMap::Bounds { holes, holes_len, .. } = &self.values else { unreachable!() };
         holes[..trail.get(*holes_len) as usize].contains(&val)
+    }
+
+    fn count_holes_in(&self, lo: i32, hi: i32, trail: &Trail) -> usize {
+        let ValueMap::Bounds { holes, holes_len, .. } = &self.values else { unreachable!() };
+        holes[..trail.get(*holes_len) as usize].iter().filter(|&&v| lo <= v && v <= hi).count()
     }
 
     fn set_bounds_empty(&self, trail: &mut Trail) {

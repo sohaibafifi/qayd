@@ -9,8 +9,33 @@ use crate::domains::int::Domain;
 use crate::domains::interval::{IntervalDomain, IntervalEvent, IntervalPresence};
 use crate::domains::list::{ListDomain, ListEvent};
 use crate::ids::{IntervalId, ListId, PropId, VarId};
-use crate::propagator::{Event, Inconsistency, Propagator};
+use crate::propagator::{Event, Inconsistency, Priority, Propagator, NBANDS};
 use crate::trail::{ReversibleInt, Trail};
+
+thread_local! {
+    /// Per-thread count of propagator invocations (a scheduling diagnostic;
+    /// no effect on results). Read via [`prop_calls`].
+    static PROP_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Per-thread count of `Expensive`-band invocations — the calls whose cost
+    /// band ordering is meant to reduce. Read via [`expensive_calls`].
+    static EXPENSIVE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Propagator invocations on this thread since the last [`reset_prop_calls`].
+pub fn prop_calls() -> u64 {
+    PROP_CALLS.with(std::cell::Cell::get)
+}
+
+/// `Expensive`-band invocations on this thread since the last [`reset_prop_calls`].
+pub fn expensive_calls() -> u64 {
+    EXPENSIVE_CALLS.with(std::cell::Cell::get)
+}
+
+/// Reset this thread's propagator-invocation counters.
+pub fn reset_prop_calls() {
+    PROP_CALLS.with(|c| c.set(0));
+    EXPENSIVE_CALLS.with(|c| c.set(0));
+}
 
 /// Per-variable subscriptions and their event granularity.
 #[derive(Clone, Default)]
@@ -93,10 +118,22 @@ pub struct Store {
     interval_domains: Vec<IntervalDomain>,
     trail: Trail,
     subs: Vec<VarSubs>,
+    /// Cached weighted degree per variable: the sum of `dom/wdeg` weights over
+    /// each of its subscription entries (mirrors [`var_weight`](Store::var_weight)).
+    /// Grown per entry in [`subscribe`](Store::subscribe) and kept in sync with
+    /// weight bumps by [`bump_var_weight`](Store::bump_var_weight), so the
+    /// brancher reads it in O(1) instead of rescanning every subscription.
+    var_weight_cache: Vec<u64>,
     /// Variables used by at least one propagator, including root-only filters.
     relevant: Vec<bool>,
-    /// Propagators waiting to run.
-    queue: VecDeque<PropId>,
+    /// Propagators waiting to run, bucketed by cost band; the lowest non-empty
+    /// band drains first so cheap propagators reach fixpoint before pricier ones.
+    queues: [VecDeque<PropId>; NBANDS],
+    /// Each propagator's cost band, indexed by `PropId`; picks its queue.
+    prio: Vec<Priority>,
+    /// Diagnostic: collapse all bands into one FIFO (the pre-banding scheduler),
+    /// so a benchmark can compare band ordering in-process. Off in normal use.
+    single_band: bool,
     /// `enqueued[prop]` guards against queuing a propagator twice.
     enqueued: Vec<bool>,
     /// The propagator currently running, if any, so it is not re-woken by its
@@ -220,6 +257,7 @@ impl Store {
         let dom = Domain::new_range(lo, hi, &mut self.trail);
         self.domains.push(dom);
         self.subs.push(VarSubs::default());
+        self.var_weight_cache.push(0);
         self.relevant.push(false);
         id
     }
@@ -230,6 +268,7 @@ impl Store {
         let dom = Domain::new_set(values, &mut self.trail);
         self.domains.push(dom);
         self.subs.push(VarSubs::default());
+        self.var_weight_cache.push(0);
         self.relevant.push(false);
         id
     }
@@ -833,11 +872,13 @@ impl Store {
         let s = &mut self.subs[var.index()];
         if !s.entries.contains(&(event, prop)) {
             s.entries.push((event, prop));
+            // A fresh entry adds one term (weight 1 at registration time) to this
+            // variable's weighted degree; bumps later adjust it via `bump_var_weight`.
+            self.var_weight_cache[var.index()] += 1;
         }
-        let scope = &mut self.scope[prop.index()];
-        if !scope.contains(&var) {
-            scope.push(var);
-        }
+        // Duplicates are collapsed once by `finalize_scope` after registration,
+        // keeping n-ary registration near-linear instead of O(n^2) contains scans.
+        self.scope[prop.index()].push(var);
     }
 
     /// Subscribe `prop` to list changes at the given granularity.
@@ -901,33 +942,67 @@ impl Store {
     pub(crate) fn alloc_prop(&mut self) -> PropId {
         let id = PropId(self.enqueued.len() as u32);
         self.enqueued.push(false);
+        self.prio.push(Priority::Linear);
         self.scope.push(Vec::new());
         id
     }
 
-    /// Put `prop` on the queue unless it is already there.
-    pub(crate) fn enqueue(&mut self, prop: PropId) {
-        if !self.enqueued[prop.index()] {
-            self.enqueued[prop.index()] = true;
-            self.queue.push_back(prop);
+    /// Set `prop`'s scheduling band (called once, at post time).
+    pub(crate) fn set_priority(&mut self, prop: PropId, priority: Priority) {
+        self.prio[prop.index()] = priority;
+    }
+
+    /// Collapse duplicate variables in `prop`'s scope, preserving first-seen
+    /// order. Run once after registration so `subscribe` stays scan-free.
+    pub(crate) fn finalize_scope(&mut self, prop: PropId) {
+        let scope = &mut self.scope[prop.index()];
+        let mut seen = std::collections::HashSet::new();
+        scope.retain(|v| seen.insert(*v));
+    }
+
+    /// The queue index for `prop`: its band, or 0 when collapsed to one FIFO.
+    fn band_of(&self, prop: PropId) -> usize {
+        if self.single_band {
+            0
+        } else {
+            self.prio[prop.index()].index()
         }
     }
 
-    /// Pop the next propagator to run, clearing its enqueued flag.
+    /// Enable single-band (FIFO) scheduling for benchmarking. Off in normal use.
+    pub(crate) fn set_single_band(&mut self, on: bool) {
+        self.single_band = on;
+    }
+
+    /// Put `prop` on its band's queue unless it is already queued.
+    pub(crate) fn enqueue(&mut self, prop: PropId) {
+        if !self.enqueued[prop.index()] {
+            self.enqueued[prop.index()] = true;
+            let band = self.band_of(prop);
+            self.queues[band].push_back(prop);
+        }
+    }
+
+    /// Pop the next propagator to run from the lowest non-empty band, clearing
+    /// its enqueued flag.
     pub(crate) fn dequeue(&mut self) -> Option<PropId> {
-        let p = self.queue.pop_front()?;
-        self.enqueued[p.index()] = false;
-        Some(p)
+        for q in &mut self.queues {
+            if let Some(p) = q.pop_front() {
+                self.enqueued[p.index()] = false;
+                return Some(p);
+            }
+        }
+        None
     }
 
     /// The next propagator that would run, without dequeuing it.
     pub(crate) fn peek_queue(&self) -> Option<PropId> {
-        self.queue.front().copied()
+        self.queues.iter().find_map(|q| q.front().copied())
     }
 
-    /// Whether the propagation queue is empty.
+    /// Whether every band's queue is empty.
     pub(crate) fn queue_is_empty(&self) -> bool {
-        self.queue.is_empty()
+        self.queues.iter().all(VecDeque::is_empty)
     }
 
     /// Snapshot `prop`'s current scope domains into `buf` (reusing its capacity;
@@ -942,33 +1017,35 @@ impl Store {
     /// Drop every queued propagator (after a failure, so stale entries do not
     /// leak into the sibling branch).
     pub(crate) fn clear_queue(&mut self) {
-        while let Some(p) = self.queue.pop_front() {
-            self.enqueued[p.index()] = false;
+        for q in &mut self.queues {
+            while let Some(p) = q.pop_front() {
+                self.enqueued[p.index()] = false;
+            }
         }
     }
 
     /// Wake the appropriate subscribers of `var` (except the running one).
     fn notify(&mut self, var: VarId, bounds_moved: bool, fixed: bool) {
-        // Split the borrow: read subscription lists while mutating queue/flags.
+        // Split the borrow: read subscription lists while mutating queues/flags.
         // Subscription lists never change during propagation.
-        let Store { subs, queue, enqueued, current, .. } = self;
+        let Store { subs, queues, enqueued, prio, single_band, current, .. } = self;
         let s = &subs[var.index()];
         for &(event, p) in &s.entries {
             if event == Event::DomainChange || (bounds_moved && event == Event::BoundChange) || (fixed && event == Event::Fix) {
-                Self::wake(queue, enqueued, *current, p);
+                Self::wake(queues, enqueued, prio, *single_band, *current, p);
             }
         }
     }
 
-    /// Wake subscribers of a interval event.
-    /// Enqueue `p` unless it is the running propagator or already queued.
-    fn wake(queue: &mut VecDeque<PropId>, enqueued: &mut [bool], current: Option<PropId>, p: PropId) {
+    /// Enqueue `p` on its band unless it is the running propagator or already queued.
+    fn wake(queues: &mut [VecDeque<PropId>; NBANDS], enqueued: &mut [bool], prio: &[Priority], single_band: bool, current: Option<PropId>, p: PropId) {
         if current == Some(p) {
             return;
         }
         if !enqueued[p.index()] {
             enqueued[p.index()] = true;
-            queue.push_back(p);
+            let band = if single_band { 0 } else { prio[p.index()].index() };
+            queues[band].push_back(p);
         }
     }
 
@@ -981,6 +1058,25 @@ impl Store {
             w += weights[p.index()];
         }
         w.max(1)
+    }
+
+    /// Weighted degree of `var` from the incremental cache: identical to
+    /// [`var_weight`](Store::var_weight) but O(1), for the per-node brancher.
+    pub fn var_weight_cached(&self, var: VarId) -> u64 {
+        self.var_weight_cache[var.index()].max(1)
+    }
+
+    /// Mirror a `dom/wdeg` weight bump on `prop` into the per-variable cache.
+    /// `scope` is deduplicated per variable, but `var_weight` sums one term per
+    /// subscription entry, so a variable subscribed to `prop` at several
+    /// granularities gains one per matching entry.
+    pub(crate) fn bump_var_weight(&mut self, prop: PropId) {
+        let p = prop.index();
+        for i in 0..self.scope[p].len() {
+            let v = self.scope[p][i].index();
+            let mult = self.subs[v].entries.iter().filter(|(_, pp)| pp.index() == p).count() as u64;
+            self.var_weight_cache[v] += mult;
+        }
     }
 
     // --- search levels (delegated to the trail) ---
@@ -1041,10 +1137,18 @@ impl Solver {
         let id = self.store.alloc_prop();
         debug_assert_eq!(id.index(), self.propagators.len());
         prop.register(&mut self.store, id);
+        self.store.set_priority(id, prop.priority());
+        self.store.finalize_scope(id);
         self.propagators.push(Some(prop));
         self.weights.push(1);
         self.store.enqueue(id);
         id
+    }
+
+    /// Collapse scheduling into a single FIFO band (the pre-banding order), for
+    /// benchmarks comparing band ordering in-process. Off in normal use.
+    pub fn set_single_band(&mut self, on: bool) {
+        self.store.set_single_band(on);
     }
 
     /// Number of posted propagators.
@@ -1100,6 +1204,10 @@ impl Solver {
     }
 
     fn run_prop(&mut self, id: PropId) -> Result<(), Inconsistency> {
+        PROP_CALLS.with(|c| c.set(c.get() + 1));
+        if self.store.prio[id.index()] == Priority::Expensive {
+            EXPENSIVE_CALLS.with(|c| c.set(c.get() + 1));
+        }
         let mut prop = self.propagators[id.index()].take().expect("running a propagator that is not present");
         self.store.clear_pending();
         self.store.current = Some(id);
@@ -1108,6 +1216,7 @@ impl Solver {
         self.propagators[id.index()] = Some(prop);
         if let Err(e) = result {
             self.weights[id.index()] += 1;
+            self.store.bump_var_weight(id);
             self.store.clear_queue();
             return Err(e);
         }

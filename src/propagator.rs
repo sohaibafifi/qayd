@@ -18,6 +18,33 @@ pub enum Event {
     DomainChange,
 }
 
+/// Cost band that orders scheduling: cheaper bands drain to fixpoint before
+/// pricier ones re-run, so an expensive global sees fewer, tighter domains and
+/// runs less often. Ordering only — the fixpoint reached is independent of it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Priority {
+    /// Unary/binary and bound arithmetic: constant or near-constant filtering.
+    Cheap,
+    /// Sums and element-like propagators: work linear in the scope.
+    Linear,
+    /// Globals (cumulative, circuit, no-overlap…): superlinear filtering.
+    Expensive,
+}
+
+impl Priority {
+    /// Band index; lowest runs first.
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Priority::Cheap => 0,
+            Priority::Linear => 1,
+            Priority::Expensive => 2,
+        }
+    }
+}
+
+/// Number of scheduling bands.
+pub(crate) const NBANDS: usize = 3;
+
 /// Clone support for boxed propagators in immutable solver templates.
 pub trait PropagatorClone {
     fn clone_box(&self) -> Box<dyn Propagator>;
@@ -45,4 +72,11 @@ pub trait Propagator: PropagatorClone + Send {
 
     /// Filter domains toward consistency. Must be idempotent; `Err(Inconsistency)` on wipeout.
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency>;
+
+    /// Scheduling cost band. Defaults to the neutral middle; override to
+    /// [`Priority::Cheap`] for bound/arith primitives or [`Priority::Expensive`]
+    /// for globals.
+    fn priority(&self) -> Priority {
+        Priority::Linear
+    }
 }

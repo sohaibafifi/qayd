@@ -1,7 +1,7 @@
 //! `lex` ordering, inverse `channel`, and the `slide` meta-constraint.
 
 use crate::ids::{PropId, VarId};
-use crate::propagator::{Event, Inconsistency, Propagator};
+use crate::propagator::{Event, Inconsistency, Priority, Propagator};
 use crate::store::{Solver, Store};
 
 // ===========================================================================
@@ -18,6 +18,8 @@ struct Lex {
 }
 
 impl Propagator for Lex {
+    fn priority(&self) -> Priority { Priority::Linear }
+
     fn register(&mut self, store: &mut Store, me: PropId) {
         for (&a, &b) in self.x.iter().zip(&self.y) {
             store.subscribe(a, me, Event::BoundChange);
@@ -80,6 +82,8 @@ struct Channel {
 }
 
 impl Propagator for Channel {
+    fn priority(&self) -> Priority { Priority::Linear }
+
     fn register(&mut self, store: &mut Store, me: PropId) {
         for (&a, &b) in self.x.iter().zip(&self.y) {
             store.subscribe(a, me, Event::DomainChange);

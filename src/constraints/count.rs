@@ -2,7 +2,7 @@
 
 use crate::constraints::linear::Relation;
 use crate::ids::{PropId, VarId};
-use crate::propagator::{Event, Inconsistency, Propagator};
+use crate::propagator::{Event, Inconsistency, Priority, Propagator};
 use crate::store::{Solver, Store};
 
 /// `#{ i : vars[i] = value }  rel  k`.
@@ -64,6 +64,8 @@ impl Count {
 }
 
 impl Propagator for Count {
+    fn priority(&self) -> Priority { Priority::Linear }
+
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &v in &self.vars {
             store.subscribe(v, me, Event::DomainChange);
@@ -109,6 +111,8 @@ struct InSet {
 }
 
 impl Propagator for InSet {
+    fn priority(&self) -> Priority { Priority::Cheap }
+
     fn register(&mut self, store: &mut Store, _me: PropId) {
         for &var in &self.vars {
             store.mark_relevant(var);
@@ -160,6 +164,8 @@ struct NValues {
 }
 
 impl Propagator for NValues {
+    fn priority(&self) -> Priority { Priority::Expensive }
+
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &v in &self.vars {
             store.subscribe(v, me, Event::DomainChange);

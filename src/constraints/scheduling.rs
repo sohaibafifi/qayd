@@ -3,7 +3,7 @@
 
 use crate::constraints::linear::{clamp_i32, linear, Relation};
 use crate::ids::{PropId, VarId};
-use crate::propagator::{Event, Inconsistency, Propagator};
+use crate::propagator::{Event, Inconsistency, Priority, Propagator};
 use crate::store::{Solver, Store};
 
 /// Ceiling of `a / b` for `a >= 0`, `b > 0`.
@@ -41,6 +41,8 @@ struct NoOverlap {
 }
 
 impl Propagator for NoOverlap {
+    fn priority(&self) -> Priority { Priority::Expensive }
+
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &s in &self.starts {
             store.subscribe(s, me, Event::BoundChange);
@@ -111,6 +113,8 @@ struct Cumulative {
 }
 
 impl Propagator for Cumulative {
+    fn priority(&self) -> Priority { Priority::Expensive }
+
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &s in &self.starts {
             store.subscribe(s, me, Event::BoundChange);
@@ -275,6 +279,8 @@ impl CumulativeVar {
 }
 
 impl Propagator for CumulativeVar {
+    fn priority(&self) -> Priority { Priority::Expensive }
+
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &s in &self.starts {
             store.subscribe(s, me, Event::BoundChange);
@@ -402,6 +408,8 @@ struct BinPacking {
 }
 
 impl Propagator for BinPacking {
+    fn priority(&self) -> Priority { Priority::Expensive }
+
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &it in &self.items {
             store.subscribe(it, me, Event::DomainChange);

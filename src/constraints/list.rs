@@ -2,7 +2,7 @@
 
 use crate::domains::list::ListEvent;
 use crate::ids::{ListId, PropId, VarId};
-use crate::propagator::{Event, Inconsistency, Propagator};
+use crate::propagator::{Event, Inconsistency, Priority, Propagator};
 use crate::store::{Premise, Solver, Store};
 
 /// Exact partition over list membership.
@@ -16,6 +16,8 @@ pub struct Partition {
 }
 
 impl Propagator for Partition {
+    fn priority(&self) -> Priority { Priority::Expensive }
+
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &list in &self.lists {
             store.subscribe_list(list, me, ListEvent::PossibleChange);
@@ -88,6 +90,8 @@ pub struct SameList {
 }
 
 impl Propagator for SameList {
+    fn priority(&self) -> Priority { Priority::Linear }
+
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &list in &self.lists {
             store.subscribe_list(list, me, ListEvent::PossibleChange);
@@ -170,6 +174,8 @@ pub struct ItemPrecedence {
 }
 
 impl Propagator for ItemPrecedence {
+    fn priority(&self) -> Priority { Priority::Cheap }
+
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &list in &self.lists {
             store.subscribe_list(list, me, ListEvent::PossibleChange);
@@ -262,6 +268,8 @@ pub struct ListCardinality {
 }
 
 impl Propagator for ListCardinality {
+    fn priority(&self) -> Priority { Priority::Linear }
+
     fn register(&mut self, store: &mut Store, me: PropId) {
         store.subscribe_list(self.list, me, ListEvent::PossibleChange);
         store.subscribe_list(self.list, me, ListEvent::RequiredChange);
@@ -338,6 +346,8 @@ pub struct ListUsed {
 }
 
 impl Propagator for ListUsed {
+    fn priority(&self) -> Priority { Priority::Linear }
+
     fn register(&mut self, store: &mut Store, me: PropId) {
         store.subscribe_list(self.list, me, ListEvent::LengthChange);
         store.subscribe(self.used, me, Event::Fix);
@@ -377,6 +387,8 @@ pub struct ListLength {
 }
 
 impl Propagator for ListLength {
+    fn priority(&self) -> Priority { Priority::Cheap }
+
     fn register(&mut self, store: &mut Store, me: PropId) {
         store.subscribe_list(self.list, me, ListEvent::PossibleChange);
         store.subscribe_list(self.list, me, ListEvent::RequiredChange);
@@ -408,6 +420,8 @@ pub struct ListItemSum {
 }
 
 impl Propagator for ListItemSum {
+    fn priority(&self) -> Priority { Priority::Linear }
+
     fn register(&mut self, store: &mut Store, me: PropId) {
         store.subscribe_list(self.list, me, ListEvent::PossibleChange);
         store.subscribe_list(self.list, me, ListEvent::RequiredChange);

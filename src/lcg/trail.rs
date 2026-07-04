@@ -355,6 +355,14 @@ pub struct Cdcl<'s> {
     proof_logger: Option<&'s mut ProofLogger<'s>>,
     /// Whether the final empty clause was already sent to the proof sink.
     proof_empty_logged: bool,
+    /// Root-state checker reused across a restart segment for CP vivification.
+    /// Cloning the FD store is the dominant per-conflict cost, so it is cloned
+    /// once per segment (lazily) and reset by push/pop between clauses; rebuilt
+    /// after a restart or objective-bound change (root state can only tighten
+    /// mid-segment, so a slightly stale checker under-removes but stays sound).
+    vivify_checker: Option<Solver>,
+    /// Reusable to-clear stack for allocation-free learned-clause minimization.
+    min_stack: Vec<u32>,
 }
 
 impl<'s> Cdcl<'s> {
@@ -422,6 +430,8 @@ impl<'s> Cdcl<'s> {
             rephase_mode: 0,
             proof_logger: None,
             proof_empty_logged: false,
+            vivify_checker: None,
+            min_stack: Vec::new(),
         }
     }
 
@@ -482,6 +492,8 @@ impl<'s> Cdcl<'s> {
     /// Scope exported clauses to the current objective bound.
     pub(crate) fn set_bound_scope(&mut self, bound: Lit) {
         self.bound_scope = Some(bound.negate());
+        // The tightened objective bound changes root state; drop the stale checker.
+        self.vivify_checker = None;
     }
 
     /// Whether the stop flag has fired.
@@ -543,7 +555,7 @@ impl<'s> Cdcl<'s> {
             self.unwatch(w0, c);
             self.unwatch(w1, c);
         }
-        self.clauses.get_mut(c).lits = Arc::from([]);
+        self.clauses.remove(c);
     }
 
     fn unwatch(&mut self, lit: Lit, clause: ClauseRef) {
@@ -1087,7 +1099,12 @@ impl<'s> Cdcl<'s> {
     }
 
     pub(crate) fn should_restart(&mut self) -> bool {
-        self.restart.should_restart(self.conflicts)
+        let fire = self.restart.should_restart(self.conflicts);
+        if fire {
+            // New segment: rebuild the vivification checker from fresh root state.
+            self.vivify_checker = None;
+        }
+        fire
     }
 
     /// One bounded root probing pass. For each selected decision literal, both
@@ -1345,7 +1362,10 @@ impl<'s> Cdcl<'s> {
             return;
         }
 
-        let mut checker = self.root_solver_clone();
+        let mut checker = match self.vivify_checker.take() {
+            Some(c) => c,
+            None => self.root_solver_clone(),
+        };
         let mut removed = 0usize;
         let mut i = 1; // keep the asserting literal
         while i < learnt.len() && removed < VIVIFY_MAX_REMOVED {
@@ -1356,6 +1376,7 @@ impl<'s> Cdcl<'s> {
                 i += 1;
             }
         }
+        self.vivify_checker = Some(checker);
         if removed > 0 {
             self.vivified_clauses += 1;
             self.vivified_lits += removed as u64;
@@ -1519,28 +1540,46 @@ impl<'s> Cdcl<'s> {
     /// A non-asserting literal `q` is redundant when the reason for the assigned
     /// literal `not q` only depends on level-0 facts, literals already present in
     /// the learned clause, or other recursively redundant literals.
-    fn minimize_learnt(&self, learnt: &mut Vec<Lit>) {
+    fn minimize_learnt(&mut self, learnt: &mut Vec<Lit>) {
         if learnt.len() < 3 || learnt.len() > MINIMIZE_LEARNT_MAX_LEN {
             return;
         }
-        let mut base_seen = vec![false; self.seen.len()];
+        // Reuse the persistent `seen` array (all-false after `analyze`) plus a
+        // to-clear stack, so steady state allocates nothing. Both are borrowed
+        // out to keep `self` free for the `&self` redundancy recursion, then
+        // restored. `seen` marks exactly the atoms currently in `learnt` (the
+        // base); the recursion's temporary marks are unwound after each literal
+        // so the next sees only the base — matching the old per-literal copy.
+        let mut seen = std::mem::take(&mut self.seen);
+        let mut stack = std::mem::take(&mut self.min_stack);
         for &lit in learnt.iter() {
-            base_seen[lit.atom() as usize] = true;
+            seen[lit.atom() as usize] = true;
         }
 
         let mut i = 1;
         while i < learnt.len() {
-            let mut seen = base_seen.clone();
-            if self.learnt_lit_redundant(learnt[i], &mut seen) {
-                base_seen[learnt[i].atom() as usize] = false;
+            let mark = stack.len();
+            let redundant = self.learnt_lit_redundant(learnt[i], &mut seen, &mut stack);
+            while stack.len() > mark {
+                seen[stack.pop().unwrap() as usize] = false;
+            }
+            if redundant {
+                seen[learnt[i].atom() as usize] = false;
                 learnt.remove(i);
             } else {
                 i += 1;
             }
         }
+
+        for &lit in learnt.iter() {
+            seen[lit.atom() as usize] = false;
+        }
+        stack.clear();
+        self.seen = seen;
+        self.min_stack = stack;
     }
 
-    fn learnt_lit_redundant(&self, lit: Lit, seen: &mut [bool]) -> bool {
+    fn learnt_lit_redundant(&self, lit: Lit, seen: &mut [bool], stack: &mut Vec<u32>) -> bool {
         let assigned = lit.negate();
         if matches!(self.reason_of(assigned.atom()), Reason::Decision | Reason::Fact | Reason::Unset) {
             return false;
@@ -1557,7 +1596,8 @@ impl<'s> Cdcl<'s> {
                 _ if seen.get(atom).copied().unwrap_or(false) => continue,
                 _ => {
                     seen[atom] = true;
-                    if !self.learnt_lit_redundant(antecedent, seen) {
+                    stack.push(antecedent.atom());
+                    if !self.learnt_lit_redundant(antecedent, seen, stack) {
                         return false;
                     }
                 }

@@ -1,6 +1,8 @@
 //! Table-family constraints: `extension` (Compact-Table-style), `regular`
 //! (layered DFA), `mdd` (layered DAG). A value is kept only if it participates
-//! in some consistent tuple/path. All buffers recomputed each call.
+//! in some consistent tuple/path. The positive `extension` keeps its live-tuple
+//! set (`currTable`) in reversible storage and refreshes only columns whose
+//! domain shrank since the last wake; `regular`/`mdd` recompute per call.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -8,6 +10,7 @@ use std::sync::Arc;
 use crate::ids::{PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::store::{Solver, Store};
+use crate::trail::ReversibleInt;
 
 // ===========================================================================
 // extension (Compact-Table style)
@@ -42,6 +45,19 @@ fn ts_has_match(current: &[u64], star: &[u64], exact: Option<&Vec<u64>>, residue
         }
     }
     false
+}
+/// Reversible `currTable` words are stored as two `i32` halves per `u64` (the
+/// trail only carries `i32`). Bit patterns round-trip through `as` casts.
+#[inline]
+fn rev_load_word(store: &Store, words: &[ReversibleInt], w: usize) -> u64 {
+    let lo = store.rev_get(words[2 * w]) as u32 as u64;
+    let hi = store.rev_get(words[2 * w + 1]) as u32 as u64;
+    lo | (hi << 32)
+}
+#[inline]
+fn rev_store_word(store: &mut Store, words: &[ReversibleInt], w: usize, v: u64) {
+    store.rev_set(words[2 * w], v as u32 as i32);
+    store.rev_set(words[2 * w + 1], (v >> 32) as u32 as i32);
 }
 fn ts_and_match(dst: &mut [u64], star: &[u64], exact: Option<&Vec<u64>>) {
     match exact {
@@ -115,6 +131,10 @@ struct Extension {
     template: Arc<ExtensionTemplate>,
     current: Vec<u64>,
     union: Vec<u64>,
+    /// Reversible `currTable`: two `i32` halves per tuple word (positive only).
+    curr_words: Vec<ReversibleInt>,
+    /// Reversible last-seen domain size per column; a mismatch marks it dirty.
+    col_size: Vec<ReversibleInt>,
     /// Last supporting word per `(column, value)` for positive tables.
     residues: Vec<HashMap<i32, usize>>,
     /// Scratch stack for negative-table completion search.
@@ -125,16 +145,28 @@ struct Extension {
 }
 
 impl Extension {
-    fn new(store: &Store, vars: &[VarId], template: Arc<ExtensionTemplate>, positive: bool) -> Self {
+    fn new(store: &mut Store, vars: &[VarId], template: Arc<ExtensionTemplate>, positive: bool) -> Self {
         assert_eq!(template.arity, vars.len(), "extension: arity mismatch");
         let nwords = template.full.len();
         let residues =
             if positive { vars.iter().map(|&var| store.values(var).map(|value| (value, 0)).collect()).collect() } else { Vec::new() };
+        // Positive tables keep currTable reversible, seeded to `full`; a `-1`
+        // last-seen size forces every column dirty on the first propagate so the
+        // initial domains (and any pre-propagate removals) are folded in once.
+        let (curr_words, col_size) = if positive {
+            let words = template.full.iter().flat_map(|&fw| [store.new_rev_int(fw as u32 as i32), store.new_rev_int((fw >> 32) as u32 as i32)]).collect();
+            let sizes = vars.iter().map(|_| store.new_rev_int(-1)).collect();
+            (words, sizes)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         Self {
             vars: vars.to_vec(),
             positive,
             current: template.full.clone(),
             union: vec![0u64; nwords],
+            curr_words,
+            col_size,
             residues,
             search: vec![vec![0u64; nwords]; vars.len() + 1],
             cover: vec![vec![0u64; nwords]; vars.len() + 1],
@@ -177,13 +209,21 @@ impl Propagator for Extension {
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
-        let Extension { vars, positive, template, current, union, residues, search, cover, buf } = self;
+        let Extension { vars, positive, template, current, union, curr_words, col_size, residues, search, cover, buf } = self;
         let ExtensionTemplate { supports, star, full, .. } = &**template;
 
         if *positive {
-            // current = AND over columns of (wildcards OR (OR over present values)).
-            current.copy_from_slice(full);
+            // currTable lives in reversible storage: load it, then re-AND only the
+            // columns whose domain shrank since the last wake (dirty columns).
+            for (w, cur) in current.iter_mut().enumerate() {
+                *cur = rev_load_word(store, curr_words, w);
+            }
             for (c, &v) in vars.iter().enumerate() {
+                let sz = store.size(v) as i32;
+                if store.rev_get(col_size[c]) == sz {
+                    continue;
+                }
+                // AND in (wildcards OR union of still-present values) for this column.
                 union.copy_from_slice(&star[c]);
                 for val in store.values(v) {
                     if let Some(bs) = supports[c].get(&val) {
@@ -191,6 +231,9 @@ impl Propagator for Extension {
                     }
                 }
                 ts_and(current, union);
+            }
+            for (w, &cur) in current.iter().enumerate() {
+                rev_store_word(store, curr_words, w, cur);
             }
 
             if ts_is_zero(current) {
@@ -207,6 +250,13 @@ impl Propagator for Extension {
                         store.remove(v, val)?;
                     }
                 }
+            }
+
+            // Record final domain sizes as the last-seen mark. Values pruned above
+            // had no live tuple, so they left `current` unchanged and need no
+            // re-fold; only genuinely new shrinkage marks a column dirty next wake.
+            for (c, &v) in vars.iter().enumerate() {
+                store.rev_set(col_size[c], store.size(v) as i32);
             }
         } else {
             // Remove a value only when no completion avoids every forbidden pattern.
@@ -249,7 +299,7 @@ pub fn extension_template(arity: usize, tuples: &[Vec<i32>]) -> Arc<ExtensionTem
 
 /// Post an extension constraint backed by a shared immutable template.
 pub fn extension_from_template(solver: &mut Solver, vars: &[VarId], template: Arc<ExtensionTemplate>, positive: bool) {
-    let prop = Extension::new(&solver.store, vars, template, positive);
+    let prop = Extension::new(&mut solver.store, vars, template, positive);
     solver.post(Box::new(prop));
 }
 
