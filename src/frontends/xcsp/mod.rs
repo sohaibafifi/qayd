@@ -239,6 +239,8 @@ pub fn run_to<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool, w: &mut W) 
 pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool, w: &mut W, options: RunOptions) -> Result<(), String> {
     let start = Instant::now();
     let options = RunOptions { workers: options.workers.max(1), ..options };
+    crate::mem::set_limit_mb(options.mem_limit.unwrap_or(0));
+    crate::mem::set_verbose(verbose && options.mem_limit.is_some());
     let path = stage_xml(xml)?;
     let mut xcsp = parse_problem(&path.0)?;
     let has_objective = xcsp.problem.objective.is_some();
@@ -321,6 +323,10 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
             writeln!(w, "c interrupted").map_err(io_err)?;
         }
         writeln!(w, "c time {:.3}s", start.elapsed().as_secs_f64()).map_err(io_err)?;
+        let peak = crate::mem::peak();
+        if peak > 0 {
+            writeln!(w, "c peak memory {} MB", peak / (1024 * 1024)).map_err(io_err)?;
+        }
     }
     w.flush().map_err(io_err)?;
     Ok(())

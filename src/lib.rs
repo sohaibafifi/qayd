@@ -28,6 +28,7 @@ pub mod frontends;
 pub mod ids;
 pub mod lcg;
 mod lns;
+pub mod mem;
 pub mod model;
 mod parallel;
 #[doc(hidden)]

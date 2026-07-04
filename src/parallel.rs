@@ -47,6 +47,9 @@ pub struct RunOptions {
     /// routing every worker to the chronological-DFS driver. Learning is on by
     /// default; plain DFS wins only on highly symmetric models.
     pub no_learn_csp: bool,
+    /// Hard memory budget in megabytes; `None` = unlimited. Enforced only when the
+    /// tracking allocator is installed (the `qayd` binary).
+    pub mem_limit: Option<usize>,
 }
 
 impl RunOptions {
@@ -58,7 +61,7 @@ impl RunOptions {
 
 impl Default for RunOptions {
     fn default() -> Self {
-        Self { seed: 0, workers: 1, mode: Mode::Default, split: false, probes: 0, lns: 0, no_learn_csp: false }
+        Self { seed: 0, workers: 1, mode: Mode::Default, split: false, probes: 0, lns: 0, no_learn_csp: false, mem_limit: None }
     }
 }
 

@@ -6,6 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Track live allocations process-wide so `--mem-limit` can act on real usage.
+#[global_allocator]
+static ALLOC: qayd::mem::Tracking = qayd::mem::Tracking;
+
 /// Read an instance, transparently decompressing `.lzma` / `.xz`.
 fn read_instance(path: &str) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
@@ -44,7 +48,7 @@ fn is_instance(arg: &str) -> bool {
 }
 
 const USAGE: &str =
-    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--ls] [--split] [--probe N] [--lns N] [--no-learn-csp] <instance.xml[.lzma|.xz]>";
+    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--mem-limit MB] [--ls] [--split] [--probe N] [--lns N] [--no-learn-csp] <instance.xml[.lzma|.xz]>";
 
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
@@ -83,6 +87,7 @@ fn main() {
     let mut probes = 0;
     let mut lns = 0;
     let mut no_learn_csp = false;
+    let mut mem_limit: Option<usize> = None;
     let mut path: Option<String> = None;
 
     let mut it = args.iter();
@@ -98,6 +103,7 @@ fn main() {
             "--probe" => probes = positive(it.next().map(String::as_str), "--probe needs a positive integer"),
             "--lns" => lns = positive(it.next().map(String::as_str), "--lns needs a positive integer"),
             "--no-learn-csp" => no_learn_csp = true,
+            "--mem-limit" => mem_limit = Some(positive(it.next().map(String::as_str), "--mem-limit needs a positive integer (megabytes)")),
             other if other.starts_with('-') => {
                 eprintln!("unknown option {other}");
                 usage();
@@ -135,7 +141,25 @@ fn main() {
             s.store(true, Ordering::SeqCst);
         });
     }
+    if let Some(mb) = mem_limit {
+        qayd::mem::set_limit_mb(mb);
+        let s = stop.clone();
+        std::thread::spawn(move || {
+            // Same clean-stop path as the time limit: set the flag, keep the
+            // incumbent, report SATISFIABLE/UNKNOWN (never OPTIMUM/UNSAT).
+            while !s.load(Ordering::Relaxed) {
+                if qayd::mem::over_hard() {
+                    if verbose {
+                        eprintln!("c mem hard limit reached at {} MB; stopping search", qayd::mem::live() / (1024 * 1024));
+                    }
+                    s.store(true, Ordering::SeqCst);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+    }
 
     let mode = if ls { qayd::frontends::xcsp::Mode::Ls } else { qayd::frontends::xcsp::Mode::Default };
-    run_instance(&path, verbose, &stop, qayd::frontends::xcsp::RunOptions { seed, workers, mode, split, probes, lns, no_learn_csp });
+    run_instance(&path, verbose, &stop, qayd::frontends::xcsp::RunOptions { seed, workers, mode, split, probes, lns, no_learn_csp, mem_limit });
 }

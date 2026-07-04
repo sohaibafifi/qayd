@@ -507,8 +507,14 @@ impl<'s> Cdcl<'s> {
     /// keeping glue clauses (LBD ≤ 2). Must run at the root (level 0), where no
     /// deleted clause can be a needed reason. Deletion is by tombstone.
     pub(crate) fn maybe_reduce_db(&mut self) {
-        if self.num_learned <= self.max_learned {
+        // Under memory pressure, force a reduction even below the soft cap so the
+        // learned DB shrinks before the hard limit stops search.
+        let soft = crate::mem::pressure() != crate::mem::Pressure::None;
+        if self.num_learned <= self.max_learned && !soft {
             return;
+        }
+        if soft {
+            crate::mem::note_soft();
         }
         debug_assert_eq!(self.decision_level(), 0, "reduction off the root");
         let mut learned: Vec<ClauseRef> = (0..self.clauses.len() as u32)
@@ -538,7 +544,11 @@ impl<'s> Cdcl<'s> {
             removed += 1;
         }
         self.num_learned -= removed;
-        self.max_learned += 500;
+        if soft {
+            self.max_learned = crate::mem::degrade_budget(self.max_learned);
+        } else {
+            self.max_learned += 500;
+        }
     }
 
     /// Tombstone a clause: unwatch it and free its literals; its slot remains so
