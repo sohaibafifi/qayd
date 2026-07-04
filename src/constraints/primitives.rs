@@ -470,7 +470,6 @@ pub fn element_const(solver: &mut Solver, array: &[i32], idx: VarId, value: VarI
 #[derive(Clone, Default)]
 struct AllDifferent {
     vars: Vec<VarId>,
-    buf: Vec<i32>,
     /// Persistent matching hint: `matching[i]` = value assigned to `vars[i]`
     /// (`i32::MIN` = unmatched / no hint yet).
     matching: Vec<i32>,
@@ -489,6 +488,15 @@ struct AllDifferent {
     aug_stack: Vec<(usize, usize, usize)>,
     scc_work: Vec<(usize, usize)>,
     tj_stack: Vec<usize>,
+    /// Pending edge removals `(var index, value index)`, collected before any
+    /// mutation so explanations can cite the pre-removal domains.
+    removals: Vec<(usize, usize)>,
+    /// Per-value-SCC explanation memo, shared by every edge removed against
+    /// that component; cleared each call (stale domains would be unsound).
+    scc_why: Vec<Option<Vec<Premise>>>,
+    /// Reverse of `g`, built only when there are removals to explain.
+    rg: Vec<Vec<usize>>,
+    visited: Vec<bool>,
 }
 
 fn index_of(values: &[i32], val: i32) -> usize {
@@ -600,8 +608,9 @@ impl Propagator for AllDifferent {
             return Ok(());
         }
         let AllDifferent {
-            vars, buf, matching, values, adj, var_to_val, val_to_var, seen, g, reachable,
+            vars, matching, values, adj, var_to_val, val_to_var, seen, g, reachable,
             dfs_stack, comp, index, low, on_stack, aug_stack, scc_work, tj_stack,
+            removals, scc_why, rg, visited,
         } = self;
 
         // Value universe (sorted, deduped); value index = position.
@@ -653,7 +662,23 @@ impl Propagator for AllDifferent {
             if var_to_val[i] < 0 {
                 seen.fill(false);
                 if !augment(i, adj, val_to_var, var_to_val, seen, aug_stack) {
-                    return Err(Inconsistency); // variable i uncoverable
+                    if !store.explaining() {
+                        return Err(Inconsistency);
+                    }
+                    // Variable i is uncoverable, and the failed DFS already
+                    // holds the Hall violator: `seen` marks the value set A it
+                    // exhausted, each such value matched to a distinct
+                    // variable, so those variables plus i are |A|+1 variables
+                    // confined to A. Pin their (still unmutated) domains.
+                    let mut why = Vec::new();
+                    store.domain_premises(vars[i], &mut why);
+                    for v in 0..m {
+                        if seen[v] {
+                            debug_assert!(val_to_var[v] >= 0, "seen value must be matched");
+                            store.domain_premises(vars[val_to_var[v] as usize], &mut why);
+                        }
+                    }
+                    return Err(store.fail_because(why));
                 }
             }
         }
@@ -719,19 +744,90 @@ impl Propagator for AllDifferent {
         }
 
         // Remove every non-matching edge that lies in no maximum matching.
+        // Collect first, explain, then remove: an explanation must cite
+        // domains as they stood before this call's own removals, or the LCG
+        // trail rejects it and falls back to the whole scope.
+        removals.clear();
         for (i, &var) in vars.iter().enumerate() {
             let matched = var_to_val[i] as usize;
-            buf.clear();
-            buf.extend(store.values(var));
-            for &val in buf.iter() {
+            for val in store.values(var) {
                 let vidx = index_of(values, val);
-                if vidx == matched {
-                    continue; // matching edge is always supported
-                }
-                if comp[i] != comp[n + vidx] && !reachable[n + vidx] {
-                    store.remove(var, val)?;
+                if vidx != matched && comp[i] != comp[n + vidx] && !reachable[n + vidx] {
+                    removals.push((i, vidx));
                 }
             }
+        }
+        if removals.is_empty() {
+            return Ok(());
+        }
+        if !store.explaining() {
+            for &(i, vidx) in removals.iter() {
+                store.remove(vars[i], values[vidx])?;
+            }
+            return Ok(());
+        }
+
+        // One explanation per value SCC, shared by every edge removed against
+        // it: the variables that can reach the SCC (reverse DFS) are matched
+        // one-to-one with the values that can reach it and their domains lie
+        // inside that value set — a Hall set T saturating a set A containing
+        // the removed value, so any variable outside T loses it. Pinning
+        // T's domains is a sound reason for x != v (T may exceed the minimal
+        // Hall set; a superset only weakens the learned clause).
+        // ponytail: reverse graph + one DFS per referenced SCC is O(edges)
+        // each — bounded by the Régin pass itself.
+        while rg.len() < total {
+            rg.push(Vec::new());
+        }
+        for cell in rg.iter_mut().take(total) {
+            cell.clear();
+        }
+        for (u, out) in g.iter().enumerate().take(total) {
+            for &w in out {
+                rg[w].push(u);
+            }
+        }
+        scc_why.clear();
+        scc_why.resize(ncomp, None);
+        visited.clear();
+        visited.resize(total, false);
+        let mut scc_uses = vec![0u32; ncomp];
+        for &(_, vidx) in removals.iter() {
+            let cid = comp[n + vidx];
+            scc_uses[cid] += 1;
+            if scc_why[cid].is_some() {
+                continue;
+            }
+            visited.fill(false);
+            visited[n + vidx] = true;
+            dfs_stack.clear();
+            dfs_stack.push(n + vidx);
+            while let Some(u) = dfs_stack.pop() {
+                for &w in &rg[u] {
+                    if !visited[w] {
+                        visited[w] = true;
+                        dfs_stack.push(w);
+                    }
+                }
+            }
+            let mut why = Vec::new();
+            for (j, &var) in vars.iter().enumerate() {
+                if visited[j] {
+                    store.domain_premises(var, &mut why);
+                }
+            }
+            scc_why[cid] = Some(why);
+        }
+        for &(i, vidx) in removals.iter() {
+            let cid = comp[n + vidx];
+            scc_uses[cid] -= 1;
+            // The last edge of an SCC takes the premise vector; earlier ones clone.
+            let why = if scc_uses[cid] == 0 {
+                scc_why[cid].take().expect("explained above")
+            } else {
+                scc_why[cid].as_ref().expect("explained above").clone()
+            };
+            store.remove_because(vars[i], values[vidx], why)?;
         }
         Ok(())
     }

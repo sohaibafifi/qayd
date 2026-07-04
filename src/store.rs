@@ -153,6 +153,9 @@ pub struct Store {
     /// Ablation switch: always explain with the whole-scope snapshot, ignoring
     /// propagator-supplied premises. Off in normal use.
     force_scope_reasons: bool,
+    /// Whether an LCG trail consumes reasons. Off outside learning, so
+    /// propagators with costly explanation construction can skip it entirely.
+    explain: bool,
     /// Unary-resource interval pairs registered by `no_overlap`. Each pair's order
     /// is a boolean variable (`1` = first-before-second, `0` = second-before-first,
     /// unfixed = undecided), so the order decision is a first-class atom the
@@ -752,6 +755,18 @@ impl Store {
         self.force_scope_reasons = on;
     }
 
+    /// Mark that an LCG trail consumes reasons (set by the learning engine).
+    pub(crate) fn set_explain(&mut self, on: bool) {
+        self.explain = on;
+    }
+
+    /// Whether reasons are consumed: propagators may skip building costly
+    /// explanations when this is off.
+    #[inline]
+    pub fn explaining(&self) -> bool {
+        self.explain
+    }
+
     // --- domain mutations with a tight, propagator-supplied reason ---
     //
     // Each stages `why` (premises true now that entail the change) for the next
@@ -803,6 +818,17 @@ impl Store {
     pub(crate) fn clear_pending(&mut self) {
         self.pending_premises = None;
         self.pending_conflict = None;
+    }
+
+    /// Append premises pinning `var`'s current domain exactly: `Ge min`,
+    /// `Le max`, one `Ne` per hole — the same shape as the whole-scope
+    /// fallback snapshot, so a subset of variables can never explain wider
+    /// than the fallback does.
+    pub fn domain_premises(&self, var: VarId, out: &mut Vec<Premise>) {
+        let sv = self.scope_var(var);
+        out.push(Premise::Ge { var, bound: sv.min });
+        out.push(Premise::Le { var, bound: sv.max });
+        out.extend(sv.holes.into_iter().map(|h| Premise::Ne { var, val: h }));
     }
 
     /// Snapshot one variable's current domain as a [`ScopeVar`].
