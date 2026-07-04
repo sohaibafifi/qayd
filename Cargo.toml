@@ -35,6 +35,13 @@ opt-level = 3
 overflow-checks = false
 panic = "abort"
 
+# Profile for the PyO3 extension module (`maturin --profile pyext`): identical
+# to release except panics unwind, so PyO3 catches them at the FFI boundary and
+# raises a Python exception instead of aborting the host interpreter.
+[profile.pyext]
+inherits = "release"
+panic = "unwind"
+
 
 [dependencies]
 ctrlc = "3.5.2"

@@ -2578,6 +2578,15 @@ fn used(route: &PyListVar) -> PyTerm {
     single_term(route, list::Reduction { op: list::ReduceOp::Used, iterable: list::Iterable::Items(route.index as usize), arena, body })
 }
 
+/// Deliberate panic, for tests only: proves the extension is built with
+/// unwinding panics (profile `pyext`), so a Rust panic surfaces as a Python
+/// exception instead of aborting the interpreter.
+#[pyfunction]
+#[doc(hidden)]
+fn _rust_panic() {
+    panic!("qayd _rust_panic(): intentional test panic");
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyModel>()?;
@@ -2622,6 +2631,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(select_kth, m)?)?;
     m.add_function(wrap_pyfunction!(windows, m)?)?;
     m.add_function(wrap_pyfunction!(used, m)?)?;
+    m.add_function(wrap_pyfunction!(_rust_panic, m)?)?;
     m.add("STAR", table::STAR)?;
     Ok(())
 }

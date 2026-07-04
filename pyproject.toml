@@ -24,3 +24,6 @@ examples = [
 features = ["python"]
 module-name = "qayd._core"
 python-source = "frontends/python"
+# `pyext` = release with unwinding panics: PyO3 converts a Rust panic into a
+# Python exception instead of aborting the interpreter (release has panic=abort).
+profile = "pyext"
