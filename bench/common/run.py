@@ -31,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # .xz (fd 37 7a) and raw-.lzma (5d 00 00) both go through the lzma module
 # (lzma.open auto-detects the container); bz2 and gzip by their own magic.
@@ -47,8 +48,11 @@ def opener(path):
     return lambda: open(path, "rb")
 
 
-def materialize(path, scratch):
+def materialize(path, scratch, tag):
     """Decompress/copy instance into scratch dir, return the plain file path.
+
+    `tag` keeps the scratch name unique so parallel workers don't clobber
+    each other's instance file.
 
     For CNF, strip any SATLIB-style trailer (a line that is just `%`, then `0`)
     -- strict parsers like CaDiCaL reject it, competition parsers ignore it.
@@ -63,7 +67,7 @@ def materialize(path, scratch):
         ext = ".wbo"
     else:
         ext = ".opb"
-    dst = os.path.join(scratch, "inst" + ext)
+    dst = os.path.join(scratch, f"inst{tag}{ext}")
     with opener(path)() as src, open(dst, "wb") as out:
         if ext == ".cnf":
             for line in src:
@@ -88,8 +92,8 @@ def normalize_status(raw):
     return "UNKNOWN"
 
 
-def run_one(cmd_tmpl, inst, timeout, scratch):
-    f = materialize(inst, scratch)
+def run_one(cmd_tmpl, inst, timeout, scratch, tag=0):
+    f = materialize(inst, scratch, tag)
     cmd = cmd_tmpl.replace("{f}", f).replace("{t}", str(timeout))
     argv = cmd.split()
     t0 = time.time()
@@ -106,6 +110,13 @@ def run_one(cmd_tmpl, inst, timeout, scratch):
             out, _ = p.communicate()
     except Exception as e:
         return "ERROR", None, time.time() - t0, False, str(e)
+    finally:
+        # Parallel runs materialize one file per in-flight instance; drop it
+        # eagerly so scratch holds at most `jobs` decompressed instances.
+        try:
+            os.remove(f)
+        except OSError:
+            pass
     dt = time.time() - t0
 
     status, obj = "UNKNOWN", None
@@ -145,6 +156,9 @@ def main():
     ap.add_argument("--cmd", required=True, help="solver command template with {f} and optional {t}")
     ap.add_argument("--timeout", type=int, default=10)
     ap.add_argument("--limit", type=int, default=0, help="cap instances (0 = all)")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="instances run concurrently (solver itself stays as templated); "
+                    "co-running instances add timing noise, so compare runs made with the SAME value")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -163,20 +177,35 @@ def main():
         sys.exit(1)
 
     scratch = tempfile.mkdtemp(prefix="satpb_")
+
+    def solve_row(tag_inst):
+        tag, inst = tag_inst
+        status, obj, dt, to, err = run_one(args.cmd, inst, args.timeout, scratch, tag)
+        return os.path.basename(inst), status, obj, dt, to, err, direction(inst)
+
     try:
         with open(args.out, "w", newline="") as fh:
             wr = csv.writer(fh)
             wr.writerow(["instance", "status", "obj", "time", "timedout", "dir"])
-            for i, inst in enumerate(files, 1):
-                status, obj, dt, to, err = run_one(args.cmd, inst, args.timeout, scratch)
-                d = direction(inst)
-                name = os.path.basename(inst)
+
+            def emit(done, row):
+                name, status, obj, dt, to, err, d = row
                 wr.writerow([name, status, "" if obj is None else obj, f"{dt:.3f}", int(to), d])
                 fh.flush()
                 extra = f" obj={obj}" if obj is not None else ""
                 if status == "ERROR" and err:
                     extra += f" ({err})"
-                print(f"[{i}/{total}] {name}: {status}{extra} {dt:.2f}s{' TO' if to else ''}", flush=True)
+                print(f"[{done}/{total}] {name}: {status}{extra} {dt:.2f}s{' TO' if to else ''}", flush=True)
+
+            if args.jobs <= 1:
+                for i, inst in enumerate(files, 1):
+                    emit(i, solve_row((i, inst)))
+            else:
+                # CSV rows land in completion order; compare.py keys by name.
+                with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+                    futures = [pool.submit(solve_row, (i, inst)) for i, inst in enumerate(files, 1)]
+                    for done, fut in enumerate(as_completed(futures), 1):
+                        emit(done, fut.result())
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
