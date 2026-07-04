@@ -845,9 +845,14 @@ impl Store {
         ScopeVar { var, min, max, holes }
     }
 
-    /// Append an engine event for a real domain change.
+    /// Append an engine event for a real domain change. Only the LCG trail
+    /// drains `events`, and it runs with `explain` on; under plain search the
+    /// Vec has no consumer, so skip the push (and its `Cause` payload) to avoid
+    /// leaking one heap allocation per propagation for the whole enumeration.
     fn emit(&mut self, primary: DomEvent, cause: Cause) {
-        self.events.push(EngineEvent { primary, cause });
+        if self.explain {
+            self.events.push(EngineEvent { primary, cause });
+        }
     }
 
     /// `(min, max)` of variable index `i`.
