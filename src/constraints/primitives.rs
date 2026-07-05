@@ -499,7 +499,7 @@ struct AllDifferent {
     visited: Vec<bool>,
 }
 
-fn index_of(values: &[i32], val: i32) -> usize {
+pub(crate) fn index_of(values: &[i32], val: i32) -> usize {
     values.binary_search(&val).unwrap()
 }
 
@@ -545,7 +545,7 @@ fn augment(
 /// `work` is scratch (node, next-edge-index) frames; `tj_stack` is the Tarjan
 /// component stack.
 #[allow(clippy::too_many_arguments)]
-fn scc_visit(
+pub(crate) fn scc_visit(
     start: usize,
     g: &[Vec<usize>],
     index: &mut [i64],
