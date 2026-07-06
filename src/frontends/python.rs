@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pyo3::class::basic::CompareOp;
-use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyTimeoutError, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyIterator, PyModule};
@@ -25,6 +25,7 @@ use crate::expr::{self, Expr};
 use crate::ids::VarId;
 use crate::model as shared_model;
 use crate::model::list;
+use crate::mus::{extract_mus, MusResult};
 use crate::problem::{Objective as ProblemObjective, Problem};
 use crate::search::{self, Objective as SearchObjective, SearchControl, SolveStats};
 use crate::Solver;
@@ -115,6 +116,39 @@ struct PyConstraint {
     inner: ExprLike,
 }
 
+/// Context manager returned by [`PyModel::soft`]: on `__enter__` it opens a
+/// fresh selector and routes posted constraints through it; on `__exit__` it
+/// stops routing. Records the group so [`PyModel::mus`] can name it in a core.
+#[pyclass(name = "SoftGroup", module = "qayd", unsendable)]
+struct PySoftGroup {
+    model: Py<PyModel>,
+    name: Option<String>,
+}
+
+#[pymethods]
+impl PySoftGroup {
+    fn __enter__(&self, py: Python<'_>) -> PyResult<()> {
+        let mut model = self.model.borrow_mut(py);
+        let sel = model.solver.new_var_range(0, 1);
+        let name = self.name.clone().unwrap_or_else(|| format!("c{}", model.mus_selectors.len()));
+        model.names.push(None); // keep VarId ↔ names alignment; hidden from `variables()`
+        model.solver.set_selector(Some(sel));
+        model.mus_selectors.push((name, sel));
+        Ok(())
+    }
+
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc_value: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        self.model.borrow_mut(py).solver.set_selector(None);
+        Ok(false) // do not suppress exceptions
+    }
+}
+
 #[pyclass(name = "SolveStats", module = "qayd", skip_from_py_object)]
 #[derive(Clone)]
 struct PySolveStats {
@@ -179,6 +213,27 @@ struct PyModel {
     col_globals: Vec<list::GlobalConstraint>,
     col_schedule: Option<list::Schedule>,
     col_sched_gen: u64,
+    /// Soft-constraint groups for MUS extraction: `(name, selector)`. Each is a
+    /// `{0,1}` variable guarding the constraints posted inside a `with
+    /// model.soft(name):` block; selectors occupy a `names` slot (to keep
+    /// `VarId ↔ names` alignment) but are hidden from the user-facing variable
+    /// enumerations.
+    mus_selectors: Vec<(String, VarId)>,
+}
+
+impl PyModel {
+    fn is_selector(&self, index: u32) -> bool {
+        self.mus_selectors.iter().any(|&(_, sel)| sel.0 == index)
+    }
+
+    /// The user's decision variables (every named slot that is not a selector).
+    fn decision_var_ids(&self) -> Vec<VarId> {
+        (0..self.names.len() as u32).filter(|&i| !self.is_selector(i)).map(VarId).collect()
+    }
+
+    fn selector_name(&self, sel: VarId) -> String {
+        self.mus_selectors.iter().find(|&&(_, v)| v == sel).map(|(name, _)| name.clone()).unwrap_or_default()
+    }
 }
 
 impl PyIntVar {
@@ -281,7 +336,7 @@ fn one_id_for(model_id: u64, var: &PyIntVar) -> PyResult<VarId> {
 fn search_ids(model: &PyModel, search: Option<&Bound<'_, PyAny>>, extra: Option<VarId>) -> PyResult<Vec<VarId>> {
     let mut vars = match search {
         Some(obj) if !obj.is_none() => ids_for(model.id, &var_list_from_py(obj)?)?,
-        _ => (0..model.names.len()).map(|i| VarId(i as u32)).collect(),
+        _ => model.decision_var_ids(),
     };
     if let Some(var) = extra {
         if !vars.contains(&var) {
@@ -835,12 +890,13 @@ impl PyModel {
             col_globals: Vec::new(),
             col_schedule: None,
             col_sched_gen: 0,
+            mus_selectors: Vec::new(),
         }
     }
 
     #[getter]
     fn num_vars(&self) -> usize {
-        self.names.len()
+        self.names.len() - self.mus_selectors.len()
     }
 
     #[getter]
@@ -896,7 +952,12 @@ impl PyModel {
     }
 
     fn variables(&self) -> Vec<PyIntVar> {
-        self.names.iter().enumerate().map(|(index, name)| PyIntVar { model_id: self.id, index: index as u32, name: name.clone() }).collect()
+        self.names
+            .iter()
+            .enumerate()
+            .filter(|&(index, _)| !self.is_selector(index as u32))
+            .map(|(index, name)| PyIntVar { model_id: self.id, index: index as u32, name: name.clone() })
+            .collect()
     }
 
     fn add(&mut self, constraint: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -1396,6 +1457,42 @@ impl PyModel {
             verbose_finish(&solution);
         }
         Ok(solution)
+    }
+
+    /// A soft-constraint group for MUS extraction. Use as a context manager:
+    /// every constraint posted inside the `with` block is guarded by one fresh
+    /// selector, and [`mus`](PyModel::mus) reports which groups form an unsat
+    /// core. `name` defaults to `c0, c1, …`. Constraints posted outside any
+    /// `soft` block are hard (always active).
+    ///
+    /// ```python
+    /// with model.soft("c1"):
+    ///     model.sum([a], ">=", 1)
+    /// core = model.mus()  # -> ["c1", ...] or None if satisfiable
+    /// ```
+    #[pyo3(signature = (name=None))]
+    fn soft(slf: Py<Self>, name: Option<String>) -> PySoftGroup {
+        PySoftGroup { model: slf, name }
+    }
+
+    /// Extract a minimal unsatisfiable subset of the [`soft`](PyModel::soft)
+    /// groups (with all hard constraints active). Returns the list of group names
+    /// in the MUS, or `None` if the model is satisfiable. Raises on time-out.
+    #[pyo3(signature = (time_limit=None))]
+    fn mus(&self, py: Python<'_>, time_limit: Option<u64>) -> PyResult<Option<Vec<String>>> {
+        if self.col_universe.is_some() || self.col_schedule.is_some() {
+            return Err(PyValueError::new_err("mus() is not supported for list/interval models"));
+        }
+        let vars = self.decision_var_ids();
+        let selectors: Vec<VarId> = self.mus_selectors.iter().map(|&(_, sel)| sel).collect();
+        let mut solver = self.solver.clone();
+        let stop = deadline(time_limit);
+        let result = with_interrupts(py, &stop, || extract_mus(&mut solver, &vars, &selectors, &stop))?;
+        match result {
+            MusResult::Sat(_) => Ok(None),
+            MusResult::Interrupted => Err(PyTimeoutError::new_err("mus() timed out")),
+            MusResult::Mus(core) => Ok(Some(core.iter().map(|&sel| self.selector_name(sel)).collect())),
+        }
     }
 
     #[pyo3(signature = (search=None))]
@@ -2601,6 +2698,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMatrix>()?;
     m.add_class::<PyMatrixRow>()?;
     m.add_class::<PyConstraint>()?;
+    m.add_class::<PySoftGroup>()?;
     m.add_class::<PySolution>()?;
     m.add_class::<PySolveStats>()?;
     m.add_function(wrap_pyfunction!(expr_fn, m)?)?;
