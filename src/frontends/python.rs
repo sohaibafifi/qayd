@@ -25,7 +25,7 @@ use crate::expr::{self, Expr};
 use crate::ids::VarId;
 use crate::model as shared_model;
 use crate::model::list;
-use crate::mus::{extract_mus, MusResult};
+use crate::mus::{explain_mus, extract_mus, MusRel, MusResult};
 use crate::problem::{Objective as ProblemObjective, Problem};
 use crate::search::{self, Objective as SearchObjective, SearchControl, SolveStats};
 use crate::Solver;
@@ -233,6 +233,18 @@ impl PyModel {
 
     fn selector_name(&self, sel: VarId) -> String {
         self.mus_selectors.iter().find(|&&(_, v)| v == sel).map(|(name, _)| name.clone()).unwrap_or_default()
+    }
+
+    /// Format a semantic atom `var rel value` using the variable's name.
+    fn atom_text(&self, var: VarId, rel: MusRel, value: i32) -> String {
+        let name = self.names.get(var.index()).and_then(|n| n.clone()).unwrap_or_else(|| format!("x{}", var.index()));
+        let op = match rel {
+            MusRel::Eq => "==",
+            MusRel::Ne => "!=",
+            MusRel::Ge => ">=",
+            MusRel::Le => "<=",
+        };
+        format!("{name} {op} {value}")
     }
 }
 
@@ -1493,6 +1505,32 @@ impl PyModel {
             MusResult::Interrupted => Err(PyTimeoutError::new_err("mus() timed out")),
             MusResult::Mus(core) => Ok(Some(core.iter().map(|&sel| self.selector_name(sel)).collect())),
         }
+    }
+
+    /// Explain a MUS at sub-constraint granularity: for each core
+    /// constraint that refutes by propagation, the *specific* atoms it reasoned
+    /// about (`"x >= 4"`), not the whole global. Returns a `{name: [atom, ...]}`
+    /// dict, or `None` when the model is satisfiable or the core needs search to
+    /// refute (use [`mus`](PyModel::mus) for the constraint-level core then).
+    #[pyo3(signature = (time_limit=None))]
+    fn explain_mus(&self, py: Python<'_>, time_limit: Option<u64>) -> PyResult<Option<HashMap<String, Vec<String>>>> {
+        if self.col_universe.is_some() || self.col_schedule.is_some() {
+            return Err(PyValueError::new_err("explain_mus() is not supported for list/interval models"));
+        }
+        let vars = self.decision_var_ids();
+        let selectors: Vec<VarId> = self.mus_selectors.iter().map(|&(_, sel)| sel).collect();
+        let mut solver = self.solver.clone();
+        let stop = deadline(time_limit);
+        let explained = with_interrupts(py, &stop, || match extract_mus(&mut solver, &vars, &selectors, &stop) {
+            MusResult::Mus(mus) if !mus.is_empty() => explain_mus(&mut solver, &vars, &mus, &stop).map(|e| e.constraints),
+            _ => None, // satisfiable, empty (root unsat), or interrupted
+        })?;
+        Ok(explained.map(|constraints| {
+            constraints
+                .into_iter()
+                .map(|(sel, atoms)| (self.selector_name(sel), atoms.iter().map(|a| self.atom_text(a.var, a.rel, a.value)).collect()))
+                .collect()
+        }))
     }
 
     #[pyo3(signature = (search=None))]

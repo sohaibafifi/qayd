@@ -1595,6 +1595,98 @@ impl<'s> Cdcl<'s> {
         core
     }
 
+    /// Brique 4 prototype — the *semantic footprint* of an unsatisfiable set of
+    /// selectors that refutes by propagation alone. Asserts every selector in
+    /// `on` at the root, propagates once, and, if that already fails, walks the
+    /// refutation's reason DAG bucketing the non-selector literals of each
+    /// propagator explanation by the selector it carries. The result is, per
+    /// constraint, the *specific* atoms it reasoned about — the Hall set of an
+    /// `allDifferent`, the energy window of a `cumulative` — not the whole
+    /// global. This is the differentiator from CNF-level proof trimming: the DAG
+    /// leaves are the propagators' structured [`Reason::Generic`] explanations.
+    ///
+    /// `None` when asserting the selectors does not fail by propagation (the core
+    /// needs search to refute; a sub-constraint explanation for that case is
+    /// future work). The caller must have run [`init`](Cdcl::init) and pass a set
+    /// known to be unsatisfiable. Leaves the trail dirty — use a fresh engine.
+    pub(crate) fn explain_by_propagation(&mut self, on: &[Lit]) -> Option<Vec<(VarId, Vec<Lit>)>> {
+        debug_assert_eq!(self.decision_level(), 0);
+        for &lit in on {
+            let cref = self.add_clause(vec![lit], false, 0);
+            if self.assign(lit, Reason::Clause(cref)).is_err() {
+                return Some(Vec::new()); // a selector wiped a domain on assertion: one-atom refutation
+            }
+        }
+        let conflict = match self.propagate() {
+            Ok(()) => return None, // consistent under propagation: the core needs search
+            Err(conflict) => conflict,
+        };
+        // Recognise selectors by *variable*: `= 1` may surface as either the `Eq`
+        // or the `Ge` atom of a `{0,1}` selector, so atom-matching would miss it.
+        let sel_vars: HashSet<VarId> = on.iter().map(|l| self.atoms.var_of(l.atom())).collect();
+        Some(self.footprint_of_cone(&conflict, &sel_vars))
+    }
+
+    /// Walk the reason DAG behind `conflict` (read-only, over the live trail),
+    /// bucketing every propagator explanation's non-selector literals under the
+    /// selector variable it carries. `sel_vars` are the selector variables.
+    fn footprint_of_cone(&self, conflict: &Conflict, sel_vars: &HashSet<VarId>) -> Vec<(VarId, Vec<Lit>)> {
+        let mut buckets: Vec<(VarId, Vec<Lit>)> = Vec::new();
+        let mut seen: HashSet<Atom> = HashSet::new();
+
+        // The failing propagator's own premises (all true literals).
+        let conflict_ds: Vec<Lit> = match conflict {
+            Conflict::Generic(ds) => ds.clone(),
+            Conflict::Clause(c) => self.clauses.get(*c).lits.iter().map(|l| l.negate()).collect(),
+        };
+        self.bucket_footprint(&mut buckets, sel_vars, &conflict_ds);
+        let mut stack: Vec<Lit> = conflict_ds;
+
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t.atom()) {
+                continue;
+            }
+            match self.reason_of(t.atom()) {
+                // A propagator inference: `ds` are its true premises, tagged with
+                // the constraint's selector by the `Selected` wrapper.
+                Reason::Generic(ds) => {
+                    let ds = ds.to_vec();
+                    self.bucket_footprint(&mut buckets, sel_vars, &ds);
+                    stack.extend_from_slice(&ds);
+                }
+                // A clause reason carries no selector here (no learning on this
+                // path); just keep walking its antecedents.
+                Reason::Clause(c) => {
+                    let ante: Vec<Lit> = self.clauses.get(*c).lits.iter().copied().filter(|&l| l != t).map(|l| l.negate()).collect();
+                    stack.extend_from_slice(&ante);
+                }
+                Reason::Decision | Reason::Fact | Reason::Unset => {} // leaves
+            }
+        }
+        buckets
+    }
+
+    /// Add the non-selector literals of one propagator explanation `ds` to the
+    /// footprint bucket of each selector variable `ds` carries.
+    fn bucket_footprint(&self, buckets: &mut Vec<(VarId, Vec<Lit>)>, sel_vars: &HashSet<VarId>, ds: &[Lit]) {
+        let is_sel = |l: &Lit| sel_vars.contains(&self.atoms.var_of(l.atom()));
+        for sel in ds.iter().copied().filter(is_sel) {
+            let sel_var = self.atoms.var_of(sel.atom());
+            let entry = match buckets.iter_mut().find(|(v, _)| *v == sel_var) {
+                Some(entry) => entry,
+                None => {
+                    buckets.push((sel_var, Vec::new()));
+                    buckets.last_mut().unwrap()
+                }
+            };
+            for &lit in ds {
+                if !is_sel(&lit) && !entry.1.contains(&lit) {
+                    entry.1.push(lit);
+                }
+            }
+        }
+    }
+
     /// Recursively minimize a learned clause using the implication graph.
     ///
     /// A non-asserting literal `q` is redundant when the reason for the assigned

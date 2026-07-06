@@ -13,7 +13,7 @@ use std::sync::atomic::AtomicBool;
 
 use crate::ids::VarId;
 use crate::lcg::engine::AssumptionOutcome;
-use crate::lcg::lit::{Lit, LitOrConst};
+use crate::lcg::lit::{AtomKind, Lit, LitOrConst};
 use crate::lcg::trail::Cdcl;
 use crate::store::Solver;
 
@@ -56,7 +56,11 @@ pub enum MusResult {
 /// selector from [`selected`]) with respect to `solver`'s constraints over the
 /// decision variables `vars`.
 pub fn extract_mus<'a>(solver: &'a mut Solver, vars: &[VarId], selectors: &[VarId], stop: &'a AtomicBool) -> MusResult {
-    let mut cdcl = Cdcl::new(solver, vars);
+    // Work on a clone: the search mutates root domains (sound learned units), so
+    // never touch the caller's model — keeps `extract_mus`/`explain_mus` pure and
+    // composable on one solver.
+    let mut work = solver.clone();
+    let mut cdcl = Cdcl::new(&mut work, vars);
     cdcl.set_stop(stop);
     if !cdcl.init() {
         return MusResult::Mus(Vec::new()); // root already unsatisfiable
@@ -93,6 +97,79 @@ pub fn extract_mus<'a>(solver: &'a mut Solver, vars: &[VarId], selectors: &[VarI
         None => MusResult::Interrupted,
         Some(minimal) => MusResult::Mus(minimal.into_iter().map(|i| sel_of[i]).collect()),
     }
+}
+
+/// A relation in a [`MusAtom`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MusRel {
+    /// `var = value`.
+    Eq,
+    /// `var ≠ value`.
+    Ne,
+    /// `var ≥ value`.
+    Ge,
+    /// `var ≤ value`.
+    Le,
+}
+
+/// One semantic atom a constraint reasoned about in a refutation: `var rel value`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MusAtom {
+    pub var: VarId,
+    pub rel: MusRel,
+    pub value: i32,
+}
+
+/// A sub-constraint MUS explanation (Brique 4): for each MUS constraint, the
+/// selector and the specific atoms it used in the refutation — a Hall set, an
+/// energy window — rather than the whole global.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MusExplanation {
+    /// `(selector, atoms)` per constraint that participated in the refutation.
+    pub constraints: Vec<(VarId, Vec<MusAtom>)>,
+}
+
+/// Explain *why* a MUS is unsatisfiable at sub-constraint granularity: the
+/// specific semantic atoms each constraint contributed. `mus` is a set of
+/// selectors (e.g. from [`extract_mus`]) whose constraints are jointly
+/// unsatisfiable.
+///
+/// Returns `Some` when the MUS refutes by propagation alone (the common case
+/// for a minimal global core: a pigeonhole `allDifferent`, an overloaded
+/// `cumulative`); `None` when refuting it needs search, where a sub-constraint
+/// explanation is out of scope for this prototype — the constraint-level MUS
+/// from [`extract_mus`] still applies.
+pub fn explain_mus<'a>(solver: &'a mut Solver, vars: &[VarId], mus: &[VarId], stop: &'a AtomicBool) -> Option<MusExplanation> {
+    let mut work = solver.clone(); // pure w.r.t. the caller's model (see extract_mus)
+    let mut cdcl = Cdcl::new(&mut work, vars);
+    cdcl.set_stop(stop);
+    if !cdcl.init() {
+        return Some(MusExplanation { constraints: Vec::new() }); // root already unsatisfiable
+    }
+    let mut on: Vec<Lit> = Vec::with_capacity(mus.len());
+    for &sel in mus {
+        match cdcl.atoms.eq(sel, 1) {
+            LitOrConst::Lit(lit) => on.push(lit),
+            _ => return None, // a selector fixed at the root cannot be toggled
+        }
+    }
+    let footprint = cdcl.explain_by_propagation(&on)?;
+    let constraints = footprint
+        .into_iter()
+        .map(|(selector, atoms)| (selector, atoms.iter().map(|&lit| decode_atom(&cdcl, lit)).collect()))
+        .collect();
+    Some(MusExplanation { constraints })
+}
+
+/// Decode an LCG literal into its human-facing `var rel value` atom.
+fn decode_atom(cdcl: &Cdcl<'_>, lit: Lit) -> MusAtom {
+    let (var, rel, value) = match cdcl.atoms.decode(lit.atom()) {
+        AtomKind::Eq { var, v } if lit.is_positive() => (var, MusRel::Eq, v),
+        AtomKind::Eq { var, v } => (var, MusRel::Ne, v),
+        AtomKind::Ge { var, k } if lit.is_positive() => (var, MusRel::Ge, k),
+        AtomKind::Ge { var, k } => (var, MusRel::Le, k - 1),
+    };
+    MusAtom { var, rel, value }
 }
 
 /// `Some(true)` if activating exactly `active` (every other selector off) is
