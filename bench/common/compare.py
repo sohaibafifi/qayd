@@ -60,6 +60,9 @@ def main():
     ap.add_argument("--timeout", type=int, default=10)
     ap.add_argument("--name-a", default="qayd")
     ap.add_argument("--name-b", default="baseline")
+    ap.add_argument("--details", type=int, default=0, metavar="N",
+                    help="list per-instance regressions: lost/gained instances, "
+                    "top-N slowdowns/speedups among solved-by-both, objective regressions")
     args = ap.parse_args()
 
     A, B = load(args.a), load(args.b)
@@ -73,6 +76,7 @@ def main():
     contradictions, obj_tie, a_better, a_worse = [], 0, 0, 0
     a_faster = b_faster = 0
     only_a = only_b = both = neither = 0
+    lost, gained, deltas, obj_regressions = [], [], [], []
     for i in common:
         sa, sb = A[i]["status"], B[i]["status"]
         oaj, obj = A[i]["obj"], B[i]["obj"]
@@ -93,7 +97,12 @@ def main():
         only_a += oa and not ob
         only_b += ob and not oa
         neither += not oa and not ob
+        if oa and not ob:
+            gained.append((i, A[i]["time"]))
+        if ob and not oa:
+            lost.append((i, B[i]["time"]))
         if oa and ob:
+            deltas.append((A[i]["time"] - B[i]["time"], i, A[i]["time"], B[i]["time"]))
             if A[i]["time"] < B[i]["time"]:
                 a_faster += 1
             elif B[i]["time"] < A[i]["time"]:
@@ -103,6 +112,7 @@ def main():
                 a_better += 1
             elif c == -1:
                 a_worse += 1
+                obj_regressions.append((i, A[i]["obj"], B[i]["obj"]))
             elif A[i]["obj"] is not None:
                 obj_tie += 1
 
@@ -122,6 +132,31 @@ def main():
     print(f"  CONTRADICTIONS (soundness bug!) : {len(contradictions)}")
     for i, sa, sb in contradictions:
         print(f"    !! {i}: {na}={sa} {nb}={sb}")
+
+    if args.details:
+        n = args.details
+        if lost:
+            print(f"  lost by {na} (solved only by {nb}):")
+            for i, t in sorted(lost, key=lambda x: x[1]):
+                print(f"    - {i}  ({nb}: {t:.1f}s)")
+        if gained:
+            print(f"  gained by {na}:")
+            for i, t in sorted(gained, key=lambda x: x[1]):
+                print(f"    + {i}  ({na}: {t:.1f}s)")
+        slow = sorted((d for d in deltas if d[0] > 0), reverse=True)[:n]
+        if slow:
+            print(f"  top slowdowns for {na} (solved-by-both, ordered by lost seconds):")
+            for dt, i, ta, tb in slow:
+                print(f"    {i}: {tb:.1f}s -> {ta:.1f}s  (+{dt:.1f}s)")
+        fast = sorted(d for d in deltas if d[0] < 0)[:n]
+        if fast:
+            print(f"  top speedups for {na}:")
+            for dt, i, ta, tb in fast:
+                print(f"    {i}: {tb:.1f}s -> {ta:.1f}s  ({dt:.1f}s)")
+        if obj_regressions:
+            print(f"  objective regressions for {na} (solved-by-both):")
+            for i, oa_v, ob_v in obj_regressions[:n]:
+                print(f"    {i}: {na}={oa_v} {nb}={ob_v}")
 
 
 if __name__ == "__main__":
