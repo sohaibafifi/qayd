@@ -211,7 +211,7 @@ pub(crate) fn decide_sat_shared_seeded(
 pub enum AssumptionResult {
     /// A full assignment over `vars` satisfying every assumption.
     Sat(Vec<i32>),
-    /// A subset of `cube` inconsistent with the constraints — an unsat core.
+    /// A subset of `cube` inconsistent with the constraints: an unsat core.
     /// Empty means the constraints are unsatisfiable regardless of the cube.
     Unsat(Vec<BoolLit>),
     /// The search was interrupted by the stop flag before a status was decided.
@@ -225,7 +225,7 @@ pub enum AssumptionResult {
 /// Each assumption is a [`BoolLit`] over a `{0,1}`/`{-1,1}` variable. An
 /// assumption already entailed by the constraints is dropped (it can never be
 /// part of a core); one already contradicted forms a singleton core on its own.
-/// The returned core is *a* core, not necessarily minimal — minimisation is a
+/// The returned core is *a* core, not necessarily minimal; minimisation is a
 /// separate step.
 pub fn solve_under_assumptions(
     solver: &mut Solver,

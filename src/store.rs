@@ -71,6 +71,23 @@ pub enum Premise {
     Ne { var: VarId, val: i32 },
 }
 
+impl Premise {
+    /// The variable this premise constrains.
+    fn var(&self) -> VarId {
+        match *self {
+            Premise::Ge { var, .. } | Premise::Le { var, .. } | Premise::Eq { var, .. } | Premise::Ne { var, .. } => var,
+        }
+    }
+}
+
+/// Number of distinct variables mentioned by a tight reason: its witness size.
+fn distinct_premise_vars(why: &[Premise]) -> u32 {
+    let mut vars: Vec<u32> = why.iter().map(|p| p.var().0).collect();
+    vars.sort_unstable();
+    vars.dedup();
+    vars.len() as u32
+}
+
 /// A scope variable's domain, snapshotted just before a propagator's mutation.
 /// `holes` are absent root-supported values strictly inside `(min, max)`.
 #[derive(Clone, Debug)]
@@ -158,6 +175,12 @@ pub struct Store {
     /// literal appears in the nogood (letting an unsat core trace to it). `None`
     /// outside a selected propagator's `propagate`.
     injected_premise: Option<Premise>,
+    /// Research instrumentation (off by default): when `Some`, every tight
+    /// propagator reason records `(distinct witness variables, propagator scope
+    /// size, kind)` with `kind` = 1 for a failure, 0 for an inference. Used by the
+    /// MUS "finesse" study to measure how small a global's Hall-set / energy-window
+    /// witness is versus its full scope.
+    finesse: Option<Vec<(u32, u32, u8)>>,
     /// Whether an LCG trail consumes reasons. Off outside learning, so
     /// propagators with costly explanation construction can skip it entirely.
     explain: bool,
@@ -755,6 +778,7 @@ impl Store {
                 // A real change under an active selector is entailed by the inner
                 // premises *and* `sel = 1`; stamp the latter so the nogood carries it.
                 if will_change {
+                    self.record_finesse(&p, false);
                     if let Some(prem) = self.injected_premise {
                         p.push(prem);
                     }
@@ -834,8 +858,32 @@ impl Store {
     /// Report inconsistency with a tight conflict reason (`why`: premises true
     /// now that are jointly infeasible). Use as `return Err(store.fail_because(..))`.
     pub fn fail_because(&mut self, why: Vec<Premise>) -> Inconsistency {
+        self.record_finesse(&why, true);
         self.pending_conflict = Some(why);
         Inconsistency
+    }
+
+    /// Sample the current tight reason's `(witness vars, scope, kind)` for the
+    /// finesse kill-test, where `kind` is 1 for a failure and 0 for an inference.
+    /// No-op unless [`enable_finesse`](Store::enable_finesse) is on.
+    fn record_finesse(&mut self, why: &[Premise], failure: bool) {
+        if self.finesse.is_none() {
+            return;
+        }
+        let Some(pid) = self.current else { return };
+        let witness = distinct_premise_vars(why);
+        let scope = self.scope[pid.index()].len() as u32;
+        self.finesse.as_mut().unwrap().push((witness, scope, u8::from(failure)));
+    }
+
+    /// Start recording finesse samples (research instrumentation).
+    pub fn enable_finesse(&mut self) {
+        self.finesse = Some(Vec::new());
+    }
+
+    /// Drain the finesse samples: `(distinct witness vars, scope size, priority index)`.
+    pub fn take_finesse(&mut self) -> Vec<(u32, u32, u8)> {
+        self.finesse.take().unwrap_or_default()
     }
 
     /// Take any conflict reason staged by [`fail_because`](Store::fail_because).
@@ -1175,7 +1223,7 @@ pub struct Solver {
     /// `dom/wdeg` weights, indexed by `PropId`; bumped when a propagator fails.
     weights: Vec<u64>,
     /// When set, [`post`](Solver::post) wraps each propagator in a
-    /// [`Selected`] guard on this selector — used to build constraint-level
+    /// [`Selected`] guard on this selector, used to build constraint-level
     /// unsat cores. `None` in normal solving (no wrapping, no overhead).
     current_selector: Option<VarId>,
 }

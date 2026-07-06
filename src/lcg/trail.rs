@@ -1550,7 +1550,7 @@ impl<'s> Cdcl<'s> {
     /// assumption solving: `p` is a cube assumption literal that is currently
     /// *false* (so `¬p` sits on the trail). Instead of stopping at a 1-UIP, walk
     /// the implication graph back to the assumption *decisions* that forced `¬p`
-    /// and return that subset of the cube (including `p` itself) — a set of
+    /// and return that subset of the cube (including `p` itself): a set of
     /// assumptions jointly inconsistent with the root (an unsat core).
     ///
     /// Only assumption decisions are on the trail when this is called (the driver
@@ -1595,20 +1595,20 @@ impl<'s> Cdcl<'s> {
         core
     }
 
-    /// Brique 4 prototype — the *semantic footprint* of an unsatisfiable set of
-    /// selectors that refutes by propagation alone. Asserts every selector in
-    /// `on` at the root, propagates once, and, if that already fails, walks the
-    /// refutation's reason DAG bucketing the non-selector literals of each
-    /// propagator explanation by the selector it carries. The result is, per
-    /// constraint, the *specific* atoms it reasoned about — the Hall set of an
-    /// `allDifferent`, the energy window of a `cumulative` — not the whole
-    /// global. This is the differentiator from CNF-level proof trimming: the DAG
-    /// leaves are the propagators' structured [`Reason::Generic`] explanations.
+    /// The *semantic footprint* of an unsatisfiable set of selectors that refutes
+    /// by propagation alone. Asserts every selector in `on` at the root,
+    /// propagates once, and, if that already fails, walks the refutation's reason
+    /// DAG bucketing the non-selector literals of each propagator explanation by
+    /// the selector it carries. The result is, per constraint, the *specific*
+    /// atoms it reasoned about (the Hall set of an `allDifferent`, the energy
+    /// window of a `cumulative`), not the whole global. This is the differentiator
+    /// from CNF-level proof trimming: the DAG leaves are the propagators'
+    /// structured [`Reason::Generic`] explanations.
     ///
     /// `None` when asserting the selectors does not fail by propagation (the core
     /// needs search to refute; a sub-constraint explanation for that case is
     /// future work). The caller must have run [`init`](Cdcl::init) and pass a set
-    /// known to be unsatisfiable. Leaves the trail dirty — use a fresh engine.
+    /// known to be unsatisfiable. Leaves the trail dirty; use a fresh engine.
     pub(crate) fn explain_by_propagation(&mut self, on: &[Lit]) -> Option<Vec<(VarId, Vec<Lit>)>> {
         debug_assert_eq!(self.decision_level(), 0);
         for &lit in on {

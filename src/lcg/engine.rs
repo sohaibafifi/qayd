@@ -656,7 +656,7 @@ impl Cdcl<'_> {
                 }
                 continue;
             }
-            // Phase 2: assumptions all satisfied — branch for a model. A conflict
+            // Phase 2: assumptions all satisfied, branch for a model. A conflict
             // that refutes the cube backjumps below `cube.len()`, re-entering
             // Phase 1 where `analyze_final` catches the now-false assumption.
             match self.select_var(vars, None) {

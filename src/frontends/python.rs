@@ -25,7 +25,7 @@ use crate::expr::{self, Expr};
 use crate::ids::VarId;
 use crate::model as shared_model;
 use crate::model::list;
-use crate::mus::{explain_mus, extract_mus, MusRel, MusResult};
+use crate::mus::{enumerate_mus, explain_mus, extract_mus, MusRel, MusResult};
 use crate::problem::{Objective as ProblemObjective, Problem};
 use crate::search::{self, Objective as SearchObjective, SearchControl, SolveStats};
 use crate::Solver;
@@ -1505,6 +1505,28 @@ impl PyModel {
             MusResult::Interrupted => Err(PyTimeoutError::new_err("mus() timed out")),
             MusResult::Mus(core) => Ok(Some(core.iter().map(|&sel| self.selector_name(sel)).collect())),
         }
+    }
+
+    /// Enumerate the full infeasibility landscape of the [`soft`](PyModel::soft)
+    /// groups (MARCO): returns `(muses, msses, complete)` where `muses` is every
+    /// minimal unsatisfiable subset and `msses` every maximal satisfiable subset
+    /// (each as a list of group names). `complete` is `False` if the search
+    /// stopped early (time-out or `limit` reached). `limit` caps the total number
+    /// of MUS + MSS returned (there can be exponentially many).
+    #[pyo3(signature = (time_limit=None, limit=None))]
+    fn enumerate_mus(&self, py: Python<'_>, time_limit: Option<u64>, limit: Option<usize>) -> PyResult<(Vec<Vec<String>>, Vec<Vec<String>>, bool)> {
+        if self.col_universe.is_some() || self.col_schedule.is_some() {
+            return Err(PyValueError::new_err("enumerate_mus() is not supported for list/interval models"));
+        }
+        let vars = self.decision_var_ids();
+        let selectors: Vec<VarId> = self.mus_selectors.iter().map(|&(_, sel)| sel).collect();
+        let mut solver = self.solver.clone();
+        let stop = deadline(time_limit);
+        let result = with_interrupts(py, &stop, || enumerate_mus(&mut solver, &vars, &selectors, &stop, limit))?;
+        let names = |group: &[VarId]| group.iter().map(|&sel| self.selector_name(sel)).collect::<Vec<_>>();
+        let muses = result.muses.iter().map(|m| names(m)).collect();
+        let msses = result.msses.iter().map(|m| names(m)).collect();
+        Ok((muses, msses, result.complete))
     }
 
     /// Explain a MUS at sub-constraint granularity: for each core
