@@ -30,6 +30,7 @@ pub mod lcg;
 mod lns;
 pub mod mem;
 pub mod model;
+pub mod mus;
 mod parallel;
 #[doc(hidden)]
 pub mod problem;
@@ -48,8 +49,8 @@ pub use ids::{IntervalId, ListId, PropId, VarId};
 pub use propagator::{Event, Inconsistency, Propagator};
 pub use search::{
     count_solutions, first_domain_solution, first_solution, maximize, minimize, optimize_with, solve, solve_bool_cnf_interruptible,
-    solve_bool_cnf_seeded, solve_bool_cnf_seeded_with_proof, solve_domains, solve_domains_interruptible, solve_interruptible, BoolCnfError,
-    BoolLit, DomainSolution, SearchControl, SolveStats,
+    solve_bool_cnf_seeded, solve_bool_cnf_seeded_with_proof, solve_domains, solve_domains_interruptible, solve_interruptible,
+    solve_under_assumptions, AssumptionResult, BoolCnfError, BoolLit, DomainSolution, SearchControl, SolveStats,
 };
 pub use store::{Solver, Store};
 pub use trail::{ReversibleInt, Trail};

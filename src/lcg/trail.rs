@@ -1546,6 +1546,55 @@ impl<'s> Cdcl<'s> {
         Some(learnt)
     }
 
+    /// MiniSat `analyzeFinal`, the sibling of [`analyze`](Self::analyze) for
+    /// assumption solving: `p` is a cube assumption literal that is currently
+    /// *false* (so `¬p` sits on the trail). Instead of stopping at a 1-UIP, walk
+    /// the implication graph back to the assumption *decisions* that forced `¬p`
+    /// and return that subset of the cube (including `p` itself) — a set of
+    /// assumptions jointly inconsistent with the root (an unsat core).
+    ///
+    /// Only assumption decisions are on the trail when this is called (the driver
+    /// invokes it before branching, and any conflict backjumps branch levels
+    /// away first), so every `Reason::Decision` literal reached is a cube
+    /// assumption. Uses the shared `seen` buffer, restored on exit.
+    pub(crate) fn analyze_final(&mut self, p: Lit) -> Vec<Lit> {
+        let mut core = vec![p];
+        if self.decision_level() == 0 {
+            // ¬p is a root fact or a learned root unit: p alone refutes the root.
+            return core;
+        }
+        let start = p.negate(); // true on the trail
+        let root_end = self.level_starts[1];
+        let mut touched = vec![start.atom()];
+        self.seen[start.atom() as usize] = true;
+        // Newest first, down to the first decision level; root literals (below
+        // `root_end`) have no assumption antecedents and are skipped.
+        for i in (root_end..self.trail.len()).rev() {
+            let lit = self.trail[i];
+            let a = lit.atom();
+            if !self.seen[a as usize] {
+                continue;
+            }
+            self.seen[a as usize] = false;
+            if matches!(self.reason_of(a), Reason::Decision) {
+                core.push(lit); // a participating assumption decision
+            } else {
+                for q in self.reason_lits(lit) {
+                    let qa = q.atom() as usize;
+                    let lv = self.level_of(q.atom());
+                    if lv != 0 && lv != UNSET && !self.seen[qa] {
+                        self.seen[qa] = true;
+                        touched.push(q.atom());
+                    }
+                }
+            }
+        }
+        for a in touched {
+            self.seen[a as usize] = false;
+        }
+        core
+    }
+
     /// Recursively minimize a learned clause using the implication graph.
     ///
     /// A non-asserting literal `q` is redundant when the reason for the assigned

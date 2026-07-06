@@ -11,6 +11,7 @@ use crate::domains::interval::IntervalPresence;
 use crate::expr::Expr;
 use crate::ids::{IntervalId, ListId, VarId};
 use crate::lcg::clause::ClauseSharing;
+use crate::lcg::engine::AssumptionOutcome;
 use crate::lcg::lit::{AtomKind, LazyAtomRegistry, Lit, LitOrConst};
 use crate::lcg::trail::Cdcl;
 use crate::lcg::view::Tri;
@@ -203,6 +204,63 @@ pub(crate) fn decide_sat_shared_seeded(
         cdcl.use_fast_restarts();
     }
     cdcl.decide_sat(vars, stop)
+}
+
+/// Status of [`solve_under_assumptions`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AssumptionResult {
+    /// A full assignment over `vars` satisfying every assumption.
+    Sat(Vec<i32>),
+    /// A subset of `cube` inconsistent with the constraints — an unsat core.
+    /// Empty means the constraints are unsatisfiable regardless of the cube.
+    Unsat(Vec<BoolLit>),
+    /// The search was interrupted by the stop flag before a status was decided.
+    Interrupted,
+}
+
+/// Solve `solver` over `vars` under the Boolean assumption `cube`, returning a
+/// model, an unsat core (a subset of `cube` inconsistent with the constraints),
+/// or interruption.
+///
+/// Each assumption is a [`BoolLit`] over a `{0,1}`/`{-1,1}` variable. An
+/// assumption already entailed by the constraints is dropped (it can never be
+/// part of a core); one already contradicted forms a singleton core on its own.
+/// The returned core is *a* core, not necessarily minimal — minimisation is a
+/// separate step.
+pub fn solve_under_assumptions(
+    solver: &mut Solver,
+    vars: &[VarId],
+    cube: &[BoolLit],
+    stop: &AtomicBool,
+) -> Result<AssumptionResult, BoolCnfError> {
+    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, 0, None) else {
+        return Ok(AssumptionResult::Interrupted);
+    };
+    // Translate the Boolean cube to internal literals, remembering the reverse map.
+    let mut cube_lits: Vec<Lit> = Vec::with_capacity(cube.len());
+    let mut reverse: Vec<(Lit, BoolLit)> = Vec::with_capacity(cube.len());
+    for &bl in cube {
+        validate_bool_var(&cdcl, bl.var)?;
+        match cdcl.atoms.eq(bl.var, bool_value(&cdcl, bl.var, bl.value)) {
+            LitOrConst::True => {} // trivially satisfied: never in a core
+            LitOrConst::False => return Ok(AssumptionResult::Unsat(vec![bl])), // impossible alone
+            LitOrConst::Lit(l) => {
+                if !cube_lits.contains(&l) {
+                    cube_lits.push(l);
+                    reverse.push((l, bl));
+                }
+            }
+        }
+    }
+    Ok(match cdcl.solve_under_assumptions(vars, &cube_lits, stop) {
+        AssumptionOutcome::Sat(model) => AssumptionResult::Sat(model),
+        AssumptionOutcome::Interrupted => AssumptionResult::Interrupted,
+        AssumptionOutcome::Unsat(core) => AssumptionResult::Unsat(
+            core.into_iter()
+                .map(|l| reverse.iter().find(|(cl, _)| *cl == l).map(|&(_, bl)| bl).expect("core literal came from the cube"))
+                .collect(),
+        ),
+    })
 }
 
 /// Find one solution or prove UNSAT for native Boolean CNF clauses.

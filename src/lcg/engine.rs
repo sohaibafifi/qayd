@@ -13,6 +13,7 @@ use crate::expr::Expr;
 use crate::ids::{PropId, VarId};
 use crate::lcg::lit::{Lit, LitOrConst};
 use crate::lcg::trail::{Cdcl, Reason};
+use crate::lcg::view::Tri;
 use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::search::{Objective, SearchControl, SolveStats};
 use crate::store::{Premise, Solver, Store};
@@ -82,6 +83,17 @@ impl ObjectiveImpact {
         let width = i64::from(solver.store.max(var)) - i64::from(solver.store.min(var));
         coeff.saturating_mul(width.max(0) as u128)
     }
+}
+
+/// Outcome of [`Cdcl::solve_under_assumptions`].
+pub(crate) enum AssumptionOutcome {
+    /// A full assignment over `vars` satisfying the root and the whole cube.
+    Sat(Vec<i32>),
+    /// A subset of the cube inconsistent with the root (an unsat core). Empty
+    /// means the root alone is unsatisfiable, independent of the cube.
+    Unsat(Vec<Lit>),
+    /// The stop flag fired before a status was decided.
+    Interrupted,
 }
 
 impl Cdcl<'_> {
@@ -589,6 +601,76 @@ impl Cdcl<'_> {
         stats.failures = self.conflicts;
         self.copy_inprocessing_stats(&mut stats);
         (solution, stats, complete)
+    }
+
+    /// Solve the root constraints under `cube`, a set of assumption literals,
+    /// returning a model, an unsat core (subset of `cube`), or interruption.
+    ///
+    /// MiniSat-style assumption solving: each assumption is placed as its own
+    /// decision (not a root unit), so learned clauses stay entailed by the root
+    /// alone and a refutation traces back through [`analyze_final`] to exactly
+    /// the assumptions that participated. `decision_level()` doubles as the index
+    /// of the next assumption to place; already-implied assumptions get a dummy
+    /// level to keep that alignment (and to be replayed identically after a
+    /// restart, which backjumps to the root).
+    pub(crate) fn solve_under_assumptions(&mut self, vars: &[VarId], cube: &[Lit], stop: &AtomicBool) -> AssumptionOutcome {
+        if !self.init() {
+            return AssumptionOutcome::Unsat(Vec::new()); // root already unsatisfiable
+        }
+        self.resolve_assumptions(vars, cube, stop)
+    }
+
+    /// Re-solve under `cube` from the current root, reusing the engine's learned
+    /// clauses (all entailed by the root, hence valid under any cube). The caller
+    /// must have run [`init`](Cdcl::init) once. This is the per-query primitive
+    /// for MUS minimisation, which fires many cubes at one engine.
+    pub(crate) fn resolve_assumptions(&mut self, vars: &[VarId], cube: &[Lit], stop: &AtomicBool) -> AssumptionOutcome {
+        self.backjump_to(0);
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return AssumptionOutcome::Interrupted;
+            }
+            if !self.maybe_restart() {
+                return AssumptionOutcome::Unsat(Vec::new());
+            }
+            let d = self.decision_level();
+            if d < cube.len() {
+                // Phase 1: place the next assumption as a decision.
+                let p = cube[d];
+                match self.value(p) {
+                    Tri::True => self.open_level(), // already implied: dummy level
+                    Tri::False => {
+                        let core = self.analyze_final(p);
+                        self.backjump_to(0);
+                        return AssumptionOutcome::Unsat(core);
+                    }
+                    Tri::Unknown => {
+                        self.decide(p).expect("in-domain assumption decision cannot fail");
+                        if !self.propagate_and_learn() {
+                            // Level-0 refutation: every learnt clause is root-entailed,
+                            // so this means the root alone is unsatisfiable.
+                            self.backjump_to(0);
+                            return AssumptionOutcome::Unsat(Vec::new());
+                        }
+                    }
+                }
+                continue;
+            }
+            // Phase 2: assumptions all satisfied — branch for a model. A conflict
+            // that refutes the cube backjumps below `cube.len()`, re-entering
+            // Phase 1 where `analyze_final` catches the now-false assumption.
+            match self.select_var(vars, None) {
+                None => return AssumptionOutcome::Sat(vars.iter().map(|&v| self.solver.store.value(v)).collect()),
+                Some(v) => {
+                    let lit = self.decision_lit(v, &self.saved_phase);
+                    self.decide(lit).expect("in-domain decision cannot fail");
+                    if !self.propagate_and_learn() {
+                        self.backjump_to(0);
+                        return AssumptionOutcome::Unsat(Vec::new()); // root alone is unsat
+                    }
+                }
+            }
+        }
     }
 }
 
