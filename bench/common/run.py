@@ -92,7 +92,25 @@ def normalize_status(raw):
     return "UNKNOWN"
 
 
-def run_one(cmd_tmpl, inst, timeout, scratch, tag=0):
+def rlimit_preexec(mem_mb):
+    """Cap the child's address space (solver-agnostic OOM guard, like the
+    wall-clock kill): the kernel fails its allocations instead of taking the
+    machine down. Enforced on Linux; macOS ignores RLIMIT_AS (best effort)."""
+    if not mem_mb:
+        return None
+    import resource
+
+    def preexec():
+        limit = mem_mb * 1024 * 1024
+        try:
+            resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+        except (ValueError, OSError):
+            pass
+
+    return preexec
+
+
+def run_one(cmd_tmpl, inst, timeout, scratch, tag=0, mem_mb=0):
     f = materialize(inst, scratch, tag)
     cmd = cmd_tmpl.replace("{f}", f).replace("{t}", str(timeout))
     argv = cmd.split()
@@ -101,7 +119,8 @@ def run_one(cmd_tmpl, inst, timeout, scratch, tag=0):
     out = ""
     try:
         p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                             text=True, start_new_session=True)
+                             text=True, start_new_session=True,
+                             preexec_fn=rlimit_preexec(mem_mb))
         try:
             out, _ = p.communicate(timeout=timeout + 5)
         except subprocess.TimeoutExpired:
@@ -159,6 +178,9 @@ def main():
     ap.add_argument("--jobs", type=int, default=1,
                     help="instances run concurrently (solver itself stays as templated); "
                     "co-running instances add timing noise, so compare runs made with the SAME value")
+    ap.add_argument("--mem-mb", type=int, default=0,
+                    help="address-space cap per instance in MB (0 = none): the OS kills an "
+                    "over-consuming solver instead of the machine dying; scored like any abnormal exit")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -180,7 +202,7 @@ def main():
 
     def solve_row(tag_inst):
         tag, inst = tag_inst
-        status, obj, dt, to, err = run_one(args.cmd, inst, args.timeout, scratch, tag)
+        status, obj, dt, to, err = run_one(args.cmd, inst, args.timeout, scratch, tag, args.mem_mb)
         return os.path.basename(inst), status, obj, dt, to, err, direction(inst)
 
     try:
