@@ -1146,11 +1146,18 @@ impl XcspCallback for Model {
         });
     }
 
-    fn on_constraint_channel_v1(&mut self, list: &[String], _start_index: i32) {
+    fn on_constraint_channel_v1(&mut self, list: &[String], start_index: i32) {
         guard!(self, {
             let vars = self.scope(list)?;
-            self.local.add_channel_inverse(vars.clone(), _start_index, vars.clone(), _start_index);
-            channel(&mut self.solver, &vars, &vars);
+            self.local.add_channel_inverse(vars.clone(), start_index, vars.clone(), start_index);
+            if start_index == 0 {
+                channel(&mut self.solver, &vars, &vars);
+            } else {
+                // The plain propagator is 0-based; shifted positions need the
+                // offset-aware decomposition (mirrors the two-list variant).
+                let vars2 = vars.clone();
+                self.post_channel_inverse_kernel(&vars, start_index, &vars2, start_index);
+            }
             Ok(())
         });
     }
@@ -1159,21 +1166,7 @@ impl XcspCallback for Model {
             let xs = self.scope(list1)?;
             let ys = self.scope(list2)?;
             self.local.add_channel_inverse(xs.clone(), start_index1, ys.clone(), start_index2);
-            for &x in &xs {
-                linear(&mut self.solver, &[1], &[x], Relation::Ge, start_index2 as i64);
-                linear(&mut self.solver, &[1], &[x], Relation::Le, start_index2 as i64 + ys.len() as i64 - 1);
-            }
-            for &y in &ys {
-                linear(&mut self.solver, &[1], &[y], Relation::Ge, start_index1 as i64);
-                linear(&mut self.solver, &[1], &[y], Relation::Le, start_index1 as i64 + xs.len() as i64 - 1);
-            }
-            for (i, &x) in xs.iter().enumerate() {
-                for (j, &y) in ys.iter().enumerate() {
-                    let xv = expr::eq(expr::var(x), expr::int(start_index2 as i64 + j as i64));
-                    let yv = expr::eq(expr::var(y), expr::int(start_index1 as i64 + i as i64));
-                    crate::constraints::intension::intension(&mut self.solver, expr::iff(xv, yv));
-                }
-            }
+            self.post_channel_inverse_kernel(&xs, start_index1, &ys, start_index2);
             Ok(())
         });
     }
@@ -1566,15 +1559,50 @@ impl Model {
         origins.iter().map(|b| b.iter().map(|s| self.var_id(s)).collect()).collect()
     }
 
+    /// Offset-aware kernel encoding of `channel(xs, ys)`: value bounds plus the
+    /// pairwise iff decomposition. Used whenever a start index shifts positions
+    /// out of the plain 0-based `channel` propagator's frame.
+    fn post_channel_inverse_kernel(&mut self, xs: &[VarId], start_index1: i32, ys: &[VarId], start_index2: i32) {
+        for &x in xs {
+            linear(&mut self.solver, &[1], &[x], Relation::Ge, start_index2 as i64);
+            linear(&mut self.solver, &[1], &[x], Relation::Le, start_index2 as i64 + ys.len() as i64 - 1);
+        }
+        for &y in ys {
+            linear(&mut self.solver, &[1], &[y], Relation::Ge, start_index1 as i64);
+            linear(&mut self.solver, &[1], &[y], Relation::Le, start_index1 as i64 + xs.len() as i64 - 1);
+        }
+        for (i, &x) in xs.iter().enumerate() {
+            for (j, &y) in ys.iter().enumerate() {
+                let xv = expr::eq(expr::var(x), expr::int(start_index2 as i64 + j as i64));
+                let yv = expr::eq(expr::var(y), expr::int(start_index1 as i64 + i as i64));
+                crate::constraints::intension::intension(&mut self.solver, expr::iff(xv, yv));
+            }
+        }
+    }
+
     fn post_diffn(&mut self, origins: Vec<Vec<VarId>>, lengths: Vec<Vec<Expr>>, zero_ignored: bool) -> Result<(), String> {
         self.local.add_no_overlap(origins.clone(), lengths.clone(), zero_ignored);
         flatten::post_diffn(&mut self.solver, &origins, &lengths, zero_ignored)
     }
 
+    /// Fold a `startIndex` offset into the index variable, returning a fresh
+    /// 0-based index var constrained to `idx - start_index`, or `idx` unchanged
+    /// when the list is already 0-based. Same technique as `matrix_index`.
+    fn zero_based_index(&mut self, idx: VarId, start_index: i32, len: usize) -> VarId {
+        if start_index == 0 {
+            return idx;
+        }
+        let idx0 = self.solver.new_var_range(0, len as i32 - 1);
+        let offset = i64::from(start_index);
+        linear(&mut self.solver, &[1, -1], &[idx0, idx], Relation::Eq, -offset);
+        self.local.add_expr(expr::eq(expr::var(idx0), expr::add(vec![expr::var(idx), expr::int(-offset)])));
+        idx0
+    }
+
     fn post_element(&mut self, array: Vec<VarId>, start_index: i32, index: &str, value: VarId) -> Result<(), String> {
-        require(start_index == 0, "element with non-zero startIndex")?;
         let idx = self.var_id(index)?;
-        self.local.add_element(array.clone(), idx, value, start_index);
+        let idx = self.zero_based_index(idx, start_index, array.len());
+        self.local.add_element(array.clone(), idx, value, 0);
         element(&mut self.solver, &array, idx, value);
         Ok(())
     }
@@ -1587,8 +1615,8 @@ impl Model {
         operator: ROp,
         operand: Operand,
     ) -> Result<(), String> {
-        require(start_index == 0, "element with non-zero startIndex")?;
         let idx = self.var_id(index)?;
+        let idx = self.zero_based_index(idx, start_index, array.len());
         self.element_cond(array, idx, operator, operand)
     }
 
@@ -1728,14 +1756,17 @@ impl Model {
                 if !aligned {
                     return Err("objective: coeffs/terms length mismatch".to_string());
                 }
+                // Saturating throughout: extreme coeffs (near i32::MAX) over wide
+                // domains can exceed i64, and a wrapped span would slip past the
+                // guard below. Saturating fails safe into the Linear fallback.
                 let (mut lo, mut hi) = (0i64, 0i64);
                 for (&c, &v) in coeffs.iter().zip(&vars) {
                     let (vmin, vmax) = (self.solver.store.min(v) as i64, self.solver.store.max(v) as i64);
-                    let (a, b) = if c >= 0 { (c * vmin, c * vmax) } else { (c * vmax, c * vmin) };
-                    lo += a;
-                    hi += b;
+                    let (a, b) = if c >= 0 { (c.saturating_mul(vmin), c.saturating_mul(vmax)) } else { (c.saturating_mul(vmax), c.saturating_mul(vmin)) };
+                    lo = lo.saturating_add(a);
+                    hi = hi.saturating_add(b);
                 }
-                if hi - lo > MAX_MATERIALIZED_OBJECTIVE_SPAN {
+                if hi.saturating_sub(lo) > MAX_MATERIALIZED_OBJECTIVE_SPAN {
                     self.objective = Some(Objective::Linear(minimize, coeffs, vars));
                     return Ok(());
                 }

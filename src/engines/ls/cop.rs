@@ -141,7 +141,7 @@ enum Functional {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum LocalRhs {
+pub enum LocalRhs {
     Const(i64),
     Var(VarId),
 }
@@ -689,7 +689,7 @@ impl LocalSearchSpec {
         self.ensure(var);
     }
 
-    pub(crate) fn add_expr(&mut self, expr: Expr) {
+    pub fn add_expr(&mut self, expr: Expr) {
         if let Some(functional) = functional_from_expr(&expr, &self.derived) {
             self.mark_functional(functional);
         }
@@ -703,23 +703,23 @@ impl LocalSearchSpec {
         self.constraints.push(LocalConstraint::Linear { coeffs, vars, rel, rhs });
     }
 
-    pub(crate) fn add_all_different(&mut self, vars: Vec<VarId>) {
+    pub fn add_all_different(&mut self, vars: Vec<VarId>) {
         self.constraints.push(LocalConstraint::AllDifferent(vars));
     }
 
-    pub(crate) fn add_all_different_rows(&mut self, rows: Vec<Vec<VarId>>) {
+    pub fn add_all_different_rows(&mut self, rows: Vec<Vec<VarId>>) {
         self.constraints.push(LocalConstraint::AllDifferentRows(rows));
     }
 
-    pub(crate) fn add_all_different_except(&mut self, vars: Vec<VarId>, except: Vec<i32>) {
+    pub fn add_all_different_except(&mut self, vars: Vec<VarId>, except: Vec<i32>) {
         self.constraints.push(LocalConstraint::AllDifferentExcept { vars, except });
     }
 
-    pub(crate) fn add_all_equal(&mut self, vars: Vec<VarId>) {
+    pub fn add_all_equal(&mut self, vars: Vec<VarId>) {
         self.constraints.push(LocalConstraint::AllEqual(vars));
     }
 
-    pub(crate) fn add_extension(&mut self, vars: Vec<VarId>, tuples: Vec<Vec<i32>>, positive: bool) {
+    pub fn add_extension(&mut self, vars: Vec<VarId>, tuples: Vec<Vec<i32>>, positive: bool) {
         if positive {
             if let Some(functional) = functional_from_extension(&vars, &tuples) {
                 self.mark_functional(functional);
@@ -730,71 +730,71 @@ impl LocalSearchSpec {
         }
     }
 
-    pub(crate) fn add_lex_chain(&mut self, rows: Vec<Vec<VarId>>, strict: bool) {
+    pub fn add_lex_chain(&mut self, rows: Vec<Vec<VarId>>, strict: bool) {
         self.constraints.push(LocalConstraint::Lex { rows, strict });
     }
 
-    pub(crate) fn add_count(&mut self, vars: Vec<VarId>, values: Vec<i32>, rel: Relation, rhs: LocalRhs) {
+    pub fn add_count(&mut self, vars: Vec<VarId>, values: Vec<i32>, rel: Relation, rhs: LocalRhs) {
         self.constraints.push(LocalConstraint::Count { vars, values, rel, rhs });
     }
 
-    pub(crate) fn add_count_allowed(&mut self, vars: Vec<VarId>, values: Vec<i32>, allowed: Vec<i32>) {
+    pub fn add_count_allowed(&mut self, vars: Vec<VarId>, values: Vec<i32>, allowed: Vec<i32>) {
         self.constraints.push(LocalConstraint::CountAllowed { vars, values, allowed });
     }
 
-    pub(crate) fn add_n_values(&mut self, vars: Vec<VarId>, rel: Relation, rhs: LocalRhs) {
+    pub fn add_n_values(&mut self, vars: Vec<VarId>, rel: Relation, rhs: LocalRhs) {
         self.constraints.push(LocalConstraint::NValues { vars, rel, rhs });
     }
 
-    pub(crate) fn add_cardinality(&mut self, vars: Vec<VarId>, values: Vec<i32>, low: Vec<i64>, high: Vec<i64>, closed: bool) {
+    pub fn add_cardinality(&mut self, vars: Vec<VarId>, values: Vec<i32>, low: Vec<i64>, high: Vec<i64>, closed: bool) {
         self.constraints.push(LocalConstraint::Cardinality { vars, values, low, high, closed });
     }
 
-    pub(crate) fn add_extremum(&mut self, vars: Vec<VarId>, is_min: bool, rel: Relation, rhs: LocalRhs) {
+    pub fn add_extremum(&mut self, vars: Vec<VarId>, is_min: bool, rel: Relation, rhs: LocalRhs) {
         self.constraints.push(LocalConstraint::Extremum { vars, is_min, rel, rhs });
     }
 
-    pub(crate) fn add_element_member(&mut self, array: Vec<VarId>, value: i32) {
+    pub fn add_element_member(&mut self, array: Vec<VarId>, value: i32) {
         self.constraints.push(LocalConstraint::ElementMember { array, value });
     }
 
-    pub(crate) fn add_element(&mut self, array: Vec<VarId>, index: VarId, target: VarId, start_index: i32) {
+    pub fn add_element(&mut self, array: Vec<VarId>, index: VarId, target: VarId, start_index: i32) {
         self.mark_functional(Functional::Element { target, array, index, start_index });
     }
 
-    pub(crate) fn add_cumulative(&mut self, starts: Vec<VarId>, durations: Vec<VarId>, heights: Vec<VarId>, cap: LocalRhs) {
+    pub fn add_cumulative(&mut self, starts: Vec<VarId>, durations: Vec<VarId>, heights: Vec<VarId>, cap: LocalRhs) {
         self.constraints.push(LocalConstraint::Cumulative { starts, durations, heights, cap });
     }
 
-    pub(crate) fn add_channel_inverse(&mut self, xs: Vec<VarId>, x_start: i32, ys: Vec<VarId>, y_start: i32) {
+    pub fn add_channel_inverse(&mut self, xs: Vec<VarId>, x_start: i32, ys: Vec<VarId>, y_start: i32) {
         self.constraints.push(LocalConstraint::ChannelInverse { xs, x_start, ys, y_start });
     }
 
-    pub(crate) fn add_channel_onehot(&mut self, xs: Vec<VarId>, value: VarId, start_index: i32) {
+    pub fn add_channel_onehot(&mut self, xs: Vec<VarId>, value: VarId, start_index: i32) {
         self.constraints.push(LocalConstraint::ChannelOneHot { xs, value, start_index });
     }
 
-    pub(crate) fn add_precedence(&mut self, vars: Vec<VarId>, values: Vec<i32>, covered: bool) {
+    pub fn add_precedence(&mut self, vars: Vec<VarId>, values: Vec<i32>, covered: bool) {
         self.constraints.push(LocalConstraint::Precedence { vars, values, covered });
     }
 
-    pub(crate) fn add_circuit(&mut self, vars: Vec<VarId>) {
+    pub fn add_circuit(&mut self, vars: Vec<VarId>) {
         self.constraints.push(LocalConstraint::Circuit(vars));
     }
 
-    pub(crate) fn add_bin_packing(&mut self, items: Vec<VarId>, sizes: Vec<i64>, limits: Vec<LocalRhs>, exact: bool) {
+    pub fn add_bin_packing(&mut self, items: Vec<VarId>, sizes: Vec<i64>, limits: Vec<LocalRhs>, exact: bool) {
         self.constraints.push(LocalConstraint::BinPacking { items, sizes, limits, exact });
     }
 
-    pub(crate) fn add_no_overlap(&mut self, origins: Vec<Vec<VarId>>, lengths: Vec<Vec<Expr>>, zero_ignored: bool) {
+    pub fn add_no_overlap(&mut self, origins: Vec<Vec<VarId>>, lengths: Vec<Vec<Expr>>, zero_ignored: bool) {
         self.constraints.push(LocalConstraint::NoOverlap { origins, lengths, zero_ignored });
     }
 
-    pub(crate) fn add_regular(&mut self, vars: Vec<VarId>, dfa: Dfa) {
+    pub fn add_regular(&mut self, vars: Vec<VarId>, dfa: Dfa) {
         self.constraints.push(LocalConstraint::Regular { vars, dfa });
     }
 
-    pub(crate) fn add_mdd(&mut self, vars: Vec<VarId>, mdd: Mdd) {
+    pub fn add_mdd(&mut self, vars: Vec<VarId>, mdd: Mdd) {
         self.constraints.push(LocalConstraint::Mdd { vars, mdd });
     }
 

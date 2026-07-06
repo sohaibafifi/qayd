@@ -33,7 +33,7 @@ fn any_eq_expr(vars: &[VarId], value: i32) -> Expr {
     expr::or(vars.iter().map(|&var| expr::eq(expr::var(var), expr::int(value as i64))).collect())
 }
 
-pub(crate) fn post_tuple_not_equal(solver: &mut Solver, left: &[VarId], right: &[VarId]) -> Result<(), String> {
+pub fn post_tuple_not_equal(solver: &mut Solver, left: &[VarId], right: &[VarId]) -> Result<(), String> {
     if left.len() != right.len() {
         return Err("allDifferent-list: ragged tuples".to_string());
     }
@@ -42,7 +42,7 @@ pub(crate) fn post_tuple_not_equal(solver: &mut Solver, left: &[VarId], right: &
     Ok(())
 }
 
-pub(crate) fn post_all_different_except(solver: &mut Solver, vars: &[VarId], except: &[i32]) {
+pub fn post_all_different_except(solver: &mut Solver, vars: &[VarId], except: &[i32]) {
     for i in 0..vars.len() {
         for j in (i + 1)..vars.len() {
             let mut terms = vec![expr::ne(expr::var(vars[i]), expr::var(vars[j]))];
@@ -52,14 +52,14 @@ pub(crate) fn post_all_different_except(solver: &mut Solver, vars: &[VarId], exc
     }
 }
 
-pub(crate) fn post_channel_onehot_index(solver: &mut Solver, xs: &[VarId], value: VarId, start_index: i32) {
+pub fn post_channel_onehot_index(solver: &mut Solver, xs: &[VarId], value: VarId, start_index: i32) {
     for (i, &x) in xs.iter().enumerate() {
         let idx = start_index as i64 + i as i64;
         intension(solver, expr::iff(expr::eq(expr::var(x), expr::int(1)), expr::eq(expr::var(value), expr::int(idx))));
     }
 }
 
-pub(crate) fn post_bin_loads(solver: &mut Solver, items: &[VarId], sizes: &[i64], loads: &[VarId]) {
+pub fn post_bin_loads(solver: &mut Solver, items: &[VarId], sizes: &[i64], loads: &[VarId]) {
     assert!(loads.len() <= i32::MAX as usize, "binPacking: too many bins");
     if loads.is_empty() {
         if !items.is_empty() {
@@ -88,7 +88,7 @@ pub(crate) fn post_bin_loads(solver: &mut Solver, items: &[VarId], sizes: &[i64]
     }
 }
 
-pub(crate) fn post_diffn(solver: &mut Solver, origins: &[Vec<VarId>], lengths: &[Vec<Expr>], zero_ignored: bool) -> Result<(), String> {
+pub fn post_diffn(solver: &mut Solver, origins: &[Vec<VarId>], lengths: &[Vec<Expr>], zero_ignored: bool) -> Result<(), String> {
     if origins.len() != lengths.len() {
         return Err("noOverlap: origins/lengths length mismatch".to_string());
     }
@@ -133,7 +133,7 @@ pub(crate) fn nvalues_var(solver: &mut Solver, vars: &[VarId]) -> VarId {
     aux
 }
 
-pub(crate) fn count_values_to_var(solver: &mut Solver, vars: &[VarId], values: &[i32], rel: Relation, target: VarId) {
+pub fn count_values_to_var(solver: &mut Solver, vars: &[VarId], values: &[i32], rel: Relation, target: VarId) {
     let mut terms = Vec::with_capacity(vars.len() + 1);
     for &var in vars {
         terms.push(aux_for_expr(solver, in_values_expr(var, values)));
