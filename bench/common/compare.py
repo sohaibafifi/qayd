@@ -69,6 +69,13 @@ def main():
     common = sorted(set(A) & set(B))
     na, nb = args.name_a, args.name_b
 
+    # PAR2 charges 2*timeout per unsolved instance: a --timeout below the runs'
+    # real budget silently skews the ranking, so flag the mismatch loudly.
+    max_t = max((r["time"] for r in list(A.values()) + list(B.values())), default=0.0)
+    if max_t > args.timeout * 1.1:
+        print(f"  !! --timeout {args.timeout} looks wrong: recorded times reach "
+              f"{max_t:.0f}s — PAR2 is unreliable; pass the runs' actual timeout")
+
     solved_a = sum(A[i]["status"] in SOLVED for i in common)
     solved_b = sum(B[i]["status"] in SOLVED for i in common)
     vbs = sum((A[i]["status"] in SOLVED) or (B[i]["status"] in SOLVED) for i in common)
