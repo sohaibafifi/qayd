@@ -41,7 +41,9 @@ struct NoOverlap {
 }
 
 impl Propagator for NoOverlap {
-    fn priority(&self) -> Priority { Priority::Expensive }
+    fn priority(&self) -> Priority {
+        Priority::Expensive
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &s in &self.starts {
@@ -173,7 +175,9 @@ impl Cumulative {
 }
 
 impl Propagator for Cumulative {
-    fn priority(&self) -> Priority { Priority::Expensive }
+    fn priority(&self) -> Priority {
+        Priority::Expensive
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &s in &self.starts {
@@ -362,7 +366,9 @@ impl CumulativeVar {
 }
 
 impl Propagator for CumulativeVar {
-    fn priority(&self) -> Priority { Priority::Expensive }
+    fn priority(&self) -> Priority {
+        Priority::Expensive
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &s in &self.starts {
@@ -491,7 +497,9 @@ struct BinPacking {
 }
 
 impl Propagator for BinPacking {
-    fn priority(&self) -> Priority { Priority::Expensive }
+    fn priority(&self) -> Priority {
+        Priority::Expensive
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &it in &self.items {

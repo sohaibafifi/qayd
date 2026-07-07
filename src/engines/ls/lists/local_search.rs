@@ -587,9 +587,8 @@ fn destroy_shaw(lists: &mut [Vec<i32>], candidates: &CandidateNeighbors, target:
     let mut step = 0u64;
     while removed_set.len() < target && removed_set.len() < present.len() {
         let pivot = order[(mix64(seed ^ mix64(step)) % order.len() as u64) as usize];
-        let next = candidates
-            .nearest_present(pivot, &removed_set, &present)
-            .or_else(|| all.iter().copied().find(|c| !removed_set.contains(c)));
+        let next =
+            candidates.nearest_present(pivot, &removed_set, &present).or_else(|| all.iter().copied().find(|c| !removed_set.contains(c)));
         let Some(next) = next else { break };
         removed_set.insert(next);
         order.push(next);
@@ -917,9 +916,7 @@ pub fn solve_collection_capped(
     record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report);
 
     if std::env::var("QAYD_LS_DEBUG").is_ok() {
-        eprintln!(
-            "LS: iters={iter} local_optima={local_optima} lns_calls={lns_calls} lns_ok={lns_ok} restarts={restarts} kicks={kicks}"
-        );
+        eprintln!("LS: iters={iter} local_optima={local_optima} lns_calls={lns_calls} lns_ok={lns_ok} restarts={restarts} kicks={kicks}");
     }
 
     // Report the objective values from the same score that drove the search, so

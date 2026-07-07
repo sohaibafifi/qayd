@@ -43,6 +43,24 @@ release and CI builds stay portable.
 `pipeline.sh [TIMEOUT_S] [LIMIT]` - per-instance wall-clock timeout and an
 optional instance cap (0 = all fetched).
 
+## Session probe
+
+The Python session probe measures rolling-horizon re-solves under the current
+architecture: `SolveSession.solve()` keeps the shared learned-clause pool across
+epochs, while each epoch still solves from a cloned base solver. It compares
+that path with cold `Model.solve()` calls using the same assumptions, hints, and
+branch order.
+
+```sh
+uv run --with maturin maturin develop --features python
+uv run python bench/session_probe.py --vars 32 --conflicts 50 --epochs 6 --epoch-time-limit 3
+```
+
+Use `--format jsonl` or `--format csv` for scripts. The reported
+`cold_over_session_time` is a rough ratio for the synthetic instance, not a
+claim about a true live push/pop continuation. Epoch solves are capped at one
+second by default; pass `--epoch-time-limit 0` for an unbounded exact run.
+
 ## Data sources
 
 - **SAT** - Global Benchmark Database, <https://benchmark-database.de>, which

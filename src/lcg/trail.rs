@@ -313,6 +313,9 @@ pub struct Cdcl<'s> {
     /// nearest-neighbour successors for routing). Empty = none; otherwise indexed
     /// by `VarId` and used to seed the saved-phase array at the start of `optimize`.
     pub(crate) initial_phase: Vec<Option<i32>>,
+    /// Optional user-supplied variable priority. When non-empty, branching picks
+    /// the first unfixed variable in this list before using the default heuristic.
+    pub(crate) branch_order: Vec<VarId>,
     /// Live (non-tombstone) deletable learned clauses.
     num_learned: usize,
     /// Soft cap on live learned clauses; grows after each reduction.
@@ -411,6 +414,7 @@ impl<'s> Cdcl<'s> {
             stop: &NEVER_STOP,
             seed: 0,
             initial_phase: Vec::new(),
+            branch_order: Vec::new(),
             num_learned: 0,
             max_learned: 2000,
             conflicts: 0,
@@ -1560,7 +1564,7 @@ impl<'s> Cdcl<'s> {
         // out to keep `self` free for the `&self` redundancy recursion, then
         // restored. `seen` marks exactly the atoms currently in `learnt` (the
         // base); the recursion's temporary marks are unwound after each literal
-        // so the next sees only the base — matching the old per-literal copy.
+        // so the next sees only the base, matching the old per-literal copy.
         let mut seen = std::mem::take(&mut self.seen);
         let mut stack = std::mem::take(&mut self.min_stack);
         for &lit in learnt.iter() {

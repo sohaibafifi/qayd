@@ -8,11 +8,12 @@ use pyo3::class::basic::CompareOp;
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyIterator, PyModule};
+use pyo3::types::{PyAny, PyDict, PyIterator, PyModule};
 
 use crate::constraints::count;
 use crate::constraints::graph;
 use crate::constraints::intension;
+use crate::constraints::interval as interval_constraints;
 use crate::constraints::lex;
 use crate::constraints::linear::{self, Relation};
 use crate::constraints::primitives;
@@ -22,11 +23,13 @@ use crate::engines::ls::cop::{solve_ls, LocalRhs, LocalSearchSpec, LsConfig};
 use crate::engines::ls::lists;
 use crate::engines::{list_exact as list_exact_engine, routing as routing_engine, schedule as schedule_engine};
 use crate::expr::{self, Expr};
-use crate::ids::VarId;
+use crate::ids::{IntervalId, VarId};
+use crate::lcg::clause::{ClauseSharing, SharedClausePool};
+use crate::lcg::lit::{AtomKind, AtomTable, Lit};
 use crate::model as shared_model;
 use crate::model::list;
 use crate::problem::{Objective as ProblemObjective, Problem};
-use crate::search::{self, Objective as SearchObjective, SearchControl, SolveStats};
+use crate::search::{self, Assumption, AssumptionOp, Objective as SearchObjective, SearchControl, SolveStats};
 use crate::Solver;
 
 static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(1);
@@ -95,6 +98,24 @@ struct PyIntervalVar {
     model_id: u64,
     gen: u64,
     index: u32,
+    kind: PyIntervalKind,
+    interval: Option<IntervalId>,
+    start: Option<VarId>,
+    presence: Option<VarId>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PyIntervalKind {
+    Schedule,
+    Native,
+}
+
+#[derive(Clone)]
+struct NativeIntervalSpec {
+    interval: IntervalId,
+    start: VarId,
+    presence: Option<VarId>,
+    duration: i32,
 }
 
 #[pymethods]
@@ -102,6 +123,21 @@ impl PyIntervalVar {
     #[getter]
     fn index(&self) -> usize {
         self.index as usize
+    }
+
+    #[getter]
+    fn start(&self) -> Option<PyIntVar> {
+        self.start.map(|var| PyIntVar { model_id: self.model_id, index: var.0, name: None })
+    }
+
+    #[getter]
+    fn presence(&self) -> Option<PyIntVar> {
+        self.presence.map(|var| PyIntVar { model_id: self.model_id, index: var.0, name: None })
+    }
+
+    #[getter]
+    fn optional(&self) -> bool {
+        self.presence.is_some()
     }
 
     fn __repr__(&self) -> String {
@@ -145,7 +181,9 @@ struct PySolution {
     /// Value of each lexicographic objective tier. `objective` is the first tier.
     objectives: Vec<i64>,
     /// Interval start times, for a schedule model (empty otherwise).
-    starts: Vec<i64>,
+    starts: Vec<Option<i64>>,
+    /// Interval presence flags, for native interval models.
+    presences: Vec<bool>,
     /// Chosen machine per interval, for a flexible (moded) schedule model
     /// (empty otherwise).
     machines: Vec<i64>,
@@ -163,6 +201,8 @@ struct PyModel {
     solver: Solver,
     names: Vec<Option<String>>,
     objective: Option<ObjectiveSpec>,
+    then_objectives: Vec<ObjectiveSpec>,
+    native_intervals: Vec<NativeIntervalSpec>,
     /// Local-search model built in parallel with the CP posts, so `--ls`-style
     /// LS (`solve(engine="ls")`) can run on the same model.
     local: LocalSearchSpec,
@@ -180,6 +220,30 @@ struct PyModel {
     col_schedule: Option<list::Schedule>,
     col_sched_gen: u64,
 }
+
+#[pyclass(name = "SolveSession", module = "qayd", unsendable)]
+struct PySolveSession {
+    id: u64,
+    solver: Solver,
+    names: Vec<Option<String>>,
+    objectives: Vec<MaterializedObjective>,
+    search: Vec<VarId>,
+    native_intervals: Vec<NativeIntervalSpec>,
+    clauses: Arc<SharedClausePool>,
+    next_worker: usize,
+}
+
+#[derive(Clone)]
+struct MaterializedObjective {
+    minimizing: bool,
+    var: VarId,
+    text: String,
+    support: Vec<VarId>,
+}
+
+type PyRawNogood = (u32, Vec<u32>);
+type PyNogoodLit = (u32, String, i32);
+type PyNogood = (u32, Vec<PyNogoodLit>);
 
 impl PyIntVar {
     fn display_name(&self) -> String {
@@ -278,10 +342,10 @@ fn one_id_for(model_id: u64, var: &PyIntVar) -> PyResult<VarId> {
     Ok(VarId(var.index))
 }
 
-fn search_ids(model: &PyModel, search: Option<&Bound<'_, PyAny>>, extra: Option<VarId>) -> PyResult<Vec<VarId>> {
+fn search_ids_for(model_id: u64, num_vars: usize, search: Option<&Bound<'_, PyAny>>, extra: Option<VarId>) -> PyResult<Vec<VarId>> {
     let mut vars = match search {
-        Some(obj) if !obj.is_none() => ids_for(model.id, &var_list_from_py(obj)?)?,
-        _ => (0..model.names.len()).map(|i| VarId(i as u32)).collect(),
+        Some(obj) if !obj.is_none() => ids_for(model_id, &var_list_from_py(obj)?)?,
+        _ => (0..num_vars).map(|i| VarId(i as u32)).collect(),
     };
     if let Some(var) = extra {
         if !vars.contains(&var) {
@@ -291,14 +355,61 @@ fn search_ids(model: &PyModel, search: Option<&Bound<'_, PyAny>>, extra: Option<
     Ok(vars)
 }
 
+fn search_ids(model: &PyModel, search: Option<&Bound<'_, PyAny>>, extra: Option<VarId>) -> PyResult<Vec<VarId>> {
+    search_ids_for(model.id, model.names.len(), search, extra)
+}
+
 fn append_expr_vars(vars: &mut Vec<VarId>, expr: &Expr) {
     let mut objective_vars = Vec::new();
     expr.collect_vars(&mut objective_vars);
     for var in objective_vars {
-        if !vars.contains(&var) {
-            vars.push(var);
+        append_var(vars, var);
+    }
+}
+
+fn append_var(vars: &mut Vec<VarId>, var: VarId) {
+    if !vars.contains(&var) {
+        vars.push(var);
+    }
+}
+
+fn append_interval_domain_vars(vars: &mut Vec<VarId>, solver: &Solver) {
+    for i in 0..solver.store.num_intervals() {
+        let interval = IntervalId(i as u32);
+        append_var(vars, solver.store.interval_start_var(interval));
+        if let Some(presence) = solver.store.interval_presence_var(interval) {
+            append_var(vars, presence);
         }
     }
+    for i in 0..solver.store.disjunctive_pair_count() {
+        append_var(vars, solver.store.disjunctive_order_var(i));
+    }
+}
+
+fn attach_native_interval_solution(solution: &mut PySolution, intervals: &[NativeIntervalSpec]) {
+    if intervals.is_empty() || solution.values.iter().all(Option::is_none) {
+        return;
+    }
+    let mut starts = Vec::with_capacity(intervals.len());
+    let mut presences = Vec::with_capacity(intervals.len());
+    for interval in intervals {
+        let present = interval.presence.and_then(|var| solution.values.get(var.index()).copied().flatten()) != Some(0);
+        presences.push(present);
+        starts.push(if present { solution.values.get(interval.start.index()).copied().flatten().map(i64::from) } else { None });
+    }
+    solution.starts = starts;
+    solution.presences = presences;
+}
+
+fn checked_interval_start_max(horizon: i64, duration: i64) -> PyResult<i32> {
+    if duration < 0 {
+        return Err(PyValueError::new_err("interval duration must be non-negative"));
+    }
+    let start_max = horizon.checked_sub(duration).ok_or_else(|| PyValueError::new_err("interval horizon minus duration overflows"))?;
+    if start_max < 0 {
+        return Err(PyValueError::new_err("interval duration exceeds its horizon"));
+    }
+    checked_i32(start_max, "interval start upper bound")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -315,7 +426,9 @@ fn make_solution(
     let mut values = vec![None; num_vars];
     if let Some(assignment) = assignment {
         for (&var, &value) in vars.iter().zip(assignment) {
-            values[var.index()] = Some(value);
+            if let Some(slot) = values.get_mut(var.index()) {
+                *slot = Some(value);
+            }
         }
     }
     PySolution {
@@ -328,6 +441,7 @@ fn make_solution(
         lists: None,
         objectives: objective.map(|o| vec![o]).unwrap_or_default(),
         starts: Vec::new(),
+        presences: Vec::new(),
         machines: Vec::new(),
     }
 }
@@ -536,6 +650,386 @@ fn parse_relation(relation: &str) -> PyResult<Relation> {
 
 fn checked_i32(value: i64, name: &str) -> PyResult<i32> {
     i32::try_from(value).map_err(|_| PyValueError::new_err(format!("{name} is outside the i32 domain range")))
+}
+
+fn relation_to_assumption_op(relation: &str) -> PyResult<AssumptionOp> {
+    match relation {
+        "==" | "=" | "eq" | "Eq" => Ok(AssumptionOp::Eq),
+        "!=" | "<>" | "ne" | "Ne" => Ok(AssumptionOp::Ne),
+        "<=" | "le" | "Le" => Ok(AssumptionOp::Le),
+        "<" | "lt" | "Lt" => Ok(AssumptionOp::Lt),
+        ">=" | "ge" | "Ge" => Ok(AssumptionOp::Ge),
+        ">" | "gt" | "Gt" => Ok(AssumptionOp::Gt),
+        _ => Err(PyValueError::new_err("assumption relation must be one of == != <= < >= >")),
+    }
+}
+
+fn flipped_op(op: AssumptionOp) -> AssumptionOp {
+    match op {
+        AssumptionOp::Eq => AssumptionOp::Eq,
+        AssumptionOp::Ne => AssumptionOp::Ne,
+        AssumptionOp::Le => AssumptionOp::Ge,
+        AssumptionOp::Lt => AssumptionOp::Gt,
+        AssumptionOp::Ge => AssumptionOp::Le,
+        AssumptionOp::Gt => AssumptionOp::Lt,
+    }
+}
+
+fn var_const_assumption(lhs: &Expr, rhs: &Expr, op: AssumptionOp) -> Option<Assumption> {
+    match (lhs, rhs) {
+        (Expr::Var(var), Expr::Const(value)) => i32::try_from(*value).ok().map(|value| Assumption { var: *var, op, value }),
+        (Expr::Const(value), Expr::Var(var)) => i32::try_from(*value).ok().map(|value| Assumption { var: *var, op: flipped_op(op), value }),
+        _ => None,
+    }
+}
+
+fn simple_assumption_expr(expr: &Expr) -> Option<Assumption> {
+    match expr {
+        Expr::Eq(lhs, rhs) => var_const_assumption(lhs, rhs, AssumptionOp::Eq),
+        Expr::Ne(lhs, rhs) => var_const_assumption(lhs, rhs, AssumptionOp::Ne),
+        Expr::Le(lhs, rhs) => var_const_assumption(lhs, rhs, AssumptionOp::Le),
+        Expr::Lt(lhs, rhs) => var_const_assumption(lhs, rhs, AssumptionOp::Lt),
+        Expr::Ge(lhs, rhs) => var_const_assumption(lhs, rhs, AssumptionOp::Ge),
+        Expr::Gt(lhs, rhs) => var_const_assumption(lhs, rhs, AssumptionOp::Gt),
+        Expr::Not(inner) => simple_assumption_expr(inner).map(|assumption| {
+            let op = match assumption.op {
+                AssumptionOp::Eq => AssumptionOp::Ne,
+                AssumptionOp::Ne => AssumptionOp::Eq,
+                AssumptionOp::Le => AssumptionOp::Gt,
+                AssumptionOp::Lt => AssumptionOp::Ge,
+                AssumptionOp::Ge => AssumptionOp::Lt,
+                AssumptionOp::Gt => AssumptionOp::Le,
+            };
+            Assumption { op, ..assumption }
+        }),
+        Expr::Var(var) => Some(Assumption::eq(*var, 1)),
+        _ => None,
+    }
+}
+
+fn assumption_from_py(model_id: u64, item: &Bound<'_, PyAny>) -> PyResult<Assumption> {
+    if let Ok(constraint) = item.extract::<PyRef<'_, PyConstraint>>() {
+        if let Some(owner) = constraint.inner.model_id {
+            if owner != model_id {
+                return Err(PyValueError::new_err("assumption belongs to a different model"));
+            }
+        }
+        return simple_assumption_expr(&constraint.inner.expr)
+            .ok_or_else(|| PyValueError::new_err("assumptions must be simple variable bounds such as x == v, x <= v, or x >= v"));
+    }
+    if let Ok(var) = item.extract::<PyRef<'_, PyIntVar>>() {
+        return Ok(Assumption::eq(one_id_for(model_id, &var)?, 1));
+    }
+    if let Ok((var, value)) = item.extract::<(PyRef<'_, PyIntVar>, i32)>() {
+        return Ok(Assumption::eq(one_id_for(model_id, &var)?, value));
+    }
+    if let Ok((var, relation, value)) = item.extract::<(PyRef<'_, PyIntVar>, String, i32)>() {
+        return Ok(Assumption { var: one_id_for(model_id, &var)?, op: relation_to_assumption_op(&relation)?, value });
+    }
+    Err(PyTypeError::new_err("assumption must be a simple Constraint, an IntVar, (IntVar, value), or (IntVar, relation, value)"))
+}
+
+fn assumptions_from_py(model_id: u64, assumptions: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<Assumption>> {
+    let Some(assumptions) = assumptions else {
+        return Ok(Vec::new());
+    };
+    if assumptions.is_none() {
+        return Ok(Vec::new());
+    }
+    let iter = PyIterator::from_object(assumptions)?;
+    iter.map(|item| assumption_from_py(model_id, &item?)).collect()
+}
+
+fn hint_pairs_from_py(model_id: u64, hints: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<(VarId, i32)>> {
+    let Some(hints) = hints else {
+        return Ok(Vec::new());
+    };
+    if hints.is_none() {
+        return Ok(Vec::new());
+    }
+    let iter = PyIterator::from_object(hints)?;
+    let mut out = Vec::new();
+    for item in iter {
+        let item = item?;
+        if let Ok((var, value)) = item.extract::<(PyRef<'_, PyIntVar>, i32)>() {
+            out.push((one_id_for(model_id, &var)?, value));
+        } else {
+            return Err(PyTypeError::new_err("hints must be an iterable of (IntVar, value) pairs"));
+        }
+    }
+    Ok(out)
+}
+
+fn branch_order_from_py(model_id: u64, branch_order: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<VarId>> {
+    let Some(branch_order) = branch_order else {
+        return Ok(Vec::new());
+    };
+    if branch_order.is_none() {
+        return Ok(Vec::new());
+    }
+    ids_for(model_id, &var_list_from_py(branch_order)?)
+}
+
+fn phase_from_hints(num_vars: usize, hints: &[(VarId, i32)]) -> Vec<Option<i32>> {
+    let mut phase = vec![None; num_vars];
+    for &(var, value) in hints {
+        if let Some(slot) = phase.get_mut(var.index()) {
+            *slot = Some(value);
+        }
+    }
+    phase
+}
+
+fn objective_specs(primary: &Option<ObjectiveSpec>, tiers: &[ObjectiveSpec]) -> Vec<ObjectiveSpec> {
+    let mut out = Vec::new();
+    if let Some(objective) = primary {
+        out.push(objective.clone());
+    }
+    out.extend_from_slice(tiers);
+    out
+}
+
+fn expr_bounds_i32(solver: &Solver, expr: &Expr) -> PyResult<(i32, i32)> {
+    let (lo, hi) = expr.bounds(&|var| (i64::from(solver.store.min(var)), i64::from(solver.store.max(var))));
+    Ok((checked_i32(lo, "objective lower bound")?, checked_i32(hi, "objective upper bound")?))
+}
+
+fn materialize_objectives(solver: &mut Solver, objectives: &[ObjectiveSpec]) -> PyResult<Vec<MaterializedObjective>> {
+    let mut out = Vec::with_capacity(objectives.len());
+    for objective in objectives {
+        let mut support = Vec::new();
+        objective.expr.expr.collect_vars(&mut support);
+        support.sort_unstable();
+        support.dedup();
+        let var = match &objective.expr.expr {
+            Expr::Var(var) => *var,
+            expr => {
+                let (lo, hi) = expr_bounds_i32(solver, expr)?;
+                let obj = solver.new_var_range(lo, hi);
+                intension::intension(solver, expr::eq(expr::var(obj), expr.clone()));
+                obj
+            }
+        };
+        out.push(MaterializedObjective { minimizing: objective.minimizing, var, text: objective.expr.text.clone(), support });
+    }
+    Ok(out)
+}
+
+fn call_incumbent(
+    py: Python<'_>,
+    callback: Option<&Bound<'_, PyAny>>,
+    value: i64,
+    vars: &[VarId],
+    assignment: &[i32],
+    num_vars: usize,
+) -> PyResult<()> {
+    let Some(callback) = callback else {
+        return Ok(());
+    };
+    let values = PyDict::new(py);
+    for (&var, &value) in vars.iter().zip(assignment) {
+        if var.index() < num_vars {
+            values.set_item(var.0, value)?;
+        }
+    }
+    callback.call1((value, values))?;
+    Ok(())
+}
+
+fn add_stats(total: &mut SolveStats, stats: SolveStats) {
+    total.solutions += stats.solutions;
+    total.nodes += stats.nodes;
+    total.failures += stats.failures;
+    total.learned_lits += stats.learned_lits;
+    total.vivified_clauses += stats.vivified_clauses;
+    total.vivified_lits += stats.vivified_lits;
+    total.binary_clause_visits += stats.binary_clause_visits;
+    total.watched_clause_visits += stats.watched_clause_visits;
+    total.watched_literal_scans += stats.watched_literal_scans;
+    total.binary_implications += stats.binary_implications;
+}
+
+fn next_clause_sharing(clauses: Option<&Arc<SharedClausePool>>, next_worker: &mut usize) -> Option<ClauseSharing> {
+    clauses.map(|clauses| {
+        let worker = *next_worker;
+        *next_worker = next_worker.saturating_add(1);
+        ClauseSharing::new(Arc::clone(clauses), worker)
+    })
+}
+
+fn atom_table_for_solver(solver: &Solver, vars: &[VarId], clauses: &SharedClausePool) -> AtomTable {
+    let nvars = solver.store.num_vars();
+    let mut active = (0..nvars).map(|i| solver.store.is_relevant(VarId(i as u32))).collect::<Vec<_>>();
+    for &var in vars {
+        if var.index() < active.len() {
+            active[var.index()] = true;
+        }
+    }
+    AtomTable::build_active_sparse_with_registry(
+        nvars,
+        |v: VarId| active[v.index()],
+        |v: VarId| solver.store.size(v) == 2 && solver.store.contains(v, -1) && solver.store.contains(v, 1),
+        |v: VarId| solver.store.sparse_values(v),
+        |v: VarId| (solver.store.min(v), solver.store.max(v)),
+        clauses.lazy_atoms(),
+    )
+}
+
+fn decode_nogood_lit(atoms: &AtomTable, lit: Lit) -> (u32, String, i32) {
+    match atoms.decode(lit.atom()) {
+        AtomKind::Ge { var, k } if lit.is_positive() => (var.0, ">=".to_string(), k),
+        AtomKind::Ge { var, k } => (var.0, "<".to_string(), k),
+        AtomKind::Eq { var, v } if lit.is_positive() => (var.0, "==".to_string(), v),
+        AtomKind::Eq { var, v } => (var.0, "!=".to_string(), v),
+    }
+}
+
+fn append_objective_search_vars(vars: &mut Vec<VarId>, objectives: &[MaterializedObjective]) {
+    for objective in objectives {
+        for &var in &objective.support {
+            append_var(vars, var);
+        }
+        append_var(vars, objective.var);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_integer_template(
+    solver_template: &Solver,
+    model_id: u64,
+    num_vars: usize,
+    search_vars: &[VarId],
+    objectives: &[MaterializedObjective],
+    assumptions: &[Assumption],
+    hints: &[(VarId, i32)],
+    stop: &Arc<AtomicBool>,
+    seed: u64,
+    clauses: Option<&Arc<SharedClausePool>>,
+    next_worker: &mut usize,
+    conflict_budget: Option<u64>,
+    branch_order: &[VarId],
+    verbose: bool,
+    on_incumbent: Option<Py<PyAny>>,
+) -> PyResult<PySolution> {
+    let mut vars = search_vars.to_vec();
+    for &var in branch_order {
+        append_var(&mut vars, var);
+    }
+    append_interval_domain_vars(&mut vars, solver_template);
+    append_objective_search_vars(&mut vars, objectives);
+    let mut remaining_conflicts = conflict_budget;
+
+    if objectives.is_empty() {
+        let mut solver = solver_template.clone();
+        let phase = phase_from_hints(solver.store.num_vars(), hints);
+        let sharing = next_clause_sharing(clauses, next_worker);
+        let (assignment, stats, complete) = search::decide_sat_assuming_seeded(
+            &mut solver,
+            &vars,
+            assumptions,
+            stop,
+            seed,
+            sharing,
+            remaining_conflicts,
+            phase,
+            branch_order.to_vec(),
+        );
+        let status = match (assignment.is_some(), complete) {
+            (true, _) => "SATISFIABLE",
+            (false, true) => "UNSATISFIABLE",
+            (false, false) => "UNKNOWN",
+        };
+        return Ok(make_solution(status, &vars, assignment.as_deref(), None, None, None, stats, num_vars));
+    }
+
+    let mut active_assumptions = assumptions.to_vec();
+    let mut total_stats = SolveStats::default();
+    let mut best_assignment: Option<Vec<i32>> = None;
+    let mut objective_values = Vec::with_capacity(objectives.len());
+    let mut complete = true;
+
+    for (tier, objective) in objectives.iter().enumerate() {
+        if remaining_conflicts == Some(0) || stop.load(Ordering::Relaxed) {
+            complete = false;
+            break;
+        }
+        let mut solver = solver_template.clone();
+        let phase = phase_from_hints(solver.store.num_vars(), hints);
+        let sharing = next_clause_sharing(clauses, next_worker);
+        let mut callback_error: Option<PyErr> = None;
+        let (best, stats, tier_complete) = search::optimize_assuming_seeded(
+            &mut solver,
+            &vars,
+            &active_assumptions,
+            SearchObjective::Var(objective.var),
+            objective.minimizing,
+            stop,
+            seed.wrapping_add(tier as u64),
+            None,
+            sharing,
+            remaining_conflicts,
+            phase,
+            branch_order.to_vec(),
+            |value, assignment| {
+                if verbose {
+                    println!("  incumbent tier {tier}: {value}");
+                }
+                if callback_error.is_none() {
+                    if let Some(cb) = &on_incumbent {
+                        // The solve runs with the GIL released; reacquire it
+                        // only for the callback invocation itself.
+                        let res = Python::attach(|py| call_incumbent(py, Some(cb.bind(py)), value, &vars, assignment, num_vars));
+                        if let Err(err) = res {
+                            callback_error = Some(err);
+                            stop.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
+            },
+        );
+        if let Some(err) = callback_error {
+            return Err(err);
+        }
+        if let Some(limit) = remaining_conflicts.as_mut() {
+            *limit = limit.saturating_sub(stats.failures);
+        }
+        add_stats(&mut total_stats, stats);
+        let Some((assignment, value)) = best else {
+            let status = if tier == 0 && tier_complete { "UNSATISFIABLE" } else { "UNKNOWN" };
+            return Ok(make_solution(
+                status,
+                &vars,
+                best_assignment.as_deref(),
+                objective_values.first().copied(),
+                Some(if objectives[0].minimizing { "min" } else { "max" }),
+                Some(&objectives[0].text),
+                total_stats,
+                num_vars,
+            ));
+        };
+        best_assignment = Some(assignment);
+        objective_values.push(value);
+        let value_i32 = checked_i32(value, "objective value")?;
+        active_assumptions.push(Assumption::eq(objective.var, value_i32));
+        if !tier_complete {
+            complete = false;
+            break;
+        }
+    }
+
+    let mut solution = make_solution(
+        if complete && objective_values.len() == objectives.len() { "OPTIMAL" } else { "SATISFIABLE" },
+        &vars,
+        best_assignment.as_deref(),
+        objective_values.first().copied(),
+        Some(if objectives[0].minimizing { "min" } else { "max" }),
+        Some(&objectives[0].text),
+        total_stats,
+        num_vars,
+    );
+    solution.objectives = objective_values;
+    let _ = model_id;
+    Ok(solution)
 }
 
 #[pymethods]
@@ -758,8 +1252,14 @@ impl PySolution {
 
     /// Interval start times for a schedule model (empty otherwise).
     #[getter]
-    fn starts(&self) -> Vec<i64> {
+    fn starts(&self) -> Vec<Option<i64>> {
         self.starts.clone()
+    }
+
+    /// Interval presence flags for a native interval model.
+    #[getter]
+    fn presences(&self) -> Vec<bool> {
+        self.presences.clone()
     }
 
     /// Chosen machine per interval for a flexible schedule model (empty otherwise).
@@ -818,6 +1318,111 @@ impl PySolution {
 }
 
 #[pymethods]
+impl PySolveSession {
+    #[getter]
+    fn learned_nogoods(&self) -> usize {
+        self.clauses.len()
+    }
+
+    fn clear_nogoods(&mut self) {
+        self.clauses = Arc::new(SharedClausePool::default());
+        self.next_worker = 0;
+    }
+
+    #[pyo3(signature = (limit=None))]
+    fn raw_nogoods(&self, limit: Option<usize>) -> Vec<PyRawNogood> {
+        self.clauses
+            .snapshot(limit.unwrap_or(0))
+            .into_iter()
+            .map(|(lbd, lits)| (lbd, lits.iter().map(|lit| lit.code()).collect()))
+            .collect()
+    }
+
+    #[pyo3(signature = (limit=None))]
+    fn nogoods(&self, limit: Option<usize>) -> Vec<PyNogood> {
+        let atoms = atom_table_for_solver(&self.solver, &self.search, &self.clauses);
+        self.clauses
+            .snapshot(limit.unwrap_or(0))
+            .into_iter()
+            .map(|(lbd, lits)| (lbd, lits.iter().copied().map(|lit| decode_nogood_lit(&atoms, lit)).collect()))
+            .collect()
+    }
+
+    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, conflict_budget=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn solve(
+        &mut self,
+        py: Python<'_>,
+        search: Option<&Bound<'_, PyAny>>,
+        assumptions: Option<&Bound<'_, PyAny>>,
+        hints: Option<&Bound<'_, PyAny>>,
+        branch_order: Option<&Bound<'_, PyAny>>,
+        on_incumbent: Option<&Bound<'_, PyAny>>,
+        verbose: bool,
+        time_limit: Option<u64>,
+        seed: u64,
+        conflict_budget: Option<u64>,
+    ) -> PyResult<PySolution> {
+        if let Some(callback) = on_incumbent {
+            if !callback.is_callable() {
+                return Err(PyTypeError::new_err("on_incumbent must be callable"));
+            }
+        }
+        if verbose {
+            verbose_start(self.names.len(), self.solver.num_propagators(), !self.objectives.is_empty());
+        }
+        let assumptions = assumptions_from_py(self.id, assumptions)?;
+        let hints = hint_pairs_from_py(self.id, hints)?;
+        let branch_order = branch_order_from_py(self.id, branch_order)?;
+        let search_vars = match search {
+            Some(obj) if !obj.is_none() => search_ids_for(self.id, self.names.len(), Some(obj), None)?,
+            _ => self.search.clone(),
+        };
+        let stop = deadline(time_limit);
+        let clauses = Arc::clone(&self.clauses);
+        // Owned/plain captures so the compute closure is Send and the solve
+        // runs with the GIL released (the callback reacquires it on its own).
+        let on_incumbent = on_incumbent.map(|cb| cb.clone().unbind());
+        let solver_template = self.solver.clone();
+        let (model_id, num_vars, objectives) = (self.id, self.names.len(), self.objectives.clone());
+        let worker0 = self.next_worker;
+        let stop_inner = Arc::clone(&stop);
+        let (solution, worker) = with_interrupts(py, &stop, move || {
+            let mut worker = worker0;
+            let solution = solve_integer_template(
+                &solver_template,
+                model_id,
+                num_vars,
+                &search_vars,
+                &objectives,
+                &assumptions,
+                &hints,
+                &stop_inner,
+                seed,
+                Some(&clauses),
+                &mut worker,
+                conflict_budget,
+                &branch_order,
+                verbose,
+                on_incumbent,
+            );
+            (solution, worker)
+        })?;
+        self.next_worker = worker;
+        let mut solution = solution?;
+        attach_native_interval_solution(&mut solution, &self.native_intervals);
+        if verbose {
+            verbose_finish(&solution);
+        }
+        Ok(solution)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("SolveSession(num_vars={}, objectives={}, learned_nogoods={})", self.names.len(), self.objectives.len(), self.clauses.len())
+    }
+}
+
+#[pymethods]
 impl PyModel {
     #[new]
     fn new() -> Self {
@@ -826,6 +1431,8 @@ impl PyModel {
             solver: Solver::new(),
             names: Vec::new(),
             objective: None,
+            then_objectives: Vec::new(),
+            native_intervals: Vec::new(),
             local: LocalSearchSpec::default(),
             col_universe: None,
             col_lists: 0,
@@ -1130,12 +1737,19 @@ impl PyModel {
         }
 
         let intervals = interval_list_from_py(items)?;
-        for iv in &intervals {
-            self.check_interval_scope(iv)?;
+        if intervals.iter().all(|iv| iv.kind == PyIntervalKind::Native) {
+            let ids = self.native_interval_specs(&intervals)?.into_iter().map(|spec| spec.interval).collect::<Vec<_>>();
+            interval_constraints::no_overlap(&mut self.solver, &ids);
+        } else if intervals.iter().all(|iv| iv.kind == PyIntervalKind::Schedule) {
+            for iv in &intervals {
+                self.check_interval_scope(iv)?;
+            }
+            let idx = intervals.iter().map(|iv| iv.index as usize).collect();
+            let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("create intervals before no_overlap"))?;
+            sched.resources.push(list::Resource::NoOverlap(idx));
+        } else {
+            return Err(PyValueError::new_err("cannot mix native intervals and schedule intervals in one no_overlap"));
         }
-        let idx = intervals.iter().map(|iv| iv.index as usize).collect();
-        let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("create intervals before no_overlap"))?;
-        sched.resources.push(list::Resource::NoOverlap(idx));
         Ok(())
     }
 
@@ -1230,7 +1844,7 @@ impl PyModel {
         if count == 0 {
             return Err(PyValueError::new_err("need at least one list"));
         }
-        if !self.names.is_empty() || self.objective.is_some() {
+        if !self.names.is_empty() || self.objective.is_some() || !self.then_objectives.is_empty() {
             return Err(PyValueError::new_err("cannot mix integer variables with list_vars; use one modeling style per model"));
         }
         if self.col_schedule.is_some() {
@@ -1257,10 +1871,19 @@ impl PyModel {
     /// Precedence over list items or interval variables.
     fn precedence(&mut self, before: &Bound<'_, PyAny>, after: &Bound<'_, PyAny>) -> PyResult<()> {
         if let (Ok(a), Ok(b)) = (before.extract::<PyRef<'_, PyIntervalVar>>(), after.extract::<PyRef<'_, PyIntervalVar>>()) {
-            self.check_interval_scope(&a)?;
-            self.check_interval_scope(&b)?;
-            let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("create intervals before precedence"))?;
-            sched.precedences.push((a.index as usize, b.index as usize));
+            if a.kind != b.kind {
+                return Err(PyValueError::new_err("cannot mix native intervals and schedule intervals in one precedence"));
+            }
+            if a.kind == PyIntervalKind::Native {
+                let before = self.native_interval_spec(&a)?.interval;
+                let after = self.native_interval_spec(&b)?.interval;
+                interval_constraints::interval_precedence(&mut self.solver, before, after);
+            } else {
+                self.check_interval_scope(&a)?;
+                self.check_interval_scope(&b)?;
+                let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("create intervals before precedence"))?;
+                sched.precedences.push((a.index as usize, b.index as usize));
+            }
             return Ok(());
         }
         let before =
@@ -1276,19 +1899,33 @@ impl PyModel {
         self.col_globals.push(list::GlobalConstraint::SameList { a, b });
     }
 
-    /// Create one fixed-duration interval.
-    fn interval(&mut self, duration: i64, horizon: i64) -> PyResult<PyIntervalVar> {
-        let mut intervals = self.intervals(vec![duration], horizon)?;
-        Ok(intervals.remove(0))
+    /// Create one fixed-duration native interval.
+    #[pyo3(signature = (duration, horizon, *, optional=false, name=None))]
+    fn interval(&mut self, duration: i64, horizon: i64, optional: bool, name: Option<String>) -> PyResult<PyIntervalVar> {
+        self.create_native_interval(duration, horizon, optional, name)
     }
 
-    /// Create fixed-duration intervals.
-    fn intervals(&mut self, durations: Vec<i64>, horizon: i64) -> PyResult<Vec<PyIntervalVar>> {
-        self.enter_schedule_mode()?;
-        let intervals = durations.iter().map(|&d| list::IntervalVar { duration: d, horizon, modes: Vec::new() }).collect();
-        self.col_schedule = Some(list::Schedule { intervals, precedences: Vec::new(), resources: Vec::new(), minimize_makespan: true });
-        let gen = self.col_sched_gen;
-        Ok((0..durations.len()).map(|i| PyIntervalVar { model_id: self.id, gen, index: i as u32 }).collect())
+    /// Create one optional fixed-duration native interval.
+    #[pyo3(signature = (duration, horizon, *, name=None))]
+    fn optional_interval(&mut self, duration: i64, horizon: i64, name: Option<String>) -> PyResult<PyIntervalVar> {
+        self.create_native_interval(duration, horizon, true, name)
+    }
+
+    /// Create fixed-duration native intervals.
+    #[pyo3(signature = (durations, horizon, *, optional=false, name=None))]
+    fn intervals(&mut self, durations: Vec<i64>, horizon: i64, optional: bool, name: Option<String>) -> PyResult<Vec<PyIntervalVar>> {
+        let mut intervals = Vec::with_capacity(durations.len());
+        for (i, duration) in durations.into_iter().enumerate() {
+            let var_name = name.as_ref().map(|prefix| format!("{prefix}[{i}]"));
+            intervals.push(self.create_native_interval(duration, horizon, optional, var_name)?);
+        }
+        Ok(intervals)
+    }
+
+    /// Create optional fixed-duration native intervals.
+    #[pyo3(signature = (durations, horizon, *, name=None))]
+    fn optional_intervals(&mut self, durations: Vec<i64>, horizon: i64, name: Option<String>) -> PyResult<Vec<PyIntervalVar>> {
+        self.intervals(durations, horizon, true, name)
     }
 
     /// Create intervals whose mode is selected from `(machine, duration)` pairs.
@@ -1307,7 +1944,17 @@ impl PyModel {
             .collect();
         self.col_schedule = Some(list::Schedule { intervals, precedences: Vec::new(), resources: Vec::new(), minimize_makespan: true });
         let gen = self.col_sched_gen;
-        Ok((0..modes.len()).map(|i| PyIntervalVar { model_id: self.id, gen, index: i as u32 }).collect())
+        Ok((0..modes.len())
+            .map(|i| PyIntervalVar {
+                model_id: self.id,
+                gen,
+                index: i as u32,
+                kind: PyIntervalKind::Schedule,
+                interval: None,
+                start: None,
+                presence: None,
+            })
+            .collect())
     }
 
     /// Moded intervals that choose the same machine never overlap.
@@ -1321,6 +1968,18 @@ impl PyModel {
     /// the scheduling semantics.
     #[pyo3(signature = (intervals=None))]
     fn minimize_makespan(&mut self, intervals: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        if !self.native_intervals.is_empty()
+            || intervals
+                .is_some_and(|items| interval_list_from_py(items).is_ok_and(|ivs| ivs.iter().any(|iv| iv.kind == PyIntervalKind::Native)))
+        {
+            let selected = if let Some(intervals) = intervals {
+                let intervals = interval_list_from_py(intervals)?;
+                self.native_interval_specs(&intervals)?
+            } else {
+                self.native_intervals.clone()
+            };
+            return self.set_native_makespan_objective(&selected);
+        }
         if let Some(intervals) = intervals {
             for iv in interval_list_from_py(intervals)? {
                 self.check_interval_scope(&iv)?;
@@ -1334,28 +1993,56 @@ impl PyModel {
     /// A renewable resource of `capacity`: `demands` are `(interval, amount)`
     /// pairs whose total over any instant may not exceed the capacity.
     fn resource(&mut self, demands: Vec<(PyIntervalVar, i64)>, capacity: i64) -> PyResult<()> {
-        for (iv, _) in &demands {
-            self.check_interval_scope(iv)?;
+        if demands.iter().all(|(iv, _)| iv.kind == PyIntervalKind::Native) {
+            let mut intervals = Vec::with_capacity(demands.len());
+            let mut heights = Vec::with_capacity(demands.len());
+            for (iv, amount) in &demands {
+                intervals.push(self.native_interval_spec(iv)?.interval);
+                heights.push(checked_i32(*amount, "cumulative demand")?);
+            }
+            interval_constraints::cumulative(&mut self.solver, &intervals, &heights, checked_i32(capacity, "cumulative capacity")?);
+        } else if demands.iter().all(|(iv, _)| iv.kind == PyIntervalKind::Schedule) {
+            for (iv, _) in &demands {
+                self.check_interval_scope(iv)?;
+            }
+            let demands = demands.iter().map(|(iv, amount)| (iv.index as usize, *amount)).collect();
+            let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("create intervals before resource"))?;
+            sched.resources.push(list::Resource::Cumulative { demands, capacity });
+        } else {
+            return Err(PyValueError::new_err("cannot mix native intervals and schedule intervals in one resource"));
         }
-        let demands = demands.iter().map(|(iv, amount)| (iv.index as usize, *amount)).collect();
-        let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("create intervals before resource"))?;
-        sched.resources.push(list::Resource::Cumulative { demands, capacity });
         Ok(())
     }
 
-    #[pyo3(signature = (*, search=None, verbose=false, time_limit=None, seed=0, engine="auto"))]
+    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, engine="auto", conflict_budget=None))]
+    #[allow(clippy::too_many_arguments)]
     fn solve(
         &self,
         py: Python<'_>,
         search: Option<&Bound<'_, PyAny>>,
+        assumptions: Option<&Bound<'_, PyAny>>,
+        hints: Option<&Bound<'_, PyAny>>,
+        branch_order: Option<&Bound<'_, PyAny>>,
+        on_incumbent: Option<&Bound<'_, PyAny>>,
         verbose: bool,
         time_limit: Option<u64>,
         seed: u64,
         engine: &str,
+        conflict_budget: Option<u64>,
     ) -> PyResult<PySolution> {
         let engine = parse_engine(engine)?;
+        let exact_hooks = assumptions.is_some_and(|obj| !obj.is_none())
+            || hints.is_some_and(|obj| !obj.is_none())
+            || branch_order.is_some_and(|obj| !obj.is_none())
+            || on_incumbent.is_some()
+            || conflict_budget.is_some();
         if self.col_universe.is_some() || self.col_schedule.is_some() {
-            if !self.names.is_empty() || self.objective.is_some() {
+            if exact_hooks {
+                return Err(PyValueError::new_err(
+                    "assumptions, hints, branch_order, callbacks, and conflict_budget are only supported by the integer exact engine",
+                ));
+            }
+            if !self.names.is_empty() || self.objective.is_some() || !self.then_objectives.is_empty() {
                 return Err(PyValueError::new_err(
                     "model mixes integer variables with list/interval variables; use one modeling style per model",
                 ));
@@ -1363,19 +2050,79 @@ impl PyModel {
             return self.solve_collection(py, time_limit, seed, verbose, engine);
         }
         if engine == PythonEngine::Ls {
+            if !self.native_intervals.is_empty() {
+                return Err(PyValueError::new_err("engine='ls' does not support native interval variables"));
+            }
+            if exact_hooks {
+                return Err(PyValueError::new_err(
+                    "assumptions, hints, branch_order, callbacks, and conflict_budget are only supported by the integer exact engine",
+                ));
+            }
             let Some(objective) = &self.objective else {
                 return Err(PyValueError::new_err("engine='ls' requires an objective"));
             };
             return self.solve_ls(py, objective, search, verbose, time_limit, seed);
         }
-        if let Some(objective) = &self.objective {
-            return self.solve_optimization(py, objective, search, verbose, time_limit, seed);
+        if !exact_hooks && self.then_objectives.is_empty() {
+            if let Some(objective) = &self.objective {
+                return self.solve_single_optimization(py, objective, search, &[], verbose, time_limit, seed);
+            }
+        }
+        let objective_specs = objective_specs(&self.objective, &self.then_objectives);
+        if !objective_specs.is_empty() || exact_hooks {
+            if let Some(callback) = on_incumbent {
+                if !callback.is_callable() {
+                    return Err(PyTypeError::new_err("on_incumbent must be callable"));
+                }
+            }
+            if verbose {
+                verbose_start(self.names.len(), self.solver.num_propagators(), !objective_specs.is_empty());
+            }
+            let assumptions = assumptions_from_py(self.id, assumptions)?;
+            let hints = hint_pairs_from_py(self.id, hints)?;
+            let branch_order = branch_order_from_py(self.id, branch_order)?;
+            let mut solver = self.solver.clone();
+            let objectives = materialize_objectives(&mut solver, &objective_specs)?;
+            let mut search_vars = search_ids_for(self.id, self.names.len(), search, None)?;
+            append_interval_domain_vars(&mut search_vars, &solver);
+            let stop = deadline(time_limit);
+            // Owned/plain captures: the solve detaches from the GIL, and only
+            // the incumbent callback reattaches per invocation.
+            let on_incumbent = on_incumbent.map(|cb| cb.clone().unbind());
+            let (model_id, num_vars) = (self.id, self.names.len());
+            let stop_inner = Arc::clone(&stop);
+            let mut solution = with_interrupts(py, &stop, move || {
+                let mut worker = 0usize;
+                solve_integer_template(
+                    &solver,
+                    model_id,
+                    num_vars,
+                    &search_vars,
+                    &objectives,
+                    &assumptions,
+                    &hints,
+                    &stop_inner,
+                    seed,
+                    None,
+                    &mut worker,
+                    conflict_budget,
+                    &branch_order,
+                    verbose,
+                    on_incumbent,
+                )
+            })??;
+            attach_native_interval_solution(&mut solution, &self.native_intervals);
+            if verbose {
+                verbose_finish(&solution);
+            }
+            return Ok(solution);
         }
         if verbose {
             verbose_start(self.names.len(), self.solver.num_propagators(), false);
         }
-        let vars = search_ids(self, search, None)?;
+        let mut vars = search_ids(self, search, None)?;
         let mut solver = self.solver.clone();
+        append_interval_domain_vars(&mut vars, &solver);
         let stop = deadline(time_limit);
         let mut assignment = None;
         let stats = with_interrupts(py, &stop, || {
@@ -1391,7 +2138,8 @@ impl PyModel {
             )
         })?;
         let status = if assignment.is_some() { "SATISFIABLE" } else { "UNSATISFIABLE" };
-        let solution = make_solution(status, &vars, assignment.as_deref(), None, None, None, stats, self.names.len());
+        let mut solution = make_solution(status, &vars, assignment.as_deref(), None, None, None, stats, self.names.len());
+        attach_native_interval_solution(&mut solution, &self.native_intervals);
         if verbose {
             verbose_finish(&solution);
         }
@@ -1423,15 +2171,50 @@ impl PyModel {
         self.set_integer_objective(objective, false)
     }
 
-    /// Append a lower-priority lexicographic tier to a list/interval objective: a
-    /// tie among solutions equal on the earlier tiers is broken by minimising
-    /// (`then_minimize`) or maximising (`then_maximize`) this term.
-    fn then_minimize(&mut self, objective: PyRef<'_, PyTerm>) -> PyResult<()> {
-        self.push_collection_tier(&objective, true, false)
+    /// Append a lower-priority lexicographic tier.
+    fn then_minimize(&mut self, objective: &Bound<'_, PyAny>) -> PyResult<()> {
+        if let Ok(term) = objective.extract::<PyRef<'_, PyTerm>>() {
+            return self.push_collection_tier(&term, true, false);
+        }
+        self.push_integer_tier(objective, true)
     }
 
-    fn then_maximize(&mut self, objective: PyRef<'_, PyTerm>) -> PyResult<()> {
-        self.push_collection_tier(&objective, false, false)
+    fn then_maximize(&mut self, objective: &Bound<'_, PyAny>) -> PyResult<()> {
+        if let Ok(term) = objective.extract::<PyRef<'_, PyTerm>>() {
+            return self.push_collection_tier(&term, false, false);
+        }
+        self.push_integer_tier(objective, false)
+    }
+
+    fn session(&self) -> PyResult<PySolveSession> {
+        if self.col_universe.is_some() || self.col_schedule.is_some() {
+            return Err(PyValueError::new_err("SolveSession is currently supported for integer exact models"));
+        }
+        let objective_specs = objective_specs(&self.objective, &self.then_objectives);
+        let mut solver = self.solver.clone();
+        let objectives = materialize_objectives(&mut solver, &objective_specs)?;
+        let mut search = (0..self.names.len()).map(|i| VarId(i as u32)).collect::<Vec<_>>();
+        append_interval_domain_vars(&mut search, &solver);
+        append_objective_search_vars(&mut search, &objectives);
+        // Freeze the atom layout for the whole session: the eager LCG atom ids
+        // depend on the ACTIVE set (relevant ∪ search vars), and the session's
+        // kept nogoods are re-injected by raw atom id across epochs. Marking the
+        // full session universe relevant makes the layout invariant, so a
+        // per-epoch `search` only guides branching and can never reinterpret a
+        // stored nogood (nor trip `set_base`'s layout assert).
+        for &v in &search {
+            solver.store.mark_relevant(v);
+        }
+        Ok(PySolveSession {
+            id: self.id,
+            solver,
+            names: self.names.clone(),
+            objectives,
+            search,
+            native_intervals: self.native_intervals.clone(),
+            clauses: Arc::new(SharedClausePool::default()),
+            next_worker: 0,
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -1448,6 +2231,96 @@ impl PyModel {
         self.names.push(None);
         self.local.add_var(id);
         id
+    }
+
+    fn register_native_backing_var(&mut self, var: VarId, name: Option<String>) {
+        while self.names.len() <= var.index() {
+            self.names.push(None);
+        }
+        if name.is_some() || self.names[var.index()].is_none() {
+            self.names[var.index()] = name;
+        }
+    }
+
+    fn enter_native_interval_mode(&self) -> PyResult<()> {
+        if self.col_universe.is_some() {
+            return Err(PyValueError::new_err("model already has list variables; use one domain style per model"));
+        }
+        if self.col_schedule.is_some() {
+            return Err(PyValueError::new_err("model already has schedule intervals; use native intervals or alternatives, not both"));
+        }
+        Ok(())
+    }
+
+    fn create_native_interval(&mut self, duration: i64, horizon: i64, optional: bool, name: Option<String>) -> PyResult<PyIntervalVar> {
+        self.enter_native_interval_mode()?;
+        let duration_i32 = checked_i32(duration, "interval duration")?;
+        let start_max = checked_interval_start_max(horizon, duration)?;
+        let interval = if optional {
+            self.solver.store.new_optional_interval(0, start_max, duration_i32)
+        } else {
+            self.solver.store.new_interval(0, start_max, duration_i32)
+        };
+        let start = self.solver.store.interval_start_var(interval);
+        self.register_native_backing_var(start, name.as_ref().map(|name| format!("{name}.start")));
+        let presence = self.solver.store.interval_presence_var(interval);
+        if let Some(var) = presence {
+            self.register_native_backing_var(var, name.as_ref().map(|name| format!("{name}.presence")));
+        }
+        let index = self.native_intervals.len() as u32;
+        self.native_intervals.push(NativeIntervalSpec { interval, start, presence, duration: duration_i32 });
+        Ok(PyIntervalVar {
+            model_id: self.id,
+            gen: 0,
+            index,
+            kind: PyIntervalKind::Native,
+            interval: Some(interval),
+            start: Some(start),
+            presence,
+        })
+    }
+
+    fn native_interval_spec(&self, iv: &PyIntervalVar) -> PyResult<NativeIntervalSpec> {
+        if iv.model_id != self.id {
+            return Err(PyValueError::new_err("this interval belongs to a different model"));
+        }
+        if iv.kind != PyIntervalKind::Native {
+            return Err(PyValueError::new_err("expected a native interval"));
+        }
+        let spec = self
+            .native_intervals
+            .get(iv.index as usize)
+            .ok_or_else(|| PyValueError::new_err("this interval is stale; rebuild it from the current model"))?;
+        if Some(spec.interval) != iv.interval {
+            return Err(PyValueError::new_err("this interval is stale; rebuild it from the current model"));
+        }
+        Ok(spec.clone())
+    }
+
+    fn native_interval_specs(&self, intervals: &[PyIntervalVar]) -> PyResult<Vec<NativeIntervalSpec>> {
+        intervals.iter().map(|iv| self.native_interval_spec(iv)).collect()
+    }
+
+    fn set_native_makespan_objective(&mut self, intervals: &[NativeIntervalSpec]) -> PyResult<()> {
+        if intervals.is_empty() {
+            return Err(PyValueError::new_err("minimize_makespan needs at least one interval"));
+        }
+        let upper = intervals.iter().map(|spec| self.solver.store.interval_end_max(spec.interval)).max().unwrap_or(0);
+        let makespan = self.solver.new_var_range(0, upper.max(0));
+        self.register_native_backing_var(makespan, Some("makespan".to_string()));
+        for spec in intervals {
+            let end = expr::add(vec![expr::var(spec.start), expr::int(i64::from(spec.duration))]);
+            let bound = expr::ge(expr::var(makespan), end);
+            let constraint =
+                if let Some(presence) = spec.presence { expr::imp(expr::eq(expr::var(presence), expr::int(1)), bound) } else { bound };
+            intension::intension(&mut self.solver, constraint);
+        }
+        self.objective = Some(ObjectiveSpec {
+            minimizing: true,
+            expr: ExprLike { model_id: Some(self.id), expr: Expr::Var(makespan), text: "makespan".to_string() },
+        });
+        self.then_objectives.clear();
+        Ok(())
     }
 
     /// Solve the recorded list-domain model (list variables + reductions) with the
@@ -1479,6 +2352,9 @@ impl PyModel {
     }
 
     fn set_integer_objective(&mut self, objective: &Bound<'_, PyAny>, minimizing: bool) -> PyResult<()> {
+        if self.col_universe.is_some() || self.col_schedule.is_some() {
+            return Err(PyValueError::new_err("integer objectives cannot be mixed with list or interval models"));
+        }
         let expr = expr_from_py(objective)?;
         if let Some(model_id) = expr.model_id {
             if model_id != self.id {
@@ -1491,6 +2367,29 @@ impl PyModel {
             return Err(PyValueError::new_err("objective must reference at least one model variable"));
         }
         self.objective = Some(ObjectiveSpec { minimizing, expr });
+        self.then_objectives.clear();
+        Ok(())
+    }
+
+    fn push_integer_tier(&mut self, objective: &Bound<'_, PyAny>, minimizing: bool) -> PyResult<()> {
+        if self.objective.is_none() {
+            return Err(PyValueError::new_err("then_minimize/then_maximize requires a primary integer objective first"));
+        }
+        if self.col_universe.is_some() || self.col_schedule.is_some() {
+            return Err(PyValueError::new_err("integer objective tiers cannot be mixed with list or interval models"));
+        }
+        let expr = expr_from_py(objective)?;
+        if let Some(model_id) = expr.model_id {
+            if model_id != self.id {
+                return Err(PyValueError::new_err("objective belongs to a different model"));
+            }
+        }
+        let mut objective_vars = Vec::new();
+        expr.expr.collect_vars(&mut objective_vars);
+        if objective_vars.is_empty() {
+            return Err(PyValueError::new_err("objective must reference at least one model variable"));
+        }
+        self.then_objectives.push(ObjectiveSpec { minimizing, expr });
         Ok(())
     }
 
@@ -1498,7 +2397,7 @@ impl PyModel {
     /// list variables, and bumps the schedule generation so handles from an
     /// earlier `intervals`/`alternatives` call become stale.
     fn enter_schedule_mode(&mut self) -> PyResult<()> {
-        if !self.names.is_empty() || self.objective.is_some() {
+        if !self.names.is_empty() || !self.native_intervals.is_empty() || self.objective.is_some() || !self.then_objectives.is_empty() {
             return Err(PyValueError::new_err("cannot mix integer variables with interval variables; use one modeling style per model"));
         }
         if self.col_universe.is_some() {
@@ -1513,6 +2412,10 @@ impl PyModel {
     fn check_interval_scope(&self, iv: &PyIntervalVar) -> PyResult<()> {
         if iv.model_id != self.id {
             return Err(PyValueError::new_err("this interval belongs to a different model"));
+        }
+        if iv.kind == PyIntervalKind::Native {
+            self.native_interval_spec(iv)?;
+            return Ok(());
         }
         if iv.gen != self.col_sched_gen {
             return Err(PyValueError::new_err("this interval is stale; rebuild it from the current intervals()/alternatives()"));
@@ -1610,6 +2513,7 @@ impl PyModel {
             lists: sol.feasible.then(|| sol.lists.clone()),
             objectives,
             starts: Vec::new(),
+            presences: Vec::new(),
             machines: Vec::new(),
         }))
     }
@@ -1682,6 +2586,7 @@ impl PyModel {
             lists: outcome.solution,
             objectives: outcome.objectives,
             starts: Vec::new(),
+            presences: Vec::new(),
             machines: Vec::new(),
         }))
     }
@@ -1753,12 +2658,20 @@ impl PyModel {
             stats: outcome.stats.into(),
             lists: None,
             objectives: outcome.objective.map(|value| vec![value]).unwrap_or_default(),
-            starts: outcome.starts,
+            starts: outcome.starts.into_iter().map(Some).collect(),
+            presences: Vec::new(),
             machines: outcome.machines,
         }))
     }
 
-    fn solve_collection(&self, py: Python<'_>, time_limit: Option<u64>, seed: u64, verbose: bool, engine: PythonEngine) -> PyResult<PySolution> {
+    fn solve_collection(
+        &self,
+        py: Python<'_>,
+        time_limit: Option<u64>,
+        seed: u64,
+        verbose: bool,
+        engine: PythonEngine,
+    ) -> PyResult<PySolution> {
         let model = list::CollectionModel {
             items: self.col_universe.clone().unwrap_or_default(),
             lists: self.col_lists,
@@ -1826,7 +2739,8 @@ impl PyModel {
             stats: SolveStats::default().into(),
             lists: sol.feasible.then(|| sol.lists.clone()),
             objectives,
-            starts: if sol.feasible { sol.starts.clone() } else { Vec::new() },
+            starts: if sol.feasible { sol.starts.iter().copied().map(Some).collect() } else { Vec::new() },
+            presences: Vec::new(),
             machines: if sol.feasible { sol.machines.clone() } else { Vec::new() },
         })
     }
@@ -1900,11 +2814,13 @@ impl PyModel {
         Ok(solution)
     }
 
-    fn solve_optimization(
+    #[allow(clippy::too_many_arguments)]
+    fn solve_single_optimization(
         &self,
         py: Python<'_>,
         objective: &ObjectiveSpec,
         search: Option<&Bound<'_, PyAny>>,
+        branch_order: &[VarId],
         verbose: bool,
         time_limit: Option<u64>,
         seed: u64,
@@ -1920,8 +2836,12 @@ impl PyModel {
             println!("  expression: {}", objective.expr.text);
         }
         let mut vars = search_ids(self, search, None)?;
+        for &var in branch_order {
+            append_var(&mut vars, var);
+        }
         append_expr_vars(&mut vars, &objective.expr.expr);
         let mut solver = self.solver.clone();
+        append_interval_domain_vars(&mut vars, &solver);
         let stop = deadline(time_limit);
         let minimizing = objective.minimizing;
         let obj_expr = objective.expr.expr.clone();
@@ -1942,6 +2862,7 @@ impl PyModel {
                 &[],
                 None,
                 Vec::new(),
+                branch_order.to_vec(),
                 |value, _| {
                     if verbose {
                         println!("  incumbent: {value}");
@@ -1950,9 +2871,7 @@ impl PyModel {
             )
         })?;
         let Some((assignment, objective_value)) = best else {
-            // No incumbent: a proven-infeasible search is UNSATISFIABLE; one cut
-            // short by the time limit or Ctrl-C is merely UNKNOWN.
-            let solution = make_solution(
+            let mut solution = make_solution(
                 if complete { "UNSATISFIABLE" } else { "UNKNOWN" },
                 &vars,
                 None,
@@ -1962,14 +2881,13 @@ impl PyModel {
                 stats,
                 self.names.len(),
             );
+            attach_native_interval_solution(&mut solution, &self.native_intervals);
             if verbose {
                 verbose_finish(&solution);
             }
             return Ok(solution);
         };
-        // An incumbent is OPTIMAL only when search finished; a stopped search
-        // yields a feasible-but-unproven SATISFIABLE.
-        let solution = make_solution(
+        let mut solution = make_solution(
             if complete { "OPTIMAL" } else { "SATISFIABLE" },
             &vars,
             Some(&assignment),
@@ -1979,6 +2897,7 @@ impl PyModel {
             stats,
             self.names.len(),
         );
+        attach_native_interval_solution(&mut solution, &self.native_intervals);
         if verbose {
             verbose_finish(&solution);
         }
@@ -2603,6 +3522,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyConstraint>()?;
     m.add_class::<PySolution>()?;
     m.add_class::<PySolveStats>()?;
+    m.add_class::<PySolveSession>()?;
     m.add_function(wrap_pyfunction!(expr_fn, m)?)?;
     m.add_function(wrap_pyfunction!(all_fn, m)?)?;
     m.add_function(wrap_pyfunction!(any_fn, m)?)?;

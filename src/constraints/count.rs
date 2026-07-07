@@ -65,7 +65,9 @@ impl Count {
 }
 
 impl Propagator for Count {
-    fn priority(&self) -> Priority { Priority::Linear }
+    fn priority(&self) -> Priority {
+        Priority::Linear
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &v in &self.vars {
@@ -304,9 +306,34 @@ impl Propagator for Cardinality {
             return Ok(());
         }
         let Cardinality {
-            vars, listed_values, listed_low, listed_high, hint, values, low, high, assign, count,
-            adj, occ, queue, visited_var, visited_val, par_var_of_val, par_val_of_var, edge_var,
-            prev_val, g, comp, index, scc_low, on_stack, tj_stack, scc_work, removals, domain_buf,
+            vars,
+            listed_values,
+            listed_low,
+            listed_high,
+            hint,
+            values,
+            low,
+            high,
+            assign,
+            count,
+            adj,
+            occ,
+            queue,
+            visited_var,
+            visited_val,
+            par_var_of_val,
+            par_val_of_var,
+            edge_var,
+            prev_val,
+            g,
+            comp,
+            index,
+            scc_low,
+            on_stack,
+            tj_stack,
+            scc_work,
+            removals,
+            domain_buf,
         } = self;
 
         // Value universe = union of current domains plus every listed value.
@@ -484,7 +511,9 @@ struct InSet {
 }
 
 impl Propagator for InSet {
-    fn priority(&self) -> Priority { Priority::Cheap }
+    fn priority(&self) -> Priority {
+        Priority::Cheap
+    }
 
     fn register(&mut self, store: &mut Store, _me: PropId) {
         for &var in &self.vars {
@@ -565,7 +594,9 @@ fn disjoint_lb(store: &Store, vars: &[VarId], order: &mut Vec<usize>) -> i64 {
 }
 
 impl Propagator for NValues {
-    fn priority(&self) -> Priority { Priority::Linear }
+    fn priority(&self) -> Priority {
+        Priority::Linear
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &v in &self.vars {
@@ -615,10 +646,7 @@ impl Propagator for NValues {
             let mut changed = false;
 
             // Forced max distinct == 1  =>  every variable equal: intersect domains.
-            let forced_one = matches!(
-                (self.rel, self.k),
-                (Relation::Le, 1) | (Relation::Lt, 2) | (Relation::Eq, 1)
-            );
+            let forced_one = matches!((self.rel, self.k), (Relation::Le, 1) | (Relation::Lt, 2) | (Relation::Eq, 1));
             if forced_one {
                 self.common.clear();
                 self.common.extend(store.values(self.vars[0]));

@@ -360,6 +360,7 @@ pub(crate) fn solve_collection(
         &[],
         None,
         initial_phase,
+        Vec::new(),
         |value, _assignment| {
             improvements += 1;
             report(value);

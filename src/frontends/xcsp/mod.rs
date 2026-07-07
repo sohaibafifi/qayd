@@ -484,6 +484,7 @@ fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w
                 &[],
                 None,
                 Vec::new(),
+                Vec::new(),
                 |v, _| write_improvement_from(w, verbose, &mut io_err, v, "sequential"),
             );
             if let Some(e) = io_err {

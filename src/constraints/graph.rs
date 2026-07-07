@@ -147,7 +147,9 @@ impl Circuit {
 }
 
 impl Propagator for Circuit {
-    fn priority(&self) -> Priority { Priority::Expensive }
+    fn priority(&self) -> Priority {
+        Priority::Expensive
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &v in &self.succ {

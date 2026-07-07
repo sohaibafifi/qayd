@@ -19,7 +19,9 @@ pub struct IntervalPrecedence {
 }
 
 impl Propagator for IntervalPrecedence {
-    fn priority(&self) -> Priority { Priority::Cheap }
+    fn priority(&self) -> Priority {
+        Priority::Cheap
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         store.subscribe_interval(self.before, me, IntervalEvent::EndBoundChange);
@@ -205,7 +207,9 @@ fn both_orders_infeasible(store: &Store, i: IntervalId, j: IntervalId) -> Vec<Pr
 }
 
 impl Propagator for NoOverlap {
-    fn priority(&self) -> Priority { Priority::Expensive }
+    fn priority(&self) -> Priority {
+        Priority::Expensive
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &interval in &self.intervals {
@@ -403,7 +407,9 @@ pub struct MakespanBound {
 }
 
 impl Propagator for MakespanBound {
-    fn priority(&self) -> Priority { Priority::Cheap }
+    fn priority(&self) -> Priority {
+        Priority::Cheap
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &interval in &self.intervals {
@@ -451,7 +457,9 @@ pub struct Cumulative {
 }
 
 impl Propagator for Cumulative {
-    fn priority(&self) -> Priority { Priority::Expensive }
+    fn priority(&self) -> Priority {
+        Priority::Expensive
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &interval in &self.intervals {
@@ -611,7 +619,9 @@ pub struct ExactlyOneMode {
 }
 
 impl Propagator for ExactlyOneMode {
-    fn priority(&self) -> Priority { Priority::Cheap }
+    fn priority(&self) -> Priority {
+        Priority::Cheap
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &mode in &self.modes {

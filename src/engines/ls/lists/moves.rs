@@ -761,7 +761,12 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                                 if cand_cost && !candidate_cross_exchange(per, state, (src, start_x, len_x), (y, start_y, len_y)) {
                                     continue;
                                 }
-                                build_cross_exchange(&mut a, &mut b, (&state.lists[src], start_x, len_x), (&state.lists[y], start_y, len_y));
+                                build_cross_exchange(
+                                    &mut a,
+                                    &mut b,
+                                    (&state.lists[src], start_x, len_x),
+                                    (&state.lists[y], start_y, len_y),
+                                );
                                 let na = list_score(per, src, &a);
                                 let nb = list_score(per, y, &b);
                                 overrides.clear();

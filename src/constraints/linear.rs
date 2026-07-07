@@ -56,7 +56,9 @@ impl LinearLeq {
 }
 
 impl Propagator for LinearLeq {
-    fn priority(&self) -> Priority { Priority::Linear }
+    fn priority(&self) -> Priority {
+        Priority::Linear
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &v in &self.vars {
@@ -158,7 +160,9 @@ impl LinearEq {
 }
 
 impl Propagator for LinearEq {
-    fn priority(&self) -> Priority { Priority::Linear }
+    fn priority(&self) -> Priority {
+        Priority::Linear
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &v in &self.vars {
@@ -233,7 +237,9 @@ impl LinearNeq {
 }
 
 impl Propagator for LinearNeq {
-    fn priority(&self) -> Priority { Priority::Linear }
+    fn priority(&self) -> Priority {
+        Priority::Linear
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &v in &self.vars {

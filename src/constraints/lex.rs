@@ -18,7 +18,9 @@ struct Lex {
 }
 
 impl Propagator for Lex {
-    fn priority(&self) -> Priority { Priority::Linear }
+    fn priority(&self) -> Priority {
+        Priority::Linear
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         for (&a, &b) in self.x.iter().zip(&self.y) {
@@ -82,7 +84,9 @@ struct Channel {
 }
 
 impl Propagator for Channel {
-    fn priority(&self) -> Priority { Priority::Linear }
+    fn priority(&self) -> Priority {
+        Priority::Linear
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         for (&a, &b) in self.x.iter().zip(&self.y) {

@@ -361,6 +361,7 @@ fn optimize_linear_tier(
         &[],
         None,
         Vec::new(),
+        Vec::new(),
         |value, _| on_improve(&[value]),
     );
     match best {

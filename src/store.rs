@@ -1069,7 +1069,14 @@ impl Store {
     }
 
     /// Enqueue `p` on its band unless it is the running propagator or already queued.
-    fn wake(queues: &mut [VecDeque<PropId>; NBANDS], enqueued: &mut [bool], prio: &[Priority], single_band: bool, current: Option<PropId>, p: PropId) {
+    fn wake(
+        queues: &mut [VecDeque<PropId>; NBANDS],
+        enqueued: &mut [bool],
+        prio: &[Priority],
+        single_band: bool,
+        current: Option<PropId>,
+        p: PropId,
+    ) {
         if current == Some(p) {
             return;
         }

@@ -1762,7 +1762,11 @@ impl Model {
                 let (mut lo, mut hi) = (0i64, 0i64);
                 for (&c, &v) in coeffs.iter().zip(&vars) {
                     let (vmin, vmax) = (self.solver.store.min(v) as i64, self.solver.store.max(v) as i64);
-                    let (a, b) = if c >= 0 { (c.saturating_mul(vmin), c.saturating_mul(vmax)) } else { (c.saturating_mul(vmax), c.saturating_mul(vmin)) };
+                    let (a, b) = if c >= 0 {
+                        (c.saturating_mul(vmin), c.saturating_mul(vmax))
+                    } else {
+                        (c.saturating_mul(vmax), c.saturating_mul(vmin))
+                    };
                     lo = lo.saturating_add(a);
                     hi = hi.saturating_add(b);
                 }

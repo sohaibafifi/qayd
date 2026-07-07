@@ -161,5 +161,10 @@ fn main() {
     }
 
     let mode = if ls { qayd::frontends::xcsp::Mode::Ls } else { qayd::frontends::xcsp::Mode::Default };
-    run_instance(&path, verbose, &stop, qayd::frontends::xcsp::RunOptions { seed, workers, mode, split, probes, lns, no_learn_csp, mem_limit });
+    run_instance(
+        &path,
+        verbose,
+        &stop,
+        qayd::frontends::xcsp::RunOptions { seed, workers, mode, split, probes, lns, no_learn_csp, mem_limit },
+    );
 }

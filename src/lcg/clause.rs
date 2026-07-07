@@ -166,6 +166,26 @@ impl SharedClausePool {
     pub fn lazy_atoms(&self) -> Arc<LazyAtomRegistry> {
         Arc::clone(&self.lazy_atoms)
     }
+
+    /// Snapshot the live shared clauses in chronological order. `limit` keeps
+    /// only the newest clauses when non-zero.
+    #[cfg(feature = "python")]
+    pub fn snapshot(&self, limit: usize) -> Vec<(u32, Arc<[Lit]>)> {
+        let ring = self.ring.lock().unwrap();
+        let write = ring.write;
+        let cap = ring.mask as u64 + 1;
+        let mut start = write.saturating_sub(cap);
+        if limit > 0 {
+            start = start.max(write.saturating_sub(limit as u64));
+        }
+        let mut out = Vec::with_capacity((write - start) as usize);
+        for i in start..write {
+            if let Some(clause) = &ring.slots[(i as usize) & ring.mask] {
+                out.push((clause.lbd, Arc::clone(&clause.lits)));
+            }
+        }
+        out
+    }
 }
 
 /// Per-worker view of the shared clause pool.

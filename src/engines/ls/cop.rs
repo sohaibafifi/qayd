@@ -839,11 +839,7 @@ impl LocalModel {
             let min = problem.solver.store.min(var);
             let max = problem.solver.store.max(var);
             let size = problem.solver.store.size(var);
-            let values = if size <= MAX_DOMAIN_VALUES {
-                problem.solver.store.values(var).collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
+            let values = if size <= MAX_DOMAIN_VALUES { problem.solver.store.values(var).collect::<Vec<_>>() } else { Vec::new() };
             if values.is_empty() && min > max {
                 return Err(1);
             }

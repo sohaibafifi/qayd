@@ -88,6 +88,11 @@ impl Cdcl<'_> {
     /// Branching heuristic: unfixed variable minimising `size / (wdeg + activity)`
     /// (dom/wdeg combined with VSIDS activity), or `None` if all fixed.
     fn select_var(&self, vars: &[VarId], objective: Option<&ObjectiveImpact>) -> Option<VarId> {
+        for &v in &self.branch_order {
+            if vars.contains(&v) && self.solver.store.size(v) > 1 {
+                return Some(v);
+            }
+        }
         let mut best: Option<VarId> = None;
         let mut best_score = f64::INFINITY;
         let mut best_objective: Option<VarId> = None;
@@ -528,8 +533,17 @@ impl Cdcl<'_> {
             }
             match self.select_var(vars, objective_impact.as_ref()) {
                 None => {
-                    let keep_searching =
-                        self.accept_solution(vars, objective, minimizing, &mut best, &mut enforced, &mut phase, &mut stats, &mut obj_bound, on_improve);
+                    let keep_searching = self.accept_solution(
+                        vars,
+                        objective,
+                        minimizing,
+                        &mut best,
+                        &mut enforced,
+                        &mut phase,
+                        &mut stats,
+                        &mut obj_bound,
+                        on_improve,
+                    );
                     if !keep_searching {
                         break; // optimal
                     }
@@ -590,13 +604,61 @@ impl Cdcl<'_> {
         self.copy_inprocessing_stats(&mut stats);
         (solution, stats, complete)
     }
+
+    /// CDCL decision driver under a temporary assumption cube. Learned clauses
+    /// exported from this run are scoped by the negated cube literals.
+    pub(crate) fn decide_sat_assuming(
+        &mut self,
+        vars: &[VarId],
+        cube: &[Lit],
+        conflict_budget: Option<u64>,
+        stop: &AtomicBool,
+    ) -> (Option<Vec<i32>>, SolveStats, bool) {
+        let mut stats = SolveStats::default();
+        if !self.init() || !self.assume_cube(cube) || !self.sync_shared_clauses() {
+            stats.failures = self.conflicts;
+            self.copy_inprocessing_stats(&mut stats);
+            return (None, stats, true);
+        }
+        if self.initial_phase.len() == self.solver.store.num_vars() {
+            self.saved_phase = self.initial_phase.clone();
+        }
+        let conflict_limit = conflict_budget.map(|n| self.conflicts.saturating_add(n));
+        let mut complete = true;
+        let solution = loop {
+            if stop.load(Ordering::Relaxed) || conflict_limit.is_some_and(|limit| self.conflicts >= limit) {
+                complete = false;
+                break None;
+            }
+            if !self.maybe_restart() {
+                break None;
+            }
+            match self.select_var(vars, None) {
+                None => {
+                    stats.solutions += 1;
+                    break Some(vars.iter().map(|&v| self.solver.store.value(v)).collect());
+                }
+                Some(v) => {
+                    stats.nodes += 1;
+                    let lit = self.decision_lit(v, &self.saved_phase);
+                    self.decide(lit).expect("in-domain decision cannot fail");
+                    if !self.propagate_and_learn() {
+                        break None;
+                    }
+                }
+            }
+        };
+        stats.failures = self.conflicts;
+        self.copy_inprocessing_stats(&mut stats);
+        (solution, stats, complete)
+    }
 }
 
 /// Handle to the single persistent objective-bound propagator (Linear/Expr).
 /// Owned by one `optimize` run; the propagator is posted lazily on the first
 /// improving incumbent, so a solver cloned from the immutable model template
 /// (parallel/cube workers, see `parallel.rs`) never aliases another worker's
-/// bound cell — each posts its own on its own first incumbent.
+/// bound cell, each posts its own on its own first incumbent.
 // ponytail: per-run cell; no cross-run reuse needed since a solver runs one optimize.
 #[derive(Default)]
 struct ObjBoundCell {

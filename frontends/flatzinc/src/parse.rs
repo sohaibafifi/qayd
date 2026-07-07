@@ -191,12 +191,12 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
     let name = body[..open].trim();
     let args = split_args(body[open + 1..].trim_end_matches(')'));
     match name {
-        "int_eq" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Eq),
-        "int_ne" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Ne),
-        "int_le" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Le),
-        "int_lt" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Lt),
-        "int_ge" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Ge),
-        "int_gt" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Gt),
+        "int_eq" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?, Relation::Eq),
+        "int_ne" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?, Relation::Ne),
+        "int_le" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?, Relation::Le),
+        "int_lt" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?, Relation::Lt),
+        "int_ge" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?, Relation::Ge),
+        "int_gt" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?, Relation::Gt),
         "int_lin_eq" => model.post_linear(&args, Relation::Eq),
         "int_lin_ne" => model.post_linear(&args, Relation::Ne),
         "int_lin_le" => model.post_linear(&args, Relation::Le),
@@ -249,11 +249,11 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
         "int_lin_gt_imp" => model.post_lin_reif(&args, Relation::Gt, Reif::Imp),
 
         // Boolean channelling and logic.
-        "bool2int" | "bool_eq" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Eq),
-        "bool_le" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Le),
-        "bool_lt" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Lt),
-        "bool_ge" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Ge),
-        "bool_gt" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?,Relation::Gt),
+        "bool2int" | "bool_eq" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?, Relation::Eq),
+        "bool_le" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?, Relation::Le),
+        "bool_lt" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?, Relation::Lt),
+        "bool_ge" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?, Relation::Ge),
+        "bool_gt" => model.post_cmp(arg(name, &args, 0)?, arg(name, &args, 1)?, Relation::Gt),
         "bool_not" => {
             let x = model.var_atom(arg(name, &args, 0)?)?;
             let y = model.var_atom(arg(name, &args, 1)?)?;
@@ -294,31 +294,31 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
         // Functional integer arithmetic.
         "int_times" => {
             let (a, b) = model.two_atoms(arg(name, &args, 0)?, arg(name, &args, 1)?)?;
-            model.post_def(arg(name, &args, 2)?,expr::mul(vec![a, b]))
+            model.post_def(arg(name, &args, 2)?, expr::mul(vec![a, b]))
         }
         "int_plus" => {
             let (a, b) = model.two_atoms(arg(name, &args, 0)?, arg(name, &args, 1)?)?;
-            model.post_def(arg(name, &args, 2)?,expr::add(vec![a, b]))
+            model.post_def(arg(name, &args, 2)?, expr::add(vec![a, b]))
         }
         "int_minus" => {
             let (a, b) = model.two_atoms(arg(name, &args, 0)?, arg(name, &args, 1)?)?;
-            model.post_def(arg(name, &args, 2)?,expr::sub(a, b))
+            model.post_def(arg(name, &args, 2)?, expr::sub(a, b))
         }
         "int_max" => {
             let (a, b) = model.two_atoms(arg(name, &args, 0)?, arg(name, &args, 1)?)?;
-            model.post_def(arg(name, &args, 2)?,expr::max_of(vec![a, b]))
+            model.post_def(arg(name, &args, 2)?, expr::max_of(vec![a, b]))
         }
         "int_min" => {
             let (a, b) = model.two_atoms(arg(name, &args, 0)?, arg(name, &args, 1)?)?;
-            model.post_def(arg(name, &args, 2)?,expr::min_of(vec![a, b]))
+            model.post_def(arg(name, &args, 2)?, expr::min_of(vec![a, b]))
         }
         "int_div" => {
             let (a, b) = model.two_atoms(arg(name, &args, 0)?, arg(name, &args, 1)?)?;
-            model.post_def(arg(name, &args, 2)?,expr::div(a, b))
+            model.post_def(arg(name, &args, 2)?, expr::div(a, b))
         }
         "int_mod" => {
             let (a, b) = model.two_atoms(arg(name, &args, 0)?, arg(name, &args, 1)?)?;
-            model.post_def(arg(name, &args, 2)?,expr::rem(a, b))
+            model.post_def(arg(name, &args, 2)?, expr::rem(a, b))
         }
         "int_abs" => {
             let a = model.atom_expr(arg(name, &args, 0)?)?;

@@ -16,7 +16,9 @@ pub struct Partition {
 }
 
 impl Propagator for Partition {
-    fn priority(&self) -> Priority { Priority::Expensive }
+    fn priority(&self) -> Priority {
+        Priority::Expensive
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &list in &self.lists {
@@ -90,7 +92,9 @@ pub struct SameList {
 }
 
 impl Propagator for SameList {
-    fn priority(&self) -> Priority { Priority::Linear }
+    fn priority(&self) -> Priority {
+        Priority::Linear
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &list in &self.lists {
@@ -174,7 +178,9 @@ pub struct ItemPrecedence {
 }
 
 impl Propagator for ItemPrecedence {
-    fn priority(&self) -> Priority { Priority::Cheap }
+    fn priority(&self) -> Priority {
+        Priority::Cheap
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &list in &self.lists {
@@ -268,7 +274,9 @@ pub struct ListCardinality {
 }
 
 impl Propagator for ListCardinality {
-    fn priority(&self) -> Priority { Priority::Linear }
+    fn priority(&self) -> Priority {
+        Priority::Linear
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         store.subscribe_list(self.list, me, ListEvent::PossibleChange);
@@ -346,7 +354,9 @@ pub struct ListUsed {
 }
 
 impl Propagator for ListUsed {
-    fn priority(&self) -> Priority { Priority::Linear }
+    fn priority(&self) -> Priority {
+        Priority::Linear
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         store.subscribe_list(self.list, me, ListEvent::LengthChange);
@@ -387,7 +397,9 @@ pub struct ListLength {
 }
 
 impl Propagator for ListLength {
-    fn priority(&self) -> Priority { Priority::Cheap }
+    fn priority(&self) -> Priority {
+        Priority::Cheap
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         store.subscribe_list(self.list, me, ListEvent::PossibleChange);
@@ -420,7 +432,9 @@ pub struct ListItemSum {
 }
 
 impl Propagator for ListItemSum {
-    fn priority(&self) -> Priority { Priority::Linear }
+    fn priority(&self) -> Priority {
+        Priority::Linear
+    }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
         store.subscribe_list(self.list, me, ListEvent::PossibleChange);

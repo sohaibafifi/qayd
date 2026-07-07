@@ -608,9 +608,27 @@ impl Propagator for AllDifferent {
             return Ok(());
         }
         let AllDifferent {
-            vars, matching, values, adj, var_to_val, val_to_var, seen, g, reachable,
-            dfs_stack, comp, index, low, on_stack, aug_stack, scc_work, tj_stack,
-            removals, scc_why, rg, visited,
+            vars,
+            matching,
+            values,
+            adj,
+            var_to_val,
+            val_to_var,
+            seen,
+            g,
+            reachable,
+            dfs_stack,
+            comp,
+            index,
+            low,
+            on_stack,
+            aug_stack,
+            scc_work,
+            tj_stack,
+            removals,
+            scc_why,
+            rg,
+            visited,
         } = self;
 
         // Value universe (sorted, deduped); value index = position.

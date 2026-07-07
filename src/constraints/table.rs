@@ -170,7 +170,11 @@ impl Extension {
         // last-seen size forces every column dirty on the first propagate so the
         // initial domains (and any pre-propagate removals) are folded in once.
         let (curr_words, col_size) = if positive {
-            let words = template.full.iter().flat_map(|&fw| [store.new_rev_int(fw as u32 as i32), store.new_rev_int((fw >> 32) as u32 as i32)]).collect();
+            let words = template
+                .full
+                .iter()
+                .flat_map(|&fw| [store.new_rev_int(fw as u32 as i32), store.new_rev_int((fw >> 32) as u32 as i32)])
+                .collect();
             let sizes = vars.iter().map(|_| store.new_rev_int(-1)).collect();
             (words, sizes)
         } else {
@@ -304,7 +308,22 @@ impl Propagator for Extension {
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
         let Extension {
-            vars, positive, template, current, union, curr_words, col_size, residues, search, cover, buf, killer_seen, explain_gen, last_kill_col, removals, why,
+            vars,
+            positive,
+            template,
+            current,
+            union,
+            curr_words,
+            col_size,
+            residues,
+            search,
+            cover,
+            buf,
+            killer_seen,
+            explain_gen,
+            last_kill_col,
+            removals,
+            why,
         } = self;
         let ExtensionTemplate { arity, supports, star, full, tuples } = &**template;
         let arity = *arity;

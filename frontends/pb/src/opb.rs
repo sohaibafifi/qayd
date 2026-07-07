@@ -117,10 +117,7 @@ pub fn parse(input: &str) -> Result<Opb, ParseError> {
             continue;
         }
 
-        let body = trimmed
-            .strip_suffix(';')
-            .map(str::trim)
-            .ok_or_else(|| err(line, "statement must end with ';'"))?;
+        let body = trimmed.strip_suffix(';').map(str::trim).ok_or_else(|| err(line, "statement must end with ';'"))?;
 
         if let Some((maximize, rest)) = strip_objective_keyword(body) {
             if opb.objective.is_some() {

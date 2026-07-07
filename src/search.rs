@@ -63,6 +63,38 @@ pub struct BoolLit {
     pub value: bool,
 }
 
+/// Relation used by a temporary solve assumption.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssumptionOp {
+    /// `var == value`.
+    Eq,
+    /// `var != value`.
+    Ne,
+    /// `var <= value`.
+    Le,
+    /// `var < value`.
+    Lt,
+    /// `var >= value`.
+    Ge,
+    /// `var > value`.
+    Gt,
+}
+
+/// A temporary integer-domain assumption for one solve call.
+///
+/// Assumptions are translated to LCG literals after the atom table is built. They
+/// are asserted for the current solve only, and learned clauses exported from
+/// that solve are guarded by the negated assumption literals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Assumption {
+    /// Variable constrained by the assumption.
+    pub var: VarId,
+    /// Relation applied to [`value`](Self::value).
+    pub op: AssumptionOp,
+    /// Right-hand side value.
+    pub value: i32,
+}
+
 impl BoolLit {
     /// Literal `var = 1`.
     #[inline]
@@ -74,6 +106,14 @@ impl BoolLit {
     #[inline]
     pub fn negative(var: VarId) -> Self {
         Self { var, value: false }
+    }
+}
+
+impl Assumption {
+    /// Construct `var == value`.
+    #[inline]
+    pub fn eq(var: VarId, value: i32) -> Self {
+        Self { var, op: AssumptionOp::Eq, value }
     }
 }
 
@@ -146,6 +186,49 @@ fn seeded_cdcl<'a>(
     Some(cdcl)
 }
 
+fn assumption_lit(cdcl: &Cdcl<'_>, assumption: Assumption) -> Option<Option<Lit>> {
+    let loc = match assumption.op {
+        AssumptionOp::Eq => cdcl.atoms.eq(assumption.var, assumption.value),
+        AssumptionOp::Ne => match cdcl.atoms.eq(assumption.var, assumption.value) {
+            LitOrConst::Lit(lit) => return Some(Some(lit.negate())),
+            LitOrConst::True => LitOrConst::False,
+            LitOrConst::False => LitOrConst::True,
+        },
+        AssumptionOp::Ge => cdcl.atoms.ge(assumption.var, assumption.value),
+        AssumptionOp::Gt => cdcl.atoms.ge_i64(assumption.var, i64::from(assumption.value) + 1),
+        AssumptionOp::Le => match cdcl.atoms.ge_i64(assumption.var, i64::from(assumption.value) + 1) {
+            LitOrConst::Lit(lit) => return Some(Some(lit.negate())),
+            LitOrConst::True => LitOrConst::False,
+            LitOrConst::False => LitOrConst::True,
+        },
+        AssumptionOp::Lt => match cdcl.atoms.ge(assumption.var, assumption.value) {
+            LitOrConst::Lit(lit) => return Some(Some(lit.negate())),
+            LitOrConst::True => LitOrConst::False,
+            LitOrConst::False => LitOrConst::True,
+        },
+    };
+    match loc {
+        LitOrConst::Lit(lit) => Some(Some(lit)),
+        LitOrConst::True => Some(None),
+        LitOrConst::False => None,
+    }
+}
+
+fn assumption_cube(cdcl: &Cdcl<'_>, assumptions: &[Assumption]) -> Option<Vec<Lit>> {
+    let mut cube = Vec::with_capacity(assumptions.len());
+    for &assumption in assumptions {
+        if let Some(lit) = assumption_lit(cdcl, assumption)? {
+            if !cube.contains(&lit) {
+                if cube.contains(&lit.negate()) {
+                    return None;
+                }
+                cube.push(lit);
+            }
+        }
+    }
+    Some(cube)
+}
+
 /// Enumerate solutions over `vars`; `on_solution` returns [`SearchControl::Stop`]
 /// to halt early. Mutates `solver` (posts learnt clauses, leaves end state).
 pub fn solve<F>(solver: &mut Solver, vars: &[VarId], on_solution: F) -> SolveStats
@@ -172,6 +255,41 @@ where
         return SolveStats::default();
     };
     cdcl.enumerate(vars, on_solution, stop)
+}
+
+/// Find one solution under temporary assumptions, with optional learned-clause
+/// exchange, value hints, and a conflict budget.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decide_sat_assuming_seeded(
+    solver: &mut Solver,
+    vars: &[VarId],
+    assumptions: &[Assumption],
+    stop: &AtomicBool,
+    seed: u64,
+    clause_sharing: Option<ClauseSharing>,
+    conflict_budget: Option<u64>,
+    initial_phase: Vec<Option<i32>>,
+    branch_order: Vec<VarId>,
+) -> (Option<Vec<i32>>, SolveStats, bool) {
+    let lazy_atoms = clause_sharing.as_ref().map(ClauseSharing::lazy_atoms);
+    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, lazy_atoms) else {
+        return (None, SolveStats::default(), false);
+    };
+    let Some(cube) = assumption_cube(&cdcl, assumptions) else {
+        return (None, SolveStats::default(), true);
+    };
+    if let Some(sharing) = clause_sharing {
+        cdcl.set_clause_sharing(sharing);
+    }
+    cdcl.initial_phase = initial_phase;
+    cdcl.branch_order = branch_order;
+    cdcl.decide_sat_assuming(vars, &cube, conflict_budget, stop)
+}
+
+/// Find one solution under temporary assumptions, or prove that the assumed
+/// subproblem is unsatisfiable.
+pub fn first_solution_assuming(solver: &mut Solver, vars: &[VarId], assumptions: &[Assumption]) -> (Option<Vec<i32>>, SolveStats, bool) {
+    decide_sat_assuming_seeded(solver, vars, assumptions, &NEVER_STOP, 0, None, None, Vec::new(), Vec::new())
 }
 
 /// Find one solution over `vars`, or prove UNSAT, with CDCL learning and restarts.
@@ -659,10 +777,21 @@ pub fn optimize_with(
     on_improve: impl FnMut(i32),
 ) -> (Option<(Vec<i32>, i32)>, SolveStats) {
     let mut on_improve = on_improve;
-    let (best, stats, _) =
-        optimize_seeded(solver, vars, Objective::Var(obj), minimizing, stop, 0, None, None, &[], None, Vec::new(), |value, _| {
-            on_improve(value as i32)
-        });
+    let (best, stats, _) = optimize_seeded(
+        solver,
+        vars,
+        Objective::Var(obj),
+        minimizing,
+        stop,
+        0,
+        None,
+        None,
+        &[],
+        None,
+        Vec::new(),
+        Vec::new(),
+        |value, _| on_improve(value as i32),
+    );
     (best.map(|(solution, value)| (solution, value as i32)), stats)
 }
 
@@ -681,6 +810,7 @@ pub(crate) fn optimize_seeded(
     cube: &[Lit],
     conflict_budget: Option<u64>,
     initial_phase: Vec<Option<i32>>,
+    branch_order: Vec<VarId>,
     on_improve: impl FnMut(i64, &[i32]),
 ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
     let lazy_atoms = clause_sharing.as_ref().map(ClauseSharing::lazy_atoms);
@@ -691,7 +821,68 @@ pub(crate) fn optimize_seeded(
         cdcl.set_clause_sharing(sharing);
     }
     cdcl.initial_phase = initial_phase;
+    cdcl.branch_order = branch_order;
     cdcl.optimize(vars, objective, minimizing, stop, shared_bound, cube, conflict_budget, on_improve)
+}
+
+/// Optimise with temporary assumptions. This keeps the public callsite in terms
+/// of integer variables rather than LCG literals.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn optimize_assuming_seeded(
+    solver: &mut Solver,
+    vars: &[VarId],
+    assumptions: &[Assumption],
+    objective: Objective<'_>,
+    minimizing: bool,
+    stop: &AtomicBool,
+    seed: u64,
+    shared_bound: Option<&AtomicI64>,
+    clause_sharing: Option<ClauseSharing>,
+    conflict_budget: Option<u64>,
+    initial_phase: Vec<Option<i32>>,
+    branch_order: Vec<VarId>,
+    on_improve: impl FnMut(i64, &[i32]),
+) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
+    let lazy_atoms = clause_sharing.as_ref().map(ClauseSharing::lazy_atoms);
+    let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, lazy_atoms) else {
+        return (None, SolveStats::default(), false);
+    };
+    let Some(cube) = assumption_cube(&cdcl, assumptions) else {
+        return (None, SolveStats::default(), true);
+    };
+    if let Some(sharing) = clause_sharing {
+        cdcl.set_clause_sharing(sharing);
+    }
+    cdcl.initial_phase = initial_phase;
+    cdcl.branch_order = branch_order;
+    cdcl.optimize(vars, objective, minimizing, stop, shared_bound, &cube, conflict_budget, on_improve)
+}
+
+/// Optimise an objective variable under temporary assumptions.
+pub fn optimize_var_assuming(
+    solver: &mut Solver,
+    vars: &[VarId],
+    assumptions: &[Assumption],
+    obj: VarId,
+    minimizing: bool,
+    stop: &AtomicBool,
+    on_improve: impl FnMut(i64, &[i32]),
+) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
+    optimize_assuming_seeded(
+        solver,
+        vars,
+        assumptions,
+        Objective::Var(obj),
+        minimizing,
+        stop,
+        0,
+        None,
+        None,
+        None,
+        Vec::new(),
+        Vec::new(),
+        on_improve,
+    )
 }
 
 /// Pick a binary split for one root cube.
