@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::domains::interval::{IntervalEvent, IntervalPresence};
 use crate::ids::{IntervalId, PropId, VarId};
-use crate::propagator::{Inconsistency, Priority, Propagator};
+use crate::propagator::{Event, Inconsistency, Priority, Propagator};
 use crate::store::{Premise, Solver, Store};
 
 /// Structured fixed-duration interval precedence.
@@ -698,4 +698,209 @@ impl Propagator for ExactlyOneMode {
 /// Post an `alternative`: exactly one of `modes` (optional intervals) is present.
 pub fn exactly_one_mode(solver: &mut Solver, modes: &[IntervalId]) -> PropId {
     solver.post(Box::new(ExactlyOneMode { modes: modes.to_vec() }))
+}
+
+/// Raise a plain variable's lower bound, explained, reporting whether it moved.
+fn set_var_min_because(store: &mut Store, var: VarId, min: i32, why: Vec<Premise>) -> Result<bool, Inconsistency> {
+    let before = store.min(var);
+    store.remove_below_because(var, min, why)?;
+    Ok(store.min(var) != before)
+}
+
+/// Lower a plain variable's upper bound, explained, reporting whether it moved.
+fn set_var_max_because(store: &mut Store, var: VarId, max: i32, why: Vec<Premise>) -> Result<bool, Inconsistency> {
+    let before = store.max(var);
+    store.remove_above_because(var, max, why)?;
+    Ok(store.max(var) != before)
+}
+
+/// Bounds channel for an `alternative` master: one shared start `S`, and one optional
+/// per-member interval (own start `s_m`, presence `p_m`) per `(machine, duration)`
+/// mode, with the co-posted [`ExactlyOneMode`] keeping exactly one present. `S`
+/// is the chosen mode's start. A mode is *capable* while `p_m` is not fixed to
+/// `0` (it can still host `S`).
+///
+/// The naive encoding (`p_m == 1 ⇒ s_m == S` as generic implications) prunes
+/// nothing until `p_m` is decided, so it never confines `S` and never rules a
+/// mode out early. This does both on bounds:
+/// - (a) `S` lies in the union of the capable modes' windows (it equals the
+///   chosen capable mode's start);
+/// - (b) a capable mode whose window is disjoint from `S`'s can no longer host
+///   `S`, so it is forced absent;
+/// - (c) the chosen (`p_m == 1`) mode's start equals `S`, propagated both ways.
+///
+/// An unchosen mode's start is left alone beyond (b): while `p_m` is undecided
+/// that start is meaningless, so tying it to `S` would be the very over-
+/// constraint the guarded channel exists to avoid.
+#[derive(Clone)]
+pub struct AlternativeChannel {
+    shared_start: VarId,
+    modes: Vec<IntervalId>,
+}
+
+impl AlternativeChannel {
+    /// Reason for rule (a)'s union bound on `S`: every mode that is not fixed-
+    /// absent must be covered, because `S` could still equal any of their starts.
+    /// A capable mode cites the bound feeding the union (`Ge`/`Le` on its start);
+    /// a fixed-absent mode cites `p_m == 0`, which is what lets us drop it.
+    fn union_reason(&self, store: &Store, lower: bool) -> Vec<Premise> {
+        let mut why = Vec::with_capacity(self.modes.len());
+        for &m in &self.modes {
+            if store.interval_presence(m) == IntervalPresence::Absent {
+                if let Some(var) = store.interval_presence_var(m) {
+                    why.push(Premise::Eq { var, val: 0 });
+                }
+            } else {
+                let start = store.interval_start_var(m);
+                why.push(if lower {
+                    Premise::Ge { var: start, bound: store.interval_start_min(m) }
+                } else {
+                    Premise::Le { var: start, bound: store.interval_start_max(m) }
+                });
+            }
+        }
+        why
+    }
+}
+
+impl Propagator for AlternativeChannel {
+    fn priority(&self) -> Priority {
+        Priority::Cheap
+    }
+
+    fn register(&mut self, store: &mut Store, me: PropId) {
+        store.subscribe(self.shared_start, me, Event::BoundChange);
+        for &mode in &self.modes {
+            store.subscribe_interval(mode, me, IntervalEvent::StartBoundChange);
+            store.subscribe_interval(mode, me, IntervalEvent::PresenceChange);
+        }
+    }
+
+    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+        // This propagator mutates its own scope (forcing `p_m := 0`, shifting `S`
+        // and `s_m`), which never re-wakes it, so it loops to its own fixpoint.
+        // Every rule only tightens domains, and each reason is built from the
+        // reads current at its mutating call, so a bound another rule moved
+        // earlier in the pass only means one more iteration, never an unsound push.
+        loop {
+            let mut changed = false;
+
+            // Rule (a): confine `S` to the union of the capable modes' windows.
+            let mut union_lo = i32::MAX;
+            let mut union_hi = i32::MIN;
+            for &m in &self.modes {
+                if store.interval_presence(m) != IntervalPresence::Absent {
+                    union_lo = union_lo.min(store.interval_start_min(m));
+                    union_hi = union_hi.max(store.interval_start_max(m));
+                }
+            }
+            if union_lo > union_hi {
+                // No capable mode remains; `ExactlyOneMode` owns that conflict.
+                return Ok(());
+            }
+            if union_lo > store.min(self.shared_start) {
+                let why = if store.explaining() { self.union_reason(store, true) } else { Vec::new() };
+                changed |= set_var_min_because(store, self.shared_start, union_lo, why)?;
+            }
+            if union_hi < store.max(self.shared_start) {
+                let why = if store.explaining() { self.union_reason(store, false) } else { Vec::new() };
+                changed |= set_var_max_because(store, self.shared_start, union_hi, why)?;
+            }
+
+            let s_lo = store.min(self.shared_start);
+            let s_hi = store.max(self.shared_start);
+
+            // Rule (b): a capable mode disjoint from `S`'s window cannot host the
+            // chosen start, so it becomes absent (`p_m == 1 ⇒ s_m == S` is then
+            // unsatisfiable). Reason: the two bounds that make the windows disjoint.
+            for &m in &self.modes {
+                if store.interval_presence(m) == IntervalPresence::Absent {
+                    continue;
+                }
+                let start = store.interval_start_var(m);
+                let m_lo = store.interval_start_min(m);
+                let m_hi = store.interval_start_max(m);
+                if m_hi < s_lo {
+                    let why = if store.explaining() {
+                        vec![Premise::Le { var: start, bound: m_hi }, Premise::Ge { var: self.shared_start, bound: s_lo }]
+                    } else {
+                        Vec::new()
+                    };
+                    changed |= store.forbid_interval_presence_because(m, why)?;
+                } else if m_lo > s_hi {
+                    let why = if store.explaining() {
+                        vec![Premise::Ge { var: start, bound: m_lo }, Premise::Le { var: self.shared_start, bound: s_hi }]
+                    } else {
+                        Vec::new()
+                    };
+                    changed |= store.forbid_interval_presence_because(m, why)?;
+                }
+            }
+
+            // Rule (c): the chosen mode's start equals `S`; propagate both ways.
+            for &m in &self.modes {
+                if store.interval_presence(m) != IntervalPresence::Present {
+                    continue;
+                }
+                let start = store.interval_start_var(m);
+                // `S >= s_m.lb` and `S <= s_m.ub`.
+                let m_lo = store.interval_start_min(m);
+                if m_lo > store.min(self.shared_start) {
+                    let why = if store.explaining() {
+                        let mut w = vec![Premise::Ge { var: start, bound: m_lo }];
+                        w.extend(present_premise(store, m));
+                        w
+                    } else {
+                        Vec::new()
+                    };
+                    changed |= set_var_min_because(store, self.shared_start, m_lo, why)?;
+                }
+                let m_hi = store.interval_start_max(m);
+                if m_hi < store.max(self.shared_start) {
+                    let why = if store.explaining() {
+                        let mut w = vec![Premise::Le { var: start, bound: m_hi }];
+                        w.extend(present_premise(store, m));
+                        w
+                    } else {
+                        Vec::new()
+                    };
+                    changed |= set_var_max_because(store, self.shared_start, m_hi, why)?;
+                }
+                // `s_m >= S.lb` and `s_m <= S.ub` (re-read `S` after the pushes above).
+                let s_lo = store.min(self.shared_start);
+                if s_lo > store.interval_start_min(m) {
+                    let why = if store.explaining() {
+                        let mut w = vec![Premise::Ge { var: self.shared_start, bound: s_lo }];
+                        w.extend(present_premise(store, m));
+                        w
+                    } else {
+                        Vec::new()
+                    };
+                    changed |= store.set_interval_start_min_because(m, s_lo, why)?;
+                }
+                let s_hi = store.max(self.shared_start);
+                if s_hi < store.interval_start_max(m) {
+                    let why = if store.explaining() {
+                        let mut w = vec![Premise::Le { var: self.shared_start, bound: s_hi }];
+                        w.extend(present_premise(store, m));
+                        w
+                    } else {
+                        Vec::new()
+                    };
+                    changed |= store.set_interval_start_max_because(m, s_hi, why)?;
+                }
+            }
+
+            if !changed {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Post the bounds channel of a moded interval: `shared_start` is the chosen
+/// mode's start, over the per-mode optional `modes`. Co-post [`exactly_one_mode`]
+/// so exactly one mode is present.
+pub fn alternative_channel(solver: &mut Solver, shared_start: VarId, modes: &[IntervalId]) -> PropId {
+    solver.post(Box::new(AlternativeChannel { shared_start, modes: modes.to_vec() }))
 }

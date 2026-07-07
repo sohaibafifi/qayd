@@ -102,9 +102,27 @@ struct PyIntervalVar {
     interval: Option<IntervalId>,
     start: Option<VarId>,
     presence: Option<VarId>,
-    /// Fixed duration; `None` for moded intervals whose realised duration
-    /// depends on the selected mode.
+    /// Fixed duration; `None` for an `alternative` master whose realised
+    /// duration depends on the selected member.
     duration: Option<i64>,
+    /// Set on an `alternative` master: the member optional intervals, of which
+    /// exactly one executes. The master's `start` is the shared start `S`; its
+    /// realised duration is read off the chosen member's presence.
+    alternative: Option<AlternativeInterval>,
+}
+
+/// The payload of an `alternative` master: parallel per-member data, aligned
+/// to the input member order.
+#[derive(Clone)]
+struct AlternativeInterval {
+    /// Display name for the master's `.end`/`.realized_duration` texts.
+    name: String,
+    /// The member intervals, echoed for `.members`.
+    members: Vec<PyIntervalVar>,
+    /// Per-member presence variable.
+    presences: Vec<VarId>,
+    /// Per-member duration.
+    durations: Vec<i64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -123,9 +141,15 @@ struct NativeIntervalSpec {
 
 #[pymethods]
 impl PyIntervalVar {
+    /// The backing native-interval index, or `None` for an `alternative`
+    /// master (which has no single backing interval).
     #[getter]
-    fn index(&self) -> usize {
-        self.index as usize
+    fn index(&self) -> Option<usize> {
+        if self.alternative.is_some() {
+            None
+        } else {
+            Some(self.index as usize)
+        }
     }
 
     #[getter]
@@ -149,12 +173,26 @@ impl PyIntervalVar {
     }
 
     /// `start + duration`, as an expression usable in constraints/objectives.
+    /// For an `alternative` master it is the shared start plus the realised
+    /// (chosen) member's duration, `S + Σ p_m·d_m`.
     #[getter]
     fn end(&self) -> PyResult<PyExpr> {
+        if let Some(alt) = &self.alternative {
+            let start = self.start.expect("an alternative master has a shared start");
+            let mut terms = vec![expr::var(start)];
+            terms.extend(alt.duration_terms());
+            return Ok(PyExpr {
+                inner: ExprLike {
+                    model_id: Some(self.model_id),
+                    expr: expr::add(terms),
+                    text: format!("{}.end", alt.name),
+                },
+            });
+        }
         let (Some(start), Some(duration)) = (self.start, self.duration) else {
             return Err(PyValueError::new_err(
                 "end is only available on fixed-duration intervals with a start variable; \
-                 a moded interval (alternatives) has a mode-dependent duration",
+                 a schedule-engine interval (alternatives) has a mode-dependent duration",
             ));
         };
         Ok(PyExpr {
@@ -166,8 +204,51 @@ impl PyIntervalVar {
         })
     }
 
+    /// The realised duration `Σ p_m·d_m` of an `alternative` master (exact
+    /// under the exactly-one choice). Raises on a plain interval.
+    #[getter]
+    fn realized_duration(&self) -> PyResult<PyExpr> {
+        let alt = self.require_alternative("realized_duration")?;
+        Ok(PyExpr {
+            inner: ExprLike {
+                model_id: Some(self.model_id),
+                expr: expr::add(alt.duration_terms()),
+                text: format!("{}.realized_duration", alt.name),
+            },
+        })
+    }
+
+    /// The member intervals of an `alternative` master (empty otherwise), in
+    /// the order they were given.
+    #[getter]
+    fn members(&self) -> Vec<PyIntervalVar> {
+        self.alternative.as_ref().map(|alt| alt.members.clone()).unwrap_or_default()
+    }
+
     fn __repr__(&self) -> String {
+        if let Some(alt) = &self.alternative {
+            return format!("IntervalVar({})", alt.name);
+        }
         format!("IntervalVar({})", self.index)
+    }
+}
+
+impl PyIntervalVar {
+    fn require_alternative(&self, what: &str) -> PyResult<&AlternativeInterval> {
+        self.alternative
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err(format!("{what} is only available on an alternative master (Model.alternative)")))
+    }
+}
+
+impl AlternativeInterval {
+    /// `p_m·d_m` per member (exactly one `p_m` is `1`).
+    fn duration_terms(&self) -> Vec<Expr> {
+        self.presences
+            .iter()
+            .zip(&self.durations)
+            .map(|(&presence, &duration)| expr::mul(vec![expr::var(presence), expr::int(duration)]))
+            .collect()
     }
 }
 
@@ -1931,12 +2012,6 @@ impl PyModel {
         self.create_native_interval(duration, horizon, optional, name)
     }
 
-    /// Create one optional fixed-duration native interval.
-    #[pyo3(signature = (duration, horizon, *, name=None))]
-    fn optional_interval(&mut self, duration: i64, horizon: i64, name: Option<String>) -> PyResult<PyIntervalVar> {
-        self.create_native_interval(duration, horizon, true, name)
-    }
-
     /// Create fixed-duration native intervals.
     #[pyo3(signature = (durations, horizon, *, optional=false, name=None))]
     fn intervals(&mut self, durations: Vec<i64>, horizon: i64, optional: bool, name: Option<String>) -> PyResult<Vec<PyIntervalVar>> {
@@ -1948,10 +2023,57 @@ impl PyModel {
         Ok(intervals)
     }
 
-    /// Create optional fixed-duration native intervals.
-    #[pyo3(signature = (durations, horizon, *, name=None))]
-    fn optional_intervals(&mut self, durations: Vec<i64>, horizon: i64, name: Option<String>) -> PyResult<Vec<PyIntervalVar>> {
-        self.intervals(durations, horizon, true, name)
+    /// The `alternative` constraint over optional intervals the caller created:
+    /// exactly one member executes, and the returned master synchronises with
+    /// it (`.start` is the shared start, `.end`/`.realized_duration` follow the
+    /// chosen member). A dedicated bounds channel confines the master's start
+    /// to the union of the still-capable members' windows and rules out members
+    /// whose window it can no longer reach.
+    #[pyo3(signature = (members, *, name=None))]
+    fn alternative(&mut self, members: &Bound<'_, PyAny>, name: Option<String>) -> PyResult<PyIntervalVar> {
+        let members = interval_list_from_py(members)?;
+        if members.is_empty() {
+            return Err(PyValueError::new_err("alternative needs at least one member interval"));
+        }
+        let mut ids: Vec<IntervalId> = Vec::with_capacity(members.len());
+        let mut presences: Vec<VarId> = Vec::with_capacity(members.len());
+        let mut durations: Vec<i64> = Vec::with_capacity(members.len());
+        let (mut start_lo, mut start_hi) = (i32::MAX, i32::MIN);
+        for member in &members {
+            let spec = self.native_interval_spec(member)?;
+            let Some(presence) = spec.presence else {
+                return Err(PyValueError::new_err(
+                    "alternative members must be optional intervals (Model.interval(..., optional=True))",
+                ));
+            };
+            if ids.contains(&spec.interval) {
+                return Err(PyValueError::new_err("alternative members must be distinct intervals"));
+            }
+            start_lo = start_lo.min(self.solver.store.interval_start_min(spec.interval));
+            start_hi = start_hi.max(self.solver.store.interval_start_max(spec.interval));
+            ids.push(spec.interval);
+            presences.push(presence);
+            durations.push(i64::from(spec.duration));
+        }
+
+        let shared_start = self.solver.new_var_range(start_lo, start_hi);
+        self.register_native_backing_var(shared_start, name.as_ref().map(|name| format!("{name}.start")));
+
+        interval_constraints::exactly_one_mode(&mut self.solver, &ids);
+        interval_constraints::alternative_channel(&mut self.solver, shared_start, &ids);
+
+        let name = name.unwrap_or_else(|| format!("alternative{}", shared_start.0));
+        Ok(PyIntervalVar {
+            model_id: self.id,
+            gen: 0,
+            index: u32::MAX,
+            kind: PyIntervalKind::Native,
+            interval: None,
+            start: Some(shared_start),
+            presence: None,
+            duration: None,
+            alternative: Some(AlternativeInterval { name, members, presences, durations }),
+        })
     }
 
     /// Create intervals whose mode is selected from `(machine, duration)` pairs.
@@ -1980,6 +2102,7 @@ impl PyModel {
                 start: None,
                 presence: None,
                 duration: None,
+                alternative: None,
             })
             .collect())
     }
@@ -2305,12 +2428,16 @@ impl PyModel {
             start: Some(start),
             presence,
             duration: Some(duration),
+            alternative: None,
         })
     }
 
     fn native_interval_spec(&self, iv: &PyIntervalVar) -> PyResult<NativeIntervalSpec> {
         if iv.model_id != self.id {
             return Err(PyValueError::new_err("this interval belongs to a different model"));
+        }
+        if iv.alternative.is_some() {
+            return Err(PyValueError::new_err("an alternative master is not directly schedulable; schedule its members instead"));
         }
         if iv.kind != PyIntervalKind::Native {
             return Err(PyValueError::new_err("expected a native interval"));
