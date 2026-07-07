@@ -313,6 +313,9 @@ fn run_member_var_search(
 /// indicators (`Used` terms). Returns `None` for anything not yet linearizable
 /// (currently `Count`), so the caller falls back to the enumerate path.
 fn lower_linear_tier(solver: &mut Solver, lists: &[ListId], tier: &ListObjectiveTier) -> Option<(Vec<i64>, Vec<VarId>)> {
+    if tier.max_terms.is_some() {
+        return None;
+    }
     let mut coeffs = Vec::new();
     let mut vars = Vec::new();
     for term in &tier.terms {
@@ -336,7 +339,7 @@ fn lower_linear_tier(solver: &mut Solver, lists: &[ListId], tier: &ListObjective
                 coeffs.push(*coeff);
                 vars.push(used);
             }
-            ListObjectiveTerm::Count { .. } => return None,
+            ListObjectiveTerm::Count { .. } | ListObjectiveTerm::Reduction(_) => return None,
         }
     }
     Some((coeffs, vars))
@@ -560,6 +563,7 @@ mod tests {
                 ListObjectiveTerm::Sum { list: 1, weights: vec![(10, 10), (20, 10), (30, 0)], coeff: 1 },
                 ListObjectiveTerm::Sum { list: 2, weights: vec![(10, 20), (20, 20), (30, 1)], coeff: 1 },
             ],
+            max_terms: None,
         }];
         let stop = AtomicBool::new(false);
         let member = solve(&model, &objective_tiers, &stop, |_| {}).expect("solve").expect("supported");
@@ -599,6 +603,7 @@ mod tests {
         let objective_tiers = vec![ListObjectiveTier {
             minimize: true,
             terms: vec![ListObjectiveTerm::Sum { list: 1, weights: vec![(10, 1), (20, 2), (30, 3)], coeff: 1 }],
+            max_terms: None,
         }];
         let stop = AtomicBool::new(false);
         let member = solve(&model, &objective_tiers, &stop, |_| {}).expect("solve").expect("supported");
@@ -634,6 +639,7 @@ mod tests {
                 ListObjectiveTerm::Used { list: 1, coeff: 1 },
                 ListObjectiveTerm::Used { list: 2, coeff: 1 },
             ],
+            max_terms: None,
         }];
         let stop = AtomicBool::new(false);
         let member = solve(&model, &objective_tiers, &stop, |_| {}).expect("solve").expect("supported");

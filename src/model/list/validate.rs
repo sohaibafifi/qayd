@@ -330,7 +330,7 @@ impl CollectionModel {
             return Err(format!("at most {MAX_TIERS} objective tiers are supported"));
         }
         for tier in &self.objectives {
-            for r in &tier.terms {
+            for r in tier.reductions() {
                 validate_reduction(r, &self.items, self.lists)?;
             }
         }

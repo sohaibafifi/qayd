@@ -565,6 +565,10 @@ fn parse_engine(engine: &str) -> PyResult<PythonEngine> {
     }
 }
 
+fn collection_has_max_terms(model: &list::CollectionModel) -> bool {
+    model.objectives.iter().any(list::ObjectiveTier::has_max_terms)
+}
+
 fn verbose_start(num_vars: usize, num_constraints: usize, has_objective: bool) {
     println!("qayd solve");
     println!("  variables: {num_vars}");
@@ -2496,7 +2500,7 @@ impl PyModel {
         } else if self.col_objectives.len() >= list::MAX_TIERS {
             return Err(PyValueError::new_err(format!("at most {} objective tiers are supported", list::MAX_TIERS)));
         }
-        self.col_objectives.push(list::ObjectiveTier { minimize, terms: term.reductions.clone() });
+        self.col_objectives.push(list::ObjectiveTier { minimize, terms: term.reductions.clone(), max_terms: term.max_terms.clone() });
         Ok(())
     }
 
@@ -2843,6 +2847,9 @@ impl PyModel {
                 return Err(PyValueError::new_err(format!("model is not supported by an exact engine: {}", selection.reason)));
             }
         }
+        if collection_has_max_terms(&model) {
+            return Err(PyValueError::new_err("max_of list terms is supported by exact list backends only for this model shape"));
+        }
         let limit = time_limit.unwrap_or(5);
         // The first tier drives the progress line; report its sense.
         let primary_sense = self.col_objectives.first().map_or("min", |t| if t.minimize { "min" } else { "max" });
@@ -3125,20 +3132,44 @@ fn min_of(items: &Bound<'_, PyAny>) -> PyResult<PyExpr> {
 }
 
 #[pyfunction]
-fn max_of(items: &Bound<'_, PyAny>) -> PyResult<PyExpr> {
-    let items = expr_list_from_py(items)?;
-    if items.is_empty() {
+fn max_of(items: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    let py = items.py();
+    let raw = items.try_iter()?.map(|item| item.map(|item| item.unbind())).collect::<PyResult<Vec<_>>>()?;
+    if raw.is_empty() {
         return Err(PyValueError::new_err("max_of requires at least one expression"));
     }
+
+    let mut terms = Vec::with_capacity(raw.len());
+    let mut saw_non_term = false;
+    for item in &raw {
+        match item.bind(py).extract::<PyRef<'_, PyTerm>>() {
+            Ok(term) => terms.push(term.clone()),
+            Err(_) => {
+                saw_non_term = true;
+                break;
+            }
+        }
+    }
+    if !terms.is_empty() {
+        if saw_non_term || terms.len() != raw.len() {
+            return Err(PyTypeError::new_err("max_of(iterable) cannot mix list-domain terms with arithmetic expressions"));
+        }
+        let term = max_term(terms)?;
+        return Ok(term.into_pyobject(py)?.into_any().unbind());
+    }
+
     let mut model_id = None;
-    let mut exprs = Vec::with_capacity(items.len());
-    let mut texts = Vec::with_capacity(items.len());
-    for item in items {
+    let mut exprs = Vec::with_capacity(raw.len());
+    let mut texts = Vec::with_capacity(raw.len());
+    for item in raw {
+        let item = item.bind(py);
+        let item = expr_from_py(item)?;
         model_id = merge_model_ids(model_id, item.model_id)?;
         exprs.push(item.expr);
         texts.push(item.text);
     }
-    Ok(PyExpr { inner: ExprLike { model_id, expr: Expr::Max(exprs), text: format!("max({})", texts.join(", ")) } })
+    let expr = PyExpr { inner: ExprLike { model_id, expr: Expr::Max(exprs), text: format!("max({})", texts.join(", ")) } };
+    Ok(expr.into_pyobject(py)?.into_any().unbind())
 }
 
 #[pyfunction]
@@ -3307,6 +3338,7 @@ struct PyTerm {
     model_id: u64,
     gen: u64,
     reductions: Vec<list::Reduction>,
+    max_terms: Option<Vec<Vec<list::Reduction>>>,
 }
 
 /// A constraint `term <op> rhs` over a single list reduction.
@@ -3325,9 +3357,12 @@ fn combine_terms(a: &PyTerm, b: &PyTerm) -> PyResult<PyTerm> {
     if a.model_id != b.model_id || a.gen != b.gen {
         return Err(PyValueError::new_err("cannot combine terms from different models or list_vars generations"));
     }
+    if a.max_terms.is_some() || b.max_terms.is_some() {
+        return Err(PyTypeError::new_err("max_of terms cannot be added to other terms; use them directly as an objective"));
+    }
     let mut reductions = a.reductions.clone();
     reductions.extend(b.reductions.iter().cloned());
-    Ok(PyTerm { model_id: a.model_id, gen: a.gen, reductions })
+    Ok(PyTerm { model_id: a.model_id, gen: a.gen, reductions, max_terms: None })
 }
 
 fn scale_reduction(reduction: &list::Reduction, coeff: i64) -> PyResult<list::Reduction> {
@@ -3337,8 +3372,28 @@ fn scale_reduction(reduction: &list::Reduction, coeff: i64) -> PyResult<list::Re
 }
 
 fn scale_term(term: &PyTerm, coeff: i64) -> PyResult<PyTerm> {
+    if term.max_terms.is_some() {
+        return Err(PyTypeError::new_err("max_of terms cannot be multiplied by a scalar"));
+    }
     let reductions = term.reductions.iter().map(|reduction| scale_reduction(reduction, coeff)).collect::<PyResult<Vec<_>>>()?;
-    Ok(PyTerm { model_id: term.model_id, gen: term.gen, reductions })
+    Ok(PyTerm { model_id: term.model_id, gen: term.gen, reductions, max_terms: None })
+}
+
+fn max_term(terms: Vec<PyTerm>) -> PyResult<PyTerm> {
+    let first = terms.first().ok_or_else(|| PyValueError::new_err("max_of requires at least one term"))?;
+    let model_id = first.model_id;
+    let gen = first.gen;
+    let mut groups = Vec::with_capacity(terms.len());
+    for term in terms {
+        if term.model_id != model_id || term.gen != gen {
+            return Err(PyValueError::new_err("cannot combine terms from different models or list_vars generations"));
+        }
+        if term.max_terms.is_some() {
+            return Err(PyTypeError::new_err("nested max_of terms are not supported"));
+        }
+        groups.push(term.reductions);
+    }
+    Ok(PyTerm { model_id, gen, reductions: Vec::new(), max_terms: Some(groups) })
 }
 
 #[pymethods]
@@ -3368,6 +3423,9 @@ impl PyTerm {
     }
 
     fn __richcmp__(&self, other: &Bound<'_, PyAny>, op: CompareOp) -> PyResult<PyListConstraint> {
+        if self.max_terms.is_some() {
+            return Err(PyValueError::new_err("max_of list terms are supported as objectives, not constraints"));
+        }
         let rhs = other.extract::<i64>().map_err(|_| PyTypeError::new_err("a term can only be compared to an integer bound"))?;
         let op = match op {
             CompareOp::Le => list::Op::Le,
@@ -3460,7 +3518,7 @@ fn lower(n: &PyNode, arena: &mut list::ExprArena) -> list::ExprId {
 }
 
 fn single_term(route: &PyListVar, reduction: list::Reduction) -> PyTerm {
-    PyTerm { model_id: route.model_id, gen: route.gen, reductions: vec![reduction] }
+    PyTerm { model_id: route.model_id, gen: route.gen, reductions: vec![reduction], max_terms: None }
 }
 
 /// Build a per-item reduction `op(route, i => body)` from a Python lambda.

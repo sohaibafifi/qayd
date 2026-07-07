@@ -182,6 +182,14 @@ impl BackendSelection {
                         routing: summary.routing_shape(model.lists.len()),
                     };
                 }
+                if summary.has_max_objective && interval_constraints {
+                    return Self {
+                        class: ModelClass::Routing,
+                        backend: Backend::DomainExact,
+                        reason: "max_of list objective uses exact list enumeration",
+                        routing: summary.routing_shape(model.lists.len()),
+                    };
+                }
                 return Self {
                     class: ModelClass::Routing,
                     backend: Backend::ListLocalSearch,
@@ -191,6 +199,14 @@ impl BackendSelection {
             }
 
             if summary.has_sequence_reduction {
+                if summary.has_max_objective && interval_constraints {
+                    return Self {
+                        class: ModelClass::Sequencing,
+                        backend: Backend::DomainExact,
+                        reason: "max_of list objective uses exact list enumeration",
+                        routing: None,
+                    };
+                }
                 return Self {
                     class: ModelClass::Sequencing,
                     backend: Backend::ListLocalSearch,
@@ -236,6 +252,7 @@ struct ListSummary {
     has_edges: bool,
     has_scan: bool,
     has_sequence_reduction: bool,
+    has_max_objective: bool,
     has_capacity_like_constraints: bool,
     has_fleet_objective: bool,
     has_same_list: bool,
@@ -246,8 +263,9 @@ impl ListSummary {
     fn for_model(model: &Model) -> Self {
         let mut summary = Self::default();
         for objective in &model.objectives {
-            if let Objective::ListTerms { terms, .. } = objective {
-                for reduction in terms {
+            if let Objective::ListTerms { terms, max_terms, .. } = objective {
+                summary.has_max_objective |= max_terms.is_some();
+                for reduction in terms.iter().chain(max_terms.iter().flat_map(|groups| groups.iter().flat_map(|group| group.iter()))) {
                     summary.visit_reduction(reduction);
                     summary.has_fleet_objective |= matches!(reduction.op, list::ReduceOp::Used);
                 }
@@ -298,7 +316,10 @@ impl ListSummary {
 
 fn objectives_are_list_simple(model: &Model) -> bool {
     model.objectives.iter().all(|objective| match objective {
-        Objective::ListTerms { terms, .. } => terms.iter().all(is_list_simple_objective_reduction),
+        Objective::ListTerms { terms, max_terms, .. } => terms
+            .iter()
+            .chain(max_terms.iter().flat_map(|groups| groups.iter().flat_map(|group| group.iter())))
+            .all(is_list_simple_objective_reduction),
         Objective::IntExpr { .. } | Objective::Makespan { .. } => false,
     })
 }
@@ -321,9 +342,12 @@ fn routing_integer_lowering_supported(model: &Model) -> bool {
         {
             return false;
         }
-        let Objective::ListTerms { minimize: true, terms } = &model.objectives[0] else {
+        let Objective::ListTerms { minimize: true, terms, max_terms } = &model.objectives[0] else {
             return false;
         };
+        if max_terms.is_some() {
+            return false;
+        }
         return direct_closed_edge_objective(terms, model.lists.len(), items)
             && list_constraints_are_integer_routing_supported(model, items);
     }

@@ -213,13 +213,25 @@ impl GlobalConstraint {
     }
 }
 
-/// One lexicographic objective tier: the sum of its reductions, minimised or
-/// maximised. Earlier tiers dominate later ones (e.g. fleet size before
-/// distance). At most [`MAX_TIERS`] tiers.
+/// One lexicographic objective tier. By default the tier is the sum of its
+/// reductions. `max_terms` represents `max(sum(group_0), sum(group_1), ...)`.
+/// Earlier tiers dominate later ones (e.g. fleet size before distance). At most
+/// [`MAX_TIERS`] tiers.
 #[derive(Clone)]
 pub struct ObjectiveTier {
     pub minimize: bool,
     pub terms: Vec<Reduction>,
+    pub max_terms: Option<Vec<Vec<Reduction>>>,
+}
+
+impl ObjectiveTier {
+    pub fn reductions(&self) -> impl Iterator<Item = &Reduction> {
+        self.terms.iter().chain(self.max_terms.iter().flat_map(|groups| groups.iter().flat_map(|group| group.iter())))
+    }
+
+    pub fn has_max_terms(&self) -> bool {
+        self.max_terms.is_some()
+    }
 }
 
 /// One way to run an interval: on `machine` for `duration` time units. A

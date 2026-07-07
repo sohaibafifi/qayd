@@ -171,7 +171,11 @@ impl Model {
             }
         }
         for tier in &collection_model.objectives {
-            model.add_objective(Objective::ListTerms { minimize: tier.minimize, terms: tier.terms.clone() });
+            model.add_objective(Objective::ListTerms {
+                minimize: tier.minimize,
+                terms: tier.terms.clone(),
+                max_terms: tier.max_terms.clone(),
+            });
         }
         model
     }

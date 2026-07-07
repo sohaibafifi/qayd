@@ -133,7 +133,7 @@ impl RoutingSpec {
             return None;
         }
         let tier = &model.objectives[0];
-        if !tier.minimize || tier.terms.len() != model.lists {
+        if !tier.minimize || tier.max_terms.is_some() || tier.terms.len() != model.lists {
             return None;
         }
         let (depot, edge) = parse_route_edge_objective(&tier.terms, model.lists)?;
@@ -965,7 +965,7 @@ mod tests {
         let model = CollectionModel {
             items: vec![1, 2, 3],
             lists: 1,
-            objectives: vec![ObjectiveTier { minimize: true, terms: vec![reduction] }],
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![reduction], max_terms: None }],
             constraints: Vec::new(),
             globals: Vec::new(),
             schedule: None,
@@ -1018,7 +1018,7 @@ mod tests {
         let model = CollectionModel {
             items: vec![1, 2, 3, 4],
             lists: 2,
-            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)] }],
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)], max_terms: None }],
             constraints: vec![load(0), load(1)],
             globals: Vec::new(),
             schedule: None,
@@ -1111,7 +1111,7 @@ mod tests {
         let model = CollectionModel {
             items,
             lists: 2,
-            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)] }],
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)], max_terms: None }],
             constraints: vec![load(0), load(1), count_eq(0, 4), count_eq(1, 4)],
             globals: vec![GlobalConstraint::SameList { a: 1, b: 5 }, GlobalConstraint::SameList { a: 2, b: 6 }],
             schedule: None,
@@ -1163,7 +1163,7 @@ mod tests {
         CollectionModel {
             items,
             lists: 1,
-            objectives: vec![ObjectiveTier { minimize: true, terms: vec![reduction] }],
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![reduction], max_terms: None }],
             constraints: Vec::new(),
             globals: Vec::new(),
             schedule: None,
@@ -1250,7 +1250,7 @@ mod tests {
         let model = CollectionModel {
             items: items.clone(),
             lists: 2,
-            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)] }],
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)], max_terms: None }],
             constraints: vec![load(0), load(1)],
             globals: Vec::new(),
             schedule: None,
@@ -1329,7 +1329,7 @@ mod tests {
         CollectionModel {
             items,
             lists: 2,
-            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)] }],
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)], max_terms: None }],
             constraints: vec![load(0), load(1)],
             globals: same.iter().map(|&(a, b)| GlobalConstraint::SameList { a, b }).collect(),
             schedule: None,
@@ -1568,7 +1568,7 @@ mod tests {
         let model = CollectionModel {
             items: items.clone(),
             lists: 2,
-            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)] }],
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)], max_terms: None }],
             constraints: vec![count_eq(0, 2), count_eq(1, 2)],
             globals: Vec::new(),
             schedule: None,
@@ -1615,7 +1615,7 @@ mod tests {
         let model = CollectionModel {
             items: items.clone(),
             lists: 2,
-            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)] }],
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)], max_terms: None }],
             constraints: vec![load(0), load(1), count_eq(0, 2), count_eq(1, 2)],
             globals: vec![GlobalConstraint::SameList { a: 1, b: 3 }],
             schedule: None,
@@ -1671,7 +1671,7 @@ mod tests {
         let model = CollectionModel {
             items: items.clone(),
             lists: 2,
-            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)] }],
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)], max_terms: None }],
             constraints: vec![value_sum(0), value_sum(1)],
             globals: Vec::new(),
             schedule: None,
@@ -1731,7 +1731,7 @@ mod tests {
         let model = CollectionModel {
             items,
             lists: 2,
-            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)] }],
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)], max_terms: None }],
             constraints: vec![load(0), load(1), count_eq(0, 2), count_eq(1, 2), value_sum(0), value_sum(1)],
             globals: vec![GlobalConstraint::SameList { a: 1, b: 3 }],
             schedule: None,
@@ -1777,7 +1777,7 @@ mod tests {
         let model = CollectionModel {
             items,
             lists: 2,
-            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)] }],
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge(0), edge(1)], max_terms: None }],
             constraints: vec![load(0), load(1)],
             globals: Vec::new(),
             schedule: None,

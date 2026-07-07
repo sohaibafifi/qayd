@@ -823,6 +823,15 @@ pub fn solve_collection_capped(
             machines: Vec::new(),
         };
     }
+    if model.objectives.iter().any(|tier| tier.max_terms.is_some()) {
+        return CollectionSolution {
+            lists: vec![Vec::new(); model.lists.max(1)],
+            objectives: Vec::new(),
+            feasible: false,
+            starts: Vec::new(),
+            machines: Vec::new(),
+        };
+    }
     if let Some(sched) = &model.schedule {
         return solve_schedule(sched, seed, stop, report);
     }

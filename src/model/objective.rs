@@ -9,7 +9,7 @@ pub enum Objective {
     /// Integer expression objective.
     IntExpr { minimize: bool, expr: Expr },
     /// One tier over list reductions.
-    ListTerms { minimize: bool, terms: Vec<ListReduction> },
+    ListTerms { minimize: bool, terms: Vec<ListReduction>, max_terms: Option<Vec<Vec<ListReduction>>> },
     /// Minimize or maximize the latest interval end.
     Makespan { minimize: bool, intervals: Vec<IntervalVarRef> },
 }
