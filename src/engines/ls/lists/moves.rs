@@ -2,10 +2,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::eval::{eval_expr, violation_of};
 use super::local_search::{
-    base_totals, compute_con_vals, full_score, list_score, signed, ListScore, PerList, ReductionDeltaKind, Score, State,
+    compute_con_vals, full_score, list_score, score_with_replacements, ListScore, PerList, ReductionDeltaKind, Score, State, TrialList,
 };
 use crate::mix64;
-use crate::model::list::{CollectionModel, Iterable, Reduction, MAX_TIERS};
+use crate::model::list::{CollectionModel, Iterable, Reduction};
 
 pub(super) fn snapshot(per: &PerList, state: &State) -> (Vec<Vec<i32>>, Score, bool) {
     let score = full_score(per, state);
@@ -34,38 +34,14 @@ pub(super) enum Move {
     Reverse { list: usize, i: usize, j: usize },
 }
 
-/// Score of the state if one list's cached score were replaced by `nl`.
-fn delta_one(per: &PerList, base: (i64, [i64; MAX_TIERS]), scores: &[ListScore], l: usize, nl: ListScore) -> Score {
-    let v = base.0.saturating_sub(scores[l].violation).saturating_add(nl.violation);
-    let mut raw = base.1;
-    for ((r, &old), &new) in raw.iter_mut().zip(scores[l].objectives.iter()).zip(nl.objectives.iter()) {
-        *r = r.saturating_sub(old).saturating_add(new);
-    }
-    signed(per, v, raw)
+/// Score of the state if one list were replaced by candidate contents.
+fn score_one(per: &PerList, state: &State, list: usize, score: ListScore, contents: &[i32], global_delta: i64) -> Score {
+    score_with_replacements(per, state, &[TrialList { list, score, contents }], global_delta)
 }
 
-/// Score of the state if lists `a` and `b` were replaced by `na`/`nb`.
-fn delta_two(
-    per: &PerList,
-    base: (i64, [i64; MAX_TIERS]),
-    scores: &[ListScore],
-    a: usize,
-    na: ListScore,
-    b: usize,
-    nb: ListScore,
-) -> Score {
-    let v = base
-        .0
-        .saturating_sub(scores[a].violation)
-        .saturating_sub(scores[b].violation)
-        .saturating_add(na.violation)
-        .saturating_add(nb.violation);
-    let mut raw = base.1;
-    let (oa, ob) = (&scores[a].objectives, &scores[b].objectives);
-    for ((((r, &sa), &sb), &xa), &xb) in raw.iter_mut().zip(oa.iter()).zip(ob.iter()).zip(na.objectives.iter()).zip(nb.objectives.iter()) {
-        *r = r.saturating_sub(sa).saturating_sub(sb).saturating_add(xa).saturating_add(xb);
-    }
-    signed(per, v, raw)
+/// Score of the state if two lists were replaced by candidate contents.
+fn score_two<'a>(per: &PerList, state: &'a State, left: TrialList<'a>, right: TrialList<'a>, global_delta: i64) -> Score {
+    score_with_replacements(per, state, &[left, right], global_delta)
 }
 
 /// Copy `list` into `buf` (reusing its capacity) with one edit applied.
@@ -398,7 +374,10 @@ fn reduction_delta(r: &Reduction, kind: ReductionDeltaKind, list: &[i32], edit: 
 /// base score and constraint values when the list is fully incremental, else by
 /// materialising the edited list and rescoring it in full.
 fn trial_list_score(per: &PerList, state: &State, idx: usize, edit: Edit, scratch: &mut Vec<i32>) -> ListScore {
-    if per.list_incremental[idx] {
+    if per.has_max_objective() || !per.list_incremental[idx] {
+        edit.apply(scratch, &state.lists[idx]);
+        list_score(per, idx, scratch)
+    } else {
         let list = &state.lists[idx];
         let base = &state.scores[idx];
         let mut objectives = base.objectives;
@@ -414,9 +393,6 @@ fn trial_list_score(per: &PerList, state: &State, idx: usize, edit: Edit, scratc
             violation = violation.saturating_sub(violation_of(old, c.op, c.rhs)).saturating_add(violation_of(new, c.op, c.rhs));
         }
         ListScore { violation, objectives }
-    } else {
-        edit.apply(scratch, &state.lists[idx]);
-        list_score(per, idx, scratch)
     }
 }
 
@@ -568,11 +544,9 @@ fn candidate_cross_exchange(per: &PerList, state: &State, a: (usize, usize, usiz
 /// source route at a time: a route whose *entire* neighbourhood yields no
 /// improvement is marked inactive (don't-look bit) and skipped until a later
 /// applied move touches it again, so settled routes are not re-scanned every
-/// pass. Each candidate is scored in O(1) against the cached base totals and
-/// built into a reused scratch buffer, so no allocation happens per candidate.
+/// pass. Candidate buffers are reused, so no allocation happens per candidate.
 /// `stop` is polled per candidate so even very long lists honour the time limit.
 pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBool, memory: &mut SearchMemory) -> Option<Move> {
-    let base = base_totals(&state.scores);
     let current = full_score(per, state);
     // Repair-capable moves (relocate / or-opt insert filters) only prune by the
     // geometric candidate lists once feasible: while a route still overflows, the
@@ -584,7 +558,6 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
     // instance afford enough passes to reach feasibility.
     let use_candidates = per.has_edges && current.violation == 0 && per.candidates.is_some();
     let cand_cost = if per.infeas_cand { per.has_edges && per.candidates.is_some() } else { use_candidates };
-    let gviol = state.global_viol;
     let k = state.lists.len();
     let mut a = Vec::new();
     let mut b = Vec::new();
@@ -594,10 +567,6 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
         polled = polled.wrapping_add(1);
         polled.is_multiple_of(1024) && stop.load(Ordering::Relaxed)
     };
-    // Add the current global violation plus a move's global delta to a per-list
-    // trial score, so cross-list constraints steer the search too.
-    let with_global = |s: Score, gdelta: i64| Score { violation: s.violation.saturating_add(gviol).saturating_add(gdelta), tiers: s.tiers };
-
     // Scan one source route at a time so a settled route can be skipped wholesale
     // via its don't-look bit. A route is marked inactive only once its *entire*
     // neighbourhood (relocate, swap, and for routing: or-opt, 2-opt*, cross,
@@ -624,7 +593,7 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                         }
                         let nl = trial_list_score(per, state, src, Edit::MoveWithin { from: src_pos, to: dst_pos }, &mut a);
                         // Within-list move: no item changes list, so gdelta = 0.
-                        if with_global(delta_one(per, base, &state.scores, src, nl), 0) < current {
+                        if score_one(per, state, src, nl, &a, 0) < current {
                             return Some(Move::Relocate { src, src_pos, dst, dst_pos });
                         }
                     }
@@ -639,7 +608,14 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                             continue;
                         }
                         let nb = trial_list_score(per, state, dst, Edit::Insert { pos: dst_pos, item }, &mut b);
-                        if with_global(delta_two(per, base, &state.scores, src, na, dst, nb), gd) < current {
+                        if score_two(
+                            per,
+                            state,
+                            TrialList { list: src, score: na, contents: &a },
+                            TrialList { list: dst, score: nb, contents: &b },
+                            gd,
+                        ) < current
+                        {
                             return Some(Move::Relocate { src, src_pos, dst, dst_pos });
                         }
                     }
@@ -660,7 +636,14 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                     let na = trial_list_score(per, state, src, Edit::Replace { pos: xp, item: vy }, &mut a);
                     let nb = trial_list_score(per, state, y, Edit::Replace { pos: yp, item: vx }, &mut b);
                     let gd = per.globals.delta(&state.item_list, &[(vx, y), (vy, src)]);
-                    if with_global(delta_two(per, base, &state.scores, src, na, y, nb), gd) < current {
+                    if score_two(
+                        per,
+                        state,
+                        TrialList { list: src, score: na, contents: &a },
+                        TrialList { list: y, score: nb, contents: &b },
+                        gd,
+                    ) < current
+                    {
                         return Some(Move::Swap { a: src, a_pos: xp, b: y, b_pos: yp });
                     }
                 }
@@ -684,7 +667,7 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                                     return None;
                                 }
                                 let nl = trial_list_score(per, state, src, Edit::SegmentMoveWithin { start, len, to: dst_pos }, &mut a);
-                                if with_global(delta_one(per, base, &state.scores, src, nl), 0) < current {
+                                if score_one(per, state, src, nl, &a, 0) < current {
                                     return Some(Move::OrOpt { src, start, len, dst, dst_pos });
                                 }
                             }
@@ -703,7 +686,14 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                                     continue;
                                 }
                                 let nb = trial_list_score(per, state, dst, Edit::SegmentInsert { pos: dst_pos, items, len }, &mut b);
-                                if with_global(delta_two(per, base, &state.scores, src, na, dst, nb), gd) < current {
+                                if score_two(
+                                    per,
+                                    state,
+                                    TrialList { list: src, score: na, contents: &a },
+                                    TrialList { list: dst, score: nb, contents: &b },
+                                    gd,
+                                ) < current
+                                {
                                     return Some(Move::OrOpt { src, start, len, dst, dst_pos });
                                 }
                             }
@@ -736,7 +726,14 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                         overrides.extend(state.lists[src][cut_x..].iter().map(|&item| (item, y)));
                         overrides.extend(state.lists[y][cut_y..].iter().map(|&item| (item, src)));
                         let gd = per.globals.delta(&state.item_list, &overrides);
-                        if with_global(delta_two(per, base, &state.scores, src, na, y, nb), gd) < current {
+                        if score_two(
+                            per,
+                            state,
+                            TrialList { list: src, score: na, contents: &a },
+                            TrialList { list: y, score: nb, contents: &b },
+                            gd,
+                        ) < current
+                        {
                             return Some(Move::TwoOptStar { a: src, cut_a: cut_x, b: y, cut_b: cut_y });
                         }
                     }
@@ -774,7 +771,14 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                                 overrides.extend(state.lists[src][start_x..start_x + len_x].iter().map(|&item| (item, y)));
                                 overrides.extend(state.lists[y][start_y..start_y + len_y].iter().map(|&item| (item, src)));
                                 let gd = per.globals.delta(&state.item_list, &overrides);
-                                if with_global(delta_two(per, base, &state.scores, src, na, y, nb), gd) < current {
+                                if score_two(
+                                    per,
+                                    state,
+                                    TrialList { list: src, score: na, contents: &a },
+                                    TrialList { list: y, score: nb, contents: &b },
+                                    gd,
+                                ) < current
+                                {
                                     return Some(Move::CrossExchange {
                                         a: src,
                                         start_a: start_x,
@@ -805,7 +809,7 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                         }
                     }
                     let nl = trial_list_score(per, state, src, Edit::Reverse { i, j }, &mut a);
-                    if with_global(delta_one(per, base, &state.scores, src, nl), 0) < current {
+                    if score_one(per, state, src, nl, &a, 0) < current {
                         return Some(Move::Reverse { list: src, i, j });
                     }
                 }

@@ -565,10 +565,6 @@ fn parse_engine(engine: &str) -> PyResult<PythonEngine> {
     }
 }
 
-fn collection_has_max_terms(model: &list::CollectionModel) -> bool {
-    model.objectives.iter().any(list::ObjectiveTier::has_max_terms)
-}
-
 fn verbose_start(num_vars: usize, num_constraints: usize, has_objective: bool) {
     println!("qayd solve");
     println!("  variables: {num_vars}");
@@ -2846,9 +2842,6 @@ impl PyModel {
             if engine == PythonEngine::Exact {
                 return Err(PyValueError::new_err(format!("model is not supported by an exact engine: {}", selection.reason)));
             }
-        }
-        if collection_has_max_terms(&model) {
-            return Err(PyValueError::new_err("max_of list terms is supported by exact list backends only for this model shape"));
         }
         let limit = time_limit.unwrap_or(5);
         // The first tier drives the progress line; report its sense.

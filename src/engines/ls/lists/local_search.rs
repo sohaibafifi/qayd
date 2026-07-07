@@ -14,7 +14,7 @@ use super::moves::{apply_move, best_improving_move, better, random_kick, shuffle
 use super::schedule_ls::solve_schedule;
 use crate::mix64;
 use crate::model::list::{
-    CollectionModel, CollectionSolution, Constraint, Expr, ExprId, GlobalConstraint, Iterable, ReduceOp, Reduction, MAX_TIERS,
+    CollectionModel, CollectionSolution, Constraint, Expr, ExprId, GlobalConstraint, Iterable, MaxTerm, ReduceOp, Reduction, MAX_TIERS,
 };
 
 pub(super) struct Globals {
@@ -98,6 +98,7 @@ impl Globals {
 /// true when tier `t` is minimised.
 pub(super) struct PerList {
     pub(super) objective: Vec<[Vec<Reduction>; MAX_TIERS]>,
+    pub(super) max_objective: [Vec<MaxTerm>; MAX_TIERS],
     pub(super) objective_delta: Vec<[Vec<ReductionDeltaKind>; MAX_TIERS]>,
     pub(super) constraints: Vec<Vec<Constraint>>,
     pub(super) constraint_delta: Vec<Vec<ReductionDeltaKind>>,
@@ -136,7 +137,7 @@ impl CandidateNeighbors {
             return None;
         }
         let mut values = model.items.clone();
-        for reduction in model.objectives.iter().flat_map(|tier| tier.terms.iter()) {
+        for reduction in model.objectives.iter().flat_map(|tier| tier.reductions()) {
             if let Iterable::Edges { start, end, .. } = &reduction.iterable {
                 values.push(*start);
                 values.push(*end);
@@ -264,6 +265,7 @@ fn reduction_delta_kind(r: &Reduction) -> ReductionDeltaKind {
 impl PerList {
     pub(super) fn build(model: &CollectionModel) -> Self {
         let mut objective: Vec<[Vec<Reduction>; MAX_TIERS]> = (0..model.lists).map(|_| std::array::from_fn(|_| Vec::new())).collect();
+        let mut max_objective: [Vec<MaxTerm>; MAX_TIERS] = std::array::from_fn(|_| Vec::new());
         let mut objective_delta: Vec<[Vec<ReductionDeltaKind>; MAX_TIERS]> =
             (0..model.lists).map(|_| std::array::from_fn(|_| Vec::new())).collect();
         let mut constraints = vec![Vec::new(); model.lists];
@@ -284,6 +286,19 @@ impl PerList {
                 objective_delta[list][t].push(reduction_delta_kind(r));
                 objective[list][t].push(r.clone());
             }
+            if let Some(max_terms) = &tier.max_terms {
+                for term in max_terms {
+                    for r in term.groups.iter().flatten() {
+                        let list = r.iterable.list();
+                        if let Iterable::Edges { start, end, .. } = &r.iterable {
+                            has_edges = true;
+                            route_bounds[list].get_or_insert((*start, *end));
+                            candidate_matrix.get_or_insert_with(|| direct_edge_matrix(r));
+                        }
+                    }
+                }
+                max_objective[t].extend(max_terms.iter().cloned());
+            }
         }
         for c in &model.constraints {
             let list = c.reduction.iterable.list();
@@ -303,6 +318,7 @@ impl PerList {
             .collect();
         Self {
             objective,
+            max_objective,
             objective_delta,
             constraints,
             constraint_delta,
@@ -315,6 +331,10 @@ impl PerList {
             candidates: candidate_matrix.flatten().and_then(|matrix| CandidateNeighbors::build(model, matrix)),
             infeas_cand: std::env::var("QAYD_LS_INFEAS_CAND").as_deref() != Ok("0"),
         }
+    }
+
+    pub(super) fn has_max_objective(&self) -> bool {
+        self.max_objective.iter().any(|terms| !terms.is_empty())
     }
 }
 
@@ -332,6 +352,12 @@ pub(super) struct Score {
 pub(super) struct ListScore {
     pub(super) violation: i64,
     pub(super) objectives: [i64; MAX_TIERS],
+}
+
+pub(super) struct TrialList<'a> {
+    pub(super) list: usize,
+    pub(super) score: ListScore,
+    pub(super) contents: &'a [i32],
 }
 
 pub(super) fn list_score(per: &PerList, idx: usize, contents: &[i32]) -> ListScore {
@@ -376,16 +402,64 @@ pub(super) fn base_totals(scores: &[ListScore]) -> (i64, [i64; MAX_TIERS]) {
     (violation, raw)
 }
 
-pub(super) fn total_score(per: &PerList, scores: &[ListScore]) -> Score {
-    let (violation, raw) = base_totals(scores);
+fn trial_contents<'a>(lists: &'a [Vec<i32>], replacements: &'a [TrialList<'a>], list: usize) -> &'a [i32] {
+    replacements.iter().find_map(|trial| (trial.list == list).then_some(trial.contents)).unwrap_or(&lists[list])
+}
+
+fn max_objective_totals<'a>(per: &PerList, lists: &'a [Vec<i32>], replacements: &'a [TrialList<'a>]) -> (i64, [i64; MAX_TIERS]) {
+    let mut violation = 0i64;
+    let mut raw = [0i64; MAX_TIERS];
+    for (tier, terms) in per.max_objective.iter().enumerate() {
+        for term in terms {
+            let mut best = None;
+            for group in &term.groups {
+                let mut group_value = 0i64;
+                let mut defined = true;
+                for reduction in group {
+                    let contents = trial_contents(lists, replacements, reduction.iterable.list());
+                    match eval_reduction(reduction, contents) {
+                        Some(value) => group_value = group_value.saturating_add(value),
+                        None => {
+                            defined = false;
+                            violation = violation.saturating_add(INFEASIBLE);
+                        }
+                    }
+                }
+                if defined {
+                    best = Some(best.map_or(group_value, |value: i64| value.max(group_value)));
+                }
+            }
+            if let Some(best) = best {
+                raw[tier] = raw[tier].saturating_add(best.saturating_mul(term.coeff));
+            }
+        }
+    }
+    (violation, raw)
+}
+
+pub(super) fn score_with_replacements<'a>(per: &PerList, state: &'a State, replacements: &'a [TrialList<'a>], global_delta: i64) -> Score {
+    let (mut violation, mut raw) = base_totals(&state.scores);
+    for replacement in replacements {
+        let old = &state.scores[replacement.list];
+        violation = violation.saturating_sub(old.violation).saturating_add(replacement.score.violation);
+        for ((slot, &old), &new) in raw.iter_mut().zip(old.objectives.iter()).zip(replacement.score.objectives.iter()) {
+            *slot = slot.saturating_sub(old).saturating_add(new);
+        }
+    }
+    violation = violation.saturating_add(state.global_viol).saturating_add(global_delta);
+    if per.has_max_objective() {
+        let (max_violation, max_raw) = max_objective_totals(per, &state.lists, replacements);
+        violation = violation.saturating_add(max_violation);
+        for (slot, value) in raw.iter_mut().zip(max_raw) {
+            *slot = slot.saturating_add(value);
+        }
+    }
     signed(per, violation, raw)
 }
 
 /// Full score including the cross-list global violation.
 pub(super) fn full_score(per: &PerList, state: &State) -> Score {
-    let mut s = total_score(per, &state.scores);
-    s.violation = s.violation.saturating_add(state.global_viol);
-    s
+    score_with_replacements(per, state, &[], 0)
 }
 
 /// State of the search: list contents, cached per-list scores, and (for global
@@ -518,17 +592,15 @@ fn record_state(
     true
 }
 
-fn score_with_replaced_list(per: &PerList, state: &State, list: usize, replacement: ListScore, global_delta: i64) -> Score {
-    let (mut violation, mut raw) = base_totals(&state.scores);
-    violation = violation
-        .saturating_sub(state.scores[list].violation)
-        .saturating_add(replacement.violation)
-        .saturating_add(state.global_viol)
-        .saturating_add(global_delta);
-    for ((slot, &old), &new) in raw.iter_mut().zip(state.scores[list].objectives.iter()).zip(replacement.objectives.iter()) {
-        *slot = slot.saturating_sub(old).saturating_add(new);
-    }
-    signed(per, violation, raw)
+fn score_with_replaced_list(
+    per: &PerList,
+    state: &State,
+    list: usize,
+    replacement: ListScore,
+    contents: &[i32],
+    global_delta: i64,
+) -> Score {
+    score_with_replacements(per, state, &[TrialList { list, score: replacement, contents }], global_delta)
 }
 
 fn shuffle_values(values: &mut [i32], seed: u64) {
@@ -625,7 +697,7 @@ fn repair_lns(per: &PerList, state: &mut State, removed: &[i32], seed: u64, stop
                 scratch.insert(pos, item);
                 let next = list_score(per, list, &scratch);
                 let global_delta = per.globals.delta(&state.item_list, &[(item, list)]);
-                let score = score_with_replaced_list(per, state, list, next, global_delta);
+                let score = score_with_replaced_list(per, state, list, next, &scratch, global_delta);
                 let tie = mix64(seed ^ (item as i64 as u64) ^ ((list as u64) << 32) ^ pos as u64);
                 if best
                     .as_ref()
@@ -683,7 +755,7 @@ fn repair_regret(per: &PerList, state: &mut State, removed: &[i32], k: usize, se
                     scratch.insert(pos, item);
                     let next = list_score(per, list, &scratch);
                     let global_delta = per.globals.delta(&state.item_list, &[(item, list)]);
-                    let cost = score_scalar(&score_with_replaced_list(per, state, list, next, global_delta));
+                    let cost = score_scalar(&score_with_replaced_list(per, state, list, next, &scratch, global_delta));
                     let tie = mix64(seed ^ (item as i64 as u64) ^ ((list as u64) << 32) ^ pos as u64);
                     let ins = topk.partition_point(|&c| c <= cost);
                     if ins < k {
@@ -815,15 +887,6 @@ pub fn solve_collection_capped(
     // backstop for direct Rust callers so the engine never panics or corrupts.
     if let Err(_e) = model.validate() {
         debug_assert!(false, "solve_collection called on an invalid model: {_e}");
-        return CollectionSolution {
-            lists: vec![Vec::new(); model.lists.max(1)],
-            objectives: Vec::new(),
-            feasible: false,
-            starts: Vec::new(),
-            machines: Vec::new(),
-        };
-    }
-    if model.objectives.iter().any(|tier| tier.has_max_terms()) {
         return CollectionSolution {
             lists: vec![Vec::new(); model.lists.max(1)],
             objectives: Vec::new(),
