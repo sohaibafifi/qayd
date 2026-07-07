@@ -114,12 +114,16 @@ Common options:
 
 ## Python Examples
 
-The Python examples are the easiest way to inspect the list-domain modeling API:
+The Python examples live under `examples/python/`, grouped by domain: `routing/`,
+`scheduling/`, `packing/`, and `mus/` (infeasibility analysis).
 
 ```bash
-QAYD_VRP_INSTANCE=/path/to/instance.vrp uv run --extra examples examples/python/vrp.py
-uv run examples/python/cvrptw.py
-uv run examples/python/bin_packing.py
+QAYD_VRP_INSTANCE=/path/to/instance.vrp uv run --extra examples examples/python/routing/vrp.py
+uv run examples/python/routing/cvrptw.py
+uv run examples/python/packing/bin_packing.py
+uv run examples/python/mus/mus.py           # diagnose an infeasible model: model.soft(...) / model.mus()
+uv run examples/python/mus/mus_explain.py   # sub-constraint MUS explanation: model.explain_mus()
+uv run examples/python/mus/mus_enumerate.py # all MUSes + MSSes/MCSes (MARCO): model.enumerate_mus()
 ```
 
 The VRP example uses `vrplib` and expects a local CVRPLIB file via

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pyo3::class::basic::CompareOp;
-use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyTimeoutError, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyIterator, PyModule};
@@ -28,6 +28,7 @@ use crate::lcg::clause::{ClauseSharing, SharedClausePool};
 use crate::lcg::lit::{AtomKind, AtomTable, Lit};
 use crate::model as shared_model;
 use crate::model::list;
+use crate::mus::{enumerate_mus, explain_mus, extract_mus, MusRel, MusResult};
 use crate::problem::{Objective as ProblemObjective, Problem};
 use crate::search::{self, Assumption, AssumptionOp, Objective as SearchObjective, SearchControl, SolveStats};
 use crate::Solver;
@@ -254,6 +255,39 @@ struct PyConstraint {
     inner: ExprLike,
 }
 
+/// Context manager returned by [`PyModel::soft`]: on `__enter__` it opens a
+/// fresh selector and routes posted constraints through it; on `__exit__` it
+/// stops routing. Records the group so [`PyModel::mus`] can name it in a core.
+#[pyclass(name = "SoftGroup", module = "qayd", unsendable)]
+struct PySoftGroup {
+    model: Py<PyModel>,
+    name: Option<String>,
+}
+
+#[pymethods]
+impl PySoftGroup {
+    fn __enter__(&self, py: Python<'_>) -> PyResult<()> {
+        let mut model = self.model.borrow_mut(py);
+        let sel = model.solver.new_var_range(0, 1);
+        let name = self.name.clone().unwrap_or_else(|| format!("c{}", model.mus_selectors.len()));
+        model.names.push(None); // keep VarId ↔ names alignment; hidden from `variables()`
+        model.solver.set_selector(Some(sel));
+        model.mus_selectors.push((name, sel));
+        Ok(())
+    }
+
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc_value: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        self.model.borrow_mut(py).solver.set_selector(None);
+        Ok(false) // do not suppress exceptions
+    }
+}
+
 #[pyclass(name = "SolveStats", module = "qayd", skip_from_py_object)]
 #[derive(Clone)]
 struct PySolveStats {
@@ -322,6 +356,39 @@ struct PyModel {
     col_globals: Vec<list::GlobalConstraint>,
     col_schedule: Option<list::Schedule>,
     col_sched_gen: u64,
+    /// Soft-constraint groups for MUS extraction: `(name, selector)`. Each is a
+    /// `{0,1}` variable guarding the constraints posted inside a `with
+    /// model.soft(name):` block; selectors occupy a `names` slot (to keep
+    /// `VarId ↔ names` alignment) but are hidden from the user-facing variable
+    /// enumerations.
+    mus_selectors: Vec<(String, VarId)>,
+}
+
+impl PyModel {
+    fn is_selector(&self, index: u32) -> bool {
+        self.mus_selectors.iter().any(|&(_, sel)| sel.0 == index)
+    }
+
+    /// The user's decision variables (every named slot that is not a selector).
+    fn decision_var_ids(&self) -> Vec<VarId> {
+        (0..self.names.len() as u32).filter(|&i| !self.is_selector(i)).map(VarId).collect()
+    }
+
+    fn selector_name(&self, sel: VarId) -> String {
+        self.mus_selectors.iter().find(|&&(_, v)| v == sel).map(|(name, _)| name.clone()).unwrap_or_default()
+    }
+
+    /// Format a semantic atom `var rel value` using the variable's name.
+    fn atom_text(&self, var: VarId, rel: MusRel, value: i32) -> String {
+        let name = self.names.get(var.index()).and_then(|n| n.clone()).unwrap_or_else(|| format!("x{}", var.index()));
+        let op = match rel {
+            MusRel::Eq => "==",
+            MusRel::Ne => "!=",
+            MusRel::Ge => ">=",
+            MusRel::Le => "<=",
+        };
+        format!("{name} {op} {value}")
+    }
 }
 
 #[pyclass(name = "SolveSession", module = "qayd", unsendable)]
@@ -446,9 +513,18 @@ fn one_id_for(model_id: u64, var: &PyIntVar) -> PyResult<VarId> {
 }
 
 fn search_ids_for(model_id: u64, num_vars: usize, search: Option<&Bound<'_, PyAny>>, extra: Option<VarId>) -> PyResult<Vec<VarId>> {
+    search_ids_with_default(model_id, (0..num_vars).map(|i| VarId(i as u32)).collect(), search, extra)
+}
+
+fn search_ids_with_default(
+    model_id: u64,
+    default_vars: Vec<VarId>,
+    search: Option<&Bound<'_, PyAny>>,
+    extra: Option<VarId>,
+) -> PyResult<Vec<VarId>> {
     let mut vars = match search {
         Some(obj) if !obj.is_none() => ids_for(model_id, &var_list_from_py(obj)?)?,
-        _ => (0..num_vars).map(|i| VarId(i as u32)).collect(),
+        _ => default_vars,
     };
     if let Some(var) = extra {
         if !vars.contains(&var) {
@@ -459,7 +535,7 @@ fn search_ids_for(model_id: u64, num_vars: usize, search: Option<&Bound<'_, PyAn
 }
 
 fn search_ids(model: &PyModel, search: Option<&Bound<'_, PyAny>>, extra: Option<VarId>) -> PyResult<Vec<VarId>> {
-    search_ids_for(model.id, model.names.len(), search, extra)
+    search_ids_with_default(model.id, model.decision_var_ids(), search, extra)
 }
 
 fn append_expr_vars(vars: &mut Vec<VarId>, expr: &Expr) {
@@ -1545,12 +1621,13 @@ impl PyModel {
             col_globals: Vec::new(),
             col_schedule: None,
             col_sched_gen: 0,
+            mus_selectors: Vec::new(),
         }
     }
 
     #[getter]
     fn num_vars(&self) -> usize {
-        self.names.len()
+        self.names.len() - self.mus_selectors.len()
     }
 
     #[getter]
@@ -1606,7 +1683,12 @@ impl PyModel {
     }
 
     fn variables(&self) -> Vec<PyIntVar> {
-        self.names.iter().enumerate().map(|(index, name)| PyIntVar { model_id: self.id, index: index as u32, name: name.clone() }).collect()
+        self.names
+            .iter()
+            .enumerate()
+            .filter(|&(index, _)| !self.is_selector(index as u32))
+            .map(|(index, name)| PyIntVar { model_id: self.id, index: index as u32, name: name.clone() })
+            .collect()
     }
 
     fn add(&mut self, constraint: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -2227,7 +2309,7 @@ impl PyModel {
             let branch_order = branch_order_from_py(self.id, branch_order)?;
             let mut solver = self.solver.clone();
             let objectives = materialize_objectives(&mut solver, &objective_specs)?;
-            let mut search_vars = search_ids_for(self.id, self.names.len(), search, None)?;
+            let mut search_vars = search_ids(self, search, None)?;
             append_interval_domain_vars(&mut search_vars, &solver);
             let stop = deadline(time_limit);
             // Owned/plain captures: the solve detaches from the GIL, and only
@@ -2290,6 +2372,95 @@ impl PyModel {
         Ok(solution)
     }
 
+    /// A soft-constraint group for MUS extraction. Use as a context manager:
+    /// every constraint posted inside the `with` block is guarded by one fresh
+    /// selector, and [`mus`](PyModel::mus) reports which groups form an unsat
+    /// core. `name` defaults to `c0, c1, …`. Constraints posted outside any
+    /// `soft` block are hard (always active).
+    ///
+    /// ```python
+    /// with model.soft("c1"):
+    ///     model.sum([a], ">=", 1)
+    /// core = model.mus()  # -> ["c1", ...] or None if satisfiable
+    /// ```
+    #[pyo3(signature = (name=None))]
+    fn soft(slf: Py<Self>, name: Option<String>) -> PySoftGroup {
+        PySoftGroup { model: slf, name }
+    }
+
+    /// Extract a minimal unsatisfiable subset of the [`soft`](PyModel::soft)
+    /// groups (with all hard constraints active). Returns the list of group names
+    /// in the MUS, or `None` if the model is satisfiable. Raises on time-out.
+    #[pyo3(signature = (time_limit=None))]
+    fn mus(&self, py: Python<'_>, time_limit: Option<u64>) -> PyResult<Option<Vec<String>>> {
+        if self.col_universe.is_some() || self.col_schedule.is_some() {
+            return Err(PyValueError::new_err("mus() is not supported for list/interval models"));
+        }
+        let vars = self.decision_var_ids();
+        let selectors: Vec<VarId> = self.mus_selectors.iter().map(|&(_, sel)| sel).collect();
+        let mut solver = self.solver.clone();
+        let stop = deadline(time_limit);
+        let result = with_interrupts(py, &stop, || extract_mus(&mut solver, &vars, &selectors, &stop))?;
+        match result {
+            MusResult::Sat(_) => Ok(None),
+            MusResult::Interrupted => Err(PyTimeoutError::new_err("mus() timed out")),
+            MusResult::Mus(core) => Ok(Some(core.iter().map(|&sel| self.selector_name(sel)).collect())),
+        }
+    }
+
+    /// Enumerate the full infeasibility landscape of the [`soft`](PyModel::soft)
+    /// groups (MARCO): returns `(muses, msses, complete)` where `muses` is every
+    /// minimal unsatisfiable subset and `msses` every maximal satisfiable subset
+    /// (each as a list of group names). `complete` is `False` if the search
+    /// stopped early (time-out or `limit` reached). `limit` caps the total number
+    /// of MUS + MSS returned (there can be exponentially many).
+    #[pyo3(signature = (time_limit=None, limit=None))]
+    fn enumerate_mus(
+        &self,
+        py: Python<'_>,
+        time_limit: Option<u64>,
+        limit: Option<usize>,
+    ) -> PyResult<(Vec<Vec<String>>, Vec<Vec<String>>, bool)> {
+        if self.col_universe.is_some() || self.col_schedule.is_some() {
+            return Err(PyValueError::new_err("enumerate_mus() is not supported for list/interval models"));
+        }
+        let vars = self.decision_var_ids();
+        let selectors: Vec<VarId> = self.mus_selectors.iter().map(|&(_, sel)| sel).collect();
+        let mut solver = self.solver.clone();
+        let stop = deadline(time_limit);
+        let result = with_interrupts(py, &stop, || enumerate_mus(&mut solver, &vars, &selectors, &stop, limit))?;
+        let names = |group: &[VarId]| group.iter().map(|&sel| self.selector_name(sel)).collect::<Vec<_>>();
+        let muses = result.muses.iter().map(|m| names(m)).collect();
+        let msses = result.msses.iter().map(|m| names(m)).collect();
+        Ok((muses, msses, result.complete))
+    }
+
+    /// Explain a MUS at sub-constraint granularity: for each core
+    /// constraint that refutes by propagation, the *specific* atoms it reasoned
+    /// about (`"x >= 4"`), not the whole global. Returns a `{name: [atom, ...]}`
+    /// dict, or `None` when the model is satisfiable or the core needs search to
+    /// refute (use [`mus`](PyModel::mus) for the constraint-level core then).
+    #[pyo3(signature = (time_limit=None))]
+    fn explain_mus(&self, py: Python<'_>, time_limit: Option<u64>) -> PyResult<Option<HashMap<String, Vec<String>>>> {
+        if self.col_universe.is_some() || self.col_schedule.is_some() {
+            return Err(PyValueError::new_err("explain_mus() is not supported for list/interval models"));
+        }
+        let vars = self.decision_var_ids();
+        let selectors: Vec<VarId> = self.mus_selectors.iter().map(|&(_, sel)| sel).collect();
+        let mut solver = self.solver.clone();
+        let stop = deadline(time_limit);
+        let explained = with_interrupts(py, &stop, || match extract_mus(&mut solver, &vars, &selectors, &stop) {
+            MusResult::Mus(mus) if !mus.is_empty() => explain_mus(&mut solver, &vars, &mus, &stop).map(|e| e.constraints),
+            _ => None, // satisfiable, empty (root unsat), or interrupted
+        })?;
+        Ok(explained.map(|constraints| {
+            constraints
+                .into_iter()
+                .map(|(sel, atoms)| (self.selector_name(sel), atoms.iter().map(|a| self.atom_text(a.var, a.rel, a.value)).collect()))
+                .collect()
+        }))
+    }
+
     #[pyo3(signature = (search=None))]
     fn count_solutions(&self, search: Option<&Bound<'_, PyAny>>) -> PyResult<u64> {
         let vars = search_ids(self, search, None)?;
@@ -2337,7 +2508,7 @@ impl PyModel {
         let objective_specs = objective_specs(&self.objective, &self.then_objectives);
         let mut solver = self.solver.clone();
         let objectives = materialize_objectives(&mut solver, &objective_specs)?;
-        let mut search = (0..self.names.len()).map(|i| VarId(i as u32)).collect::<Vec<_>>();
+        let mut search = self.decision_var_ids();
         append_interval_domain_vars(&mut search, &solver);
         append_objective_search_vars(&mut search, &objectives);
         // Freeze the atom layout for the whole session: the eager LCG atom ids
@@ -3784,6 +3955,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMatrix>()?;
     m.add_class::<PyMatrixRow>()?;
     m.add_class::<PyConstraint>()?;
+    m.add_class::<PySoftGroup>()?;
     m.add_class::<PySolution>()?;
     m.add_class::<PySolveStats>()?;
     m.add_class::<PySolveSession>()?;

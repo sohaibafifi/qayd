@@ -9,7 +9,7 @@ use crate::domains::int::Domain;
 use crate::domains::interval::{IntervalDomain, IntervalEvent, IntervalPresence};
 use crate::domains::list::{ListDomain, ListEvent};
 use crate::ids::{IntervalId, ListId, PropId, VarId};
-use crate::propagator::{Event, Inconsistency, Priority, Propagator, NBANDS};
+use crate::propagator::{Event, Inconsistency, Priority, Propagator, Selected, NBANDS};
 use crate::trail::{ReversibleInt, Trail};
 
 thread_local! {
@@ -69,6 +69,23 @@ pub enum Premise {
     Eq { var: VarId, val: i32 },
     /// `[var ≠ val]`.
     Ne { var: VarId, val: i32 },
+}
+
+impl Premise {
+    /// The variable this premise constrains.
+    fn var(&self) -> VarId {
+        match *self {
+            Premise::Ge { var, .. } | Premise::Le { var, .. } | Premise::Eq { var, .. } | Premise::Ne { var, .. } => var,
+        }
+    }
+}
+
+/// Number of distinct variables mentioned by a tight reason: its witness size.
+fn distinct_premise_vars(why: &[Premise]) -> u32 {
+    let mut vars: Vec<u32> = why.iter().map(|p| p.var().0).collect();
+    vars.sort_unstable();
+    vars.dedup();
+    vars.len() as u32
 }
 
 /// A scope variable's domain, snapshotted just before a propagator's mutation.
@@ -153,6 +170,17 @@ pub struct Store {
     /// Ablation switch: always explain with the whole-scope snapshot, ignoring
     /// propagator-supplied premises. Off in normal use.
     force_scope_reasons: bool,
+    /// A premise the [`Selected`](crate::propagator::Selected) wrapper stamps
+    /// onto every tight reason its inner propagator emits, so the selector
+    /// literal appears in the nogood (letting an unsat core trace to it). `None`
+    /// outside a selected propagator's `propagate`.
+    injected_premise: Option<Premise>,
+    /// Research instrumentation (off by default): when `Some`, every tight
+    /// propagator reason records `(distinct witness variables, propagator scope
+    /// size, kind)` with `kind` = 1 for a failure, 0 for an inference. Used by the
+    /// MUS "finesse" study to measure how small a global's Hall-set / energy-window
+    /// witness is versus its full scope.
+    finesse: Option<Vec<(u32, u32, u8)>>,
     /// Whether an LCG trail consumes reasons. Off outside learning, so
     /// propagators with costly explanation construction can skip it entirely.
     explain: bool,
@@ -745,7 +773,18 @@ impl Store {
     fn cause_for(&mut self, will_change: bool) -> Cause {
         let pending = self.pending_premises.take();
         match pending {
-            Some(p) if !self.force_scope_reasons => Cause::Premises(if will_change { p } else { Vec::new() }),
+            Some(p) if !self.force_scope_reasons => {
+                let mut p = if will_change { p } else { Vec::new() };
+                // A real change under an active selector is entailed by the inner
+                // premises *and* `sel = 1`; stamp the latter so the nogood carries it.
+                if will_change {
+                    self.record_finesse(&p, false);
+                    if let Some(prem) = self.injected_premise {
+                        p.push(prem);
+                    }
+                }
+                Cause::Premises(p)
+            }
             _ => Cause::Scope,
         }
     }
@@ -753,6 +792,26 @@ impl Store {
     /// Set the [`force_scope_reasons`](Store::force_scope_reasons) ablation switch.
     pub(crate) fn set_force_scope_reasons(&mut self, on: bool) {
         self.force_scope_reasons = on;
+    }
+
+    /// Stage the premise a [`Selected`](crate::propagator::Selected) wrapper
+    /// attributes to every tight reason its inner propagator emits while active.
+    pub(crate) fn set_injected_premise(&mut self, premise: Premise) {
+        self.injected_premise = Some(premise);
+    }
+
+    /// Stop stamping the injected premise.
+    pub(crate) fn clear_injected_premise(&mut self) {
+        self.injected_premise = None;
+    }
+
+    /// Append `premise` to any staged [`fail_because`](Store::fail_because)
+    /// conflict. A no-op when the inner propagator failed without a tight
+    /// conflict (the whole-scope fallback already carries the selector).
+    pub(crate) fn push_conflict_premise(&mut self, premise: Premise) {
+        if let Some(conflict) = &mut self.pending_conflict {
+            conflict.push(premise);
+        }
     }
 
     /// Mark that an LCG trail consumes reasons (set by the learning engine).
@@ -799,8 +858,32 @@ impl Store {
     /// Report inconsistency with a tight conflict reason (`why`: premises true
     /// now that are jointly infeasible). Use as `return Err(store.fail_because(..))`.
     pub fn fail_because(&mut self, why: Vec<Premise>) -> Inconsistency {
+        self.record_finesse(&why, true);
         self.pending_conflict = Some(why);
         Inconsistency
+    }
+
+    /// Sample the current tight reason's `(witness vars, scope, kind)` for the
+    /// finesse kill-test, where `kind` is 1 for a failure and 0 for an inference.
+    /// No-op unless [`enable_finesse`](Store::enable_finesse) is on.
+    fn record_finesse(&mut self, why: &[Premise], failure: bool) {
+        if self.finesse.is_none() {
+            return;
+        }
+        let Some(pid) = self.current else { return };
+        let witness = distinct_premise_vars(why);
+        let scope = self.scope[pid.index()].len() as u32;
+        self.finesse.as_mut().unwrap().push((witness, scope, u8::from(failure)));
+    }
+
+    /// Start recording finesse samples (research instrumentation).
+    pub fn enable_finesse(&mut self) {
+        self.finesse = Some(Vec::new());
+    }
+
+    /// Drain the finesse samples: `(distinct witness vars, scope size, priority index)`.
+    pub fn take_finesse(&mut self) -> Vec<(u32, u32, u8)> {
+        self.finesse.take().unwrap_or_default()
     }
 
     /// Take any conflict reason staged by [`fail_because`](Store::fail_because).
@@ -818,6 +901,7 @@ impl Store {
     pub(crate) fn clear_pending(&mut self) {
         self.pending_premises = None;
         self.pending_conflict = None;
+        self.injected_premise = None;
     }
 
     /// Append premises pinning `var`'s current domain exactly: `Ge min`,
@@ -1145,6 +1229,10 @@ pub struct Solver {
     propagators: Vec<Option<Box<dyn Propagator>>>,
     /// `dom/wdeg` weights, indexed by `PropId`; bumped when a propagator fails.
     weights: Vec<u64>,
+    /// When set, [`post`](Solver::post) wraps each propagator in a
+    /// [`Selected`] guard on this selector, used to build constraint-level
+    /// unsat cores. `None` in normal solving (no wrapping, no overhead).
+    current_selector: Option<VarId>,
 }
 
 const _: fn() = || {
@@ -1170,8 +1258,13 @@ impl Solver {
     }
 
     /// Post a propagator: register it (subscribes to its variables) and enqueue
-    /// it for an initial propagation.
-    pub fn post(&mut self, mut prop: Box<dyn Propagator>) -> PropId {
+    /// it for an initial propagation. Under [`set_selector`](Solver::set_selector)
+    /// the propagator is first wrapped in a [`Selected`] guard.
+    pub fn post(&mut self, prop: Box<dyn Propagator>) -> PropId {
+        let mut prop: Box<dyn Propagator> = match self.current_selector {
+            Some(sel) => Box::new(Selected::new(sel, prop)),
+            None => prop,
+        };
         let id = self.store.alloc_prop();
         debug_assert_eq!(id.index(), self.propagators.len());
         prop.register(&mut self.store, id);
@@ -1181,6 +1274,15 @@ impl Solver {
         self.weights.push(1);
         self.store.enqueue(id);
         id
+    }
+
+    /// Route subsequently [`post`](Solver::post)ed propagators through a
+    /// [`Selected`] guard on `sel` (a `{0,1}` selector): the constraint is active
+    /// only when `sel = 1`, and its inferences carry `sel` in their reason. Pass
+    /// `None` to stop guarding. The basis for constraint-level unsat cores; see
+    /// [`crate::mus`].
+    pub fn set_selector(&mut self, sel: Option<VarId>) {
+        self.current_selector = sel;
     }
 
     /// Collapse scheduling into a single FIFO band (the pre-banding order), for

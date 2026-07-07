@@ -21,7 +21,7 @@ except ImportError as exc:
 import qayd as cp
 
 here = os.path.dirname(os.path.abspath(__file__))
-repo_root = os.path.abspath(os.path.join(here, "..", ".."))
+repo_root = os.path.abspath(os.path.join(here, "..", "..", ".."))
 path = os.environ.get("QAYD_VRP_INSTANCE", os.path.join(repo_root, "data", "vrplib", "CVRP", "X-n101-k25.vrp"))
 time_limit = int(os.environ.get("QAYD_VRP_T", "10"))
 

@@ -1,7 +1,7 @@
 //! The [`Propagator`] trait, the filtering error type, and event kinds.
 
-use crate::ids::PropId;
-use crate::store::Store;
+use crate::ids::{PropId, VarId};
+use crate::store::{Premise, Store};
 
 /// A domain became empty: the current node is infeasible.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -78,5 +78,65 @@ pub trait Propagator: PropagatorClone + Send {
     /// for globals.
     fn priority(&self) -> Priority {
         Priority::Linear
+    }
+}
+
+/// A half-reified guard around another propagator: the inner constraint is
+/// enforced only while the selector variable `sel` is fixed to `1`, and every
+/// reason the inner propagator produces is attributed to `sel = 1` (via the
+/// store's injected premise), so a refutation traces back to this selector.
+///
+/// The building block for constraint-level unsat cores: post each candidate
+/// constraint under its own selector, assume all selectors true, and a
+/// [`solve_under_assumptions`](crate::search::solve_under_assumptions) core is
+/// exactly the offending constraints. Posted transparently by
+/// [`Solver::post`](crate::store::Solver::post) under
+/// [`set_selector`](crate::store::Solver::set_selector).
+#[derive(Clone)]
+pub struct Selected {
+    sel: VarId,
+    inner: Box<dyn Propagator>,
+}
+
+impl Selected {
+    /// Guard `inner` with selector `sel` (a `{0,1}` variable).
+    pub fn new(sel: VarId, inner: Box<dyn Propagator>) -> Self {
+        Self { sel, inner }
+    }
+}
+
+impl Propagator for Selected {
+    fn register(&mut self, store: &mut Store, me: PropId) {
+        // Wake when the selector is fixed (0 disables, 1 activates), and adopt
+        // the inner propagator's own subscriptions under this same id so the
+        // whole-scope reason includes `sel`.
+        store.subscribe(self.sel, me, Event::Fix);
+        self.inner.register(store, me);
+    }
+
+    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+        if !store.is_fixed(self.sel) {
+            return Ok(()); // selector undecided: constraint not yet required
+        }
+        if store.value(self.sel) != 1 {
+            return Ok(()); // selector off: constraint deactivated (half-reified)
+        }
+        // Active: attribute every reason the inner produces to `sel = 1`, so the
+        // selector appears in each learned nogood. Tight inference reasons are
+        // stamped through the store's injected premise; a `fail_because` conflict
+        // is stamped explicitly; a bare wipeout falls back to the whole scope,
+        // which already carries `sel` via the subscription above.
+        let premise = Premise::Eq { var: self.sel, val: 1 };
+        store.set_injected_premise(premise);
+        let result = self.inner.propagate(store);
+        if result.is_err() {
+            store.push_conflict_premise(premise);
+        }
+        store.clear_injected_premise();
+        result
+    }
+
+    fn priority(&self) -> Priority {
+        self.inner.priority()
     }
 }
