@@ -238,8 +238,12 @@ pub fn solve(
         return Ok(Some(Outcome { status: Status::Unsatisfiable, objectives: Vec::new(), solution: None, stats: SolveStats::default() }));
     }
 
+    if objective_tiers_order_dependent(objective_tiers) {
+        return Ok(Some(run_ordered_search(model, &parsed, objective_tiers, stop, &mut on_improve)));
+    }
+
     let (solver, lists) = build_solver(model, &parsed);
-    let outcome = if member_var_exact_supported(&parsed, &model.globals) {
+    let outcome = if member_var_exact_supported(&parsed, &model.globals, objective_tiers) {
         run_member_var_search(solver, &lists, &model.items, objective_tiers, stop, &mut on_improve)
     } else {
         run_domain_search(solver, objective_tiers, stop, &mut on_improve)
@@ -255,10 +259,167 @@ pub fn solve(
 /// branching heuristic, so those stay on chrono to avoid regressing them. Item
 /// precedence (`ListLe`) is now explained and oracle-checked, but routing it is a
 /// separate (perf) decision still pending, so it stays on chrono for now. The
-/// routed set: partition + `Length` + `same_list`.
-fn member_var_exact_supported(parsed: &[ListConstraint], globals: &[list::GlobalConstraint]) -> bool {
+/// routed set: partition + `Length` + `same_list`, with objectives that do not
+/// depend on list order.
+fn member_var_exact_supported(
+    parsed: &[ListConstraint],
+    globals: &[list::GlobalConstraint],
+    objective_tiers: &[ListObjectiveTier],
+) -> bool {
     parsed.iter().all(|c| matches!(c, ListConstraint::Length { .. }))
         && globals.iter().all(|global| matches!(global, list::GlobalConstraint::SameList { .. }))
+        && objective_tiers.iter().all(member_var_objective_supported)
+}
+
+fn member_var_objective_supported(tier: &ListObjectiveTier) -> bool {
+    tier.terms.iter().all(member_var_objective_term_supported)
+        && tier.max_terms.as_ref().is_none_or(|terms| {
+            terms.iter().all(|term| term.groups.iter().all(|group| group.iter().all(member_var_objective_term_supported)))
+        })
+}
+
+fn member_var_objective_term_supported(term: &ListObjectiveTerm) -> bool {
+    match term {
+        ListObjectiveTerm::Sum { .. } | ListObjectiveTerm::Count { .. } | ListObjectiveTerm::Used { .. } => true,
+        ListObjectiveTerm::Reduction(reduction) => matches!(reduction.iterable, list::Iterable::Items(_)),
+    }
+}
+
+fn objective_tiers_order_dependent(tiers: &[ListObjectiveTier]) -> bool {
+    tiers.iter().any(|tier| !member_var_objective_supported(tier))
+}
+
+fn run_ordered_search(
+    model: &CollectionModel,
+    parsed: &[ListConstraint],
+    objective_tiers: &[ListObjectiveTier],
+    stop: &AtomicBool,
+    on_improve: &mut impl FnMut(&[i64]),
+) -> Outcome {
+    let has_objective = !objective_tiers.is_empty();
+    let mut lists = vec![Vec::new(); model.lists];
+    let mut solution = None;
+    let mut best_objectives = Vec::new();
+    let mut stats = SolveStats::default();
+
+    let complete = enumerate_ordered_partitions(
+        0,
+        &model.items,
+        &mut lists,
+        parsed,
+        &model.globals,
+        objective_tiers,
+        has_objective,
+        &mut solution,
+        &mut best_objectives,
+        &mut stats,
+        stop,
+        on_improve,
+    ) && !stop.load(std::sync::atomic::Ordering::Relaxed);
+
+    Outcome { status: outcome_status(solution.is_some(), has_objective, complete), objectives: best_objectives, solution, stats }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enumerate_ordered_partitions(
+    item_idx: usize,
+    items: &[i32],
+    lists: &mut [Vec<i32>],
+    parsed: &[ListConstraint],
+    globals: &[list::GlobalConstraint],
+    objective_tiers: &[ListObjectiveTier],
+    has_objective: bool,
+    solution: &mut Option<Vec<Vec<i32>>>,
+    best_objectives: &mut Vec<i64>,
+    stats: &mut SolveStats,
+    stop: &AtomicBool,
+    on_improve: &mut impl FnMut(&[i64]),
+) -> bool {
+    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    if item_idx == items.len() {
+        stats.solutions += 1;
+        if !ordered_lists_feasible(parsed, globals, lists) {
+            stats.failures += 1;
+            return true;
+        }
+        if !has_objective {
+            *solution = Some(lists.to_vec());
+            return false;
+        }
+        let candidate = evaluate_list_objectives(objective_tiers, lists);
+        if solution.is_none() || list_objectives_better(&candidate, best_objectives, objective_tiers) {
+            on_improve(&candidate);
+            *solution = Some(lists.to_vec());
+            *best_objectives = candidate;
+        }
+        return true;
+    }
+
+    let item = items[item_idx];
+    for list_idx in 0..lists.len() {
+        if list_exceeds_max_len(parsed, list_idx, lists[list_idx].len() + 1) {
+            continue;
+        }
+        for pos in 0..=lists[list_idx].len() {
+            stats.nodes += 1;
+            lists[list_idx].insert(pos, item);
+            let complete = enumerate_ordered_partitions(
+                item_idx + 1,
+                items,
+                lists,
+                parsed,
+                globals,
+                objective_tiers,
+                has_objective,
+                solution,
+                best_objectives,
+                stats,
+                stop,
+                on_improve,
+            );
+            lists[list_idx].remove(pos);
+            if !complete {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn list_exceeds_max_len(parsed: &[ListConstraint], list: usize, len: usize) -> bool {
+    parsed.iter().any(|constraint| matches!(constraint, ListConstraint::Length { list: l, max, .. } if *l == list && len > *max))
+}
+
+fn ordered_lists_feasible(parsed: &[ListConstraint], globals: &[list::GlobalConstraint], lists: &[Vec<i32>]) -> bool {
+    parsed.iter().all(|constraint| match constraint {
+        ListConstraint::Length { list, min, max } => lists.get(*list).is_some_and(|items| (*min..=*max).contains(&items.len())),
+        ListConstraint::ItemSum { list, weights, min, max } => lists.get(*list).is_some_and(|items| {
+            let total = items.iter().fold(0i64, |sum, item| sum.saturating_add(objective_weight(weights, *item)));
+            (*min..=*max).contains(&total)
+        }),
+        ListConstraint::Impossible => false,
+    }) && globals.iter().all(|global| match *global {
+        list::GlobalConstraint::ListLe { before, after } => {
+            let Some(before_list) = ordered_item_owner(lists, before) else { return false };
+            let Some(after_list) = ordered_item_owner(lists, after) else { return false };
+            before_list <= after_list
+        }
+        list::GlobalConstraint::SameList { a, b } => {
+            let Some(a_list) = ordered_item_owner(lists, a) else { return false };
+            let Some(b_list) = ordered_item_owner(lists, b) else { return false };
+            a_list == b_list
+        }
+    })
+}
+
+fn objective_weight(weights: &[(i32, i64)], item: i32) -> i64 {
+    weights.iter().find_map(|(known, weight)| (*known == item).then_some(*weight)).unwrap_or(0)
+}
+
+fn ordered_item_owner(lists: &[Vec<i32>], item: i32) -> Option<usize> {
+    lists.iter().position(|list| list.contains(&item))
 }
 
 fn run_member_var_search(
@@ -649,5 +810,41 @@ mod tests {
         assert_eq!(member.status, chrono.status);
         assert_eq!(member.objectives, chrono.objectives);
         assert_eq!(member.objectives, vec![1], "all items in a single list means one used list");
+    }
+
+    #[test]
+    fn order_dependent_objective_uses_domain_search() {
+        use std::sync::Arc;
+
+        use crate::model::list::{ExprArena, Iterable, ObjectiveTier, ReduceOp, Reduction};
+        use crate::model::list_objective_tiers;
+
+        let mut dist = vec![vec![50; 4]; 4];
+        dist[0][2] = 1;
+        dist[2][1] = 1;
+        dist[1][3] = 1;
+        dist[3][0] = 1;
+
+        let mut arena = ExprArena::default();
+        let i = arena.arg(0);
+        let j = arena.arg(1);
+        let body = arena.matrix(Arc::new(dist), i, j);
+        let edge_cost = Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list: 0, start: 0, end: 0 }, arena, body, coeff: 1 };
+        let model = CollectionModel {
+            items: vec![1, 2, 3],
+            lists: 1,
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![edge_cost], max_terms: None }],
+            constraints: Vec::new(),
+            globals: Vec::new(),
+            schedule: None,
+        };
+        let objective_tiers = list_objective_tiers(&model.objectives, &model.items).expect("edge objective parses");
+        let stop = AtomicBool::new(false);
+
+        let outcome = solve(&model, &objective_tiers, &stop, |_| {}).expect("solve").expect("supported");
+
+        assert_eq!(outcome.status, Status::Optimal);
+        assert_eq!(outcome.objectives, vec![4]);
+        assert_eq!(outcome.solution, Some(vec![vec![2, 1, 3]]));
     }
 }
