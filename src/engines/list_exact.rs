@@ -113,10 +113,16 @@ fn list_constraint(constraint: &list::Constraint, items: &[i32]) -> Option<ListC
     let list = *list;
 
     if matches!(constraint.reduction.op, list::ReduceOp::Used) {
+        if constraint.reduction.coeff != 1 {
+            return None;
+        }
         return used_constraint_as_length(list, constraint.op, constraint.rhs, items.len());
     }
 
     if matches!(constraint.reduction.op, list::ReduceOp::Count) {
+        if constraint.reduction.coeff != 1 {
+            return None;
+        }
         let body = constraint.reduction.arena.exprs.get(constraint.reduction.body.0 as usize)?;
         let list::Expr::Const(value) = body else {
             return None;
@@ -144,7 +150,11 @@ fn list_constraint(constraint: &list::Constraint, items: &[i32]) -> Option<ListC
     if matches!(constraint.reduction.op, list::ReduceOp::Sum) {
         let mut weights = Vec::with_capacity(items.len());
         for &item in items {
-            weights.push((item, eval_collection_expr_one(&constraint.reduction.arena.exprs, constraint.reduction.body, i64::from(item))?));
+            weights.push((
+                item,
+                eval_collection_expr_one(&constraint.reduction.arena.exprs, constraint.reduction.body, i64::from(item))?
+                    .saturating_mul(constraint.reduction.coeff),
+            ));
         }
         let (min, max) = match constraint.op {
             list::Op::Le => (i64::MIN / 4, constraint.rhs),
@@ -307,8 +317,9 @@ fn lower_linear_tier(solver: &mut Solver, lists: &[ListId], tier: &ListObjective
     let mut vars = Vec::new();
     for term in &tier.terms {
         match term {
-            ListObjectiveTerm::Sum { list, weights } => {
+            ListObjectiveTerm::Sum { list, weights, coeff } => {
                 for &(item, weight) in weights {
+                    let weight = weight.saturating_mul(*coeff);
                     if weight == 0 {
                         continue;
                     }
@@ -316,10 +327,13 @@ fn lower_linear_tier(solver: &mut Solver, lists: &[ListId], tier: &ListObjective
                     vars.push(solver.store.list_member_var(lists[*list], item)?);
                 }
             }
-            ListObjectiveTerm::Used { list } => {
+            ListObjectiveTerm::Used { list, coeff } => {
+                if *coeff == 0 {
+                    continue;
+                }
                 let used = solver.store.new_var_range(0, 1);
                 list_constraints::list_used(solver, lists[*list], used);
-                coeffs.push(1);
+                coeffs.push(*coeff);
                 vars.push(used);
             }
             ListObjectiveTerm::Count { .. } => return None,
@@ -542,9 +556,9 @@ mod tests {
         let objective_tiers = vec![ListObjectiveTier {
             minimize: true,
             terms: vec![
-                ListObjectiveTerm::Sum { list: 0, weights: vec![(10, 0), (20, 0), (30, 3)] },
-                ListObjectiveTerm::Sum { list: 1, weights: vec![(10, 10), (20, 10), (30, 0)] },
-                ListObjectiveTerm::Sum { list: 2, weights: vec![(10, 20), (20, 20), (30, 1)] },
+                ListObjectiveTerm::Sum { list: 0, weights: vec![(10, 0), (20, 0), (30, 3)], coeff: 1 },
+                ListObjectiveTerm::Sum { list: 1, weights: vec![(10, 10), (20, 10), (30, 0)], coeff: 1 },
+                ListObjectiveTerm::Sum { list: 2, weights: vec![(10, 20), (20, 20), (30, 1)], coeff: 1 },
             ],
         }];
         let stop = AtomicBool::new(false);
@@ -568,8 +582,11 @@ mod tests {
         use crate::model::list::{Constraint, ExprArena, Iterable, Op, ReduceOp, Reduction};
         let mut arena = ExprArena::default();
         let body = arena.constant(1);
-        let length_eq_two =
-            Constraint { reduction: Reduction { op: ReduceOp::Count, iterable: Iterable::Items(0), arena, body }, op: Op::Eq, rhs: 2 };
+        let length_eq_two = Constraint {
+            reduction: Reduction { op: ReduceOp::Count, iterable: Iterable::Items(0), arena, body, coeff: 1 },
+            op: Op::Eq,
+            rhs: 2,
+        };
         let model = CollectionModel {
             items: vec![10, 20, 30],
             lists: 2,
@@ -581,7 +598,7 @@ mod tests {
         // Unique optimum: list 1 holds exactly one item; the cheapest is item 10.
         let objective_tiers = vec![ListObjectiveTier {
             minimize: true,
-            terms: vec![ListObjectiveTerm::Sum { list: 1, weights: vec![(10, 1), (20, 2), (30, 3)] }],
+            terms: vec![ListObjectiveTerm::Sum { list: 1, weights: vec![(10, 1), (20, 2), (30, 3)], coeff: 1 }],
         }];
         let stop = AtomicBool::new(false);
         let member = solve(&model, &objective_tiers, &stop, |_| {}).expect("solve").expect("supported");
@@ -612,7 +629,11 @@ mod tests {
         };
         let objective_tiers = vec![ListObjectiveTier {
             minimize: true,
-            terms: vec![ListObjectiveTerm::Used { list: 0 }, ListObjectiveTerm::Used { list: 1 }, ListObjectiveTerm::Used { list: 2 }],
+            terms: vec![
+                ListObjectiveTerm::Used { list: 0, coeff: 1 },
+                ListObjectiveTerm::Used { list: 1, coeff: 1 },
+                ListObjectiveTerm::Used { list: 2, coeff: 1 },
+            ],
         }];
         let stop = AtomicBool::new(false);
         let member = solve(&model, &objective_tiers, &stop, |_| {}).expect("solve").expect("supported");

@@ -130,7 +130,7 @@ pub(super) fn eval_reduction(reduction: &Reduction, contents: &[i32]) -> Option<
         }
     }
 
-    match reduction.op {
+    let value = match reduction.op {
         ReduceOp::Sum => Some(sum),
         ReduceOp::Count => Some(count),
         ReduceOp::Used => Some(i64::from(steps > 0)),
@@ -144,7 +144,8 @@ pub(super) fn eval_reduction(reduction: &Reduction, contents: &[i32]) -> Option<
                 Some(values[k])
             }
         }
-    }
+    };
+    value.map(|value| value.saturating_mul(reduction.coeff))
 }
 
 pub(super) fn violation_of(value: i64, op: Op, rhs: i64) -> i64 {

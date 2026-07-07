@@ -180,6 +180,7 @@ pub struct Reduction {
     pub iterable: Iterable,
     pub arena: ExprArena,
     pub body: ExprId,
+    pub coeff: i64,
 }
 
 /// A constraint `reduction <op> rhs`.

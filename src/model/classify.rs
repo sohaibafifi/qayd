@@ -363,7 +363,7 @@ fn direct_closed_edge_objective(terms: &[list::Reduction], list_count: usize, it
 }
 
 fn direct_closed_edge_signature<'a>(reduction: &'a list::Reduction, items: &[i32]) -> Option<(usize, EdgeSignature<'a>)> {
-    if !matches!(reduction.op, list::ReduceOp::Sum) {
+    if !matches!(reduction.op, list::ReduceOp::Sum) || reduction.coeff != 1 {
         return None;
     }
     let list::Iterable::Edges { list: reduction_list, start, end } = &reduction.iterable else {
@@ -547,9 +547,15 @@ pub(crate) fn length_bound_from_collection_constraint(constraint: &list::Constra
         return None;
     };
     if matches!(constraint.reduction.op, list::ReduceOp::Used) {
+        if constraint.reduction.coeff != 1 {
+            return None;
+        }
         return used_bound_as_length(*list, constraint.op, constraint.rhs, item_count);
     }
     if !matches!(constraint.reduction.op, list::ReduceOp::Count) {
+        return None;
+    }
+    if constraint.reduction.coeff != 1 {
         return None;
     }
     if !matches!(
@@ -602,7 +608,11 @@ pub(crate) fn item_sum_bound_from_collection_constraint(constraint: &list::Const
     };
     let mut weights = Vec::with_capacity(items.len());
     for &item in items {
-        weights.push((item, eval_collection_expr_one(&constraint.reduction.arena.exprs, constraint.reduction.body, i64::from(item))?));
+        weights.push((
+            item,
+            eval_collection_expr_one(&constraint.reduction.arena.exprs, constraint.reduction.body, i64::from(item))?
+                .saturating_mul(constraint.reduction.coeff),
+        ));
     }
     let (min, max) = match constraint.op {
         list::Op::Le => (i64::MIN / 4, constraint.rhs),

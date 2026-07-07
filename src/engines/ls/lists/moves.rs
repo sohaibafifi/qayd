@@ -374,7 +374,7 @@ fn segment_path_cost(a: i32, b: i32, items: &[i32], edge: &impl Fn(i32, i32) -> 
 
 /// Delta of one supported reduction's raw value under `edit`.
 fn reduction_delta(r: &Reduction, kind: ReductionDeltaKind, list: &[i32], edit: &Edit) -> i64 {
-    match kind {
+    let delta = match kind {
         ReductionDeltaKind::ItemsSum => items_value_delta(list, edit, |item| eval_expr(&r.arena.exprs, r.body, &[i64::from(item)])),
         ReductionDeltaKind::ItemsCount => {
             items_value_delta(list, edit, |item| i64::from(eval_expr(&r.arena.exprs, r.body, &[i64::from(item)]) != 0))
@@ -390,7 +390,8 @@ fn reduction_delta(r: &Reduction, kind: ReductionDeltaKind, list: &[i32], edit: 
             _ => unreachable!("edge delta kind on a non-edge reduction"),
         },
         ReductionDeltaKind::Unsupported => unreachable!("reduction_delta on an unsupported reduction"),
-    }
+    };
+    delta.saturating_mul(r.coeff)
 }
 
 /// Trial score of list `idx` after `edit`, computed incrementally from the cached

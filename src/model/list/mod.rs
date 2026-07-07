@@ -32,11 +32,11 @@ pub type ListIterable = Iterable;
 #[derive(Clone)]
 pub enum ListObjectiveTerm {
     /// Sum of item weights in a list.
-    Sum { list: usize, weights: Vec<(i32, i64)> },
+    Sum { list: usize, weights: Vec<(i32, i64)>, coeff: i64 },
     /// Count of items whose weight/predicate value is non-zero.
-    Count { list: usize, weights: Vec<(i32, i64)> },
+    Count { list: usize, weights: Vec<(i32, i64)>, coeff: i64 },
     /// `1` when the list is non-empty, else `0`.
-    Used { list: usize },
+    Used { list: usize, coeff: i64 },
 }
 
 /// One domain exact lexicographic objective tier.
@@ -68,13 +68,22 @@ pub fn evaluate_list_objectives(tiers: &[ListObjectiveTier], lists: &[Vec<i32>])
         .map(|tier| {
             tier.terms.iter().fold(0i64, |acc, term| {
                 acc.saturating_add(match term {
-                    ListObjectiveTerm::Sum { list, weights } => lists
+                    ListObjectiveTerm::Sum { list, weights, coeff } => lists
                         .get(*list)
-                        .map_or(0, |items| items.iter().fold(0i64, |sum, item| sum.saturating_add(list_item_weight(weights, *item)))),
-                    ListObjectiveTerm::Count { list, weights } => lists.get(*list).map_or(0, |items| {
-                        items.iter().filter(|item| list_item_weight(weights, **item) != 0).fold(0i64, |count, _| count.saturating_add(1))
-                    }),
-                    ListObjectiveTerm::Used { list } => i64::from(lists.get(*list).is_some_and(|items| !items.is_empty())),
+                        .map_or(0, |items| items.iter().fold(0i64, |sum, item| sum.saturating_add(list_item_weight(weights, *item))))
+                        .saturating_mul(*coeff),
+                    ListObjectiveTerm::Count { list, weights, coeff } => lists
+                        .get(*list)
+                        .map_or(0, |items| {
+                            items
+                                .iter()
+                                .filter(|item| list_item_weight(weights, **item) != 0)
+                                .fold(0i64, |count, _| count.saturating_add(1))
+                        })
+                        .saturating_mul(*coeff),
+                    ListObjectiveTerm::Used { list, coeff } => {
+                        i64::from(lists.get(*list).is_some_and(|items| !items.is_empty())).saturating_mul(*coeff)
+                    }
                 })
             })
         })
@@ -97,9 +106,11 @@ fn list_objective_term(reduction: &Reduction, items: &[i32]) -> Option<ListObjec
         return None;
     };
     match reduction.op {
-        ReduceOp::Sum => Some(ListObjectiveTerm::Sum { list: *list, weights: list_item_values(reduction, items)? }),
-        ReduceOp::Count => Some(ListObjectiveTerm::Count { list: *list, weights: list_item_values(reduction, items)? }),
-        ReduceOp::Used => Some(ListObjectiveTerm::Used { list: *list }),
+        ReduceOp::Sum => Some(ListObjectiveTerm::Sum { list: *list, weights: list_item_values(reduction, items)?, coeff: reduction.coeff }),
+        ReduceOp::Count => {
+            Some(ListObjectiveTerm::Count { list: *list, weights: list_item_values(reduction, items)?, coeff: reduction.coeff })
+        }
+        ReduceOp::Used => Some(ListObjectiveTerm::Used { list: *list, coeff: reduction.coeff }),
         ReduceOp::Min | ReduceOp::Max | ReduceOp::SelectKth(_) => None,
     }
 }

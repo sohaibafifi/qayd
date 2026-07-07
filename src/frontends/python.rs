@@ -182,11 +182,7 @@ impl PyIntervalVar {
             let mut terms = vec![expr::var(start)];
             terms.extend(alt.duration_terms());
             return Ok(PyExpr {
-                inner: ExprLike {
-                    model_id: Some(self.model_id),
-                    expr: expr::add(terms),
-                    text: format!("{}.end", alt.name),
-                },
+                inner: ExprLike { model_id: Some(self.model_id), expr: expr::add(terms), text: format!("{}.end", alt.name) },
             });
         }
         let (Some(start), Some(duration)) = (self.start, self.duration) else {
@@ -2042,9 +2038,7 @@ impl PyModel {
         for member in &members {
             let spec = self.native_interval_spec(member)?;
             let Some(presence) = spec.presence else {
-                return Err(PyValueError::new_err(
-                    "alternative members must be optional intervals (Model.interval(..., optional=True))",
-                ));
+                return Err(PyValueError::new_err("alternative members must be optional intervals (Model.interval(..., optional=True))"));
             };
             if ids.contains(&spec.interval) {
                 return Err(PyValueError::new_err("alternative members must be distinct intervals"));
@@ -3336,6 +3330,17 @@ fn combine_terms(a: &PyTerm, b: &PyTerm) -> PyResult<PyTerm> {
     Ok(PyTerm { model_id: a.model_id, gen: a.gen, reductions })
 }
 
+fn scale_reduction(reduction: &list::Reduction, coeff: i64) -> PyResult<list::Reduction> {
+    let mut reduction = reduction.clone();
+    reduction.coeff = reduction.coeff.checked_mul(coeff).ok_or_else(|| PyValueError::new_err("term coefficient overflows i64"))?;
+    Ok(reduction)
+}
+
+fn scale_term(term: &PyTerm, coeff: i64) -> PyResult<PyTerm> {
+    let reductions = term.reductions.iter().map(|reduction| scale_reduction(reduction, coeff)).collect::<PyResult<Vec<_>>>()?;
+    Ok(PyTerm { model_id: term.model_id, gen: term.gen, reductions })
+}
+
 #[pymethods]
 impl PyTerm {
     fn __add__(&self, other: PyRef<'_, PyTerm>) -> PyResult<PyTerm> {
@@ -3348,6 +3353,18 @@ impl PyTerm {
             return Ok(self.clone());
         }
         Err(PyTypeError::new_err("a term can only be added to another term"))
+    }
+
+    fn __mul__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
+        scale_term(self, other.extract::<i64>().map_err(|_| PyTypeError::new_err("a term can only be multiplied by an integer"))?)
+    }
+
+    fn __rmul__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
+        self.__mul__(other)
+    }
+
+    fn __neg__(&self) -> PyResult<PyTerm> {
+        scale_term(self, -1)
     }
 
     fn __richcmp__(&self, other: &Bound<'_, PyAny>, op: CompareOp) -> PyResult<PyListConstraint> {
@@ -3451,7 +3468,7 @@ fn build_items_reduction(route: &PyListVar, op: list::ReduceOp, func: &Bound<'_,
     let body = coerce_node(&func.call1((node(PyNode::Arg(0)),))?)?;
     let mut arena = list::ExprArena::default();
     let body_id = lower(&body, &mut arena);
-    Ok(single_term(route, list::Reduction { op, iterable: list::Iterable::Items(route.index as usize), arena, body: body_id }))
+    Ok(single_term(route, list::Reduction { op, iterable: list::Iterable::Items(route.index as usize), arena, body: body_id, coeff: 1 }))
 }
 
 /// `sum(route, i => body)`, or `sum(terms)` to add a collection of terms.
@@ -3481,9 +3498,8 @@ fn sum(py: Python<'_>, arg: &Bound<'_, PyAny>, func: Option<&Bound<'_, PyAny>>) 
             });
             continue;
         }
-        let e = expr_from_py(&item).map_err(|_| {
-            PyTypeError::new_err("sum(iterable) expects list-domain terms or arithmetic operands (Expr, IntVar, int)")
-        })?;
+        let e = expr_from_py(&item)
+            .map_err(|_| PyTypeError::new_err("sum(iterable) expects list-domain terms or arithmetic operands (Expr, IntVar, int)"))?;
         if terms.is_some() {
             return Err(PyTypeError::new_err("sum(iterable) cannot mix list-domain terms with arithmetic expressions"));
         }
@@ -3495,9 +3511,7 @@ fn sum(py: Python<'_>, arg: &Bound<'_, PyAny>, func: Option<&Bound<'_, PyAny>>) 
     match (terms, exprs) {
         (Some(t), None) => Ok(t.into_pyobject(py)?.into_any().unbind()),
         (None, Some((parts, model_id, texts))) => {
-            let expr = PyExpr {
-                inner: ExprLike { model_id, expr: expr::add(parts), text: format!("({})", texts.join(" + ")) },
-            };
+            let expr = PyExpr { inner: ExprLike { model_id, expr: expr::add(parts), text: format!("({})", texts.join(" + ")) } };
             Ok(expr.into_pyobject(py)?.into_any().unbind())
         }
         _ => Err(PyValueError::new_err("sum got no terms to add")),
@@ -3529,7 +3543,7 @@ fn count_reduction(route: &PyListVar, func: Option<&Bound<'_, PyAny>>) -> PyResu
             let body = arena.constant(1);
             Ok(single_term(
                 route,
-                list::Reduction { op: list::ReduceOp::Count, iterable: list::Iterable::Items(route.index as usize), arena, body },
+                list::Reduction { op: list::ReduceOp::Count, iterable: list::Iterable::Items(route.index as usize), arena, body, coeff: 1 },
             ))
         }
     }
@@ -3544,14 +3558,14 @@ fn sum_edges(route: &PyListVar, func: &Bound<'_, PyAny>, start: i32, end: i32) -
     let mut arena = list::ExprArena::default();
     let body_id = lower(&body, &mut arena);
     let iterable = list::Iterable::Edges { list: route.index as usize, start, end };
-    Ok(single_term(route, list::Reduction { op: list::ReduceOp::Sum, iterable, arena, body: body_id }))
+    Ok(single_term(route, list::Reduction { op: list::ReduceOp::Sum, iterable, arena, body: body_id, coeff: 1 }))
 }
 
 fn pairs_term(route: &PyListVar, body: Arc<PyNode>) -> PyTerm {
     let mut arena = list::ExprArena::default();
     let body_id = lower(&body, &mut arena);
     let iterable = list::Iterable::Pairs(route.index as usize);
-    single_term(route, list::Reduction { op: list::ReduceOp::Sum, iterable, arena, body: body_id })
+    single_term(route, list::Reduction { op: list::ReduceOp::Sum, iterable, arena, body: body_id, coeff: 1 })
 }
 
 /// `item_pairs(route, (a, b) => body)`: sum the body over every ordered pair of
@@ -3623,7 +3637,7 @@ fn scan_sum(route: &PyListVar, step: &Bound<'_, PyAny>, emit: &Bound<'_, PyAny>,
     let step_id = lower(&step_body, &mut arena);
     let emit_id = lower(&emit_body, &mut arena);
     let iterable = list::Iterable::Scan { list: route.index as usize, init, boundary, step: step_id };
-    Ok(single_term(route, list::Reduction { op: list::ReduceOp::Sum, iterable, arena, body: emit_id }))
+    Ok(single_term(route, list::Reduction { op: list::ReduceOp::Sum, iterable, arena, body: emit_id, coeff: 1 }))
 }
 
 /// `select_kth(route, k, step, emit, init=, boundary=)`: the `k`-th smallest
@@ -3642,7 +3656,7 @@ fn select_kth(route: &PyListVar, k: usize, step: &Bound<'_, PyAny>, emit: &Bound
     let step_id = lower(&step_body, &mut arena);
     let emit_id = lower(&emit_body, &mut arena);
     let iterable = list::Iterable::Scan { list: route.index as usize, init, boundary, step: step_id };
-    Ok(single_term(route, list::Reduction { op: list::ReduceOp::SelectKth(k), iterable, arena, body: emit_id }))
+    Ok(single_term(route, list::Reduction { op: list::ReduceOp::SelectKth(k), iterable, arena, body: emit_id, coeff: 1 }))
 }
 
 /// `windows(route, size, inner, emit)`: for each window of `size` consecutive
@@ -3657,7 +3671,7 @@ fn windows(route: &PyListVar, size: usize, inner: &Bound<'_, PyAny>, emit: &Boun
     let inner_id = lower(&inner_body, &mut arena);
     let emit_id = lower(&emit_body, &mut arena);
     let iterable = list::Iterable::Windows { list: route.index as usize, size, inner: inner_id };
-    Ok(single_term(route, list::Reduction { op: list::ReduceOp::Sum, iterable, arena, body: emit_id }))
+    Ok(single_term(route, list::Reduction { op: list::ReduceOp::Sum, iterable, arena, body: emit_id, coeff: 1 }))
 }
 
 /// Wrap a constant integer array / matrix for use inside lambdas.
@@ -3678,7 +3692,10 @@ fn matrix(data: Vec<Vec<i64>>) -> PyMatrix {
 fn used(route: &PyListVar) -> PyTerm {
     let mut arena = list::ExprArena::default();
     let body = arena.constant(0);
-    single_term(route, list::Reduction { op: list::ReduceOp::Used, iterable: list::Iterable::Items(route.index as usize), arena, body })
+    single_term(
+        route,
+        list::Reduction { op: list::ReduceOp::Used, iterable: list::Iterable::Items(route.index as usize), arena, body, coeff: 1 },
+    )
 }
 
 /// Deliberate panic, for tests only: proves the extension is built with

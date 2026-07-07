@@ -726,7 +726,7 @@ fn parse_route_edge_objective(terms: &[Reduction], list_count: usize) -> Option<
 }
 
 fn direct_closed_edge_term(reduction: &Reduction) -> Option<(usize, i32, DirectEdgeMatrix)> {
-    if !matches!(reduction.op, ReduceOp::Sum) {
+    if !matches!(reduction.op, ReduceOp::Sum) || reduction.coeff != 1 {
         return None;
     }
     let Iterable::Edges { list: reduction_list, start, end } = &reduction.iterable else {
@@ -824,7 +824,8 @@ fn parse_item_sum_constraint(constraint: &Constraint, items: &[i32]) -> Option<(
     };
     let mut weights = Vec::with_capacity(items.len());
     for &item in items {
-        let weight = eval_collection_expr_one(&constraint.reduction.arena.exprs, constraint.reduction.body, i64::from(item))?;
+        let weight = eval_collection_expr_one(&constraint.reduction.arena.exprs, constraint.reduction.body, i64::from(item))?
+            .saturating_mul(constraint.reduction.coeff);
         weights.push((item, weight));
     }
     let (min, max) = match constraint.op {
@@ -839,6 +840,9 @@ fn parse_item_sum_constraint(constraint: &Constraint, items: &[i32]) -> Option<(
 /// non-zero constant body (so it counts membership). Returns `(list, min, max)`.
 fn parse_length_constraint(constraint: &Constraint, item_count: usize) -> Option<(usize, usize, usize)> {
     if !matches!(constraint.reduction.op, ReduceOp::Count) {
+        return None;
+    }
+    if constraint.reduction.coeff != 1 {
         return None;
     }
     let Iterable::Items(list) = &constraint.reduction.iterable else {
@@ -876,8 +880,11 @@ fn parse_capacity_constraint(constraint: &Constraint, items: &[i32]) -> Option<(
     }
     let mut demands = Vec::with_capacity(items.len());
     for &item in items {
-        let demand =
-            i32::try_from(eval_collection_expr_one(&constraint.reduction.arena.exprs, constraint.reduction.body, i64::from(item))?).ok()?;
+        let demand = i32::try_from(
+            eval_collection_expr_one(&constraint.reduction.arena.exprs, constraint.reduction.body, i64::from(item))?
+                .saturating_mul(constraint.reduction.coeff),
+        )
+        .ok()?;
         if demand < 0 || demand > capacity {
             return None;
         }
@@ -954,7 +961,7 @@ mod tests {
         let i = arena.arg(0);
         let j = arena.arg(1);
         let body = arena.matrix(std::sync::Arc::new(dist), i, j);
-        let reduction = Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list: 0, start: 0, end: 0 }, arena, body };
+        let reduction = Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list: 0, start: 0, end: 0 }, arena, body, coeff: 1 };
         let model = CollectionModel {
             items: vec![1, 2, 3],
             lists: 1,
@@ -995,13 +1002,17 @@ mod tests {
             let i = arena.arg(0);
             let j = arena.arg(1);
             let body = arena.matrix(Arc::clone(&dist), i, j);
-            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body }
+            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body, coeff: 1 }
         };
         let load = |list| {
             let mut arena = ExprArena::default();
             let i = arena.arg(0);
             let body = arena.array(Arc::clone(&demand), i);
-            Constraint { reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body }, op: Op::Le, rhs: 2 }
+            Constraint {
+                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body, coeff: 1 },
+                op: Op::Le,
+                rhs: 2,
+            }
         };
 
         let model = CollectionModel {
@@ -1085,13 +1096,17 @@ mod tests {
             let i = arena.arg(0);
             let j = arena.arg(1);
             let body = arena.matrix(Arc::clone(&dist_arc), i, j);
-            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body }
+            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body, coeff: 1 }
         };
         let load = |list| {
             let mut arena = ExprArena::default();
             let i = arena.arg(0);
             let body = arena.array(Arc::clone(&demand_arc), i);
-            Constraint { reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body }, op: Op::Le, rhs: 4 }
+            Constraint {
+                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body, coeff: 1 },
+                op: Op::Le,
+                rhs: 4,
+            }
         };
         let model = CollectionModel {
             items,
@@ -1143,7 +1158,8 @@ mod tests {
         let i = arena.arg(0);
         let j = arena.arg(1);
         let body = arena.matrix(Arc::clone(dist), i, j);
-        let reduction = Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list: 0, start: depot, end: depot }, arena, body };
+        let reduction =
+            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list: 0, start: depot, end: depot }, arena, body, coeff: 1 };
         CollectionModel {
             items,
             lists: 1,
@@ -1219,13 +1235,17 @@ mod tests {
             let i = arena.arg(0);
             let j = arena.arg(1);
             let body = arena.matrix(Arc::clone(&dist_arc), i, j);
-            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body }
+            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body, coeff: 1 }
         };
         let load = |list| {
             let mut arena = ExprArena::default();
             let i = arena.arg(0);
             let body = arena.array(Arc::clone(&demand_arc), i);
-            Constraint { reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body }, op: Op::Le, rhs: 2 }
+            Constraint {
+                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body, coeff: 1 },
+                op: Op::Le,
+                rhs: 2,
+            }
         };
         let model = CollectionModel {
             items: items.clone(),
@@ -1294,14 +1314,14 @@ mod tests {
             let i = arena.arg(0);
             let j = arena.arg(1);
             let body = arena.matrix(Arc::clone(dist), i, j);
-            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body }
+            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body, coeff: 1 }
         };
         let load = |list| {
             let mut arena = ExprArena::default();
             let i = arena.arg(0);
             let body = arena.array(Arc::clone(demand), i);
             Constraint {
-                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body },
+                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body, coeff: 1 },
                 op: Op::Le,
                 rhs: capacity,
             }
@@ -1517,7 +1537,11 @@ mod tests {
     fn count_eq(list: usize, k: i64) -> Constraint {
         let mut arena = ExprArena::default();
         let body = arena.constant(1); // count of items present = route length
-        Constraint { reduction: Reduction { op: ReduceOp::Count, iterable: Iterable::Items(list), arena, body }, op: Op::Eq, rhs: k }
+        Constraint {
+            reduction: Reduction { op: ReduceOp::Count, iterable: Iterable::Items(list), arena, body, coeff: 1 },
+            op: Op::Eq,
+            rhs: k,
+        }
     }
 
     #[test]
@@ -1539,7 +1563,7 @@ mod tests {
             let i = arena.arg(0);
             let j = arena.arg(1);
             let body = arena.matrix(Arc::clone(&dist_arc), i, j);
-            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body }
+            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body, coeff: 1 }
         };
         let model = CollectionModel {
             items: items.clone(),
@@ -1576,13 +1600,17 @@ mod tests {
             let i = arena.arg(0);
             let j = arena.arg(1);
             let body = arena.matrix(Arc::clone(&dist_arc), i, j);
-            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body }
+            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body, coeff: 1 }
         };
         let load = |list| {
             let mut arena = ExprArena::default();
             let i = arena.arg(0);
             let body = arena.array(Arc::clone(&demand_arc), i);
-            Constraint { reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body }, op: Op::Le, rhs: 2 }
+            Constraint {
+                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body, coeff: 1 },
+                op: Op::Le,
+                rhs: 2,
+            }
         };
         let model = CollectionModel {
             items: items.clone(),
@@ -1628,13 +1656,17 @@ mod tests {
             let i = arena.arg(0);
             let j = arena.arg(1);
             let body = arena.matrix(Arc::clone(&dist_arc), i, j);
-            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body }
+            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body, coeff: 1 }
         };
         let value_sum = |list| {
             let mut arena = ExprArena::default();
             let i = arena.arg(0);
             let body = arena.array(Arc::clone(&value_arc), i);
-            Constraint { reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body }, op: Op::Ge, rhs: 11 }
+            Constraint {
+                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body, coeff: 1 },
+                op: Op::Ge,
+                rhs: 11,
+            }
         };
         let model = CollectionModel {
             items: items.clone(),
@@ -1674,19 +1706,27 @@ mod tests {
             let i = arena.arg(0);
             let j = arena.arg(1);
             let body = arena.matrix(Arc::clone(&dist_arc), i, j);
-            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body }
+            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body, coeff: 1 }
         };
         let load = |list| {
             let mut arena = ExprArena::default();
             let i = arena.arg(0);
             let body = arena.array(Arc::clone(&demand_arc), i);
-            Constraint { reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body }, op: Op::Le, rhs: 2 }
+            Constraint {
+                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body, coeff: 1 },
+                op: Op::Le,
+                rhs: 2,
+            }
         };
         let value_sum = |list| {
             let mut arena = ExprArena::default();
             let i = arena.arg(0);
             let body = arena.array(Arc::clone(&value_arc), i);
-            Constraint { reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body }, op: Op::Ge, rhs: 11 }
+            Constraint {
+                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body, coeff: 1 },
+                op: Op::Ge,
+                rhs: 11,
+            }
         };
         let model = CollectionModel {
             items,
@@ -1722,13 +1762,17 @@ mod tests {
             let i = arena.arg(0);
             let j = arena.arg(1);
             let body = arena.matrix(Arc::clone(&dist_arc), i, j);
-            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body }
+            Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body, coeff: 1 }
         };
         let load = |list| {
             let mut arena = ExprArena::default();
             let i = arena.arg(0);
             let body = arena.array(Arc::clone(&demand_arc), i);
-            Constraint { reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body }, op: Op::Le, rhs: 3 }
+            Constraint {
+                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body, coeff: 1 },
+                op: Op::Le,
+                rhs: 3,
+            }
         };
         let model = CollectionModel {
             items,
