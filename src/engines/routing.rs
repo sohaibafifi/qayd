@@ -133,7 +133,7 @@ impl RoutingSpec {
             return None;
         }
         let tier = &model.objectives[0];
-        if !tier.minimize || tier.max_terms.is_some() || tier.terms.len() != model.lists {
+        if !tier.minimize || tier.has_max_terms() || tier.terms.len() != model.lists {
             return None;
         }
         let (depot, edge) = parse_route_edge_objective(&tier.terms, model.lists)?;

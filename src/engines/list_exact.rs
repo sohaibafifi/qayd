@@ -313,7 +313,7 @@ fn run_member_var_search(
 /// indicators (`Used` terms). Returns `None` for anything not yet linearizable
 /// (currently `Count`), so the caller falls back to the enumerate path.
 fn lower_linear_tier(solver: &mut Solver, lists: &[ListId], tier: &ListObjectiveTier) -> Option<(Vec<i64>, Vec<VarId>)> {
-    if tier.max_terms.is_some() {
+    if tier.max_terms.as_ref().is_some_and(|terms| !terms.is_empty()) {
         return None;
     }
     let mut coeffs = Vec::new();

@@ -19,8 +19,8 @@ pub use objective::*;
 // `list::` so its `Expr` does not clash with the intension `Expr`; only the
 // model-level list surface is re-exported at the model root.
 pub use list::{
-    evaluate_list_objectives, list_objective_tiers, list_objectives_better, ListDecl, ListIterable, ListObjectiveTerm, ListObjectiveTier,
-    ListReduceOp, ListReduction, ListReductionConstraint, ListVarRef,
+    evaluate_list_objectives, list_objective_tiers, list_objectives_better, ListDecl, ListIterable, ListMaxTerm, ListObjectiveTerm,
+    ListObjectiveTier, ListReduceOp, ListReduction, ListReductionConstraint, ListVarRef,
 };
 
 /// Constraint declarations owned by the shared model.

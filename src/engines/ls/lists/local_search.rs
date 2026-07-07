@@ -823,7 +823,7 @@ pub fn solve_collection_capped(
             machines: Vec::new(),
         };
     }
-    if model.objectives.iter().any(|tier| tier.max_terms.is_some()) {
+    if model.objectives.iter().any(|tier| tier.has_max_terms()) {
         return CollectionSolution {
             lists: vec![Vec::new(); model.lists.max(1)],
             objectives: Vec::new(),

@@ -19,6 +19,9 @@ pub struct ListDecl {
 /// Current list reduction representation during the migration.
 pub type ListReduction = Reduction;
 
+/// Current list max-objective component representation during the migration.
+pub type ListMaxTerm = MaxTerm;
+
 /// Current list constraint representation during the migration.
 pub type ListReductionConstraint = Constraint;
 
@@ -42,6 +45,13 @@ pub enum ListObjectiveTerm {
     Reduction(Reduction),
 }
 
+/// Parsed exact-search form of `coeff * max(sum(group_0), ...)`.
+#[derive(Clone)]
+pub struct ListObjectiveMaxTerm {
+    pub groups: Vec<Vec<ListObjectiveTerm>>,
+    pub coeff: i64,
+}
+
 /// One domain exact lexicographic objective tier.
 #[derive(Clone)]
 pub struct ListObjectiveTier {
@@ -49,8 +59,8 @@ pub struct ListObjectiveTier {
     pub minimize: bool,
     /// Terms summed to form the tier value.
     pub terms: Vec<ListObjectiveTerm>,
-    /// Alternative objective form: maximum over grouped term sums.
-    pub max_terms: Option<Vec<Vec<ListObjectiveTerm>>>,
+    /// Max components added to the tier value.
+    pub max_terms: Option<Vec<ListObjectiveMaxTerm>>,
 }
 
 /// Parse list objective tiers that domain exact search can evaluate.
@@ -62,10 +72,21 @@ pub fn list_objective_tiers(tiers: &[ObjectiveTier], items: &[i32]) -> Option<Ve
             terms.push(list_objective_term(reduction, items)?);
         }
         let max_terms = match &tier.max_terms {
-            Some(groups) => Some(
-                groups
+            Some(max_terms) => Some(
+                max_terms
                     .iter()
-                    .map(|group| group.iter().map(|reduction| list_objective_term(reduction, items)).collect::<Option<Vec<_>>>())
+                    .map(|term| {
+                        Some(ListObjectiveMaxTerm {
+                            groups: term
+                                .groups
+                                .iter()
+                                .map(|group| {
+                                    group.iter().map(|reduction| list_objective_term(reduction, items)).collect::<Option<Vec<_>>>()
+                                })
+                                .collect::<Option<Vec<_>>>()?,
+                            coeff: term.coeff,
+                        })
+                    })
                     .collect::<Option<Vec<_>>>()?,
             ),
             None => None,
@@ -79,9 +100,16 @@ pub fn list_objective_tiers(tiers: &[ObjectiveTier], items: &[i32]) -> Option<Ve
 pub fn evaluate_list_objectives(tiers: &[ListObjectiveTier], lists: &[Vec<i32>]) -> Vec<i64> {
     tiers
         .iter()
-        .map(|tier| match &tier.max_terms {
-            Some(groups) => groups.iter().map(|group| eval_list_objective_terms(group, lists, tier.minimize)).max().unwrap_or(0),
-            None => eval_list_objective_terms(&tier.terms, lists, tier.minimize),
+        .map(|tier| {
+            let mut value = eval_list_objective_terms(&tier.terms, lists, tier.minimize);
+            if let Some(max_terms) = &tier.max_terms {
+                for term in max_terms {
+                    let component =
+                        term.groups.iter().map(|group| eval_list_objective_terms(group, lists, tier.minimize)).max().unwrap_or(0);
+                    value = value.saturating_add(component.saturating_mul(term.coeff));
+                }
+            }
+            value
         })
         .collect()
 }

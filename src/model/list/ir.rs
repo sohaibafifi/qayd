@@ -213,24 +213,33 @@ impl GlobalConstraint {
     }
 }
 
-/// One lexicographic objective tier. By default the tier is the sum of its
-/// reductions. `max_terms` represents `max(sum(group_0), sum(group_1), ...)`.
-/// Earlier tiers dominate later ones (e.g. fleet size before distance). At most
-/// [`MAX_TIERS`] tiers.
+/// A composable `coeff * max(sum(group_0), sum(group_1), ...)` objective
+/// component.
+#[derive(Clone)]
+pub struct MaxTerm {
+    pub groups: Vec<Vec<Reduction>>,
+    pub coeff: i64,
+}
+
+/// One lexicographic objective tier. The tier value is the sum of its reductions
+/// plus each `max_terms` component. Earlier tiers dominate later ones (e.g. fleet
+/// size before distance). At most [`MAX_TIERS`] tiers.
 #[derive(Clone)]
 pub struct ObjectiveTier {
     pub minimize: bool,
     pub terms: Vec<Reduction>,
-    pub max_terms: Option<Vec<Vec<Reduction>>>,
+    pub max_terms: Option<Vec<MaxTerm>>,
 }
 
 impl ObjectiveTier {
     pub fn reductions(&self) -> impl Iterator<Item = &Reduction> {
-        self.terms.iter().chain(self.max_terms.iter().flat_map(|groups| groups.iter().flat_map(|group| group.iter())))
+        self.terms
+            .iter()
+            .chain(self.max_terms.iter().flat_map(|terms| terms.iter().flat_map(|term| term.groups.iter().flat_map(|group| group.iter()))))
     }
 
     pub fn has_max_terms(&self) -> bool {
-        self.max_terms.is_some()
+        self.max_terms.as_ref().is_some_and(|terms| !terms.is_empty())
     }
 }
 

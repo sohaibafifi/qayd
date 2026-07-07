@@ -264,8 +264,10 @@ impl ListSummary {
         let mut summary = Self::default();
         for objective in &model.objectives {
             if let Objective::ListTerms { terms, max_terms, .. } = objective {
-                summary.has_max_objective |= max_terms.is_some();
-                for reduction in terms.iter().chain(max_terms.iter().flat_map(|groups| groups.iter().flat_map(|group| group.iter()))) {
+                summary.has_max_objective |= max_terms.as_ref().is_some_and(|terms| !terms.is_empty());
+                for reduction in terms.iter().chain(
+                    max_terms.iter().flat_map(|terms| terms.iter().flat_map(|term| term.groups.iter().flat_map(|group| group.iter()))),
+                ) {
                     summary.visit_reduction(reduction);
                     summary.has_fleet_objective |= matches!(reduction.op, list::ReduceOp::Used);
                 }
@@ -318,7 +320,7 @@ fn objectives_are_list_simple(model: &Model) -> bool {
     model.objectives.iter().all(|objective| match objective {
         Objective::ListTerms { terms, max_terms, .. } => terms
             .iter()
-            .chain(max_terms.iter().flat_map(|groups| groups.iter().flat_map(|group| group.iter())))
+            .chain(max_terms.iter().flat_map(|terms| terms.iter().flat_map(|term| term.groups.iter().flat_map(|group| group.iter()))))
             .all(is_list_simple_objective_reduction),
         Objective::IntExpr { .. } | Objective::Makespan { .. } => false,
     })
@@ -345,7 +347,7 @@ fn routing_integer_lowering_supported(model: &Model) -> bool {
         let Objective::ListTerms { minimize: true, terms, max_terms } = &model.objectives[0] else {
             return false;
         };
-        if max_terms.is_some() {
+        if max_terms.as_ref().is_some_and(|terms| !terms.is_empty()) {
             return false;
         }
         return direct_closed_edge_objective(terms, model.lists.len(), items)

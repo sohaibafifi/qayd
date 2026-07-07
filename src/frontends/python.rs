@@ -3338,7 +3338,7 @@ struct PyTerm {
     model_id: u64,
     gen: u64,
     reductions: Vec<list::Reduction>,
-    max_terms: Option<Vec<Vec<list::Reduction>>>,
+    max_terms: Option<Vec<list::MaxTerm>>,
 }
 
 /// A constraint `term <op> rhs` over a single list reduction.
@@ -3357,12 +3357,12 @@ fn combine_terms(a: &PyTerm, b: &PyTerm) -> PyResult<PyTerm> {
     if a.model_id != b.model_id || a.gen != b.gen {
         return Err(PyValueError::new_err("cannot combine terms from different models or list_vars generations"));
     }
-    if a.max_terms.is_some() || b.max_terms.is_some() {
-        return Err(PyTypeError::new_err("max_of terms cannot be added to other terms; use them directly as an objective"));
-    }
     let mut reductions = a.reductions.clone();
     reductions.extend(b.reductions.iter().cloned());
-    Ok(PyTerm { model_id: a.model_id, gen: a.gen, reductions, max_terms: None })
+    let mut max_terms = a.max_terms.clone().unwrap_or_default();
+    max_terms.extend(b.max_terms.iter().flatten().cloned());
+    let max_terms = (!max_terms.is_empty()).then_some(max_terms);
+    Ok(PyTerm { model_id: a.model_id, gen: a.gen, reductions, max_terms })
 }
 
 fn scale_reduction(reduction: &list::Reduction, coeff: i64) -> PyResult<list::Reduction> {
@@ -3372,11 +3372,23 @@ fn scale_reduction(reduction: &list::Reduction, coeff: i64) -> PyResult<list::Re
 }
 
 fn scale_term(term: &PyTerm, coeff: i64) -> PyResult<PyTerm> {
-    if term.max_terms.is_some() {
-        return Err(PyTypeError::new_err("max_of terms cannot be multiplied by a scalar"));
-    }
     let reductions = term.reductions.iter().map(|reduction| scale_reduction(reduction, coeff)).collect::<PyResult<Vec<_>>>()?;
-    Ok(PyTerm { model_id: term.model_id, gen: term.gen, reductions, max_terms: None })
+    let max_terms = term
+        .max_terms
+        .as_ref()
+        .map(|terms| {
+            terms
+                .iter()
+                .map(|term| {
+                    Ok(list::MaxTerm {
+                        groups: term.groups.clone(),
+                        coeff: term.coeff.checked_mul(coeff).ok_or_else(|| PyValueError::new_err("term coefficient overflows i64"))?,
+                    })
+                })
+                .collect::<PyResult<Vec<_>>>()
+        })
+        .transpose()?;
+    Ok(PyTerm { model_id: term.model_id, gen: term.gen, reductions, max_terms })
 }
 
 fn max_term(terms: Vec<PyTerm>) -> PyResult<PyTerm> {
@@ -3393,7 +3405,7 @@ fn max_term(terms: Vec<PyTerm>) -> PyResult<PyTerm> {
         }
         groups.push(term.reductions);
     }
-    Ok(PyTerm { model_id, gen, reductions: Vec::new(), max_terms: Some(groups) })
+    Ok(PyTerm { model_id, gen, reductions: Vec::new(), max_terms: Some(vec![list::MaxTerm { groups, coeff: 1 }]) })
 }
 
 #[pymethods]
@@ -3423,7 +3435,7 @@ impl PyTerm {
     }
 
     fn __richcmp__(&self, other: &Bound<'_, PyAny>, op: CompareOp) -> PyResult<PyListConstraint> {
-        if self.max_terms.is_some() {
+        if self.max_terms.as_ref().is_some_and(|terms| !terms.is_empty()) {
             return Err(PyValueError::new_err("max_of list terms are supported as objectives, not constraints"));
         }
         let rhs = other.extract::<i64>().map_err(|_| PyTypeError::new_err("a term can only be compared to an integer bound"))?;
