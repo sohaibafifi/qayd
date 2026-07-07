@@ -102,6 +102,9 @@ struct PyIntervalVar {
     interval: Option<IntervalId>,
     start: Option<VarId>,
     presence: Option<VarId>,
+    /// Fixed duration; `None` for moded intervals whose realised duration
+    /// depends on the selected mode.
+    duration: Option<i64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -138,6 +141,29 @@ impl PyIntervalVar {
     #[getter]
     fn optional(&self) -> bool {
         self.presence.is_some()
+    }
+
+    #[getter]
+    fn duration(&self) -> Option<i64> {
+        self.duration
+    }
+
+    /// `start + duration`, as an expression usable in constraints/objectives.
+    #[getter]
+    fn end(&self) -> PyResult<PyExpr> {
+        let (Some(start), Some(duration)) = (self.start, self.duration) else {
+            return Err(PyValueError::new_err(
+                "end is only available on fixed-duration intervals with a start variable; \
+                 a moded interval (alternatives) has a mode-dependent duration",
+            ));
+        };
+        Ok(PyExpr {
+            inner: ExprLike {
+                model_id: Some(self.model_id),
+                expr: expr::add(vec![expr::var(start), expr::int(duration)]),
+                text: format!("(interval{}.start + {})", self.index, duration),
+            },
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -1953,6 +1979,7 @@ impl PyModel {
                 interval: None,
                 start: None,
                 presence: None,
+                duration: None,
             })
             .collect())
     }
@@ -2277,6 +2304,7 @@ impl PyModel {
             interval: Some(interval),
             start: Some(start),
             presence,
+            duration: Some(duration),
         })
     }
 
@@ -3302,22 +3330,51 @@ fn build_items_reduction(route: &PyListVar, op: list::ReduceOp, func: &Bound<'_,
 /// `sum(route, i => body)`, or `sum(terms)` to add a collection of terms.
 #[pyfunction]
 #[pyo3(signature = (arg, func=None))]
-fn sum(arg: &Bound<'_, PyAny>, func: Option<&Bound<'_, PyAny>>) -> PyResult<PyTerm> {
+fn sum(py: Python<'_>, arg: &Bound<'_, PyAny>, func: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
     if let Some(f) = func {
         let route = arg
             .extract::<PyRef<'_, PyListVar>>()
             .map_err(|_| PyTypeError::new_err("sum(route, lambda): the first argument must be a list variable"))?;
-        return build_items_reduction(&route, list::ReduceOp::Sum, f);
+        return Ok(build_items_reduction(&route, list::ReduceOp::Sum, f)?.into_pyobject(py)?.into_any().unbind());
     }
-    let mut acc: Option<PyTerm> = None;
+    // An iterable of list-domain terms folds to a Term; an iterable of
+    // arithmetic operands (Expr/IntVar/int) folds to an Expr. Mixing the two
+    // domains has no meaning.
+    let mut terms: Option<PyTerm> = None;
+    let mut exprs: Option<(Vec<Expr>, Option<u64>, Vec<String>)> = None;
     for item in arg.try_iter()? {
-        let t = item?.extract::<PyRef<'_, PyTerm>>().map_err(|_| PyTypeError::new_err("sum(iterable) expects an iterable of terms"))?;
-        acc = Some(match acc {
-            None => t.clone(),
-            Some(a) => combine_terms(&a, &t)?,
-        });
+        let item = item?;
+        if let Ok(t) = item.extract::<PyRef<'_, PyTerm>>() {
+            if exprs.is_some() {
+                return Err(PyTypeError::new_err("sum(iterable) cannot mix list-domain terms with arithmetic expressions"));
+            }
+            terms = Some(match terms {
+                None => t.clone(),
+                Some(a) => combine_terms(&a, &t)?,
+            });
+            continue;
+        }
+        let e = expr_from_py(&item).map_err(|_| {
+            PyTypeError::new_err("sum(iterable) expects list-domain terms or arithmetic operands (Expr, IntVar, int)")
+        })?;
+        if terms.is_some() {
+            return Err(PyTypeError::new_err("sum(iterable) cannot mix list-domain terms with arithmetic expressions"));
+        }
+        let (parts, model_id, texts) = exprs.get_or_insert_with(|| (Vec::new(), None, Vec::new()));
+        *model_id = merge_model_ids(*model_id, e.model_id)?;
+        parts.push(e.expr);
+        texts.push(e.text);
     }
-    acc.ok_or_else(|| PyValueError::new_err("sum got no terms to add"))
+    match (terms, exprs) {
+        (Some(t), None) => Ok(t.into_pyobject(py)?.into_any().unbind()),
+        (None, Some((parts, model_id, texts))) => {
+            let expr = PyExpr {
+                inner: ExprLike { model_id, expr: expr::add(parts), text: format!("({})", texts.join(" + ")) },
+            };
+            Ok(expr.into_pyobject(py)?.into_any().unbind())
+        }
+        _ => Err(PyValueError::new_err("sum got no terms to add")),
+    }
 }
 
 /// `min(route, i => body)` over a route's items (undefined, hence infeasible,
