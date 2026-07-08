@@ -37,6 +37,16 @@ from ._core import (
     used,
     windows,
 )
+from .list_resource import (
+    ScanResource,
+    ScanResourceConstraint,
+    ScanResourcePointExpr,
+    install_model_api as install_list_resource_api,
+    scan_resource,
+)
+
+install_list_resource_api()
+
 from .routing import (
     CustomerData,
     CustomerRef,
@@ -44,6 +54,8 @@ from .routing import (
     CustomerValue,
     RouteSet,
     RouteVar,
+    RouteResourceVisitView,
+    RoutingResource,
     VisitView,
     install_model_api as install_routing_api,
 )
@@ -74,7 +86,12 @@ __all__ = [
     "Model",
     "RouteSet",
     "RouteVar",
+    "RouteResourceVisitView",
+    "RoutingResource",
     "ScheduleSet",
+    "ScanResource",
+    "ScanResourceConstraint",
+    "ScanResourcePointExpr",
     "ScheduledTaskView",
     "Solution",
     "SolveStats",
@@ -102,6 +119,7 @@ __all__ = [
     "ne",
     "pos_pairs",
     "scan_sum",
+    "scan_resource",
     "select_kth",
     "max_of",
     "maximum",

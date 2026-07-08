@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
 from . import _core as cp
+from .list_resource import ScanResource, scan_resource
 
 
 _ORIGINAL_MODEL_ADD = cp.Model.add
@@ -257,6 +258,7 @@ class RouteSet:
         self.optional = bool(optional)
         self._lists = model.list_vars(customers.ids, count=int(vehicles), optional=optional)
         self._routes = [RouteVar(self, index, route) for index, route in enumerate(self._lists)]
+        self._resources: Dict[str, RoutingResource] = {}
 
     def __iter__(self) -> Iterator[RouteVar]:
         return iter(self._routes)
@@ -278,6 +280,41 @@ class RouteSet:
 
     def total_profit(self, profit: Optional[Any] = None) -> Any:
         return self.sum(lambda route: route.profit(profit))
+
+    def resource(
+        self,
+        name: str,
+        *,
+        initial: int = 0,
+        lower: Optional[int] = None,
+        upper: Optional[int] = None,
+        bounds: Optional[Tuple[int, int]] = None,
+        delta: Optional[Callable[[RouteItemRef, RouteItemRef], Any]] = None,
+        transition: Optional[Callable[[RouteItemRef, Any, RouteItemRef], Any]] = None,
+        consume: Optional[Callable[[RouteItemRef, RouteItemRef], Any]] = None,
+        produce: Optional[Callable[[RouteItemRef], Any]] = None,
+        refill: Optional[Callable[[RouteItemRef], Any]] = None,
+    ) -> "RoutingResource":
+        resource = RoutingResource(
+            self,
+            name,
+            initial=initial,
+            lower=lower,
+            upper=upper,
+            bounds=bounds,
+            delta=delta,
+            transition=transition,
+            consume=consume,
+            produce=produce,
+            refill=refill,
+        )
+        if name in self._resources:
+            raise ValueError(f"route resource {name!r} already exists")
+        self._resources[name] = resource
+        return resource
+
+    def _item_ref(self, node: Any) -> RouteItemRef:
+        return RouteItemRef(self, node)
 
     def _travel_matrix(self, travel: Optional[Any] = None) -> Any:
         matrix = self.travel if travel is None else _core_matrix(travel)
@@ -335,6 +372,13 @@ class VisitView:
 
     def before(self, other: "VisitView") -> "VisitOrderConstraint":
         return VisitOrderConstraint(self, other)
+
+    def __getattr__(self, name: str) -> "RouteResourceVisitView":
+        try:
+            resource = self.routes._resources[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+        return RouteResourceVisitView(resource, self.customer)
 
     def __repr__(self) -> str:
         return f"VisitView({self.customer.id})"
@@ -483,6 +527,165 @@ class VisitOrderConstraint(VisitConstraint):
             _ORIGINAL_MODEL_ADD(model, term <= 0)
 
 
+class RoutingResource:
+    """One named deterministic resource over every route."""
+
+    def __init__(
+        self,
+        routes: RouteSet,
+        name: str,
+        *,
+        initial: int,
+        lower: Optional[int],
+        upper: Optional[int],
+        bounds: Optional[Tuple[int, int]],
+        delta: Optional[Callable[[RouteItemRef, RouteItemRef], Any]],
+        transition: Optional[Callable[[RouteItemRef, Any, RouteItemRef], Any]],
+        consume: Optional[Callable[[RouteItemRef, RouteItemRef], Any]],
+        produce: Optional[Callable[[RouteItemRef], Any]],
+        refill: Optional[Callable[[RouteItemRef], Any]],
+    ):
+        if bounds is not None:
+            if lower is not None or upper is not None:
+                raise ValueError("use either bounds=(lower, upper) or lower=/upper=, not both")
+            lower, upper = bounds
+        if refill is not None:
+            if produce is not None:
+                raise ValueError("use produce= or refill=, not both")
+            produce = refill
+        provided = sum(value is not None for value in (delta, transition, consume))
+        if provided != 1:
+            raise ValueError("route resource needs exactly one of delta=, transition=, or consume=")
+
+        self.routes = routes
+        self.name = name
+        self.initial = _as_i64(initial, "resource initial value")
+        self.lower = lower
+        self.upper = upper
+        self._scans = [self._make_scan(route, delta, transition, consume, produce) for route in routes]
+
+    def visit(self, customer: Union[int, CustomerRef]) -> "RouteResourceVisitView":
+        return RouteResourceVisitView(self, self.routes.customers[customer])
+
+    def within_bounds(self, *, view: str = "after", lower: Optional[int] = None, upper: Optional[int] = None) -> "RoutingResourceBoundsConstraint":
+        if lower is None:
+            lower = self.lower
+        if upper is None:
+            upper = self.upper
+        if lower is None and upper is None:
+            raise ValueError("within_bounds needs a lower or upper bound")
+        return RoutingResourceBoundsConstraint(self, view, lower, upper)
+
+    def _make_scan(
+        self,
+        route: RouteVar,
+        delta: Optional[Callable[[RouteItemRef, RouteItemRef], Any]],
+        transition: Optional[Callable[[RouteItemRef, Any, RouteItemRef], Any]],
+        consume: Optional[Callable[[RouteItemRef, RouteItemRef], Any]],
+        produce: Optional[Callable[[RouteItemRef], Any]],
+    ) -> ScanResource:
+        routes = self.routes
+        if transition is not None:
+
+            def step(cur: Any, state: Any, prev: Any) -> Any:
+                return transition(routes._item_ref(cur), state, routes._item_ref(prev))
+
+            return scan_resource(route, initial=self.initial, lower=self.lower, upper=self.upper, transition=step, boundary=routes.depot)
+        if delta is not None:
+
+            def step(cur: Any, state: Any, prev: Any) -> Any:
+                return state + delta(routes._item_ref(prev), routes._item_ref(cur))
+
+            return scan_resource(route, initial=self.initial, lower=self.lower, upper=self.upper, transition=step, boundary=routes.depot)
+
+        if produce is None:
+            produce = lambda cur: 0
+
+        def step(cur: Any, state: Any, prev: Any) -> Any:
+            cur_ref = routes._item_ref(cur)
+            return state - consume(routes._item_ref(prev), cur_ref) + produce(cur_ref)
+
+        scan = scan_resource(route, initial=self.initial, lower=self.lower, upper=self.upper, transition=step, boundary=routes.depot)
+        scan.view("before", lambda cur, state, prev: state - produce(routes._item_ref(cur)))
+        return scan
+
+    def _constraint(self, customer_id: int, view: str, op: str, rhs: int) -> "RoutingResourcePointConstraint":
+        return RoutingResourcePointConstraint(self, customer_id, view, op, rhs)
+
+    def __repr__(self) -> str:
+        return f"RoutingResource({self.name!r})"
+
+
+class RouteResourceVisitView:
+    def __init__(self, resource: RoutingResource, customer: CustomerRef):
+        self.resource = resource
+        self.customer = customer
+
+    @property
+    def after(self) -> "RouteResourcePointExpr":
+        return RouteResourcePointExpr(self.resource, self.customer, "after")
+
+    @property
+    def before(self) -> "RouteResourcePointExpr":
+        return RouteResourcePointExpr(self.resource, self.customer, "before")
+
+
+class RouteResourcePointExpr:
+    def __init__(self, resource: RoutingResource, customer: CustomerRef, view: str):
+        self.resource = resource
+        self.customer = customer
+        self.view = view
+
+    def __le__(self, rhs: Any) -> "RoutingResourcePointConstraint":
+        return self.resource._constraint(self.customer.id, self.view, "le", _as_i64(rhs, "resource bound"))
+
+    def __ge__(self, rhs: Any) -> "RoutingResourcePointConstraint":
+        return self.resource._constraint(self.customer.id, self.view, "ge", _as_i64(rhs, "resource bound"))
+
+    def __eq__(self, rhs: Any) -> "RoutingResourcePointConstraint":  # type: ignore[override]
+        return self.resource._constraint(self.customer.id, self.view, "eq", _as_i64(rhs, "resource bound"))
+
+    def __hash__(self) -> int:
+        return hash((id(self.resource), self.customer.id, self.view))
+
+
+class RoutingResourceConstraint(VisitConstraint):
+    pass
+
+
+class RoutingResourcePointConstraint(RoutingResourceConstraint):
+    def __init__(self, resource: RoutingResource, customer_id: int, view: str, op: str, rhs: int):
+        self.resource = resource
+        self.customer_id = int(customer_id)
+        self.view = view
+        self.op = op
+        self.rhs = rhs
+
+    def post(self, model: Any) -> None:
+        for scan in self.resource._scans:
+            expr = scan.at(self.customer_id, view=self.view)
+            if self.op == "le":
+                model.add(expr <= self.rhs)
+            elif self.op == "ge":
+                model.add(expr >= self.rhs)
+            elif self.op == "eq":
+                model.add(expr == self.rhs)
+            else:
+                raise ValueError(f"unsupported resource relation {self.op!r}")
+
+
+class RoutingResourceBoundsConstraint(RoutingResourceConstraint):
+    def __init__(self, resource: RoutingResource, view: str, lower: Optional[int], upper: Optional[int]):
+        self.resource = resource
+        self.view = view
+        self.lower = lower
+        self.upper = upper
+
+    def post(self, model: Any) -> None:
+        for scan in self.resource._scans:
+            model.add(scan.within_bounds(view=self.view, lower=self.lower, upper=self.upper))
+
+
 def customers(self: Any, items: Iterable[int]) -> CustomerSet:
     return CustomerSet(items)
 
@@ -534,6 +737,8 @@ __all__ = [
     "CustomerValue",
     "RouteSet",
     "RouteVar",
+    "RouteResourceVisitView",
+    "RoutingResource",
     "VisitView",
     "install_model_api",
 ]

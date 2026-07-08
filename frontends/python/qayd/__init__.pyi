@@ -194,6 +194,35 @@ class ListConstraint:
     """A constraint ``term <op> rhs`` over a single list reduction."""
 
 
+class ScanResourceConstraint:
+    """A constraint over a deterministic resource scan."""
+
+
+class ScanResourcePointExpr:
+    """A named resource view at one list item."""
+
+    def __le__(self, rhs: int) -> ScanResourceConstraint: ...
+    def __ge__(self, rhs: int) -> ScanResourceConstraint: ...
+    def __eq__(self, rhs: object) -> ScanResourceConstraint: ...  # type: ignore[override]
+    def __hash__(self) -> int: ...
+
+
+class ScanResource:
+    """A deterministic state threaded along one list variable."""
+
+    def view(self, name: str, projection: _Body3) -> ScanResource: ...
+    def at(self, item: int, *, view: str = ...) -> ScanResourcePointExpr: ...
+    def after(self, item: int) -> ScanResourcePointExpr: ...
+    def before(self, item: int) -> ScanResourcePointExpr: ...
+    def within_bounds(
+        self,
+        *,
+        view: str = ...,
+        lower: Optional[int] = ...,
+        upper: Optional[int] = ...,
+    ) -> ScanResourceConstraint: ...
+
+
 # ===========================================================================
 # Routing convenience API
 # ===========================================================================
@@ -277,6 +306,7 @@ class VisitView:
     def position(self) -> VisitPositionExpr: ...
     def same_route(self, other: "VisitView") -> VisitConstraint: ...
     def before(self, other: "VisitView") -> VisitConstraint: ...
+    def __getattr__(self, name: str) -> "RouteResourceVisitView": ...
     def __repr__(self) -> str: ...
 
 
@@ -293,6 +323,39 @@ class RouteVar:
     def __repr__(self) -> str: ...
 
 
+class RoutingResource:
+    """One named deterministic resource over every route."""
+
+    name: str
+    def visit(self, customer: Union[int, CustomerRef]) -> "RouteResourceVisitView": ...
+    def within_bounds(
+        self,
+        *,
+        view: str = ...,
+        lower: Optional[int] = ...,
+        upper: Optional[int] = ...,
+    ) -> VisitConstraint: ...
+    def __repr__(self) -> str: ...
+
+
+class RouteResourceVisitView:
+    """Per-customer view of one route resource."""
+
+    @property
+    def before(self) -> "RouteResourcePointExpr": ...
+    @property
+    def after(self) -> "RouteResourcePointExpr": ...
+
+
+class RouteResourcePointExpr:
+    """A route resource view for one customer."""
+
+    def __le__(self, rhs: Union[int, CustomerValue]) -> VisitConstraint: ...
+    def __ge__(self, rhs: Union[int, CustomerValue]) -> VisitConstraint: ...
+    def __eq__(self, rhs: Union[int, CustomerValue]) -> VisitConstraint: ...  # type: ignore[override]
+    def __hash__(self) -> int: ...
+
+
 class RouteSet:
     """A set of visible routes over a customer set."""
 
@@ -306,6 +369,20 @@ class RouteSet:
     def used_count(self) -> Term: ...
     def total_distance(self, travel: Optional[Any] = ...) -> Term: ...
     def total_profit(self, profit: Optional[Any] = ...) -> Term: ...
+    def resource(
+        self,
+        name: str,
+        *,
+        initial: int = ...,
+        lower: Optional[int] = ...,
+        upper: Optional[int] = ...,
+        bounds: Optional[Tuple[int, int]] = ...,
+        delta: Optional[Callable[[Any, Any], Any]] = ...,
+        transition: Optional[Callable[[Any, Any, Any], Any]] = ...,
+        consume: Optional[Callable[[Any, Any], Any]] = ...,
+        produce: Optional[Callable[[Any], Any]] = ...,
+        refill: Optional[Callable[[Any], Any]] = ...,
+    ) -> RoutingResource: ...
     def __repr__(self) -> str: ...
 
 
@@ -543,9 +620,10 @@ class Model:
         constraint: Union[
             Constraint,
             ListConstraint,
+            ScanResourceConstraint,
             VisitConstraint,
             ScheduleConstraint,
-            Iterable[Union[Constraint, ListConstraint, VisitConstraint, ScheduleConstraint]],
+            Iterable[Union[Constraint, ListConstraint, ScanResourceConstraint, VisitConstraint, ScheduleConstraint]],
         ],
     ) -> None: ...
     def linear(self, coeffs: Sequence[int], vars: Iterable[IntVar], relation: str, rhs: int) -> None: ...
@@ -785,6 +863,21 @@ def ne(a: _LambdaLike, b: _LambdaLike) -> LambdaExpr:
 
 def scan_sum(route: ListVar, step: _Body3, emit: _Body3, *, init: int = ..., boundary: int = ...) -> Term:
     """Fold an accumulator along the route and sum a per-step ``emit`` value."""
+    ...
+
+
+def scan_resource(
+    route: ListVar,
+    *,
+    initial: int = ...,
+    lower: Optional[int] = ...,
+    upper: Optional[int] = ...,
+    bounds: Optional[Tuple[int, int]] = ...,
+    transition: Optional[_Body3] = ...,
+    delta: Optional[_Body2] = ...,
+    boundary: int = ...,
+) -> ScanResource:
+    """Thread one deterministic resource state along a list variable."""
     ...
 
 
