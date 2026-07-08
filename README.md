@@ -118,32 +118,35 @@ The Python examples live under `examples/python/`, grouped by domain: `routing/`
 `scheduling/`, `packing/`, and `mus/` (infeasibility analysis).
 
 ```bash
-QAYD_VRP_INSTANCE=/path/to/instance.vrp uv run --extra examples examples/python/routing/vrp.py
-uv run examples/python/routing/cvrptw.py
+QAYD_VRP_INSTANCE=/path/to/instance.vrp uv run --extra examples examples/python/routing/api/vrp.py
+uv run examples/python/routing/api/cvrptw.py
 uv run examples/python/packing/bin_packing.py
 uv run examples/python/mus/mus.py           # diagnose an infeasible model: model.soft(...) / model.mus()
 uv run examples/python/mus/mus_explain.py   # sub-constraint MUS explanation: model.explain_mus()
 uv run examples/python/mus/mus_enumerate.py # all MUSes + MSSes/MCSes (MARCO): model.enumerate_mus()
 ```
 
-The VRP example uses `vrplib` and expects a local CVRPLIB file via
-`QAYD_VRP_INSTANCE`. Benchmark data under `data/` is local scratch data and is
-not part of the source release.
+The API routing examples live under `examples/python/routing/api/`; the raw
+list-lambda equivalents live under `examples/python/routing/native/`. The VRP
+example uses `vrplib` and expects a local CVRPLIB file via `QAYD_VRP_INSTANCE`.
+Benchmark data under `data/` is local scratch data and is not part of the source
+release.
 
-Typical list model shape:
+Typical routing API shape:
 
 ```python
 import qayd as cp
 
 model = cp.Model()
-routes = model.list_vars(customers, count=k)
+customers = model.customers(range(1, n + 1))
+for customer in customers:
+    customer.demand = demand[customer.id]
 
+routes = model.routes(customers, vehicles=k, depot=0, travel=dist)
 for route in routes:
-    model.add(cp.sum(route, lambda i: demand[i]) <= capacity)
+    model.add(route.sum(lambda customer: customer.demand) <= capacity)
 
-model.minimize(
-    cp.sum(cp.sum_edges(r, lambda i, j: dist[i][j], start=0, end=0) for r in routes)
-)
+model.minimize(routes.sum(lambda route: route.distance()))
 solution = model.solve(time_limit=30)
 ```
 

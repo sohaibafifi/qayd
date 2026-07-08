@@ -1,8 +1,4 @@
-"""Capacitated vehicle routing on real CVRPLIB instances, read with vrplib.
-
-Modeled the usual way: a Model with k list variables (one per vehicle), a total
-distance objective, and a per-route capacity constraint. solve() picks the
-list-domain engine because the model has list variables.
+"""Capacitated vehicle routing with the routing convenience API.
 
 Instance: set ``QAYD_VRP_INSTANCE`` to any CVRPLIB ``.vrp`` file. If it is not
 set, the script tries the local scratch path
@@ -21,7 +17,7 @@ except ImportError as exc:
 import qayd as cp
 
 here = os.path.dirname(os.path.abspath(__file__))
-repo_root = os.path.abspath(os.path.join(here, "..", "..", ".."))
+repo_root = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))
 path = os.environ.get("QAYD_VRP_INSTANCE", os.path.join(repo_root, "data", "vrplib", "CVRP", "X-n101-k25.vrp"))
 time_limit = int(os.environ.get("QAYD_VRP_T", "10"))
 
@@ -30,33 +26,29 @@ if not os.path.exists(path):
 
 inst = vrplib.read_instance(path)
 name = inst.get("name", os.path.basename(path))
-dim = len(inst["demand"])                 # nodes including the depot
-depot = int(inst["depot"][0])             # CVRPLIB depot is node 0
+dim = len(inst["demand"])
+depot = int(inst["depot"][0])
 capacity = int(inst["capacity"])
 demand = [int(d) for d in inst["demand"]]
-customers = [i for i in range(dim) if i != depot]
-
-# CVRPLIB optima use TSPLIB nearest-integer distances, so round EUC_2D weights.
+customer_ids = [i for i in range(dim) if i != depot]
 dist = [[int(w + 0.5) for w in row] for row in inst["edge_weight"]]
 
-# Available vehicles: CVRPLIB names encode the fixed benchmark fleet as "-kN".
-# Override QAYD_VRP_K only when intentionally solving a different fleet size.
 m = re.search(r"-k(\d+)", name)
 min_k = int(m.group(1)) if m else -(-sum(demand) // capacity)
 k = int(os.environ.get("QAYD_VRP_K", str(min_k)))
 
-D = cp.matrix(dist)        # constant tables, indexed by node id inside lambdas
-Q = cp.array(demand)
-
 model = cp.Model()
-routes = model.list_vars(customers, count=k)   # k vehicles partition the customers
-model.minimize(cp.sum(cp.sum_edges(r, lambda i, j: D[i][j], start=depot, end=depot) for r in routes))
-for r in routes:
-    model.add(cp.sum(r, lambda i: Q[i]) <= capacity)  # each route within capacity
+customers = model.customers(customer_ids)
+for customer in customers:
+    customer.demand = demand[customer.id]
+
+routes = model.routes(customers, vehicles=k, depot=depot, travel=dist)
+for route in routes:
+    model.add(route.sum(lambda customer: customer.demand) <= capacity)
+model.minimize(routes.sum(lambda route: route.distance()))
 
 solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
 
-# Known optimum, if the instance comment records it (CVRPLIB convention).
 opt = re.search(r"Optimal value:\s*(\d+)", inst.get("comment", ""))
 gap = f"  (known optimum {opt.group(1)})" if opt else ""
 
@@ -73,6 +65,6 @@ for r, route in enumerate(solution.lists):
     print(f"  route {r}: load {load:5d}  {[depot, *route, depot]}")
 
 served = sorted(c for route in solution.lists for c in route)
-assert served == sorted(customers), "every customer served exactly once"
+assert served == sorted(customer_ids), "every customer served exactly once"
 for route in solution.lists:
     assert sum(demand[c] for c in route) <= capacity, "capacity respected"

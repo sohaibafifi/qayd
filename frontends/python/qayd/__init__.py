@@ -37,15 +37,34 @@ from ._core import (
     used,
     windows,
 )
+from .routing import (
+    CustomerData,
+    CustomerRef,
+    CustomerSet,
+    CustomerValue,
+    RouteSet,
+    RouteVar,
+    VisitView,
+    install_model_api,
+)
+
+install_model_api()
 
 __all__ = [
     "STAR",
     "Constraint",
+    "CustomerData",
+    "CustomerRef",
+    "CustomerSet",
+    "CustomerValue",
     "Expr",
     "IntVar",
     "Model",
+    "RouteSet",
+    "RouteVar",
     "Solution",
     "SolveStats",
+    "VisitView",
     "abs",
     "all",
     "any",
