@@ -120,6 +120,8 @@ The Python examples live under `examples/python/`, grouped by domain: `routing/`
 ```bash
 QAYD_VRP_INSTANCE=/path/to/instance.vrp uv run --extra examples examples/python/routing/api/vrp.py
 uv run examples/python/routing/api/cvrptw.py
+uv run examples/python/scheduling/api/jssp.py
+uv run examples/python/scheduling/api/rcpsp.py
 uv run examples/python/packing/bin_packing.py
 uv run examples/python/mus/mus.py           # diagnose an infeasible model: model.soft(...) / model.mus()
 uv run examples/python/mus/mus_explain.py   # sub-constraint MUS explanation: model.explain_mus()
@@ -129,6 +131,8 @@ uv run examples/python/mus/mus_enumerate.py # all MUSes + MSSes/MCSes (MARCO): m
 The API routing examples live under `examples/python/routing/api/`; the raw
 list-lambda equivalents live under `examples/python/routing/native/`. The VRP
 example uses `vrplib` and expects a local CVRPLIB file via `QAYD_VRP_INSTANCE`.
+Interval scheduling API examples live under `examples/python/scheduling/api/`;
+the raw interval/list equivalents live under `examples/python/scheduling/native/`.
 Benchmark data under `data/` is local scratch data and is not part of the source
 release.
 
@@ -147,6 +151,25 @@ for route in routes:
     model.add(route.sum(lambda customer: customer.demand) <= capacity)
 
 model.minimize(routes.sum(lambda route: route.distance()))
+solution = model.solve(time_limit=30)
+```
+
+Typical scheduling API shape:
+
+```python
+model = cp.Model()
+tasks = model.tasks(range(n))
+for task in tasks:
+    task.duration = duration[task.id]
+    task.demand = demand[task.id]
+
+schedule = model.schedule(tasks, horizon=horizon)
+for before, after in precedences:
+    model.add(schedule[before].end <= schedule[after].start)
+for resource in resources:
+    model.add(schedule.resource(lambda task: task.demand[resource]) <= capacity[resource])
+
+model.minimize(schedule.makespan())
 solution = model.solve(time_limit=30)
 ```
 

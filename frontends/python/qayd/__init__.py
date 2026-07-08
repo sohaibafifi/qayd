@@ -45,10 +45,22 @@ from .routing import (
     RouteSet,
     RouteVar,
     VisitView,
-    install_model_api,
+    install_model_api as install_routing_api,
 )
 
-install_model_api()
+install_routing_api()
+
+from .scheduling import (
+    ScheduleSet,
+    ScheduledTaskView,
+    TaskData,
+    TaskRef,
+    TaskSet,
+    TaskValue,
+    install_model_api as install_scheduling_api,
+)
+
+install_scheduling_api()
 
 __all__ = [
     "STAR",
@@ -62,8 +74,14 @@ __all__ = [
     "Model",
     "RouteSet",
     "RouteVar",
+    "ScheduleSet",
+    "ScheduledTaskView",
     "Solution",
     "SolveStats",
+    "TaskData",
+    "TaskRef",
+    "TaskSet",
+    "TaskValue",
     "VisitView",
     "abs",
     "all",
