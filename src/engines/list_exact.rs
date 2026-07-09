@@ -103,11 +103,22 @@ pub struct Outcome {
 enum ListConstraint {
     Length { list: usize, min: usize, max: usize },
     ItemSum { list: usize, weights: Vec<(i32, i64)>, min: i64, max: i64 },
+    /// A sequence reduction (scan) checked by evaluating it on the completed
+    /// ordered lists during enumeration, rather than posted into the solver.
+    Reduction { reduction: list::Reduction, op: list::Op, rhs: i64 },
     Impossible,
 }
 
 fn list_constraint(constraint: &list::Constraint, items: &[i32]) -> Option<ListConstraint> {
     let list::Iterable::Items(list) = &constraint.reduction.iterable else {
+        // A scan constraint has no linearizable posting; it is enumeration-checked.
+        if matches!(constraint.reduction.iterable, list::Iterable::Scan { .. }) {
+            return Some(ListConstraint::Reduction {
+                reduction: constraint.reduction.clone(),
+                op: constraint.op,
+                rhs: constraint.rhs,
+            });
+        }
         return None;
     };
     let list = *list;
@@ -238,7 +249,11 @@ pub fn solve(
         return Ok(Some(Outcome { status: Status::Unsatisfiable, objectives: Vec::new(), solution: None, stats: SolveStats::default() }));
     }
 
-    if objective_tiers_order_dependent(objective_tiers) {
+    // A `Reduction` constraint (scan) is not posted into the solver, only checked
+    // on completed ordered lists, so it needs the enumeration path. The member-var
+    // and chrono paths would accept assignments that violate it.
+    let has_unposted_reduction = parsed.iter().any(|c| matches!(c, ListConstraint::Reduction { .. }));
+    if has_unposted_reduction || objective_tiers_order_dependent(objective_tiers) {
         return Ok(Some(run_ordered_search(model, &parsed, objective_tiers, stop, &mut on_improve)));
     }
 
@@ -399,6 +414,14 @@ fn ordered_lists_feasible(parsed: &[ListConstraint], globals: &[list::GlobalCons
             let total = items.iter().fold(0i64, |sum, item| sum.saturating_add(objective_weight(weights, *item)));
             (*min..=*max).contains(&total)
         }),
+        ListConstraint::Reduction { reduction, op, rhs } => match list::eval_reduction_on_lists(reduction, lists) {
+            Some(value) => match op {
+                list::Op::Le => value <= *rhs,
+                list::Op::Ge => value >= *rhs,
+                list::Op::Eq => value == *rhs,
+            },
+            None => false,
+        },
         ListConstraint::Impossible => false,
     }) && globals.iter().all(|global| match *global {
         list::GlobalConstraint::ListLe { before, after } => {
@@ -634,7 +657,8 @@ fn build_solver(model: &CollectionModel, parsed: &[ListConstraint]) -> (Solver, 
             ListConstraint::ItemSum { list, weights, min, max } => {
                 list_constraints::list_item_sum(&mut solver, lists[*list], weights.clone(), *min, *max);
             }
-            ListConstraint::Impossible => {}
+            // Enumeration-checked in `ordered_lists_feasible`; nothing to post.
+            ListConstraint::Reduction { .. } | ListConstraint::Impossible => {}
         }
     }
     for global in &model.globals {

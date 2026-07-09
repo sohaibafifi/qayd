@@ -375,6 +375,10 @@ struct PyModel {
     col_objectives: Vec<list::ObjectiveTier>,
     col_constraints: Vec<list::Constraint>,
     col_globals: Vec<list::GlobalConstraint>,
+    /// Scan reductions bound to a `list_value()` handle by `add(scan == v)`, keyed
+    /// by the handle's value id. Resolved into objective terms at tier push time,
+    /// so a reified scan total feeds a linear objective without an integer var.
+    col_reified: Vec<Option<list::Reduction>>,
     col_schedule: Option<list::Schedule>,
     col_sched_gen: u64,
     /// Soft-constraint groups for MUS extraction: `(name, selector)`. Each is a
@@ -1640,6 +1644,7 @@ impl PyModel {
             col_objectives: Vec::new(),
             col_constraints: Vec::new(),
             col_globals: Vec::new(),
+            col_reified: Vec::new(),
             col_schedule: None,
             col_sched_gen: 0,
             mus_selectors: Vec::new(),
@@ -1717,6 +1722,18 @@ impl PyModel {
         if let Ok(lc) = constraint.extract::<PyRef<'_, PyListConstraint>>() {
             self.check_term_scope(lc.model_id, lc.gen)?;
             self.col_constraints.push(list::Constraint { reduction: lc.reduction.clone(), op: lc.op, rhs: lc.rhs });
+            return Ok(());
+        }
+        // `add(scan == v)` binds a scan total to a `list_value()` handle. The
+        // binding is a definition, not a restriction, so it is recorded against
+        // the value slot and resolved when the objective tier is pushed.
+        if let Ok(reified) = constraint.extract::<PyRef<'_, PyReified>>() {
+            self.check_term_scope(reified.model_id, reified.gen)?;
+            let slot = self
+                .col_reified
+                .get_mut(reified.value)
+                .ok_or_else(|| PyValueError::new_err("this list value is stale; rebuild it from the current list_vars()"))?;
+            *slot = Some(reified.reduction.clone());
             return Ok(());
         }
         if let Ok(constraint) = constraint_from_py(constraint) {
@@ -2070,8 +2087,21 @@ impl PyModel {
         self.col_objectives.clear();
         self.col_constraints.clear();
         self.col_globals.clear();
+        self.col_reified.clear();
         let gen = self.col_gen;
         Ok((0..count).map(|i| PyListVar { model_id: self.id, gen, index: i as u32 }).collect())
+    }
+
+    /// Mint a collection-scoped scalar to reify a scan total into: bind it with
+    /// `add(scan_sum(r, ...) == v)`, then use `v` in a linear objective. Requires
+    /// an active `list_vars` generation.
+    fn list_value(&mut self) -> PyResult<ListValue> {
+        if self.col_universe.is_none() {
+            return Err(PyValueError::new_err("call list_vars() before list_value()"));
+        }
+        let value = self.col_reified.len();
+        self.col_reified.push(None);
+        Ok(ListValue { model_id: self.id, gen: self.col_gen, value })
     }
 
     /// Precedence over list items or interval variables.
@@ -2488,7 +2518,7 @@ impl PyModel {
 
     /// Set the primary minimization objective.
     fn minimize(&mut self, objective: &Bound<'_, PyAny>) -> PyResult<()> {
-        if let Ok(term) = objective.extract::<PyRef<'_, PyTerm>>() {
+        if let Some(term) = collection_objective_term(objective) {
             self.push_collection_tier(&term, true, true)?;
             return Ok(());
         }
@@ -2497,7 +2527,7 @@ impl PyModel {
 
     /// Set the primary maximization objective.
     fn maximize(&mut self, objective: &Bound<'_, PyAny>) -> PyResult<()> {
-        if let Ok(term) = objective.extract::<PyRef<'_, PyTerm>>() {
+        if let Some(term) = collection_objective_term(objective) {
             self.push_collection_tier(&term, false, true)?;
             return Ok(());
         }
@@ -2506,14 +2536,14 @@ impl PyModel {
 
     /// Append a lower-priority lexicographic tier.
     fn then_minimize(&mut self, objective: &Bound<'_, PyAny>) -> PyResult<()> {
-        if let Ok(term) = objective.extract::<PyRef<'_, PyTerm>>() {
+        if let Some(term) = collection_objective_term(objective) {
             return self.push_collection_tier(&term, true, false);
         }
         self.push_integer_tier(objective, true)
     }
 
     fn then_maximize(&mut self, objective: &Bound<'_, PyAny>) -> PyResult<()> {
-        if let Ok(term) = objective.extract::<PyRef<'_, PyTerm>>() {
+        if let Some(term) = collection_objective_term(objective) {
             return self.push_collection_tier(&term, false, false);
         }
         self.push_integer_tier(objective, false)
@@ -2685,7 +2715,16 @@ impl PyModel {
         } else if self.col_objectives.len() >= list::MAX_TIERS {
             return Err(PyValueError::new_err(format!("at most {} objective tiers are supported", list::MAX_TIERS)));
         }
-        self.col_objectives.push(list::ObjectiveTier { minimize, terms: term.reductions.clone(), max_terms: term.max_terms.clone() });
+        let mut terms = term.reductions.clone();
+        for &(value, coeff) in &term.values {
+            let reduction = self
+                .col_reified
+                .get(value)
+                .and_then(|slot| slot.as_ref())
+                .ok_or_else(|| PyValueError::new_err("a list value in the objective was never bound with add(scan == value)"))?;
+            terms.push(scale_reduction(reduction, coeff)?);
+        }
+        self.col_objectives.push(list::ObjectiveTier { minimize, terms, max_terms: term.max_terms.clone() });
         Ok(())
     }
 
@@ -3521,6 +3560,9 @@ struct PyTerm {
     gen: u64,
     reductions: Vec<list::Reduction>,
     max_terms: Option<Vec<list::MaxTerm>>,
+    /// `(value_id, coeff)` for each reified `list_value()` added into this term;
+    /// resolved to its bound scan reduction when the objective tier is pushed.
+    values: Vec<(usize, i64)>,
 }
 
 /// A constraint `term <op> rhs` over a single list reduction.
@@ -3534,6 +3576,15 @@ struct PyListConstraint {
     rhs: i64,
 }
 
+/// Coerce a collection objective argument: a `Term`, or a bare `list_value()`
+/// handle (`minimize(v)`). Returns `None` for an integer expression objective.
+fn collection_objective_term(objective: &Bound<'_, PyAny>) -> Option<PyTerm> {
+    if let Ok(term) = objective.extract::<PyRef<'_, PyTerm>>() {
+        return Some(term.clone());
+    }
+    objective.extract::<PyRef<'_, ListValue>>().ok().map(|value| value.as_term())
+}
+
 /// Sum two terms, rejecting a mix of models or `list_vars` generations.
 fn combine_terms(a: &PyTerm, b: &PyTerm) -> PyResult<PyTerm> {
     if a.model_id != b.model_id || a.gen != b.gen {
@@ -3544,7 +3595,9 @@ fn combine_terms(a: &PyTerm, b: &PyTerm) -> PyResult<PyTerm> {
     let mut max_terms = a.max_terms.clone().unwrap_or_default();
     max_terms.extend(b.max_terms.iter().flatten().cloned());
     let max_terms = (!max_terms.is_empty()).then_some(max_terms);
-    Ok(PyTerm { model_id: a.model_id, gen: a.gen, reductions, max_terms })
+    let mut values = a.values.clone();
+    values.extend(b.values.iter().copied());
+    Ok(PyTerm { model_id: a.model_id, gen: a.gen, reductions, max_terms, values })
 }
 
 fn scale_reduction(reduction: &list::Reduction, coeff: i64) -> PyResult<list::Reduction> {
@@ -3570,7 +3623,12 @@ fn scale_term(term: &PyTerm, coeff: i64) -> PyResult<PyTerm> {
                 .collect::<PyResult<Vec<_>>>()
         })
         .transpose()?;
-    Ok(PyTerm { model_id: term.model_id, gen: term.gen, reductions, max_terms })
+    let values = term
+        .values
+        .iter()
+        .map(|&(value, c)| Ok((value, c.checked_mul(coeff).ok_or_else(|| PyValueError::new_err("term coefficient overflows i64"))?)))
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(PyTerm { model_id: term.model_id, gen: term.gen, reductions, max_terms, values })
 }
 
 fn max_term(terms: Vec<PyTerm>) -> PyResult<PyTerm> {
@@ -3585,9 +3643,12 @@ fn max_term(terms: Vec<PyTerm>) -> PyResult<PyTerm> {
         if term.max_terms.is_some() {
             return Err(PyTypeError::new_err("nested max_of terms are not supported"));
         }
+        if !term.values.is_empty() {
+            return Err(PyTypeError::new_err("reified list values are not supported inside max_of terms"));
+        }
         groups.push(term.reductions);
     }
-    Ok(PyTerm { model_id, gen, reductions: Vec::new(), max_terms: Some(vec![list::MaxTerm { groups, coeff: 1 }]) })
+    Ok(PyTerm { model_id, gen, reductions: Vec::new(), max_terms: Some(vec![list::MaxTerm { groups, coeff: 1 }]), values: Vec::new() })
 }
 
 #[pymethods]
@@ -3616,22 +3677,107 @@ impl PyTerm {
         scale_term(self, -1)
     }
 
-    fn __richcmp__(&self, other: &Bound<'_, PyAny>, op: CompareOp) -> PyResult<PyListConstraint> {
+    fn __richcmp__(&self, other: &Bound<'_, PyAny>, op: CompareOp) -> PyResult<Py<PyAny>> {
         if self.max_terms.as_ref().is_some_and(|terms| !terms.is_empty()) {
             return Err(PyValueError::new_err("max_of list terms are supported as objectives, not constraints"));
         }
-        let rhs = other.extract::<i64>().map_err(|_| PyTypeError::new_err("a term can only be compared to an integer bound"))?;
         let op = match op {
             CompareOp::Le => list::Op::Le,
             CompareOp::Ge => list::Op::Ge,
             CompareOp::Eq => list::Op::Eq,
             _ => return Err(PyValueError::new_err("a term supports only <=, >=, ==")),
         };
-        if self.reductions.len() != 1 {
+        if self.reductions.len() != 1 || !self.values.is_empty() {
             return Err(PyValueError::new_err("a constraint must be a single reduction over one list, not a sum of terms"));
         }
-        Ok(PyListConstraint { model_id: self.model_id, gen: self.gen, reduction: self.reductions[0].clone(), op, rhs })
+        let py = other.py();
+        // `scan_sum(r, ...) == v` reifies the scan total to a `list_value()` handle,
+        // so the value can then enter a linear objective.
+        if let Ok(value) = other.extract::<PyRef<'_, ListValue>>() {
+            if value.model_id != self.model_id || value.gen != self.gen {
+                return Err(PyValueError::new_err("this list value belongs to a different model or list_vars generation"));
+            }
+            // Reification binds the value AS a definition (`value := reduction`),
+            // which is exactly `==`. An inequality (`<=`/`>=`) would make the value
+            // a bounded optimisation variable the enumeration does not yet range
+            // over, so it is rejected rather than silently treated as `==`.
+            if !matches!(op, list::Op::Eq) {
+                return Err(PyValueError::new_err(
+                    "reify a scan into a list value with `scan == value` (inequality reification is not supported)",
+                ));
+            }
+            let reified = PyReified { model_id: self.model_id, gen: self.gen, value: value.value, reduction: self.reductions[0].clone() };
+            return Ok(reified.into_pyobject(py)?.into_any().unbind());
+        }
+        let rhs = other
+            .extract::<i64>()
+            .map_err(|_| PyTypeError::new_err("a term can only be compared to an integer bound or a list value"))?;
+        let constraint = PyListConstraint { model_id: self.model_id, gen: self.gen, reduction: self.reductions[0].clone(), op, rhs };
+        Ok(constraint.into_pyobject(py)?.into_any().unbind())
     }
+}
+
+/// A collection-scoped scalar minted by `Model.list_value()`. A scan total is
+/// bound to it with `add(scan == v)`; it then composes into a linear objective
+/// (`sum_edges + v`). Collection models forbid real integer variables, so this is
+/// not an `IntVar` -- it is resolved to its bound reduction at solve time.
+#[pyclass(name = "ListValue", module = "qayd", skip_from_py_object)]
+#[derive(Clone)]
+struct ListValue {
+    model_id: u64,
+    gen: u64,
+    value: usize,
+}
+
+impl ListValue {
+    fn as_term(&self) -> PyTerm {
+        PyTerm { model_id: self.model_id, gen: self.gen, reductions: Vec::new(), max_terms: None, values: vec![(self.value, 1)] }
+    }
+}
+
+#[pymethods]
+impl ListValue {
+    fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
+        let this = self.as_term();
+        if let Ok(term) = other.extract::<PyRef<'_, PyTerm>>() {
+            return combine_terms(&this, &term);
+        }
+        if let Ok(value) = other.extract::<PyRef<'_, ListValue>>() {
+            return combine_terms(&this, &value.as_term());
+        }
+        if other.extract::<i64>().is_ok_and(|v| v == 0) {
+            return Ok(this);
+        }
+        Err(PyTypeError::new_err("a list value can only be added to a term or another list value"))
+    }
+
+    fn __radd__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
+        self.__add__(other)
+    }
+
+    fn __mul__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
+        let coeff = other.extract::<i64>().map_err(|_| PyTypeError::new_err("a list value can only be multiplied by an integer"))?;
+        Ok(PyTerm { model_id: self.model_id, gen: self.gen, reductions: Vec::new(), max_terms: None, values: vec![(self.value, coeff)] })
+    }
+
+    fn __rmul__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
+        self.__mul__(other)
+    }
+
+    fn __neg__(&self) -> PyTerm {
+        PyTerm { model_id: self.model_id, gen: self.gen, reductions: Vec::new(), max_terms: None, values: vec![(self.value, -1)] }
+    }
+}
+
+/// A reified binding `reduction <op> value`, produced by comparing a scan total
+/// to a `list_value()` handle and recorded by `Model.add`.
+#[pyclass(name = "Reified", module = "qayd", skip_from_py_object)]
+#[derive(Clone)]
+struct PyReified {
+    model_id: u64,
+    gen: u64,
+    value: usize,
+    reduction: list::Reduction,
 }
 
 /// Lower a Python lambda-body tree into a reduction's flat expression arena.
@@ -3712,7 +3858,7 @@ fn lower(n: &PyNode, arena: &mut list::ExprArena) -> list::ExprId {
 }
 
 fn single_term(route: &PyListVar, reduction: list::Reduction) -> PyTerm {
-    PyTerm { model_id: route.model_id, gen: route.gen, reductions: vec![reduction], max_terms: None }
+    PyTerm { model_id: route.model_id, gen: route.gen, reductions: vec![reduction], max_terms: None, values: Vec::new() }
 }
 
 /// Build a per-item reduction `op(route, i => body)` from a Python lambda.
@@ -3967,6 +4113,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyIntervalVar>()?;
     m.add_class::<PyTerm>()?;
     m.add_class::<PyListConstraint>()?;
+    m.add_class::<ListValue>()?;
+    m.add_class::<PyReified>()?;
     m.add_class::<PyExpr>()?;
     m.add_class::<PyLambdaExpr>()?;
     m.add_class::<PyArray>()?;

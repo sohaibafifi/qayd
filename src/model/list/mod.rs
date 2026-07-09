@@ -173,7 +173,7 @@ fn eval_list_objective_term(term: &ListObjectiveTerm, lists: &[Vec<i32>]) -> Opt
     })
 }
 
-fn eval_reduction_on_lists(reduction: &Reduction, lists: &[Vec<i32>]) -> Option<i64> {
+pub(crate) fn eval_reduction_on_lists(reduction: &Reduction, lists: &[Vec<i32>]) -> Option<i64> {
     let contents = lists.get(reduction.iterable.list())?;
     let arena = &reduction.arena.exprs;
     let body = reduction.body;

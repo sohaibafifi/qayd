@@ -182,11 +182,18 @@ impl BackendSelection {
                         routing: summary.routing_shape(model.lists.len()),
                     };
                 }
-                if summary.has_max_objective && interval_constraints {
+                // Exact list enumeration handles a max_of objective, a linear edge
+                // objective over an optional list model (its free pool list only
+                // enumeration resolves soundly), and an edge objective mixed with a
+                // scan term that integer edge-lowering cannot represent.
+                if objectives_are_list_terms(model)
+                    && constraints_domain_exact_checkable(model)
+                    && (summary.has_max_objective || has_free_pool_list(model) || objective_has_scan_reduction(model))
+                {
                     return Self {
                         class: ModelClass::Routing,
                         backend: Backend::DomainExact,
-                        reason: "max_of list objective uses exact list enumeration",
+                        reason: "edge list objective uses exact list enumeration",
                         routing: summary.routing_shape(model.lists.len()),
                     };
                 }
@@ -199,11 +206,17 @@ impl BackendSelection {
             }
 
             if summary.has_sequence_reduction {
-                if summary.has_max_objective && interval_constraints {
+                // A scan/window objective is scored and checked exactly by
+                // enumeration. A scan appearing only in a constraint keeps its
+                // established local-search fallback unless the objective needs it.
+                if objectives_are_list_terms(model)
+                    && constraints_domain_exact_checkable(model)
+                    && (summary.has_max_objective || has_free_pool_list(model) || objective_has_scan_reduction(model))
+                {
                     return Self {
                         class: ModelClass::Sequencing,
                         backend: Backend::DomainExact,
-                        reason: "max_of list objective uses exact list enumeration",
+                        reason: "sequence list objective uses exact list enumeration",
                         routing: None,
                     };
                 }
@@ -314,6 +327,83 @@ impl ListSummary {
             has_fleet_objective: self.has_fleet_objective,
         })
     }
+}
+
+fn objectives_are_list_terms(model: &Model) -> bool {
+    !model.objectives.is_empty() && model.objectives.iter().all(|objective| matches!(objective, Objective::ListTerms { .. }))
+}
+
+/// Every constraint can be enforced by the domain-exact engine: the standard
+/// list constraints post into the solver, and a `Scan` reduction constraint is
+/// checked on the completed ordered lists during enumeration. A scan is admitted
+/// only when it also passes the routing signature, so classify and the engines
+/// agree on which scans are sound (weirder scans still fall back to local search).
+fn constraints_domain_exact_checkable(model: &Model) -> bool {
+    let items = model.lists.first().map_or(&[][..], |list| list.universe.as_slice());
+    model.constraints.iter().all(|constraint| match constraint {
+        Constraint::ListPartition { .. }
+        | Constraint::SameList { .. }
+        | Constraint::ItemPrecedence { .. }
+        | Constraint::ListLength { .. }
+        | Constraint::ListItemSum { .. } => true,
+        Constraint::ListReduction(constraint) => {
+            matches!(constraint.reduction.iterable, list::Iterable::Scan { .. })
+                && list::scan::scan_routing_signature(constraint, items).is_some()
+        }
+        Constraint::IntervalPrecedence { .. } | Constraint::IntervalResource(_) | Constraint::Intension(_) => false,
+    })
+}
+
+/// True when an objective tier scores a scan, window, or pair reduction that
+/// integer edge-lowering cannot represent, so it needs exact list enumeration.
+///
+/// Only a `Scan` objective is diverted here: `Windows`/`Pairs` objectives keep
+/// their established local-search fallback (exact enumeration is exponential, so
+/// diverting them would regress large sequencing/QAP models).
+fn objective_has_scan_reduction(model: &Model) -> bool {
+    model.objectives.iter().any(|objective| match objective {
+        Objective::ListTerms { terms, max_terms, .. } => terms
+            .iter()
+            .chain(max_terms.iter().flat_map(|terms| terms.iter().flat_map(|term| term.groups.iter().flatten())))
+            .any(|reduction| matches!(reduction.iterable, list::Iterable::Scan { .. })),
+        Objective::IntExpr { .. } | Objective::Makespan { .. } => false,
+    })
+}
+
+/// True when some list is a free "pool": referenced by no objective term and no
+/// per-list constraint. An optional list model carries such a pool that silently
+/// absorbs unvisited items, and only exact enumeration handles it soundly.
+fn has_free_pool_list(model: &Model) -> bool {
+    let n = model.lists.len();
+    if n == 0 {
+        return false;
+    }
+    let mut referenced = vec![false; n];
+    for objective in &model.objectives {
+        if let Objective::ListTerms { terms, max_terms, .. } = objective {
+            for reduction in
+                terms.iter().chain(max_terms.iter().flat_map(|terms| terms.iter().flat_map(|term| term.groups.iter().flatten())))
+            {
+                let list = reduction.iterable.list();
+                if list < n {
+                    referenced[list] = true;
+                }
+            }
+        }
+    }
+    for constraint in &model.constraints {
+        match constraint {
+            Constraint::ListLength { list, .. } | Constraint::ListItemSum { list, .. } => referenced[list.0] = true,
+            Constraint::ListReduction(constraint) => {
+                let list = constraint.reduction.iterable.list();
+                if list < n {
+                    referenced[list] = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    referenced.iter().any(|seen| !seen)
 }
 
 fn objectives_are_list_simple(model: &Model) -> bool {
