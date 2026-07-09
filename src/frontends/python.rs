@@ -305,6 +305,27 @@ struct PySolveStats {
     vivified_lits: u64,
 }
 
+/// Result of [`enumerate_mus`](PyModel::enumerate_mus): the minimal unsatisfiable
+/// subsets and minimal satisfiable subsets found, and whether enumeration ran to
+/// completion (`False` when a time limit or `limit` cap stopped it early).
+#[pyclass(name = "MusEnumeration", module = "qayd", skip_from_py_object)]
+#[derive(Clone)]
+struct PyMusEnumeration {
+    #[pyo3(get)]
+    muses: Vec<Vec<String>>,
+    #[pyo3(get)]
+    msses: Vec<Vec<String>>,
+    #[pyo3(get)]
+    complete: bool,
+}
+
+#[pymethods]
+impl PyMusEnumeration {
+    fn __repr__(&self) -> String {
+        format!("MusEnumeration(muses={}, msses={}, complete={})", self.muses.len(), self.msses.len(), self.complete)
+    }
+}
+
 #[pyclass(name = "Solution", module = "qayd")]
 struct PySolution {
     status: String,
@@ -2415,12 +2436,7 @@ impl PyModel {
     /// stopped early (time-out or `limit` reached). `limit` caps the total number
     /// of MUS + MSS returned (there can be exponentially many).
     #[pyo3(signature = (time_limit=None, limit=None))]
-    fn enumerate_mus(
-        &self,
-        py: Python<'_>,
-        time_limit: Option<u64>,
-        limit: Option<usize>,
-    ) -> PyResult<(Vec<Vec<String>>, Vec<Vec<String>>, bool)> {
+    fn enumerate_mus(&self, py: Python<'_>, time_limit: Option<u64>, limit: Option<usize>) -> PyResult<PyMusEnumeration> {
         if self.col_universe.is_some() || self.col_schedule.is_some() {
             return Err(PyValueError::new_err("enumerate_mus() is not supported for list/interval models"));
         }
@@ -2430,9 +2446,11 @@ impl PyModel {
         let stop = deadline(time_limit);
         let result = with_interrupts(py, &stop, || enumerate_mus(&mut solver, &vars, &selectors, &stop, limit))?;
         let names = |group: &[VarId]| group.iter().map(|&sel| self.selector_name(sel)).collect::<Vec<_>>();
-        let muses = result.muses.iter().map(|m| names(m)).collect();
-        let msses = result.msses.iter().map(|m| names(m)).collect();
-        Ok((muses, msses, result.complete))
+        Ok(PyMusEnumeration {
+            muses: result.muses.iter().map(|m| names(m)).collect(),
+            msses: result.msses.iter().map(|m| names(m)).collect(),
+            complete: result.complete,
+        })
     }
 
     /// Explain a MUS at sub-constraint granularity: for each core
@@ -3958,6 +3976,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySoftGroup>()?;
     m.add_class::<PySolution>()?;
     m.add_class::<PySolveStats>()?;
+    m.add_class::<PyMusEnumeration>()?;
     m.add_class::<PySolveSession>()?;
     m.add_function(wrap_pyfunction!(expr_fn, m)?)?;
     m.add_function(wrap_pyfunction!(all_fn, m)?)?;

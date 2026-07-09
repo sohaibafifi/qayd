@@ -513,6 +513,19 @@ class SolveStats:
     def __repr__(self) -> str: ...
 
 
+class MusEnumeration:
+    """Result of `Model.enumerate_mus`: minimal unsatisfiable subsets, minimal
+    satisfiable subsets, and whether enumeration ran to completion."""
+
+    @property
+    def muses(self) -> list[list[str]]: ...
+    @property
+    def msses(self) -> list[list[str]]: ...
+    @property
+    def complete(self) -> bool: ...
+    def __repr__(self) -> str: ...
+
+
 class Solution:
     """The outcome of a solve: status, objective, and variable values."""
 
