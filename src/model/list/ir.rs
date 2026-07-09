@@ -29,7 +29,7 @@ pub enum ReduceOp {
 }
 
 /// Comparison for a constraint `reduction <op> rhs`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Le,
     Ge,
@@ -37,13 +37,13 @@ pub enum Op {
 }
 
 /// Index of an [`Expr`] node inside a reduction's [`ExprArena`].
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ExprId(pub u32);
 
 /// One node of a lambda body. Arrays and matrices are shared by `Arc`, so the
 /// same constant table reused across many reductions costs one refcount bump,
 /// not a deep copy.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub enum Expr {
     Const(i64),
     /// The `k`-th lambda binder: the item for `Items`, source/target for `Edges`.
@@ -71,7 +71,7 @@ pub enum Expr {
 }
 
 /// A flat arena of [`Expr`] nodes; the body is the last/returned [`ExprId`].
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub struct ExprArena {
     pub exprs: Vec<Expr>,
 }

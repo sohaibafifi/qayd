@@ -415,8 +415,22 @@ fn list_constraints_are_integer_routing_supported(model: &Model, items: &[i32]) 
     let mut capacities: Vec<Option<(Vec<i64>, i64)>> = (0..model.lists.len()).map(|_| None).collect();
     let mut lengths: Vec<Option<(usize, usize)>> = (0..model.lists.len()).map(|_| None).collect();
     let mut item_sums: Vec<Option<ItemSumSignature>> = (0..model.lists.len()).map(|_| None).collect();
+    let mut scans: Vec<Vec<list::scan::ScanRoutingSpec>> = (0..model.lists.len()).map(|_| Vec::new()).collect();
     for constraint in &model.constraints {
         match constraint {
+            // A `Sum` scan lowers to a per-customer resource extension; anything
+            // else on `ListReduction` stays with local search. A route may carry
+            // several scans (e.g. one time window per customer).
+            Constraint::ListReduction(reduction) if list::scan::scan_constraint_list(reduction).is_some() => {
+                let (Some(list), Some(spec)) = (list::scan::scan_constraint_list(reduction), list::scan::scan_routing_signature(reduction, items))
+                else {
+                    return false;
+                };
+                if list >= scans.len() {
+                    return false;
+                }
+                scans[list].push(spec);
+            }
             Constraint::ListPartition { .. } => {}
             Constraint::SameList { a, b, .. } => {
                 if !items.contains(a) || !items.contains(b) {
@@ -457,7 +471,17 @@ fn list_constraints_are_integer_routing_supported(model: &Model, items: &[i32]) 
             | Constraint::Intension(_) => return false,
         }
     }
-    homogeneous_present(&capacities) && homogeneous_present(&lengths) && homogeneous_present(&item_sums)
+    homogeneous_present(&capacities) && homogeneous_present(&lengths) && homogeneous_present(&item_sums) && scan_lists_homogeneous(&scans)
+}
+
+/// Every route must carry the identical (ordered) set of scans, or none -- a
+/// route-specific scan is unsafe under depot-copy symmetry. Empty everywhere is
+/// fine. Mirrors the engine's `homogeneous(&scan_by_list)`.
+fn scan_lists_homogeneous(by_list: &[Vec<list::scan::ScanRoutingSpec>]) -> bool {
+    match by_list.first() {
+        None => true,
+        Some(first) => by_list.iter().all(|scans| scans == first),
+    }
 }
 
 fn homogeneous_present<T: PartialEq>(by_list: &[Option<T>]) -> bool {

@@ -1,6 +1,7 @@
 //! List variable declarations and list-objective evaluation.
 
 mod ir;
+pub(crate) mod scan;
 mod validate;
 
 pub use ir::*;

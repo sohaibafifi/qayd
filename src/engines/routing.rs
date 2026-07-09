@@ -20,6 +20,7 @@ use crate::engines::ls::lists as ls_lists;
 use crate::expr;
 use crate::ids::{ListId, PropId, VarId};
 use crate::model::list::{
+    scan::{lower_scan, scan_routing_signature, ScanRoutingSpec},
     CollectionModel, CollectionSolution, Constraint, Expr, ExprId, GlobalConstraint, Iterable, Op, ReduceOp, Reduction,
 };
 use crate::propagator::{Event, Inconsistency, Propagator};
@@ -70,6 +71,11 @@ struct RoutingSpec {
     /// non-capacity `Sum` shape (`>=`, `==`, or negative weights); a `Sum(nonneg) <=
     /// cap` is parsed as capacity instead. Route-specific bounds are rejected.
     item_sum: Option<ItemSumSpec>,
+    /// Homogeneous per-route `Sum` scans (each a cumulative resource extension).
+    /// A route may carry several (e.g. one time window per customer); every route
+    /// carries the identical set, since route-specific scans are unsafe under
+    /// depot-copy symmetry. Empty means no scan.
+    scan: Vec<ScanRoutingSpec>,
 }
 
 /// The model's homogeneous per-route side constraints, classified.
@@ -77,6 +83,7 @@ struct RouteSideConstraints {
     capacity: Option<CapacitySpec>,
     length: Option<(usize, usize)>,
     item_sum: Option<ItemSumSpec>,
+    scan: Vec<ScanRoutingSpec>,
 }
 
 pub(crate) struct RoutingIntegerOutcome {
@@ -157,6 +164,7 @@ impl RoutingSpec {
             same_list,
             length: sides.length,
             item_sum: sides.item_sum,
+            scan: sides.scan,
         })
     }
 
@@ -184,6 +192,10 @@ impl RoutingSpec {
             let load = self.post_capacity_loads(&mut solver, &succ, capacity);
             post_route_capacity_check(&mut solver, &succ, self.depot_count, self.node_demands(capacity), capacity.capacity);
             debug_assert_eq!(load.len(), n);
+        }
+
+        for scan in &self.scan {
+            self.post_scan_constraint(&mut solver, &succ, &nodes, scan);
         }
 
         post_depot_symmetry(&mut solver, &succ, self.depot_count, n);
@@ -302,6 +314,72 @@ impl RoutingSpec {
             }
         }
         load
+    }
+
+    /// Resource-extension encoding for a homogeneous `Sum` scan. Threads a
+    /// per-customer accumulator and a per-route cumulative sum along the chosen
+    /// arcs, then bounds each route's total against the constraint's rhs.
+    ///
+    /// Soundness rests on `circuit` making each customer's predecessor unique, so
+    /// the `==` step/emit implications pin every accumulator exactly (unlike the
+    /// capacity `>=` relaxation). The cumulative sum is kept per route -- reset to
+    /// `0` at every depot -- because the list-local-search spec applies the scan
+    /// bound to each route independently, not to the fleet total.
+    fn post_scan_constraint(&self, solver: &mut Solver, succ: &[VarId], nodes: &[i32], scan: &ScanRoutingSpec) {
+        let n = nodes.len();
+        let depot_count = self.depot_count;
+        let arena = &scan.arena.exprs;
+        // `cv[node]` = the accumulator's view of a node: `boundary` at a depot, else
+        // the item value. `A(from)` = the accumulator entering an arc's tail.
+        let cv = |node: usize| if node < depot_count { i64::from(scan.boundary) } else { i64::from(nodes[node]) };
+
+        let mut acc = vec![None; n];
+        let mut route_sum = vec![None; n];
+        for (node, slot) in acc.iter_mut().enumerate().take(n).skip(depot_count) {
+            *slot = Some(solver.new_var_range(scan.acc_dom.0 as i32, scan.acc_dom.1 as i32));
+            route_sum[node] = Some(solver.new_var_range(scan.total_dom.0 as i32, scan.total_dom.1 as i32));
+        }
+        let a_of = |from: usize| if from < depot_count { expr::int(scan.init) } else { expr::var(acc[from].expect("customer accumulator")) };
+        let sum_in = |from: usize| if from < depot_count { expr::int(0) } else { expr::var(route_sum[from].expect("customer route sum")) };
+
+        for (from, &from_var) in succ.iter().enumerate() {
+            for to in depot_count..n {
+                if from == to {
+                    continue;
+                }
+                let cur = i64::from(nodes[to]);
+                let prev = cv(from);
+                let arc = expr::eq(expr::var(from_var), expr::int(to as i64));
+                let acc_to = acc[to].expect("customer accumulator");
+                // acc[to] == step(cur, A(from), prev).
+                let step_rhs = lower_scan(arena, scan.step, cur, prev, &a_of(from));
+                intension::intension(solver, expr::imp(arc.clone(), expr::eq(expr::var(acc_to), step_rhs)));
+                // route_sum[to] == sum_in(from) + coeff * emit(cur, acc[to], prev).
+                let emit_rhs = lower_scan(arena, scan.emit, cur, prev, &expr::var(acc_to));
+                let contribution = expr::mul(vec![expr::int(scan.coeff), emit_rhs]);
+                let extended = expr::add(vec![sum_in(from), contribution]);
+                intension::intension(solver, expr::imp(arc, expr::eq(expr::var(route_sum[to].expect("customer route sum")), extended)));
+            }
+        }
+
+        // Per-route bound: when an arc closes a route (points back at a depot), the
+        // route total is `sum_in(from)` -- `0` for an empty route -- and must obey
+        // the constraint's op against rhs.
+        for (from, &from_var) in succ.iter().enumerate() {
+            for to in 0..depot_count {
+                if from == to {
+                    continue;
+                }
+                let arc = expr::eq(expr::var(from_var), expr::int(to as i64));
+                let total = sum_in(from);
+                let bounded = match scan.op {
+                    Op::Le => expr::le(total, expr::int(scan.rhs)),
+                    Op::Ge => expr::ge(total, expr::int(scan.rhs)),
+                    Op::Eq => expr::eq(total, expr::int(scan.rhs)),
+                };
+                intension::intension(solver, expr::imp(arc, bounded));
+            }
+        }
     }
 }
 
@@ -770,6 +848,7 @@ fn parse_route_side_constraints(model: &CollectionModel) -> Option<RouteSideCons
     let mut cap_by_list: Vec<Option<CapacitySpec>> = (0..model.lists).map(|_| None).collect();
     let mut len_by_list: Vec<Option<(usize, usize)>> = (0..model.lists).map(|_| None).collect();
     let mut sum_by_list: Vec<Option<ItemSumSpec>> = (0..model.lists).map(|_| None).collect();
+    let mut scan_by_list: Vec<Vec<ScanRoutingSpec>> = (0..model.lists).map(|_| Vec::new()).collect();
     for constraint in &model.constraints {
         if let Some((list, min, max)) = parse_length_constraint(constraint, model.items.len()) {
             if list >= model.lists || len_by_list[list].is_some() {
@@ -786,6 +865,14 @@ fn parse_route_side_constraints(model: &CollectionModel) -> Option<RouteSideCons
                 return None;
             }
             sum_by_list[list] = Some(spec);
+        } else if let Iterable::Scan { list, .. } = constraint.reduction.iterable {
+            // Mirrors the classifier gate: a `Sum` scan lowers, anything else falls
+            // to LS. Keeping this the same predicate keeps the two gates in lockstep.
+            let spec = scan_routing_signature(constraint, &model.items)?;
+            if list >= model.lists {
+                return None;
+            }
+            scan_by_list[list].push(spec);
         } else {
             return None;
         }
@@ -794,7 +881,15 @@ fn parse_route_side_constraints(model: &CollectionModel) -> Option<RouteSideCons
         capacity: homogeneous(&cap_by_list)?,
         length: homogeneous(&len_by_list)?,
         item_sum: homogeneous(&sum_by_list)?,
+        scan: homogeneous_scans(&scan_by_list)?,
     })
+}
+
+/// Every route must carry the identical (ordered) set of scans, or none.
+/// Mirrors the classifier's `scan_lists_homogeneous`.
+fn homogeneous_scans(by_list: &[Vec<ScanRoutingSpec>]) -> Option<Vec<ScanRoutingSpec>> {
+    let first = by_list.first()?;
+    by_list.iter().all(|scans| scans == first).then(|| first.clone())
 }
 
 /// `Some(None)` = absent from every route, `Some(Some(v))` = the shared value,
@@ -952,7 +1047,7 @@ mod tests {
     use crate::model::list::{CollectionModel, Constraint, ExprArena, GlobalConstraint, Iterable, ObjectiveTier, Op, ReduceOp, Reduction};
     use crate::search::{self, SearchControl};
 
-    use super::{routes_from_successors, solve_collection, CapacityCheck, RoutingSpec};
+    use super::{routes_from_successors, scan_routing_signature, solve_collection, CapacityCheck, RoutingSpec};
 
     #[test]
     fn lowers_closed_tsp_to_integer_circuit() {
@@ -1787,5 +1882,488 @@ mod tests {
 
         assert!(outcome.complete, "exhausted the search");
         assert!(!outcome.solution.feasible, "capacity overflow makes the model infeasible");
+    }
+
+    // --- scan (resource-extension) oracles --------------------------------------
+
+    /// Time-window lateness scan: `step = max(earliest, acc + travel) + service`,
+    /// emitting `max(0, end - latest)`. Mirrors `tests/collection.rs::lateness_scan`.
+    fn lateness_scan(list: usize, dist: &[Vec<i64>], earliest: &[i64], latest: &[i64], service: &[i64], depot: i32) -> Reduction {
+        let mut arena = ExprArena::default();
+        let cur = arena.arg(0);
+        let acc = arena.arg(1);
+        let prev = arena.arg(2);
+        let travel = arena.matrix(Arc::new(dist.to_vec()), prev, cur);
+        let arrive = arena.add(acc, travel);
+        let earl = arena.array(Arc::new(earliest.to_vec()), cur);
+        let start = arena.max(earl, arrive);
+        let svc = arena.array(Arc::new(service.to_vec()), cur);
+        let step = arena.add(start, svc);
+        let cur_e = arena.arg(0);
+        let end = arena.arg(1);
+        let lat = arena.array(Arc::new(latest.to_vec()), cur_e);
+        let over = arena.sub(end, lat);
+        let zero = arena.constant(0);
+        let emit = arena.max(zero, over);
+        Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list, init: 0, boundary: depot, step }, arena, body: emit, coeff: 1 }
+    }
+
+    /// Oracle replaying the lateness scan over an ordered route.
+    fn lateness_sum(order: &[i32], dist: &[Vec<i64>], earliest: &[i64], latest: &[i64], service: &[i64], depot: i32) -> i64 {
+        let mut acc = 0i64;
+        let mut prev = depot;
+        let mut sum = 0i64;
+        for &c in order {
+            let end = earliest[c as usize].max(acc + dist[prev as usize][c as usize]) + service[c as usize];
+            sum += (end - latest[c as usize]).max(0);
+            acc = end;
+            prev = c;
+        }
+        sum
+    }
+
+    fn ordered_closed_cost(depot: i32, order: &[i32], dist: &[Vec<i64>]) -> i64 {
+        let mut cost = 0i64;
+        let mut prev = depot;
+        for &c in order {
+            cost += dist[prev as usize][c as usize];
+            prev = c;
+        }
+        cost + dist[prev as usize][depot as usize]
+    }
+
+    fn op_ok(v: i64, op: Op, rhs: i64) -> bool {
+        match op {
+            Op::Le => v <= rhs,
+            Op::Ge => v >= rhs,
+            Op::Eq => v == rhs,
+        }
+    }
+
+    /// Exhaustive minimum total distance over two-route partitions where each
+    /// route has a distance-optimal ordering meeting its per-route scan bound (and
+    /// optional capacity). The scan is filtered per route, matching the LS spec.
+    #[allow(clippy::too_many_arguments)]
+    fn min_two_routes_scan(
+        items: &[i32],
+        dist: &[Vec<i64>],
+        demand: &[i64],
+        capacity: Option<i64>,
+        earliest: &[i64],
+        latest: &[i64],
+        service: &[i64],
+        depot: i32,
+        op: Op,
+        rhs: i64,
+    ) -> Option<i64> {
+        let best_route = |route: &[i32]| -> Option<i64> {
+            if let Some(cap) = capacity {
+                if route.iter().map(|&c| demand[c as usize]).sum::<i64>() > cap {
+                    return None;
+                }
+            }
+            permutations(route)
+                .iter()
+                .filter(|p| op_ok(lateness_sum(p, dist, earliest, latest, service, depot), op, rhs))
+                .map(|p| ordered_closed_cost(depot, p, dist))
+                .min()
+        };
+        let n = items.len();
+        let mut best: Option<i64> = None;
+        for code in 0..(1u32 << n) {
+            let mut routes = [Vec::new(), Vec::new()];
+            for (i, &it) in items.iter().enumerate() {
+                routes[((code >> i) & 1) as usize].push(it);
+            }
+            if let (Some(a), Some(b)) = (best_route(&routes[0]), best_route(&routes[1])) {
+                best = Some(best.map_or(a + b, |x| x.min(a + b)));
+            }
+        }
+        best
+    }
+
+    fn line_dist(positions: &[i64]) -> Vec<Vec<i64>> {
+        positions.iter().map(|&i| positions.iter().map(|&j| (i - j).abs()).collect()).collect()
+    }
+
+    fn scan_edge(dist: &Arc<Vec<Vec<i64>>>, list: usize) -> Reduction {
+        let mut arena = ExprArena::default();
+        let i = arena.arg(0);
+        let j = arena.arg(1);
+        let body = arena.matrix(Arc::clone(dist), i, j);
+        Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body, coeff: 1 }
+    }
+
+    fn scan_load(demand: &Arc<Vec<i64>>, list: usize, rhs: i64) -> Constraint {
+        let mut arena = ExprArena::default();
+        let i = arena.arg(0);
+        let body = arena.array(Arc::clone(demand), i);
+        Constraint { reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body, coeff: 1 }, op: Op::Le, rhs }
+    }
+
+    #[test]
+    fn scan_cvrptw_matches_brute_force() {
+        // P2 shape: cumulative service+travel time with hard time windows (lateness
+        // sum <= 0) plus capacity 2. Customers 1,2 share a deadline (5) they cannot
+        // both meet on one route, so a feasible plan must split them. Proven OPTIMAL.
+        let dist = line_dist(&[0, 2, 4, 6, 8]);
+        let demand = vec![0i64, 1, 1, 1, 1];
+        let service = vec![0i64, 1, 1, 1, 1];
+        let earliest = vec![0i64, 0, 0, 0, 0];
+        let latest = vec![0i64, 5, 5, 20, 20];
+        let items = vec![1, 2, 3, 4];
+        let depot = 0;
+        let brute =
+            min_two_routes_scan(&items, &dist, &demand, Some(2), &earliest, &latest, &service, depot, Op::Le, 0).expect("feasible plan exists");
+
+        let dist_arc = Arc::new(dist.clone());
+        let demand_arc = Arc::new(demand.clone());
+        let mut constraints = vec![scan_load(&demand_arc, 0, 2), scan_load(&demand_arc, 1, 2)];
+        for l in 0..2 {
+            constraints.push(Constraint { reduction: lateness_scan(l, &dist, &earliest, &latest, &service, depot), op: Op::Le, rhs: 0 });
+        }
+        let model = CollectionModel {
+            items: items.clone(),
+            lists: 2,
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![scan_edge(&dist_arc, 0), scan_edge(&dist_arc, 1)], max_terms: None }],
+            constraints,
+            globals: Vec::new(),
+            schedule: None,
+        };
+
+        let stop = AtomicBool::new(false);
+        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported cvrptw scan lowering");
+        assert!(outcome.complete, "exhausted the search");
+        assert!(outcome.solution.feasible, "a time-window-feasible plan exists");
+        assert_eq!(outcome.solution.objectives, vec![brute], "exact optimum equals the tw-filtered exhaustive minimum");
+        for route in &outcome.solution.lists {
+            assert!(!(route.contains(&1) && route.contains(&2)), "1 and 2 cannot share a route");
+            assert!(lateness_sum(route, &dist, &earliest, &latest, &service, depot) <= 0, "each route meets its hard windows");
+        }
+
+        // LS-vs-exact: local search reaches the same optimum on this enumerable model.
+        let ls = crate::engines::ls::lists::solve_collection_capped(&model, 0, &stop, 50_000, &mut |_| {});
+        assert!(ls.feasible, "LS finds a feasible plan");
+        assert_eq!(ls.objectives, vec![brute], "LS agrees with the exact optimum");
+    }
+
+    #[test]
+    fn scan_bound_is_per_route_not_fleet_total() {
+        // Every arc costs 1; each customer needs service 1 and has deadline 1, so a
+        // route's k-th stop finishes at time 2k and is (2k-1) late. Any 2-2 split
+        // gives each route lateness 1+3 = 4 <= 5 (feasible per route) but a fleet
+        // total of 8 > 5. A global-sum lowering would wrongly reject every split and
+        // return UNSAT; a correct per-route lowering keeps it feasible.
+        let dist = vec![
+            vec![0, 1, 1, 1, 1],
+            vec![1, 0, 1, 1, 1],
+            vec![1, 1, 0, 1, 1],
+            vec![1, 1, 1, 0, 1],
+            vec![1, 1, 1, 1, 0],
+        ];
+        let service = vec![0i64, 1, 1, 1, 1];
+        let earliest = vec![0i64, 0, 0, 0, 0];
+        let latest = vec![0i64, 1, 1, 1, 1];
+        let demand = vec![0i64; 5];
+        let items = vec![1, 2, 3, 4];
+        let depot = 0;
+        let rhs = 5;
+        let brute = min_two_routes_scan(&items, &dist, &demand, None, &earliest, &latest, &service, depot, Op::Le, rhs).expect("feasible");
+
+        let dist_arc = Arc::new(dist.clone());
+        let mut constraints = Vec::new();
+        for l in 0..2 {
+            constraints.push(Constraint { reduction: lateness_scan(l, &dist, &earliest, &latest, &service, depot), op: Op::Le, rhs });
+        }
+        let model = CollectionModel {
+            items: items.clone(),
+            lists: 2,
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![scan_edge(&dist_arc, 0), scan_edge(&dist_arc, 1)], max_terms: None }],
+            constraints,
+            globals: Vec::new(),
+            schedule: None,
+        };
+
+        let stop = AtomicBool::new(false);
+        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported per-route scan lowering");
+        assert!(outcome.complete, "exhausted the search");
+        assert!(outcome.solution.feasible, "a per-route-feasible plan exists (a global-sum lowering would be UNSAT here)");
+        assert_eq!(outcome.solution.objectives, vec![brute], "exact optimum equals the per-route-filtered minimum");
+        let sums: Vec<i64> = outcome.solution.lists.iter().map(|r| lateness_sum(r, &dist, &earliest, &latest, &service, depot)).collect();
+        assert!(sums.iter().all(|&s| s <= rhs), "every route respects the per-route bound");
+        assert!(sums.iter().sum::<i64>() > rhs, "the fleet total exceeds rhs: the scan is enforced per route, not globally");
+    }
+
+    #[test]
+    fn scan_single_route_unsat() {
+        // One vehicle, two customers, each with deadline 1 and service 1 over unit
+        // arcs: whichever is served first already finishes at time 2 (1 late), so no
+        // ordering meets the hard windows. The exact search must prove UNSAT.
+        let dist = vec![vec![0, 1, 1], vec![1, 0, 1], vec![1, 1, 0]];
+        let service = vec![0i64, 1, 1];
+        let earliest = vec![0i64, 0, 0];
+        let latest = vec![0i64, 1, 1];
+        let items = vec![1, 2];
+        let depot = 0;
+
+        let dist_arc = Arc::new(dist.clone());
+        let model = CollectionModel {
+            items: items.clone(),
+            lists: 1,
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![scan_edge(&dist_arc, 0)], max_terms: None }],
+            constraints: vec![Constraint { reduction: lateness_scan(0, &dist, &earliest, &latest, &service, depot), op: Op::Le, rhs: 0 }],
+            globals: Vec::new(),
+            schedule: None,
+        };
+        let stop = AtomicBool::new(false);
+        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported single-route scan lowering");
+        assert!(outcome.complete, "exhausted the search");
+        assert!(!outcome.solution.feasible, "no ordering meets both hard windows");
+    }
+
+    #[test]
+    fn scan_multiple_per_route_compose() {
+        // Two identical lateness scans per route (the Python API posts one scan per
+        // customer time window, so a route commonly carries several). The exact
+        // optimum must still equal the single-scan brute-force minimum -- the extra
+        // resource thread must not corrupt the result.
+        let dist = line_dist(&[0, 2, 4, 6, 8]);
+        let demand = vec![0i64, 1, 1, 1, 1];
+        let service = vec![0i64, 1, 1, 1, 1];
+        let earliest = vec![0i64, 0, 0, 0, 0];
+        let latest = vec![0i64, 5, 5, 20, 20];
+        let items = vec![1, 2, 3, 4];
+        let depot = 0;
+        let brute =
+            min_two_routes_scan(&items, &dist, &demand, Some(2), &earliest, &latest, &service, depot, Op::Le, 0).expect("feasible plan exists");
+
+        let dist_arc = Arc::new(dist.clone());
+        let demand_arc = Arc::new(demand.clone());
+        let mut constraints = vec![scan_load(&demand_arc, 0, 2), scan_load(&demand_arc, 1, 2)];
+        for l in 0..2 {
+            for _ in 0..2 {
+                constraints.push(Constraint { reduction: lateness_scan(l, &dist, &earliest, &latest, &service, depot), op: Op::Le, rhs: 0 });
+            }
+        }
+        let model = CollectionModel {
+            items: items.clone(),
+            lists: 2,
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![scan_edge(&dist_arc, 0), scan_edge(&dist_arc, 1)], max_terms: None }],
+            constraints,
+            globals: Vec::new(),
+            schedule: None,
+        };
+        let stop = AtomicBool::new(false);
+        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported multi-scan lowering");
+        assert!(outcome.complete, "exhausted the search");
+        assert!(outcome.solution.feasible, "a feasible plan exists");
+        assert_eq!(outcome.solution.objectives, vec![brute], "duplicate scans are idempotent");
+    }
+
+    // --- dispatch (classifier agrees with the engine) ---------------------------
+
+    use crate::model::classify::{Backend, BackendSelection, ModelClass};
+
+    /// A two-route edge-objective model carrying one scan constraint builder per
+    /// route, for classifier dispatch checks.
+    fn scan_dispatch_model(scan: impl Fn(usize) -> Option<Constraint>) -> CollectionModel {
+        let dist_arc = Arc::new(line_dist(&[0, 2, 4, 6, 8]));
+        let mut constraints = Vec::new();
+        for l in 0..2 {
+            if let Some(c) = scan(l) {
+                constraints.push(c);
+            }
+        }
+        CollectionModel {
+            items: vec![1, 2, 3, 4],
+            lists: 2,
+            objectives: vec![ObjectiveTier { minimize: true, terms: vec![scan_edge(&dist_arc, 0), scan_edge(&dist_arc, 1)], max_terms: None }],
+            constraints,
+            globals: Vec::new(),
+            schedule: None,
+        }
+    }
+
+    fn tw_scan_constraint(l: usize) -> Constraint {
+        let dist = line_dist(&[0, 2, 4, 6, 8]);
+        let service = vec![0i64, 1, 1, 1, 1];
+        let earliest = vec![0i64, 0, 0, 0, 0];
+        let latest = vec![0i64, 5, 5, 20, 20];
+        Constraint { reduction: lateness_scan(l, &dist, &earliest, &latest, &service, 0), op: Op::Le, rhs: 0 }
+    }
+
+    #[test]
+    fn dispatch_supported_scan_routes_to_integer_exact() {
+        let model = scan_dispatch_model(|l| Some(tw_scan_constraint(l)));
+        let selection = BackendSelection::for_collection(&model);
+        assert_eq!(selection.class, ModelClass::Routing);
+        assert_eq!(selection.backend, Backend::IntegerExact, "a homogeneous lowerable scan routes to the exact engine");
+    }
+
+    #[test]
+    fn dispatch_multiple_homogeneous_scans_route_to_integer_exact() {
+        // Each route carries two identical scans: still homogeneous, still exact.
+        let model = scan_dispatch_model(|l| Some(tw_scan_constraint(l)));
+        let mut model = model;
+        for l in 0..2 {
+            model.constraints.push(tw_scan_constraint(l));
+        }
+        assert_eq!(BackendSelection::for_collection(&model).backend, Backend::IntegerExact);
+    }
+
+    #[test]
+    fn dispatch_non_homogeneous_scan_falls_back_to_ls() {
+        // Scan on route 0 only: route-specific, so unsafe under depot symmetry.
+        let model = scan_dispatch_model(|l| (l == 0).then(|| tw_scan_constraint(l)));
+        assert_eq!(BackendSelection::for_collection(&model).backend, Backend::ListLocalSearch);
+    }
+
+    #[test]
+    fn dispatch_acc_in_divisor_scan_falls_back_to_ls() {
+        let divisor_scan = |l: usize| {
+            let mut arena = ExprArena::default();
+            let cur = arena.arg(0);
+            let acc = arena.arg(1);
+            let step = arena.div(cur, acc); // divides by the accumulator: rejected
+            let body = arena.constant(0);
+            Some(Constraint {
+                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list: l, init: 1, boundary: 0, step }, arena, body, coeff: 1 },
+                op: Op::Le,
+                rhs: 0,
+            })
+        };
+        assert_eq!(BackendSelection::for_collection(&scan_dispatch_model(divisor_scan)).backend, Backend::ListLocalSearch);
+    }
+
+    #[test]
+    fn dispatch_zero_capable_divisor_scan_falls_back_to_ls() {
+        // `emit = cur / rate[cur]` with `rate[1] == 0`: LS reads the zero divisor
+        // as the value 0, but the kernel `Div` makes that stop infeasible, so the
+        // two engines would disagree. The scan must fall back to LS, not lower.
+        let zero_div = |l: usize| {
+            let mut arena = ExprArena::default();
+            let cur = arena.arg(0);
+            let acc = arena.arg(1);
+            let step = arena.add(acc, cur);
+            let cur_e = arena.arg(0);
+            let rate = arena.array(Arc::new(vec![9, 0, 2, 2, 2]), cur_e); // rate[item 1] == 0
+            let body = arena.div(cur_e, rate);
+            Some(Constraint {
+                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list: l, init: 0, boundary: 0, step }, arena, body, coeff: 1 },
+                op: Op::Le,
+                rhs: 100,
+            })
+        };
+        assert_eq!(BackendSelection::for_collection(&scan_dispatch_model(zero_div)).backend, Backend::ListLocalSearch);
+    }
+
+    #[test]
+    fn dispatch_nonzero_const_divisor_scan_stays_exact() {
+        // The div guard must not over-reject: dividing by a nonzero constant lowers
+        // cleanly (div-by-const with the accumulator in the numerator is supported).
+        let const_div = |l: usize| {
+            let mut arena = ExprArena::default();
+            let cur = arena.arg(0);
+            let acc = arena.arg(1);
+            let step = arena.add(acc, cur);
+            let acc_e = arena.arg(1);
+            let two = arena.constant(2);
+            let body = arena.div(acc_e, two);
+            Some(Constraint {
+                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list: l, init: 0, boundary: 0, step }, arena, body, coeff: 1 },
+                op: Op::Le,
+                rhs: 100,
+            })
+        };
+        assert_eq!(BackendSelection::for_collection(&scan_dispatch_model(const_div)).backend, Backend::IntegerExact);
+    }
+
+    #[test]
+    fn dispatch_oversized_table_scan_falls_back_to_ls() {
+        // A table value beyond the i32-safe band could overflow the kernel's plain
+        // i64 `Expr::eval` on an intermediate (LS saturates), so the scan falls back.
+        let big_table = |l: usize| {
+            let mut arena = ExprArena::default();
+            let acc = arena.arg(1);
+            let cur_s = arena.arg(0);
+            let huge = arena.array(Arc::new(vec![0, i64::MAX, 0, 0, 0]), cur_s);
+            let step = arena.add(acc, huge);
+            let body = arena.arg(1);
+            Some(Constraint {
+                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list: l, init: 0, boundary: 0, step }, arena, body, coeff: 1 },
+                op: Op::Le,
+                rhs: 100,
+            })
+        };
+        assert_eq!(BackendSelection::for_collection(&scan_dispatch_model(big_table)).backend, Backend::ListLocalSearch);
+    }
+
+    #[test]
+    fn signature_rejects_zero_capable_and_oversized_leaves() {
+        // Direct predicate checks: `scan_routing_signature` returns `None` for a
+        // zero-capable divisor and for an out-of-band table leaf.
+        let items = vec![1, 2, 3, 4];
+        let zero_div = {
+            let mut arena = ExprArena::default();
+            let cur = arena.arg(0);
+            let acc = arena.arg(1);
+            let step = arena.add(acc, cur);
+            let cur_e = arena.arg(0);
+            let rate = arena.array(Arc::new(vec![9, 0, 2, 2, 2]), cur_e);
+            let body = arena.div(cur_e, rate);
+            Constraint {
+                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list: 0, init: 0, boundary: 0, step }, arena, body, coeff: 1 },
+                op: Op::Le,
+                rhs: 100,
+            }
+        };
+        assert!(scan_routing_signature(&zero_div, &items).is_none(), "zero-capable divisor is rejected");
+    }
+
+    #[test]
+    fn dispatch_select_kth_scan_falls_back_to_ls() {
+        let kth_scan = |l: usize| {
+            let mut arena = ExprArena::default();
+            let cur = arena.arg(0);
+            let acc = arena.arg(1);
+            let step = arena.add(acc, cur);
+            let body = arena.arg(1);
+            Some(Constraint {
+                reduction: Reduction {
+                    op: ReduceOp::SelectKth(0),
+                    iterable: Iterable::Scan { list: l, init: 0, boundary: 0, step },
+                    arena,
+                    body,
+                    coeff: 1,
+                },
+                op: Op::Le,
+                rhs: 0,
+            })
+        };
+        assert_eq!(BackendSelection::for_collection(&scan_dispatch_model(kth_scan)).backend, Backend::ListLocalSearch);
+    }
+
+    #[test]
+    fn dispatch_out_of_i32_range_scan_falls_back_to_ls() {
+        // acc multiplies by 100000 each step, leaving the i32-safe band immediately.
+        let huge_scan = |l: usize| {
+            let mut arena = ExprArena::default();
+            let acc = arena.arg(1);
+            let big = arena.constant(100_000);
+            let step = arena.mul(acc, big);
+            let body = arena.constant(0);
+            Some(Constraint {
+                reduction: Reduction {
+                    op: ReduceOp::Sum,
+                    iterable: Iterable::Scan { list: l, init: 100_000, boundary: 0, step },
+                    arena,
+                    body,
+                    coeff: 1,
+                },
+                op: Op::Le,
+                rhs: 0,
+            })
+        };
+        assert_eq!(BackendSelection::for_collection(&scan_dispatch_model(huge_scan)).backend, Backend::ListLocalSearch);
     }
 }
