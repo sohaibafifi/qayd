@@ -426,56 +426,203 @@ fn is_list_simple_objective_reduction(reduction: &list::Reduction) -> bool {
 }
 
 fn routing_integer_lowering_supported(model: &Model) -> bool {
-    if model.int_vars.is_empty() && model.intervals.is_empty() && !model.lists.is_empty() && model.objectives.len() == 1 {
-        let items = &model.lists[0].universe;
-        if model.lists.len().saturating_add(items.len()) > MAX_INTEGER_ROUTING_NODES
-            || !model.lists.iter().all(|list| list.universe == *items)
-            || !items_are_unique(items)
-        {
+    if !(model.int_vars.is_empty() && model.intervals.is_empty() && !model.lists.is_empty() && model.objectives.len() == 1) {
+        return false;
+    }
+    let items = &model.lists[0].universe;
+    if model.lists.len().saturating_add(items.len()) > MAX_INTEGER_ROUTING_NODES
+        || !model.lists.iter().all(|list| list.universe == *items)
+        || !items_are_unique(items)
+    {
+        return false;
+    }
+    let Objective::ListTerms { minimize: true, terms, max_terms } = &model.objectives[0] else {
+        return false;
+    };
+    if max_terms.as_ref().is_some_and(|terms| !terms.is_empty()) {
+        return false;
+    }
+
+    // The objective tier is closed-edge terms (one per real route) plus optional
+    // reified `Sum`-scan terms (one per real route); anything else is unsupported.
+    let mut edge_terms = Vec::new();
+    let mut scan_terms = Vec::new();
+    for term in terms {
+        match &term.iterable {
+            list::Iterable::Edges { .. } => edge_terms.push(term),
+            list::Iterable::Scan { .. } => scan_terms.push(term),
+            _ => return false,
+        }
+    }
+
+    // A list referenced by no objective term and no per-list constraint is a free
+    // pool. Exactly one => optional model with `k = lists - 1` real routes; zero =>
+    // today's non-optional path; more than one => unsupported (fall to enumeration).
+    let n_lists = model.lists.len();
+    let Some(pool_list) = single_free_pool_list(model, terms, n_lists) else {
+        // `single_free_pool_list` returns `None` for zero or >1 free lists; only >1
+        // is unsupported. Distinguish by recomputing the free count.
+        return free_pool_count(model, terms, n_lists) == 0 && edges_and_side_supported(model, &edge_terms, &scan_terms, items, n_lists, None);
+    };
+    edges_and_side_supported(model, &edge_terms, &scan_terms, items, n_lists, Some(pool_list))
+}
+
+/// Number of lists referenced by no objective term and no per-list constraint.
+fn free_pool_count(model: &Model, terms: &[list::Reduction], n_lists: usize) -> usize {
+    pool_referenced(model, terms, n_lists).iter().filter(|&&seen| !seen).count()
+}
+
+/// The single free-pool list index, or `None` when the free count is not exactly 1.
+fn single_free_pool_list(model: &Model, terms: &[list::Reduction], n_lists: usize) -> Option<usize> {
+    let referenced = pool_referenced(model, terms, n_lists);
+    let mut free = (0..n_lists).filter(|&list| !referenced[list]);
+    let first = free.next()?;
+    free.next().is_none().then_some(first)
+}
+
+fn pool_referenced(model: &Model, terms: &[list::Reduction], n_lists: usize) -> Vec<bool> {
+    let mut referenced = vec![false; n_lists];
+    for term in terms {
+        let list = term.iterable.list();
+        if list < n_lists {
+            referenced[list] = true;
+        }
+    }
+    for constraint in &model.constraints {
+        match constraint {
+            Constraint::ListLength { list, .. } | Constraint::ListItemSum { list, .. } => referenced[list.0] = true,
+            Constraint::ListReduction(constraint) => {
+                let list = constraint.reduction.iterable.list();
+                if list < n_lists {
+                    referenced[list] = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    referenced
+}
+
+/// Shared tail of the routing gate once the pool structure is known: the `k` real
+/// routes carry a homogeneous closed-edge objective (and optional homogeneous scan
+/// objective), and the side constraints are supported. `pool` is the free-pool
+/// list index when the model is optional, or `None` for the non-optional path.
+fn edges_and_side_supported(
+    model: &Model,
+    edge_terms: &[&list::Reduction],
+    scan_terms: &[&list::Reduction],
+    items: &[i32],
+    n_lists: usize,
+    pool: Option<usize>,
+) -> bool {
+    let k = if pool.is_some() { n_lists - 1 } else { n_lists };
+    if k == 0 || !edges_homogeneous(edge_terms, k, items) {
+        return false;
+    }
+    if !scan_terms.is_empty() {
+        // A reified scan objective is only lowered alongside a pool (a non-pool
+        // scan objective keeps its established enumeration path).
+        if pool.is_none() || scan_terms.len() != k || !scans_homogeneous_objective(scan_terms, k, items) {
             return false;
         }
-        let Objective::ListTerms { minimize: true, terms, max_terms } = &model.objectives[0] else {
+    }
+    match pool {
+        Some(pool_list) => pool_side_constraints_supported(model, items, pool_list, n_lists),
+        None => list_constraints_are_integer_routing_supported(model, items),
+    }
+}
+
+/// A homogeneous closed-edge objective over exactly `k` real routes: `k` distinct
+/// lists, identical depot and matrix. The lists need not be `0..k` (a pool model's
+/// real lists are the objective-referenced subset).
+fn edges_homogeneous(edge_terms: &[&list::Reduction], k: usize, items: &[i32]) -> bool {
+    if edge_terms.len() != k {
+        return false;
+    }
+    let mut seen: Vec<usize> = Vec::with_capacity(k);
+    let mut base: Option<EdgeSignature<'_>> = None;
+    for term in edge_terms {
+        let Some((list, signature)) = direct_closed_edge_signature(term, items) else {
             return false;
         };
-        if max_terms.as_ref().is_some_and(|terms| !terms.is_empty()) {
+        if seen.contains(&list) {
             return false;
         }
-        return direct_closed_edge_objective(terms, model.lists.len(), items)
-            && list_constraints_are_integer_routing_supported(model, items);
+        seen.push(list);
+        match &base {
+            None => base = Some(signature),
+            Some(base) => {
+                if signature.depot != base.depot || signature.reversed != base.reversed || signature.matrix != base.matrix {
+                    return false;
+                }
+            }
+        }
     }
-    false
+    true
+}
+
+/// A homogeneous reified `Sum`-scan objective over `k` distinct real routes.
+fn scans_homogeneous_objective(scan_terms: &[&list::Reduction], k: usize, items: &[i32]) -> bool {
+    if scan_terms.len() != k {
+        return false;
+    }
+    let mut seen: Vec<usize> = Vec::with_capacity(k);
+    let mut base: Option<list::scan::ScanRoutingSpec> = None;
+    for term in scan_terms {
+        let list = term.iterable.list();
+        if seen.contains(&list) {
+            return false;
+        }
+        seen.push(list);
+        let synth = list::Constraint { reduction: (*term).clone(), op: list::Op::Le, rhs: 0 };
+        let Some(spec) = list::scan::scan_routing_signature(&synth, items) else {
+            return false;
+        };
+        match &base {
+            None => base = Some(spec),
+            Some(base) => {
+                if &spec != base {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// A pool model admits only homogeneous `Sum`-scan side constraints over the real
+/// routes (the pool list carries none). Capacity, length, item-sum, same-list, and
+/// precedence are rejected (they would wrongly cap or count the free pool route).
+fn pool_side_constraints_supported(model: &Model, items: &[i32], pool_list: usize, n_lists: usize) -> bool {
+    let mut scans: Vec<Vec<list::scan::ScanRoutingSpec>> = (0..n_lists).map(|_| Vec::new()).collect();
+    for constraint in &model.constraints {
+        match constraint {
+            Constraint::ListPartition { .. } => {}
+            Constraint::ListReduction(reduction) if list::scan::scan_constraint_list(reduction).is_some() => {
+                let (Some(list), Some(spec)) =
+                    (list::scan::scan_constraint_list(reduction), list::scan::scan_routing_signature(reduction, items))
+                else {
+                    return false;
+                };
+                if list >= n_lists || list == pool_list {
+                    return false;
+                }
+                scans[list].push(spec);
+            }
+            _ => return false,
+        }
+    }
+    let mut real = (0..n_lists).filter(|&list| list != pool_list).map(|list| &scans[list]);
+    match real.next() {
+        None => true,
+        Some(first) => real.all(|list_scans| list_scans == first),
+    }
 }
 
 struct EdgeSignature<'a> {
     depot: i32,
     reversed: bool,
     matrix: &'a [Vec<i64>],
-}
-
-fn direct_closed_edge_objective(terms: &[list::Reduction], list_count: usize, items: &[i32]) -> bool {
-    if terms.len() != list_count {
-        return false;
-    }
-    let mut by_list: Vec<Option<EdgeSignature<'_>>> = (0..list_count).map(|_| None).collect();
-    for term in terms {
-        let Some((list, signature)) = direct_closed_edge_signature(term, items) else {
-            return false;
-        };
-        if list >= list_count || by_list[list].is_some() {
-            return false;
-        }
-        by_list[list] = Some(signature);
-    }
-    let mut signatures = by_list.into_iter();
-    let Some(Some(first)) = signatures.next() else {
-        return false;
-    };
-    signatures.all(|item| {
-        let Some(other) = item else {
-            return false;
-        };
-        other.depot == first.depot && other.reversed == first.reversed && other.matrix == first.matrix
-    })
 }
 
 fn direct_closed_edge_signature<'a>(reduction: &'a list::Reduction, items: &[i32]) -> Option<(usize, EdgeSignature<'a>)> {

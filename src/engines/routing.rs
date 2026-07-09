@@ -76,6 +76,15 @@ struct RoutingSpec {
     /// carries the identical set, since route-specific scans are unsafe under
     /// depot-copy symmetry. Empty means no scan.
     scan: Vec<ScanRoutingSpec>,
+    /// Optional-list model: `depot_count` includes one extra "pool depot" (the
+    /// last depot index) whose zero-cost route absorbs dropped items. Every cost
+    /// channel is gated by `in_pool` so a pooled item contributes 0 everywhere.
+    /// `depot_count == k + 1` real routes when set; `depot_count == k` otherwise.
+    pool: bool,
+    /// Homogeneous per-route reified `Sum` scan folded into the objective, or
+    /// `None`. Only set for pool models; a pooled customer contributes 0 (gated
+    /// by `in_pool`). The `op`/`rhs` fields are unused (it is scored, not bounded).
+    scan_objective: Option<ScanRoutingSpec>,
 }
 
 /// The model's homogeneous per-route side constraints, classified.
@@ -126,45 +135,113 @@ impl RoutingSpec {
         if model.schedule.is_some() || model.lists == 0 || model.objectives.len() != 1 {
             return None;
         }
-        // Only label-free `SameList` globals are channeled (others -- e.g. ListLe --
-        // are route-named and unsafe under depot-copy symmetry, so leave them to LS).
-        let mut same_list = Vec::new();
-        for global in &model.globals {
-            match *global {
-                GlobalConstraint::SameList { a, b } => same_list.push((a, b)),
-                _ => return None,
-            }
-        }
         let node_count = model.lists.checked_add(model.items.len())?;
         if node_count > MAX_INTEGER_ROUTING_NODES {
             return None;
         }
         let tier = &model.objectives[0];
-        if !tier.minimize || tier.has_max_terms() || tier.terms.len() != model.lists {
+        if !tier.minimize || tier.has_max_terms() || !items_are_unique(&model.items) {
             return None;
         }
-        let (depot, edge) = parse_route_edge_objective(&tier.terms, model.lists)?;
-        if model.items.contains(&depot) || !items_are_unique(&model.items) {
+
+        // The objective tier is a mix of closed-edge terms (one per real route) and
+        // reified `Sum`-scan terms (one per real route). Anything else is unsupported.
+        let mut edge_terms = Vec::new();
+        let mut scan_terms = Vec::new();
+        for term in &tier.terms {
+            match &term.iterable {
+                Iterable::Edges { .. } => edge_terms.push(term),
+                Iterable::Scan { .. } => scan_terms.push(term),
+                _ => return None,
+            }
+        }
+
+        // A list referenced by no objective term and no per-list constraint is a
+        // free "pool". Exactly one pool => optional model with `k = lists - 1` real
+        // routes; zero pools => today's exact non-optional path (every list served).
+        let n_lists = model.lists;
+        let mut referenced = vec![false; n_lists];
+        for term in &tier.terms {
+            let list = term.iterable.list();
+            if list >= n_lists {
+                return None;
+            }
+            referenced[list] = true;
+        }
+        for constraint in &model.constraints {
+            let list = constraint.reduction.iterable.list();
+            if list < n_lists {
+                referenced[list] = true;
+            }
+        }
+        let free: Vec<usize> = (0..n_lists).filter(|&list| !referenced[list]).collect();
+        let pool = match free.len() {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        let k = if pool { n_lists - 1 } else { n_lists };
+        if k == 0 {
             return None;
         }
-        // SameList references items that must be in the universe.
-        if same_list.iter().any(|&(a, b)| !model.items.contains(&a) || !model.items.contains(&b)) {
+
+        // Homogeneous closed-edge matrix over the `k` real routes.
+        let (depot, edge) = homogeneous_edge_objective(&edge_terms, k)?;
+        if model.items.contains(&depot) {
             return None;
         }
-        let mut nodes = Vec::with_capacity(model.items.len() + 1);
-        nodes.push(depot);
+
+        // Reified scan objective: `k` homogeneous copies, only for pool models (a
+        // non-pool scan objective keeps its established enumeration path).
+        let scan_objective = if scan_terms.is_empty() {
+            None
+        } else {
+            if !pool || scan_terms.len() != k {
+                return None;
+            }
+            Some(homogeneous_scan_terms(&scan_terms, &model.items)?)
+        };
+
+        // Side constraints. A pool is only lowerable alongside homogeneous scan
+        // constraints (a capacity/length/item-sum/same-list route would wrongly cap
+        // or count the free pool route), so those stay on enumeration.
+        let (capacity, same_list, length, item_sum, scan) = if pool {
+            if !model.globals.is_empty() {
+                return None;
+            }
+            let pool_list = free[0];
+            (None, Vec::new(), None, None, parse_pool_scan_constraints(model, pool_list)?)
+        } else {
+            let mut same_list = Vec::new();
+            for global in &model.globals {
+                match *global {
+                    GlobalConstraint::SameList { a, b } => same_list.push((a, b)),
+                    _ => return None,
+                }
+            }
+            if same_list.iter().any(|&(a, b)| !model.items.contains(&a) || !model.items.contains(&b)) {
+                return None;
+            }
+            let sides = parse_route_side_constraints(model)?;
+            (sides.capacity, same_list, sides.length, sides.item_sum, sides.scan)
+        };
+
+        let depot_count = if pool { k + 1 } else { k };
+        let mut nodes = Vec::with_capacity(depot_count + model.items.len());
+        nodes.extend((0..depot_count).map(|_| depot));
         nodes.extend_from_slice(&model.items);
-        let sides = parse_route_side_constraints(model)?;
         edge.covers_i32_costs(&nodes).then_some(Self {
-            depot_count: model.lists,
+            depot_count,
             depot,
             items: model.items.clone(),
             edge,
-            capacity: sides.capacity,
+            capacity,
             same_list,
-            length: sides.length,
-            item_sum: sides.item_sum,
-            scan: sides.scan,
+            length,
+            item_sum,
+            scan,
+            pool,
+            scan_objective,
         })
     }
 
@@ -180,12 +257,37 @@ impl RoutingSpec {
         // lowering builds the complete graph, so it stays on the base rules.
         graph::circuit(&mut solver, &succ);
 
+        // Pool-membership channel. `in_pool[node]` is fixed 1 at the pool depot
+        // (the last depot index), 0 at every real depot, and threaded to each
+        // customer from its unique predecessor arc. `circuit` gives each customer
+        // one predecessor, so the implication pins it exactly at a leaf.
+        let in_pool = self.pool.then(|| self.build_pool_membership(&mut solver, &succ, n));
+
         let mut cost_vars = Vec::with_capacity(n);
         for (from_idx, &from_node) in nodes.iter().enumerate() {
             let row = nodes.iter().map(|&to_node| self.edge.cost(from_node, to_node).expect("validated edge cost")).collect::<Vec<_>>();
-            let cost = solver.new_var_set(&row);
-            primitives::element_const(&mut solver, &row, succ[from_idx], cost);
-            cost_vars.push(cost);
+            match &in_pool {
+                // Gate the edge: a pooled tail (customer or the pool depot itself)
+                // contributes 0 on every one of its arcs, so the whole pool route
+                // -- depot-to-item, item-to-item and item-to-depot -- is zero-cost.
+                Some(in_pool) => {
+                    let raw = solver.new_var_set(&row);
+                    primitives::element_const(&mut solver, &row, succ[from_idx], raw);
+                    let mut domain = row.clone();
+                    if !domain.contains(&0) {
+                        domain.push(0);
+                    }
+                    let cost = solver.new_var_set(&domain);
+                    let gated = expr::ite(expr::eq(expr::var(in_pool[from_idx]), expr::int(1)), expr::int(0), expr::var(raw));
+                    intension::intension(&mut solver, expr::eq(expr::var(cost), gated));
+                    cost_vars.push(cost);
+                }
+                None => {
+                    let cost = solver.new_var_set(&row);
+                    primitives::element_const(&mut solver, &row, succ[from_idx], cost);
+                    cost_vars.push(cost);
+                }
+            }
         }
 
         if let Some(capacity) = &self.capacity {
@@ -195,10 +297,22 @@ impl RoutingSpec {
         }
 
         for scan in &self.scan {
-            self.post_scan_constraint(&mut solver, &succ, &nodes, scan);
+            self.post_scan_constraint(&mut solver, &succ, &nodes, scan, in_pool.as_deref());
         }
 
-        post_depot_symmetry(&mut solver, &succ, self.depot_count, n);
+        // Reified scan objective: one gated per-customer contribution, summed into
+        // the objective. A pooled customer contributes 0 (gated by `in_pool`), so
+        // summing the ungated real customers equals the real routes' scan totals.
+        if let Some(scan) = &self.scan_objective {
+            let in_pool = in_pool.as_deref().expect("scan objective is only set for pool models");
+            cost_vars.extend(self.post_scan_objective(&mut solver, &succ, &nodes, scan, in_pool));
+        }
+
+        // Depot symmetry orders only the `k` real depots; the pool depot (last
+        // index) keeps its fixed, distinct, unconstrained role and is excluded, so
+        // relabelling real depots never touches it. Non-pool orders all depots.
+        let real_depots = if self.pool { self.depot_count - 1 } else { self.depot_count };
+        post_depot_symmetry(&mut solver, &succ, real_depots, self.depot_count, n);
 
         // Membership <-> route-order channel. Built only for same-list requirements
         // over >= 2 routes (one route makes `same_list` trivially true). The list
@@ -325,7 +439,7 @@ impl RoutingSpec {
     /// capacity `>=` relaxation). The cumulative sum is kept per route -- reset to
     /// `0` at every depot -- because the list-local-search spec applies the scan
     /// bound to each route independently, not to the fleet total.
-    fn post_scan_constraint(&self, solver: &mut Solver, succ: &[VarId], nodes: &[i32], scan: &ScanRoutingSpec) {
+    fn post_scan_constraint(&self, solver: &mut Solver, succ: &[VarId], nodes: &[i32], scan: &ScanRoutingSpec, in_pool: Option<&[VarId]>) {
         let n = nodes.len();
         let depot_count = self.depot_count;
         let arena = &scan.arena.exprs;
@@ -377,9 +491,105 @@ impl RoutingSpec {
                     Op::Ge => expr::ge(total, expr::int(scan.rhs)),
                     Op::Eq => expr::eq(total, expr::int(scan.rhs)),
                 };
-                intension::intension(solver, expr::imp(arc, bounded));
+                // The pool route is unbounded: a closing arc whose tail is pooled
+                // (`in_pool[from] == 1`) closes the pool route, so its total is not
+                // held against rhs. Real routes (tail not pooled) are bounded.
+                let guarded = match in_pool {
+                    Some(in_pool) => expr::imp(expr::eq(expr::var(in_pool[from]), expr::int(0)), bounded),
+                    None => bounded,
+                };
+                intension::intension(solver, expr::imp(arc, guarded));
             }
         }
+    }
+
+    /// Build the pool-membership vars: `1` fixed at the pool depot (last depot
+    /// index), `0` fixed at every real depot, `[0, 1]` at customers, threaded from
+    /// each customer's unique predecessor arc `succ[from] == to => in_pool[to] ==
+    /// in_pool[from]`. Pinned exactly at a leaf because `circuit` makes the
+    /// predecessor unique; partial states leave a customer's membership free.
+    fn build_pool_membership(&self, solver: &mut Solver, succ: &[VarId], n: usize) -> Vec<VarId> {
+        let pool_depot = self.depot_count - 1;
+        let in_pool: Vec<VarId> = (0..n)
+            .map(|node| {
+                if node == pool_depot {
+                    solver.new_var_set(&[1])
+                } else if node < self.depot_count {
+                    solver.new_var_set(&[0])
+                } else {
+                    solver.new_var_range(0, 1)
+                }
+            })
+            .collect();
+        for from in 0..n {
+            for to in self.depot_count..n {
+                if from == to {
+                    continue;
+                }
+                let arc = expr::eq(expr::var(succ[from]), expr::int(to as i64));
+                intension::intension(solver, expr::imp(arc, expr::eq(expr::var(in_pool[to]), expr::var(in_pool[from]))));
+            }
+        }
+        in_pool
+    }
+
+    /// Lower a reified `Sum`-scan objective into per-customer contribution vars.
+    /// Threads its own accumulator (same pinning discipline as
+    /// [`Self::post_scan_constraint`]), pins each customer's `coeff * emit` by its
+    /// incoming arc, then gates it by `in_pool` so a pooled customer contributes 0.
+    /// Returns the contribution vars to append to the objective's cost vars.
+    fn post_scan_objective(&self, solver: &mut Solver, succ: &[VarId], nodes: &[i32], scan: &ScanRoutingSpec, in_pool: &[VarId]) -> Vec<VarId> {
+        let n = nodes.len();
+        let depot_count = self.depot_count;
+        let arena = &scan.arena.exprs;
+        let cv = |node: usize| if node < depot_count { i64::from(scan.boundary) } else { i64::from(nodes[node]) };
+
+        let mut acc = vec![None; n];
+        for slot in acc.iter_mut().take(n).skip(depot_count) {
+            *slot = Some(solver.new_var_range(scan.acc_dom.0 as i32, scan.acc_dom.1 as i32));
+        }
+        let a_of = |from: usize| if from < depot_count { expr::int(scan.init) } else { expr::var(acc[from].expect("customer accumulator")) };
+
+        for (from, &from_var) in succ.iter().enumerate() {
+            for to in depot_count..n {
+                if from == to {
+                    continue;
+                }
+                let cur = i64::from(nodes[to]);
+                let prev = cv(from);
+                let arc = expr::eq(expr::var(from_var), expr::int(to as i64));
+                let step_rhs = lower_scan(arena, scan.step, cur, prev, &a_of(from));
+                intension::intension(solver, expr::imp(arc, expr::eq(expr::var(acc[to].expect("customer accumulator")), step_rhs)));
+            }
+        }
+
+        // Per-customer `coeff * emit` at the chosen predecessor, gated to 0 when pooled.
+        let (ce_lo, ce_hi) = {
+            let a = scan.coeff.saturating_mul(scan.emit_dom.0);
+            let b = scan.coeff.saturating_mul(scan.emit_dom.1);
+            (a.min(b), a.max(b))
+        };
+        let mut contrib = Vec::with_capacity(n - depot_count);
+        for c in depot_count..n {
+            let emit_var = solver.new_var_range(ce_lo as i32, ce_hi as i32);
+            let acc_c = expr::var(acc[c].expect("customer accumulator"));
+            for (from, &from_var) in succ.iter().enumerate() {
+                if from == c {
+                    continue;
+                }
+                let cur = i64::from(nodes[c]);
+                let prev = cv(from);
+                let arc = expr::eq(expr::var(from_var), expr::int(c as i64));
+                let emit_rhs = lower_scan(arena, scan.emit, cur, prev, &acc_c);
+                let scaled = expr::mul(vec![expr::int(scan.coeff), emit_rhs]);
+                intension::intension(solver, expr::imp(arc, expr::eq(expr::var(emit_var), scaled)));
+            }
+            let obj = solver.new_var_range(ce_lo.min(0) as i32, ce_hi.max(0) as i32);
+            let gated = expr::ite(expr::eq(expr::var(in_pool[c]), expr::int(1)), expr::int(0), expr::var(emit_var));
+            intension::intension(solver, expr::eq(expr::var(obj), gated));
+            contrib.push(obj);
+        }
+        contrib
     }
 }
 
@@ -395,7 +605,10 @@ pub(crate) fn solve_collection(
     // Warm start: a quick local-search incumbent seeds the first dive and, after
     // replay verification, supplies an initial exact objective bound.
     // `QAYD_ROUTING_WARMSTART=0` disables it (ablation).
-    let warm = if std::env::var("QAYD_ROUTING_WARMSTART").as_deref() != Ok("0") {
+    // Pool models skip the warm start: `ls_tour_succ` chains routes by depot index,
+    // which would not respect the pool depot's distinct fixed role. Warm start is
+    // only a perf seed, so correctness holds on the NN seed + exact search alone.
+    let warm = if !spec.pool && std::env::var("QAYD_ROUTING_WARMSTART").as_deref() != Ok("0") {
         // A bounded local-search pass: enough to find a good incumbent, capped so
         // it terminates even without a stop flag and leaves the exact search the
         // bulk of the time.
@@ -452,8 +665,12 @@ pub(crate) fn solve_collection(
             // The circuit + capacity propagators guarantee a single Hamiltonian
             // cycle decoding into exactly `depot_count` routes; a failure here is a
             // logic bug, not an unsupported model -- panic rather than fall back.
-            let routes =
-                routes_from_successors(&nodes, depot_count, &assignment[..nodes.len()]).expect("solved circuit decodes into k routes");
+            // A pool model decodes the pool depot's segment as the last list.
+            let routes = if spec.pool {
+                decode_pool_routes(&nodes, depot_count, &assignment[..nodes.len()])
+            } else {
+                routes_from_successors(&nodes, depot_count, &assignment[..nodes.len()]).expect("solved circuit decodes into k routes")
+            };
             (routes, Some(value), true)
         }
         None => match verified {
@@ -668,17 +885,19 @@ impl Propagator for RouteSegmentChannel {
 /// non-decreasing. Sound: relabelling depot copies to sort their heads always
 /// yields an equivalent solution, and empty routes tie at the sentinel rather
 /// than at a depot index (so the degenerate all-empty cycle is not over-pruned).
-fn post_depot_symmetry(solver: &mut Solver, succ: &[VarId], depot_count: usize, n: usize) {
-    if depot_count < 2 {
+fn post_depot_symmetry(solver: &mut Solver, succ: &[VarId], order_count: usize, depot_threshold: usize, n: usize) {
+    if order_count < 2 {
         return;
     }
     let sentinel = n as i64;
-    let head: Vec<VarId> = succ[..depot_count]
+    let head: Vec<VarId> = succ[..order_count]
         .iter()
         .map(|&s| {
-            let h = solver.new_var_range(depot_count as i32, n as i32);
-            // head = (succ < depot_count) ? sentinel : succ   (empty route -> sentinel)
-            let def = expr::ite(expr::lt(expr::var(s), expr::int(depot_count as i64)), expr::int(sentinel), expr::var(s));
+            let h = solver.new_var_range(depot_threshold as i32, n as i32);
+            // head = (succ < depot_threshold) ? sentinel : succ   (empty route -> sentinel).
+            // `depot_threshold` is the internal depot count, so a real depot pointing at
+            // any depot (incl. the pool depot) still reads as an empty real route.
+            let def = expr::ite(expr::lt(expr::var(s), expr::int(depot_threshold as i64)), expr::int(sentinel), expr::var(s));
             intension::intension(solver, expr::eq(expr::var(h), def));
             h
         })
@@ -782,25 +1001,102 @@ fn routes_from_successors(nodes: &[i32], depot_count: usize, succ: &[i32]) -> Op
     (routes.len() == depot_count && seen.iter().all(|&x| x)).then_some(routes)
 }
 
-fn parse_route_edge_objective(terms: &[Reduction], list_count: usize) -> Option<(i32, DirectEdgeMatrix)> {
-    let mut by_list: Vec<Option<(i32, DirectEdgeMatrix)>> = (0..list_count).map(|_| None).collect();
-    for term in terms {
+/// A homogeneous closed-edge objective over exactly `k` real routes: every term
+/// is a distinct list carrying the identical depot and distance matrix. Unlike
+/// [`parse_route_edge_objective`] the lists need not be `0..k` (a pool model's
+/// real lists are the objective-referenced subset), so distinctness is checked
+/// against the seen set rather than an index array.
+fn homogeneous_edge_objective(edge_terms: &[&Reduction], k: usize) -> Option<(i32, DirectEdgeMatrix)> {
+    if edge_terms.len() != k {
+        return None;
+    }
+    let mut seen: Vec<usize> = Vec::with_capacity(k);
+    let mut base: Option<(i32, DirectEdgeMatrix)> = None;
+    for term in edge_terms {
         let (list, depot, edge) = direct_closed_edge_term(term)?;
-        if list >= list_count || by_list[list].is_some() {
+        if seen.contains(&list) {
             return None;
         }
-        by_list[list] = Some((depot, edge));
+        seen.push(list);
+        match &base {
+            None => base = Some((depot, edge)),
+            Some((base_depot, base_edge)) => {
+                if depot != *base_depot || !base_edge.same_matrix_as(&edge) {
+                    return None;
+                }
+            }
+        }
     }
+    base
+}
 
-    let mut parsed = by_list.into_iter();
-    let (depot, edge) = parsed.next()??;
-    for item in parsed {
-        let (other_depot, other_edge) = item?;
-        if other_depot != depot || !edge.same_matrix_as(&other_edge) {
+/// A homogeneous reified `Sum`-scan objective over the real routes: every term is
+/// a distinct list with the identical lowered signature. The `op`/`rhs` are
+/// synthesised (unused when scored) so the shared signature parser can validate
+/// the accumulator domains and reject out-of-band or accumulator-in-divisor scans.
+fn homogeneous_scan_terms(scan_terms: &[&Reduction], items: &[i32]) -> Option<ScanRoutingSpec> {
+    let mut seen: Vec<usize> = Vec::with_capacity(scan_terms.len());
+    let mut base: Option<ScanRoutingSpec> = None;
+    for term in scan_terms {
+        let list = term.iterable.list();
+        if seen.contains(&list) {
             return None;
         }
+        seen.push(list);
+        let synth = Constraint { reduction: (*term).clone(), op: Op::Le, rhs: 0 };
+        let spec = scan_routing_signature(&synth, items)?;
+        match &base {
+            None => base = Some(spec),
+            Some(base_spec) => {
+                if &spec != base_spec {
+                    return None;
+                }
+            }
+        }
     }
-    Some((depot, edge))
+    base
+}
+
+/// The pool model's side constraints: only homogeneous `Sum`-scan constraints
+/// over the real routes are lowerable (the pool list carries none). Anything else
+/// (capacity, length, item-sum) rejects to enumeration. Homogeneity is checked
+/// across the real lists only -- the pool list is excluded, since it is unbounded.
+fn parse_pool_scan_constraints(model: &CollectionModel, pool_list: usize) -> Option<Vec<ScanRoutingSpec>> {
+    let mut by_list: Vec<Vec<ScanRoutingSpec>> = (0..model.lists).map(|_| Vec::new()).collect();
+    for constraint in &model.constraints {
+        let Iterable::Scan { list, .. } = constraint.reduction.iterable else {
+            return None;
+        };
+        if list >= model.lists || list == pool_list {
+            return None;
+        }
+        by_list[list].push(scan_routing_signature(constraint, &model.items)?);
+    }
+    let mut real = (0..model.lists).filter(|&list| list != pool_list).map(|list| &by_list[list]);
+    let first = real.next()?;
+    real.all(|scans| scans == first).then(|| first.clone())
+}
+
+/// Decode a solved pool tour into `depot_count` lists: the segment starting at
+/// each real depot `0..k` (in depot-index order, arbitrary since the real depots
+/// are interchangeable) followed by the pool depot's segment as the LAST list,
+/// matching the enumeration convention where the free pool list contributes 0.
+fn decode_pool_routes(nodes: &[i32], depot_count: usize, succ: &[i32]) -> Vec<Vec<i32>> {
+    let segment = |start: usize| -> Vec<i32> {
+        let mut route = Vec::new();
+        let mut cur = succ[start] as usize;
+        let mut steps = 0usize;
+        while cur >= depot_count && cur < nodes.len() && steps <= nodes.len() {
+            route.push(nodes[cur]);
+            cur = succ[cur] as usize;
+            steps += 1;
+        }
+        route
+    };
+    let pool_depot = depot_count - 1;
+    let mut lists: Vec<Vec<i32>> = (0..pool_depot).map(segment).collect();
+    lists.push(segment(pool_depot));
+    lists
 }
 
 fn direct_closed_edge_term(reduction: &Reduction) -> Option<(usize, i32, DirectEdgeMatrix)> {
@@ -2365,5 +2661,434 @@ mod tests {
             })
         };
         assert_eq!(BackendSelection::for_collection(&scan_dispatch_model(huge_scan)).backend, Backend::ListLocalSearch);
+    }
+
+    // --- optional-list pool oracles (G9) ----------------------------------------
+    //
+    // The pool depot forms a zero-cost route that absorbs dropped items. Every test
+    // asserts a three-way equality: engine integer optimum == exact list enumeration
+    // optimum == an independent hand brute-force where each item goes to one of the
+    // k real routes OR the pool (cost 0). This is the primary defence against a
+    // silently mis-gated pooled item.
+
+    /// Best closed-route value for one real route under a pool: the minimum
+    /// closed-tour cost over orderings passing `filter`, minus a constant reward per
+    /// served stop. `None` if no ordering passes the filter; empty route scores 0.
+    fn best_pool_route(depot: i32, route: &[i32], dist: &[Vec<i64>], reward: i64, filter: &dyn Fn(&[i32]) -> bool) -> Option<i64> {
+        if route.is_empty() {
+            return Some(0);
+        }
+        permutations(route)
+            .iter()
+            .filter(|p| filter(p))
+            .map(|p| ordered_closed_cost(depot, p, dist))
+            .min()
+            .map(|cost| cost - reward * route.len() as i64)
+    }
+
+    /// Exhaustive optimum for a `k`-real-route optional model: each item goes to one
+    /// of `k` real routes OR the pool (contributing 0). Mirrors the in_pool gating.
+    fn min_pool(depot: i32, items: &[i32], dist: &[Vec<i64>], k: usize, reward: i64, filter: &dyn Fn(&[i32]) -> bool) -> i64 {
+        let choices = k + 1;
+        let combos = (choices as u64).pow(items.len() as u32);
+        let mut best = i64::MAX;
+        for combo in 0..combos {
+            let mut routes = vec![Vec::new(); k];
+            let mut code = combo;
+            for &item in items {
+                let choice = (code % choices as u64) as usize;
+                code /= choices as u64;
+                if choice < k {
+                    routes[choice].push(item);
+                }
+            }
+            let total: Option<i64> = routes.iter().map(|r| best_pool_route(depot, r, dist, reward, filter)).sum();
+            if let Some(total) = total {
+                best = best.min(total);
+            }
+        }
+        best
+    }
+
+    /// The exact list-enumeration optimum for a pool model (the G8 oracle). Asserts
+    /// the instance is enumerable (proven OPTIMAL), scoring only the objective-
+    /// referenced real lists so the free pool list contributes 0.
+    fn enum_pool_optimum(model: &CollectionModel) -> i64 {
+        let tiers = crate::model::list_objective_tiers(&model.objectives, &model.items).expect("objective parses for enumeration");
+        let stop = AtomicBool::new(false);
+        let outcome = crate::engines::list_exact::solve(model, &tiers, &stop, |_| {}).expect("enumeration runs").expect("enumeration supports the model");
+        assert_eq!(outcome.status, crate::engines::list_exact::Status::Optimal, "enumeration proves optimality on the small instance");
+        outcome.objectives[0]
+    }
+
+    /// A `k`-real-route pool model whose objective is edges only (list `k` is the
+    /// free pool, referenced by nothing).
+    fn pool_edge_model(items: Vec<i32>, dist: &Arc<Vec<Vec<i64>>>, k: usize) -> CollectionModel {
+        let terms = (0..k).map(|list| scan_edge(dist, list)).collect();
+        CollectionModel { items, lists: k + 1, objectives: vec![ObjectiveTier { minimize: true, terms, max_terms: None }], constraints: Vec::new(), globals: Vec::new(), schedule: None }
+    }
+
+    /// A reified scan objective term paying a constant `reward` per served stop
+    /// (`emit = -reward`, order-independent). Its `Sum` over a real route is
+    /// `-reward * length`, so summing the served customers rewards serving them.
+    fn reward_scan(list: usize, reward: i64) -> Reduction {
+        let mut arena = ExprArena::default();
+        let step = arena.arg(1); // accumulator threaded unchanged (unused)
+        let emit = arena.constant(-reward);
+        Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list, init: 0, boundary: 0, step }, arena, body: emit, coeff: 1 }
+    }
+
+    /// A `k`-real-route pool model: edges plus a reified reward scan per real route.
+    fn pool_reward_model(items: Vec<i32>, dist: &Arc<Vec<Vec<i64>>>, k: usize, reward: i64) -> CollectionModel {
+        let mut terms: Vec<Reduction> = (0..k).map(|list| scan_edge(dist, list)).collect();
+        terms.extend((0..k).map(|list| reward_scan(list, reward)));
+        CollectionModel { items, lists: k + 1, objectives: vec![ObjectiveTier { minimize: true, terms, max_terms: None }], constraints: Vec::new(), globals: Vec::new(), schedule: None }
+    }
+
+    fn allow_all(_: &[i32]) -> bool {
+        true
+    }
+
+    #[test]
+    fn pool_all_items_pooled_is_zero() {
+        // No reward, every served edge strictly positive: dropping everything is
+        // optimal. The whole pool route must be zero-cost (optimum 0).
+        let dist = vec![vec![0, 7, 9, 8], vec![7, 0, 5, 6], vec![9, 5, 0, 4], vec![8, 6, 4, 0]];
+        let items = vec![1, 2, 3];
+        let brute = min_pool(0, &items, &dist, 1, 0, &allow_all);
+        assert_eq!(brute, 0, "with no reward the best plan pools every item");
+        let model = pool_edge_model(items.clone(), &Arc::new(dist), 1);
+        let enumerated = enum_pool_optimum(&model);
+        let stop = AtomicBool::new(false);
+        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported pool lowering");
+        assert!(outcome.complete, "exhausted the search");
+        assert!(outcome.solution.feasible);
+        assert_eq!(outcome.solution.objectives, vec![0], "engine optimum is zero");
+        assert_eq!(outcome.solution.objectives[0], enumerated, "engine == enumeration");
+        assert_eq!(outcome.solution.objectives[0], brute, "engine == hand brute-force");
+        assert!(outcome.solution.lists[0].is_empty(), "the real route is empty");
+        let mut pooled = outcome.solution.lists[1].clone();
+        pooled.sort_unstable();
+        assert_eq!(pooled, items, "every item lands in the pool list");
+    }
+
+    #[test]
+    fn pool_single_node_serve_or_drop() {
+        // One customer, round trip 20. Reward 25 > 20 -> serve (net -5); reward 5 <
+        // 20 -> drop (optimum 0). The gate must flip with the reward.
+        let dist = vec![vec![0, 10], vec![10, 0]];
+        let items = vec![1];
+
+        let served_brute = min_pool(0, &items, &dist, 1, 25, &allow_all);
+        assert_eq!(served_brute, -5);
+        let served = pool_reward_model(items.clone(), &Arc::new(dist.clone()), 1, 25);
+        let enumerated = enum_pool_optimum(&served);
+        let stop = AtomicBool::new(false);
+        let outcome = solve_collection(&served, 0, &stop, &mut |_| {}).expect("supported");
+        assert!(outcome.complete);
+        assert_eq!(outcome.solution.objectives[0], served_brute, "serve: engine == brute");
+        assert_eq!(outcome.solution.objectives[0], enumerated, "serve: engine == enumeration");
+        assert_eq!(outcome.solution.lists[0], vec![1], "the customer is served");
+
+        let dropped_brute = min_pool(0, &items, &dist, 1, 5, &allow_all);
+        assert_eq!(dropped_brute, 0);
+        let dropped = pool_reward_model(items.clone(), &Arc::new(dist), 1, 5);
+        let enumerated = enum_pool_optimum(&dropped);
+        let outcome = solve_collection(&dropped, 0, &stop, &mut |_| {}).expect("supported");
+        assert!(outcome.complete);
+        assert_eq!(outcome.solution.objectives[0], dropped_brute, "drop: engine == brute");
+        assert_eq!(outcome.solution.objectives[0], enumerated, "drop: engine == enumeration");
+        assert!(outcome.solution.lists[0].is_empty(), "the customer is pooled");
+        assert_eq!(outcome.solution.lists[1], vec![1]);
+    }
+
+    #[test]
+    fn pool_reward_scan_changes_optimum_and_matches_oracles() {
+        // Customers on a line at positions 1, 2, 10 (depot 0). Reward 6/stop makes
+        // the near cluster {1,2} profitable but the far one a loss, so the optimum
+        // serves some and pools some -- and beats the edges-only optimum of 0,
+        // proving the reified scan term actually bites (exercises the gating).
+        let dist = line_dist(&[0, 1, 2, 10]);
+        let items = vec![1, 2, 3];
+        let reward = 6;
+        let brute = min_pool(0, &items, &dist, 1, reward, &allow_all);
+        assert!(brute < 0, "the reward makes serving profitable, changing the optimum from the edges-only 0");
+
+        let model = pool_reward_model(items, &Arc::new(dist), 1, reward);
+        let enumerated = enum_pool_optimum(&model);
+        let stop = AtomicBool::new(false);
+        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported pool + reward lowering");
+        assert!(outcome.complete, "exhausted the search");
+        assert_eq!(outcome.solution.objectives[0], brute, "engine == hand brute-force");
+        assert_eq!(outcome.solution.objectives[0], enumerated, "engine == enumeration");
+        assert!(!outcome.solution.lists[0].is_empty(), "some customers are served");
+        assert!(!outcome.solution.lists[1].is_empty(), "some customers are pooled");
+    }
+
+    #[test]
+    fn pool_multi_route_matches_oracles() {
+        // Two real routes + pool. Two near clusters go to the two routes; a far
+        // customer is pooled. Reward 8/stop.
+        let dist = line_dist(&[0, 1, 2, 20, 21, 50]);
+        let items = vec![1, 2, 3, 4, 5];
+        let reward = 8;
+        let brute = min_pool(0, &items, &dist, 2, reward, &allow_all);
+        let model = pool_reward_model(items.clone(), &Arc::new(dist), 2, reward);
+        let enumerated = enum_pool_optimum(&model);
+        let stop = AtomicBool::new(false);
+        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported multi-route pool");
+        assert!(outcome.complete, "exhausted the search");
+        assert_eq!(outcome.solution.objectives[0], brute, "engine == hand brute-force");
+        assert_eq!(outcome.solution.objectives[0], enumerated, "engine == enumeration");
+        let mut served: Vec<i32> = outcome.solution.lists[..2].iter().flatten().copied().collect();
+        served.sort_unstable();
+        let mut pooled = outcome.solution.lists[2].clone();
+        pooled.sort_unstable();
+        let mut all: Vec<i32> = served.iter().chain(pooled.iter()).copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, items, "every item is either served or pooled exactly once");
+    }
+
+    #[test]
+    fn pool_empty_real_route_matches_oracles() {
+        // Two real routes but only one near cluster is profitable, so one real route
+        // stays empty and the far customer is pooled.
+        let dist = line_dist(&[0, 1, 2, 50]);
+        let items = vec![1, 2, 3];
+        let reward = 6;
+        let brute = min_pool(0, &items, &dist, 2, reward, &allow_all);
+        let model = pool_reward_model(items, &Arc::new(dist), 2, reward);
+        let enumerated = enum_pool_optimum(&model);
+        let stop = AtomicBool::new(false);
+        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported pool with empty route");
+        assert!(outcome.complete, "exhausted the search");
+        assert_eq!(outcome.solution.objectives[0], brute, "engine == hand brute-force");
+        assert_eq!(outcome.solution.objectives[0], enumerated, "engine == enumeration");
+        let empty_real_routes = outcome.solution.lists[..2].iter().filter(|route| route.is_empty()).count();
+        assert!(empty_real_routes >= 1, "at least one real route is empty");
+    }
+
+    #[test]
+    fn pool_scan_constraint_and_reward_objective_matches_oracles() {
+        // The combined decisive case: optional + edges + a scan CONSTRAINT (hard
+        // time windows) + a reified scan OBJECTIVE (reward). Customers 1,2 share a
+        // deadline they cannot both meet in one route, so the window forbids serving
+        // both; the reward still makes serving the reachable ones profitable, and the
+        // far ones (3,4) are cheap to reach late. Three-way equality throughout.
+        let dist = line_dist(&[0, 2, 4, 6, 8]);
+        let service = vec![0i64, 1, 1, 1, 1];
+        let earliest = vec![0i64, 0, 0, 0, 0];
+        let latest = vec![0i64, 5, 5, 20, 20];
+        let items = vec![1, 2, 3, 4];
+        let depot = 0;
+        let reward = 20;
+        let windows = |route: &[i32]| lateness_sum(route, &dist, &earliest, &latest, &service, depot) <= 0;
+        let brute = min_pool(depot, &items, &dist, 1, reward, &windows);
+        assert!(brute < 0, "serving the reachable customers is profitable under the windows");
+
+        let dist_arc = Arc::new(dist.clone());
+        let mut terms = vec![scan_edge(&dist_arc, 0)];
+        terms.push(reward_scan(0, reward));
+        let model = CollectionModel {
+            items: items.clone(),
+            lists: 2,
+            objectives: vec![ObjectiveTier { minimize: true, terms, max_terms: None }],
+            constraints: vec![Constraint { reduction: lateness_scan(0, &dist, &earliest, &latest, &service, depot), op: Op::Le, rhs: 0 }],
+            globals: Vec::new(),
+            schedule: None,
+        };
+        let enumerated = enum_pool_optimum(&model);
+        let stop = AtomicBool::new(false);
+        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported combined pool lowering");
+        assert!(outcome.complete, "exhausted the search");
+        assert_eq!(outcome.solution.objectives[0], brute, "engine == hand brute-force");
+        assert_eq!(outcome.solution.objectives[0], enumerated, "engine == enumeration");
+        assert!(
+            !(outcome.solution.lists[0].contains(&1) && outcome.solution.lists[0].contains(&2)),
+            "the window forbids serving both 1 and 2 in the single real route"
+        );
+        assert!(windows(&outcome.solution.lists[0]), "the served route meets its hard windows");
+    }
+
+    #[test]
+    fn pool_scale_proves_optimal_where_enumeration_times_out() {
+        // 12 customers + a pool, every served edge strictly positive. Enumeration
+        // cannot exhaust the ordered partitions within a short budget (SATISFIABLE,
+        // best-found still positive); the integer path proves the optimum is 0 (pool
+        // everything) from the non-negative edge bound. This is the scale win: an
+        // instance enumeration cannot close but the integer path proves OPTIMAL.
+        let count = 12usize;
+        let positions: Vec<i64> = (0..=count as i64).collect();
+        let dist = line_dist(&positions);
+        let items: Vec<i32> = (1..=count as i32).collect();
+        let model = pool_edge_model(items, &Arc::new(dist), 1);
+
+        // Enumeration under a short wall-clock budget: it finds a plan but cannot
+        // prove optimality (10! ordered partitions).
+        let tiers = crate::model::list_objective_tiers(&model.objectives, &model.items).expect("objective parses");
+        let enum_stop = Arc::new(AtomicBool::new(false));
+        {
+            let flag = Arc::clone(&enum_stop);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
+        let enum_start = std::time::Instant::now();
+        let enum_out = crate::engines::list_exact::solve(&model, &tiers, &enum_stop, |_| {}).expect("runs").expect("supported");
+        let enum_elapsed = enum_start.elapsed();
+        assert_eq!(enum_out.status, crate::engines::list_exact::Status::Satisfiable, "enumeration cannot prove optimality in the budget");
+
+        // Integer path: proves OPTIMAL. A safety timeout turns a hang into a clear
+        // failure rather than blocking CI.
+        let int_stop = Arc::new(AtomicBool::new(false));
+        {
+            let flag = Arc::clone(&int_stop);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
+        let int_start = std::time::Instant::now();
+        let outcome = solve_collection(&model, 0, &int_stop, &mut |_| {}).expect("supported pool lowering");
+        let int_elapsed = int_start.elapsed();
+        assert!(outcome.complete, "the integer path proves optimality");
+        assert_eq!(outcome.solution.objectives[0], 0, "pooling every customer is optimal");
+        assert!(
+            outcome.solution.objectives[0] <= enum_out.objectives[0],
+            "the proven optimum is no worse than enumeration's un-proven incumbent"
+        );
+        eprintln!(
+            "SCALE pool: enumeration SATISFIABLE in {:?}, integer OPTIMAL ({}) in {:?}",
+            enum_elapsed, outcome.solution.objectives[0], int_elapsed
+        );
+    }
+
+    #[test]
+    fn pool_classify_and_from_model_agree() {
+        // Lockstep: classify-IntegerExact <=> RoutingSpec::from_model.is_some(), over
+        // a battery covering the pool shapes and the must-enumerate exclusions. The
+        // shared parse plus this test plus the enumeration fall-through mean a gap
+        // can never yield a wrong optimum -- only the exact enumeration optimum.
+        let dist4 = Arc::new(vec![vec![0, 7, 9, 8], vec![7, 0, 5, 6], vec![9, 5, 0, 4], vec![8, 6, 4, 0]]);
+        let dist_line = Arc::new(line_dist(&[0, 2, 4, 6, 8]));
+        let demand = Arc::new(vec![0i64, 1, 1, 1, 1]);
+
+        // A pool + capacity model (must route to enumeration, not integer).
+        let mut cap_pool = pool_reward_model(vec![1, 2, 3, 4], &dist_line, 1, 10);
+        cap_pool.constraints.push(scan_load(&demand, 0, 2));
+
+        // A pool + route-specific scan (non-homogeneous over the two real routes).
+        let mut route_specific = pool_reward_model(vec![1, 2, 3, 4], &dist_line, 2, 10);
+        route_specific.constraints.push(Constraint {
+            reduction: lateness_scan(0, &line_dist(&[0, 2, 4, 6, 8]), &[0, 0, 0, 0, 0], &[0, 5, 5, 20, 20], &[0, 1, 1, 1, 1], 0),
+            op: Op::Le,
+            rhs: 0,
+        });
+
+        let battery: Vec<CollectionModel> = vec![
+            pool_edge_model(vec![1, 2, 3], &dist4, 1),                                  // pool, single route
+            pool_edge_model(vec![1], &dist4, 1),                                        // pool, single node
+            pool_edge_model(vec![1, 2, 3], &dist4, 2),                                  // pool, multi route
+            pool_reward_model(vec![1, 2, 3], &Arc::new(line_dist(&[0, 1, 2, 10])), 1, 6), // pool + reward objective
+            pool_reward_model(vec![1, 2, 3, 4, 5], &Arc::new(line_dist(&[0, 1, 2, 20, 21, 50])), 2, 8), // pool + reward, multi
+            cap_pool,                                                                   // pool + capacity -> enumeration
+            route_specific,                                                             // pool + route-specific scan -> enumeration
+            closed_tsp_model(vec![1, 2, 3], 0, &dist4),                                 // non-pool TSP
+        ];
+
+        for model in &battery {
+            let classify_integer = BackendSelection::for_collection(model).backend == Backend::IntegerExact;
+            let engine_lowers = RoutingSpec::from_model(model).is_some();
+            assert_eq!(classify_integer, engine_lowers, "classifier and engine must agree on lowerability");
+        }
+        // The two exclusions really are excluded, and really do route to enumeration.
+        assert!(RoutingSpec::from_model(&battery[5]).is_none(), "pool + capacity is not integer-lowerable");
+        assert_eq!(BackendSelection::for_collection(&battery[5]).backend, Backend::DomainExact, "pool + capacity routes to enumeration");
+        assert!(RoutingSpec::from_model(&battery[6]).is_none(), "route-specific scan is not integer-lowerable");
+    }
+
+    /// Per-route cumulative-load scan `Σ prefix_load`, as a constraint reduction.
+    /// `emit = acc` (running load after each stop); `step = acc + item_value`.
+    fn prefix_load_scan(list: usize) -> Reduction {
+        let mut arena = ExprArena::default();
+        let cur = arena.arg(0);
+        let acc = arena.arg(1);
+        let step = arena.add(acc, cur);
+        let emit = arena.arg(1); // the new accumulator = load after this stop
+        Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list, init: 0, boundary: 0, step }, arena, body: emit, coeff: 1 }
+    }
+
+    #[test]
+    fn pool_scan_constraint_ge_matches_oracle() {
+        // A `Ge` scan constraint on a pool model (only `Le` was covered): each real
+        // route's cumulative load must reach at least `rhs`, so an empty (all-pooled)
+        // route is forbidden when rhs > 0. A reward objective incentivises serving,
+        // and three-way equality must hold including this feasibility coupling.
+        let dist = line_dist(&[0, 1, 2, 3]);
+        let items = vec![1, 2, 3];
+        let reward = 12;
+        let rhs = 3;
+        let dist_arc = Arc::new(dist.clone());
+        let mut model = pool_reward_model(items.clone(), &dist_arc, 1, reward);
+        model.constraints.push(Constraint { reduction: prefix_load_scan(0), op: Op::Ge, rhs });
+
+        // Hand brute-force: the real route's Σ prefix-load must be >= rhs.
+        let prefix_ok = |route: &[i32]| {
+            let (mut acc, mut total) = (0i64, 0i64);
+            for &c in route {
+                acc += i64::from(c);
+                total += acc;
+            }
+            route.is_empty() || total >= rhs
+        };
+        let brute = min_pool(0, &items, &dist, 1, reward, &prefix_ok);
+
+        let enumerated = enum_pool_optimum(&model);
+        let stop = AtomicBool::new(false);
+        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported Ge-scan pool lowering");
+        assert!(outcome.complete, "exhausted the search");
+        assert_eq!(outcome.solution.objectives[0], brute, "engine == hand brute-force");
+        assert_eq!(outcome.solution.objectives[0], enumerated, "engine == enumeration");
+        assert!(prefix_ok(&outcome.solution.lists[0]), "the served route meets the Ge load floor");
+    }
+
+    #[test]
+    fn pool_random_instances_match_enumeration() {
+        // Broad differential defense for the pool gating: on random small pool
+        // instances (varied topology, item count, route count, reward), the integer
+        // optimum must equal the enumeration optimum. Catches gating bugs in
+        // combinations the hand-written cases do not enumerate. Fixed seed, trimmed
+        // to stay CI-cheap while covering the pool cost channels.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        for _ in 0..50 {
+            let n = 2 + (next() % 3) as usize; // 2..=4 customers
+            let k = 1 + (next() % 2) as usize; // 1..=2 real routes
+            let m = n + 1; // node universe: depot + customers
+            let mut dist = vec![vec![0i64; m]; m];
+            #[allow(clippy::needless_range_loop)] // fills dist[a][b] over the full grid
+            for a in 0..m {
+                for b in 0..m {
+                    if a != b {
+                        dist[a][b] = 1 + (next() % 9) as i64; // strictly positive
+                    }
+                }
+            }
+            let items: Vec<i32> = (1..=n as i32).collect();
+            let reward = (next() % 12) as i64; // 0..=11; 0 => pool everything
+            let model = pool_reward_model(items, &Arc::new(dist), k, reward);
+
+            let enumerated = enum_pool_optimum(&model);
+            let stop = AtomicBool::new(false);
+            let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported random pool lowering");
+            assert!(outcome.complete, "integer path proves optimality on the small instance");
+            assert_eq!(outcome.solution.objectives[0], enumerated, "integer optimum == enumeration optimum (n={n}, k={k}, reward={reward})");
+        }
     }
 }

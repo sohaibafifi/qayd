@@ -2853,7 +2853,12 @@ impl PyModel {
             }
         };
         let Some(outcome) = with_interrupts(py, &stop, || routing_engine::solve_collection(model, seed, &stop, &mut report))? else {
-            return Ok(None);
+            // Defence in depth: the classifier admitted this model but the engine
+            // parse declined it (a lockstep gap). Every admitted routing model is
+            // enumeration-checkable, so fall through to the exact list enumeration
+            // rather than erroring or silently dropping to local search -- the worst
+            // case is still the exact enumeration optimum, never a wrong one.
+            return self.try_solve_domain_lists(py, model, &shared_model::BackendSelection { backend: shared_model::Backend::DomainExact, ..*selection }, time_limit, verbose);
         };
         let sol = outcome.solution;
         let status = if sol.feasible {
