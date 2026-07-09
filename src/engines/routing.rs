@@ -76,11 +76,15 @@ struct RoutingSpec {
     /// carries the identical set, since route-specific scans are unsafe under
     /// depot-copy symmetry. Empty means no scan.
     scan: Vec<ScanRoutingSpec>,
-    /// Optional-list model: `depot_count` includes one extra "pool depot" (the
-    /// last depot index) whose zero-cost route absorbs dropped items. Every cost
-    /// channel is gated by `in_pool` so a pooled item contributes 0 everywhere.
+    /// Optional-list model: `Some(pool_list)` marks it optional and carries the
+    /// MODEL list index of the free pool (its LS partition), `None` for a
+    /// non-optional model. `depot_count` includes one extra "pool depot" (the last
+    /// depot index) whose zero-cost route absorbs dropped items; every cost channel
+    /// is gated by `in_pool` so a pooled item contributes 0 everywhere.
     /// `depot_count == k + 1` real routes when set; `depot_count == k` otherwise.
-    pool: bool,
+    /// The pool depot is always the last depot index; `pool_list` is the distinct
+    /// LS list index (which need not be last among the model's lists).
+    pool_list: Option<usize>,
     /// Homogeneous per-route reified `Sum` scan folded into the objective, or
     /// `None`. Only set for pool models; a pooled customer contributes 0 (gated
     /// by `in_pool`). The `op`/`rhs` fields are unused (it is scored, not bounded).
@@ -151,7 +155,11 @@ impl RoutingSpec {
         for term in &tier.terms {
             match &term.iterable {
                 Iterable::Edges { .. } => edge_terms.push(term),
+                // A reified `Sum` scan, or a per-item `Sum` reward (`cp.sum(x, |i| ...)`)
+                // that normalises to an identity-accumulator scan (see
+                // `scan_routing_signature`), so its optionals get the dominance bound.
                 Iterable::Scan { .. } => scan_terms.push(term),
+                Iterable::Items(_) if matches!(term.op, ReduceOp::Sum) => scan_terms.push(term),
                 _ => return None,
             }
         }
@@ -240,9 +248,13 @@ impl RoutingSpec {
             length,
             item_sum,
             scan,
-            pool,
+            pool_list: pool.then(|| free[0]),
             scan_objective,
         })
+    }
+
+    fn pool(&self) -> bool {
+        self.pool_list.is_some()
     }
 
     fn lower(&self) -> LoweredProblem {
@@ -261,7 +273,7 @@ impl RoutingSpec {
         // (the last depot index), 0 at every real depot, and threaded to each
         // customer from its unique predecessor arc. `circuit` gives each customer
         // one predecessor, so the implication pins it exactly at a leaf.
-        let in_pool = self.pool.then(|| self.build_pool_membership(&mut solver, &succ, n));
+        let in_pool = self.pool().then(|| self.build_pool_membership(&mut solver, &succ, n));
 
         let mut cost_vars = Vec::with_capacity(n);
         for (from_idx, &from_node) in nodes.iter().enumerate() {
@@ -290,6 +302,28 @@ impl RoutingSpec {
             }
         }
 
+        // Pool dominance: force-pool every optional that provably cannot beat pooling
+        // (its minimum reward plus a lower bound on its insertion travel is >= 0), so
+        // B&B never enumerates whether to serve it. Sound: serving such a customer can
+        // only weakly worsen the objective (see `dominated_optionals`), so pooling it
+        // preserves the optimum. The residual search is then the served-only routing.
+        if let Some(in_pool) = &in_pool {
+            for c in self.dominated_optionals(&nodes) {
+                intension::intension(&mut solver, expr::eq(expr::var(in_pool[c]), expr::int(1)));
+            }
+            // Pool-route symmetry: its order is cost- and feasibility-irrelevant (every
+            // pooled arc is gated to 0, the pool route is unbounded), so fix it to
+            // increasing customer index -- a pooled customer never points back to a
+            // lower-indexed customer. This removes the |pool|! equivalent orderings the
+            // circuit would otherwise walk once the optionals are pooled.
+            for c in self.depot_count..n {
+                for d in self.depot_count..c {
+                    let pooled = expr::eq(expr::var(in_pool[c]), expr::int(1));
+                    intension::intension(&mut solver, expr::imp(pooled, expr::ne(expr::var(succ[c]), expr::int(d as i64))));
+                }
+            }
+        }
+
         if let Some(capacity) = &self.capacity {
             let load = self.post_capacity_loads(&mut solver, &succ, capacity);
             post_route_capacity_check(&mut solver, &succ, self.depot_count, self.node_demands(capacity), capacity.capacity);
@@ -311,7 +345,7 @@ impl RoutingSpec {
         // Depot symmetry orders only the `k` real depots; the pool depot (last
         // index) keeps its fixed, distinct, unconstrained role and is excluded, so
         // relabelling real depots never touches it. Non-pool orders all depots.
-        let real_depots = if self.pool { self.depot_count - 1 } else { self.depot_count };
+        let real_depots = if self.pool() { self.depot_count - 1 } else { self.depot_count };
         post_depot_symmetry(&mut solver, &succ, real_depots, self.depot_count, n);
 
         // Membership <-> route-order channel. Built only for same-list requirements
@@ -370,6 +404,8 @@ impl RoutingSpec {
         // Branch only the successor variables; per-node costs are functionally
         // determined from them by `element_const`, and branching them (they carry
         // the objective impact) would bypass the nearest-neighbour value ordering.
+        // in_pool is a derived channel (dominated optionals are fixed above, the rest
+        // follow from the fixed predecessor arc), never branched.
         let search_vars = succ;
         LoweredProblem { solver, search_vars, cost_vars, nodes, depot_count: self.depot_count, initial_phase }
     }
@@ -384,8 +420,26 @@ impl RoutingSpec {
             return None;
         }
         let item_node = |item: i32| self.items.iter().position(|&x| x == item).map(|i| self.depot_count + i);
-        let mut routes: Vec<&Vec<i32>> = ls_lists.iter().collect();
-        routes.sort_by_key(|route| route.first().and_then(|&item| item_node(item)).unwrap_or(usize::MAX));
+        let sort_head = |routes: &mut Vec<&Vec<i32>>| {
+            routes.sort_by_key(|route| route.first().and_then(|&item| item_node(item)).unwrap_or(usize::MAX));
+        };
+        let routes: Vec<&Vec<i32>> = match self.pool_list {
+            // Real routes fill depots `0..k-1` sorted by first customer (matching
+            // post_depot_symmetry, which orders only the real depots); the pool list
+            // fills the pool depot `k` (last), which that ordering excludes. The
+            // `(depot + 1) % depot_count` closing then chains `k -> pool -> 0`.
+            Some(pl) => {
+                let mut real: Vec<&Vec<i32>> = ls_lists.iter().enumerate().filter(|&(i, _)| i != pl).map(|(_, r)| r).collect();
+                sort_head(&mut real);
+                real.push(&ls_lists[pl]);
+                real
+            }
+            None => {
+                let mut routes: Vec<&Vec<i32>> = ls_lists.iter().collect();
+                sort_head(&mut routes);
+                routes
+            }
+        };
 
         let mut succ_val: Vec<Option<usize>> = vec![None; n];
         for (depot, route) in routes.iter().enumerate() {
@@ -533,6 +587,117 @@ impl RoutingSpec {
         in_pool
     }
 
+    /// Static `[min, max]` of customer `c`'s reified objective contribution
+    /// (`coeff * emit`): `emit` at this fixed `cur`, bounded over every predecessor
+    /// value and the accumulator's domain. A sentinel var stands in for the
+    /// accumulator so it can be bounded over `acc_dom`.
+    fn served_reward_bounds(&self, nodes: &[i32], scan: &ScanRoutingSpec, c: usize) -> (i64, i64) {
+        const ACC_SENTINEL: VarId = VarId(u32::MAX);
+        let arena = &scan.arena.exprs;
+        let cur = i64::from(nodes[c]);
+        let cv = |node: usize| if node < self.depot_count { i64::from(scan.boundary) } else { i64::from(nodes[node]) };
+        let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+        for from in 0..nodes.len() {
+            if from == c {
+                continue;
+            }
+            let e = lower_scan(arena, scan.emit, cur, cv(from), &expr::var(ACC_SENTINEL));
+            let (l, h) = e.bounds(&|v| if v == ACC_SENTINEL { scan.acc_dom } else { (0, 0) });
+            let (cl, ch) = (scan.coeff.saturating_mul(l), scan.coeff.saturating_mul(h));
+            lo = lo.min(cl.min(ch));
+            hi = hi.max(cl.max(ch));
+        }
+        if lo > hi {
+            (0, 0)
+        } else {
+            (lo, hi)
+        }
+    }
+
+    /// Whether the objective scan emits a pure per-item value (depends only on the
+    /// current node, `Arg(0)`, not the accumulator `Arg(1)` or predecessor `Arg(2)`).
+    /// Only then is a served customer's contribution independent of the others, so
+    /// serving/pooling it cannot ripple through the route -- the precondition for the
+    /// pool dominance. `None` (edges only) is trivially per-item (zero contribution).
+    fn scan_objective_is_per_item(&self) -> bool {
+        let Some(scan) = &self.scan_objective else {
+            return true;
+        };
+        let arena = &scan.arena.exprs;
+        let mut stack = vec![scan.emit];
+        while let Some(id) = stack.pop() {
+            match &arena[id.0 as usize] {
+                Expr::Arg(k) if *k >= 1 => return false,
+                Expr::Arg(_) | Expr::Const(_) => {}
+                Expr::Array(_, i) => stack.push(*i),
+                Expr::Matrix(_, i, j) => {
+                    stack.push(*i);
+                    stack.push(*j);
+                }
+                Expr::Add(a, b)
+                | Expr::Sub(a, b)
+                | Expr::Mul(a, b)
+                | Expr::Min(a, b)
+                | Expr::Max(a, b)
+                | Expr::Div(a, b)
+                | Expr::Lt(a, b)
+                | Expr::Le(a, b)
+                | Expr::Eq(a, b)
+                | Expr::Ne(a, b) => {
+                    stack.push(*a);
+                    stack.push(*b);
+                }
+                Expr::Abs(a) => stack.push(*a),
+                Expr::IfThenElse(c, a, b) => {
+                    stack.push(*c);
+                    stack.push(*a);
+                    stack.push(*b);
+                }
+            }
+        }
+        true
+    }
+
+    /// Optionals that cannot beat pooling: serving customer `c` adds a lower bound
+    /// `marginal` on its insertion travel (min over predecessor/successor pairs of
+    /// `edge(p,c) + edge(c,s) - edge(p,s)`, a true lower bound on the extra travel)
+    /// and at best its minimum reward. When `reward_min + marginal >= 0`, serving `c`
+    /// never strictly improves the objective, so pooling dominates and `c` is fixed
+    /// pooled. Sound only with no per-route scan constraint (which could REQUIRE `c`)
+    /// and a per-item reward (so serving `c` does not ripple onto other customers);
+    /// on a non-metric matrix `marginal` may be negative and the rule simply does not
+    /// fire. Returns the customer node indices to force `in_pool = 1`.
+    fn dominated_optionals(&self, nodes: &[i32]) -> Vec<usize> {
+        if !self.pool() || !self.scan.is_empty() || !self.scan_objective_is_per_item() {
+            return Vec::new();
+        }
+        let n = nodes.len();
+        let pool_depot = self.depot_count - 1;
+        let servable: Vec<usize> = (0..n).filter(|&i| i != pool_depot).collect();
+        let mut pooled = Vec::new();
+        for c in self.depot_count..n {
+            let reward_min = self.scan_objective.as_ref().map_or(0, |scan| self.served_reward_bounds(nodes, scan, c).0);
+            let mut marginal = i64::MAX;
+            for &p in &servable {
+                if p == c {
+                    continue;
+                }
+                for &s in &servable {
+                    if s == c {
+                        continue;
+                    }
+                    let edge = |a: i32, b: i32| i64::from(self.edge.cost(a, b).expect("validated edge cost"));
+                    let m = edge(nodes[p], nodes[c]) + edge(nodes[c], nodes[s]) - edge(nodes[p], nodes[s]);
+                    marginal = marginal.min(m);
+                }
+            }
+            if reward_min.saturating_add(marginal) >= 0 {
+                pooled.push(c);
+            }
+        }
+        pooled
+    }
+
     /// Lower a reified `Sum`-scan objective into per-customer contribution vars.
     /// Threads its own accumulator (same pinning discipline as
     /// [`Self::post_scan_constraint`]), pins each customer's `coeff * emit` by its
@@ -564,27 +729,35 @@ impl RoutingSpec {
         }
 
         // Per-customer `coeff * emit` at the chosen predecessor, gated to 0 when pooled.
-        let (ce_lo, ce_hi) = {
-            let a = scan.coeff.saturating_mul(scan.emit_dom.0);
-            let b = scan.coeff.saturating_mul(scan.emit_dom.1);
-            (a.min(b), a.max(b))
-        };
         let mut contrib = Vec::with_capacity(n - depot_count);
         for c in depot_count..n {
-            let emit_var = solver.new_var_range(ce_lo as i32, ce_hi as i32);
+            let cur = i64::from(nodes[c]);
+            // Tight per-customer contribution bounds. For an order-independent per-item
+            // reward these collapse to a single constant, so the contribution var stays
+            // 2-valued ({0, reward}) rather than a fleet-wide range -- keeping the
+            // objective-bound propagation cost independent of the reward magnitude (a
+            // wide range makes it O(reward)).
+            let (lo, hi) = self.served_reward_bounds(nodes, scan, c);
+            let emit_var = if lo == hi { solver.new_var_set(&[lo as i32]) } else { solver.new_var_range(lo as i32, hi as i32) };
             let acc_c = expr::var(acc[c].expect("customer accumulator"));
             for (from, &from_var) in succ.iter().enumerate() {
                 if from == c {
                     continue;
                 }
-                let cur = i64::from(nodes[c]);
                 let prev = cv(from);
                 let arc = expr::eq(expr::var(from_var), expr::int(c as i64));
                 let emit_rhs = lower_scan(arena, scan.emit, cur, prev, &acc_c);
                 let scaled = expr::mul(vec![expr::int(scan.coeff), emit_rhs]);
                 intension::intension(solver, expr::imp(arc, expr::eq(expr::var(emit_var), scaled)));
             }
-            let obj = solver.new_var_range(ce_lo.min(0) as i32, ce_hi.max(0) as i32);
+            // The gated contribution is `emit_var` (served) or 0 (pooled). Keep it a
+            // small set when the reward is a per-item constant, else the interval.
+            let obj = if lo == hi {
+                let vals: Vec<i32> = if lo == 0 { vec![0] } else { vec![0, lo as i32] };
+                solver.new_var_set(&vals)
+            } else {
+                solver.new_var_range(lo.min(0) as i32, hi.max(0) as i32)
+            };
             let gated = expr::ite(expr::eq(expr::var(in_pool[c]), expr::int(1)), expr::int(0), expr::var(emit_var));
             intension::intension(solver, expr::eq(expr::var(obj), gated));
             contrib.push(obj);
@@ -604,11 +777,10 @@ pub(crate) fn solve_collection(
     let spec = RoutingSpec::from_model(model)?;
     // Warm start: a quick local-search incumbent seeds the first dive and, after
     // replay verification, supplies an initial exact objective bound.
-    // `QAYD_ROUTING_WARMSTART=0` disables it (ablation).
-    // Pool models skip the warm start: `ls_tour_succ` chains routes by depot index,
-    // which would not respect the pool depot's distinct fixed role. Warm start is
-    // only a perf seed, so correctness holds on the NN seed + exact search alone.
-    let warm = if !spec.pool && std::env::var("QAYD_ROUTING_WARMSTART").as_deref() != Ok("0") {
+    // `QAYD_ROUTING_WARMSTART=0` disables it (ablation). Pool models are included:
+    // `ls_tour_succ` chains the pool list through the fixed pool depot, and replay
+    // verifies the decode -- an infeasible one degrades gracefully to bound-less.
+    let warm = if std::env::var("QAYD_ROUTING_WARMSTART").as_deref() != Ok("0") {
         // A bounded local-search pass: enough to find a good incumbent, capped so
         // it terminates even without a stop flag and leaves the exact search the
         // bulk of the time.
@@ -666,7 +838,7 @@ pub(crate) fn solve_collection(
             // cycle decoding into exactly `depot_count` routes; a failure here is a
             // logic bug, not an unsupported model -- panic rather than fall back.
             // A pool model decodes the pool depot's segment as the last list.
-            let routes = if spec.pool {
+            let routes = if spec.pool() {
                 decode_pool_routes(&nodes, depot_count, &assignment[..nodes.len()])
             } else {
                 routes_from_successors(&nodes, depot_count, &assignment[..nodes.len()]).expect("solved circuit decodes into k routes")
@@ -3089,6 +3261,177 @@ mod tests {
             let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported random pool lowering");
             assert!(outcome.complete, "integer path proves optimality on the small instance");
             assert_eq!(outcome.solution.objectives[0], enumerated, "integer optimum == enumeration optimum (n={n}, k={k}, reward={reward})");
+        }
+    }
+
+    /// A reified scan objective paying a per-item reward: `emit = table[cur]`, so a
+    /// route's `Sum` is the total reward of its served customers (each pooled one is
+    /// gated to 0). Distinct from the order-independent constant `reward_scan`.
+    fn item_reward_scan(list: usize, reward_table: &Arc<Vec<i64>>) -> Reduction {
+        let mut arena = ExprArena::default();
+        let step = arena.arg(1); // accumulator threaded unchanged (unused)
+        let cur = arena.arg(0);
+        let emit = arena.array(Arc::clone(reward_table), cur);
+        Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list, init: 0, boundary: 0, step }, arena, body: emit, coeff: 1 }
+    }
+
+    /// The same per-item reward as `item_reward_scan` (`emit = table[cur]`), but
+    /// expressed as a `Sum` over `Items` (`cp.sum(x, |i| table[i])`) -- the CIBLE 1
+    /// objective shape. Must normalise to the identical identity-accumulator scan.
+    fn item_reward_items(list: usize, reward_table: &Arc<Vec<i64>>) -> Reduction {
+        let mut arena = ExprArena::default();
+        let cur = arena.arg(0);
+        let emit = arena.array(Arc::clone(reward_table), cur);
+        Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list), arena, body: emit, coeff: 1 }
+    }
+
+    /// The G10 repro as a model: one real route + pool, required customers `1..=n`
+    /// (each paying a huge serve reward `-reward`) and disposable optionals
+    /// `n+1..=n+m` (zero reward, pure positive detour on the line). Objective =
+    /// travel - reward per served required.
+    fn disposable_model(n: usize, m: usize, reward: i64) -> CollectionModel {
+        let total = n + m;
+        let positions: Vec<i64> = (0..=total as i64).collect();
+        let dist = Arc::new(line_dist(&positions));
+        let mut reward_table = vec![0i64; total + 1];
+        for slot in reward_table.iter_mut().take(n + 1).skip(1) {
+            *slot = -reward;
+        }
+        let reward_table = Arc::new(reward_table);
+        let items: Vec<i32> = (1..=total as i32).collect();
+        let terms = vec![scan_edge(&dist, 0), item_reward_scan(0, &reward_table)];
+        CollectionModel { items, lists: 2, objectives: vec![ObjectiveTier { minimize: true, terms, max_terms: None }], constraints: Vec::new(), globals: Vec::new(), schedule: None }
+    }
+
+    /// `disposable_model` with the per-served reward expressed as an `Items` sum
+    /// (`cp.sum(x, |i| table[i])`) rather than a scan -- the CIBLE 1 objective shape.
+    fn disposable_items_model(n: usize, m: usize, reward: i64) -> CollectionModel {
+        let total = n + m;
+        let positions: Vec<i64> = (0..=total as i64).collect();
+        let dist = Arc::new(line_dist(&positions));
+        let mut reward_table = vec![0i64; total + 1];
+        for slot in reward_table.iter_mut().take(n + 1).skip(1) {
+            *slot = -reward;
+        }
+        let reward_table = Arc::new(reward_table);
+        let items: Vec<i32> = (1..=total as i32).collect();
+        let terms = vec![scan_edge(&dist, 0), item_reward_items(0, &reward_table)];
+        CollectionModel { items, lists: 2, objectives: vec![ObjectiveTier { minimize: true, terms, max_terms: None }], constraints: Vec::new(), globals: Vec::new(), schedule: None }
+    }
+
+    #[test]
+    fn cible1_items_reward_disposables_prove_optimal() {
+        // CIBLE 1: disposable optionals under a per-item `Items` reward
+        // (`cp.sum(x, |i| REQ[i]) * -reward`) must prove OPTIMAL, not just
+        // SATISFIABLE -- the normalisation feeds the same dominance bound the scan
+        // reward gets. The M=n optimum equals the M=0 optimum (disposables dropped).
+        let reward = 100_000i64;
+        for n in [6usize, 8] {
+            let stop = AtomicBool::new(false);
+            let v0 = solve_collection(&disposable_items_model(n, 0, reward), 0, &stop, &mut |_| {}).expect("M=0 lowering");
+            assert!(v0.complete, "M=0 proves OPTIMAL (n={n})");
+            let vn = solve_collection(&disposable_items_model(n, n, reward), 0, &stop, &mut |_| {}).expect("M=n lowering");
+            assert!(vn.complete, "M=n proves OPTIMAL via the items-reward dominance bound (n={n})");
+            assert_eq!(vn.solution.objectives[0], v0.solution.objectives[0], "disposables dropped: M=n optimum == M=0 optimum (n={n})");
+        }
+    }
+
+    #[test]
+    fn pool_items_reward_matches_scan_and_enumeration() {
+        // Soundness of the `Items`-reward normalisation: on random small pool
+        // instances the per-item `Items` reward must lower to the SAME optimum as
+        // the equivalent per-item scan reward AND as enumeration, and prove OPTIMAL.
+        // Signed rewards (some serve-profitable, some not) exercise the dominance
+        // gate both ways. Fixed seed, trimmed for CI.
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        for _ in 0..50 {
+            let n = 2 + (next() % 3) as usize; // 2..=4 customers
+            let k = 1 + (next() % 2) as usize; // 1..=2 real routes
+            let m = n + 1;
+            let mut dist = vec![vec![0i64; m]; m];
+            #[allow(clippy::needless_range_loop)] // fills dist[a][b] over the full grid
+            for a in 0..m {
+                for b in 0..m {
+                    if a != b {
+                        dist[a][b] = 1 + (next() % 9) as i64;
+                    }
+                }
+            }
+            let dist = Arc::new(dist);
+            let items: Vec<i32> = (1..=n as i32).collect();
+            let mut reward_table = vec![0i64; m];
+            for slot in reward_table.iter_mut().skip(1) {
+                *slot = (next() % 13) as i64 - 6; // -6..=6
+            }
+            let reward_table = Arc::new(reward_table);
+            let mk = |scan: bool| {
+                let mut terms: Vec<Reduction> = (0..k).map(|l| scan_edge(&dist, l)).collect();
+                terms.extend((0..k).map(|l| if scan { item_reward_scan(l, &reward_table) } else { item_reward_items(l, &reward_table) }));
+                CollectionModel { items: items.clone(), lists: k + 1, objectives: vec![ObjectiveTier { minimize: true, terms, max_terms: None }], constraints: Vec::new(), globals: Vec::new(), schedule: None }
+            };
+            let items_model = mk(false);
+            let enumerated = enum_pool_optimum(&items_model);
+            let stop = AtomicBool::new(false);
+            let items_out = solve_collection(&items_model, 0, &stop, &mut |_| {}).expect("items-reward lowering");
+            let scan_out = solve_collection(&mk(true), 0, &stop, &mut |_| {}).expect("scan-reward lowering");
+            assert!(items_out.complete, "items-reward integer path proves optimality (n={n}, k={k})");
+            assert_eq!(items_out.solution.objectives[0], enumerated, "items optimum == enumeration (n={n}, k={k})");
+            assert_eq!(items_out.solution.objectives[0], scan_out.solution.objectives[0], "items reward == scan reward optimum (n={n}, k={k})");
+        }
+    }
+
+    #[test]
+    fn pool_disposable_optionals_prove_optimal_and_primal_never_worse() {
+        // G10 acceptance: DISPOSABLE optionals (zero reward, pure detour) must not
+        // collapse the optimality proof. (1) bench(8,8) proves OPTIMAL in seconds;
+        // (2) for every (n, m) the incumbent is <= the same model's M=0 optimum
+        // (serve required only) -- the primal is never worse than dropping all
+        // optionals. Disposables must land in the pool, requireds in the real route.
+        let reward = 100_000i64;
+        // A safety timeout turns a hang into a clear failure rather than blocking CI.
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let flag = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(120));
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
+        let solve = |model: &CollectionModel| -> (i64, bool, std::time::Duration) {
+            let start = std::time::Instant::now();
+            let out = solve_collection(model, 0, &stop, &mut |_| {}).expect("supported disposable-optional lowering");
+            (if out.complete { out.solution.objectives[0] } else { i64::MAX }, out.complete, start.elapsed())
+        };
+        for n in 5..=8usize {
+            let (v_star, m0_complete, _) = solve(&disposable_model(n, 0, reward));
+            assert!(m0_complete, "M=0 optimum proves OPTIMAL for n={n}");
+            for m in 0..=n {
+                let model = disposable_model(n, m, reward);
+                let stop_local = AtomicBool::new(false);
+                let start = std::time::Instant::now();
+                let out = solve_collection(&model, 0, &stop_local, &mut |_| {}).expect("supported");
+                let elapsed = start.elapsed();
+                eprintln!("G10 n={n} m={m} status={} obj={} time={:?}", if out.complete { "OPTIMAL" } else { "SATISFIABLE" }, out.solution.objectives[0], elapsed);
+                assert!(out.complete, "OPTIMAL proven for n={n} m={m} in {elapsed:?}");
+                assert!(
+                    out.solution.objectives[0] <= v_star,
+                    "primal never worse than M=0 optimum: n={n} m={m} got {} vs {v_star}",
+                    out.solution.objectives[0]
+                );
+                for &c in &out.solution.lists[0] {
+                    assert!((c as usize) <= n, "only required customers are served: n={n} m={m} served {c}");
+                }
+                let pooled = &out.solution.lists[1];
+                for d in (n + 1)..=(n + m) {
+                    assert!(pooled.contains(&(d as i32)), "disposable {d} lands in the pool: n={n} m={m}");
+                }
+            }
         }
     }
 }

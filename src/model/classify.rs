@@ -450,7 +450,11 @@ fn routing_integer_lowering_supported(model: &Model) -> bool {
     for term in terms {
         match &term.iterable {
             list::Iterable::Edges { .. } => edge_terms.push(term),
+            // A reified `Sum` scan, or a per-item `Sum` reward normalising to one
+            // (kept in lockstep with `RoutingSpec::from_model` via the shared
+            // `scan_routing_signature` parser both funnel through).
             list::Iterable::Scan { .. } => scan_terms.push(term),
+            list::Iterable::Items(_) if matches!(term.op, list::ReduceOp::Sum) => scan_terms.push(term),
             _ => return false,
         }
     }

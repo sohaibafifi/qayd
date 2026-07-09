@@ -63,10 +63,28 @@ pub(crate) fn scan_routing_signature(constraint: &Constraint, items: &[i32]) -> 
     if !matches!(constraint.reduction.op, ReduceOp::Sum) {
         return None;
     }
-    let Iterable::Scan { init, boundary, step, .. } = constraint.reduction.iterable else {
-        return None;
+    // Accept a reified `Sum` scan directly, or a per-item `Sum` over `Items`
+    // (`cp.sum(x, |i| ...)`), which is exactly the identity-accumulator scan: the
+    // accumulator stays at 0 and the body reads only the current item (`Arg(0)`).
+    // Normalising it here -- the one parser both classify and the engine funnel
+    // through -- keeps them in lockstep and reuses the whole scan lowering, so a
+    // per-item reward gets the same dominance bound and warm start as a scan reward.
+    let (owned_arena, step, init, boundary) = match constraint.reduction.iterable {
+        Iterable::Scan { init, boundary, step, .. } => (constraint.reduction.arena.clone(), step, init, boundary),
+        Iterable::Items(_) => {
+            // A well-formed `Items` body binds only `Arg(0)`; reject any body that
+            // reads a scan-only binder, since reinterpreting it as the accumulator
+            // (`Arg(1)`) or predecessor (`Arg(2)`) would silently change its value.
+            if reads_non_item_arg(&constraint.reduction.arena.exprs, constraint.reduction.body) {
+                return None;
+            }
+            let mut arena = constraint.reduction.arena.clone();
+            let step = arena.arg(1); // identity accumulator: new_acc = acc (stays init = 0)
+            (arena, step, 0, 0)
+        }
+        _ => return None,
     };
-    let arena = &constraint.reduction.arena.exprs;
+    let arena = &owned_arena.exprs;
     let emit = constraint.reduction.body;
     if step.0 as usize >= arena.len() || emit.0 as usize >= arena.len() {
         return None;
@@ -153,7 +171,7 @@ pub(crate) fn scan_routing_signature(constraint: &Constraint, items: &[i32]) -> 
     }
 
     Some(ScanRoutingSpec {
-        arena: constraint.reduction.arena.clone(),
+        arena: owned_arena,
         step,
         emit,
         init,
@@ -257,6 +275,29 @@ fn eval_index(arena: &[Expr], id: ExprId, cur: i64, prev: i64) -> i64 {
                 rec(*b)
             }
         }
+    }
+}
+
+/// Whether an expression subtree references any binder beyond `Arg(0)` (the
+/// current item). Used to confirm a per-item (`Items`) body reads only the
+/// current item before it is reinterpreted as an identity-accumulator scan emit.
+fn reads_non_item_arg(arena: &[Expr], id: ExprId) -> bool {
+    match &arena[id.0 as usize] {
+        Expr::Const(_) => false,
+        Expr::Arg(k) => *k >= 1,
+        Expr::Array(_, i) | Expr::Abs(i) => reads_non_item_arg(arena, *i),
+        Expr::Matrix(_, i, j)
+        | Expr::Add(i, j)
+        | Expr::Sub(i, j)
+        | Expr::Mul(i, j)
+        | Expr::Min(i, j)
+        | Expr::Max(i, j)
+        | Expr::Div(i, j)
+        | Expr::Lt(i, j)
+        | Expr::Le(i, j)
+        | Expr::Eq(i, j)
+        | Expr::Ne(i, j) => reads_non_item_arg(arena, *i) || reads_non_item_arg(arena, *j),
+        Expr::IfThenElse(c, a, b) => reads_non_item_arg(arena, *c) || reads_non_item_arg(arena, *a) || reads_non_item_arg(arena, *b),
     }
 }
 
