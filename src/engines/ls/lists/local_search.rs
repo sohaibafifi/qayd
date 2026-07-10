@@ -867,7 +867,45 @@ pub fn solve_collection(model: &CollectionModel, seed: u64, stop: &AtomicBool, r
     // exact same trajectory runs every time regardless of host speed. Unset in
     // normal use (the wall-clock stop flag is the only budget).
     let max_iters = std::env::var("QAYD_LS_MAX_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX);
-    solve_collection_capped(model, seed, stop, max_iters, report)
+    solve_collection_capped(model, seed, stop, max_iters, None, report)
+}
+
+/// Like [`solve_collection`], but seeds the initial incumbent from `hint` -- one
+/// visiting-order sequence per list variable, from a caller's constructive
+/// heuristic -- instead of the greedy random partition. Universe items the hint
+/// omits are placed in the last list (the pool on an optional model, so unhinted
+/// nodes stay droppable). The hint seeds only the first incumbent; GRASP restarts
+/// still diversify from fresh random partitions, and the best incumbent (possibly
+/// the hint itself) is always retained.
+pub fn solve_collection_hinted(model: &CollectionModel, seed: u64, stop: &AtomicBool, hint: &[Vec<i32>], report: &mut dyn FnMut(i64)) -> CollectionSolution {
+    let max_iters = std::env::var("QAYD_LS_MAX_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX);
+    solve_collection_capped(model, seed, stop, max_iters, Some(hint), report)
+}
+
+/// Complete a warm-start hint into a full `k`-list partition for [`State::from_lists`]:
+/// copy each provided sequence (defensively dropping duplicates and any value
+/// outside the universe), then place every universe item the hint omits in the
+/// last list -- the unreferenced pool on an optional model (so unhinted nodes stay
+/// droppable), or the last route otherwise. Guarantees a complete partition so no
+/// item is silently left unassigned.
+fn hint_partition(model: &CollectionModel, hint: &[Vec<i32>]) -> Vec<Vec<i32>> {
+    let k = model.lists.max(1);
+    let universe: HashSet<i32> = model.items.iter().copied().collect();
+    let mut placed: HashSet<i32> = HashSet::with_capacity(model.items.len());
+    let mut lists: Vec<Vec<i32>> = vec![Vec::new(); k];
+    for (l, seq) in hint.iter().take(k).enumerate() {
+        for &value in seq {
+            if universe.contains(&value) && placed.insert(value) {
+                lists[l].push(value);
+            }
+        }
+    }
+    for &item in &model.items {
+        if !placed.contains(&item) {
+            lists[k - 1].push(item);
+        }
+    }
+    lists
 }
 
 /// Like [`solve_collection`], but stops after at most `max_iters` local-search
@@ -879,6 +917,7 @@ pub fn solve_collection_capped(
     seed: u64,
     stop: &AtomicBool,
     max_iters: u64,
+    hint: Option<&[Vec<i32>]>,
     report: &mut dyn FnMut(i64),
 ) -> CollectionSolution {
     // Guard the search path: an invalid model would otherwise panic (bad list
@@ -902,7 +941,13 @@ pub fn solve_collection_capped(
     let n = model.items.len();
     let mut order: Vec<usize> = (0..n).collect();
     shuffle(&mut order, seed);
-    let mut state = State::greedy(model, &per, &order);
+    // Warm start from the caller's hint when given (completed to a full
+    // partition); otherwise the greedy random construction. Either way the search
+    // loop, restarts, and incumbent tracking below are identical.
+    let mut state = match hint {
+        Some(h) => State::from_lists(model, &per, hint_partition(model, h)),
+        None => State::greedy(model, &per, &order),
+    };
     let mut memory = SearchMemory::new(model.lists.max(1));
 
     let (mut best_lists, mut best_score, mut best_feasible) = snapshot(&per, &state);

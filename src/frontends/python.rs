@@ -2291,7 +2291,7 @@ impl PyModel {
         Ok(())
     }
 
-    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, engine="auto", conflict_budget=None))]
+    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, engine="auto", conflict_budget=None, list_hint=None))]
     #[allow(clippy::too_many_arguments)]
     fn solve(
         &self,
@@ -2306,6 +2306,7 @@ impl PyModel {
         seed: u64,
         engine: &str,
         conflict_budget: Option<u64>,
+        list_hint: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PySolution> {
         let engine = parse_engine(engine)?;
         let exact_hooks = assumptions.is_some_and(|obj| !obj.is_none())
@@ -2313,6 +2314,7 @@ impl PyModel {
             || branch_order.is_some_and(|obj| !obj.is_none())
             || on_incumbent.is_some()
             || conflict_budget.is_some();
+        let list_hint = list_hint.filter(|obj| !obj.is_none());
         if self.col_universe.is_some() || self.col_schedule.is_some() {
             if exact_hooks {
                 return Err(PyValueError::new_err(
@@ -2324,7 +2326,22 @@ impl PyModel {
                     "model mixes integer variables with list/interval variables; use one modeling style per model",
                 ));
             }
-            return self.solve_collection(py, time_limit, seed, verbose, engine);
+            // A list-shaped warm start (`list[list[int]]`, one visiting-order
+            // sequence per list variable) seeds the local-search incumbent. Only
+            // meaningful for a `list_vars` model, and only consumed on the LS path.
+            let list_hint = match list_hint {
+                Some(obj) => {
+                    if self.col_universe.is_none() {
+                        return Err(PyValueError::new_err("list_hint is only supported for list_vars models"));
+                    }
+                    Some(self.parse_list_hint(obj)?)
+                }
+                None => None,
+            };
+            return self.solve_collection(py, time_limit, seed, verbose, engine, list_hint);
+        }
+        if list_hint.is_some() {
+            return Err(PyValueError::new_err("list_hint is only supported for list_vars models on engine='ls'"));
         }
         if engine == PythonEngine::Ls {
             if !self.native_intervals.is_empty() {
@@ -3046,6 +3063,36 @@ impl PyModel {
         }))
     }
 
+    /// Parse and validate a list-shaped warm start: `list[list[int]]`, one
+    /// visiting-order sequence per list variable. Rejects more sequences than the
+    /// model has lists, a node outside the universe, or a node assigned to two
+    /// lists. Unnamed universe nodes are legal (the engine pools them).
+    fn parse_list_hint(&self, obj: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<i32>>> {
+        let hint: Vec<Vec<i32>> = obj.extract().map_err(|_| {
+            PyValueError::new_err("list_hint must be a list of lists of ints (one node sequence per list variable)")
+        })?;
+        if hint.len() > self.col_lists {
+            return Err(PyValueError::new_err(format!(
+                "list_hint has {} sequences but the model has {} list variable(s)",
+                hint.len(),
+                self.col_lists
+            )));
+        }
+        let universe: std::collections::HashSet<i32> = self.col_universe.as_deref().unwrap_or(&[]).iter().copied().collect();
+        let mut seen: std::collections::HashSet<i32> = std::collections::HashSet::new();
+        for seq in &hint {
+            for &value in seq {
+                if !universe.contains(&value) {
+                    return Err(PyValueError::new_err(format!("list_hint node {value} is not in the list_vars universe")));
+                }
+                if !seen.insert(value) {
+                    return Err(PyValueError::new_err(format!("list_hint assigns node {value} to more than one list")));
+                }
+            }
+        }
+        Ok(hint)
+    }
+
     fn solve_collection(
         &self,
         py: Python<'_>,
@@ -3053,6 +3100,7 @@ impl PyModel {
         seed: u64,
         verbose: bool,
         engine: PythonEngine,
+        list_hint: Option<Vec<Vec<i32>>>,
     ) -> PyResult<PySolution> {
         let model = list::CollectionModel {
             items: self.col_universe.clone().unwrap_or_default(),
@@ -3063,13 +3111,19 @@ impl PyModel {
             schedule: self.col_schedule.clone(),
         };
         model.validate().map_err(PyValueError::new_err)?;
-        let shared = shared_model::Model::from_collection(&model);
-        let selection = shared_model::BackendSelection::for_model(&shared);
-        if engine != PythonEngine::Ls {
-            if let Some(solution) = self.try_solve_routing_integer(py, &model, &selection, time_limit, seed, verbose)? {
+        // The exact-engine classifier (`BackendSelection::for_model`) parses every
+        // scan-fed constraint via `scan_routing_signature`, which is O(pool^2..3)
+        // per constraint scan over the shared universe. It exists only to pick an
+        // exact backend, so an `engine="ls"` solve -- which never runs the exact
+        // engines below -- must not pay it. Compute it only off the LS path; on LS
+        // it stays `None` and the whole pre-search classification is skipped.
+        let selection = (engine != PythonEngine::Ls)
+            .then(|| shared_model::BackendSelection::for_model(&shared_model::Model::from_collection(&model)));
+        if let Some(selection) = &selection {
+            if let Some(solution) = self.try_solve_routing_integer(py, &model, selection, time_limit, seed, verbose)? {
                 return Ok(solution);
             }
-            if let Some(solution) = self.try_solve_domain_collection(py, &model, &selection, time_limit, seed, verbose)? {
+            if let Some(solution) = self.try_solve_domain_collection(py, &model, selection, time_limit, seed, verbose)? {
                 return Ok(solution);
             }
             if engine == PythonEngine::Exact {
@@ -3081,9 +3135,17 @@ impl PyModel {
         let primary_sense = self.col_objectives.first().map_or("min", |t| if t.minimize { "min" } else { "max" });
         if verbose {
             println!("qayd solve (collection)");
-            println!("  class: {}", selection.class.name());
-            println!("  backend: {}", selection.backend.name());
-            println!("  reason: {}", selection.reason);
+            match &selection {
+                Some(selection) => {
+                    println!("  class: {}", selection.class.name());
+                    println!("  backend: {}", selection.backend.name());
+                    println!("  reason: {}", selection.reason);
+                }
+                None => {
+                    println!("  backend: list local search");
+                    println!("  reason: engine=ls; exact-backend classification skipped");
+                }
+            }
             println!("  items: {}", model.items.len());
             println!("  lists: {}", model.lists);
             println!("  constraints: {}", model.constraints.len());
@@ -3099,7 +3161,10 @@ impl PyModel {
                 println!("  o {objective}  ({primary_sense}, {:.2}s)", start.elapsed().as_secs_f64());
             }
         };
-        let sol = with_interrupts(py, &stop, || lists::solve_collection(&model, seed, &stop, &mut report))?;
+        let sol = with_interrupts(py, &stop, || match &list_hint {
+            Some(hint) => lists::solve_collection_hinted(&model, seed, &stop, hint, &mut report),
+            None => lists::solve_collection(&model, seed, &stop, &mut report),
+        })?;
         if verbose {
             println!("qayd result (collection)");
             println!("  status: {}", if sol.feasible { "SATISFIABLE" } else { "UNKNOWN" });

@@ -8,5 +8,5 @@ mod local_search;
 mod moves;
 mod schedule_ls;
 
-pub use local_search::{solve_collection, solve_collection_capped};
+pub use local_search::{solve_collection, solve_collection_capped, solve_collection_hinted};
 pub use moves::audit_incremental;

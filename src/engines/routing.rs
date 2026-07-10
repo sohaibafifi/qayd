@@ -785,7 +785,7 @@ pub(crate) fn solve_collection(
         // it terminates even without a stop flag and leaves the exact search the
         // bulk of the time.
         let mut ignore_warm_start_progress = |_| {};
-        Some(ls_lists::solve_collection_capped(model, seed, stop, WARM_START_ITERS, &mut ignore_warm_start_progress))
+        Some(ls_lists::solve_collection_capped(model, seed, stop, WARM_START_ITERS, None, &mut ignore_warm_start_progress))
     } else {
         None
     };
@@ -2510,7 +2510,7 @@ mod tests {
         }
 
         // LS-vs-exact: local search reaches the same optimum on this enumerable model.
-        let ls = crate::engines::ls::lists::solve_collection_capped(&model, 0, &stop, 50_000, &mut |_| {});
+        let ls = crate::engines::ls::lists::solve_collection_capped(&model, 0, &stop, 50_000, None, &mut |_| {});
         assert!(ls.feasible, "LS finds a feasible plan");
         assert_eq!(ls.objectives, vec![brute], "LS agrees with the exact optimum");
     }
