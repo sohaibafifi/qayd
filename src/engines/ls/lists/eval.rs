@@ -106,7 +106,7 @@ pub(super) fn eval_reduction(reduction: &Reduction, contents: &[i32]) -> Option<
                 }
             }
         }
-        Iterable::Scan { init, boundary, step, .. } => {
+        Iterable::Scan { init, boundary, step, end, .. } => {
             let mut acc = init;
             let mut prev = boundary;
             for &cur in contents {
@@ -114,6 +114,12 @@ pub(super) fn eval_reduction(reduction: &Reduction, contents: &[i32]) -> Option<
                 fold(eval_expr(arena, body, &[i64::from(cur), new_acc, i64::from(prev)]));
                 acc = new_acc;
                 prev = cur;
+            }
+            // Closing edge to `end`: one more transition `(cur=end, prev=last item
+            // or boundary)`, mirroring how `Edges` appends `(last_item, end)`.
+            if let Some(end) = end {
+                let new_acc = eval_expr(arena, step, &[i64::from(end), acc, i64::from(prev)]);
+                fold(eval_expr(arena, body, &[i64::from(end), new_acc, i64::from(prev)]));
             }
         }
         Iterable::Windows { size, inner, .. } => {

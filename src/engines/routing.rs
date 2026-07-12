@@ -1216,7 +1216,9 @@ fn homogeneous_scan_terms(scan_terms: &[&Reduction], items: &[i32]) -> Option<Sc
         }
         seen.push(list);
         let synth = Constraint { reduction: (*term).clone(), op: Op::Le, rhs: 0 };
-        let spec = scan_routing_signature(&synth, items)?;
+        // The integer lowering does not thread a closing edge, so an `end`-scan is
+        // not integer-lowerable (it falls to exact enumeration instead).
+        let spec = scan_routing_signature(&synth, items).filter(|s| s.end.is_none())?;
         match &base {
             None => base = Some(spec),
             Some(base_spec) => {
@@ -1242,7 +1244,7 @@ fn parse_pool_scan_constraints(model: &CollectionModel, pool_list: usize) -> Opt
         if list >= model.lists || list == pool_list {
             return None;
         }
-        by_list[list].push(scan_routing_signature(constraint, &model.items)?);
+        by_list[list].push(scan_routing_signature(constraint, &model.items).filter(|s| s.end.is_none())?);
     }
     let mut real = (0..model.lists).filter(|&list| list != pool_list).map(|list| &by_list[list]);
     let first = real.next()?;
@@ -1336,7 +1338,7 @@ fn parse_route_side_constraints(model: &CollectionModel) -> Option<RouteSideCons
         } else if let Iterable::Scan { list, .. } = constraint.reduction.iterable {
             // Mirrors the classifier gate: a `Sum` scan lowers, anything else falls
             // to LS. Keeping this the same predicate keeps the two gates in lockstep.
-            let spec = scan_routing_signature(constraint, &model.items)?;
+            let spec = scan_routing_signature(constraint, &model.items).filter(|s| s.end.is_none())?;
             if list >= model.lists {
                 return None;
             }
@@ -2373,7 +2375,7 @@ mod tests {
         let over = arena.sub(end, lat);
         let zero = arena.constant(0);
         let emit = arena.max(zero, over);
-        Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list, init: 0, boundary: depot, step }, arena, body: emit, coeff: 1 }
+        Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list, init: 0, boundary: depot, step, end: None }, arena, body: emit, coeff: 1 }
     }
 
     /// Oracle replaying the lateness scan over an ordered route.
@@ -2695,7 +2697,7 @@ mod tests {
             let step = arena.div(cur, acc); // divides by the accumulator: rejected
             let body = arena.constant(0);
             Some(Constraint {
-                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list: l, init: 1, boundary: 0, step }, arena, body, coeff: 1 },
+                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list: l, init: 1, boundary: 0, step, end: None }, arena, body, coeff: 1 },
                 op: Op::Le,
                 rhs: 0,
             })
@@ -2717,7 +2719,7 @@ mod tests {
             let rate = arena.array(Arc::new(vec![9, 0, 2, 2, 2]), cur_e); // rate[item 1] == 0
             let body = arena.div(cur_e, rate);
             Some(Constraint {
-                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list: l, init: 0, boundary: 0, step }, arena, body, coeff: 1 },
+                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list: l, init: 0, boundary: 0, step, end: None }, arena, body, coeff: 1 },
                 op: Op::Le,
                 rhs: 100,
             })
@@ -2738,7 +2740,7 @@ mod tests {
             let two = arena.constant(2);
             let body = arena.div(acc_e, two);
             Some(Constraint {
-                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list: l, init: 0, boundary: 0, step }, arena, body, coeff: 1 },
+                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list: l, init: 0, boundary: 0, step, end: None }, arena, body, coeff: 1 },
                 op: Op::Le,
                 rhs: 100,
             })
@@ -2758,7 +2760,7 @@ mod tests {
             let step = arena.add(acc, huge);
             let body = arena.arg(1);
             Some(Constraint {
-                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list: l, init: 0, boundary: 0, step }, arena, body, coeff: 1 },
+                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list: l, init: 0, boundary: 0, step, end: None }, arena, body, coeff: 1 },
                 op: Op::Le,
                 rhs: 100,
             })
@@ -2780,7 +2782,7 @@ mod tests {
             let rate = arena.array(Arc::new(vec![9, 0, 2, 2, 2]), cur_e);
             let body = arena.div(cur_e, rate);
             Constraint {
-                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list: 0, init: 0, boundary: 0, step }, arena, body, coeff: 1 },
+                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list: 0, init: 0, boundary: 0, step, end: None }, arena, body, coeff: 1 },
                 op: Op::Le,
                 rhs: 100,
             }
@@ -2799,7 +2801,7 @@ mod tests {
             Some(Constraint {
                 reduction: Reduction {
                     op: ReduceOp::SelectKth(0),
-                    iterable: Iterable::Scan { list: l, init: 0, boundary: 0, step },
+                    iterable: Iterable::Scan { list: l, init: 0, boundary: 0, step, end: None },
                     arena,
                     body,
                     coeff: 1,
@@ -2823,7 +2825,7 @@ mod tests {
             Some(Constraint {
                 reduction: Reduction {
                     op: ReduceOp::Sum,
-                    iterable: Iterable::Scan { list: l, init: 100_000, boundary: 0, step },
+                    iterable: Iterable::Scan { list: l, init: 100_000, boundary: 0, step, end: None },
                     arena,
                     body,
                     coeff: 1,
@@ -2907,7 +2909,7 @@ mod tests {
         let mut arena = ExprArena::default();
         let step = arena.arg(1); // accumulator threaded unchanged (unused)
         let emit = arena.constant(-reward);
-        Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list, init: 0, boundary: 0, step }, arena, body: emit, coeff: 1 }
+        Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list, init: 0, boundary: 0, step, end: None }, arena, body: emit, coeff: 1 }
     }
 
     /// A `k`-real-route pool model: edges plus a reified reward scan per real route.
@@ -3188,7 +3190,7 @@ mod tests {
         let acc = arena.arg(1);
         let step = arena.add(acc, cur);
         let emit = arena.arg(1); // the new accumulator = load after this stop
-        Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list, init: 0, boundary: 0, step }, arena, body: emit, coeff: 1 }
+        Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list, init: 0, boundary: 0, step, end: None }, arena, body: emit, coeff: 1 }
     }
 
     #[test]
@@ -3272,7 +3274,7 @@ mod tests {
         let step = arena.arg(1); // accumulator threaded unchanged (unused)
         let cur = arena.arg(0);
         let emit = arena.array(Arc::clone(reward_table), cur);
-        Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list, init: 0, boundary: 0, step }, arena, body: emit, coeff: 1 }
+        Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list, init: 0, boundary: 0, step, end: None }, arena, body: emit, coeff: 1 }
     }
 
     /// The same per-item reward as `item_reward_scan` (`emit = table[cur]`), but

@@ -161,6 +161,7 @@ fn validate_reduction(reduction: &Reduction, items: &[i32], lists: usize) -> Res
     let nodes_i: Vec<i64>;
     let positions_i: Vec<i64>;
     let scan_nodes: Vec<i64>;
+    let scan_cur: Vec<i64>;
     let acc_dummy = [0i64];
     let domains: Vec<&[i64]> = match reduction.iterable {
         Iterable::Items(_) => vec![&items_i],
@@ -175,19 +176,25 @@ fn validate_reduction(reduction: &Reduction, items: &[i32], lists: usize) -> Res
             positions_i = (0..items_i.len() as i64).collect();
             vec![&items_i, &items_i, &positions_i, &positions_i]
         }
-        Iterable::Scan { boundary, step, .. } => {
+        Iterable::Scan { boundary, step, end, .. } => {
             if step.0 as usize >= arena.len() {
                 return Err("scan step refers to a missing expression".to_string());
             }
             // The accumulator (`Arg(1)`) has no finite domain, so it must never
             // index a table; reject that rather than read a silent 0.
             reject_arg1_index(arena, "scan accumulator")?;
-            let mut n = items_i.clone();
-            n.push(i64::from(boundary));
-            scan_nodes = n;
-            // Arg(0)=current item and Arg(2)=previous item range over nodes; the
-            // accumulator slot is a dummy since it is never an index (checked).
-            vec![&items_i, &acc_dummy, &scan_nodes]
+            let mut prev_nodes = items_i.clone();
+            prev_nodes.push(i64::from(boundary));
+            scan_nodes = prev_nodes;
+            // Arg(0)=current ranges over items, plus the closing node `end` when the
+            // scan folds the return edge; Arg(2)=previous ranges over items and the
+            // boundary; the accumulator slot is a dummy (never an index, checked).
+            let mut cur = items_i.clone();
+            if let Some(e) = end {
+                cur.push(i64::from(e));
+            }
+            scan_cur = cur;
+            vec![&scan_cur, &acc_dummy, &scan_nodes]
         }
         Iterable::Windows { size, inner, .. } => {
             if size == 0 {

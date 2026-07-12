@@ -891,7 +891,7 @@ def ne(a: _LambdaLike, b: _LambdaLike) -> LambdaExpr:
     ...
 
 
-def scan_sum(route: ListVar, step: _Body3, emit: _Body3, *, init: int = ..., boundary: int = ...) -> Term:
+def scan_sum(route: ListVar, step: _Body3, emit: _Body3, *, init: int = ..., boundary: int = ..., end: Optional[int] = ...) -> Term:
     """Fold an accumulator along the route and sum a per-step ``emit`` value."""
     ...
 

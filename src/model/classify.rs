@@ -579,7 +579,7 @@ fn scans_homogeneous_objective(scan_terms: &[&list::Reduction], k: usize, items:
         }
         seen.push(list);
         let synth = list::Constraint { reduction: (*term).clone(), op: list::Op::Le, rhs: 0 };
-        let Some(spec) = list::scan::scan_routing_signature(&synth, items) else {
+        let Some(spec) = list::scan::scan_routing_signature(&synth, items).filter(|s| s.end.is_none()) else {
             return false;
         };
         match &base {
@@ -604,7 +604,7 @@ fn pool_side_constraints_supported(model: &Model, items: &[i32], pool_list: usiz
             Constraint::ListPartition { .. } => {}
             Constraint::ListReduction(reduction) if list::scan::scan_constraint_list(reduction).is_some() => {
                 let (Some(list), Some(spec)) =
-                    (list::scan::scan_constraint_list(reduction), list::scan::scan_routing_signature(reduction, items))
+                    (list::scan::scan_constraint_list(reduction), list::scan::scan_routing_signature(reduction, items).filter(|s| s.end.is_none()))
                 else {
                     return false;
                 };
@@ -663,7 +663,7 @@ fn list_constraints_are_integer_routing_supported(model: &Model, items: &[i32]) 
             // else on `ListReduction` stays with local search. A route may carry
             // several scans (e.g. one time window per customer).
             Constraint::ListReduction(reduction) if list::scan::scan_constraint_list(reduction).is_some() => {
-                let (Some(list), Some(spec)) = (list::scan::scan_constraint_list(reduction), list::scan::scan_routing_signature(reduction, items))
+                let (Some(list), Some(spec)) = (list::scan::scan_constraint_list(reduction), list::scan::scan_routing_signature(reduction, items).filter(|s| s.end.is_none()))
                 else {
                     return false;
                 };

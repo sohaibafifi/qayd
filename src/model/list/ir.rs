@@ -153,7 +153,14 @@ pub enum Iterable {
     /// accumulator) and `Arg(2)` (the previous item), aggregated by the
     /// reduction's op. Used for cumulative time and load along a route, e.g.
     /// time-window lateness. The accumulator must not index a table.
-    Scan { list: usize, init: i64, boundary: i32, step: ExprId },
+    ///
+    /// When `end` is `Some(node)`, the fold performs ONE more transition for the
+    /// closing edge after the last item -- `step(end, acc_last, last_item)` then a
+    /// final emit -- exactly as [`Iterable::Edges`] appends the closing edge
+    /// `(last_item, end)`. This bounds a resource over the CLOSED tour (including
+    /// the return arc). `None` stops at the last item (the original behaviour). On
+    /// an empty list the closing edge is `(boundary, end)`, matching `Edges`.
+    Scan { list: usize, init: i64, boundary: i32, step: ExprId, end: Option<i32> },
     /// Each window of `size` consecutive items. `inner` is summed over the
     /// window items (each seeing the item as `Arg(0)`) to a window total; the
     /// reduction's body then emits a per-window value seeing that total as

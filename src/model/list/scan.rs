@@ -40,6 +40,12 @@ pub(crate) struct ScanRoutingSpec {
     pub op: Op,
     pub rhs: i64,
     pub coeff: i64,
+    /// Closing node for the tour: when `Some`, the scan folds one extra transition
+    /// for the return edge `(last_item, end)`. The integer routing lowering does
+    /// not thread this closing edge, so it rejects `end`-scans (they fall to exact
+    /// enumeration, which evaluates the closing edge concretely); this field lets
+    /// those gates detect it.
+    pub end: Option<i32>,
     /// Sound `[lo, hi]` for a customer accumulator variable.
     pub acc_dom: (i64, i64),
     /// Sound `[lo, hi]` for a single stop's emitted value.
@@ -69,8 +75,8 @@ pub(crate) fn scan_routing_signature(constraint: &Constraint, items: &[i32]) -> 
     // Normalising it here -- the one parser both classify and the engine funnel
     // through -- keeps them in lockstep and reuses the whole scan lowering, so a
     // per-item reward gets the same dominance bound and warm start as a scan reward.
-    let (owned_arena, step, init, boundary) = match constraint.reduction.iterable {
-        Iterable::Scan { init, boundary, step, .. } => (constraint.reduction.arena.clone(), step, init, boundary),
+    let (owned_arena, step, init, boundary, end) = match constraint.reduction.iterable {
+        Iterable::Scan { init, boundary, step, end, .. } => (constraint.reduction.arena.clone(), step, init, boundary, end),
         Iterable::Items(_) => {
             // A well-formed `Items` body binds only `Arg(0)`; reject any body that
             // reads a scan-only binder, since reinterpreting it as the accumulator
@@ -80,7 +86,7 @@ pub(crate) fn scan_routing_signature(constraint: &Constraint, items: &[i32]) -> 
             }
             let mut arena = constraint.reduction.arena.clone();
             let step = arena.arg(1); // identity accumulator: new_acc = acc (stays init = 0)
-            (arena, step, 0, 0)
+            (arena, step, 0, 0, None)
         }
         _ => return None,
     };
@@ -93,9 +99,17 @@ pub(crate) fn scan_routing_signature(constraint: &Constraint, items: &[i32]) -> 
     let n = items.len();
     // Node-constant set: boundary plus every item value. Using this superset for
     // both cur and prev over-approximates but stays sound.
-    let mut cv: Vec<i64> = Vec::with_capacity(n + 1);
+    let mut cv: Vec<i64> = Vec::with_capacity(n + 2);
     cv.push(i64::from(boundary));
     cv.extend(items.iter().map(|&x| i64::from(x)));
+    // The closing edge evaluates `step`/`emit` at `cur = end`, so `end` joins the
+    // node-constant set the div/band detection and domain walks range over.
+    if let Some(e) = end {
+        let e = i64::from(e);
+        if !cv.contains(&e) {
+            cv.push(e);
+        }
+    }
 
     // Detection walk: every node must lower. Reject
     //  - an accumulator (Arg(1)) inside a table index (no finite domain to fold);
@@ -179,6 +193,7 @@ pub(crate) fn scan_routing_signature(constraint: &Constraint, items: &[i32]) -> 
         op: constraint.op,
         rhs: constraint.rhs,
         coeff: constraint.reduction.coeff,
+        end,
         acc_dom,
         emit_dom,
         total_dom,

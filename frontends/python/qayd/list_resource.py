@@ -43,6 +43,7 @@ class ScanResource:
         boundary: int = 0,
         lower: Optional[int] = None,
         upper: Optional[int] = None,
+        end: Optional[int] = None,
     ):
         self.route = _list_var(route)
         self.transition = transition
@@ -50,6 +51,10 @@ class ScanResource:
         self.boundary = int(boundary)
         self.lower = None if lower is None else _as_i64(lower, "resource lower bound")
         self.upper = None if upper is None else _as_i64(upper, "resource upper bound")
+        # Closing node: when set, the scan folds one more transition for the return
+        # edge (last item -> end), so bounds hold over the CLOSED tour including the
+        # return arc. None keeps the scan stopping at the last item.
+        self.end = None if end is None else int(end)
         self._views: Dict[str, Callable[[Any, Any, Any], Any]] = {
             "after": lambda cur, state, prev: state,
         }
@@ -91,7 +96,7 @@ class ScanResource:
             value = projection(cur, state, prev)
             return cp.if_(cp.eq(cur, item), _bound_violation(value, op, rhs), 0)
 
-        return cp.scan_sum(self.route, step=self.transition, emit=emit, init=self.initial, boundary=self.boundary)
+        return cp.scan_sum(self.route, step=self.transition, emit=emit, init=self.initial, boundary=self.boundary, end=self.end)
 
     def _scan_bounds_violation(self, view: str, lower: Optional[int], upper: Optional[int]) -> Any:
         projection = self._projection(view)
@@ -105,7 +110,7 @@ class ScanResource:
                 violation = violation + cp.max(0, value - upper)
             return violation
 
-        return cp.scan_sum(self.route, step=self.transition, emit=emit, init=self.initial, boundary=self.boundary)
+        return cp.scan_sum(self.route, step=self.transition, emit=emit, init=self.initial, boundary=self.boundary, end=self.end)
 
 
 class ScanResourcePointExpr:
@@ -165,8 +170,15 @@ def scan_resource(
     transition: Optional[Callable[[Any, Any, Any], Any]] = None,
     delta: Optional[Callable[[Any, Any], Any]] = None,
     boundary: int = 0,
+    end: Optional[int] = None,
 ) -> ScanResource:
-    """Thread one deterministic resource state along a list variable."""
+    """Thread one deterministic resource state along a list variable.
+
+    ``end`` closes the tour: with it set, the scan folds one more transition for
+    the return edge to ``end``, so ``lower``/``upper``/``within_bounds`` also hold
+    at the closing node (the state after the return arc). ``None`` stops at the
+    last item.
+    """
 
     if bounds is not None:
         if lower is not None or upper is not None:
@@ -179,7 +191,7 @@ def scan_resource(
         def transition(cur: Any, state: Any, prev: Any) -> Any:
             return state + delta(prev, cur)
 
-    return ScanResource(route, transition=transition, initial=initial, boundary=boundary, lower=lower, upper=upper)
+    return ScanResource(route, transition=transition, initial=initial, boundary=boundary, lower=lower, upper=upper, end=end)
 
 
 def _resource_add(self: Any, constraint: Any) -> None:

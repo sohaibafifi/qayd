@@ -4096,15 +4096,21 @@ fn ne_expr(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr>
 /// `emit(cur, acc, prev) -> value` (where `acc` in `emit` is the new
 /// accumulator, `prev` is the previous item or `boundary` at the first step).
 /// Used for cumulative time/load, e.g. time-window lateness.
+///
+/// With `end` set, the scan performs ONE more transition for the closing edge
+/// after the last item -- `step(end, acc_last, last_item)` then its `emit` -- so a
+/// threaded resource is folded over the CLOSED tour, including the return arc to
+/// `end`. Mirrors how `sum_edges(..., end=)` closes a tour. `end=None` (default)
+/// stops at the last item (unchanged behaviour).
 #[pyfunction]
-#[pyo3(signature = (route, step, emit, *, init=0, boundary=0))]
-fn scan_sum(route: &PyListVar, step: &Bound<'_, PyAny>, emit: &Bound<'_, PyAny>, init: i64, boundary: i32) -> PyResult<PyTerm> {
+#[pyo3(signature = (route, step, emit, *, init=0, boundary=0, end=None))]
+fn scan_sum(route: &PyListVar, step: &Bound<'_, PyAny>, emit: &Bound<'_, PyAny>, init: i64, boundary: i32, end: Option<i32>) -> PyResult<PyTerm> {
     let step_body = coerce_node(&step.call1((node(PyNode::Arg(0)), node(PyNode::Arg(1)), node(PyNode::Arg(2))))?)?;
     let emit_body = coerce_node(&emit.call1((node(PyNode::Arg(0)), node(PyNode::Arg(1)), node(PyNode::Arg(2))))?)?;
     let mut arena = list::ExprArena::default();
     let step_id = lower(&step_body, &mut arena);
     let emit_id = lower(&emit_body, &mut arena);
-    let iterable = list::Iterable::Scan { list: route.index as usize, init, boundary, step: step_id };
+    let iterable = list::Iterable::Scan { list: route.index as usize, init, boundary, step: step_id, end };
     Ok(single_term(route, list::Reduction { op: list::ReduceOp::Sum, iterable, arena, body: emit_id, coeff: 1 }))
 }
 
@@ -4123,7 +4129,7 @@ fn select_kth(route: &PyListVar, k: usize, step: &Bound<'_, PyAny>, emit: &Bound
     let mut arena = list::ExprArena::default();
     let step_id = lower(&step_body, &mut arena);
     let emit_id = lower(&emit_body, &mut arena);
-    let iterable = list::Iterable::Scan { list: route.index as usize, init, boundary, step: step_id };
+    let iterable = list::Iterable::Scan { list: route.index as usize, init, boundary, step: step_id, end: None };
     Ok(single_term(route, list::Reduction { op: list::ReduceOp::SelectKth(k), iterable, arena, body: emit_id, coeff: 1 }))
 }
 

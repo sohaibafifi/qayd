@@ -224,7 +224,7 @@ pub(crate) fn eval_reduction_on_lists(reduction: &Reduction, lists: &[Vec<i32>])
                 }
             }
         }
-        Iterable::Scan { init, boundary, step, .. } => {
+        Iterable::Scan { init, boundary, step, end, .. } => {
             let mut acc = init;
             let mut prev = boundary;
             for &cur in contents {
@@ -232,6 +232,11 @@ pub(crate) fn eval_reduction_on_lists(reduction: &Reduction, lists: &[Vec<i32>])
                 fold(eval_objective_expr(arena, body, &[i64::from(cur), new_acc, i64::from(prev)]));
                 acc = new_acc;
                 prev = cur;
+            }
+            // Closing edge to `end`: one more transition, mirroring `Edges`.
+            if let Some(end) = end {
+                let new_acc = eval_objective_expr(arena, step, &[i64::from(end), acc, i64::from(prev)]);
+                fold(eval_objective_expr(arena, body, &[i64::from(end), new_acc, i64::from(prev)]));
             }
         }
         Iterable::Windows { size, inner, .. } => {
