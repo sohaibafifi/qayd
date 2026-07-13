@@ -97,6 +97,28 @@ Python extension checks:
 cargo clippy --all-targets --features python -- -D warnings
 ```
 
+Optional incremental LP relaxation, backed by the sibling `amthal` crate:
+
+```bash
+cargo build --features lp-relaxation
+cargo test --features lp-relaxation
+```
+
+For supported linear COPs, one persistent Amthal session per exact search keeps
+its basis and factorization across domain-bound changes. Primal candidates guide
+value phases. Dual candidates can prune only after Qayd reconstructs a valid
+Lagrangian bound in exact rational arithmetic. Floating-point statuses alone
+never prove infeasibility or optimality.
+
+Root and node solves have default budgets of 50 ms and 1 ms, a 100 ms total LP
+budget, and run at most every 64 search nodes after the root.
+The defaults skip models above 2,000 variables, 1,000 rows, or 100,000 nonzeros.
+They can be tuned with `QAYD_LP_ROOT_MS`, `QAYD_LP_NODE_MS`,
+`QAYD_LP_TOTAL_MS`, `QAYD_LP_NODE_EVERY`, `QAYD_LP_MAX_VARS`,
+`QAYD_LP_MAX_ROWS`, `QAYD_LP_MAX_NONZEROS`, `QAYD_LP_MIN_COVERAGE`, and
+`QAYD_LP_MIN_GAIN`. `QAYD_LP_PHASE_MAX_VARS` caps the full CP validation of a
+rounded root phase.
+
 ## CLI
 
 ```bash

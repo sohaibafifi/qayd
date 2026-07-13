@@ -97,6 +97,7 @@ fn write_optimization_result<W: Write>(
     if verbose {
         writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures).map_err(io_err)?;
         write_inprocessing_stats(w, stats).map_err(io_err)?;
+        write_lp_stats(w, stats).map_err(io_err)?;
     }
     let sat = if complete { "s OPTIMUM FOUND" } else { "s SATISFIABLE" };
     let none = if interrupted { "s UNKNOWN" } else { "s UNSATISFIABLE" };
@@ -106,6 +107,26 @@ fn write_optimization_result<W: Write>(
 fn write_inprocessing_stats<W: Write>(w: &mut W, stats: SolveStats) -> std::io::Result<()> {
     if stats.vivified_clauses > 0 {
         writeln!(w, "c inprocessing vivified {} removed {}", stats.vivified_clauses, stats.vivified_lits)?;
+    }
+    Ok(())
+}
+
+fn write_lp_stats<W: Write>(w: &mut W, stats: SolveStats) -> std::io::Result<()> {
+    if stats.lp_rows > 0 {
+        writeln!(
+            w,
+            "c lp rows {} root_bound {} solves {} certified {} prunes {} node_prunes {} global_prunes {} timeouts {} refactorizations {} time_ms {:.3}",
+            stats.lp_rows,
+            stats.lp_root_bound.map_or_else(|| "?".to_string(), |bound| bound.to_string()),
+            stats.lp_solves,
+            stats.lp_certified,
+            stats.lp_prunes,
+            stats.lp_node_prunes,
+            stats.lp_global_prunes,
+            stats.lp_timeouts,
+            stats.lp_refactorizations,
+            stats.lp_micros as f64 / 1000.0,
+        )?;
     }
     Ok(())
 }
@@ -500,6 +521,7 @@ fn write_parallel_result<W: Write>(w: &mut W, output: &SolutionOutput, result: P
     if verbose {
         writeln!(w, "c nodes {} failures {}", result.stats.nodes, result.stats.failures).map_err(io_err)?;
         write_inprocessing_stats(w, result.stats).map_err(io_err)?;
+        write_lp_stats(w, result.stats).map_err(io_err)?;
         if result.shared_clauses > 0 || result.imported_clauses > 0 {
             writeln!(w, "c shared clauses {} imported {}", result.shared_clauses, result.imported_clauses).map_err(io_err)?;
         }

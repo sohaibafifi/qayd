@@ -28,6 +28,8 @@ pub mod frontends;
 pub mod ids;
 pub mod lcg;
 mod lns;
+#[doc(hidden)]
+pub mod lp_relaxation;
 pub mod mem;
 pub mod model;
 pub mod mus;

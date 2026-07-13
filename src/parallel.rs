@@ -313,6 +313,16 @@ fn merge_stats(total: &mut SolveStats, part: SolveStats) {
     total.learned_lits += part.learned_lits;
     total.vivified_clauses += part.vivified_clauses;
     total.vivified_lits += part.vivified_lits;
+    total.lp_rows += part.lp_rows;
+    total.lp_solves += part.lp_solves;
+    total.lp_certified += part.lp_certified;
+    total.lp_prunes += part.lp_prunes;
+    total.lp_node_prunes += part.lp_node_prunes;
+    total.lp_global_prunes += part.lp_global_prunes;
+    total.lp_timeouts += part.lp_timeouts;
+    total.lp_refactorizations += part.lp_refactorizations;
+    total.lp_micros += part.lp_micros;
+    total.lp_root_bound = total.lp_root_bound.or(part.lp_root_bound);
 }
 
 fn run_probe_worker(
@@ -640,7 +650,6 @@ pub(crate) fn solve_cop<W: Write>(
     let regular_workers = options.workers - options.probes - options.lns - incumbent_workers;
     let lns_end = regular_workers + options.lns;
     let probe_end = lns_end + options.probes;
-
     std::thread::scope(|scope| {
         let monitor = Arc::clone(&shared);
         scope.spawn(move || {

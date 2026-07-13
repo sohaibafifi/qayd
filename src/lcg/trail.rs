@@ -826,7 +826,7 @@ impl<'s> Cdcl<'s> {
     /// at its determination level; recording later, at a deeper level, would let
     /// 1-UIP backjump too far and prune feasible solutions. The reason is
     /// [`ds_recorded`], which entails every determination and is itself recorded.
-    fn sync_var(&mut self, var: VarId) {
+    pub(crate) fn sync_var(&mut self, var: VarId) {
         if self.atoms.is_sign(var) {
             let LitOrConst::Lit(l) = self.atoms.ge(var, 1) else { unreachable!("a sign variable has one real atom") };
             if !self.is_assigned(l.atom()) {

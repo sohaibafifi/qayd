@@ -303,6 +303,22 @@ struct PySolveStats {
     vivified_clauses: u64,
     #[pyo3(get)]
     vivified_lits: u64,
+    #[pyo3(get)]
+    lp_solves: u64,
+    #[pyo3(get)]
+    lp_certified: u64,
+    #[pyo3(get)]
+    lp_prunes: u64,
+    #[pyo3(get)]
+    lp_node_prunes: u64,
+    #[pyo3(get)]
+    lp_global_prunes: u64,
+    #[pyo3(get)]
+    lp_timeouts: u64,
+    #[pyo3(get)]
+    lp_micros: u64,
+    #[pyo3(get)]
+    lp_root_bound: Option<i64>,
 }
 
 /// Result of [`enumerate_mus`](PyModel::enumerate_mus): the minimal unsatisfiable
@@ -455,6 +471,14 @@ impl From<SolveStats> for PySolveStats {
             learned_lits: stats.learned_lits,
             vivified_clauses: stats.vivified_clauses,
             vivified_lits: stats.vivified_lits,
+            lp_solves: stats.lp_solves,
+            lp_certified: stats.lp_certified,
+            lp_prunes: stats.lp_prunes,
+            lp_node_prunes: stats.lp_node_prunes,
+            lp_global_prunes: stats.lp_global_prunes,
+            lp_timeouts: stats.lp_timeouts,
+            lp_micros: stats.lp_micros,
+            lp_root_bound: stats.lp_root_bound,
         }
     }
 }
@@ -1051,6 +1075,16 @@ fn add_stats(total: &mut SolveStats, stats: SolveStats) {
     total.watched_clause_visits += stats.watched_clause_visits;
     total.watched_literal_scans += stats.watched_literal_scans;
     total.binary_implications += stats.binary_implications;
+    total.lp_rows += stats.lp_rows;
+    total.lp_solves += stats.lp_solves;
+    total.lp_certified += stats.lp_certified;
+    total.lp_prunes += stats.lp_prunes;
+    total.lp_node_prunes += stats.lp_node_prunes;
+    total.lp_global_prunes += stats.lp_global_prunes;
+    total.lp_timeouts += stats.lp_timeouts;
+    total.lp_refactorizations += stats.lp_refactorizations;
+    total.lp_micros += stats.lp_micros;
+    total.lp_root_bound = total.lp_root_bound.or(stats.lp_root_bound);
 }
 
 fn next_clause_sharing(clauses: Option<&Arc<SharedClausePool>>, next_worker: &mut usize) -> Option<ClauseSharing> {

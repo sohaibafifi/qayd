@@ -71,6 +71,12 @@ impl Propagator for Intension {
 
 /// Post the constraint "`expr` holds" (evaluates non-zero/true).
 pub fn intension(solver: &mut Solver, expr: Expr) {
+    #[cfg(feature = "lp-relaxation")]
+    {
+        if let Some(row) = expr.linear_relation() {
+            solver.record_linear_relaxation(&row.coeffs, &row.vars, row.lower, row.upper);
+        }
+    }
     let mut vars = Vec::new();
     expr.collect_vars(&mut vars);
     vars.sort_unstable();

@@ -3,6 +3,49 @@
 //! interval (never narrower than reality), safe for disentailment.
 
 use crate::ids::VarId;
+#[cfg(feature = "lp-relaxation")]
+use std::collections::BTreeMap;
+
+#[cfg(feature = "lp-relaxation")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LinearForm {
+    pub constant: i128,
+    pub terms: Vec<(VarId, i128)>,
+}
+
+#[cfg(feature = "lp-relaxation")]
+pub(crate) struct LinearRelation {
+    pub coeffs: Vec<i64>,
+    pub vars: Vec<VarId>,
+    pub lower: Option<i64>,
+    pub upper: Option<i64>,
+}
+
+#[cfg(feature = "lp-relaxation")]
+impl LinearForm {
+    fn constant(value: i128) -> Self {
+        Self { constant: value, terms: Vec::new() }
+    }
+
+    fn scaled(mut self, factor: i128) -> Option<Self> {
+        self.constant = self.constant.checked_mul(factor)?;
+        for (_, coefficient) in &mut self.terms {
+            *coefficient = coefficient.checked_mul(factor)?;
+        }
+        self.terms.retain(|(_, coefficient)| *coefficient != 0);
+        Some(self)
+    }
+
+    fn add(self, other: Self) -> Option<Self> {
+        let constant = self.constant.checked_add(other.constant)?;
+        let mut terms = BTreeMap::new();
+        for (var, coefficient) in self.terms.into_iter().chain(other.terms) {
+            let entry = terms.entry(var).or_insert(0i128);
+            *entry = entry.checked_add(coefficient)?;
+        }
+        Some(Self { constant, terms: terms.into_iter().filter(|(_, coefficient)| *coefficient != 0).collect() })
+    }
+}
 
 /// A node in an `intension` expression tree.
 #[derive(Clone)]
@@ -63,6 +106,68 @@ pub enum Expr {
 }
 
 impl Expr {
+    /// Extract an exact affine form when the expression uses only constants,
+    /// variables, addition, subtraction, negation, and multiplication by constants.
+    #[cfg(feature = "lp-relaxation")]
+    pub(crate) fn linear_form(&self) -> Option<LinearForm> {
+        match self {
+            Expr::Const(value) => Some(LinearForm::constant(i128::from(*value))),
+            Expr::Var(var) => Some(LinearForm { constant: 0, terms: vec![(*var, 1)] }),
+            Expr::Neg(expr) => expr.linear_form()?.scaled(-1),
+            Expr::Add(exprs) => exprs.iter().try_fold(LinearForm::constant(0), |sum, expr| sum.add(expr.linear_form()?)),
+            Expr::Sub(left, right) => left.linear_form()?.add(right.linear_form()?.scaled(-1)?),
+            Expr::Mul(exprs) => {
+                let mut scale = 1i128;
+                let mut affine = None;
+                for expr in exprs {
+                    let form = expr.linear_form()?;
+                    if form.terms.is_empty() {
+                        scale = scale.checked_mul(form.constant)?;
+                    } else if affine.is_none() {
+                        affine = Some(form);
+                    } else {
+                        return None;
+                    }
+                }
+                affine.unwrap_or_else(|| LinearForm::constant(1)).scaled(scale)
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract a top-level affine comparison as an exact ranged row.
+    #[cfg(feature = "lp-relaxation")]
+    pub(crate) fn linear_relation(&self) -> Option<LinearRelation> {
+        let (left, right, kind) = match self {
+            Expr::Le(left, right) => (left.as_ref(), right.as_ref(), 0u8),
+            Expr::Lt(left, right) => (left.as_ref(), right.as_ref(), 1u8),
+            Expr::Ge(left, right) => (left.as_ref(), right.as_ref(), 2u8),
+            Expr::Gt(left, right) => (left.as_ref(), right.as_ref(), 3u8),
+            Expr::Eq(left, right) => (left.as_ref(), right.as_ref(), 4u8),
+            _ => return None,
+        };
+        let form = left.linear_form()?.add(right.linear_form()?.scaled(-1)?)?;
+        let rhs = form.constant.checked_neg()?;
+        let rhs = i64::try_from(rhs).ok()?;
+        let mut coeffs = Vec::with_capacity(form.terms.len());
+        let mut vars = Vec::with_capacity(form.terms.len());
+        for (var, coefficient) in form.terms {
+            coeffs.push(i64::try_from(coefficient).ok()?);
+            vars.push(var);
+        }
+        let bounds = match kind {
+            0 => (None, Some(rhs)),
+            1 => (None, rhs.checked_sub(1)),
+            2 => (Some(rhs), None),
+            3 => (rhs.checked_add(1), None),
+            _ => (Some(rhs), Some(rhs)),
+        };
+        if matches!(kind, 1 | 3) && bounds.0.is_none() && bounds.1.is_none() {
+            return None;
+        }
+        Some(LinearRelation { coeffs, vars, lower: bounds.0, upper: bounds.1 })
+    }
+
     /// Collect every variable referenced in the tree (with duplicates).
     pub fn collect_vars(&self, out: &mut Vec<VarId>) {
         match self {

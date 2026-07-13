@@ -12,8 +12,9 @@ use crate::expr;
 use crate::expr::Expr;
 use crate::ids::{PropId, VarId};
 use crate::lcg::lit::{Lit, LitOrConst};
-use crate::lcg::trail::{Cdcl, Reason};
+use crate::lcg::trail::{Cdcl, Conflict, Reason};
 use crate::lcg::view::Tri;
+use crate::lp_relaxation::{IncrementalLp, LpRuntimeStats, NodeLpResult};
 use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::search::{Objective, SearchControl, SolveStats};
 use crate::store::{Premise, Solver, Store};
@@ -97,6 +98,42 @@ pub(crate) enum AssumptionOutcome {
 }
 
 impl Cdcl<'_> {
+    fn lp_conflict(&mut self, bounds: &[(VarId, i32, i32)]) -> Conflict {
+        let mut premises = Vec::with_capacity(2 * bounds.len());
+        for &(var, lower, upper) in bounds {
+            let lower_lit = self.atoms.ge(var, lower);
+            let upper_lit = self.atoms.ge_i64(var, i64::from(upper) + 1);
+            self.sync_var(var);
+            if let LitOrConst::Lit(lit) = lower_lit {
+                if self.tvalue(lit) == Tri::True {
+                    premises.push(lit);
+                }
+            }
+            if let LitOrConst::Lit(lit) = upper_lit {
+                let lit = lit.negate();
+                if self.tvalue(lit) == Tri::True {
+                    premises.push(lit);
+                }
+            }
+        }
+        premises.sort_unstable_by_key(|lit| lit.code());
+        premises.dedup_by_key(|lit| lit.code());
+        Conflict::Generic(premises)
+    }
+
+    fn copy_lp_stats(stats: &mut SolveStats, lp: LpRuntimeStats) {
+        stats.lp_rows = lp.rows;
+        stats.lp_solves = lp.solves;
+        stats.lp_certified = lp.certified;
+        stats.lp_prunes = lp.prunes;
+        stats.lp_node_prunes = lp.node_prunes;
+        stats.lp_global_prunes = lp.global_prunes;
+        stats.lp_timeouts = lp.timeouts;
+        stats.lp_refactorizations = lp.refactorizations;
+        stats.lp_micros = lp.micros;
+        stats.lp_root_bound = lp.root_bound;
+    }
+
     /// Branching heuristic: unfixed variable minimising `size / (wdeg + activity)`
     /// (dom/wdeg combined with VSIDS activity), or `None` if all fixed.
     fn select_var(&self, vars: &[VarId], objective: Option<&ObjectiveImpact>) -> Option<VarId> {
@@ -442,6 +479,7 @@ impl Cdcl<'_> {
         phase: &mut [Option<i32>],
         stats: &mut SolveStats,
         cell: &mut ObjBoundCell,
+        lp: &mut IncrementalLp,
         on_improve: &mut F,
     ) -> bool {
         let value = objective.value(self.solver);
@@ -453,6 +491,9 @@ impl Cdcl<'_> {
         on_improve(value, &assignment);
         *best = Some((assignment, value));
         *enforced = Some(value);
+        if lp.certifies_global(value) {
+            return false;
+        }
         self.tighten_objective(objective, minimizing, value, cell)
     }
 
@@ -505,13 +546,25 @@ impl Cdcl<'_> {
             self.copy_inprocessing_stats(&mut stats);
             return (best, stats, true);
         }
+        let lp_enabled = cube.is_empty() && conflict_budget.is_none();
+        let mut lp = IncrementalLp::new(self.solver, objective, minimizing, lp_enabled, stop);
+        let lp_root = lp.solve_root(self.solver, vars, stop);
         // Seed the saved-phase array with the caller's value-ordering hint (e.g.
         // nearest-neighbour successors) when supplied, else start blank.
         let mut phase: Vec<Option<i32>> = if self.initial_phase.len() == self.solver.store.num_vars() {
             self.initial_phase.clone()
+        } else if lp_root.phase.len() == self.solver.store.num_vars() {
+            lp_root.phase.clone()
         } else {
             vec![None; self.solver.store.num_vars()]
         };
+        if lp_root.phase.len() == phase.len() {
+            for (current, proposed) in phase.iter_mut().zip(lp_root.phase) {
+                if current.is_none() {
+                    *current = proposed;
+                }
+            }
+        }
         let objective_impact = ObjectiveImpact::new(objective, self.solver.store.num_vars(), minimizing);
         let mut enforced = None;
         let mut obj_bound = ObjBoundCell::default();
@@ -543,6 +596,27 @@ impl Cdcl<'_> {
             if !self.maybe_restart() {
                 break;
             }
+            if let Some(incumbent) = enforced {
+                match lp.check_node(self.solver, incumbent, stats.nodes, self.decision_level() == 0, stop) {
+                    NodeLpResult::NotRun => {}
+                    NodeLpResult::Continue(proposed) => {
+                        if proposed.len() == phase.len() {
+                            for (current, proposed) in phase.iter_mut().zip(proposed) {
+                                if proposed.is_some() {
+                                    *current = proposed;
+                                }
+                            }
+                        }
+                    }
+                    NodeLpResult::Prune(bounds) => {
+                        let conflict = self.lp_conflict(&bounds);
+                        if !self.resolve_conflict(conflict) || !self.propagate_and_learn() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            }
             match self.select_var(vars, objective_impact.as_ref()) {
                 None => {
                     let keep_searching = self.accept_solution(
@@ -554,6 +628,7 @@ impl Cdcl<'_> {
                         &mut phase,
                         &mut stats,
                         &mut obj_bound,
+                        &mut lp,
                         on_improve,
                     );
                     if !keep_searching {
@@ -572,6 +647,7 @@ impl Cdcl<'_> {
         }
         stats.failures = self.conflicts;
         self.copy_inprocessing_stats(&mut stats);
+        Self::copy_lp_stats(&mut stats, lp.stats());
         (best, stats, complete)
     }
 

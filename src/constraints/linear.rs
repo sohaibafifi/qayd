@@ -324,6 +324,25 @@ fn post_leq(solver: &mut Solver, coeffs: &[i64], vars: &[VarId], c: i64) {
 /// Post \( \sum_i \texttt{coeffs}[i] \cdot \texttt{vars}[i] \;\texttt{rel}\; \texttt{rhs} \).
 pub fn linear(solver: &mut Solver, coeffs: &[i64], vars: &[VarId], rel: Relation, rhs: i64) {
     assert_eq!(coeffs.len(), vars.len(), "linear: coeffs/vars length mismatch");
+    #[cfg(feature = "lp-relaxation")]
+    {
+        match rel {
+            Relation::Le => solver.record_linear_relaxation(coeffs, vars, None, Some(rhs)),
+            Relation::Lt => {
+                if let Some(upper) = rhs.checked_sub(1) {
+                    solver.record_linear_relaxation(coeffs, vars, None, Some(upper));
+                }
+            }
+            Relation::Ge => solver.record_linear_relaxation(coeffs, vars, Some(rhs), None),
+            Relation::Gt => {
+                if let Some(lower) = rhs.checked_add(1) {
+                    solver.record_linear_relaxation(coeffs, vars, Some(lower), None);
+                }
+            }
+            Relation::Eq => solver.record_linear_relaxation(coeffs, vars, Some(rhs), Some(rhs)),
+            Relation::Ne => {}
+        }
+    }
     match rel {
         Relation::Le => post_leq(solver, coeffs, vars, rhs),
         Relation::Lt => post_leq(solver, coeffs, vars, rhs - 1),

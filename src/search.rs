@@ -53,6 +53,26 @@ pub struct SolveStats {
     pub watched_literal_scans: u64,
     /// Literals implied by the binary-clause fast path.
     pub binary_implications: u64,
+    /// Linear rows retained by the incremental LP relaxation.
+    pub lp_rows: u64,
+    /// Root and node LP solves attempted.
+    pub lp_solves: u64,
+    /// Floating dual candidates converted to exact rational bounds.
+    pub lp_certified: u64,
+    /// Search nodes cut by an exact LP certificate.
+    pub lp_prunes: u64,
+    /// Non-root subtrees cut by exact LP certificates.
+    pub lp_node_prunes: u64,
+    /// Whole optimization searches completed from a certified global bound.
+    pub lp_global_prunes: u64,
+    /// LP solves stopped by their local wall-clock budget.
+    pub lp_timeouts: u64,
+    /// Complete LP basis refactorizations.
+    pub lp_refactorizations: u64,
+    /// Wall-clock time spent inside LP solves.
+    pub lp_micros: u64,
+    /// Certified root bound in the user's objective direction.
+    pub lp_root_bound: Option<i64>,
 }
 
 /// A Boolean literal over an integer variable encoded as `{0, 1}` or `{-1, 1}`.

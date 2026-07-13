@@ -98,6 +98,19 @@ pub struct ScopeVar {
     pub holes: Vec<i32>,
 }
 
+/// Convex linear row retained alongside its propagator for optional LP
+/// relaxation. Bounds use `None` for infinity. Disequalities and selected
+/// constraints are deliberately absent because they have no unconditional
+/// convex relaxation in this form.
+#[cfg(feature = "lp-relaxation")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LinearRelaxationRow {
+    pub coeffs: Vec<i64>,
+    pub vars: Vec<VarId>,
+    pub lower: Option<i64>,
+    pub upper: Option<i64>,
+}
+
 /// Why a domain change happened: the raw material for its LCG explanation.
 #[derive(Clone, Debug)]
 pub enum Cause {
@@ -1233,6 +1246,9 @@ pub struct Solver {
     /// [`Selected`] guard on this selector, used to build constraint-level
     /// unsat cores. `None` in normal solving (no wrapping, no overhead).
     current_selector: Option<VarId>,
+    /// Linear semantic rows retained for the optional advisory LP engine.
+    #[cfg(feature = "lp-relaxation")]
+    linear_relaxation: Vec<LinearRelaxationRow>,
 }
 
 const _: fn() = || {
@@ -1283,6 +1299,19 @@ impl Solver {
     /// [`crate::mus`].
     pub fn set_selector(&mut self, sel: Option<VarId>) {
         self.current_selector = sel;
+    }
+
+    /// Retain an unconditional convex linear row for the optional LP view.
+    #[cfg(feature = "lp-relaxation")]
+    pub(crate) fn record_linear_relaxation(&mut self, coeffs: &[i64], vars: &[VarId], lower: Option<i64>, upper: Option<i64>) {
+        if self.current_selector.is_none() {
+            self.linear_relaxation.push(LinearRelaxationRow { coeffs: coeffs.to_vec(), vars: vars.to_vec(), lower, upper });
+        }
+    }
+
+    #[cfg(feature = "lp-relaxation")]
+    pub(crate) fn linear_relaxation(&self) -> &[LinearRelaxationRow] {
+        &self.linear_relaxation
     }
 
     /// Collapse scheduling into a single FIFO band (the pre-banding order), for
