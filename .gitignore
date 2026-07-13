@@ -4,10 +4,6 @@
 !/.github/workflows/
 !/.github/workflows/*.yml
 /tests/*
-!/tests/lp_relaxation.rs
-!/tests/lp_incremental.rs
-!/tests/lp_pruning_oracle.rs
-!/tests/lp_budget.rs
 /vendor/
 /frontends/flatzinc/tests/
 /frontends/pb/tests/
