@@ -8,8 +8,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use super::eval::{eval_reduction, violation_of, INFEASIBLE};
+use super::metrics::{metrics_enabled_from_env, ListSearchMetrics, MetricsRecorder};
 use super::moves::{apply_move, best_improving_move, better, random_kick, shuffle, snapshot, SearchMemory};
 use super::schedule_ls::solve_schedule;
 use crate::mix64;
@@ -123,6 +125,7 @@ pub(super) struct PerList {
     /// default (lets an infeasible-heavy instance afford more passes); set
     /// `QAYD_LS_INFEAS_CAND=0` to revert to the conservative feasible-only gate.
     pub(super) infeas_cand: bool,
+    pub(super) metrics: MetricsRecorder,
 }
 
 pub(super) struct CandidateNeighbors {
@@ -264,6 +267,10 @@ fn reduction_delta_kind(r: &Reduction) -> ReductionDeltaKind {
 
 impl PerList {
     pub(super) fn build(model: &CollectionModel) -> Self {
+        Self::build_profiled(model, false)
+    }
+
+    fn build_profiled(model: &CollectionModel, metrics_enabled: bool) -> Self {
         let mut objective: Vec<[Vec<Reduction>; MAX_TIERS]> = (0..model.lists).map(|_| std::array::from_fn(|_| Vec::new())).collect();
         let mut max_objective: [Vec<MaxTerm>; MAX_TIERS] = std::array::from_fn(|_| Vec::new());
         let mut objective_delta: Vec<[Vec<ReductionDeltaKind>; MAX_TIERS]> =
@@ -330,6 +337,7 @@ impl PerList {
             route_bounds,
             candidates: candidate_matrix.flatten().and_then(|matrix| CandidateNeighbors::build(model, matrix)),
             infeas_cand: std::env::var("QAYD_LS_INFEAS_CAND").as_deref() != Ok("0"),
+            metrics: MetricsRecorder::new(metrics_enabled),
         }
     }
 
@@ -365,14 +373,14 @@ pub(super) fn list_score(per: &PerList, idx: usize, contents: &[i32]) -> ListSco
     let mut objectives = [0i64; MAX_TIERS];
     for (t, tier) in per.objective[idx].iter().enumerate() {
         for r in tier {
-            match eval_reduction(r, contents) {
+            match per.metrics.measure_full(r, contents.len(), || eval_reduction(r, contents)) {
                 Some(v) => objectives[t] = objectives[t].saturating_add(v),
                 None => violation = violation.saturating_add(INFEASIBLE),
             }
         }
     }
     for c in &per.constraints[idx] {
-        match eval_reduction(&c.reduction, contents) {
+        match per.metrics.measure_full(&c.reduction, contents.len(), || eval_reduction(&c.reduction, contents)) {
             Some(v) => violation = violation.saturating_add(violation_of(v, c.op, c.rhs)),
             None => violation = violation.saturating_add(INFEASIBLE),
         }
@@ -417,7 +425,7 @@ fn max_objective_totals<'a>(per: &PerList, lists: &'a [Vec<i32>], replacements: 
                 let mut defined = true;
                 for reduction in group {
                     let contents = trial_contents(lists, replacements, reduction.iterable.list());
-                    match eval_reduction(reduction, contents) {
+                    match per.metrics.measure_full(reduction, contents.len(), || eval_reduction(reduction, contents)) {
                         Some(value) => group_value = group_value.saturating_add(value),
                         None => {
                             defined = false;
@@ -476,7 +484,10 @@ pub(super) struct State {
 
 /// Raw value of every constraint reduction on a list (`None` = undefined).
 pub(super) fn compute_con_vals(per: &PerList, idx: usize, contents: &[i32]) -> Vec<Option<i64>> {
-    per.constraints[idx].iter().map(|c| eval_reduction(&c.reduction, contents)).collect()
+    per.constraints[idx]
+        .iter()
+        .map(|c| per.metrics.measure_full(&c.reduction, contents.len(), || eval_reduction(&c.reduction, contents)))
+        .collect()
 }
 
 impl State {
@@ -695,6 +706,8 @@ fn repair_lns(per: &PerList, state: &mut State, removed: &[i32], seed: u64, stop
                 scratch.clear();
                 scratch.extend_from_slice(&state.lists[list]);
                 scratch.insert(pos, item);
+                per.metrics.record_candidate();
+                per.metrics.record_full_trial();
                 let next = list_score(per, list, &scratch);
                 let global_delta = per.globals.delta(&state.item_list, &[(item, list)]);
                 let score = score_with_replaced_list(per, state, list, next, &scratch, global_delta);
@@ -753,6 +766,8 @@ fn repair_regret(per: &PerList, state: &mut State, removed: &[i32], k: usize, se
                     scratch.clear();
                     scratch.extend_from_slice(&state.lists[list]);
                     scratch.insert(pos, item);
+                    per.metrics.record_candidate();
+                    per.metrics.record_full_trial();
                     let next = list_score(per, list, &scratch);
                     let global_delta = per.globals.delta(&state.item_list, &[(item, list)]);
                     let cost = score_scalar(&score_with_replaced_list(per, state, list, next, &scratch, global_delta));
@@ -870,6 +885,18 @@ pub fn solve_collection(model: &CollectionModel, seed: u64, stop: &AtomicBool, r
     solve_collection_capped(model, seed, stop, max_iters, None, report)
 }
 
+/// Run [`solve_collection`] with profiling enabled and return the metrics
+/// without printing them. This is intended for benchmark harnesses.
+pub fn solve_collection_profiled(
+    model: &CollectionModel,
+    seed: u64,
+    stop: &AtomicBool,
+    report: &mut dyn FnMut(i64),
+) -> (CollectionSolution, ListSearchMetrics) {
+    let max_iters = std::env::var("QAYD_LS_MAX_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX);
+    solve_collection_capped_internal(model, seed, stop, max_iters, None, report, true)
+}
+
 /// Like [`solve_collection`], but seeds the initial incumbent from `hint` -- one
 /// visiting-order sequence per list variable, from a caller's constructive
 /// heuristic -- instead of the greedy random partition. Universe items the hint
@@ -877,7 +904,13 @@ pub fn solve_collection(model: &CollectionModel, seed: u64, stop: &AtomicBool, r
 /// nodes stay droppable). The hint seeds only the first incumbent; GRASP restarts
 /// still diversify from fresh random partitions, and the best incumbent (possibly
 /// the hint itself) is always retained.
-pub fn solve_collection_hinted(model: &CollectionModel, seed: u64, stop: &AtomicBool, hint: &[Vec<i32>], report: &mut dyn FnMut(i64)) -> CollectionSolution {
+pub fn solve_collection_hinted(
+    model: &CollectionModel,
+    seed: u64,
+    stop: &AtomicBool,
+    hint: &[Vec<i32>],
+    report: &mut dyn FnMut(i64),
+) -> CollectionSolution {
     let max_iters = std::env::var("QAYD_LS_MAX_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX);
     solve_collection_capped(model, seed, stop, max_iters, Some(hint), report)
 }
@@ -920,24 +953,60 @@ pub fn solve_collection_capped(
     hint: Option<&[Vec<i32>]>,
     report: &mut dyn FnMut(i64),
 ) -> CollectionSolution {
+    let metrics_enabled = metrics_enabled_from_env();
+    let (solution, metrics) = solve_collection_capped_internal(model, seed, stop, max_iters, hint, report, metrics_enabled);
+    if metrics_enabled {
+        eprint!("{metrics}");
+    }
+    solution
+}
+
+/// Deterministic iteration-capped variant of [`solve_collection_profiled`].
+/// It always collects metrics, independently of `QAYD_LS_METRICS`, and leaves
+/// presentation to the caller.
+pub fn solve_collection_capped_profiled(
+    model: &CollectionModel,
+    seed: u64,
+    stop: &AtomicBool,
+    max_iters: u64,
+    hint: Option<&[Vec<i32>]>,
+    report: &mut dyn FnMut(i64),
+) -> (CollectionSolution, ListSearchMetrics) {
+    solve_collection_capped_internal(model, seed, stop, max_iters, hint, report, true)
+}
+
+fn solve_collection_capped_internal(
+    model: &CollectionModel,
+    seed: u64,
+    stop: &AtomicBool,
+    max_iters: u64,
+    hint: Option<&[Vec<i32>]>,
+    report: &mut dyn FnMut(i64),
+    metrics_enabled: bool,
+) -> (CollectionSolution, ListSearchMetrics) {
+    let started = metrics_enabled.then(Instant::now);
     // Guard the search path: an invalid model would otherwise panic (bad list
     // index) or read silent zeros (out-of-range table index). Callers like the
     // Python frontend validate first to raise a precise error; this is the
     // backstop for direct Rust callers so the engine never panics or corrupts.
     if let Err(_e) = model.validate() {
         debug_assert!(false, "solve_collection called on an invalid model: {_e}");
-        return CollectionSolution {
+        let solution = CollectionSolution {
             lists: vec![Vec::new(); model.lists.max(1)],
             objectives: Vec::new(),
             feasible: false,
             starts: Vec::new(),
             machines: Vec::new(),
         };
+        let metrics = MetricsRecorder::new(metrics_enabled).snapshot(started.map(|instant| instant.elapsed()).unwrap_or_default());
+        return (solution, metrics);
     }
     if let Some(sched) = &model.schedule {
-        return solve_schedule(sched, seed, stop, report);
+        let solution = solve_schedule(sched, seed, stop, report);
+        let metrics = MetricsRecorder::new(metrics_enabled).snapshot(started.map(|instant| instant.elapsed()).unwrap_or_default());
+        return (solution, metrics);
     }
-    let per = PerList::build(model);
+    let per = PerList::build_profiled(model, metrics_enabled);
     let n = model.items.len();
     let mut order: Vec<usize> = (0..n).collect();
     shuffle(&mut order, seed);
@@ -1040,5 +1109,7 @@ pub fn solve_collection_capped(
     // they can never disagree with the accepted solution. When infeasible they
     // are best-effort; `feasible` is the signal to trust.
     let objectives = objective_values(&per, &best_score);
-    CollectionSolution { lists: best_lists, objectives, feasible: best_feasible, starts: Vec::new(), machines: Vec::new() }
+    let solution = CollectionSolution { lists: best_lists, objectives, feasible: best_feasible, starts: Vec::new(), machines: Vec::new() };
+    let metrics = per.metrics.snapshot(started.map(|instant| instant.elapsed()).unwrap_or_default());
+    (solution, metrics)
 }

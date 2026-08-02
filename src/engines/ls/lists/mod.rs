@@ -5,8 +5,12 @@
 
 mod eval;
 mod local_search;
+mod metrics;
 mod moves;
 mod schedule_ls;
 
-pub use local_search::{solve_collection, solve_collection_capped, solve_collection_hinted};
+pub use local_search::{
+    solve_collection, solve_collection_capped, solve_collection_capped_profiled, solve_collection_hinted, solve_collection_profiled,
+};
+pub use metrics::{ListIterableKind, ListReduceOpKind, ListSearchMetrics, ReductionSearchMetrics};
 pub use moves::audit_incremental;

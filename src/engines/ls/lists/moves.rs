@@ -36,11 +36,13 @@ pub(super) enum Move {
 
 /// Score of the state if one list were replaced by candidate contents.
 fn score_one(per: &PerList, state: &State, list: usize, score: ListScore, contents: &[i32], global_delta: i64) -> Score {
+    per.metrics.record_candidate();
     score_with_replacements(per, state, &[TrialList { list, score, contents }], global_delta)
 }
 
 /// Score of the state if two lists were replaced by candidate contents.
 fn score_two<'a>(per: &PerList, state: &'a State, left: TrialList<'a>, right: TrialList<'a>, global_delta: i64) -> Score {
+    per.metrics.record_candidate();
     score_with_replacements(per, state, &[left, right], global_delta)
 }
 
@@ -375,21 +377,25 @@ fn reduction_delta(r: &Reduction, kind: ReductionDeltaKind, list: &[i32], edit: 
 /// materialising the edited list and rescoring it in full.
 fn trial_list_score(per: &PerList, state: &State, idx: usize, edit: Edit, scratch: &mut Vec<i32>) -> ListScore {
     if per.has_max_objective() || !per.list_incremental[idx] {
+        per.metrics.record_full_trial();
         edit.apply(scratch, &state.lists[idx]);
         list_score(per, idx, scratch)
     } else {
+        per.metrics.record_incremental_trial();
         let list = &state.lists[idx];
         let base = &state.scores[idx];
         let mut objectives = base.objectives;
         for (t, slot) in objectives.iter_mut().enumerate() {
             for (r, kind) in per.objective[idx][t].iter().zip(&per.objective_delta[idx][t]) {
-                *slot = slot.saturating_add(reduction_delta(r, *kind, list, &edit));
+                let delta = per.metrics.measure_delta(r, || reduction_delta(r, *kind, list, &edit));
+                *slot = slot.saturating_add(delta);
             }
         }
         let mut violation = base.violation;
         for (ci, (c, kind)) in per.constraints[idx].iter().zip(&per.constraint_delta[idx]).enumerate() {
             let old = state.con_vals[idx][ci].expect("supported constraint reduction is always defined");
-            let new = old.saturating_add(reduction_delta(&c.reduction, *kind, list, &edit));
+            let delta = per.metrics.measure_delta(&c.reduction, || reduction_delta(&c.reduction, *kind, list, &edit));
+            let new = old.saturating_add(delta);
             violation = violation.saturating_sub(violation_of(old, c.op, c.rhs)).saturating_add(violation_of(new, c.op, c.rhs));
         }
         ListScore { violation, objectives }
@@ -720,7 +726,9 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                             continue;
                         }
                         build_two_opt_star(&mut a, &mut b, &state.lists[src], cut_x, &state.lists[y], cut_y);
+                        per.metrics.record_full_trial();
                         let na = list_score(per, src, &a);
+                        per.metrics.record_full_trial();
                         let nb = list_score(per, y, &b);
                         overrides.clear();
                         overrides.extend(state.lists[src][cut_x..].iter().map(|&item| (item, y)));
@@ -765,7 +773,9 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                                     (&state.lists[src], start_x, len_x),
                                     (&state.lists[y], start_y, len_y),
                                 );
+                                per.metrics.record_full_trial();
                                 let na = list_score(per, src, &a);
+                                per.metrics.record_full_trial();
                                 let nb = list_score(per, y, &b);
                                 overrides.clear();
                                 overrides.extend(state.lists[src][start_x..start_x + len_x].iter().map(|&item| (item, y)));

@@ -11,7 +11,7 @@
 //!
 //! Current scope: linear PBS/PBO without certificates. Non-linear (product)
 //! terms and objectives whose value range exceeds `i32` are reported
-//! `s UNSUPPORTED`. See PB.md for the roadmap.
+//! `s UNSUPPORTED`. 
 
 mod opb;
 
