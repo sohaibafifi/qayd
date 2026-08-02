@@ -1,8 +1,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::eval::{eval_expr, violation_of};
+use super::eval::{eval_expr, violation_of, INFEASIBLE};
+use super::incremental::{EvalScratch, ListView};
 use super::local_search::{
-    compute_con_vals, full_score, list_score, score_with_replacements, ListScore, PerList, ReductionDeltaKind, Score, State, TrialList,
+    full_score, full_score_exact_lists, list_score_exact, score_with_replacements, ListScore, PerList, ReductionDeltaKind, Score, State,
+    TrialList,
 };
 use crate::mix64;
 use crate::model::list::{CollectionModel, Iterable, Reduction};
@@ -35,15 +37,30 @@ pub(super) enum Move {
 }
 
 /// Score of the state if one list were replaced by candidate contents.
-fn score_one(per: &PerList, state: &State, list: usize, score: ListScore, contents: &[i32], global_delta: i64) -> Score {
+fn score_one(
+    per: &PerList,
+    state: &State,
+    list: usize,
+    score: ListScore,
+    contents: &dyn ListView,
+    global_delta: i64,
+    scratch: &mut EvalScratch,
+) -> Score {
     per.metrics.record_candidate();
-    score_with_replacements(per, state, &[TrialList { list, score, contents }], global_delta)
+    score_with_replacements(per, state, &[TrialList { list, score, contents }], global_delta, scratch)
 }
 
 /// Score of the state if two lists were replaced by candidate contents.
-fn score_two<'a>(per: &PerList, state: &'a State, left: TrialList<'a>, right: TrialList<'a>, global_delta: i64) -> Score {
+fn score_two<'a>(
+    per: &PerList,
+    state: &'a State,
+    left: TrialList<'a>,
+    right: TrialList<'a>,
+    global_delta: i64,
+    scratch: &mut EvalScratch,
+) -> Score {
     per.metrics.record_candidate();
-    score_with_replacements(per, state, &[left, right], global_delta)
+    score_with_replacements(per, state, &[left, right], global_delta, scratch)
 }
 
 /// Copy `list` into `buf` (reusing its capacity) with one edit applied.
@@ -127,7 +144,7 @@ fn segment_items(list: &[i32], start: usize, len: usize) -> [i32; MAX_OR_OPT] {
 /// reductions' delta in O(edit) and (b) materialise the edited list for the
 /// full-recompute fallback. Positions match the `build_*` helpers exactly.
 #[derive(Clone, Copy, Debug)]
-enum Edit {
+pub(super) enum Edit {
     Remove { pos: usize },
     Insert { pos: usize, item: i32 },
     MoveWithin { from: usize, to: usize },
@@ -162,6 +179,169 @@ impl Edit {
             Edit::SegmentInsert { pos, items, len } => build_segment_inserted(buf, list, pos, &items[..len]),
             Edit::SegmentMoveWithin { start, len, to } => build_segment_moved_within(buf, list, start, len, to),
         }
+    }
+}
+
+struct EditView<'a> {
+    base: &'a [i32],
+    edit: Edit,
+}
+
+impl<'a> EditView<'a> {
+    fn new(base: &'a [i32], edit: Edit) -> Self {
+        Self { base, edit }
+    }
+}
+
+impl ListView for EditView<'_> {
+    fn len(&self) -> usize {
+        self.edit.new_len(self.base.len())
+    }
+
+    fn at(&self, index: usize) -> i32 {
+        match self.edit {
+            Edit::Remove { pos } => self.base[if index < pos { index } else { index + 1 }],
+            Edit::Insert { pos, item } => {
+                let pos = pos.min(self.base.len());
+                if index < pos {
+                    self.base[index]
+                } else if index == pos {
+                    item
+                } else {
+                    self.base[index - 1]
+                }
+            }
+            Edit::MoveWithin { from, to } => {
+                let to = to.min(self.base.len() - 1);
+                if from < to {
+                    if index < from || index > to {
+                        self.base[index]
+                    } else if index == to {
+                        self.base[from]
+                    } else {
+                        self.base[index + 1]
+                    }
+                } else if from > to {
+                    if index < to || index > from {
+                        self.base[index]
+                    } else if index == to {
+                        self.base[from]
+                    } else {
+                        self.base[index - 1]
+                    }
+                } else {
+                    self.base[index]
+                }
+            }
+            Edit::Replace { pos, item } => {
+                if index == pos {
+                    item
+                } else {
+                    self.base[index]
+                }
+            }
+            Edit::Reverse { i, j } => {
+                if (i..=j).contains(&index) {
+                    self.base[j - (index - i)]
+                } else {
+                    self.base[index]
+                }
+            }
+            Edit::SegmentRemove { start, len } => self.base[if index < start { index } else { index + len }],
+            Edit::SegmentInsert { pos, items, len } => {
+                let pos = pos.min(self.base.len());
+                if index < pos {
+                    self.base[index]
+                } else if index < pos + len {
+                    items[index - pos]
+                } else {
+                    self.base[index - len]
+                }
+            }
+            Edit::SegmentMoveWithin { start, len, to } => {
+                let post_len = self.base.len() - len;
+                let to = to.min(post_len);
+                if (to..to + len).contains(&index) {
+                    self.base[start + index - to]
+                } else {
+                    let removed_index = if index < to { index } else { index - len };
+                    self.base[if removed_index < start { removed_index } else { removed_index + len }]
+                }
+            }
+        }
+    }
+
+    fn common_prefix_len(&self, _old: &[i32]) -> usize {
+        match self.edit {
+            Edit::Remove { pos } | Edit::Insert { pos, .. } | Edit::Replace { pos, .. } => pos,
+            Edit::MoveWithin { from, to } => from.min(to),
+            Edit::Reverse { i, .. } => i,
+            Edit::SegmentRemove { start, .. } => start,
+            Edit::SegmentInsert { pos, .. } => pos,
+            Edit::SegmentMoveWithin { start, to, .. } => start.min(to),
+        }
+    }
+
+    fn common_suffix_len(&self, _old: &[i32], _prefix: usize) -> usize {
+        let old_len = self.base.len();
+        match self.edit {
+            Edit::Remove { pos } => old_len - pos - 1,
+            Edit::Insert { pos, .. } => old_len - pos.min(old_len),
+            Edit::MoveWithin { from, to } => old_len - from.max(to) - 1,
+            Edit::Replace { pos, .. } => old_len - pos - 1,
+            Edit::Reverse { j, .. } => old_len - j - 1,
+            Edit::SegmentRemove { start, len } => old_len - start - len,
+            Edit::SegmentInsert { pos, .. } => old_len - pos.min(old_len),
+            Edit::SegmentMoveWithin { start, len, to } => old_len - (start + len).max(to + len),
+        }
+    }
+}
+
+struct ChunkView<'a> {
+    chunks: [&'a [i32]; 3],
+    count: usize,
+    len: usize,
+    common_prefix: usize,
+    common_suffix: usize,
+}
+
+impl<'a> ChunkView<'a> {
+    fn two(first: &'a [i32], second: &'a [i32]) -> Self {
+        Self { chunks: [first, second, &[]], count: 2, len: first.len() + second.len(), common_prefix: first.len(), common_suffix: 0 }
+    }
+
+    fn three(first: &'a [i32], second: &'a [i32], third: &'a [i32]) -> Self {
+        Self {
+            chunks: [first, second, third],
+            count: 3,
+            len: first.len() + second.len() + third.len(),
+            common_prefix: first.len(),
+            common_suffix: third.len(),
+        }
+    }
+}
+
+impl ListView for ChunkView<'_> {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn at(&self, mut index: usize) -> i32 {
+        for chunk in &self.chunks[..self.count] {
+            if index < chunk.len() {
+                return chunk[index];
+            }
+            index -= chunk.len();
+        }
+        unreachable!("candidate chunk index out of range")
+    }
+
+    fn common_prefix_len(&self, _old: &[i32]) -> usize {
+        self.common_prefix
+    }
+
+    fn common_suffix_len(&self, _old: &[i32], _prefix: usize) -> usize {
+        self.common_suffix
     }
 }
 
@@ -220,140 +400,9 @@ fn items_value_delta(list: &[i32], edit: &Edit, value: impl Fn(i32) -> i64) -> i
     }
 }
 
-/// Delta of a closed-tour edge-sum reduction (`Edges { start, end }`) under
-/// `edit`, where `edge(from, to)` is the body contribution of one edge. The tour
-/// is `[start, list.., end]`; only edges local to the edit are touched.
-fn edges_value_delta(list: &[i32], start: i32, end: i32, edit: &Edit, symmetric: bool, edge: impl Fn(i32, i32) -> i64) -> i64 {
-    let n = list.len();
-    // The i-th tour node: 0 -> start, n+1 -> end, else list[i-1].
-    let node = |i: usize| -> i32 {
-        if i == 0 {
-            start
-        } else if i == n + 1 {
-            end
-        } else {
-            list[i - 1]
-        }
-    };
-    match *edit {
-        Edit::Remove { pos } => {
-            let t = pos + 1;
-            edge(node(t - 1), node(t + 1)).saturating_sub(edge(node(t - 1), node(t))).saturating_sub(edge(node(t), node(t + 1)))
-        }
-        Edit::Insert { pos, item } => {
-            let (a, b) = (node(pos), node(pos + 1));
-            edge(a, item).saturating_add(edge(item, b)).saturating_sub(edge(a, b))
-        }
-        Edit::Replace { pos, item } => {
-            let t = pos + 1;
-            let (l, r, old) = (node(t - 1), node(t + 1), node(t));
-            edge(l, item).saturating_add(edge(item, r)).saturating_sub(edge(l, old)).saturating_sub(edge(old, r))
-        }
-        Edit::Reverse { i, j } => {
-            let before = node(i);
-            let after = node(j + 2);
-            if symmetric {
-                return edge(before, list[j])
-                    .saturating_add(edge(list[i], after))
-                    .saturating_sub(edge(before, list[i]))
-                    .saturating_sub(edge(list[j], after));
-            }
-            let mut old = 0i64;
-            for t in i..=j + 1 {
-                old = old.saturating_add(edge(node(t), node(t + 1)));
-            }
-            // New node order across positions i..=j+2: before, list[j..=i], after.
-            let mut new = edge(before, list[j]);
-            for t in (i + 1..=j).rev() {
-                new = new.saturating_add(edge(list[t], list[t - 1]));
-            }
-            new = new.saturating_add(edge(list[i], after));
-            new.saturating_sub(old)
-        }
-        Edit::MoveWithin { from, to } => {
-            let item = list[from];
-            // Removal delta on the original tour.
-            let t = from + 1;
-            let rem = edge(node(t - 1), node(t + 1)).saturating_sub(edge(node(t - 1), node(t))).saturating_sub(edge(node(t), node(t + 1)));
-            // Insertion delta into the post-removal tour L_rm (length n-1).
-            let m = n - 1;
-            let to2 = to.min(m);
-            let lrm = |i: usize| -> i32 { list[if i < from { i } else { i + 1 }] };
-            let node_rm = |i: usize| -> i32 {
-                if i == 0 {
-                    start
-                } else if i == m + 1 {
-                    end
-                } else {
-                    lrm(i - 1)
-                }
-            };
-            let (a, b) = (node_rm(to2), node_rm(to2 + 1));
-            let ins = edge(a, item).saturating_add(edge(item, b)).saturating_sub(edge(a, b));
-            rem.saturating_add(ins)
-        }
-        Edit::SegmentRemove { start: segment_start, len } => {
-            let first = segment_start + 1;
-            let last = segment_start + len;
-            edge(node(first - 1), node(last + 1)).saturating_sub(segment_path_cost(
-                node(first - 1),
-                node(last + 1),
-                &list[segment_start..segment_start + len],
-                &edge,
-            ))
-        }
-        Edit::SegmentInsert { pos, items, len } => {
-            let (a, b) = (node(pos), node(pos + 1));
-            segment_insert_delta(a, b, &items[..len], &edge)
-        }
-        Edit::SegmentMoveWithin { start: segment_start, len, to } => {
-            let first = segment_start + 1;
-            let last = segment_start + len;
-            let rem = edge(node(first - 1), node(last + 1)).saturating_sub(segment_path_cost(
-                node(first - 1),
-                node(last + 1),
-                &list[segment_start..segment_start + len],
-                &edge,
-            ));
-
-            let m = n - len;
-            let to2 = to.min(m);
-            let lrm = |i: usize| -> i32 { list[if i < segment_start { i } else { i + len }] };
-            let node_rm = |i: usize| -> i32 {
-                if i == 0 {
-                    start
-                } else if i == m + 1 {
-                    end
-                } else {
-                    lrm(i - 1)
-                }
-            };
-            let (a, b) = (node_rm(to2), node_rm(to2 + 1));
-            rem.saturating_add(segment_insert_delta(a, b, &list[segment_start..segment_start + len], &edge))
-        }
-    }
-}
-
-fn segment_insert_delta(a: i32, b: i32, items: &[i32], edge: &impl Fn(i32, i32) -> i64) -> i64 {
-    segment_path_cost(a, b, items, edge).saturating_sub(edge(a, b))
-}
-
-fn segment_path_cost(a: i32, b: i32, items: &[i32], edge: &impl Fn(i32, i32) -> i64) -> i64 {
-    if items.is_empty() {
-        return 0;
-    }
-    let mut added = edge(a, items[0]);
-    for pair in items.windows(2) {
-        added = added.saturating_add(edge(pair[0], pair[1]));
-    }
-    added = added.saturating_add(edge(*items.last().unwrap_or(&items[0]), b));
-    added
-}
-
 /// Delta of one supported reduction's raw value under `edit`.
 fn reduction_delta(r: &Reduction, kind: ReductionDeltaKind, list: &[i32], edit: &Edit) -> i64 {
-    let delta = match kind {
-        ReductionDeltaKind::ItemsSum => items_value_delta(list, edit, |item| eval_expr(&r.arena.exprs, r.body, &[i64::from(item)])),
+    match kind {
         ReductionDeltaKind::ItemsCount => {
             items_value_delta(list, edit, |item| i64::from(eval_expr(&r.arena.exprs, r.body, &[i64::from(item)]) != 0))
         }
@@ -361,72 +410,89 @@ fn reduction_delta(r: &Reduction, kind: ReductionDeltaKind, list: &[i32], edit: 
             let old = list.len();
             i64::from(edit.new_len(old) > 0) - i64::from(old > 0)
         }
-        ReductionDeltaKind::Edges { symmetric } => match &r.iterable {
-            Iterable::Edges { start, end, .. } => edges_value_delta(list, *start, *end, edit, symmetric, |from, to| {
-                eval_expr(&r.arena.exprs, r.body, &[i64::from(from), i64::from(to)])
-            }),
-            _ => unreachable!("edge delta kind on a non-edge reduction"),
-        },
         ReductionDeltaKind::Unsupported => unreachable!("reduction_delta on an unsupported reduction"),
-    };
-    delta.saturating_mul(r.coeff)
+    }
 }
 
-/// Trial score of list `idx` after `edit`, computed incrementally from the cached
-/// base score and constraint values when the list is fully incremental, else by
-/// materialising the edited list and rescoring it in full.
-fn trial_list_score(per: &PerList, state: &State, idx: usize, edit: Edit, scratch: &mut Vec<i32>) -> ListScore {
-    if per.has_max_objective() || !per.list_incremental[idx] {
-        per.metrics.record_full_trial();
-        edit.apply(scratch, &state.lists[idx]);
-        list_score(per, idx, scratch)
-    } else {
-        per.metrics.record_incremental_trial();
-        let list = &state.lists[idx];
-        let base = &state.scores[idx];
-        let mut objectives = base.objectives;
-        for (t, slot) in objectives.iter_mut().enumerate() {
-            for (r, kind) in per.objective[idx][t].iter().zip(&per.objective_delta[idx][t]) {
-                let delta = per.metrics.measure_delta(r, || reduction_delta(r, *kind, list, &edit));
-                *slot = slot.saturating_add(delta);
+#[allow(clippy::too_many_arguments)]
+fn candidate_reduction_value(
+    per: &PerList,
+    reduction: &Reduction,
+    kind: ReductionDeltaKind,
+    cache: &super::incremental::ReductionCache,
+    old: &[i32],
+    candidate: &dyn ListView,
+    edit: Option<&Edit>,
+    scratch: &mut EvalScratch,
+) -> Option<i64> {
+    // Count and Used are the only algebraic deltas that remain exact across
+    // every i64 saturation boundary. Sum reductions use the ordered prefix and
+    // suffix transforms in ReductionCache instead: adding a delta to an already
+    // saturated total is not equivalent to replaying saturating_add.
+    let exact_raw_delta = matches!(kind, ReductionDeltaKind::ItemsCount | ReductionDeltaKind::Used);
+    let value = match (exact_raw_delta, edit) {
+        (true, Some(edit)) => per.metrics.measure_delta(reduction, || {
+            cache.raw_value().map(|raw| raw.saturating_add(reduction_delta(reduction, kind, old, edit)).saturating_mul(reduction.coeff))
+        }),
+        _ => per.metrics.measure_delta(reduction, || cache.candidate_value(reduction, old, candidate, scratch)),
+    };
+    if matches!(reduction.iterable, Iterable::Scan { .. }) {
+        per.metrics.record_incremental_scan(scratch.recomputed_scan_steps());
+    }
+    value
+}
+
+/// Trial score from accepted-state reduction caches. Local edits retain the
+/// existing O(edit) formulas for Count/Used; every other reduction recomputes
+/// only its affected output span through `candidate`.
+pub(super) fn trial_list_score_view(
+    per: &PerList,
+    state: &State,
+    idx: usize,
+    candidate: &dyn ListView,
+    edit: Option<&Edit>,
+    scratch: &mut EvalScratch,
+) -> ListScore {
+    per.metrics.record_incremental_trial();
+    let old = &state.lists[idx];
+    let caches = &state.caches[idx];
+    let mut violation = 0i64;
+    let mut objectives = [0i64; crate::model::list::MAX_TIERS];
+    for (tier, slot) in objectives.iter_mut().enumerate() {
+        for ((reduction, kind), cache) in per.objective[idx][tier].iter().zip(&per.objective_delta[idx][tier]).zip(&caches.objective[tier])
+        {
+            match candidate_reduction_value(per, reduction, *kind, cache, old, candidate, edit, scratch) {
+                Some(value) => *slot = slot.saturating_add(value),
+                None => violation = violation.saturating_add(INFEASIBLE),
             }
         }
-        let mut violation = base.violation;
-        for (ci, (c, kind)) in per.constraints[idx].iter().zip(&per.constraint_delta[idx]).enumerate() {
-            let old = state.con_vals[idx][ci].expect("supported constraint reduction is always defined");
-            let delta = per.metrics.measure_delta(&c.reduction, || reduction_delta(&c.reduction, *kind, list, &edit));
-            let new = old.saturating_add(delta);
-            violation = violation.saturating_sub(violation_of(old, c.op, c.rhs)).saturating_add(violation_of(new, c.op, c.rhs));
-        }
-        ListScore { violation, objectives }
     }
+    for ((constraint, kind), cache) in per.constraints[idx].iter().zip(&per.constraint_delta[idx]).zip(&caches.constraints) {
+        match candidate_reduction_value(per, &constraint.reduction, *kind, cache, old, candidate, edit, scratch) {
+            Some(value) => violation = violation.saturating_add(violation_of(value, constraint.op, constraint.rhs)),
+            None => violation = violation.saturating_add(INFEASIBLE),
+        }
+    }
+    ListScore { violation, objectives }
+}
+
+fn trial_list_score(per: &PerList, state: &State, idx: usize, edit: Edit, scratch: &mut EvalScratch) -> ListScore {
+    let candidate = EditView::new(&state.lists[idx], edit);
+    trial_list_score_view(per, state, idx, &candidate, Some(&edit), scratch)
 }
 
 /// Test oracle: for `model` with the given list contents, assert the incremental
 /// trial score of every single-list edit equals a full recompute of the edited
-/// list. Panics on the first mismatch; returns the number of edits checked. The
-/// `model` must use only incremental-supported reductions (so the delta paths,
-/// not the fallback, are exercised). Exposed for the integration oracle, which
-/// keeps the actual test out of `src/`.
+/// list. Panics on the first mismatch; returns the number of edits checked.
+/// Exposed for the integration oracle, which keeps the actual test out of `src/`.
 #[doc(hidden)]
 pub fn audit_incremental(model: &CollectionModel, lists: &[Vec<i32>]) -> usize {
     let per = PerList::build(model);
-    let k = lists.len();
-    assert!((0..k).all(|i| per.list_incremental[i]), "audit model must be fully incremental");
-    let scores: Vec<ListScore> = (0..k).map(|i| list_score(&per, i, &lists[i])).collect();
-    let con_vals: Vec<Vec<Option<i64>>> = (0..k).map(|i| compute_con_vals(&per, i, &lists[i])).collect();
-    let mut item_list = vec![0usize; model.items.len()];
-    for (l, lst) in lists.iter().enumerate() {
-        for &v in lst {
-            if let Some(&i) = per.globals.value_to_idx.get(&v) {
-                item_list[i] = l;
-            }
-        }
-    }
-    let global_viol = per.globals.total(&item_list);
-    let state = State { lists: lists.to_vec(), scores, con_vals, item_list, global_viol };
+    let state = State::from_lists(model, &per, lists.to_vec());
 
-    let mut scratch = Vec::new();
+    let mut scratch = EvalScratch::default();
+    let mut right_scratch = EvalScratch::default();
+    let mut score_scratch = EvalScratch::default();
     let mut full_buf = Vec::new();
     let mut checked = 0usize;
     let same = |a: &ListScore, b: &ListScore| a.violation == b.violation && a.objectives == b.objectives;
@@ -471,9 +537,12 @@ pub fn audit_incremental(model: &CollectionModel, lists: &[Vec<i32>]) -> usize {
             }
         }
         for edit in edits {
+            let view = EditView::new(list, edit);
             let inc = trial_list_score(&per, &state, idx, edit, &mut scratch);
+            let incremental_total =
+                score_with_replacements(&per, &state, &[TrialList { list: idx, score: inc, contents: &view }], 0, &mut score_scratch);
             edit.apply(&mut full_buf, list);
-            let full = list_score(&per, idx, &full_buf);
+            let full = list_score_exact(&per, idx, &full_buf);
             assert!(
                 same(&inc, &full),
                 "incremental != full for list {idx} edit {edit:?}: inc=({},{:?}) full=({},{:?})",
@@ -482,7 +551,98 @@ pub fn audit_incremental(model: &CollectionModel, lists: &[Vec<i32>]) -> usize {
                 full.violation,
                 full.objectives
             );
+            let mut full_lists = lists.to_vec();
+            full_lists[idx] = full_buf.clone();
+            let full_total = full_score_exact_lists(&per, &full_lists, state.global_viol);
+            assert!(
+                incremental_total == full_total,
+                "incremental total != full total for list {idx} edit {edit:?}: inc=({},{:?}) full=({},{:?})",
+                incremental_total.violation,
+                incremental_total.tiers,
+                full_total.violation,
+                full_total.tiers
+            );
             checked += 1;
+        }
+    }
+
+    for left in 0..lists.len() {
+        for right in (left + 1)..lists.len() {
+            for cut_left in 0..=lists[left].len() {
+                for cut_right in 0..=lists[right].len() {
+                    if cut_left == lists[left].len() && cut_right == lists[right].len() {
+                        continue;
+                    }
+                    let left_view = ChunkView::two(&lists[left][..cut_left], &lists[right][cut_right..]);
+                    let right_view = ChunkView::two(&lists[right][..cut_right], &lists[left][cut_left..]);
+                    let left_score = trial_list_score_view(&per, &state, left, &left_view, None, &mut scratch);
+                    let right_score = trial_list_score_view(&per, &state, right, &right_view, None, &mut right_scratch);
+                    let incremental_total = score_with_replacements(
+                        &per,
+                        &state,
+                        &[
+                            TrialList { list: left, score: left_score, contents: &left_view },
+                            TrialList { list: right, score: right_score, contents: &right_view },
+                        ],
+                        0,
+                        &mut score_scratch,
+                    );
+                    let mut materialized_left = Vec::new();
+                    let mut materialized_right = Vec::new();
+                    build_two_opt_star(&mut materialized_left, &mut materialized_right, &lists[left], cut_left, &lists[right], cut_right);
+                    let mut full_lists = lists.to_vec();
+                    full_lists[left] = materialized_left;
+                    full_lists[right] = materialized_right;
+                    let full_total = full_score_exact_lists(&per, &full_lists, state.global_viol);
+                    assert!(incremental_total == full_total, "2-opt* incremental total differs from full recomputation");
+                    checked += 1;
+                }
+            }
+
+            for len_left in 1..=MAX_OR_OPT.min(lists[left].len()) {
+                for start_left in 0..=lists[left].len() - len_left {
+                    for len_right in 1..=MAX_OR_OPT.min(lists[right].len()) {
+                        for start_right in 0..=lists[right].len() - len_right {
+                            let left_view = ChunkView::three(
+                                &lists[left][..start_left],
+                                &lists[right][start_right..start_right + len_right],
+                                &lists[left][start_left + len_left..],
+                            );
+                            let right_view = ChunkView::three(
+                                &lists[right][..start_right],
+                                &lists[left][start_left..start_left + len_left],
+                                &lists[right][start_right + len_right..],
+                            );
+                            let left_score = trial_list_score_view(&per, &state, left, &left_view, None, &mut scratch);
+                            let right_score = trial_list_score_view(&per, &state, right, &right_view, None, &mut right_scratch);
+                            let incremental_total = score_with_replacements(
+                                &per,
+                                &state,
+                                &[
+                                    TrialList { list: left, score: left_score, contents: &left_view },
+                                    TrialList { list: right, score: right_score, contents: &right_view },
+                                ],
+                                0,
+                                &mut score_scratch,
+                            );
+                            let mut materialized_left = Vec::new();
+                            let mut materialized_right = Vec::new();
+                            build_cross_exchange(
+                                &mut materialized_left,
+                                &mut materialized_right,
+                                (&lists[left], start_left, len_left),
+                                (&lists[right], start_right, len_right),
+                            );
+                            let mut full_lists = lists.to_vec();
+                            full_lists[left] = materialized_left;
+                            full_lists[right] = materialized_right;
+                            let full_total = full_score_exact_lists(&per, &full_lists, state.global_viol);
+                            assert!(incremental_total == full_total, "cross-exchange incremental total differs from full recomputation");
+                            checked += 1;
+                        }
+                    }
+                }
+            }
         }
     }
     checked
@@ -565,8 +725,9 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
     let use_candidates = per.has_edges && current.violation == 0 && per.candidates.is_some();
     let cand_cost = if per.infeas_cand { per.has_edges && per.candidates.is_some() } else { use_candidates };
     let k = state.lists.len();
-    let mut a = Vec::new();
-    let mut b = Vec::new();
+    let mut scratch_a = EvalScratch::default();
+    let mut scratch_b = EvalScratch::default();
+    let mut score_scratch = EvalScratch::default();
     let mut overrides = Vec::new();
     let mut polled = 0u32;
     let mut stopped = || {
@@ -597,14 +758,18 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                         if stopped() {
                             return None;
                         }
-                        let nl = trial_list_score(per, state, src, Edit::MoveWithin { from: src_pos, to: dst_pos }, &mut a);
+                        let edit = Edit::MoveWithin { from: src_pos, to: dst_pos };
+                        let nl = trial_list_score(per, state, src, edit, &mut scratch_a);
+                        let view = EditView::new(&state.lists[src], edit);
                         // Within-list move: no item changes list, so gdelta = 0.
-                        if score_one(per, state, src, nl, &a, 0) < current {
+                        if score_one(per, state, src, nl, &view, 0, &mut score_scratch) < current {
                             return Some(Move::Relocate { src, src_pos, dst, dst_pos });
                         }
                     }
                 } else {
-                    let na = trial_list_score(per, state, src, Edit::Remove { pos: src_pos }, &mut a);
+                    let source_edit = Edit::Remove { pos: src_pos };
+                    let na = trial_list_score(per, state, src, source_edit, &mut scratch_a);
+                    let source_view = EditView::new(&state.lists[src], source_edit);
                     let gd = per.globals.delta(&state.item_list, &[(item, dst)]);
                     for dst_pos in 0..=state.lists[dst].len() {
                         if stopped() {
@@ -613,13 +778,16 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                         if use_candidates && !candidate_segment_insert(per, state, dst, dst_pos, item, item) {
                             continue;
                         }
-                        let nb = trial_list_score(per, state, dst, Edit::Insert { pos: dst_pos, item }, &mut b);
+                        let destination_edit = Edit::Insert { pos: dst_pos, item };
+                        let nb = trial_list_score(per, state, dst, destination_edit, &mut scratch_b);
+                        let destination_view = EditView::new(&state.lists[dst], destination_edit);
                         if score_two(
                             per,
                             state,
-                            TrialList { list: src, score: na, contents: &a },
-                            TrialList { list: dst, score: nb, contents: &b },
+                            TrialList { list: src, score: na, contents: &source_view },
+                            TrialList { list: dst, score: nb, contents: &destination_view },
                             gd,
+                            &mut score_scratch,
                         ) < current
                         {
                             return Some(Move::Relocate { src, src_pos, dst, dst_pos });
@@ -639,15 +807,20 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                         return None;
                     }
                     let (vx, vy) = (state.lists[src][xp], state.lists[y][yp]);
-                    let na = trial_list_score(per, state, src, Edit::Replace { pos: xp, item: vy }, &mut a);
-                    let nb = trial_list_score(per, state, y, Edit::Replace { pos: yp, item: vx }, &mut b);
+                    let left_edit = Edit::Replace { pos: xp, item: vy };
+                    let right_edit = Edit::Replace { pos: yp, item: vx };
+                    let na = trial_list_score(per, state, src, left_edit, &mut scratch_a);
+                    let nb = trial_list_score(per, state, y, right_edit, &mut scratch_b);
+                    let left_view = EditView::new(&state.lists[src], left_edit);
+                    let right_view = EditView::new(&state.lists[y], right_edit);
                     let gd = per.globals.delta(&state.item_list, &[(vx, y), (vy, src)]);
                     if score_two(
                         per,
                         state,
-                        TrialList { list: src, score: na, contents: &a },
-                        TrialList { list: y, score: nb, contents: &b },
+                        TrialList { list: src, score: na, contents: &left_view },
+                        TrialList { list: y, score: nb, contents: &right_view },
                         gd,
+                        &mut score_scratch,
                     ) < current
                     {
                         return Some(Move::Swap { a: src, a_pos: xp, b: y, b_pos: yp });
@@ -672,13 +845,17 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                                 if stopped() {
                                     return None;
                                 }
-                                let nl = trial_list_score(per, state, src, Edit::SegmentMoveWithin { start, len, to: dst_pos }, &mut a);
-                                if score_one(per, state, src, nl, &a, 0) < current {
+                                let edit = Edit::SegmentMoveWithin { start, len, to: dst_pos };
+                                let nl = trial_list_score(per, state, src, edit, &mut scratch_a);
+                                let view = EditView::new(&state.lists[src], edit);
+                                if score_one(per, state, src, nl, &view, 0, &mut score_scratch) < current {
                                     return Some(Move::OrOpt { src, start, len, dst, dst_pos });
                                 }
                             }
                         } else {
-                            let na = trial_list_score(per, state, src, Edit::SegmentRemove { start, len }, &mut a);
+                            let source_edit = Edit::SegmentRemove { start, len };
+                            let na = trial_list_score(per, state, src, source_edit, &mut scratch_a);
+                            let source_view = EditView::new(&state.lists[src], source_edit);
                             let mut overrides = [(0, 0); MAX_OR_OPT];
                             for slot in 0..len {
                                 overrides[slot] = (items[slot], dst);
@@ -691,13 +868,16 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                                 if use_candidates && !candidate_segment_insert(per, state, dst, dst_pos, items[0], items[len - 1]) {
                                     continue;
                                 }
-                                let nb = trial_list_score(per, state, dst, Edit::SegmentInsert { pos: dst_pos, items, len }, &mut b);
+                                let destination_edit = Edit::SegmentInsert { pos: dst_pos, items, len };
+                                let nb = trial_list_score(per, state, dst, destination_edit, &mut scratch_b);
+                                let destination_view = EditView::new(&state.lists[dst], destination_edit);
                                 if score_two(
                                     per,
                                     state,
-                                    TrialList { list: src, score: na, contents: &a },
-                                    TrialList { list: dst, score: nb, contents: &b },
+                                    TrialList { list: src, score: na, contents: &source_view },
+                                    TrialList { list: dst, score: nb, contents: &destination_view },
                                     gd,
+                                    &mut score_scratch,
                                 ) < current
                                 {
                                     return Some(Move::OrOpt { src, start, len, dst, dst_pos });
@@ -725,11 +905,10 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                         if cand_cost && !candidate_two_opt_star(per, state, src, cut_x, y, cut_y) {
                             continue;
                         }
-                        build_two_opt_star(&mut a, &mut b, &state.lists[src], cut_x, &state.lists[y], cut_y);
-                        per.metrics.record_full_trial();
-                        let na = list_score(per, src, &a);
-                        per.metrics.record_full_trial();
-                        let nb = list_score(per, y, &b);
+                        let left_view = ChunkView::two(&state.lists[src][..cut_x], &state.lists[y][cut_y..]);
+                        let right_view = ChunkView::two(&state.lists[y][..cut_y], &state.lists[src][cut_x..]);
+                        let na = trial_list_score_view(per, state, src, &left_view, None, &mut scratch_a);
+                        let nb = trial_list_score_view(per, state, y, &right_view, None, &mut scratch_b);
                         overrides.clear();
                         overrides.extend(state.lists[src][cut_x..].iter().map(|&item| (item, y)));
                         overrides.extend(state.lists[y][cut_y..].iter().map(|&item| (item, src)));
@@ -737,9 +916,10 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                         if score_two(
                             per,
                             state,
-                            TrialList { list: src, score: na, contents: &a },
-                            TrialList { list: y, score: nb, contents: &b },
+                            TrialList { list: src, score: na, contents: &left_view },
+                            TrialList { list: y, score: nb, contents: &right_view },
                             gd,
+                            &mut score_scratch,
                         ) < current
                         {
                             return Some(Move::TwoOptStar { a: src, cut_a: cut_x, b: y, cut_b: cut_y });
@@ -767,16 +947,18 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                                 if cand_cost && !candidate_cross_exchange(per, state, (src, start_x, len_x), (y, start_y, len_y)) {
                                     continue;
                                 }
-                                build_cross_exchange(
-                                    &mut a,
-                                    &mut b,
-                                    (&state.lists[src], start_x, len_x),
-                                    (&state.lists[y], start_y, len_y),
+                                let left_view = ChunkView::three(
+                                    &state.lists[src][..start_x],
+                                    &state.lists[y][start_y..start_y + len_y],
+                                    &state.lists[src][start_x + len_x..],
                                 );
-                                per.metrics.record_full_trial();
-                                let na = list_score(per, src, &a);
-                                per.metrics.record_full_trial();
-                                let nb = list_score(per, y, &b);
+                                let right_view = ChunkView::three(
+                                    &state.lists[y][..start_y],
+                                    &state.lists[src][start_x..start_x + len_x],
+                                    &state.lists[y][start_y + len_y..],
+                                );
+                                let na = trial_list_score_view(per, state, src, &left_view, None, &mut scratch_a);
+                                let nb = trial_list_score_view(per, state, y, &right_view, None, &mut scratch_b);
                                 overrides.clear();
                                 overrides.extend(state.lists[src][start_x..start_x + len_x].iter().map(|&item| (item, y)));
                                 overrides.extend(state.lists[y][start_y..start_y + len_y].iter().map(|&item| (item, src)));
@@ -784,9 +966,10 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                                 if score_two(
                                     per,
                                     state,
-                                    TrialList { list: src, score: na, contents: &a },
-                                    TrialList { list: y, score: nb, contents: &b },
+                                    TrialList { list: src, score: na, contents: &left_view },
+                                    TrialList { list: y, score: nb, contents: &right_view },
                                     gd,
+                                    &mut score_scratch,
                                 ) < current
                                 {
                                     return Some(Move::CrossExchange {
@@ -818,8 +1001,10 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                             continue;
                         }
                     }
-                    let nl = trial_list_score(per, state, src, Edit::Reverse { i, j }, &mut a);
-                    if score_one(per, state, src, nl, &a, 0) < current {
+                    let edit = Edit::Reverse { i, j };
+                    let nl = trial_list_score(per, state, src, edit, &mut scratch_a);
+                    let view = EditView::new(&state.lists[src], edit);
+                    if score_one(per, state, src, nl, &view, 0, &mut score_scratch) < current {
                         return Some(Move::Reverse { list: src, i, j });
                     }
                 }

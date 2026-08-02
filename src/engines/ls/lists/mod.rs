@@ -4,6 +4,7 @@
 //! `model` / `collection`; this layer only searches an already-defined model.
 
 mod eval;
+mod incremental;
 mod local_search;
 mod metrics;
 mod moves;

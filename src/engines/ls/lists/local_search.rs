@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::eval::{eval_reduction, violation_of, INFEASIBLE};
+use super::incremental::{EvalScratch, InsertView, ListView, ReductionCache};
 use super::metrics::{metrics_enabled_from_env, ListSearchMetrics, MetricsRecorder};
-use super::moves::{apply_move, best_improving_move, better, random_kick, shuffle, snapshot, SearchMemory};
+use super::moves::{apply_move, best_improving_move, better, random_kick, shuffle, snapshot, trial_list_score_view, SearchMemory};
 use super::schedule_ls::solve_schedule;
 use crate::mix64;
 use crate::model::list::{
@@ -107,11 +108,6 @@ pub(super) struct PerList {
     pub(super) senses: [bool; MAX_TIERS],
     pub(super) tiers: usize,
     pub(super) globals: Globals,
-    /// Whether every reduction on list `l` supports O(edit) incremental scoring,
-    /// so a candidate move can be evaluated without rebuilding/rescanning the
-    /// list. Lists with an unsupported reduction (Pairs, Scan, Windows, Min, Max)
-    /// fall back to full recomputation.
-    pub(super) list_incremental: Vec<bool>,
     /// Whether route-edge reductions exist. Routing-only moves such as Or-opt
     /// are useful here and wasteful on order-independent packing models.
     pub(super) has_edges: bool,
@@ -199,47 +195,13 @@ impl CandidateNeighbors {
 
 #[derive(Clone, Copy)]
 pub(super) enum ReductionDeltaKind {
-    ItemsSum,
     ItemsCount,
     Used,
-    Edges { symmetric: bool },
     Unsupported,
-}
-
-impl ReductionDeltaKind {
-    fn supported(self) -> bool {
-        !matches!(self, Self::Unsupported)
-    }
 }
 
 fn expr_is_arg(exprs: &[Expr], id: ExprId, arg: u8) -> bool {
     matches!(exprs.get(id.0 as usize), Some(Expr::Arg(a)) if *a == arg)
-}
-
-fn matrix_is_symmetric(matrix: &[Vec<i64>]) -> bool {
-    let n = matrix.len();
-    if matrix.iter().any(|row| row.len() != n) {
-        return false;
-    }
-    for (i, row) in matrix.iter().enumerate() {
-        for (j, &value) in row.iter().enumerate().skip(i + 1) {
-            if value != matrix[j][i] {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-fn direct_symmetric_edge_matrix(r: &Reduction) -> bool {
-    match r.arena.exprs.get(r.body.0 as usize) {
-        Some(Expr::Matrix(matrix, row, col)) => {
-            let direct_args = expr_is_arg(&r.arena.exprs, *row, 0) && expr_is_arg(&r.arena.exprs, *col, 1);
-            let reversed_args = expr_is_arg(&r.arena.exprs, *row, 1) && expr_is_arg(&r.arena.exprs, *col, 0);
-            (direct_args || reversed_args) && matrix_is_symmetric(matrix)
-        }
-        _ => false,
-    }
 }
 
 fn direct_edge_matrix(r: &Reduction) -> Option<Arc<Vec<Vec<i64>>>> {
@@ -257,10 +219,8 @@ fn direct_edge_matrix(r: &Reduction) -> Option<Arc<Vec<Vec<i64>>>> {
 /// is built, so candidate scoring does not inspect the expression tree.
 fn reduction_delta_kind(r: &Reduction) -> ReductionDeltaKind {
     match (r.op, &r.iterable) {
-        (ReduceOp::Sum, Iterable::Items(_)) => ReductionDeltaKind::ItemsSum,
         (ReduceOp::Count, Iterable::Items(_)) => ReductionDeltaKind::ItemsCount,
         (ReduceOp::Used, Iterable::Items(_)) => ReductionDeltaKind::Used,
-        (ReduceOp::Sum, Iterable::Edges { .. }) => ReductionDeltaKind::Edges { symmetric: direct_symmetric_edge_matrix(r) },
         _ => ReductionDeltaKind::Unsupported,
     }
 }
@@ -317,12 +277,6 @@ impl PerList {
             constraint_delta[list].push(reduction_delta_kind(&c.reduction));
             constraints[list].push(c.clone());
         }
-        let list_incremental = (0..model.lists)
-            .map(|l| {
-                objective_delta[l].iter().all(|tier| tier.iter().all(|kind| kind.supported()))
-                    && constraint_delta[l].iter().all(|kind| kind.supported())
-            })
-            .collect();
         Self {
             objective,
             max_objective,
@@ -332,7 +286,6 @@ impl PerList {
             senses,
             tiers: model.objectives.len(),
             globals: Globals::build(model),
-            list_incremental,
             has_edges,
             route_bounds,
             candidates: candidate_matrix.flatten().and_then(|matrix| CandidateNeighbors::build(model, matrix)),
@@ -362,30 +315,84 @@ pub(super) struct ListScore {
     pub(super) objectives: [i64; MAX_TIERS],
 }
 
+pub(super) struct ListReductionCaches {
+    pub(super) objective: [Vec<ReductionCache>; MAX_TIERS],
+    pub(super) constraints: Vec<ReductionCache>,
+}
+
 pub(super) struct TrialList<'a> {
     pub(super) list: usize,
     pub(super) score: ListScore,
-    pub(super) contents: &'a [i32],
+    pub(super) contents: &'a dyn ListView,
 }
 
-pub(super) fn list_score(per: &PerList, idx: usize, contents: &[i32]) -> ListScore {
+fn reduction_cache(per: &PerList, reduction: &Reduction, contents: &[i32]) -> ReductionCache {
+    per.metrics.measure_full(reduction, contents.len(), || ReductionCache::build(reduction, contents))
+}
+
+impl ListReductionCaches {
+    pub(super) fn build(per: &PerList, idx: usize, contents: &[i32]) -> Self {
+        let objective = std::array::from_fn(|tier| {
+            per.objective[idx][tier].iter().map(|reduction| reduction_cache(per, reduction, contents)).collect()
+        });
+        let constraints = per.constraints[idx].iter().map(|constraint| reduction_cache(per, &constraint.reduction, contents)).collect();
+        Self { objective, constraints }
+    }
+
+    pub(super) fn score(&self, per: &PerList, idx: usize) -> ListScore {
+        let mut violation = 0i64;
+        let mut objectives = [0i64; MAX_TIERS];
+        for (tier, slot) in objectives.iter_mut().enumerate() {
+            for cache in &self.objective[tier] {
+                match cache.value() {
+                    Some(value) => *slot = slot.saturating_add(value),
+                    None => violation = violation.saturating_add(INFEASIBLE),
+                }
+            }
+        }
+        for (constraint, cache) in per.constraints[idx].iter().zip(&self.constraints) {
+            match cache.value() {
+                Some(value) => violation = violation.saturating_add(violation_of(value, constraint.op, constraint.rhs)),
+                None => violation = violation.saturating_add(INFEASIBLE),
+            }
+        }
+        ListScore { violation, objectives }
+    }
+}
+
+/// Independent full evaluator retained as the incremental-cache oracle.
+pub(super) fn list_score_exact(per: &PerList, idx: usize, contents: &[i32]) -> ListScore {
     let mut violation = 0i64;
     let mut objectives = [0i64; MAX_TIERS];
-    for (t, tier) in per.objective[idx].iter().enumerate() {
-        for r in tier {
-            match per.metrics.measure_full(r, contents.len(), || eval_reduction(r, contents)) {
-                Some(v) => objectives[t] = objectives[t].saturating_add(v),
+    for (tier, slot) in objectives.iter_mut().enumerate() {
+        for reduction in &per.objective[idx][tier] {
+            match eval_reduction(reduction, contents) {
+                Some(value) => *slot = slot.saturating_add(value),
                 None => violation = violation.saturating_add(INFEASIBLE),
             }
         }
     }
-    for c in &per.constraints[idx] {
-        match per.metrics.measure_full(&c.reduction, contents.len(), || eval_reduction(&c.reduction, contents)) {
-            Some(v) => violation = violation.saturating_add(violation_of(v, c.op, c.rhs)),
+    for constraint in &per.constraints[idx] {
+        match eval_reduction(&constraint.reduction, contents) {
+            Some(value) => violation = violation.saturating_add(violation_of(value, constraint.op, constraint.rhs)),
             None => violation = violation.saturating_add(INFEASIBLE),
         }
     }
     ListScore { violation, objectives }
+}
+
+fn build_max_caches(per: &PerList, lists: &[Vec<i32>]) -> [Vec<Vec<Vec<ReductionCache>>>; MAX_TIERS] {
+    std::array::from_fn(|tier| {
+        per.max_objective[tier]
+            .iter()
+            .map(|term| {
+                term.groups
+                    .iter()
+                    .map(|group| group.iter().map(|reduction| reduction_cache(per, reduction, &lists[reduction.iterable.list()])).collect())
+                    .collect()
+            })
+            .collect()
+    })
 }
 
 /// Apply each tier's optimisation direction to raw tier sums (smaller better).
@@ -410,22 +417,35 @@ pub(super) fn base_totals(scores: &[ListScore]) -> (i64, [i64; MAX_TIERS]) {
     (violation, raw)
 }
 
-fn trial_contents<'a>(lists: &'a [Vec<i32>], replacements: &'a [TrialList<'a>], list: usize) -> &'a [i32] {
-    replacements.iter().find_map(|trial| (trial.list == list).then_some(trial.contents)).unwrap_or(&lists[list])
-}
-
-fn max_objective_totals<'a>(per: &PerList, lists: &'a [Vec<i32>], replacements: &'a [TrialList<'a>]) -> (i64, [i64; MAX_TIERS]) {
+fn max_objective_totals<'a>(
+    per: &PerList,
+    state: &State,
+    replacements: &'a [TrialList<'a>],
+    scratch: &mut EvalScratch,
+) -> (i64, [i64; MAX_TIERS]) {
     let mut violation = 0i64;
     let mut raw = [0i64; MAX_TIERS];
     for (tier, terms) in per.max_objective.iter().enumerate() {
-        for term in terms {
+        for (term_idx, term) in terms.iter().enumerate() {
             let mut best = None;
-            for group in &term.groups {
+            for (group_idx, group) in term.groups.iter().enumerate() {
                 let mut group_value = 0i64;
                 let mut defined = true;
-                for reduction in group {
-                    let contents = trial_contents(lists, replacements, reduction.iterable.list());
-                    match per.metrics.measure_full(reduction, contents.len(), || eval_reduction(reduction, contents)) {
+                for (reduction_idx, reduction) in group.iter().enumerate() {
+                    let cache = &state.max_caches[tier][term_idx][group_idx][reduction_idx];
+                    let list = reduction.iterable.list();
+                    let value = if let Some(replacement) = replacements.iter().find(|replacement| replacement.list == list) {
+                        let value = per.metrics.measure_delta(reduction, || {
+                            cache.candidate_value(reduction, &state.lists[list], replacement.contents, scratch)
+                        });
+                        if matches!(reduction.iterable, Iterable::Scan { .. }) {
+                            per.metrics.record_incremental_scan(scratch.recomputed_scan_steps());
+                        }
+                        value
+                    } else {
+                        cache.value()
+                    };
+                    match value {
                         Some(value) => group_value = group_value.saturating_add(value),
                         None => {
                             defined = false;
@@ -445,18 +465,28 @@ fn max_objective_totals<'a>(per: &PerList, lists: &'a [Vec<i32>], replacements: 
     (violation, raw)
 }
 
-pub(super) fn score_with_replacements<'a>(per: &PerList, state: &'a State, replacements: &'a [TrialList<'a>], global_delta: i64) -> Score {
-    let (mut violation, mut raw) = base_totals(&state.scores);
-    for replacement in replacements {
-        let old = &state.scores[replacement.list];
-        violation = violation.saturating_sub(old.violation).saturating_add(replacement.score.violation);
-        for ((slot, &old), &new) in raw.iter_mut().zip(old.objectives.iter()).zip(replacement.score.objectives.iter()) {
-            *slot = slot.saturating_sub(old).saturating_add(new);
+pub(super) fn score_with_replacements<'a>(
+    per: &PerList,
+    state: &'a State,
+    replacements: &'a [TrialList<'a>],
+    global_delta: i64,
+    scratch: &mut EvalScratch,
+) -> Score {
+    // Fold in list order, just like a full evaluation. Subtracting an old
+    // contribution from a saturated total and adding the replacement is not
+    // reversible at i64::MIN/MAX.
+    let mut violation = 0i64;
+    let mut raw = [0i64; MAX_TIERS];
+    for (list, cached) in state.scores.iter().enumerate() {
+        let score = replacements.iter().find(|replacement| replacement.list == list).map_or(cached, |replacement| &replacement.score);
+        violation = violation.saturating_add(score.violation);
+        for (slot, &value) in raw.iter_mut().zip(score.objectives.iter()) {
+            *slot = slot.saturating_add(value);
         }
     }
     violation = violation.saturating_add(state.global_viol).saturating_add(global_delta);
     if per.has_max_objective() {
-        let (max_violation, max_raw) = max_objective_totals(per, &state.lists, replacements);
+        let (max_violation, max_raw) = max_objective_totals(per, state, replacements, scratch);
         violation = violation.saturating_add(max_violation);
         for (slot, value) in raw.iter_mut().zip(max_raw) {
             *slot = slot.saturating_add(value);
@@ -467,7 +497,38 @@ pub(super) fn score_with_replacements<'a>(per: &PerList, state: &'a State, repla
 
 /// Full score including the cross-list global violation.
 pub(super) fn full_score(per: &PerList, state: &State) -> Score {
-    score_with_replacements(per, state, &[], 0)
+    score_with_replacements(per, state, &[], 0, &mut EvalScratch::default())
+}
+
+pub(super) fn full_score_exact_lists(per: &PerList, lists: &[Vec<i32>], global_violation: i64) -> Score {
+    let scores: Vec<ListScore> = lists.iter().enumerate().map(|(idx, contents)| list_score_exact(per, idx, contents)).collect();
+    let (mut violation, mut raw) = base_totals(&scores);
+    violation = violation.saturating_add(global_violation);
+    for (tier, terms) in per.max_objective.iter().enumerate() {
+        for term in terms {
+            let mut best = None;
+            for group in &term.groups {
+                let mut value = 0i64;
+                let mut defined = true;
+                for reduction in group {
+                    match eval_reduction(reduction, &lists[reduction.iterable.list()]) {
+                        Some(reduction_value) => value = value.saturating_add(reduction_value),
+                        None => {
+                            defined = false;
+                            violation = violation.saturating_add(INFEASIBLE);
+                        }
+                    }
+                }
+                if defined {
+                    best = Some(best.map_or(value, |old: i64| old.max(value)));
+                }
+            }
+            if let Some(best) = best {
+                raw[tier] = raw[tier].saturating_add(best.saturating_mul(term.coeff));
+            }
+        }
+    }
+    signed(per, violation, raw)
 }
 
 /// State of the search: list contents, cached per-list scores, and (for global
@@ -475,19 +536,10 @@ pub(super) fn full_score(per: &PerList, state: &State) -> Score {
 pub(super) struct State {
     pub(super) lists: Vec<Vec<i32>>,
     pub(super) scores: Vec<ListScore>,
-    /// Raw value of each constraint reduction per list, so a candidate move can
-    /// update the (nonlinear) constraint violation incrementally.
-    pub(super) con_vals: Vec<Vec<Option<i64>>>,
+    pub(super) caches: Vec<ListReductionCaches>,
+    max_caches: [Vec<Vec<Vec<ReductionCache>>>; MAX_TIERS],
     pub(super) item_list: Vec<usize>,
     pub(super) global_viol: i64,
-}
-
-/// Raw value of every constraint reduction on a list (`None` = undefined).
-pub(super) fn compute_con_vals(per: &PerList, idx: usize, contents: &[i32]) -> Vec<Option<i64>> {
-    per.constraints[idx]
-        .iter()
-        .map(|c| per.metrics.measure_full(&c.reduction, contents.len(), || eval_reduction(&c.reduction, contents)))
-        .collect()
 }
 
 impl State {
@@ -500,48 +552,43 @@ impl State {
     /// Global constraints are ignored here; the search repairs them.
     fn greedy(model: &CollectionModel, per: &PerList, order: &[usize]) -> Self {
         let k = model.lists.max(1);
-        let mut lists: Vec<Vec<i32>> = vec![Vec::new(); k];
-        let mut scores: Vec<ListScore> = (0..k).map(|idx| list_score(per, idx, &[])).collect();
-        let mut item_list = vec![0usize; model.items.len()];
-        let mut buf: Vec<i32> = Vec::new();
+        let mut state = Self::from_lists(model, per, vec![Vec::new(); k]);
+        let mut scratch = EvalScratch::default();
         for &item_idx in order {
             let item = model.items[item_idx];
             let mut best_l = 0;
             let mut best_key = Score { violation: i64::MAX, tiers: [i64::MAX; MAX_TIERS] };
-            let mut best_sc = scores[0];
             for l in 0..k {
-                buf.clear();
-                buf.extend_from_slice(&lists[l]);
-                buf.push(item);
-                let sc = list_score(per, l, &buf);
+                let candidate = InsertView::new(&state.lists[l], state.lists[l].len(), item);
+                per.metrics.record_candidate();
+                let sc = trial_list_score_view(per, &state, l, &candidate, None, &mut scratch);
                 // Lexicographic increment of placing the item in list l.
-                let dv = sc.violation.saturating_sub(scores[l].violation);
+                let dv = sc.violation.saturating_sub(state.scores[l].violation);
                 let mut draw = [0i64; MAX_TIERS];
-                for ((d, &new), &old) in draw.iter_mut().zip(sc.objectives.iter()).zip(scores[l].objectives.iter()) {
+                for ((d, &new), &old) in draw.iter_mut().zip(sc.objectives.iter()).zip(state.scores[l].objectives.iter()) {
                     *d = new.saturating_sub(old);
                 }
                 let key = signed(per, dv, draw);
                 if key < best_key {
                     best_key = key;
                     best_l = l;
-                    best_sc = sc;
                 }
             }
-            lists[best_l].push(item);
-            scores[best_l] = best_sc;
-            item_list[item_idx] = best_l;
+            state.lists[best_l].push(item);
+            state.rescore(per, best_l);
+            state.item_list[item_idx] = best_l;
         }
-        let global_viol = per.globals.total(&item_list);
-        let con_vals = (0..k).map(|l| compute_con_vals(per, l, &lists[l])).collect();
-        Self { lists, scores, con_vals, item_list, global_viol }
+        state.global_viol = per.globals.total(&state.item_list);
+        state
     }
 
-    fn from_lists(model: &CollectionModel, per: &PerList, mut lists: Vec<Vec<i32>>) -> Self {
+    pub(super) fn from_lists(model: &CollectionModel, per: &PerList, mut lists: Vec<Vec<i32>>) -> Self {
         let k = model.lists.max(1);
         lists.truncate(k);
         lists.resize_with(k, Vec::new);
-        let scores: Vec<ListScore> = (0..k).map(|idx| list_score(per, idx, &lists[idx])).collect();
-        let con_vals = (0..k).map(|idx| compute_con_vals(per, idx, &lists[idx])).collect();
+        let caches: Vec<ListReductionCaches> = (0..k).map(|idx| ListReductionCaches::build(per, idx, &lists[idx])).collect();
+        let scores: Vec<ListScore> = (0..k).map(|idx| caches[idx].score(per, idx)).collect();
+        let max_caches = build_max_caches(per, &lists);
         let mut item_list = vec![0usize; model.items.len()];
         for (l, contents) in lists.iter().enumerate() {
             for &value in contents {
@@ -551,12 +598,23 @@ impl State {
             }
         }
         let global_viol = per.globals.total(&item_list);
-        Self { lists, scores, con_vals, item_list, global_viol }
+        Self { lists, scores, caches, max_caches, item_list, global_viol }
     }
 
     pub(super) fn rescore(&mut self, per: &PerList, idx: usize) {
-        self.scores[idx] = list_score(per, idx, &self.lists[idx]);
-        self.con_vals[idx] = compute_con_vals(per, idx, &self.lists[idx]);
+        self.caches[idx] = ListReductionCaches::build(per, idx, &self.lists[idx]);
+        self.scores[idx] = self.caches[idx].score(per, idx);
+        for (tier, terms) in per.max_objective.iter().enumerate() {
+            for (term_idx, term) in terms.iter().enumerate() {
+                for (group_idx, group) in term.groups.iter().enumerate() {
+                    for (reduction_idx, reduction) in group.iter().enumerate() {
+                        if reduction.iterable.list() == idx {
+                            self.max_caches[tier][term_idx][group_idx][reduction_idx] = reduction_cache(per, reduction, &self.lists[idx]);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Record that `value` now lives in list `l`, for global-constraint tracking.
@@ -608,10 +666,11 @@ fn score_with_replaced_list(
     state: &State,
     list: usize,
     replacement: ListScore,
-    contents: &[i32],
+    contents: &dyn ListView,
     global_delta: i64,
+    scratch: &mut EvalScratch,
 ) -> Score {
-    score_with_replacements(per, state, &[TrialList { list, score: replacement, contents }], global_delta)
+    score_with_replacements(per, state, &[TrialList { list, score: replacement, contents }], global_delta, scratch)
 }
 
 fn shuffle_values(values: &mut [i32], seed: u64) {
@@ -693,7 +752,7 @@ fn destroy_shaw(lists: &mut [Vec<i32>], candidates: &CandidateNeighbors, target:
 }
 
 fn repair_lns(per: &PerList, state: &mut State, removed: &[i32], seed: u64, stop: &AtomicBool) -> bool {
-    let mut scratch = Vec::new();
+    let mut scratch = EvalScratch::default();
     let mut polled = 0u32;
     for &item in removed {
         let mut best: Option<(Score, u64, usize, usize, ListScore)> = None;
@@ -703,14 +762,11 @@ fn repair_lns(per: &PerList, state: &mut State, removed: &[i32], seed: u64, stop
                 if polled.is_multiple_of(1024) && stop.load(Ordering::Relaxed) {
                     return false;
                 }
-                scratch.clear();
-                scratch.extend_from_slice(&state.lists[list]);
-                scratch.insert(pos, item);
+                let candidate = InsertView::new(&state.lists[list], pos, item);
                 per.metrics.record_candidate();
-                per.metrics.record_full_trial();
-                let next = list_score(per, list, &scratch);
+                let next = trial_list_score_view(per, state, list, &candidate, None, &mut scratch);
                 let global_delta = per.globals.delta(&state.item_list, &[(item, list)]);
-                let score = score_with_replaced_list(per, state, list, next, &scratch, global_delta);
+                let score = score_with_replaced_list(per, state, list, next, &candidate, global_delta, &mut scratch);
                 let tie = mix64(seed ^ (item as i64 as u64) ^ ((list as u64) << 32) ^ pos as u64);
                 if best
                     .as_ref()
@@ -724,8 +780,9 @@ fn repair_lns(per: &PerList, state: &mut State, removed: &[i32], seed: u64, stop
             return false;
         };
         state.lists[list].insert(pos, item);
-        state.scores[list] = score;
-        state.con_vals[list] = compute_con_vals(per, list, &state.lists[list]);
+        state.rescore(per, list);
+        debug_assert_eq!(state.scores[list].violation, score.violation);
+        debug_assert_eq!(state.scores[list].objectives, score.objectives);
         state.set_item_list(per, item, list);
         state.global_viol = per.globals.total(&state.item_list);
     }
@@ -749,7 +806,7 @@ fn score_scalar(score: &Score) -> i128 {
 /// is bounded because `removed` is a small fraction of the instance.
 fn repair_regret(per: &PerList, state: &mut State, removed: &[i32], k: usize, seed: u64, stop: &AtomicBool) -> bool {
     let mut pending: Vec<i32> = removed.to_vec();
-    let mut scratch = Vec::new();
+    let mut scratch = EvalScratch::default();
     let mut polled = 0u32;
     while !pending.is_empty() {
         // The pending item with the largest regret, and its best placement.
@@ -763,14 +820,11 @@ fn repair_regret(per: &PerList, state: &mut State, removed: &[i32], k: usize, se
                     if polled.is_multiple_of(1024) && stop.load(Ordering::Relaxed) {
                         return false;
                     }
-                    scratch.clear();
-                    scratch.extend_from_slice(&state.lists[list]);
-                    scratch.insert(pos, item);
+                    let candidate = InsertView::new(&state.lists[list], pos, item);
                     per.metrics.record_candidate();
-                    per.metrics.record_full_trial();
-                    let next = list_score(per, list, &scratch);
+                    let next = trial_list_score_view(per, state, list, &candidate, None, &mut scratch);
                     let global_delta = per.globals.delta(&state.item_list, &[(item, list)]);
-                    let cost = score_scalar(&score_with_replaced_list(per, state, list, next, &scratch, global_delta));
+                    let cost = score_scalar(&score_with_replaced_list(per, state, list, next, &candidate, global_delta, &mut scratch));
                     let tie = mix64(seed ^ (item as i64 as u64) ^ ((list as u64) << 32) ^ pos as u64);
                     let ins = topk.partition_point(|&c| c <= cost);
                     if ins < k {
@@ -800,8 +854,9 @@ fn repair_regret(per: &PerList, state: &mut State, removed: &[i32], k: usize, se
         let (idx, _, _, list, pos, score) = choice.expect("pending is non-empty");
         let item = pending.swap_remove(idx);
         state.lists[list].insert(pos, item);
-        state.scores[list] = score;
-        state.con_vals[list] = compute_con_vals(per, list, &state.lists[list]);
+        state.rescore(per, list);
+        debug_assert_eq!(state.scores[list].violation, score.violation);
+        debug_assert_eq!(state.scores[list].objectives, score.objectives);
         state.set_item_list(per, item, list);
         state.global_viol = per.globals.total(&state.item_list);
     }

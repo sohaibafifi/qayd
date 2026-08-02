@@ -301,10 +301,11 @@ impl MetricsRecorder {
         }
     }
 
-    pub(super) fn record_full_trial(&self) {
+    pub(super) fn record_incremental_scan(&self, recomputed_steps: u64) {
         if let Some(raw) = &self.raw {
             let mut raw = raw.borrow_mut();
-            raw.full_trials = raw.full_trials.saturating_add(1);
+            raw.scan_recomputations = raw.scan_recomputations.saturating_add(1);
+            raw.scan_recomputed_steps = raw.scan_recomputed_steps.saturating_add(recomputed_steps);
         }
     }
 
