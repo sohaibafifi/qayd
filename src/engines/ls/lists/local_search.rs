@@ -5,6 +5,7 @@
 //! shared Rust model and backend classifier first, then teach this heuristic to
 //! search it as a fallback or incumbent generator.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -12,10 +13,11 @@ use std::time::Instant;
 
 use smallvec::SmallVec;
 
+use super::alns::{build_candidate, AcceptanceKind, AlnsController};
 use super::eval::{eval_reduction, violation_of, INFEASIBLE};
 use super::incremental::{EvalScratch, InsertView, ListView, ReductionCache};
 use super::metrics::{metrics_enabled_from_env, ListSearchMetrics, MetricsRecorder};
-use super::moves::{apply_move, best_improving_move, better, random_kick, shuffle, snapshot, trial_list_score_view, SearchMemory};
+use super::moves::{apply_move, best_improving_move, better, shuffle, snapshot, trial_list_score_view, SearchMemory};
 use super::schedule_ls::solve_schedule;
 use crate::mix64;
 use crate::model::list::{
@@ -140,7 +142,13 @@ pub(super) struct PerList {
     /// default (lets an infeasible-heavy instance afford more passes); set
     /// `QAYD_LS_INFEAS_CAND=0` to revert to the conservative feasible-only gate.
     pub(super) infeas_cand: bool,
+    penalties: GlsPenalties,
     pub(super) metrics: MetricsRecorder,
+}
+
+struct GlsPenalties {
+    constraints: RefCell<Vec<Vec<i64>>>,
+    objectives: RefCell<Vec<Vec<Vec<i64>>>>,
 }
 
 pub(super) struct CandidateNeighbors {
@@ -296,6 +304,10 @@ impl PerList {
             constraint_delta[list].push(reduction_delta_kind(&c.reduction));
             constraints[list].push(c.clone());
         }
+        let penalties = GlsPenalties {
+            constraints: RefCell::new(constraints.iter().map(|list| vec![1; list.len()]).collect()),
+            objectives: RefCell::new(objective.iter().map(|list| list.iter().map(|tier| vec![1; tier.len()]).collect()).collect()),
+        };
         Self {
             objective,
             max_objective,
@@ -309,6 +321,7 @@ impl PerList {
             route_bounds,
             candidates: candidate_matrix.flatten().and_then(|matrix| CandidateNeighbors::build(model, matrix)),
             infeas_cand: std::env::var("QAYD_LS_INFEAS_CAND").as_deref() != Ok("0"),
+            penalties,
             metrics: MetricsRecorder::new(metrics_enabled),
         }
     }
@@ -316,11 +329,86 @@ impl PerList {
     pub(super) fn has_max_objective(&self) -> bool {
         self.max_objective.iter().any(|terms| !terms.is_empty())
     }
+
+    /// Increase the penalties of the reductions with maximum GLS utility.
+    /// Constraint reductions are used while infeasible. Once feasible, the
+    /// first lexicographic objective tier becomes the feature set.
+    pub(super) fn bump_gls(&self, state: &State) -> usize {
+        let raw = full_score_raw(self, state);
+        if raw.violation > 0 {
+            let mut weights = self.penalties.constraints.borrow_mut();
+            let mut best: Option<(i64, i64)> = None;
+            for (list, score) in state.scores.iter().enumerate() {
+                for (idx, &value) in score.constraint_violations.iter().enumerate() {
+                    if value <= 0 {
+                        continue;
+                    }
+                    let weight = weights[list][idx];
+                    if best.is_none_or(|(best_value, best_weight)| {
+                        i128::from(value) * i128::from(best_weight) > i128::from(best_value) * i128::from(weight)
+                    }) {
+                        best = Some((value, weight));
+                    }
+                }
+            }
+            let Some((best_value, best_weight)) = best else { return 0 };
+            let mut bumped = 0usize;
+            for (list, score) in state.scores.iter().enumerate() {
+                for (idx, &value) in score.constraint_violations.iter().enumerate() {
+                    let weight = weights[list][idx];
+                    if value > 0 && i128::from(value) * i128::from(best_weight) == i128::from(best_value) * i128::from(weight) {
+                        weights[list][idx] = weight.saturating_add(1);
+                        bumped += 1;
+                    }
+                }
+            }
+            return bumped;
+        }
+
+        if self.tiers == 0 {
+            return 0;
+        }
+        let minimize = self.senses[0];
+        let mut weights = self.penalties.objectives.borrow_mut();
+        let mut best: Option<(i64, i64)> = None;
+        for (list, score) in state.scores.iter().enumerate() {
+            for (idx, value) in score.objective_reductions[0].iter().enumerate() {
+                let Some(value) = value else { continue };
+                let utility = if minimize { *value } else { value.saturating_neg() }.max(0);
+                if utility == 0 {
+                    continue;
+                }
+                let weight = weights[list][0][idx];
+                if best.is_none_or(|(best_value, best_weight)| {
+                    i128::from(utility) * i128::from(best_weight) > i128::from(best_value) * i128::from(weight)
+                }) {
+                    best = Some((utility, weight));
+                }
+            }
+        }
+        let Some((best_value, best_weight)) = best else { return 0 };
+        let mut bumped = 0usize;
+        for (list, score) in state.scores.iter().enumerate() {
+            for (idx, value) in score.objective_reductions[0].iter().enumerate() {
+                let Some(value) = value else { continue };
+                let utility = if minimize { *value } else { value.saturating_neg() }.max(0);
+                let weight = weights[list][0][idx];
+                if utility > 0 && i128::from(utility) * i128::from(best_weight) == i128::from(best_value) * i128::from(weight) {
+                    weights[list][0][idx] = weight.saturating_add(1);
+                    bumped += 1;
+                }
+            }
+        }
+        bumped
+    }
 }
 
 /// The comparable score of a state: violation first, then the objective tiers
 /// (each already signed so smaller is better), compared lexicographically.
 pub(super) type TierValues = SmallVec<[i64; 4]>;
+pub(super) type ConstraintViolations = SmallVec<[i64; 4]>;
+pub(super) type ReductionValues = SmallVec<[Option<i64>; 4]>;
+pub(super) type ObjectiveReductionValues = SmallVec<[ReductionValues; 4]>;
 
 pub(super) fn tier_values(len: usize, value: i64) -> TierValues {
     std::iter::repeat_n(value, len).collect()
@@ -338,6 +426,9 @@ pub(super) struct Score {
 pub(super) struct ListScore {
     pub(super) violation: i64,
     pub(super) objectives: TierValues,
+    pub(super) constraint_violations: ConstraintViolations,
+    pub(super) objective_reductions: ObjectiveReductionValues,
+    pub(super) undefined_violation: i64,
 }
 
 pub(super) struct ListReductionCaches {
@@ -367,44 +458,84 @@ impl ListReductionCaches {
 
     pub(super) fn score(&self, per: &PerList, idx: usize) -> ListScore {
         let mut violation = 0i64;
+        let mut undefined_violation = 0i64;
         let mut objectives = tier_values(per.tiers, 0);
+        let mut objective_reductions = ObjectiveReductionValues::with_capacity(per.tiers);
         for (tier, slot) in objectives.iter_mut().enumerate() {
+            let mut values = ReductionValues::with_capacity(self.objective[tier].len());
             for cache in &self.objective[tier] {
                 match cache.value() {
-                    Some(value) => *slot = slot.saturating_add(value),
-                    None => violation = violation.saturating_add(INFEASIBLE),
+                    Some(value) => {
+                        *slot = slot.saturating_add(value);
+                        values.push(Some(value));
+                    }
+                    None => {
+                        violation = violation.saturating_add(INFEASIBLE);
+                        undefined_violation = undefined_violation.saturating_add(INFEASIBLE);
+                        values.push(None);
+                    }
+                }
+            }
+            objective_reductions.push(values);
+        }
+        let mut constraint_violations = ConstraintViolations::with_capacity(self.constraints.len());
+        for (constraint, cache) in per.constraints[idx].iter().zip(&self.constraints) {
+            match cache.value() {
+                Some(value) => {
+                    let constraint_violation = violation_of(value, constraint.op, constraint.rhs);
+                    violation = violation.saturating_add(constraint_violation);
+                    constraint_violations.push(constraint_violation);
+                }
+                None => {
+                    violation = violation.saturating_add(INFEASIBLE);
+                    undefined_violation = undefined_violation.saturating_add(INFEASIBLE);
+                    constraint_violations.push(0);
                 }
             }
         }
-        for (constraint, cache) in per.constraints[idx].iter().zip(&self.constraints) {
-            match cache.value() {
-                Some(value) => violation = violation.saturating_add(violation_of(value, constraint.op, constraint.rhs)),
-                None => violation = violation.saturating_add(INFEASIBLE),
-            }
-        }
-        ListScore { violation, objectives }
+        ListScore { violation, objectives, constraint_violations, objective_reductions, undefined_violation }
     }
 }
 
 /// Independent full evaluator retained as the incremental-cache oracle.
 pub(super) fn list_score_exact(per: &PerList, idx: usize, contents: &[i32]) -> ListScore {
     let mut violation = 0i64;
+    let mut undefined_violation = 0i64;
     let mut objectives = tier_values(per.tiers, 0);
+    let mut objective_reductions = ObjectiveReductionValues::with_capacity(per.tiers);
     for (tier, slot) in objectives.iter_mut().enumerate() {
+        let mut values = ReductionValues::with_capacity(per.objective[idx][tier].len());
         for reduction in &per.objective[idx][tier] {
             match eval_reduction(reduction, contents) {
-                Some(value) => *slot = slot.saturating_add(value),
-                None => violation = violation.saturating_add(INFEASIBLE),
+                Some(value) => {
+                    *slot = slot.saturating_add(value);
+                    values.push(Some(value));
+                }
+                None => {
+                    violation = violation.saturating_add(INFEASIBLE);
+                    undefined_violation = undefined_violation.saturating_add(INFEASIBLE);
+                    values.push(None);
+                }
+            }
+        }
+        objective_reductions.push(values);
+    }
+    let mut constraint_violations = ConstraintViolations::with_capacity(per.constraints[idx].len());
+    for constraint in &per.constraints[idx] {
+        match eval_reduction(&constraint.reduction, contents) {
+            Some(value) => {
+                let constraint_violation = violation_of(value, constraint.op, constraint.rhs);
+                violation = violation.saturating_add(constraint_violation);
+                constraint_violations.push(constraint_violation);
+            }
+            None => {
+                violation = violation.saturating_add(INFEASIBLE);
+                undefined_violation = undefined_violation.saturating_add(INFEASIBLE);
+                constraint_violations.push(0);
             }
         }
     }
-    for constraint in &per.constraints[idx] {
-        match eval_reduction(&constraint.reduction, contents) {
-            Some(value) => violation = violation.saturating_add(violation_of(value, constraint.op, constraint.rhs)),
-            None => violation = violation.saturating_add(INFEASIBLE),
-        }
-    }
-    ListScore { violation, objectives }
+    ListScore { violation, objectives, constraint_violations, objective_reductions, undefined_violation }
 }
 
 fn build_max_caches(per: &PerList, lists: &[Vec<i32>]) -> Vec<Vec<Vec<Vec<ReductionCache>>>> {
@@ -496,23 +627,42 @@ fn max_objective_totals<'a>(
     (violation, raw)
 }
 
-pub(super) fn score_with_replacements<'a>(
+fn score_with_replacements_mode<'a>(
     per: &PerList,
     state: &'a State,
     replacements: &'a [TrialList<'a>],
     global_delta: i64,
     scratch: &mut EvalScratch,
+    guided: bool,
 ) -> Score {
     // Fold in list order, just like a full evaluation. Subtracting an old
     // contribution from a saturated total and adding the replacement is not
     // reversible at i64::MIN/MAX.
     let mut violation = 0i64;
     let mut raw = tier_values(per.tiers, 0);
+    let constraint_weights = guided.then(|| per.penalties.constraints.borrow());
+    let objective_weights = guided.then(|| per.penalties.objectives.borrow());
     for (list, cached) in state.scores.iter().enumerate() {
         let score = replacements.iter().find(|replacement| replacement.list == list).map_or(cached, |replacement| replacement.score);
-        violation = violation.saturating_add(score.violation);
-        for (slot, &value) in raw.iter_mut().zip(score.objectives.iter()) {
+        if let Some(weights) = &constraint_weights {
+            let weighted = score
+                .constraint_violations
+                .iter()
+                .zip(&weights[list])
+                .fold(score.undefined_violation, |sum, (&value, &weight)| sum.saturating_add(value.saturating_mul(weight)));
+            violation = violation.saturating_add(weighted);
+        } else {
+            violation = violation.saturating_add(score.violation);
+        }
+        for (tier, (slot, &value)) in raw.iter_mut().zip(score.objectives.iter()).enumerate() {
             *slot = slot.saturating_add(value);
+            if let Some(weights) = &objective_weights {
+                for (&reduction_value, &weight) in score.objective_reductions[tier].iter().zip(&weights[list][tier]) {
+                    if let Some(reduction_value) = reduction_value {
+                        *slot = slot.saturating_add(reduction_value.saturating_mul(weight.saturating_sub(1)));
+                    }
+                }
+            }
         }
     }
     violation = violation.saturating_add(state.global_viol).saturating_add(global_delta);
@@ -526,9 +676,24 @@ pub(super) fn score_with_replacements<'a>(
     signed(per, violation, raw)
 }
 
+pub(super) fn score_with_replacements<'a>(
+    per: &PerList,
+    state: &'a State,
+    replacements: &'a [TrialList<'a>],
+    global_delta: i64,
+    scratch: &mut EvalScratch,
+) -> Score {
+    score_with_replacements_mode(per, state, replacements, global_delta, scratch, true)
+}
+
 /// Full score including the cross-list global violation.
 pub(super) fn full_score(per: &PerList, state: &State) -> Score {
     score_with_replacements(per, state, &[], 0, &mut EvalScratch::default())
+}
+
+/// Exact, unpenalized score used for incumbent tracking and public objectives.
+pub(super) fn full_score_raw(per: &PerList, state: &State) -> Score {
+    score_with_replacements_mode(per, state, &[], 0, &mut EvalScratch::default(), false)
 }
 
 pub(super) fn full_score_exact_lists(per: &PerList, lists: &[Vec<i32>], global_violation: i64) -> Score {
@@ -579,7 +744,7 @@ impl State {
     /// first, then objective). This yields a feasibility-leaning start, so items
     /// avoid lists they would push over a capacity bound, and empty lists with a
     /// `min`/`max` constraint get filled, far better than a blind round robin
-    /// on tight instances, while different `order`s give diverse restarts.
+    /// on tight instances, while different `order`s give diverse seeded starts.
     /// Global constraints are ignored here; the search repairs them.
     fn greedy(model: &CollectionModel, per: &PerList, order: &[usize]) -> Self {
         let k = model.lists.max(1);
@@ -678,7 +843,7 @@ fn record_state(
     best_feasible: &mut bool,
     report: &mut dyn FnMut(i64),
 ) -> bool {
-    let score = full_score(per, state);
+    let score = full_score_raw(per, state);
     let feasible = score.violation == 0;
     if !better(feasible, &score, *best_feasible, best_score) {
         return false;
@@ -692,7 +857,7 @@ fn record_state(
     true
 }
 
-fn score_with_replaced_list(
+pub(super) fn score_with_replaced_list(
     per: &PerList,
     state: &State,
     list: usize,
@@ -704,258 +869,10 @@ fn score_with_replaced_list(
     score_with_replacements(per, state, &[TrialList { list, score: replacement, contents }], global_delta, scratch)
 }
 
-fn shuffle_values(values: &mut [i32], seed: u64) {
-    for i in (1..values.len()).rev() {
-        let j = (mix64(seed.wrapping_add(i as u64)) % (i as u64 + 1)) as usize;
-        values.swap(i, j);
-    }
-}
-
-fn destroy_route_segments(lists: &mut [Vec<i32>], target: usize, seed: u64) -> Vec<i32> {
-    let mut removed = Vec::with_capacity(target);
-    let mut step = 0u64;
-    while removed.len() < target {
-        let total: usize = lists.iter().map(Vec::len).sum();
-        if total == 0 {
-            break;
-        }
-        let mut pick = (mix64(seed ^ mix64(step)) % total as u64) as usize;
-        let mut route = 0usize;
-        let mut pos = 0usize;
-        for (idx, list) in lists.iter().enumerate() {
-            if pick < list.len() {
-                route = idx;
-                pos = pick;
-                break;
-            }
-            pick -= list.len();
-        }
-
-        let remaining = target - removed.len();
-        let max_len = lists[route].len().min(remaining).min(8);
-        let len = 1 + (mix64(seed.wrapping_add(step).wrapping_add(0x9E37_79B9_7F4A_7C15)) % max_len as u64) as usize;
-        let start = if pos + len <= lists[route].len() { pos } else { lists[route].len() - len };
-        removed.extend(lists[route].drain(start..start + len));
-        step = step.wrapping_add(1);
-    }
-    shuffle_values(&mut removed, seed ^ 0xD1B5_4A32_D192_ED03);
-    removed
-}
-
-/// Shaw removal: grow a cluster of *related* (here: nearby) customers. Seed with a
-/// random customer, then repeatedly remove the nearest still-present customer to a
-/// random already-removed one. Removing a related cluster (vs scattered random
-/// nodes) gives the repair room to re-route a whole neighbourhood.
-fn destroy_shaw(lists: &mut [Vec<i32>], candidates: &CandidateNeighbors, target: usize, seed: u64) -> Vec<i32> {
-    let present: HashSet<i32> = lists.iter().flatten().copied().collect();
-    if present.is_empty() {
-        return Vec::new();
-    }
-    let all: Vec<i32> = lists.iter().flatten().copied().collect();
-    let mut removed_set: HashSet<i32> = HashSet::with_capacity(target);
-    let mut order = Vec::with_capacity(target);
-    let seed_c = all[(mix64(seed) % all.len() as u64) as usize];
-    removed_set.insert(seed_c);
-    order.push(seed_c);
-    let mut step = 0u64;
-    while removed_set.len() < target && removed_set.len() < present.len() {
-        let pivot = order[(mix64(seed ^ mix64(step)) % order.len() as u64) as usize];
-        let next =
-            candidates.nearest_present(pivot, &removed_set, &present).or_else(|| all.iter().copied().find(|c| !removed_set.contains(c)));
-        let Some(next) = next else { break };
-        removed_set.insert(next);
-        order.push(next);
-        step = step.wrapping_add(1);
-    }
-    let mut removed = Vec::with_capacity(removed_set.len());
-    for list in lists.iter_mut() {
-        list.retain(|c| {
-            if removed_set.contains(c) {
-                removed.push(*c);
-                false
-            } else {
-                true
-            }
-        });
-    }
-    shuffle_values(&mut removed, seed ^ 0xD1B5_4A32_D192_ED03);
-    removed
-}
-
-fn repair_lns(per: &PerList, state: &mut State, removed: &[i32], seed: u64, stop: &AtomicBool) -> bool {
-    let mut scratch = EvalScratch::default();
-    let mut polled = 0u32;
-    for &item in removed {
-        let mut best: Option<(Score, u64, usize, usize, ListScore)> = None;
-        for list in 0..state.lists.len() {
-            for pos in 0..=state.lists[list].len() {
-                polled = polled.wrapping_add(1);
-                if polled.is_multiple_of(1024) && stop.load(Ordering::Relaxed) {
-                    return false;
-                }
-                let candidate = InsertView::new(&state.lists[list], pos, item);
-                per.metrics.record_candidate();
-                let next = trial_list_score_view(per, state, list, &candidate, None, &mut scratch);
-                let global_delta = per.globals.delta(&state.item_list, &[(item, list)]);
-                let score = score_with_replaced_list(per, state, list, &next, &candidate, global_delta, &mut scratch);
-                let tie = mix64(seed ^ (item as i64 as u64) ^ ((list as u64) << 32) ^ pos as u64);
-                if best
-                    .as_ref()
-                    .is_none_or(|(best_score, best_tie, _, _, _)| score < *best_score || (score == *best_score && tie < *best_tie))
-                {
-                    best = Some((score, tie, list, pos, next));
-                }
-            }
-        }
-        let Some((_, _, list, pos, score)) = best else {
-            return false;
-        };
-        state.lists[list].insert(pos, item);
-        state.rescore(per, list);
-        debug_assert_eq!(state.scores[list].violation, score.violation);
-        debug_assert_eq!(state.scores[list].objectives, score.objectives);
-        state.set_item_list(per, item, list);
-        state.global_viol = per.globals.total(&state.item_list);
-    }
-    true
-}
-
 /// Flatten a lexicographic [`Score`] into a single comparable cost for regret
-/// arithmetic: violation dominates (feasibility first), then the primary
-/// objective tier. Exact for the routing case (one tier); a heuristic ordering
-/// for multi-tier models, which is fine since regret only *orders* insertions.
-fn score_scalar(score: &Score) -> i128 {
-    (score.violation as i128) * (1i128 << 50) + score.tiers[0] as i128
-}
-
-/// Regret-`k` insertion: repeatedly place the removed item that would "regret"
-/// most if deferred -- the one whose cheapest insertion is far better than its
-/// next-best `k-1` alternatives, i.e. the item with the fewest good homes left.
-/// Items with fewer than `k` feasible spots get an inflated regret so they are
-/// placed while options remain. Stronger than greedy cheapest-insertion (which
-/// ignores the competition for each slot) at O(pending² · positions) cost, which
-/// is bounded because `removed` is a small fraction of the instance.
-fn repair_regret(per: &PerList, state: &mut State, removed: &[i32], k: usize, seed: u64, stop: &AtomicBool) -> bool {
-    let mut pending: Vec<i32> = removed.to_vec();
-    let mut scratch = EvalScratch::default();
-    let mut polled = 0u32;
-    while !pending.is_empty() {
-        // The pending item with the largest regret, and its best placement.
-        let mut choice: Option<(usize, i128, u64, usize, usize, ListScore)> = None;
-        for (idx, &item) in pending.iter().enumerate() {
-            let mut topk: Vec<i128> = Vec::with_capacity(k + 1);
-            let mut best_place: Option<(i128, u64, usize, usize, ListScore)> = None;
-            for list in 0..state.lists.len() {
-                for pos in 0..=state.lists[list].len() {
-                    polled = polled.wrapping_add(1);
-                    if polled.is_multiple_of(1024) && stop.load(Ordering::Relaxed) {
-                        return false;
-                    }
-                    let candidate = InsertView::new(&state.lists[list], pos, item);
-                    per.metrics.record_candidate();
-                    let next = trial_list_score_view(per, state, list, &candidate, None, &mut scratch);
-                    let global_delta = per.globals.delta(&state.item_list, &[(item, list)]);
-                    let cost = score_scalar(&score_with_replaced_list(per, state, list, &next, &candidate, global_delta, &mut scratch));
-                    let tie = mix64(seed ^ (item as i64 as u64) ^ ((list as u64) << 32) ^ pos as u64);
-                    let ins = topk.partition_point(|&c| c <= cost);
-                    if ins < k {
-                        topk.insert(ins, cost);
-                        topk.truncate(k);
-                    }
-                    if best_place.as_ref().is_none_or(|&(bc, bt, _, _, _)| cost < bc || (cost == bc && tie < bt)) {
-                        best_place = Some((cost, tie, list, pos, next));
-                    }
-                }
-            }
-            let Some((bcost, btie, blist, bpos, bscore)) = best_place else {
-                return false; // nowhere to put this item -> repair fails
-            };
-            // Sum of (i-th best - best) over the next k-1 homes; a missing
-            // alternative is charged a large penalty so scarce-option items win.
-            const MISS: i128 = 1 << 60;
-            let mut regret: i128 = 0;
-            for i in 1..k {
-                let c = topk.get(i).copied().unwrap_or(bcost + MISS);
-                regret = regret.saturating_add(c - bcost);
-            }
-            if choice.as_ref().is_none_or(|&(_, r, t, _, _, _)| regret > r || (regret == r && btie < t)) {
-                choice = Some((idx, regret, btie, blist, bpos, bscore));
-            }
-        }
-        let (idx, _, _, list, pos, score) = choice.expect("pending is non-empty");
-        let item = pending.swap_remove(idx);
-        state.lists[list].insert(pos, item);
-        state.rescore(per, list);
-        debug_assert_eq!(state.scores[list].violation, score.violation);
-        debug_assert_eq!(state.scores[list].objectives, score.objectives);
-        state.set_item_list(per, item, list);
-        state.global_viol = per.globals.total(&state.item_list);
-    }
-    true
-}
-
-fn descend_lns_candidate(per: &PerList, state: &mut State, stop: &AtomicBool, max_steps: usize) {
-    let mut memory = SearchMemory::new(state.lists.len());
-    for _ in 0..max_steps {
-        if stop.load(Ordering::Relaxed) {
-            return;
-        }
-        let Some(mv) = best_improving_move(per, state, stop, &mut memory) else {
-            return;
-        };
-        apply_move(per, state, mv);
-        memory.reset_touched(mv);
-    }
-}
-
-fn routing_lns(
-    model: &CollectionModel,
-    per: &PerList,
-    incumbent: &[Vec<i32>],
-    seed: u64,
-    since_improve: u64,
-    stop: &AtomicBool,
-) -> Option<State> {
-    if !per.has_edges || stop.load(Ordering::Relaxed) {
-        return None;
-    }
-    let total: usize = incumbent.iter().map(Vec::len).sum();
-    if total == 0 {
-        return None;
-    }
-
-    let pressure = since_improve.min(20) as usize;
-    let jitter = (mix64(seed) % 13) as usize;
-    let destroy_pct = (12 + pressure + jitter).min(45);
-    let target = (total * destroy_pct).div_ceil(100).clamp(1, total);
-    let mut lists = incumbent.to_vec();
-    // Shaw removal when a candidate (edge-distance) structure is available, else
-    // fall back to random segment destroy. `QAYD_ROUTING_SHAW=0` forces random.
-    let removed = match &per.candidates {
-        Some(candidates) if std::env::var("QAYD_ROUTING_SHAW").as_deref() != Ok("0") => destroy_shaw(&mut lists, candidates, target, seed),
-        _ => destroy_route_segments(&mut lists, target, seed),
-    };
-    if removed.is_empty() {
-        return None;
-    }
-
-    let mut state = State::from_lists(model, per, lists);
-    // Regret-k repair when `QAYD_ROUTING_REGRET=k` (k>=2); otherwise greedy
-    // cheapest-insertion. Regret looks ahead at the competition for each slot.
-    let repair_seed = seed ^ 0xA076_1D64_78BD_642F;
-    let repaired = match std::env::var("QAYD_ROUTING_REGRET").ok().and_then(|v| v.parse::<usize>().ok()) {
-        Some(k) if k >= 2 => repair_regret(per, &mut state, &removed, k, repair_seed, stop),
-        _ => repair_lns(per, &mut state, &removed, repair_seed, stop),
-    };
-    if !repaired {
-        return None;
-    }
-    state = State::from_lists(model, per, state.lists);
-    debug_assert_eq!(state.lists.iter().map(Vec::len).sum::<usize>(), model.items.len());
-
-    let descent_steps = (removed.len() * 2).clamp(8, 64);
-    descend_lns_candidate(per, &mut state, stop, descent_steps);
-    Some(state)
+/// arithmetic. Violation dominates the primary objective tier.
+pub(super) fn score_scalar(score: &Score) -> i128 {
+    (score.violation as i128) * (1i128 << 50) + i128::from(score.tiers.first().copied().unwrap_or(0))
 }
 
 /// Solve a collection model with constraint-based local search until `stop`.
@@ -987,9 +904,9 @@ pub fn solve_collection_profiled(
 /// visiting-order sequence per list variable, from a caller's constructive
 /// heuristic -- instead of the greedy random partition. Universe items the hint
 /// omits are placed in the last list (the pool on an optional model, so unhinted
-/// nodes stay droppable). The hint seeds only the first incumbent; GRASP restarts
-/// still diversify from fresh random partitions, and the best incumbent (possibly
-/// the hint itself) is always retained.
+/// nodes stay droppable). The hint seeds the initial incumbent; adaptive
+/// destroy/repair passes diversify from it, and the best incumbent (possibly the
+/// hint itself) is always retained.
 pub fn solve_collection_hinted(
     model: &CollectionModel,
     seed: u64,
@@ -1099,7 +1016,7 @@ fn solve_collection_capped_internal(
     shuffle(&mut order, seed);
     // Warm start from the caller's hint when given (completed to a full
     // partition); otherwise the greedy random construction. Either way the search
-    // loop, restarts, and incumbent tracking below are identical.
+    // loop, ALNS controller, and incumbent tracking below are identical.
     let mut state = match hint {
         Some(h) => State::from_lists(model, &per, hint_partition(model, h)),
         None => State::greedy(model, &per, &order),
@@ -1110,25 +1027,10 @@ fn solve_collection_capped_internal(
     if best_feasible && per.tiers > 0 {
         report(tier_value(&per, &best_score, 0));
     }
-    // Local optima visited since the incumbent last improved. Descent moves do
-    // NOT reset it (otherwise a kick that descent immediately undoes would keep
-    // it at zero and the restart below would never fire). After enough fruitless
-    // local optima, restart from a fresh random partition (GRASP-style); until
-    // then, kick harder the longer the search has been stuck.
-    const RESTART_AFTER: u64 = 25;
-    const ROUTING_LNS_AFTER: u64 = 8;
-    let mut since_improve = 0u64;
+    let mut stagnant = 0u64;
     let mut iter = 0u64;
-    // When eager (default), a non-improving LNS pass does NOT reset the stuck
-    // counter, so LNS keeps firing every local optimum in [8, 25) and the GRASP
-    // restart can still eventually trigger; `QAYD_LS_LNS_EAGER=0` restores the
-    // original "reset on any LNS pass" behaviour (LNS fires once per stuck cycle).
-    let lns_eager = std::env::var("QAYD_LS_LNS_EAGER").as_deref() != Ok("0");
-    // Env-gated (`QAYD_LS_DEBUG`) diagnostics: how often the search reaches a
-    // local optimum, and how the perturbation budget splits across LNS / restart
-    // / kick. Zero runtime cost when the counters are optimised out of the hot
-    // path; printed once at loop exit.
-    let (mut local_optima, mut lns_calls, mut lns_ok, mut restarts, mut kicks) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut alns = AlnsController::new(n, &best_score);
+    let (mut local_optima, mut alns_candidates, mut alns_accepted) = (0u64, 0u64, 0u64);
 
     while !stop.load(Ordering::Relaxed) && iter < max_iters {
         iter += 1;
@@ -1137,7 +1039,7 @@ fn solve_collection_capped_internal(
                 apply_move(&per, &mut state, mv);
                 memory.reset_touched(mv);
                 if record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report) {
-                    since_improve = 0;
+                    stagnant = 0;
                 }
             }
             None => {
@@ -1146,41 +1048,36 @@ fn solve_collection_capped_internal(
                 }
                 local_optima += 1;
                 if record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report) {
-                    since_improve = 0;
+                    stagnant = 0;
                 } else {
-                    since_improve += 1;
+                    stagnant = stagnant.saturating_add(1);
                 }
-                if best_feasible && since_improve >= ROUTING_LNS_AFTER {
-                    lns_calls += 1;
-                    if let Some(candidate) =
-                        routing_lns(model, &per, &best_lists, seed ^ mix64(iter) ^ mix64(since_improve), since_improve, stop)
-                    {
-                        lns_ok += 1;
-                        // Eager: reset the stuck counter ONLY when the LNS actually
-                        // improved the incumbent, so a run of non-improving passes lets
-                        // `since_improve` climb toward `RESTART_AFTER` instead of pinning
-                        // it below and starving the GRASP restart. Non-eager: reset on
-                        // any LNS pass (original behaviour, one LNS per stuck cycle).
-                        let improved = record_state(&per, &candidate, &mut best_lists, &mut best_score, &mut best_feasible, report);
-                        if improved || !lns_eager {
-                            since_improve = 0;
-                        }
-                        state = candidate;
-                        memory.reset_all();
-                        continue;
-                    }
+
+                let penalties = per.bump_gls(&state);
+                alns.record_gls(penalties);
+
+                let operator_seed = seed ^ mix64(iter) ^ mix64(stagnant);
+                let choice = alns.choose(n, stagnant, operator_seed, iter);
+                let current_guided = full_score(&per, &state);
+                let current_raw = full_score_raw(&per, &state);
+                let Some(candidate) = build_candidate(model, &per, &state, choice, operator_seed, stop) else {
+                    alns.record_failed(choice.destroy, choice.repair);
+                    continue;
+                };
+                alns_candidates = alns_candidates.saturating_add(1);
+                let candidate_guided = full_score(&per, &candidate);
+                let candidate_raw = full_score_raw(&per, &candidate);
+                let improved_current = candidate_raw < current_raw;
+                let global_best = record_state(&per, &candidate, &mut best_lists, &mut best_score, &mut best_feasible, report);
+                let acceptance = alns.accept(&current_guided, &candidate_guided, &current_raw, &candidate_raw, operator_seed, iter);
+                if !matches!(acceptance, AcceptanceKind::Rejected) {
+                    alns_accepted = alns_accepted.saturating_add(1);
+                    state = candidate;
+                    memory.reset_all();
                 }
-                if since_improve >= RESTART_AFTER {
-                    restarts += 1;
-                    shuffle(&mut order, seed ^ mix64(iter));
-                    state = State::greedy(model, &per, &order);
-                    memory.reset_all();
-                    since_improve = 0;
-                } else {
-                    kicks += 1;
-                    let strength = 1 + (since_improve / 5) as usize;
-                    random_kick(&per, &mut state, seed ^ mix64(iter), strength);
-                    memory.reset_all();
+                alns.record(choice.destroy, choice.repair, acceptance, improved_current, global_best);
+                if global_best {
+                    stagnant = 0;
                 }
             }
         }
@@ -1189,12 +1086,12 @@ fn solve_collection_capped_internal(
     record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report);
 
     if std::env::var("QAYD_LS_DEBUG").is_ok() {
-        eprintln!("LS: iters={iter} local_optima={local_optima} lns_calls={lns_calls} lns_ok={lns_ok} restarts={restarts} kicks={kicks}");
+        eprintln!("LS: iters={iter} local_optima={local_optima} alns_candidates={alns_candidates} alns_accepted={alns_accepted}");
     }
 
-    // Report the objective values from the same score that drove the search, so
-    // they can never disagree with the accepted solution. When infeasible they
-    // are best-effort; `feasible` is the signal to trust.
+    // Report objective values from the exact unpenalized incumbent score. GLS
+    // only guides moves, so it can never leak into the public result. When
+    // infeasible these values are best-effort; `feasible` is the signal to trust.
     let objectives = objective_values(&per, &best_score);
     let solution = CollectionSolution {
         lists: best_lists,
@@ -1204,6 +1101,7 @@ fn solve_collection_capped_internal(
         presences: Vec::new(),
         machines: Vec::new(),
     };
+    per.metrics.record_alns(alns.metrics());
     let metrics = per.metrics.snapshot(started.map(|instant| instant.elapsed()).unwrap_or_default());
     (solution, metrics)
 }

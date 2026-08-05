@@ -68,6 +68,11 @@ Priority order: correct, simple, fast.
   objective improvements without proving optimality. It uses local scoring for
   common constraints, constructive starts for guarded table/element patterns,
   guided local search, and focused repair for simple Boolean exact-cover rows.
+- **Adaptive ordered-list search.** List, routing, sequencing, and packing models
+  use ALNS with online-scored Shaw, segment, and worst removals plus greedy,
+  regret-2, and regret-3 insertion. Simulated annealing and late acceptance
+  preserve diversification, while GLS penalties steer violated and objective
+  list reductions.
 - **Beta MiniZinc support.** The `qayd-fzn` driver speaks the MiniZinc solver protocol,
   so it can be used as a backend for the MiniZinc CLI and IDE. See
   [the MiniZinc integration notes](frontends/flatzinc/minizinc/README.md).

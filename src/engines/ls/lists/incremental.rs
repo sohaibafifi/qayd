@@ -46,6 +46,41 @@ impl ListView for Vec<i32> {
     }
 }
 
+/// Speculative view with one position removed from an accepted list.
+pub(super) struct RemoveView<'a> {
+    base: &'a [i32],
+    pos: usize,
+}
+
+impl<'a> RemoveView<'a> {
+    pub(super) fn new(base: &'a [i32], pos: usize) -> Self {
+        debug_assert!(pos < base.len());
+        Self { base, pos }
+    }
+}
+
+impl ListView for RemoveView<'_> {
+    fn len(&self) -> usize {
+        self.base.len() - 1
+    }
+
+    fn at(&self, index: usize) -> i32 {
+        if index < self.pos {
+            self.base[index]
+        } else {
+            self.base[index + 1]
+        }
+    }
+
+    fn common_prefix_len(&self, _old: &[i32]) -> usize {
+        self.pos
+    }
+
+    fn common_suffix_len(&self, _old: &[i32], _prefix: usize) -> usize {
+        self.base.len() - self.pos - 1
+    }
+}
+
 pub(super) struct InsertView<'a> {
     base: &'a [i32],
     pos: usize,

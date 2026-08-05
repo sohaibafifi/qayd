@@ -3,14 +3,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::eval::{eval_expr, violation_of, INFEASIBLE};
 use super::incremental::{EvalScratch, ListView};
 use super::local_search::{
-    full_score, full_score_exact_lists, list_score_exact, score_with_replacements, tier_values, ListScore, PerList, ReductionDeltaKind,
-    Score, State, TrialList,
+    full_score, full_score_exact_lists, full_score_raw, list_score_exact, score_with_replacements, tier_values, ConstraintViolations,
+    ListScore, ObjectiveReductionValues, PerList, ReductionDeltaKind, ReductionValues, Score, State, TrialList,
 };
 use crate::mix64;
 use crate::model::list::{CollectionModel, Iterable, Reduction};
 
 pub(super) fn snapshot(per: &PerList, state: &State) -> (Vec<Vec<i32>>, Score, bool) {
-    let score = full_score(per, state);
+    let score = full_score_raw(per, state);
     let feasible = score.violation == 0;
     (state.lists.clone(), score, feasible)
 }
@@ -457,23 +457,43 @@ pub(super) fn trial_list_score_view(
     let old = &state.lists[idx];
     let caches = &state.caches[idx];
     let mut violation = 0i64;
+    let mut undefined_violation = 0i64;
     let mut objectives = tier_values(per.tiers, 0);
+    let mut objective_reductions = ObjectiveReductionValues::with_capacity(per.tiers);
     for (tier, slot) in objectives.iter_mut().enumerate() {
+        let mut values = ReductionValues::with_capacity(per.objective[idx][tier].len());
         for ((reduction, kind), cache) in per.objective[idx][tier].iter().zip(&per.objective_delta[idx][tier]).zip(&caches.objective[tier])
         {
             match candidate_reduction_value(per, reduction, *kind, cache, old, candidate, edit, scratch) {
-                Some(value) => *slot = slot.saturating_add(value),
-                None => violation = violation.saturating_add(INFEASIBLE),
+                Some(value) => {
+                    *slot = slot.saturating_add(value);
+                    values.push(Some(value));
+                }
+                None => {
+                    violation = violation.saturating_add(INFEASIBLE);
+                    undefined_violation = undefined_violation.saturating_add(INFEASIBLE);
+                    values.push(None);
+                }
+            }
+        }
+        objective_reductions.push(values);
+    }
+    let mut constraint_violations = ConstraintViolations::with_capacity(per.constraints[idx].len());
+    for ((constraint, kind), cache) in per.constraints[idx].iter().zip(&per.constraint_delta[idx]).zip(&caches.constraints) {
+        match candidate_reduction_value(per, &constraint.reduction, *kind, cache, old, candidate, edit, scratch) {
+            Some(value) => {
+                let constraint_violation = violation_of(value, constraint.op, constraint.rhs);
+                violation = violation.saturating_add(constraint_violation);
+                constraint_violations.push(constraint_violation);
+            }
+            None => {
+                violation = violation.saturating_add(INFEASIBLE);
+                undefined_violation = undefined_violation.saturating_add(INFEASIBLE);
+                constraint_violations.push(0);
             }
         }
     }
-    for ((constraint, kind), cache) in per.constraints[idx].iter().zip(&per.constraint_delta[idx]).zip(&caches.constraints) {
-        match candidate_reduction_value(per, &constraint.reduction, *kind, cache, old, candidate, edit, scratch) {
-            Some(value) => violation = violation.saturating_add(violation_of(value, constraint.op, constraint.rhs)),
-            None => violation = violation.saturating_add(INFEASIBLE),
-        }
-    }
-    ListScore { violation, objectives }
+    ListScore { violation, objectives, constraint_violations, objective_reductions, undefined_violation }
 }
 
 fn trial_list_score(per: &PerList, state: &State, idx: usize, edit: Edit, scratch: &mut EvalScratch) -> ListScore {
@@ -1101,40 +1121,4 @@ pub(super) fn shuffle(order: &mut [usize], seed: u64) {
         let j = (mix64(seed.wrapping_add(i as u64)) % (i as u64 + 1)) as usize;
         order.swap(i, j);
     }
-}
-
-/// Move `strength` random items, each to a random other list, to escape a local
-/// minimum. A larger strength is a bigger perturbation for a deeper basin.
-pub(super) fn random_kick(per: &PerList, state: &mut State, seed: u64, strength: usize) {
-    if state.lists.len() < 2 {
-        return;
-    }
-    for step in 0..strength.max(1) {
-        let s = seed ^ mix64(step as u64);
-        let total: usize = state.lists.iter().map(Vec::len).sum();
-        if total == 0 {
-            return;
-        }
-        let mut pick = (mix64(s) % total as u64) as usize;
-        let mut src = 0;
-        let mut src_pos = 0;
-        for (r, l) in state.lists.iter().enumerate() {
-            if pick < l.len() {
-                src = r;
-                src_pos = pick;
-                break;
-            }
-            pick -= l.len();
-        }
-        let dst = (mix64(s ^ 0x9E37) % state.lists.len() as u64) as usize;
-        if dst == src {
-            continue;
-        }
-        let item = state.lists[src].remove(src_pos);
-        state.lists[dst].push(item);
-        state.rescore(per, src);
-        state.rescore(per, dst);
-        state.set_item_list(per, item, dst);
-    }
-    state.global_viol = per.globals.total(&state.item_list);
 }

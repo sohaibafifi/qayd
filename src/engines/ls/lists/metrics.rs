@@ -8,6 +8,33 @@ const ITERABLE_KINDS: usize = 6;
 const REDUCE_OP_KINDS: usize = 6;
 const REDUCTION_KINDS: usize = ITERABLE_KINDS * REDUCE_OP_KINDS;
 
+/// Statistics for one adaptive destroy or repair operator.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AdaptiveOperatorMetrics {
+    pub name: String,
+    pub uses: u64,
+    pub accepted: u64,
+    pub improvements: u64,
+    pub global_bests: u64,
+    /// Final roulette weight, scaled by 1,000.
+    pub weight_milli: u64,
+}
+
+/// Adaptive large-neighborhood-search statistics for one list search.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AlnsSearchMetrics {
+    pub iterations: u64,
+    pub accepted: u64,
+    pub improving: u64,
+    pub global_bests: u64,
+    pub simulated_annealing_accepts: u64,
+    pub late_acceptance_accepts: u64,
+    pub gls_updates: u64,
+    pub gls_penalties: u64,
+    pub destroy: Vec<AdaptiveOperatorMetrics>,
+    pub repair: Vec<AdaptiveOperatorMetrics>,
+}
+
 /// Iterable family reported by the ordered-list local-search profiler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListIterableKind {
@@ -127,6 +154,7 @@ pub struct ListSearchMetrics {
     /// records complete scans; later incremental scans can record suffixes here.
     pub scan_recomputations: u64,
     pub scan_recomputed_steps: u64,
+    pub alns: AlnsSearchMetrics,
     pub reductions: Vec<ReductionSearchMetrics>,
 }
 
@@ -184,6 +212,30 @@ impl fmt::Display for ListSearchMetrics {
             self.scan_recomputed_steps,
             self.average_recomputed_scan_steps()
         )?;
+        writeln!(
+            f,
+            "  alns-iterations={} accepted={} improving={} global-bests={} sa-accepts={} late-accepts={} gls-updates={} gls-penalties={}",
+            self.alns.iterations,
+            self.alns.accepted,
+            self.alns.improving,
+            self.alns.global_bests,
+            self.alns.simulated_annealing_accepts,
+            self.alns.late_acceptance_accepts,
+            self.alns.gls_updates,
+            self.alns.gls_penalties
+        )?;
+        for operator in self.alns.destroy.iter().chain(&self.alns.repair) {
+            writeln!(
+                f,
+                "  alns-operator={} uses={} accepted={} improvements={} global-bests={} weight={:.3}",
+                operator.name,
+                operator.uses,
+                operator.accepted,
+                operator.improvements,
+                operator.global_bests,
+                operator.weight_milli as f64 / 1_000.0
+            )?;
+        }
         for reduction in &self.reductions {
             writeln!(
                 f,
@@ -227,6 +279,7 @@ struct RawMetrics {
     full_trials: u64,
     scan_recomputations: u64,
     scan_recomputed_steps: u64,
+    alns: AlnsSearchMetrics,
     reductions: [RawReductionMetrics; REDUCTION_KINDS],
 }
 
@@ -238,6 +291,7 @@ impl Default for RawMetrics {
             full_trials: 0,
             scan_recomputations: 0,
             scan_recomputed_steps: 0,
+            alns: AlnsSearchMetrics::default(),
             reductions: [RawReductionMetrics::default(); REDUCTION_KINDS],
         }
     }
@@ -312,6 +366,12 @@ impl MetricsRecorder {
         }
     }
 
+    pub(super) fn record_alns(&self, metrics: AlnsSearchMetrics) {
+        if let Some(raw) = &self.raw {
+            raw.borrow_mut().alns = metrics;
+        }
+    }
+
     pub(super) fn snapshot(&self, elapsed: Duration) -> ListSearchMetrics {
         let Some(raw) = &self.raw else {
             return ListSearchMetrics::default();
@@ -343,6 +403,7 @@ impl MetricsRecorder {
             full_recompute_trial_list_evaluations: raw.full_trials,
             scan_recomputations: raw.scan_recomputations,
             scan_recomputed_steps: raw.scan_recomputed_steps,
+            alns: raw.alns.clone(),
             reductions,
         }
     }
