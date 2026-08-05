@@ -1,71 +1,161 @@
-"""Capacitated vehicle routing with the routing convenience API.
+"""Capacitated VRP through the routing convenience API.
 
-Instance: set ``QAYD_VRP_INSTANCE`` to any CVRPLIB ``.vrp`` file. If it is not
-set, the script tries the local scratch path
-``data/vrplib/CVRP/X-n101-k25.vrp``. More at http://vrp.galgos.inf.puc-rio.br.
-Tune time via ``QAYD_VRP_T``; trace with ``QAYD_VERBOSE=1``.
+The command is identical to ``routing/native/vrp.py``. Without a positional
+file it generates the same deterministic CVRP. With a CVRPLIB file it solves
+that instance directly:
+
+    uv run examples/python/routing/api/vrp.py X-n101-k25.vrp --threads 4
 """
 
-import os
+import argparse
+import contextlib
+import json
+import math
+import sys
+import time
+from random import Random
 
 import qayd as cp
-from qayd.datasets import read_cvrplib
+from qayd.datasets import read_cvrplib, read_vrp_solution
 
-here = os.path.dirname(os.path.abspath(__file__))
-repo_root = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))
-path = os.environ.get(
-    "QAYD_VRP_INSTANCE",
-    os.path.join(repo_root, "data", "vrplib", "CVRP", "X-n101-k25.vrp"),
-)
-time_limit = int(os.environ.get("QAYD_VRP_T", "10"))
 
-if not os.path.exists(path):
-    raise SystemExit("set QAYD_VRP_INSTANCE to a CVRPLIB .vrp file")
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("instance", nargs="?")
+parser.add_argument("--customers", type=int, default=30)
+parser.add_argument("--vehicles", type=int)
+parser.add_argument("--capacity", type=int, default=40, help="generated-instance capacity")
+parser.add_argument("--time-limit", type=int, default=10)
+parser.add_argument("--threads", type=int, default=1)
+parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--engine", choices=("auto", "exact", "ls"), default="ls")
+parser.add_argument("--solution", help="VRP solution file used as an LS warm start")
+parser.add_argument("--verbose", action="store_true")
+parser.add_argument("--json", action="store_true", help="emit one machine-readable result")
+args = parser.parse_args()
 
-inst = read_cvrplib(path)
-name = inst.name
-depot = inst.depot
-capacity = inst.capacity
-demand = list(inst.demands)
-customer_ids = list(inst.customers)
-dist = [list(row) for row in inst.edge_weights]
+if args.threads <= 0 or args.time_limit < 0 or args.seed < 0:
+    raise SystemExit("threads must be positive; time limit and seed must be non-negative")
 
-min_k = inst.vehicles or -(-sum(demand) // capacity)
-k = int(os.environ.get("QAYD_VRP_K", str(min_k)))
+instance = read_cvrplib(args.instance) if args.instance else None
+if instance is None:
+    n = args.customers
+    rng = Random(args.seed)
+    coordinates = [(50, 50)] + [(rng.randint(0, 100), rng.randint(0, 100)) for _ in range(n)]
+    demand = [0] + [rng.randint(1, 9) for _ in range(n)]
+    distance = [
+        [round(math.hypot(x1 - x2, y1 - y2)) for x2, y2 in coordinates]
+        for x1, y1 in coordinates
+    ]
+    depot = 0
+    customer_ids = list(range(1, n + 1))
+    capacity = args.capacity
+    vehicles = args.vehicles or (-(-sum(demand) // capacity) + 1)
+    name = f"generated-cvrp-n{n}"
+    node_ids = list(range(n + 1))
+    best_known = None
+else:
+    demand = list(instance.demands)
+    distance = [list(row) for row in instance.edge_weights]
+    depot = instance.depot
+    customer_ids = list(instance.customers)
+    capacity = instance.capacity
+    vehicles = args.vehicles or instance.vehicles
+    if vehicles is None:
+        raise SystemExit("instance name has no -kN fleet; pass --vehicles")
+    name = instance.name
+    node_ids = list(instance.node_ids)
+    best_known = instance.best_known
+
+if vehicles <= 0 or capacity <= 0:
+    raise SystemExit("vehicle count and capacity must be positive")
+if args.solution and (instance is None or args.engine != "ls"):
+    raise SystemExit("--solution requires a real instance and --engine ls")
 
 model = cp.Model()
 customers = model.customers(customer_ids)
 for customer in customers:
     customer.demand = demand[customer.id]
-
-routes = model.routes(customers, vehicles=k, depot=depot, travel=dist)
+routes = model.routes(customers, vehicles=vehicles, depot=depot, travel=distance)
 for route in routes:
     model.add(route.sum(lambda customer: customer.demand) <= capacity)
-model.minimize(routes.sum(lambda route: route.distance()))
+model.minimize(routes.total_distance())
 
-solution = model.solve(
-    time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1"
-)
+hint = None
+if args.solution:
+    hint = [list(route) for route in read_vrp_solution(args.solution, instance=instance).routes]
+solve_options = {
+    "engine": args.engine,
+    "threads": args.threads,
+    "time_limit": args.time_limit,
+    "seed": args.seed,
+    "verbose": args.verbose,
+}
+if hint is not None:
+    solve_options["list_hint"] = hint
+started = time.perf_counter()
+output = contextlib.redirect_stdout(sys.stderr) if args.json else contextlib.nullcontext()
+with output:
+    solution = model.solve(**solve_options)
+elapsed = time.perf_counter() - started
 
-gap = f"  (known optimum {inst.best_known})" if inst.best_known is not None else ""
-
-print(
-    f"instance: {name}  customers: {len(customers)}  vehicles: {k}  capacity: {capacity}"
-)
 if solution.lists is None:
-    raise SystemExit(
-        f"status: {solution.status} - no feasible solution within {time_limit}s"
-    )
-fleet = sum(1 for route in solution.lists if route)
-distance = solution.objectives[-1]
-print(f"status: {solution.status}  fleet: {fleet}  total distance: {distance}{gap}")
-for r, route in enumerate(solution.lists):
-    if not route:
-        continue
-    load = sum(demand[c] for c in route)
-    print(f"  route {r}: load {load:5d}  {[depot, *route, depot]}")
+    record = {
+        "instance": name,
+        "status": solution.status,
+        "elapsed_seconds": elapsed,
+        "objectives": [],
+        "dual_bound": solution.dual_bound,
+        "absolute_gap": solution.absolute_gap,
+        "relative_gap": solution.relative_gap,
+        "bound_method": solution.bound_method,
+    }
+    print(json.dumps(record, sort_keys=True) if args.json else f"instance: {name}  status: {solution.status}")
+    raise SystemExit(0)
 
-served = sorted(c for route in solution.lists for c in route)
+served = sorted(customer for route in solution.lists for customer in route)
 assert served == sorted(customer_ids), "every customer served exactly once"
+route_records = []
+total_distance = 0
 for route in solution.lists:
-    assert sum(demand[c] for c in route) <= capacity, "capacity respected"
+    load = sum(demand[customer] for customer in route)
+    assert load <= capacity, "capacity respected"
+    sequence = [depot, *route, depot]
+    route_distance = sum(distance[before][after] for before, after in zip(sequence, sequence[1:]))
+    total_distance += route_distance
+    route_records.append({"nodes": [node_ids[customer] for customer in route], "load": load, "distance": route_distance})
+assert list(solution.objectives) == [total_distance], "reported objective matches replay"
+
+record = {
+    "instance": name,
+    "status": solution.status,
+    "customers": len(customer_ids),
+    "vehicles": vehicles,
+    "vehicles_used": sum(bool(route) for route in solution.lists),
+    "capacity": capacity,
+    "objectives": [total_distance],
+    "dual_bound": solution.dual_bound,
+    "absolute_gap": solution.absolute_gap,
+    "relative_gap": solution.relative_gap,
+    "bound_method": solution.bound_method,
+    "best_known": best_known,
+    "elapsed_seconds": elapsed,
+    "seed": args.seed,
+    "threads": args.threads,
+    "engine": args.engine,
+    "routes": route_records,
+    "verified": True,
+}
+if args.json:
+    print(json.dumps(record, sort_keys=True))
+else:
+    known = f"  known optimum: {best_known}" if best_known is not None else ""
+    certified = (
+        f"  dual: {solution.dual_bound}  gap: {100 * solution.relative_gap:.2f}%  bound: {solution.bound_method}"
+        if solution.dual_bound is not None
+        else "  dual: unavailable"
+    )
+    print(f"instance: {name}  customers: {len(customer_ids)}  vehicles: {vehicles}  capacity: {capacity}")
+    print(f"status: {solution.status}  distance: {total_distance}{known}{certified}  elapsed: {elapsed:.3f}s")
+    for index, route in enumerate(route_records):
+        if route["nodes"]:
+            print(f"  route {index}: load {route['load']:5d}  {[node_ids[depot], *route['nodes'], node_ids[depot]]}")

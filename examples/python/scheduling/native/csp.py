@@ -6,16 +6,21 @@ The sequence is one permutation list over the cars. For each option, a
 ``cp.windows`` reduction sums the option flag over each window and penalises the
 excess over the limit.
 
-Tune via ``QAYD_CSP_N`` / ``QAYD_CSP_T``; trace with ``QAYD_VERBOSE=1``.
+Use ``--cars`` and ``--time-limit`` to control the generated instance.
 """
 
-import os
+import argparse
 from random import Random
 
 import qayd as cp
 
-n = int(os.environ.get("QAYD_CSP_N", "30"))
-time_limit = int(os.environ.get("QAYD_CSP_T", "8"))
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--cars", type=int, default=30)
+parser.add_argument("--time-limit", type=int, default=8)
+parser.add_argument("--verbose", action="store_true")
+args = parser.parse_args()
+n = args.cars
+time_limit = args.time_limit
 
 rng = Random(0)
 # Three options, each with a p/q capacity rule. options[o] is the flag per car.
@@ -47,7 +52,7 @@ model.add(
     <= 0
 )
 
-solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
+solution = model.solve(time_limit=time_limit, verbose=args.verbose)
 
 print(f"cars: {n}  options: {len(rules)}  status: {solution.status}")
 if solution.lists is None:

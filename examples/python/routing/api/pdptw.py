@@ -1,17 +1,21 @@
 """Pickup and delivery with capacity and precedence, using visit views.
 
-Tune via ``QAYD_PDPTW_N`` (requests) / ``QAYD_PDPTW_T``; trace
-``QAYD_VERBOSE=1``.
+Use ``--requests`` and ``--time-limit`` to control the generated instance.
 """
 
+import argparse
 import math
-import os
 from random import Random
 
 import qayd as cp
 
-reqs = int(os.environ.get("QAYD_PDPTW_N", "6"))
-time_limit = int(os.environ.get("QAYD_PDPTW_T", "8"))
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--requests", type=int, default=6)
+parser.add_argument("--time-limit", type=int, default=8)
+parser.add_argument("--verbose", action="store_true")
+args = parser.parse_args()
+reqs = args.requests
+time_limit = args.time_limit
 
 rng = Random(0)
 n = 2 * reqs
@@ -40,7 +44,7 @@ for pickup, delivery in pairs:
 model.minimize(routes.used_count())
 model.then_minimize(routes.sum(lambda route: route.distance()))
 
-solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
+solution = model.solve(time_limit=time_limit, verbose=args.verbose)
 
 print(f"requests: {reqs}  capacity: {capacity}  status: {solution.status}")
 if solution.lists is None:

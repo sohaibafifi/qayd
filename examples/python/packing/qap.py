@@ -6,16 +6,21 @@ Modeled with a single list variable that is a permutation of the facilities over
 the locations (``list_vars(facilities, count=1)`` puts every facility in the one list).
 The quadratic objective is a ``pos_pairs`` reduction over ordered position pairs.
 
-Tune via ``QAYD_QAP_N`` / ``QAYD_QAP_T``; trace with ``QAYD_VERBOSE=1``.
+Use ``--size`` and ``--time-limit`` to control the generated instance.
 """
 
-import os
+import argparse
 from random import Random
 
 import qayd as cp
 
-n = int(os.environ.get("QAYD_QAP_N", "10"))
-time_limit = int(os.environ.get("QAYD_QAP_T", "5"))
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--size", type=int, default=10)
+parser.add_argument("--time-limit", type=int, default=5)
+parser.add_argument("--verbose", action="store_true")
+args = parser.parse_args()
+n = args.size
+time_limit = args.time_limit
 
 rng = Random(0)
 dist = [[0 if i == j else rng.randint(1, 20) for j in range(n)] for i in range(n)]
@@ -28,7 +33,7 @@ model = cp.Model()
 (p,) = model.list_vars(list(range(n)), count=1)  # p[i] = facility placed at location i
 model.minimize(cp.pos_pairs(p, lambda a, b, i, j: A[i][j] * B[a][b]))
 
-solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
+solution = model.solve(time_limit=time_limit, verbose=args.verbose)
 
 print(f"facilities/locations: {n}  status: {solution.status}")
 if solution.lists is None:

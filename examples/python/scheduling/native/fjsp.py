@@ -8,18 +8,24 @@ makespan.
 on the same machine from overlapping; ``model.precedence`` posts the job-order
 chain. ``solution.machines`` reports the chosen machine per op.
 
-Tune via ``QAYD_FJSP_J`` / ``QAYD_FJSP_M`` / ``QAYD_FJSP_T``.
+Use ``--jobs``, ``--machines`` and ``--time-limit`` to control the example.
 """
 
-import os
+import argparse
 from random import Random
 
 import qayd as cp
 
-jobs = int(os.environ.get("QAYD_FJSP_J", "4"))
-machines = int(os.environ.get("QAYD_FJSP_M", "3"))
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--jobs", type=int, default=4)
+parser.add_argument("--machines", type=int, default=3)
+parser.add_argument("--time-limit", type=int, default=10)
+parser.add_argument("--verbose", action="store_true")
+args = parser.parse_args()
+jobs = args.jobs
+machines = args.machines
 ops_per_job = machines
-time_limit = int(os.environ.get("QAYD_FJSP_T", "10"))
+time_limit = args.time_limit
 
 rng = Random(0)
 # Each op is eligible on a random non-empty subset of machines, each with its
@@ -41,7 +47,7 @@ for j in range(jobs):
 model.no_overlap_by_machine()
 model.minimize_makespan(ivs)
 
-solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
+solution = model.solve(time_limit=time_limit, verbose=args.verbose)
 
 n = jobs * ops_per_job
 print(f"jobs: {jobs}  machines: {machines}  ops: {n}  status: {solution.status}")

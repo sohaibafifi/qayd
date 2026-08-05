@@ -7,16 +7,21 @@ scan computes each plane's landing time ``max(earliest, prev_landing +
 separation[prev][cur])``; the objective sums the earliness/tardiness penalty via
 a ternary, and a second scan constrains landings to their deadline.
 
-Tune via ``QAYD_ALP_N`` / ``QAYD_ALP_T``; trace with ``QAYD_VERBOSE=1``.
+Use ``--planes`` and ``--time-limit`` to control the generated instance.
 """
 
-import os
+import argparse
 from random import Random
 
 import qayd as cp
 
-n = int(os.environ.get("QAYD_ALP_N", "8"))
-time_limit = int(os.environ.get("QAYD_ALP_T", "5"))
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--planes", type=int, default=8)
+parser.add_argument("--time-limit", type=int, default=5)
+parser.add_argument("--verbose", action="store_true")
+args = parser.parse_args()
+n = args.planes
+time_limit = args.time_limit
 
 rng = Random(0)
 earliest = [rng.randint(0, 20) for _ in range(n)]
@@ -49,7 +54,7 @@ model.minimize(
 # Hard latest-landing deadline.
 model.add(cp.scan_sum(order, step=land, emit=lambda cur, t, prev: cp.max(0, t - L[cur]), init=0, boundary=boundary) <= 0)
 
-solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
+solution = model.solve(time_limit=time_limit, verbose=args.verbose)
 
 print(f"planes: {n}  status: {solution.status}")
 if solution.lists is None:

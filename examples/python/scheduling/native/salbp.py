@@ -6,16 +6,21 @@ One list per station; the objective counts non-empty stations via ``cp.used``;
 ``model.precedence(a, b)`` posts the cross-station precedence ``station(a) <=
 station(b)``.
 
-Tune via ``QAYD_SALBP_N`` / ``QAYD_SALBP_T``; trace with ``QAYD_VERBOSE=1``.
+Use ``--tasks`` and ``--time-limit`` to control the generated instance.
 """
 
-import os
+import argparse
 from random import Random
 
 import qayd as cp
 
-n = int(os.environ.get("QAYD_SALBP_N", "12"))
-time_limit = int(os.environ.get("QAYD_SALBP_T", "5"))
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--tasks", type=int, default=12)
+parser.add_argument("--time-limit", type=int, default=5)
+parser.add_argument("--verbose", action="store_true")
+args = parser.parse_args()
+n = args.tasks
+time_limit = args.time_limit
 
 rng = Random(0)
 # Task ids are 1..n; index 0 unused so proc[i] reads by id.
@@ -35,7 +40,7 @@ for s in stations:
 for a, b in precedences:
     model.precedence(a, b)  # station(a) <= station(b)
 
-solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
+solution = model.solve(time_limit=time_limit, verbose=args.verbose)
 
 print(f"tasks: {n}  cycle time: {cycle}  precedences: {len(precedences)}  status: {solution.status}")
 if solution.lists is None:

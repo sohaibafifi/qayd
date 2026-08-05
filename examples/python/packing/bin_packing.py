@@ -5,17 +5,22 @@ per-bin capacity constraint, and a single objective: minimise the number of
 non-empty bins via ``cp.used``. This is the same partition-plus-capacity shape
 as CVRP, with the objective counting used lists instead of distance.
 
-Tune via ``QAYD_BPP_N`` / ``QAYD_BPP_T``; trace with ``QAYD_VERBOSE=1``.
+Use ``--items`` and ``--time-limit`` to control the generated instance.
 """
 
+import argparse
 import math
-import os
 from random import Random
 
 import qayd as cp
 
-n = int(os.environ.get("QAYD_BPP_N", "20"))
-time_limit = int(os.environ.get("QAYD_BPP_T", "5"))
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--items", type=int, default=20)
+parser.add_argument("--time-limit", type=int, default=5)
+parser.add_argument("--verbose", action="store_true")
+args = parser.parse_args()
+n = args.items
+time_limit = args.time_limit
 capacity = 100
 
 rng = Random(0)
@@ -31,7 +36,7 @@ model.minimize(cp.sum(cp.used(b) for b in bins))  # minimise non-empty bins
 for b in bins:
     model.add(cp.sum(b, lambda i: W[i]) <= capacity)   # each bin within capacity
 
-solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
+solution = model.solve(time_limit=time_limit, verbose=args.verbose)
 
 print(f"items: {n}  capacity: {capacity}  status: {solution.status}")
 if solution.lists is None:

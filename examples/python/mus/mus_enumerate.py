@@ -15,12 +15,16 @@ Scenario: scheduling a meeting from conflicting requests. Alice wants it early
 Two independent contradictions - so two MUSes, and four ways to keep a maximal
 consistent set of requests.
 
-Trace the solver with QAYD_VERBOSE=1.
+Use ``--time-limit`` to bound enumeration.
 """
 
-import os
+import argparse
 
 import qayd as cp
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--time-limit", type=int, default=8)
+args = parser.parse_args()
 
 MORNING, AFTERNOON = 0, 1
 
@@ -37,7 +41,7 @@ with model.soft("bob_morning"):
 with model.soft("bob_afternoon"):
     model.sum([time], ">=", AFTERNOON)
 
-time_limit = int(os.environ.get("QAYD_MUS_T", "8"))
+time_limit = args.time_limit
 requests = {"alice_early", "alice_late", "bob_morning", "bob_afternoon"}
 
 # One reason (single-MUS) versus all of them (MARCO enumeration).

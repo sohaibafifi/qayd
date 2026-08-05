@@ -9,7 +9,6 @@ a standard JSPLIB pair-format file to solve it:
 import argparse
 import contextlib
 import json
-import os
 import sys
 import time
 from random import Random
@@ -19,14 +18,14 @@ from qayd.datasets import read_jsplib
 
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("instance", nargs="?", default=os.environ.get("QAYD_JSSP_INSTANCE"))
-parser.add_argument("--jobs", type=int, default=int(os.environ.get("QAYD_JSSP_J", "4")))
-parser.add_argument("--machines", type=int, default=int(os.environ.get("QAYD_JSSP_M", "3")))
-parser.add_argument("--time-limit", type=int, default=int(os.environ.get("QAYD_JSSP_T", "8")))
-parser.add_argument("--threads", type=int, default=int(os.environ.get("QAYD_JSSP_THREADS", "1")))
-parser.add_argument("--seed", type=int, default=int(os.environ.get("QAYD_JSSP_SEED", "0")))
+parser.add_argument("instance", nargs="?")
+parser.add_argument("--jobs", type=int, default=4)
+parser.add_argument("--machines", type=int, default=3)
+parser.add_argument("--time-limit", type=int, default=8)
+parser.add_argument("--threads", type=int, default=1)
+parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--engine", choices=("auto", "exact", "ls"))
-parser.add_argument("--verbose", action="store_true", default=os.environ.get("QAYD_VERBOSE") == "1")
+parser.add_argument("--verbose", action="store_true")
 parser.add_argument("--json", action="store_true", help="emit one machine-readable result")
 args = parser.parse_args()
 
@@ -84,7 +83,9 @@ if not solution.starts:
         "elapsed_seconds": elapsed,
         "objectives": [],
         "dual_bound": solution.dual_bound,
+        "absolute_gap": solution.absolute_gap,
         "relative_gap": solution.relative_gap,
+        "bound_method": solution.bound_method,
     }
     print(json.dumps(record, sort_keys=True) if args.json else f"instance: {name}  status: {solution.status}")
     raise SystemExit(0)
@@ -130,9 +131,9 @@ if args.json:
     print(json.dumps(record, sort_keys=True))
 else:
     certified = (
-        f"  dual: {solution.dual_bound}  gap: {100 * solution.relative_gap:.2f}%"
+        f"  dual: {solution.dual_bound}  gap: {100 * solution.relative_gap:.2f}%  bound: {solution.bound_method}"
         if solution.dual_bound is not None
-        else ""
+        else "  dual: unavailable"
     )
     print(f"instance: {name}  jobs: {jobs}  machines: {machines}  status: {solution.status}")
     print(f"makespan: {makespan}{certified}  elapsed: {elapsed:.3f}s")

@@ -11,12 +11,16 @@ Scenario: two teams each demand at least 4 seats, but the shared room holds at
 most 5. The core is all three demands; the explanation pinpoints the two seat
 counts that overflow the room.
 
-Trace the solver with ``QAYD_VERBOSE=1``.
+Use ``--time-limit`` to bound explanation.
 """
 
-import os
+import argparse
 
 import qayd as cp
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--time-limit", type=int, default=8)
+args = parser.parse_args()
 
 model = cp.Model()
 team_a = model.int_var(0, 10, name="team_a")
@@ -29,7 +33,7 @@ with model.soft("demand_b"):
 with model.soft("room_capacity"):
     model.sum([team_a, team_b], "<=", 5)
 
-time_limit = int(os.environ.get("QAYD_MUS_T", "8"))
+time_limit = args.time_limit
 
 core = model.mus(time_limit=time_limit)
 if core is None:

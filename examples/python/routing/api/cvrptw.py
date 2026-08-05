@@ -1,63 +1,201 @@
-"""Capacitated vehicle routing with time windows, using per-customer visit views.
+"""Capacitated VRPTW through the routing convenience API.
 
-Tune via ``QAYD_CVRPTW_N`` / ``QAYD_CVRPTW_T``; trace with ``QAYD_VERBOSE=1``.
+The command is identical to ``routing/native/cvrptw.py``. Without a positional
+file it generates the same deterministic instance. A Solomon or Homberger file
+can be passed directly:
+
+    uv run examples/python/routing/api/cvrptw.py C101.txt --threads 4
 """
 
+import argparse
+import contextlib
+import json
 import math
-import os
+import sys
+import time
 from random import Random
 
 import qayd as cp
+from qayd.datasets import read_solomon, read_vrp_solution
 
-n = int(os.environ.get("QAYD_CVRPTW_N", "15"))
-time_limit = int(os.environ.get("QAYD_CVRPTW_T", "10"))
 
-rng = Random(0)
-coords = [(50, 50)] + [(rng.randint(0, 100), rng.randint(0, 100)) for _ in range(n)]
-demand = [0] + [rng.randint(1, 9) for _ in range(n)]
-service = [0] + [10 for _ in range(n)]
-dist = [[round(math.hypot(coords[i][0] - coords[j][0], coords[i][1] - coords[j][1])) for j in range(n + 1)] for i in range(n + 1)]
-earliest = [0] + [rng.randint(0, 60) for _ in range(n)]
-latest = [0] + [earliest[i] + 80 for i in range(1, n + 1)]
-capacity = 40
-min_k = -(-sum(demand) // capacity)
-k = min_k + 3
+def arguments():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("instance", nargs="?")
+    parser.add_argument("--customers", type=int, default=15)
+    parser.add_argument("--vehicles", type=int)
+    parser.add_argument("--time-limit", type=int, default=10)
+    parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--engine", choices=("auto", "exact", "ls"), default="ls")
+    parser.add_argument("--distance-scale", type=int, default=10)
+    parser.add_argument("--rounding", choices=("truncate", "nearest", "ceil"), default="truncate")
+    parser.add_argument("--solution", help="VRP solution file used as an LS warm start")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--json", action="store_true", help="emit one machine-readable result")
+    return parser.parse_args()
 
+
+args = arguments()
+if args.threads <= 0 or args.time_limit < 0 or args.seed < 0:
+    raise SystemExit("threads must be positive; time limit and seed must be non-negative")
+
+instance = read_solomon(args.instance) if args.instance else None
+if instance is None:
+    n = args.customers
+    rng = Random(args.seed)
+    coordinates = [(50, 50)] + [(rng.randint(0, 100), rng.randint(0, 100)) for _ in range(n)]
+    demand = [0] + [rng.randint(1, 9) for _ in range(n)]
+    service = [0] + [10 for _ in range(n)]
+    distance = [
+        [round(math.hypot(x1 - x2, y1 - y2)) for x2, y2 in coordinates]
+        for x1, y1 in coordinates
+    ]
+    earliest = [0] + [rng.randint(0, 60) for _ in range(n)]
+    latest = [1_000] + [earliest[index] + 80 for index in range(1, n + 1)]
+    capacity = 40
+    depot = 0
+    customer_ids = list(range(1, n + 1))
+    vehicles = args.vehicles or (-(-sum(demand) // capacity) + 3)
+    scale = 1
+    name = f"generated-vrptw-n{n}"
+    node_ids = list(range(n + 1))
+else:
+    if args.distance_scale <= 0:
+        raise SystemExit("distance scale must be positive")
+    scale = args.distance_scale
+    distance = [list(row) for row in instance.distance_matrix(scale=scale, rounding=args.rounding)]
+    demand = list(instance.demands)
+    service = [value * scale for value in instance.service_times]
+    earliest = [window[0] * scale for window in instance.time_windows]
+    latest = [window[1] * scale for window in instance.time_windows]
+    capacity = instance.capacity
+    depot = instance.depot
+    customer_ids = list(instance.customers)
+    vehicles = args.vehicles or instance.vehicles
+    name = instance.name
+    node_ids = list(instance.node_ids)
+
+if vehicles <= 0:
+    raise SystemExit("vehicle count must be positive")
+if args.solution and (instance is None or args.engine != "ls"):
+    raise SystemExit("--solution requires a real instance and --engine ls")
+
+D, E, L, S = cp.matrix(distance), cp.array(earliest), cp.array(latest), cp.array(service)
 model = cp.Model()
-customers = model.customers(range(1, n + 1))
+customers = model.customers(customer_ids)
 for customer in customers:
     customer.demand = demand[customer.id]
     customer.service = service[customer.id]
     customer.earliest = earliest[customer.id]
     customer.latest = latest[customer.id]
-
-routes = model.routes(customers, vehicles=k, depot=0, travel=dist)
-for customer in customers:
-    visit = routes[customer]
-    model.add(visit.start >= customer.earliest)
-    model.add(visit.start <= customer.latest)
+routes = model.routes(customers, vehicles=vehicles, depot=depot, travel=distance)
+model.minimize(routes.used_count())
+model.then_minimize(routes.total_distance())
 for route in routes:
     model.add(route.sum(lambda customer: customer.demand) <= capacity)
+    lateness = cp.scan_sum(
+        route._list,
+        step=lambda current, clock, previous: cp.max(E[current], clock + D[previous][current]) + S[current],
+        emit=lambda current, departure, previous: cp.max(0, departure - S[current] - L[current]),
+        init=earliest[depot],
+        boundary=depot,
+        end=depot,
+    )
+    model.add(lateness <= 0)
 
-model.minimize(routes.used_count())
-model.then_minimize(routes.sum(lambda route: route.distance()))
+hint = None
+if args.solution:
+    hint = [list(route) for route in read_vrp_solution(args.solution, instance=instance).routes]
+solve_options = {
+    "engine": args.engine,
+    "threads": args.threads,
+    "time_limit": args.time_limit,
+    "seed": args.seed,
+    "verbose": args.verbose,
+}
+if hint is not None:
+    solve_options["list_hint"] = hint
+started = time.perf_counter()
+output = contextlib.redirect_stdout(sys.stderr) if args.json else contextlib.nullcontext()
+with output:
+    solution = model.solve(**solve_options)
+elapsed = time.perf_counter() - started
 
-solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
-
-print(f"customers: {n}  vehicles<={k}  capacity: {capacity}  status: {solution.status}")
 if solution.lists is None:
-    raise SystemExit(f"status: {solution.status} - no feasible plan within {time_limit}s")
-fleet, distance = solution.objectives
-print(f"fleet: {fleet}  total distance: {distance}")
-for r, route in enumerate(solution.lists):
-    if not route:
-        continue
-    acc, prev = 0, 0
-    for c in route:
-        start = max(earliest[c], acc + dist[prev][c])
-        assert start <= latest[c], "every stop starts within its window"
-        acc = start + service[c]
-        prev = c
-    print(f"  route {r}: load {sum(demand[c] for c in route):3d}  {[0, *route, 0]}")
+    record = {
+        "instance": name,
+        "status": solution.status,
+        "elapsed_seconds": elapsed,
+        "objectives": [],
+        "dual_bound": solution.dual_bound,
+        "absolute_gap": solution.absolute_gap,
+        "relative_gap": solution.relative_gap,
+        "bound_method": solution.bound_method,
+    }
+    print(json.dumps(record, sort_keys=True) if args.json else f"instance: {name}  status: {solution.status}")
+    raise SystemExit(0)
 
-assert sorted(c for route in solution.lists for c in route) == list(range(1, n + 1))
+served = sorted(customer for route in solution.lists for customer in route)
+assert served == sorted(customer_ids), "every customer served exactly once"
+total_distance = 0
+route_records = []
+for route in solution.lists:
+    load = sum(demand[customer] for customer in route)
+    assert load <= capacity, "capacity respected"
+    clock, previous = earliest[depot], depot
+    starts = []
+    for customer in route:
+        start = max(earliest[customer], clock + distance[previous][customer])
+        assert start <= latest[customer], "every service starts within its time window"
+        starts.append(start)
+        clock = start + service[customer]
+        previous = customer
+    depot_return = max(earliest[depot], clock + distance[previous][depot])
+    assert depot_return <= latest[depot], "route returns within the depot window"
+    sequence = [depot, *route, depot]
+    route_distance = sum(distance[before][after] for before, after in zip(sequence, sequence[1:]))
+    total_distance += route_distance
+    route_records.append(
+        {
+            "nodes": [node_ids[customer] for customer in route],
+            "starts": [start / scale for start in starts],
+            "load": load,
+            "distance": route_distance / scale,
+        }
+    )
+
+fleet = sum(bool(route) for route in solution.lists)
+assert list(solution.objectives) == [fleet, total_distance], "reported objectives match replay"
+record = {
+    "instance": name,
+    "status": solution.status,
+    "customers": len(customer_ids),
+    "vehicles": vehicles,
+    "capacity": capacity,
+    "objectives": [fleet, total_distance],
+    "dual_bound": solution.dual_bound,
+    "absolute_gap": solution.absolute_gap,
+    "relative_gap": solution.relative_gap,
+    "bound_method": solution.bound_method,
+    "distance": total_distance / scale,
+    "elapsed_seconds": elapsed,
+    "seed": args.seed,
+    "threads": args.threads,
+    "engine": args.engine,
+    "routes": route_records,
+    "verified": True,
+}
+if args.json:
+    print(json.dumps(record, sort_keys=True))
+else:
+    certified = (
+        f"  dual: {solution.dual_bound}  gap: {100 * solution.relative_gap:.2f}%  bound: {solution.bound_method}"
+        if solution.dual_bound is not None
+        else "  dual: unavailable"
+    )
+    print(f"instance: {name}  customers: {len(customer_ids)}  vehicles<={vehicles}  capacity: {capacity}")
+    print(f"status: {solution.status}  fleet: {fleet}  distance: {total_distance / scale:g}{certified}  elapsed: {elapsed:.3f}s")
+    for index, route in enumerate(route_records):
+        if route["nodes"]:
+            print(f"  route {index}: load {route['load']:3d}  {[node_ids[depot], *route['nodes'], node_ids[depot]]}")

@@ -10,7 +10,6 @@ import argparse
 import contextlib
 import json
 import math
-import os
 import sys
 import time
 from random import Random
@@ -21,17 +20,17 @@ from qayd.datasets import read_solomon, read_vrp_solution
 
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("instance", nargs="?", default=os.environ.get("QAYD_CVRPTW_INSTANCE"))
-    parser.add_argument("--customers", type=int, default=int(os.environ.get("QAYD_CVRPTW_N", "15")))
+    parser.add_argument("instance", nargs="?")
+    parser.add_argument("--customers", type=int, default=15)
     parser.add_argument("--vehicles", type=int)
-    parser.add_argument("--time-limit", type=int, default=int(os.environ.get("QAYD_CVRPTW_T", "10")))
-    parser.add_argument("--threads", type=int, default=int(os.environ.get("QAYD_CVRPTW_THREADS", "1")))
-    parser.add_argument("--seed", type=int, default=int(os.environ.get("QAYD_CVRPTW_SEED", "0")))
+    parser.add_argument("--time-limit", type=int, default=10)
+    parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--engine", choices=("auto", "exact", "ls"), default="ls")
     parser.add_argument("--distance-scale", type=int, default=10)
     parser.add_argument("--rounding", choices=("truncate", "nearest", "ceil"), default="truncate")
     parser.add_argument("--solution", help="VRP solution file used as an LS warm start")
-    parser.add_argument("--verbose", action="store_true", default=os.environ.get("QAYD_VERBOSE") == "1")
+    parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--json", action="store_true", help="emit one machine-readable result")
     return parser.parse_args()
 
@@ -125,7 +124,9 @@ if solution.lists is None:
         "elapsed_seconds": elapsed,
         "objectives": [],
         "dual_bound": solution.dual_bound,
+        "absolute_gap": solution.absolute_gap,
         "relative_gap": solution.relative_gap,
+        "bound_method": solution.bound_method,
     }
     print(json.dumps(record, sort_keys=True) if args.json else f"instance: {name}  status: {solution.status}")
     raise SystemExit(0)
@@ -184,9 +185,9 @@ if args.json:
     print(json.dumps(record, sort_keys=True))
 else:
     certified = (
-        f"  dual: {solution.dual_bound}  gap: {100 * solution.relative_gap:.2f}%"
+        f"  dual: {solution.dual_bound}  gap: {100 * solution.relative_gap:.2f}%  bound: {solution.bound_method}"
         if solution.dual_bound is not None
-        else ""
+        else "  dual: unavailable"
     )
     print(f"instance: {name}  customers: {len(customers)}  vehicles<={vehicles}  capacity: {capacity}")
     print(f"status: {solution.status}  fleet: {fleet}  distance: {total_distance / scale:g}{certified}  elapsed: {elapsed:.3f}s")

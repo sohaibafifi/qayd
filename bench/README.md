@@ -60,14 +60,19 @@ campaign results: reported solve time is not a search-only measurement.
 
 ## Certified bounds and gaps
 
-The native VRP, VRPTW, JSSP, and RCPSP launchers include `dual_bound`,
+The API and native VRP, VRPTW, JSSP, and RCPSP launchers include `dual_bound`,
 `absolute_gap`, `relative_gap`, and `bound_method` in every feasible JSON
 record. The dual is a certified lower bound for the minimization objective.
 Routing selects the strongest valid result among assignment, Held-Karp 1-tree,
 and stabilized route-column relaxations; compact CVRPs up to 16 customers use
-exact subset pricing. Scheduling combines critical paths with no-overlap and
-cumulative-energy bounds. Unsupported shapes report `null`, never a heuristic
-number disguised as a certificate.
+exact subset pricing. Fleet minimization also uses exact bin-packing bounds.
+VRPTW adds route incompatibilities, conflict-aware packing, travel-aware
+interval energy, and an exact elementary route-cover dual up to 16 customers,
+following the certified preprocessing and pricing ideas in `vrptw_lb`.
+Scheduling combines critical paths with no-overlap and cumulative-energy
+bounds. Unsupported shapes report `null`, never a heuristic number disguised
+as a certificate. API and native launcher pairs accept the same explicit CLI
+arguments and do not read `QAYD_*` configuration variables.
 
 ## Session probe
 

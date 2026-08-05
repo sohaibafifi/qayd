@@ -1,55 +1,144 @@
-"""Job-shop scheduling via the scheduling convenience API.
+"""Job-shop scheduling through the scheduling convenience API.
 
-Each operation stores its own duration and machine. The API builds the interval
-variables from those task attributes.
+The command is identical to ``scheduling/native/jssp.py``. Without a positional
+file it generates the same deterministic JSSP. A JSPLIB pair-format file can be
+passed directly:
 
-Tune via ``QAYD_JSSP_J`` / ``QAYD_JSSP_M`` / ``QAYD_JSSP_T``.
+    uv run examples/python/scheduling/api/jssp.py abz5.txt --threads 4
 """
 
-import os
+import argparse
+import contextlib
+import json
+import sys
+import time
 from random import Random
 
 import qayd as cp
+from qayd.datasets import read_jsplib
 
-jobs = int(os.environ.get("QAYD_JSSP_J", "4"))
-machines = int(os.environ.get("QAYD_JSSP_M", "3"))
-time_limit = int(os.environ.get("QAYD_JSSP_T", "8"))
 
-rng = Random(0)
-order = [rng.sample(range(machines), machines) for _ in range(jobs)]
-ptime = [[rng.randint(2, 9) for _ in range(machines)] for _ in range(jobs)]
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("instance", nargs="?")
+parser.add_argument("--jobs", type=int, default=4)
+parser.add_argument("--machines", type=int, default=3)
+parser.add_argument("--time-limit", type=int, default=8)
+parser.add_argument("--threads", type=int, default=1)
+parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--engine", choices=("auto", "exact", "ls"))
+parser.add_argument("--verbose", action="store_true")
+parser.add_argument("--json", action="store_true", help="emit one machine-readable result")
+args = parser.parse_args()
 
-n = jobs * machines
-duration = [ptime[j][k] for j in range(jobs) for k in range(machines)]
-machine_of = [order[j][k] for j in range(jobs) for k in range(machines)]
-horizon = sum(duration)
+if args.threads <= 0 or args.time_limit < 0 or args.seed < 0:
+    raise SystemExit("threads must be positive; time limit and seed must be non-negative")
+engine = args.engine or ("ls" if args.threads > 1 else "auto")
+
+instance = read_jsplib(args.instance) if args.instance else None
+if instance is None:
+    jobs, machines = args.jobs, args.machines
+    rng = Random(args.seed)
+    machine_order = [rng.sample(range(machines), machines) for _ in range(jobs)]
+    processing = [[rng.randint(2, 9) for _ in range(machines)] for _ in range(jobs)]
+    name = f"generated-jssp-{jobs}x{machines}"
+else:
+    jobs, machines = instance.num_jobs, instance.num_machines
+    machine_order = [list(row) for row in instance.machines]
+    processing = [list(row) for row in instance.durations]
+    name = instance.name
+
+durations = [processing[job][operation] for job in range(jobs) for operation in range(len(processing[job]))]
+machine_of = [machine_order[job][operation] for job in range(jobs) for operation in range(len(machine_order[job]))]
+job_operations = []
+offset = 0
+for job in range(jobs):
+    count = len(processing[job])
+    job_operations.append(list(range(offset, offset + count)))
+    offset += count
+horizon = sum(durations)
 
 model = cp.Model()
-tasks = model.tasks(range(n))
-for task in tasks:
-    task.duration = duration[task.id]
+task_data = model.tasks(range(len(durations)))
+for task in task_data:
+    task.duration = durations[task.id]
     task.machine = machine_of[task.id]
+schedule_model = model.schedule(task_data, horizon=horizon)
+for operations in job_operations:
+    for before, after in zip(operations, operations[1:]):
+        model.add(schedule_model[before].end <= schedule_model[after].start)
+model.add(schedule_model.no_overlap(lambda task: task.machine))
+model.minimize(schedule_model.makespan())
 
-schedule = model.schedule(tasks, horizon=horizon)
-for j in range(jobs):
-    for k in range(1, machines):
-        model.add(schedule[j * machines + k - 1].end <= schedule[j * machines + k].start)
-model.add(schedule.no_overlap(lambda task: task.machine))
-model.minimize(schedule.makespan())
+started = time.perf_counter()
+output = contextlib.redirect_stdout(sys.stderr) if args.json else contextlib.nullcontext()
+with output:
+    solution = model.solve(
+        engine=engine,
+        threads=args.threads,
+        time_limit=args.time_limit,
+        seed=args.seed,
+        verbose=args.verbose,
+    )
+elapsed = time.perf_counter() - started
 
-solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
-
-print(f"jobs: {jobs}  machines: {machines}  status: {solution.status}")
 if not solution.starts:
-    raise SystemExit(f"status: {solution.status} - no schedule within {time_limit}s")
-starts = solution.starts
-print(f"makespan: {solution.objective}")
-end = [starts[op] + duration[op] for op in range(n)]
-for j in range(jobs):
-    for k in range(1, machines):
-        assert end[j * machines + k - 1] <= starts[j * machines + k], "job order respected"
+    record = {
+        "instance": name,
+        "status": solution.status,
+        "elapsed_seconds": elapsed,
+        "objectives": [],
+        "dual_bound": solution.dual_bound,
+        "absolute_gap": solution.absolute_gap,
+        "relative_gap": solution.relative_gap,
+        "bound_method": solution.bound_method,
+    }
+    print(json.dumps(record, sort_keys=True) if args.json else f"instance: {name}  status: {solution.status}")
+    raise SystemExit(0)
+
+starts = [int(start) for start in solution.starts]
+ends = [start + duration for start, duration in zip(starts, durations)]
+for operations in job_operations:
+    for before, after in zip(operations, operations[1:]):
+        assert ends[before] <= starts[after], "job order respected"
 for machine in range(machines):
-    ops = sorted((op for op in range(n) if machine_of[op] == machine), key=lambda op: starts[op])
-    for a, b in zip(ops, ops[1:]):
-        assert end[a] <= starts[b], f"machine {machine} no overlap"
-assert max(end) == solution.objective, "reported makespan matches the schedule"
+    operations = sorted((index for index, owner in enumerate(machine_of) if owner == machine), key=starts.__getitem__)
+    for before, after in zip(operations, operations[1:]):
+        assert ends[before] <= starts[after], f"machine {machine} has no overlap"
+makespan = max(ends, default=0)
+assert list(solution.objectives) == [makespan], "reported makespan matches replay"
+
+schedule = [
+    [
+        {"machine": machine_of[index], "start": starts[index], "duration": durations[index]}
+        for index in operations
+    ]
+    for operations in job_operations
+]
+record = {
+    "instance": name,
+    "status": solution.status,
+    "jobs": jobs,
+    "machines": machines,
+    "operations": len(durations),
+    "objectives": [makespan],
+    "dual_bound": solution.dual_bound,
+    "absolute_gap": solution.absolute_gap,
+    "relative_gap": solution.relative_gap,
+    "bound_method": solution.bound_method,
+    "elapsed_seconds": elapsed,
+    "seed": args.seed,
+    "threads": args.threads,
+    "engine": engine,
+    "schedule": schedule,
+    "verified": True,
+}
+if args.json:
+    print(json.dumps(record, sort_keys=True))
+else:
+    certified = (
+        f"  dual: {solution.dual_bound}  gap: {100 * solution.relative_gap:.2f}%  bound: {solution.bound_method}"
+        if solution.dual_bound is not None
+        else "  dual: unavailable"
+    )
+    print(f"instance: {name}  jobs: {jobs}  machines: {machines}  status: {solution.status}")
+    print(f"makespan: {makespan}{certified}  elapsed: {elapsed:.3f}s")

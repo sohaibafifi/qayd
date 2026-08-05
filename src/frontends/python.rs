@@ -661,6 +661,7 @@ fn make_solution(
             }
         }
     }
+    let exact_bound = (status == "OPTIMAL").then_some(objective).flatten();
     PySolution {
         status: status.to_string(),
         objective,
@@ -673,10 +674,10 @@ fn make_solution(
         starts: Vec::new(),
         presences: Vec::new(),
         machines: Vec::new(),
-        dual_bound: None,
-        absolute_gap: None,
-        relative_gap: None,
-        bound_method: None,
+        dual_bound: exact_bound,
+        absolute_gap: exact_bound.map(|_| 0),
+        relative_gap: exact_bound.map(|_| 0.0),
+        bound_method: exact_bound.map(|_| "exact proof".to_string()),
     }
 }
 

@@ -10,12 +10,16 @@ Here the three "different slots" requirements clash with the two-slot capacity
 (pigeonhole: three talks cannot all differ across two slots). The "A in the
 morning" preference is irrelevant to that conflict, so the MUS excludes it.
 
-Trace the solver with ``QAYD_VERBOSE=1``.
+Use ``--time-limit`` to bound core extraction.
 """
 
-import os
+import argparse
 
 import qayd as cp
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--time-limit", type=int, default=8)
+args = parser.parse_args()
 
 MORNING, AFTERNOON = 1, 2
 
@@ -35,7 +39,7 @@ with model.soft("A≠C"):
 with model.soft("A in the morning"):  # a mere preference, not part of the clash
     model.sum([a], "==", MORNING)
 
-core = model.mus(time_limit=int(os.environ.get("QAYD_MUS_T", "8")))
+core = model.mus(time_limit=args.time_limit)
 
 if core is None:
     raise SystemExit("model is satisfiable — no MUS")

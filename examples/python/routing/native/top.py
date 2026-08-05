@@ -4,18 +4,24 @@ collecting), so the routes are created with ``optional=True``, which adds a
 hidden pool list holding the unvisited customers. Maximise total collected
 profit subject to each route's length cap.
 
-Tune via ``QAYD_TOP_N`` / ``QAYD_TOP_K`` / ``QAYD_TOP_T``; trace ``QAYD_VERBOSE=1``.
+Use ``--customers``, ``--vehicles`` and ``--time-limit`` to control the example.
 """
 
+import argparse
 import math
-import os
 from random import Random
 
 import qayd as cp
 
-n = int(os.environ.get("QAYD_TOP_N", "20"))
-k = int(os.environ.get("QAYD_TOP_K", "2"))
-time_limit = int(os.environ.get("QAYD_TOP_T", "8"))
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--customers", type=int, default=20)
+parser.add_argument("--vehicles", type=int, default=2)
+parser.add_argument("--time-limit", type=int, default=8)
+parser.add_argument("--verbose", action="store_true")
+args = parser.parse_args()
+n = args.customers
+k = args.vehicles
+time_limit = args.time_limit
 
 rng = Random(0)
 coords = [(50, 50)] + [(rng.randint(0, 100), rng.randint(0, 100)) for _ in range(n)]
@@ -30,7 +36,7 @@ model.maximize(cp.sum(cp.sum(r, lambda i: P[i]) for r in routes))
 for r in routes:
     model.add(cp.sum_edges(r, lambda i, j: D[i][j], start=0, end=0) <= budget)
 
-solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
+solution = model.solve(time_limit=time_limit, verbose=args.verbose)
 
 print(f"customers: {n}  vehicles: {k}  budget: {budget}  status: {solution.status}")
 if solution.lists is None:

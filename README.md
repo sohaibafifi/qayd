@@ -122,36 +122,8 @@ Common options:
 
 The Python examples live under `examples/python/`, grouped by domain: `routing/`,
 `scheduling/`, `packing/`, `optimization/`, and `mus/` (infeasibility analysis).
+Each example has a native and an API version.
 
-```bash
-uv run examples/python/routing/native/vrp.py /path/to/X-n101-k25.vrp --threads 4
-uv run examples/python/routing/native/cvrptw.py /path/to/C101.txt --threads 4
-uv run examples/python/scheduling/native/jssp.py /path/to/abz5.txt --threads 4
-uv run examples/python/scheduling/native/rcpsp.py /path/to/j301_1.sm --threads 4
-uv run examples/python/routing/api/cvrptw.py
-uv run examples/python/scheduling/api/jssp.py
-uv run examples/python/scheduling/api/rcpsp.py
-uv run examples/python/packing/bin_packing.py
-uv run examples/python/packing/set_partition.py
-uv run examples/python/optimization/tiered_pricing.py
-uv run examples/python/scheduling/native/optional_jobs.py
-uv run examples/python/mus/mus.py           # diagnose an infeasible model: model.soft(...) / model.mus()
-uv run examples/python/mus/mus_explain.py   # sub-constraint MUS explanation: model.explain_mus()
-uv run examples/python/mus/mus_enumerate.py # all MUSes + MSSes/MCSes (MARCO): model.enumerate_mus()
-```
-
-The API routing examples live under `examples/python/routing/api/`; the raw
-list-lambda equivalents live under `examples/python/routing/native/`. The
-native VRP, VRPTW, JSSP and RCPSP scripts generate a deterministic instance
-when called without an argument, or parse and solve a benchmark file passed as
-their positional argument. Add `--json` for machine-readable output and
-`--threads 4` to exercise the relevant portfolio.
-Interval scheduling API examples live under `examples/python/scheduling/api/`;
-the raw interval/list equivalents live under `examples/python/scheduling/native/`.
-Benchmark data under `data/` is local scratch data and is not part of the source
-release.
-
-Benchmark parsers are available without optional dependencies:
 
 ```python
 from qayd.datasets import load_instance, read_cvrplib, read_jsplib, read_psplib, read_solomon

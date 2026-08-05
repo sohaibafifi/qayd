@@ -2,17 +2,22 @@
 variable for the visiting order, set the objective, call solve(). The solver
 picks the list-domain engine because the model uses a list variable.
 
-Size and budget via ``QAYD_TSP_N`` / ``QAYD_TSP_T``.
+Use ``--cities`` and ``--time-limit`` to control the generated instance.
 """
 
+import argparse
 import math
-import os
 from random import Random
 
 import qayd as cp
 
-n = int(os.environ.get("QAYD_TSP_N", "15"))
-time_limit = int(os.environ.get("QAYD_TSP_T", "3"))
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--cities", type=int, default=15)
+parser.add_argument("--time-limit", type=int, default=3)
+parser.add_argument("--verbose", action="store_true")
+args = parser.parse_args()
+n = args.cities
+time_limit = args.time_limit
 
 rng = Random(0)
 # Node 0 is the start/end depot; nodes 1..n are the cities to order.
@@ -26,7 +31,7 @@ model = cp.Model()
 # Closed-tour distance: sum dist[i][j] over the edges, depot at both ends.
 model.minimize(cp.sum_edges(tour, lambda i, j: D[i][j], start=0, end=0))
 
-solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
+solution = model.solve(time_limit=time_limit, verbose=args.verbose)
 
 print(f"cities: {n}  status: {solution.status}")
 if solution.lists is None:

@@ -1,16 +1,21 @@
 """Travelling salesman, modeled with the routing convenience API.
 
-Size and budget via ``QAYD_TSP_N`` / ``QAYD_TSP_T``.
+Use ``--cities`` and ``--time-limit`` to control the generated instance.
 """
 
+import argparse
 import math
-import os
 from random import Random
 
 import qayd as cp
 
-n = int(os.environ.get("QAYD_TSP_N", "15"))
-time_limit = int(os.environ.get("QAYD_TSP_T", "3"))
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--cities", type=int, default=15)
+parser.add_argument("--time-limit", type=int, default=3)
+parser.add_argument("--verbose", action="store_true")
+args = parser.parse_args()
+n = args.cities
+time_limit = args.time_limit
 
 rng = Random(0)
 coords = [(50, 50)] + [(rng.randint(0, 100), rng.randint(0, 100)) for _ in range(n)]
@@ -21,7 +26,7 @@ customers = model.customers(range(1, n + 1))
 routes = model.routes(customers, vehicles=1, depot=0, travel=dist)
 model.minimize(routes.sum(lambda route: route.distance()))
 
-solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
+solution = model.solve(time_limit=time_limit, verbose=args.verbose)
 
 print(f"cities: {n}  status: {solution.status}")
 if solution.lists is None:

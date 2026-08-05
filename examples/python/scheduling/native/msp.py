@@ -8,17 +8,22 @@ across the blocks, computed by sorting them.
 (here the scan accumulator is the position) and returns the k-th smallest of the
 per-step emitted values. No float variables are involved.
 
-Tune via ``QAYD_MSP_N`` / ``QAYD_MSP_T``.
+Use ``--blocks`` and ``--time-limit`` to control the generated instance.
 """
 
-import os
+import argparse
 from itertools import permutations
 from random import Random
 
 import qayd as cp
 
-n = int(os.environ.get("QAYD_MSP_N", "7"))
-time_limit = int(os.environ.get("QAYD_MSP_T", "5"))
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--blocks", type=int, default=7)
+parser.add_argument("--time-limit", type=int, default=5)
+parser.add_argument("--verbose", action="store_true")
+args = parser.parse_args()
+n = args.blocks
+time_limit = args.time_limit
 
 rng = Random(0)
 g = [rng.randint(1, 20) for _ in range(n)]
@@ -40,7 +45,7 @@ model.maximize(
     ),
 )
 
-solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
+solution = model.solve(time_limit=time_limit, verbose=args.verbose)
 
 print(f"blocks: {n}  rate: {rate}  quantile k: {k}  status: {solution.status}")
 if solution.lists is None:
