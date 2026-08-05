@@ -119,7 +119,14 @@ with output:
 elapsed = time.perf_counter() - started
 
 if solution.lists is None:
-    record = {"instance": name, "status": solution.status, "elapsed_seconds": elapsed, "objectives": []}
+    record = {
+        "instance": name,
+        "status": solution.status,
+        "elapsed_seconds": elapsed,
+        "objectives": [],
+        "dual_bound": solution.dual_bound,
+        "relative_gap": solution.relative_gap,
+    }
     print(json.dumps(record, sort_keys=True) if args.json else f"instance: {name}  status: {solution.status}")
     raise SystemExit(0)
 
@@ -161,6 +168,10 @@ record = {
     "vehicles": vehicles,
     "capacity": capacity,
     "objectives": [fleet, total_distance],
+    "dual_bound": solution.dual_bound,
+    "absolute_gap": solution.absolute_gap,
+    "relative_gap": solution.relative_gap,
+    "bound_method": solution.bound_method,
     "distance": total_distance / scale,
     "elapsed_seconds": elapsed,
     "seed": args.seed,
@@ -172,8 +183,13 @@ record = {
 if args.json:
     print(json.dumps(record, sort_keys=True))
 else:
+    certified = (
+        f"  dual: {solution.dual_bound}  gap: {100 * solution.relative_gap:.2f}%"
+        if solution.dual_bound is not None
+        else ""
+    )
     print(f"instance: {name}  customers: {len(customers)}  vehicles<={vehicles}  capacity: {capacity}")
-    print(f"status: {solution.status}  fleet: {fleet}  distance: {total_distance / scale:g}  elapsed: {elapsed:.3f}s")
+    print(f"status: {solution.status}  fleet: {fleet}  distance: {total_distance / scale:g}{certified}  elapsed: {elapsed:.3f}s")
     for index, route in enumerate(route_records):
         if route["nodes"]:
             print(f"  route {index}: load {route['load']:3d}  {[node_ids[depot], *route['nodes'], node_ids[depot]]}")

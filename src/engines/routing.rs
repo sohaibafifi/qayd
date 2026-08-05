@@ -808,6 +808,7 @@ pub(crate) fn solve_collection(
     // objective bound -- so the exact prunes anything no better than `cost` from
     // the start, and if it proves nothing strictly better, we still return a real
     // (verified) solution at that cost.
+    let warm_certificate = warm.as_ref().and_then(|solution| solution.bound.as_ref()).map(|bound| (bound.dual, bound.method.clone()));
     let verified: Option<(Vec<Vec<i32>>, i64)> = warm.as_ref().filter(|ls| ls.feasible).and_then(|ls| {
         let n = spec.depot_count + spec.items.len();
         let tour = spec.ls_tour_succ(n, &ls.lists)?;
@@ -863,19 +864,21 @@ pub(crate) fn solve_collection(
             None => (vec![Vec::new(); depot_count], None, false),
         },
     };
-    Some(RoutingIntegerOutcome {
-        solution: CollectionSolution {
-            lists,
-            objectives: objective.map(|value| vec![value]).unwrap_or_default(),
-            feasible,
-            starts: Vec::new(),
-            presences: Vec::new(),
-            machines: Vec::new(),
-        },
-        stats,
-        complete,
-        improvements,
-    })
+    let mut solution = CollectionSolution {
+        lists,
+        objectives: objective.map(|value| vec![value]).unwrap_or_default(),
+        feasible,
+        starts: Vec::new(),
+        presences: Vec::new(),
+        machines: Vec::new(),
+        bound: None,
+    };
+    if complete {
+        crate::engines::dual::attach_exact(&mut solution, "exact routing proof");
+    } else if let Some((dual, method)) = warm_certificate {
+        crate::engines::dual::attach_value(model, &mut solution, dual, method);
+    }
+    Some(RoutingIntegerOutcome { solution, stats, complete, improvements })
 }
 
 /// Replay a successor tour in the solver to verify feasibility and read its exact

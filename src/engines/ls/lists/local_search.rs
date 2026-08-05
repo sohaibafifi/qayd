@@ -20,6 +20,7 @@ use super::metrics::{metrics_enabled_from_env, ListSearchMetrics, MetricsRecorde
 use super::moves::{apply_move, best_improving_move, better, shuffle, snapshot, trial_list_score_view, SearchMemory};
 use super::portfolio::WorkerCoordination;
 use super::schedule_ls::solve_schedule;
+use crate::engines::dual;
 use crate::mix64;
 use crate::model::list::{
     CollectionModel, CollectionSolution, Constraint, Expr, ExprId, GlobalConstraint, Iterable, MaxTerm, ReduceOp, Reduction,
@@ -1125,7 +1126,9 @@ fn solve_collection_capped_internal(
     metrics_enabled: bool,
     validate_model: bool,
 ) -> (CollectionSolution, ListSearchMetrics) {
-    solve_collection_capped_worker(
+    let dual_bound =
+        if !validate_model || model.validate_interruptible(stop).ok() == Some(true) { dual::compute(model, stop) } else { None };
+    let (mut solution, metrics) = solve_collection_capped_worker(
         model,
         seed,
         stop,
@@ -1136,7 +1139,9 @@ fn solve_collection_capped_internal(
         validate_model,
         SearchProfile::Sequential,
         None,
-    )
+    );
+    dual::attach(model, &mut solution, dual_bound);
+    (solution, metrics)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1161,6 +1166,7 @@ pub(super) fn solve_collection_capped_worker(
             starts: Vec::new(),
             presences: Vec::new(),
             machines: Vec::new(),
+            bound: None,
         };
         let metrics = MetricsRecorder::new(metrics_enabled).snapshot(started.map(|instant| instant.elapsed()).unwrap_or_default());
         (solution, metrics)
@@ -1319,6 +1325,7 @@ pub(super) fn solve_collection_capped_worker(
         starts: Vec::new(),
         presences: Vec::new(),
         machines: Vec::new(),
+        bound: None,
     };
     per.metrics.record_alns(alns.metrics());
     let metrics = per.metrics.snapshot(started.map(|instant| instant.elapsed()).unwrap_or_default());

@@ -21,7 +21,7 @@ use crate::constraints::scheduling;
 use crate::constraints::table;
 use crate::engines::ls::cop::{solve_ls, LocalRhs, LocalSearchSpec, LsConfig};
 use crate::engines::ls::lists;
-use crate::engines::{list_exact as list_exact_engine, routing as routing_engine, schedule as schedule_engine};
+use crate::engines::{dual as dual_engine, list_exact as list_exact_engine, routing as routing_engine, schedule as schedule_engine};
 use crate::expr::{self, Expr};
 use crate::ids::{IntervalId, VarId};
 use crate::lcg::clause::{ClauseSharing, SharedClausePool};
@@ -346,6 +346,11 @@ struct PySolution {
     /// Chosen machine per interval, for a flexible (moded) schedule model
     /// (empty otherwise).
     machines: Vec<i64>,
+    /// Certified bound for the primary objective and its gap to the incumbent.
+    dual_bound: Option<i64>,
+    absolute_gap: Option<u64>,
+    relative_gap: Option<f64>,
+    bound_method: Option<String>,
 }
 
 #[derive(Clone)]
@@ -363,6 +368,13 @@ fn canonicalize_unordered_lists(mut lists: Option<Vec<Vec<i32>>>, unordered: &Ha
         }
     }
     lists
+}
+
+fn bound_fields(bound: Option<&list::BoundReport>) -> (Option<i64>, Option<u64>, Option<f64>, Option<String>) {
+    match bound {
+        Some(bound) => (Some(bound.dual), Some(bound.absolute_gap), Some(bound.relative_gap), Some(bound.method.clone())),
+        None => (None, None, None, None),
+    }
 }
 
 #[pyclass(name = "Model", module = "qayd", unsendable)]
@@ -661,6 +673,10 @@ fn make_solution(
         starts: Vec::new(),
         presences: Vec::new(),
         machines: Vec::new(),
+        dual_bound: None,
+        absolute_gap: None,
+        relative_gap: None,
+        bound_method: None,
     }
 }
 
@@ -1487,6 +1503,28 @@ impl PySolution {
     #[getter]
     fn objective(&self) -> Option<i64> {
         self.objective
+    }
+
+    /// Certified lower bound for minimization, or upper bound for maximization.
+    #[getter]
+    fn dual_bound(&self) -> Option<i64> {
+        self.dual_bound
+    }
+
+    #[getter]
+    fn absolute_gap(&self) -> Option<u64> {
+        self.absolute_gap
+    }
+
+    /// Relative primal-dual gap as a ratio. A value of `0.01` means one percent.
+    #[getter]
+    fn relative_gap(&self) -> Option<f64> {
+        self.relative_gap
+    }
+
+    #[getter]
+    fn bound_method(&self) -> Option<String> {
+        self.bound_method.clone()
     }
 
     /// Per-tier objective values for a lexicographic (multi-objective) model.
@@ -2991,6 +3029,11 @@ impl PyModel {
             if sol.feasible {
                 println!("  objectives: {:?}", sol.objectives);
             }
+            if let Some(bound) = &sol.bound {
+                println!("  dual: {}", bound.dual);
+                println!("  gap: {:.2}%", 100.0 * bound.relative_gap);
+                println!("  bound method: {}", bound.method);
+            }
             println!("  improvements: {}", outcome.improvements);
             println!("  solutions: {}", outcome.stats.solutions);
             println!("  nodes: {}", outcome.stats.nodes);
@@ -2998,6 +3041,7 @@ impl PyModel {
         }
 
         let objectives = if sol.feasible { sol.objectives.clone() } else { Vec::new() };
+        let (dual_bound, absolute_gap, relative_gap, bound_method) = bound_fields(sol.bound.as_ref());
         Ok(Some(PySolution {
             status: status.to_string(),
             objective: sol.feasible.then(|| sol.objectives.first().copied().unwrap_or(0)),
@@ -3010,6 +3054,10 @@ impl PyModel {
             starts: Vec::new(),
             presences: Vec::new(),
             machines: Vec::new(),
+            dual_bound,
+            absolute_gap,
+            relative_gap,
+            bound_method,
         }))
     }
 
@@ -3033,6 +3081,7 @@ impl PyModel {
         if budget.expired() {
             return Ok(Some(self.unknown_collection_solution()));
         }
+        let structural_bound = dual_engine::compute(model, &budget.stop);
         let limit = budget.limit;
         let constraint_count = 1 + model.constraints.len() + model.globals.len();
         if verbose {
@@ -3062,18 +3111,31 @@ impl PyModel {
         };
 
         let status = outcome.status.as_str();
+        let objective = outcome.objectives.first().copied();
+        let bound = objective.and_then(|primal| {
+            if status == "OPTIMAL" {
+                dual_engine::make_report(primal, primal, minimize, "exact list proof".to_string())
+            } else {
+                structural_bound.and_then(|dual| dual_engine::make_report(primal, dual.value, minimize, dual.method.to_string()))
+            }
+        });
         if verbose {
             println!("qayd result (domain exact)");
             println!("  status: {status}");
             if has_objective && !outcome.objectives.is_empty() {
                 println!("  objectives: {:?}", outcome.objectives);
             }
+            if let Some(bound) = &bound {
+                println!("  dual: {}", bound.dual);
+                println!("  gap: {:.2}%", 100.0 * bound.relative_gap);
+                println!("  bound method: {}", bound.method);
+            }
             println!("  solutions: {}", outcome.stats.solutions);
             println!("  nodes: {}", outcome.stats.nodes);
             println!("  failures: {}", outcome.stats.failures);
         }
 
-        let objective = outcome.objectives.first().copied();
+        let (dual_bound, absolute_gap, relative_gap, bound_method) = bound_fields(bound.as_ref());
         Ok(Some(PySolution {
             status: status.to_string(),
             objective,
@@ -3086,6 +3148,10 @@ impl PyModel {
             starts: Vec::new(),
             presences: Vec::new(),
             machines: Vec::new(),
+            dual_bound,
+            absolute_gap,
+            relative_gap,
+            bound_method,
         }))
     }
 
@@ -3107,6 +3173,7 @@ impl PyModel {
         if budget.expired() {
             return Ok(Some(self.unknown_collection_solution()));
         }
+        let structural_bound = dual_engine::compute(model, &budget.stop);
         let limit = budget.limit;
         let moded = schedule.intervals.iter().any(|iv| !iv.modes.is_empty());
         if verbose {
@@ -3139,11 +3206,24 @@ impl PyModel {
             return Ok(None);
         };
 
+        let status = outcome.status.as_str();
+        let bound = outcome.objective.and_then(|primal| {
+            if status == "OPTIMAL" {
+                dual_engine::make_report(primal, primal, true, "exact schedule proof".to_string())
+            } else {
+                structural_bound.and_then(|dual| dual_engine::make_report(primal, dual.value, true, dual.method.to_string()))
+            }
+        });
         if verbose {
             println!("qayd result (domain exact)");
-            println!("  status: {}", outcome.status.as_str());
+            println!("  status: {status}");
             if let Some(objective) = outcome.objective {
                 println!("  objective: {objective}");
+            }
+            if let Some(bound) = &bound {
+                println!("  dual: {}", bound.dual);
+                println!("  gap: {:.2}%", 100.0 * bound.relative_gap);
+                println!("  bound method: {}", bound.method);
             }
             println!("  solutions: {}", outcome.stats.solutions);
             println!("  nodes: {}", outcome.stats.nodes);
@@ -3151,8 +3231,9 @@ impl PyModel {
         }
 
         let starts = outcome.starts.iter().zip(&outcome.presences).map(|(&start, &present)| present.then_some(start)).collect();
+        let (dual_bound, absolute_gap, relative_gap, bound_method) = bound_fields(bound.as_ref());
         Ok(Some(PySolution {
-            status: outcome.status.as_str().to_string(),
+            status: status.to_string(),
             objective: outcome.objective,
             objective_sense: schedule.minimize_makespan.then(|| "min".to_string()),
             objective_expr: schedule.minimize_makespan.then(|| "makespan".to_string()),
@@ -3163,6 +3244,10 @@ impl PyModel {
             starts,
             presences: outcome.presences,
             machines: outcome.machines,
+            dual_bound,
+            absolute_gap,
+            relative_gap,
+            bound_method,
         }))
     }
 
@@ -3185,6 +3270,10 @@ impl PyModel {
             starts: Vec::new(),
             presences: Vec::new(),
             machines: Vec::new(),
+            dual_bound: None,
+            absolute_gap: None,
+            relative_gap: None,
+            bound_method: None,
         }
     }
 
@@ -3313,12 +3402,18 @@ impl PyModel {
             if sol.feasible {
                 println!("  objectives: {:?}", sol.objectives);
             }
+            if let Some(bound) = &sol.bound {
+                println!("  dual: {}", bound.dual);
+                println!("  gap: {:.2}%", 100.0 * bound.relative_gap);
+                println!("  bound method: {}", bound.method);
+            }
             println!("  improvements: {improvements}");
         }
         // Only expose objectives and lists for a feasible incumbent. An
         // infeasible best-effort partition may violate constraints, so hiding
         // it stops a caller from accidentally consuming an invalid solution.
         let objectives = if sol.feasible { sol.objectives.clone() } else { Vec::new() };
+        let (dual_bound, absolute_gap, relative_gap, bound_method) = bound_fields(sol.bound.as_ref());
         Ok(PySolution {
             status: if sol.feasible { "SATISFIABLE".to_string() } else { "UNKNOWN".to_string() },
             objective: sol.feasible.then(|| sol.objectives.first().copied().unwrap_or(0)),
@@ -3335,6 +3430,10 @@ impl PyModel {
             },
             presences: if sol.feasible { sol.presences.clone() } else { Vec::new() },
             machines: if sol.feasible { sol.machines.clone() } else { Vec::new() },
+            dual_bound,
+            absolute_gap,
+            relative_gap,
+            bound_method,
         })
     }
 

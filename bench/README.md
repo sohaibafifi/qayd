@@ -58,6 +58,17 @@ units and exact construction at 100,000 item-list cells.
 construction, exact fallbacks, portfolio workers, and search. This matters for
 campaign results: reported solve time is not a search-only measurement.
 
+## Certified bounds and gaps
+
+The native VRP, VRPTW, JSSP, and RCPSP launchers include `dual_bound`,
+`absolute_gap`, `relative_gap`, and `bound_method` in every feasible JSON
+record. The dual is a certified lower bound for the minimization objective.
+Routing selects the strongest valid result among assignment, Held-Karp 1-tree,
+and stabilized route-column relaxations; compact CVRPs up to 16 customers use
+exact subset pricing. Scheduling combines critical paths with no-overlap and
+cumulative-energy bounds. Unsupported shapes report `null`, never a heuristic
+number disguised as a certificate.
+
 ## Session probe
 
 The Python session probe measures rolling-horizon re-solves under the current

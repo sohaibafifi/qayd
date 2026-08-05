@@ -78,7 +78,14 @@ with output:
 elapsed = time.perf_counter() - started
 
 if not solution.starts:
-    record = {"instance": name, "status": solution.status, "elapsed_seconds": elapsed, "objectives": []}
+    record = {
+        "instance": name,
+        "status": solution.status,
+        "elapsed_seconds": elapsed,
+        "objectives": [],
+        "dual_bound": solution.dual_bound,
+        "relative_gap": solution.relative_gap,
+    }
     print(json.dumps(record, sort_keys=True) if args.json else f"instance: {name}  status: {solution.status}")
     raise SystemExit(0)
 
@@ -108,6 +115,10 @@ record = {
     "machines": machines,
     "operations": len(durations),
     "objectives": [makespan],
+    "dual_bound": solution.dual_bound,
+    "absolute_gap": solution.absolute_gap,
+    "relative_gap": solution.relative_gap,
+    "bound_method": solution.bound_method,
     "elapsed_seconds": elapsed,
     "seed": args.seed,
     "threads": args.threads,
@@ -118,5 +129,10 @@ record = {
 if args.json:
     print(json.dumps(record, sort_keys=True))
 else:
+    certified = (
+        f"  dual: {solution.dual_bound}  gap: {100 * solution.relative_gap:.2f}%"
+        if solution.dual_bound is not None
+        else ""
+    )
     print(f"instance: {name}  jobs: {jobs}  machines: {machines}  status: {solution.status}")
-    print(f"makespan: {makespan}  elapsed: {elapsed:.3f}s")
+    print(f"makespan: {makespan}{certified}  elapsed: {elapsed:.3f}s")

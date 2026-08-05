@@ -5,6 +5,8 @@
 
 pub mod schedule;
 
+pub mod dual;
+
 pub mod list_exact;
 
 pub mod ls;

@@ -179,6 +179,7 @@ for route in routes:
 
 model.minimize(routes.sum(lambda route: route.distance()))
 solution = model.solve(time_limit=30)
+print(solution.objective, solution.dual_bound, solution.relative_gap)
 ```
 
 Typical scheduling API shape:

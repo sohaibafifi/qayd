@@ -12,6 +12,7 @@ use super::alns::SearchProfile;
 use super::local_search::{solve_collection_capped_worker, Score};
 use super::metrics::{metrics_enabled_from_env, ListSearchMetrics};
 use super::moves::better;
+use crate::engines::dual;
 use crate::mix64;
 use crate::model::list::{CollectionModel, CollectionSolution, ObjectiveTier};
 
@@ -208,8 +209,10 @@ fn solve_collection_parallel_internal(
     validate_model: bool,
 ) -> (CollectionSolution, ListPortfolioMetrics) {
     let workers = workers.max(1);
+    let dual_bound =
+        if !validate_model || model.validate_interruptible(stop).ok() == Some(true) { dual::compute(model, stop) } else { None };
     if workers == 1 {
-        let (solution, search) = solve_collection_capped_worker(
+        let (mut solution, search) = solve_collection_capped_worker(
             model,
             seed,
             stop,
@@ -221,6 +224,7 @@ fn solve_collection_parallel_internal(
             SearchProfile::Sequential,
             None,
         );
+        dual::attach(model, &mut solution, dual_bound);
         let worker_metrics = ListPortfolioWorkerMetrics {
             worker: 0,
             seed,
@@ -293,7 +297,8 @@ fn solve_collection_parallel_internal(
             _ => Some(idx),
         })
         .expect("a non-empty portfolio must complete at least one worker");
-    let solution = completed[best_idx].3.clone();
+    let mut solution = completed[best_idx].3.clone();
+    dual::attach(model, &mut solution, dual_bound);
     let best_worker = completed[best_idx].0;
     let worker_metrics = completed
         .into_iter()
@@ -405,6 +410,7 @@ pub fn audit_portfolio_merge() -> bool {
         starts: Vec::new(),
         presences: Vec::new(),
         machines: Vec::new(),
+        bound: None,
     };
     let incumbent = solution(true, vec![5, 10]);
     solution_better(&solution(true, vec![6, 999]), &incumbent, &model)

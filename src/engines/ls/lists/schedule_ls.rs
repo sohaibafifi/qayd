@@ -300,5 +300,6 @@ pub(super) fn solve_schedule(sched: &Schedule, seed: u64, stop: &AtomicBool, rep
         starts: if feasible { best_starts } else { Vec::new() },
         presences: if feasible { best_present } else { Vec::new() },
         machines: if feasible { machines } else { Vec::new() },
+        bound: None,
     }
 }

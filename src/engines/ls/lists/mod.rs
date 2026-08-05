@@ -4,7 +4,7 @@
 //! `model` / `collection`; this layer only searches an already-defined model.
 
 mod alns;
-mod eval;
+pub(crate) mod eval;
 mod incremental;
 mod local_search;
 mod metrics;

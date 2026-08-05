@@ -400,6 +400,17 @@ pub struct CollectionModel {
     pub schedule: Option<Schedule>,
 }
 
+/// Certified bound for the primary objective of a feasible collection
+/// solution. For minimization, `dual` is a lower bound; for maximization it is
+/// an upper bound. `relative_gap` is a ratio, so `0.01` means one percent.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundReport {
+    pub dual: i64,
+    pub absolute_gap: u64,
+    pub relative_gap: f64,
+    pub method: String,
+}
+
 /// A solution: the contents of each list, the objective value of each tier (in
 /// the model's order), and feasibility.
 #[derive(Clone, Debug)]
@@ -414,4 +425,7 @@ pub struct CollectionSolution {
     /// Chosen machine of each interval (`-1` if it has no modes), for a moded
     /// [`Schedule`] model (empty otherwise).
     pub machines: Vec<i64>,
+    /// Certified dual bound and gap for the primary objective, when a supported
+    /// relaxation was available.
+    pub bound: Option<BoundReport>,
 }

@@ -5,7 +5,7 @@ use crate::model::list::{Expr, ExprId, Iterable, Op, ReduceOp, Reduction};
 /// constraint operand, large enough to dominate any real objective.
 pub(super) const INFEASIBLE: i64 = 1_000_000_000;
 
-pub(super) fn eval_expr(arena: &[Expr], id: ExprId, args: &[i64]) -> i64 {
+pub(crate) fn eval_expr(arena: &[Expr], id: ExprId, args: &[i64]) -> i64 {
     match &arena[id.0 as usize] {
         Expr::Const(c) => *c,
         Expr::Arg(k) => args.get(*k as usize).copied().unwrap_or(0),
