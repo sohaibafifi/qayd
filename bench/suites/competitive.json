@@ -1,0 +1,19 @@
+{
+  "name": "competitive",
+  "description": "CVRPLIB X, Solomon/Homberger, JSPLIB, and PSPLIB campaign.",
+  "datasets": [
+    {"family": "cvrplib-x", "problem": "cvrp", "glob": "bench/routing/instances/cvrplib-x/*.vrp"},
+    {"family": "solomon", "problem": "cvrptw", "glob": "bench/routing/instances/solomon/**/*.[Tt][Xx][Tt]"},
+    {"family": "homberger-200", "problem": "cvrptw", "glob": "bench/routing/instances/homberger/200/**/*.[Tt][Xx][Tt]"},
+    {"family": "homberger-400", "problem": "cvrptw", "glob": "bench/routing/instances/homberger/400/**/*.[Tt][Xx][Tt]"},
+    {"family": "homberger-600", "problem": "cvrptw", "glob": "bench/routing/instances/homberger/600/**/*.[Tt][Xx][Tt]"},
+    {"family": "homberger-800", "problem": "cvrptw", "glob": "bench/routing/instances/homberger/800/**/*.[Tt][Xx][Tt]"},
+    {"family": "homberger-1000", "problem": "cvrptw", "glob": "bench/routing/instances/homberger/1000/**/*.[Tt][Xx][Tt]"},
+    {"family": "jsplib", "problem": "jssp", "glob": "bench/scheduling/instances/jsplib/instances/*"},
+    {"family": "psplib-j30", "problem": "rcpsp", "glob": "bench/scheduling/instances/psplib/sm/j30/**/*.sm"},
+    {"family": "psplib-j60", "problem": "rcpsp", "glob": "bench/scheduling/instances/psplib/sm/j60/**/*.sm"},
+    {"family": "psplib-j90", "problem": "rcpsp", "glob": "bench/scheduling/instances/psplib/sm/j90/**/*.sm"},
+    {"family": "psplib-j120", "problem": "rcpsp", "glob": "bench/scheduling/instances/psplib/sm/j120/**/*.sm"},
+    {"family": "psplib-mm-j30", "problem": "rcpsp", "glob": "bench/scheduling/instances/psplib/mm/j30/**/*.mm"}
+  ]
+}

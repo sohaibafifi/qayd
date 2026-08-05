@@ -27,6 +27,11 @@ def arguments():
     parser.add_argument("--time-limit", type=int, default=10)
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--max-iterations", type=int)
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--routing-two-way", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--routing-nearest-neighbor", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--routing-warm-start", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--engine", choices=("auto", "exact", "ls"), default="ls")
     parser.add_argument("--distance-scale", type=int, default=10)
     parser.add_argument("--rounding", choices=("truncate", "nearest", "ceil"), default="truncate")
@@ -37,7 +42,7 @@ def arguments():
 
 
 args = arguments()
-if args.threads <= 0 or args.time_limit < 0 or args.seed < 0:
+if args.threads <= 0 or args.time_limit < 0 or args.seed < 0 or (args.max_iterations is not None and args.max_iterations < 0):
     raise SystemExit("threads must be positive; time limit and seed must be non-negative")
 
 instance = read_solomon(args.instance) if args.instance else None
@@ -113,7 +118,12 @@ solve_options = {
     "time_limit": args.time_limit,
     "seed": args.seed,
     "verbose": args.verbose,
-}
+        "max_iterations": args.max_iterations,
+        "profile": args.profile,
+        "routing_two_way": args.routing_two_way,
+        "routing_nearest_neighbor": args.routing_nearest_neighbor,
+        "routing_warm_start": args.routing_warm_start,
+    }
 if hint is not None:
     solve_options["list_hint"] = hint
 started = time.perf_counter()
@@ -128,10 +138,20 @@ if solution.lists is None:
         "status": solution.status,
         "elapsed_seconds": elapsed,
         "objectives": [],
+        "objective_convention": "fleet_then_dimacs_trunc1_distance",
+        "distance_scale": scale,
+        "rounding": args.rounding,
         "dual_bound": solution.dual_bound,
         "absolute_gap": solution.absolute_gap,
         "relative_gap": solution.relative_gap,
         "bound_method": solution.bound_method,
+        "alns_iterations": solution.alns_iterations,
+        "candidates_evaluated": solution.candidates_evaluated,
+        "candidates_per_second": solution.candidates_per_second,
+        "full_recompute_percentage": solution.full_recompute_percentage,
+        "routing_two_way": args.routing_two_way,
+        "routing_nearest_neighbor": args.routing_nearest_neighbor,
+        "routing_warm_start": args.routing_warm_start,
     }
     print(json.dumps(record, sort_keys=True) if args.json else f"instance: {name}  status: {solution.status}")
     raise SystemExit(0)
@@ -174,15 +194,25 @@ record = {
     "vehicles": vehicles,
     "capacity": capacity,
     "objectives": [fleet, total_distance],
+    "objective_convention": "fleet_then_dimacs_trunc1_distance",
+    "distance_scale": scale,
+    "rounding": args.rounding,
     "dual_bound": solution.dual_bound,
     "absolute_gap": solution.absolute_gap,
     "relative_gap": solution.relative_gap,
     "bound_method": solution.bound_method,
+    "alns_iterations": solution.alns_iterations,
+    "candidates_evaluated": solution.candidates_evaluated,
+    "candidates_per_second": solution.candidates_per_second,
+    "full_recompute_percentage": solution.full_recompute_percentage,
     "distance": total_distance / scale,
     "elapsed_seconds": elapsed,
     "seed": args.seed,
     "threads": args.threads,
     "engine": args.engine,
+    "routing_two_way": args.routing_two_way,
+    "routing_nearest_neighbor": args.routing_nearest_neighbor,
+    "routing_warm_start": args.routing_warm_start,
     "routes": route_records,
     "verified": True,
 }

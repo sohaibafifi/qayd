@@ -115,34 +115,23 @@ struct AlnsConfig {
 }
 
 impl AlnsConfig {
-    fn from_env(items: usize, profile: SearchProfile) -> Self {
+    fn for_profile(items: usize, profile: SearchProfile) -> Self {
         let root = integer_sqrt(items.max(1));
         let (temperature, cooling, late_window, destroy_min, destroy_max) = match profile {
             SearchProfile::Sequential | SearchProfile::Balanced => (0.12, 0.997, root.saturating_mul(2), 6, 45),
             SearchProfile::Intensify => (0.05, 0.995, root, 3, 28),
             SearchProfile::Diversify => (0.30, 0.999, root.saturating_mul(4), 15, 65),
         };
-        let reaction_milli = env_u64("QAYD_LS_ALNS_REACTION", 200).clamp(1, WEIGHT_SCALE);
-        let segment_length = env_u64("QAYD_LS_ALNS_SEGMENT", root as u64).max(1);
-        let initial_temperature = env_f64("QAYD_LS_ALNS_TEMPERATURE", temperature).clamp(1.0e-6, 100.0);
-        let cooling = env_f64("QAYD_LS_ALNS_COOLING", cooling).clamp(0.5, 1.0);
-        let late_window = env_usize("QAYD_LS_LATE_WINDOW", late_window).max(1);
-        let min_destroy_percent = env_usize("QAYD_LS_DESTROY_MIN", destroy_min).clamp(1, 100);
-        let max_destroy_percent = env_usize("QAYD_LS_DESTROY_MAX", destroy_max).clamp(min_destroy_percent, 100);
-        Self { reaction_milli, segment_length, initial_temperature, cooling, late_window, min_destroy_percent, max_destroy_percent }
+        Self {
+            reaction_milli: 200,
+            segment_length: root as u64,
+            initial_temperature: temperature,
+            cooling,
+            late_window,
+            min_destroy_percent: destroy_min,
+            max_destroy_percent: destroy_max,
+        }
     }
-}
-
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
-}
-
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
-}
-
-fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name).ok().and_then(|value| value.parse().ok()).filter(|value: &f64| value.is_finite()).unwrap_or(default)
 }
 
 fn integer_sqrt(value: usize) -> usize {
@@ -187,7 +176,7 @@ impl AlnsController {
     }
 
     pub(super) fn new_profile(items: usize, initial: &Score, profile: SearchProfile) -> Self {
-        let config = AlnsConfig::from_env(items, profile);
+        let config = AlnsConfig::for_profile(items, profile);
         Self {
             temperature: config.initial_temperature,
             late_scores: vec![initial.clone(); config.late_window],

@@ -415,10 +415,6 @@ impl MetricsRecorder {
     }
 }
 
-pub(super) fn metrics_enabled_from_env() -> bool {
-    std::env::var("QAYD_LS_METRICS").is_ok_and(|value| !matches!(value.as_str(), "0" | "false" | "off"))
-}
-
 fn reduction_kind(reduction: &Reduction) -> (ListIterableKind, ListReduceOpKind) {
     let iterable = match reduction.iterable {
         Iterable::Items(_) => ListIterableKind::Items,

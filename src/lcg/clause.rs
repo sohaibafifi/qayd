@@ -124,16 +124,6 @@ struct SharedRing {
     write: u64,
 }
 
-/// Ring capacity from the environment (test hook), else [`SHARED_POOL_CAP`].
-/// Rounded down to a power of two; dropping old clauses is always sound, so a
-/// small forced capacity only reduces sharing, never changes any answer.
-fn shared_pool_cap() -> usize {
-    match std::env::var("QAYD_SHARED_POOL_CAP").ok().and_then(|s| s.parse::<usize>().ok()) {
-        Some(n) if n >= 1 => 1usize << (usize::BITS - 1 - n.leading_zeros()),
-        _ => SHARED_POOL_CAP,
-    }
-}
-
 /// Bounded shared clause pool. Workers keep private watch state and read
 /// cursors; the ring caps memory and drops old clauses under a lagging reader.
 pub(crate) struct SharedClausePool {
@@ -144,16 +134,22 @@ pub(crate) struct SharedClausePool {
 
 impl Default for SharedClausePool {
     fn default() -> Self {
-        let cap = shared_pool_cap();
+        Self::with_capacity(SHARED_POOL_CAP)
+    }
+}
+
+impl SharedClausePool {
+    /// Build a ring with an explicit requested capacity, rounded down to a power
+    /// of two. A smaller ring only drops more optional shared clauses.
+    pub(crate) fn with_capacity(requested: usize) -> Self {
+        let requested = requested.max(1);
+        let cap = 1usize << (usize::BITS - 1 - requested.leading_zeros());
         Self {
             ring: Mutex::new(SharedRing { slots: vec![None; cap], mask: cap - 1, write: 0 }),
             imported: AtomicU64::new(0),
             lazy_atoms: LazyAtomRegistry::new(),
         }
     }
-}
-
-impl SharedClausePool {
     /// Total clauses published to the pool (not the live window size).
     pub fn len(&self) -> usize {
         self.ring.lock().unwrap().write as usize

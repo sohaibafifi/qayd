@@ -1,7 +1,10 @@
 # Downloaded benchmarks, run outputs, and baseline jars are large / reproducible.
 */instances/
 */results/
+/results/
 solvers/*.jar
+solvers/HGS-CVRP/
+solvers/LKH-*/
 
 # Python caches
 __pycache__/

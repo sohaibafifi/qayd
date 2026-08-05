@@ -120,6 +120,56 @@ their generated demonstration; with a file argument they parse, solve and
 independently verify that instance. `--json` produces a campaign-ready record.
 Small format-correct smoke instances live under `examples/instances/`.
 
+## Competitive routing and scheduling campaign
+
+The runner uses one normalized JSONL contract for qayd API, qayd native,
+Hexaly, HGS-CVRP, LKH-3 and OR-Tools CP-SAT. Every feasible adapter result is
+replayed before it is accepted. Missing certified bounds remain `null`.
+
+CVRPLIB `-kN` names provide a minimum feasible fleet, not a maximum fleet.
+The competitive CVRP models therefore allow up to one route per customer and
+minimize distance, matching the official BKS convention. Passing `--vehicles N`
+to a qayd launcher deliberately changes the convention to a fleet limit and is
+recorded as such. HGS is likewise run without `-veh` in competitive campaigns.
+
+```sh
+# Optional public datasets and open baseline binaries
+python3 bench/fetch_collections.py --collection all
+python3 bench/solvers/fetch_competitive.py --solver hgs
+python3 bench/solvers/fetch_competitive.py --solver lkh --accept-lkh-academic-license
+
+# Fast end-to-end validation with the repository's five tiny instances
+uv run bench/campaign.py --suite smoke \
+  --solver qayd-api --solver qayd-native --solver ortools-cp-sat \
+  --budget 1 --seed 0,1,2,3,4 --threads 1 \
+  --out bench/results/smoke.jsonl
+
+# Aggregate and enforce the five-seed publication gate
+uv run bench/report.py bench/results/smoke.jsonl \
+  --markdown bench/results/smoke.md --json bench/results/smoke-summary.json \
+  --require-claim-ready
+```
+
+For the full campaign, use `--suite competitive`, budgets such as
+`--budget 1,10,60,600`, and pass external installations explicitly with
+`--hexaly-home`, `--hgs-binary`, and `--lkh-binary`. The runner is resumable by
+default. Use `--restart` only when intentionally replacing an output file.
+
+Qayd LS profiling is explicit and enabled by the campaign runner. Use
+`--no-profile-qayd` for quality-only measurements or `--max-iterations N` for a
+deterministic work budget. The same controls are available as
+`Model.solve(profile=True, max_iterations=N)` and as `--profile` plus
+`--max-iterations` on both API/native routing launchers. These controls apply
+to the ordered-list LS backend. Scheduling publishes no artificial candidate
+counter.
+
+Exact ablations are explicit too. The campaign and paired routing launchers
+accept `--[no-]routing-two-way`, `--[no-]routing-nearest-neighbor`, and
+`--[no-]routing-warm-start`; flexible job-shop launchers accept `--schedule-cdcl`. The
+Python equivalents are keyword arguments to `Model.solve`. The XCSP binary
+uses `--force-scope-reasons` and `--shared-pool-cap N` for its LCG ablations.
+There is no process-wide solver configuration through environment variables.
+
 ## Data sources
 
 - **SAT** - Global Benchmark Database, <https://benchmark-database.de>, which

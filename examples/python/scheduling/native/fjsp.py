@@ -20,6 +20,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--jobs", type=int, default=4)
 parser.add_argument("--machines", type=int, default=3)
 parser.add_argument("--time-limit", type=int, default=10)
+parser.add_argument("--schedule-cdcl", action="store_true", help="use the optional-mode CDCL exact path")
 parser.add_argument("--verbose", action="store_true")
 args = parser.parse_args()
 jobs = args.jobs
@@ -47,7 +48,7 @@ for j in range(jobs):
 model.no_overlap_by_machine()
 model.minimize_makespan(ivs)
 
-solution = model.solve(time_limit=time_limit, verbose=args.verbose)
+solution = model.solve(time_limit=time_limit, verbose=args.verbose, schedule_cdcl=args.schedule_cdcl)
 
 n = jobs * ops_per_job
 print(f"jobs: {jobs}  machines: {machines}  ops: {n}  status: {solution.status}")

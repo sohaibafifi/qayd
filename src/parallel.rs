@@ -47,6 +47,10 @@ pub struct RunOptions {
     /// routing every worker to the chronological-DFS driver. Learning is on by
     /// default; plain DFS wins only on highly symmetric models.
     pub no_learn_csp: bool,
+    /// Ablation control: use whole propagator scopes instead of tight reasons.
+    pub force_scope_reasons: bool,
+    /// Requested shared-clause ring capacity. Rounded down to a power of two.
+    pub shared_pool_capacity: usize,
     /// Hard memory budget in megabytes; `None` = unlimited. Enforced only when the
     /// tracking allocator is installed (the `qayd` binary).
     pub mem_limit: Option<usize>,
@@ -61,7 +65,18 @@ impl RunOptions {
 
 impl Default for RunOptions {
     fn default() -> Self {
-        Self { seed: 0, workers: 1, mode: Mode::Default, split: false, probes: 0, lns: 0, no_learn_csp: false, mem_limit: None }
+        Self {
+            seed: 0,
+            workers: 1,
+            mode: Mode::Default,
+            split: false,
+            probes: 0,
+            lns: 0,
+            no_learn_csp: false,
+            force_scope_reasons: false,
+            shared_pool_capacity: 1 << 14,
+            mem_limit: None,
+        }
     }
 }
 
@@ -526,12 +541,13 @@ struct CspShared {
 /// propagator is `Send` but not `Sync`, the source cannot be shared by reference,
 /// so the clones are made serially up front; the loop polls the stop flag so a
 /// slow clone of a large model cannot overrun the deadline before search begins.
-pub(crate) fn solve_csp(problem: Problem, stop: &AtomicBool, options: RunOptions) -> CspOutcome {
+pub(crate) fn solve_csp(mut problem: Problem, stop: &AtomicBool, options: RunOptions) -> CspOutcome {
+    problem.solver.set_force_scope_reasons(options.force_scope_reasons);
     let shared = Arc::new(CspShared {
         cancel: AtomicBool::new(false),
         solution: Mutex::new(None),
         decided: AtomicBool::new(false),
-        clauses: Arc::new(SharedClausePool::default()),
+        clauses: Arc::new(SharedClausePool::with_capacity(options.shared_pool_capacity)),
     });
     let mut models = Vec::with_capacity(options.workers);
     models.push(problem);
@@ -600,13 +616,14 @@ pub(crate) fn solve_csp(problem: Problem, stop: &AtomicBool, options: RunOptions
 }
 
 pub(crate) fn solve_cop<W: Write>(
-    problem: Problem,
+    mut problem: Problem,
     local: LocalSearchSpec,
     verbose: bool,
     stop: &AtomicBool,
     w: &mut W,
     options: RunOptions,
 ) -> Result<ParallelOutcome, String> {
+    problem.solver.set_force_scope_reasons(options.force_scope_reasons);
     let minimizing = problem.objective_dir().expect("COP lost its objective");
     let var_objective = problem.var_objective();
     let (probe_lower, probe_upper) = var_objective
@@ -617,7 +634,7 @@ pub(crate) fn solve_cop<W: Write>(
         proved: AtomicBool::new(false),
         best: AtomicI64::new(if minimizing { i64::MAX } else { i64::MIN }),
         solution: Mutex::new(None),
-        clauses: Arc::new(SharedClausePool::default()),
+        clauses: Arc::new(SharedClausePool::with_capacity(options.shared_pool_capacity)),
         work: WorkQueue::new(),
         minimizing,
         probe_lower: AtomicI64::new(probe_lower),

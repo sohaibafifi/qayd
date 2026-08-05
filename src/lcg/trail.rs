@@ -375,8 +375,6 @@ impl<'s> Cdcl<'s> {
     }
 
     pub(crate) fn new_with_registry(solver: &'s mut Solver, vars: &[VarId], lazy_atoms: Arc<LazyAtomRegistry>) -> Self {
-        // Ablation hook: `QAYD_SCOPE_REASONS` forces whole-scope explanations.
-        solver.store.set_force_scope_reasons(std::env::var_os("QAYD_SCOPE_REASONS").is_some());
         solver.store.set_explain(true);
         let nvars = solver.store.num_vars();
         let mut active = (0..nvars).map(|i| solver.store.is_relevant(VarId(i as u32))).collect::<Vec<_>>();

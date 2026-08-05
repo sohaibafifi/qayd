@@ -10,7 +10,7 @@ use std::sync::{mpsc, Mutex, MutexGuard};
 
 use super::alns::SearchProfile;
 use super::local_search::{solve_collection_capped_worker, Score};
-use super::metrics::{metrics_enabled_from_env, ListSearchMetrics};
+use super::metrics::ListSearchMetrics;
 use super::moves::better;
 use crate::engines::dual;
 use crate::mix64;
@@ -152,35 +152,24 @@ pub fn solve_collection_parallel(
     hint: Option<&[Vec<i32>]>,
     report: &mut dyn FnMut(i64),
 ) -> CollectionSolution {
-    let max_iters = std::env::var("QAYD_LS_MAX_ITERS").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX);
-    let metrics_enabled = metrics_enabled_from_env();
-    let (solution, metrics) =
-        solve_collection_parallel_internal(model, seed, stop, workers, max_iters, hint, report, metrics_enabled, true);
-    if metrics_enabled {
-        eprint!("{metrics}");
-    }
-    solution
+    solve_collection_parallel_internal(model, seed, stop, workers, u64::MAX, hint, report, false, true).0
 }
 
 /// Portfolio entry point for a frontend that already validated the collection
 /// model against the shared solve budget.
 #[cfg(feature = "python")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn solve_collection_parallel_validated(
     model: &CollectionModel,
     seed: u64,
     stop: &AtomicBool,
     workers: usize,
+    max_iters: u64,
     hint: Option<&[Vec<i32>]>,
     report: &mut dyn FnMut(i64),
-) -> CollectionSolution {
-    let max_iters = std::env::var("QAYD_LS_MAX_ITERS").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX);
-    let metrics_enabled = metrics_enabled_from_env();
-    let (solution, metrics) =
-        solve_collection_parallel_internal(model, seed, stop, workers, max_iters, hint, report, metrics_enabled, false);
-    if metrics_enabled {
-        eprint!("{metrics}");
-    }
-    solution
+    profile: bool,
+) -> (CollectionSolution, ListPortfolioMetrics) {
+    solve_collection_parallel_internal(model, seed, stop, workers, max_iters, hint, report, profile, false)
 }
 
 /// Deterministic iteration-capped, profiled portfolio entry point.

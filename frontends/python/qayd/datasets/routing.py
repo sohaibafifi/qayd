@@ -29,6 +29,7 @@ class CVRPLibInstance:
     edge_weights: IntMatrix
     edge_weight_type: str
     edge_weight_format: Optional[str]
+    # Minimum fleet hint parsed from `-kN`, or the explicit VEHICLES field.
     vehicles: Optional[int]
     comment: str
     best_known: Optional[int]

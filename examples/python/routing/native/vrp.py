@@ -26,13 +26,18 @@ parser.add_argument("--capacity", type=int, default=40, help="generated-instance
 parser.add_argument("--time-limit", type=int, default=10)
 parser.add_argument("--threads", type=int, default=1)
 parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--max-iterations", type=int)
+parser.add_argument("--profile", action="store_true")
+parser.add_argument("--routing-two-way", action=argparse.BooleanOptionalAction, default=True)
+parser.add_argument("--routing-nearest-neighbor", action=argparse.BooleanOptionalAction, default=True)
+parser.add_argument("--routing-warm-start", action=argparse.BooleanOptionalAction, default=True)
 parser.add_argument("--engine", choices=("auto", "exact", "ls"), default="ls")
 parser.add_argument("--solution", help="VRP solution file used as an LS warm start")
 parser.add_argument("--verbose", action="store_true")
 parser.add_argument("--json", action="store_true", help="emit one machine-readable result")
 args = parser.parse_args()
 
-if args.threads <= 0 or args.time_limit < 0 or args.seed < 0:
+if args.threads <= 0 or args.time_limit < 0 or args.seed < 0 or (args.max_iterations is not None and args.max_iterations < 0):
     raise SystemExit("threads must be positive; time limit and seed must be non-negative")
 
 instance = read_cvrplib(args.instance) if args.instance else None
@@ -49,6 +54,7 @@ if instance is None:
     customers = list(range(1, n + 1))
     capacity = args.capacity
     vehicles = args.vehicles or (-(-sum(demand) // capacity) + 1)
+    minimum_vehicles = None
     name = f"generated-cvrp-n{n}"
     node_ids = list(range(n + 1))
     best_known = None
@@ -58,15 +64,19 @@ else:
     depot = instance.depot
     customers = list(instance.customers)
     capacity = instance.capacity
-    vehicles = args.vehicles or instance.vehicles
-    if vehicles is None:
-        raise SystemExit("instance name has no -kN fleet; pass --vehicles")
+    minimum_vehicles = instance.vehicles
+    vehicles = args.vehicles or len(customers)
     name = instance.name
     node_ids = list(instance.node_ids)
     best_known = instance.best_known
 
 if vehicles <= 0 or capacity <= 0:
     raise SystemExit("vehicle count and capacity must be positive")
+objective_convention = (
+    "cvrplib_unlimited_fleet_distance"
+    if instance is not None and args.vehicles is None
+    else "distance_with_vehicle_limit"
+)
 if args.solution and (instance is None or args.engine != "ls"):
     raise SystemExit("--solution requires a real instance and --engine ls")
 
@@ -86,6 +96,11 @@ solve_options = {
     "time_limit": args.time_limit,
     "seed": args.seed,
     "verbose": args.verbose,
+    "max_iterations": args.max_iterations,
+    "profile": args.profile,
+    "routing_two_way": args.routing_two_way,
+    "routing_nearest_neighbor": args.routing_nearest_neighbor,
+    "routing_warm_start": args.routing_warm_start,
 }
 if hint is not None:
     solve_options["list_hint"] = hint
@@ -101,10 +116,18 @@ if solution.lists is None:
         "status": solution.status,
         "elapsed_seconds": elapsed,
         "objectives": [],
+        "objective_convention": objective_convention,
         "dual_bound": solution.dual_bound,
         "absolute_gap": solution.absolute_gap,
         "relative_gap": solution.relative_gap,
         "bound_method": solution.bound_method,
+        "alns_iterations": solution.alns_iterations,
+        "candidates_evaluated": solution.candidates_evaluated,
+        "candidates_per_second": solution.candidates_per_second,
+        "full_recompute_percentage": solution.full_recompute_percentage,
+        "routing_two_way": args.routing_two_way,
+        "routing_nearest_neighbor": args.routing_nearest_neighbor,
+        "routing_warm_start": args.routing_warm_start,
     }
     print(json.dumps(record, sort_keys=True) if args.json else f"instance: {name}  status: {solution.status}")
     raise SystemExit(0)
@@ -127,18 +150,27 @@ record = {
     "status": solution.status,
     "customers": len(customers),
     "vehicles": vehicles,
+    "minimum_vehicles": minimum_vehicles,
     "vehicles_used": sum(bool(route) for route in solution.lists),
     "capacity": capacity,
     "objectives": [total_distance],
+    "objective_convention": objective_convention,
     "dual_bound": solution.dual_bound,
     "absolute_gap": solution.absolute_gap,
     "relative_gap": solution.relative_gap,
     "bound_method": solution.bound_method,
+    "alns_iterations": solution.alns_iterations,
+    "candidates_evaluated": solution.candidates_evaluated,
+    "candidates_per_second": solution.candidates_per_second,
+    "full_recompute_percentage": solution.full_recompute_percentage,
     "best_known": best_known,
     "elapsed_seconds": elapsed,
     "seed": args.seed,
     "threads": args.threads,
     "engine": args.engine,
+    "routing_two_way": args.routing_two_way,
+    "routing_nearest_neighbor": args.routing_nearest_neighbor,
+    "routing_warm_start": args.routing_warm_start,
     "routes": route_records,
     "verified": True,
 }

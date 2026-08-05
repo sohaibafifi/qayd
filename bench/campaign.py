@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+"""Run reproducible multi-seed routing and scheduling campaigns.
+
+Examples:
+
+  uv run bench/campaign.py --suite smoke --solver qayd-native \
+      --budget 1 --seed 0 --out bench/results/smoke.jsonl
+
+  uv run bench/campaign.py --suite competitive \
+      --solver qayd-native --solver hexaly --solver hgs --solver lkh \
+      --solver ortools-cp-sat --budget 1,10,60,600 --seed 0,1,2,3,4 \
+      --threads 4 --hexaly-home /opt/hexaly_14_5 \
+      --hgs-binary bench/solvers/HGS-CVRP/build/hgs \
+      --lkh-binary bench/solvers/LKH-3.0.13/LKH \
+      --out bench/results/competitive.jsonl
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+from typing import Any, Iterable
+
+from common.competitive import (
+    complete_record,
+    json_record_from_output,
+    machine_provenance,
+    run_measured,
+    sha256_file,
+)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+ADAPTERS = ROOT / "bench" / "adapters"
+QAYD_SCRIPTS = {
+    ("api", "cvrp"): "examples/python/routing/api/vrp.py",
+    ("native", "cvrp"): "examples/python/routing/native/vrp.py",
+    ("api", "cvrptw"): "examples/python/routing/api/cvrptw.py",
+    ("native", "cvrptw"): "examples/python/routing/native/cvrptw.py",
+    ("api", "jssp"): "examples/python/scheduling/api/jssp.py",
+    ("native", "jssp"): "examples/python/scheduling/native/jssp.py",
+    ("api", "rcpsp"): "examples/python/scheduling/api/rcpsp.py",
+    ("native", "rcpsp"): "examples/python/scheduling/native/rcpsp.py",
+}
+SOLVERS = ("qayd-api", "qayd-native", "hexaly", "hgs", "lkh", "ortools-cp-sat")
+SOLVER_PROBLEMS = {
+    "qayd-api": {"cvrp", "cvrptw", "jssp", "rcpsp"},
+    "qayd-native": {"cvrp", "cvrptw", "jssp", "rcpsp"},
+    "hexaly": {"cvrp", "cvrptw", "jssp", "rcpsp"},
+    "hgs": {"cvrp"},
+    "lkh": {"cvrp", "cvrptw"},
+    "ortools-cp-sat": {"jssp", "rcpsp"},
+}
+
+
+def number_list(values: Iterable[str], *, positive: bool) -> list[int]:
+    parsed = []
+    for value in values:
+        for field in value.split(","):
+            if not field.strip():
+                continue
+            number = int(field)
+            if (positive and number <= 0) or (not positive and number < 0):
+                raise argparse.ArgumentTypeError("values must be positive" if positive else "values must be non-negative")
+            parsed.append(number)
+    return sorted(set(parsed))
+
+
+def load_suite(value: str) -> tuple[Path, dict[str, Any]]:
+    candidate = Path(value)
+    if not candidate.exists():
+        candidate = ROOT / "bench" / "suites" / f"{value}.json"
+    if not candidate.is_file():
+        raise SystemExit(f"suite not found: {value}")
+    with candidate.open(encoding="utf-8") as stream:
+        suite = json.load(stream)
+    if not isinstance(suite.get("datasets"), list):
+        raise SystemExit(f"invalid suite: {candidate}")
+    return candidate.resolve(), suite
+
+
+def discover_instances(
+    suite: dict[str, Any], families: set[str], limit_per_family: int,
+) -> list[dict[str, Any]]:
+    found = []
+    for dataset in suite["datasets"]:
+        family = dataset["family"]
+        if families and family not in families:
+            continue
+        pattern = dataset["glob"]
+        paths = sorted(path for path in ROOT.glob(pattern) if path.is_file())
+        if limit_per_family:
+            paths = paths[:limit_per_family]
+        for path in paths:
+            found.append({
+                "family": family,
+                "problem": dataset["problem"],
+                "path": path.resolve(),
+                "instance_path": str(path.relative_to(ROOT)),
+                "instance_sha256": sha256_file(path),
+                "best_known": adjacent_best_known(path),
+            })
+    return found
+
+
+def adjacent_best_known(path: Path) -> float | None:
+    solution = path.with_suffix(".sol")
+    if solution.is_file():
+        for raw in reversed(solution.read_text(encoding="utf-8", errors="replace").splitlines()):
+            fields = raw.replace(":", " ").split()
+            if len(fields) >= 2 and fields[0].lower() in {"cost", "objective", "value"}:
+                try:
+                    return float(fields[1])
+                except ValueError:
+                    return None
+    for parent in path.parents:
+        metadata = parent / "instances.json"
+        if metadata.is_file():
+            try:
+                entries = json.loads(metadata.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                entries = []
+            for entry in entries if isinstance(entries, list) else []:
+                if entry.get("name") == path.name and isinstance(entry.get("optimum"), (int, float)):
+                    return float(entry["optimum"])
+        summary_path = parent / "summary.json"
+        if summary_path.is_file():
+            try:
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                summary = {}
+            prefix = str(summary.get("instance_set", ""))
+            suffix = path.stem.removeprefix(prefix)
+            fields = suffix.split("_")
+            if prefix and len(fields) == 2 and all(field.isdigit() for field in fields):
+                parameter, instance = map(int, fields)
+                for entry in summary.get("solutions", []):
+                    if entry.get("parameter") == parameter and entry.get("instance") == instance:
+                        value = entry.get("optimal_makespan") if entry.get("is_proven_optimal") else entry.get("upper_bound")
+                        return float(value) if isinstance(value, (int, float)) else None
+    return None
+
+
+def binary_version(path: Path) -> str:
+    if not path.is_file():
+        return f"missing:{path}"
+    return f"sha256:{sha256_file(path)[:16]}"
+
+
+def solver_version(name: str, args: argparse.Namespace, provenance: dict[str, Any]) -> str:
+    if name.startswith("qayd-"):
+        cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        workspace = cargo.split("[workspace.package]", 1)[-1]
+        match = re.search(r'^version\s*=\s*"([^"]+)"', workspace, re.MULTILINE)
+        version = match.group(1) if match else "unknown"
+        return f"qayd {version} ({(provenance.get('commit') or 'unknown')[:12]})"
+    if name == "ortools-cp-sat":
+        try:
+            import ortools
+            return f"OR-Tools {ortools.__version__} CP-SAT"
+        except ImportError:
+            return "OR-Tools missing"
+    if name == "hexaly":
+        binary = Path(args.hexaly_home) / "bin" / "hexaly" if args.hexaly_home else Path("missing")
+        if binary.is_file():
+            try:
+                result = subprocess.run([str(binary)], text=True, capture_output=True, timeout=5)
+                first = (result.stdout + result.stderr).splitlines()[0]
+                return f"{first.strip()} [{binary_version(binary)}]"
+            except (OSError, subprocess.SubprocessError, IndexError):
+                pass
+        return binary_version(binary)
+    if name == "hgs":
+        return f"HGS-CVRP {binary_version(Path(args.hgs_binary or 'missing'))}"
+    if name == "lkh":
+        return f"LKH-3 {binary_version(Path(args.lkh_binary or 'missing'))}"
+    return "unknown"
+
+
+def command_for(
+    solver: str, item: dict[str, Any], budget: int, seed: int,
+    args: argparse.Namespace,
+) -> list[str]:
+    problem = item["problem"]
+    instance = str(item["path"])
+    threads = effective_threads(solver, item, args)
+    common = [instance, "--time-limit", str(budget), "--threads", str(threads), "--seed", str(seed), "--json"]
+    if solver.startswith("qayd-"):
+        variant = solver.removeprefix("qayd-")
+        engine = args.qayd_engine
+        if (variant == "api" and problem in {"jssp", "rcpsp"} and engine == "ls") or (
+            problem == "rcpsp" and item["path"].suffix.lower() == ".mm" and engine == "ls"
+        ):
+            engine = "auto"
+        command = [sys.executable, str(ROOT / QAYD_SCRIPTS[(variant, problem)]), *common, "--engine", engine]
+        list_controls = problem in {"cvrp", "cvrptw"}
+        if args.profile_qayd and engine == "ls" and list_controls:
+            command.append("--profile")
+        if args.max_iterations is not None and engine == "ls" and list_controls:
+            command.extend(("--max-iterations", str(args.max_iterations)))
+        if problem in {"cvrp", "cvrptw"}:
+            command.append("--routing-two-way" if args.routing_two_way else "--no-routing-two-way")
+            command.append("--routing-nearest-neighbor" if args.routing_nearest_neighbor else "--no-routing-nearest-neighbor")
+            command.append("--routing-warm-start" if args.routing_warm_start else "--no-routing-warm-start")
+        return command
+    if solver == "ortools-cp-sat":
+        return [sys.executable, str(ADAPTERS / "ortools_cp_sat.py"), problem, *common]
+    if solver == "hexaly":
+        return [
+            sys.executable, str(ADAPTERS / "hexaly.py"), problem, *common,
+            "--hexaly-home", str(Path(args.hexaly_home).resolve()),
+        ]
+    if solver == "hgs":
+        return [
+            sys.executable, str(ADAPTERS / "hgs.py"), instance,
+            "--time-limit", str(budget), "--seed", str(seed), "--threads", str(threads),
+            "--binary", str(Path(args.hgs_binary).resolve()), "--json",
+        ]
+    if solver == "lkh":
+        return [
+            sys.executable, str(ADAPTERS / "lkh.py"), problem, instance,
+            "--time-limit", str(budget), "--seed", str(seed), "--threads", str(threads),
+            "--binary", str(Path(args.lkh_binary).resolve()), "--json",
+        ]
+    raise AssertionError(solver)
+
+
+def effective_threads(solver: str, item: dict[str, Any], args: argparse.Namespace) -> int:
+    if solver in {"hgs", "lkh"}:
+        return 1
+    if solver.startswith("qayd-"):
+        if args.qayd_engine != "ls":
+            return 1
+        if solver == "qayd-api" and item["problem"] in {"jssp", "rcpsp"}:
+            return 1
+        if item["problem"] == "rcpsp" and item["path"].suffix.lower() == ".mm":
+            return 1
+    return args.threads
+
+
+def run_key(solver: str, item: dict[str, Any], budget: int, seed: int, args: argparse.Namespace) -> str:
+    raw = json.dumps(
+        [
+            solver,
+            item["instance_path"],
+            item["instance_sha256"],
+            item["problem"],
+            budget,
+            seed,
+            args.threads,
+            args.qayd_engine if solver.startswith("qayd-") else None,
+            args.max_iterations if solver.startswith("qayd-") else None,
+            args.profile_qayd if solver.startswith("qayd-") else None,
+            args.routing_two_way if solver.startswith("qayd-") else None,
+            args.routing_nearest_neighbor if solver.startswith("qayd-") else None,
+            args.routing_warm_start if solver.startswith("qayd-") else None,
+        ],
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(raw.encode()).hexdigest()[:20]
+
+
+def existing_keys(path: Path) -> set[str]:
+    keys = set()
+    if not path.is_file():
+        return keys
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("run_id"):
+                keys.add(record["run_id"])
+    return keys
+
+
+def check_solver_arguments(solvers: list[str], args: argparse.Namespace) -> None:
+    requirements = {
+        "hexaly": (args.hexaly_home, "--hexaly-home"),
+        "hgs": (args.hgs_binary, "--hgs-binary"),
+        "lkh": (args.lkh_binary, "--lkh-binary"),
+    }
+    for solver, (value, flag) in requirements.items():
+        if solver in solvers and not value:
+            raise SystemExit(f"{solver} requires {flag}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--suite", default="smoke", help="suite name or JSON file")
+    parser.add_argument("--solver", action="append", choices=SOLVERS, required=True)
+    parser.add_argument("--budget", action="append", default=[], metavar="SECONDS", help="repeat or use comma-separated checkpoints")
+    parser.add_argument("--seed", action="append", default=[], help="repeat or use comma-separated seeds")
+    parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--family", action="append", default=[], help="only selected dataset families")
+    parser.add_argument("--limit-per-family", type=int, default=0)
+    parser.add_argument("--memory-limit-mb", type=int, default=0)
+    parser.add_argument("--grace-seconds", type=float, default=20.0, help="wrapper grace beyond solver budget")
+    parser.add_argument("--qayd-engine", choices=("auto", "exact", "ls"), default="ls")
+    parser.add_argument("--max-iterations", type=int, help="explicit LS iteration cap for qayd")
+    parser.add_argument(
+        "--profile-qayd", action=argparse.BooleanOptionalAction, default=True,
+        help="collect candidate throughput for qayd LS runs",
+    )
+    parser.add_argument("--routing-two-way", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--routing-nearest-neighbor", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--routing-warm-start", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--hexaly-home", help="Hexaly installation root, for example /opt/hexaly_14_5")
+    parser.add_argument("--hgs-binary", help="compiled HGS-CVRP executable")
+    parser.add_argument("--lkh-binary", help="compiled LKH-3 executable")
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--restart", action="store_true", help="ignore completed run IDs instead of resuming")
+    args = parser.parse_args()
+
+    if (
+        args.threads <= 0
+        or args.limit_per_family < 0
+        or args.memory_limit_mb < 0
+        or args.grace_seconds < 0
+        or (args.max_iterations is not None and args.max_iterations < 0)
+    ):
+        raise SystemExit("threads must be positive; limits and grace must be non-negative")
+    budgets = number_list(args.budget or ["1,10,60,600"], positive=True)
+    seeds = number_list(args.seed or ["0,1,2,3,4"], positive=False)
+    solvers = list(dict.fromkeys(args.solver))
+    check_solver_arguments(solvers, args)
+    suite_path, suite = load_suite(args.suite)
+    instances = discover_instances(suite, set(args.family), args.limit_per_family)
+    if not instances:
+        raise SystemExit("no matching instances; run bench/fetch_collections.py for the competitive suite")
+
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    completed = set() if args.restart else existing_keys(args.out)
+    provenance = machine_provenance(ROOT)
+    versions = {solver: solver_version(solver, args, provenance) for solver in solvers}
+    sidecar = args.out.with_suffix(args.out.suffix + ".provenance.json")
+    sidecar_payload = {
+        "schema_version": 1,
+        "suite": suite,
+        "suite_file": str(suite_path),
+        "solvers": versions,
+        "budgets": budgets,
+        "seeds": seeds,
+        "threads": args.threads,
+        "memory_limit_mb": args.memory_limit_mb,
+        "qayd_engine": args.qayd_engine,
+        "max_iterations": args.max_iterations,
+        "profile_qayd": args.profile_qayd,
+        "routing_two_way": args.routing_two_way,
+        "routing_nearest_neighbor": args.routing_nearest_neighbor,
+        "routing_warm_start": args.routing_warm_start,
+        "host": provenance,
+    }
+    compatibility_fields = (
+        "suite", "suite_file", "solvers", "budgets", "seeds", "threads",
+        "memory_limit_mb", "qayd_engine", "max_iterations", "profile_qayd",
+        "routing_two_way", "routing_nearest_neighbor", "routing_warm_start",
+    )
+    if args.out.exists() and not args.restart:
+        if not sidecar.is_file():
+            raise SystemExit(f"cannot resume without provenance sidecar: {sidecar}")
+        previous = json.loads(sidecar.read_text(encoding="utf-8"))
+        changed = [field for field in compatibility_fields if previous.get(field) != sidecar_payload.get(field)]
+        if changed:
+            fields = ", ".join(changed)
+            raise SystemExit(f"campaign configuration changed ({fields}); use a new --out or --restart")
+        if previous.get("host", {}).get("commit") != provenance.get("commit"):
+            raise SystemExit("qayd commit changed; use a new --out or --restart")
+    sidecar.write_text(json.dumps(sidecar_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    jobs = [
+        (solver, item, budget, seed)
+        for item in instances
+        for budget in budgets
+        for seed in seeds
+        for solver in solvers if item["problem"] in SOLVER_PROBLEMS[solver]
+    ]
+    pending = [job for job in jobs if run_key(job[0], job[1], job[2], job[3], args) not in completed]
+    print(f"campaign: {len(instances)} instances, {len(jobs)} runs, {len(pending)} pending", file=sys.stderr)
+    mode = "w" if args.restart else "a"
+    with args.out.open(mode, encoding="utf-8") as output:
+        for index, (solver, item, budget, seed) in enumerate(pending, 1):
+            identifier = run_key(solver, item, budget, seed, args)
+            argv = command_for(solver, item, budget, seed, args)
+            measured = run_measured(
+                argv, timeout=budget + args.grace_seconds, cwd=ROOT,
+                memory_limit_mb=args.memory_limit_mb,
+            )
+            try:
+                record = json_record_from_output(measured["stdout"])
+            except ValueError as error:
+                record = {"status": "ERROR", "objectives": [], "verified": False, "error": str(error)}
+            record.update({
+                "run_id": identifier,
+                "solver": solver,
+                "solver_version": versions[solver],
+                "problem": item["problem"],
+                "family": item["family"],
+                "instance_path": item["instance_path"],
+                "instance_sha256": item["instance_sha256"],
+                "checkpoint_seconds": budget,
+                "seed": seed,
+                "requested_threads": args.threads,
+                "threads": effective_threads(solver, item, args),
+                "wall_seconds": measured["wall_seconds"],
+                "peak_memory_mb": measured["peak_memory_mb"],
+                "return_code": measured["return_code"],
+                "timed_out": measured["timed_out"],
+                "command": measured["argv"],
+            })
+            if record.get("best_known") is None and item["best_known"] is not None:
+                record["best_known"] = item["best_known"]
+            if measured["return_code"] != 0:
+                record["status"] = "ERROR"
+                record["verified"] = False
+                record["diagnostic"] = measured["stderr"][-4000:]
+            record = complete_record(record)
+            output.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+            output.flush()
+            objective = record["objectives"] or "-"
+            print(
+                f"[{index}/{len(pending)}] {solver} {item['family']}/{item['path'].name} "
+                f"t={budget} seed={seed}: {record['status']} obj={objective} "
+                f"rss={record['peak_memory_mb']:.1f}MB",
+                file=sys.stderr,
+            )
+
+
+if __name__ == "__main__":
+    main()

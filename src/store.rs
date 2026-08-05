@@ -1247,6 +1247,12 @@ impl Solver {
         Self::default()
     }
 
+    /// Force whole-propagator-scope LCG explanations. This is an explicit
+    /// ablation control; normal solving uses the tighter propagator reasons.
+    pub fn set_force_scope_reasons(&mut self, on: bool) {
+        self.store.set_force_scope_reasons(on);
+    }
+
     /// Create a variable with domain `[lo, hi]`.
     pub fn new_var_range(&mut self, lo: i32, hi: i32) -> VarId {
         self.store.new_var_range(lo, hi)

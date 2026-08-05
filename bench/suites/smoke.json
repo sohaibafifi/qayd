@@ -1,0 +1,11 @@
+{
+  "name": "smoke",
+  "description": "Format-correct local instances for end-to-end campaign validation.",
+  "datasets": [
+    {"family": "cvrplib-x", "problem": "cvrp", "glob": "examples/instances/routing/tiny-cvrp.vrp"},
+    {"family": "solomon", "problem": "cvrptw", "glob": "examples/instances/routing/tiny-vrptw.txt"},
+    {"family": "jsplib", "problem": "jssp", "glob": "examples/instances/scheduling/tiny-jssp.txt"},
+    {"family": "psplib-sm", "problem": "rcpsp", "glob": "examples/instances/scheduling/tiny-rcpsp.sm"},
+    {"family": "psplib-mm", "problem": "rcpsp", "glob": "examples/instances/scheduling/tiny-mrcpsp.mm"}
+  ]
+}

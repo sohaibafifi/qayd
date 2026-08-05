@@ -351,6 +351,11 @@ struct PySolution {
     absolute_gap: Option<u64>,
     relative_gap: Option<f64>,
     bound_method: Option<String>,
+    /// Local-search work counters, present only when `profile=True`.
+    alns_iterations: Option<u64>,
+    candidates_evaluated: Option<u64>,
+    candidates_per_second: Option<f64>,
+    full_recompute_percentage: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -678,6 +683,10 @@ fn make_solution(
         absolute_gap: exact_bound.map(|_| 0),
         relative_gap: exact_bound.map(|_| 0.0),
         bound_method: exact_bound.map(|_| "exact proof".to_string()),
+        alns_iterations: None,
+        candidates_evaluated: None,
+        candidates_per_second: None,
+        full_recompute_percentage: None,
     }
 }
 
@@ -1526,6 +1535,26 @@ impl PySolution {
     #[getter]
     fn bound_method(&self) -> Option<String> {
         self.bound_method.clone()
+    }
+
+    #[getter]
+    fn alns_iterations(&self) -> Option<u64> {
+        self.alns_iterations
+    }
+
+    #[getter]
+    fn candidates_evaluated(&self) -> Option<u64> {
+        self.candidates_evaluated
+    }
+
+    #[getter]
+    fn candidates_per_second(&self) -> Option<f64> {
+        self.candidates_per_second
+    }
+
+    #[getter]
+    fn full_recompute_percentage(&self) -> Option<f64> {
+        self.full_recompute_percentage
     }
 
     /// Per-tier objective values for a lexicographic (multi-objective) model.
@@ -2406,7 +2435,7 @@ impl PyModel {
         Ok(())
     }
 
-    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, threads=1, engine="auto", conflict_budget=None, list_hint=None))]
+    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, threads=1, engine="auto", conflict_budget=None, list_hint=None, max_iterations=None, profile=false, schedule_cdcl=false, routing_two_way=true, routing_nearest_neighbor=true, routing_warm_start=true))]
     #[allow(clippy::too_many_arguments)]
     fn solve(
         &self,
@@ -2423,6 +2452,12 @@ impl PyModel {
         engine: &str,
         conflict_budget: Option<u64>,
         list_hint: Option<&Bound<'_, PyAny>>,
+        max_iterations: Option<u64>,
+        profile: bool,
+        schedule_cdcl: bool,
+        routing_two_way: bool,
+        routing_nearest_neighbor: bool,
+        routing_warm_start: bool,
     ) -> PyResult<PySolution> {
         if threads == 0 {
             return Err(PyValueError::new_err("threads must be a positive integer"));
@@ -2460,7 +2495,27 @@ impl PyModel {
                 }
                 None => None,
             };
-            return self.solve_collection(py, time_limit, seed, threads, verbose, engine, list_hint);
+            let routing_options = routing_engine::RoutingOptions {
+                two_way: routing_two_way,
+                nearest_neighbor: routing_nearest_neighbor,
+                warm_start: routing_warm_start,
+            };
+            return self.solve_collection(
+                py,
+                time_limit,
+                seed,
+                threads,
+                verbose,
+                engine,
+                list_hint,
+                max_iterations,
+                profile,
+                schedule_cdcl,
+                routing_options,
+            );
+        }
+        if max_iterations.is_some() || profile || schedule_cdcl {
+            return Err(PyValueError::new_err("max_iterations, profile, and schedule_cdcl are only supported by list and schedule models"));
         }
         if threads > 1 {
             return Err(PyValueError::new_err("threads > 1 is currently supported only for list and schedule models with engine='ls'"));
@@ -2940,6 +2995,7 @@ impl PyModel {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_solve_domain_collection(
         &self,
         py: Python<'_>,
@@ -2948,6 +3004,7 @@ impl PyModel {
         budget: &CollectionBudget,
         seed: u64,
         verbose: bool,
+        schedule_cdcl: bool,
     ) -> PyResult<Option<PySolution>> {
         if selection.backend != shared_model::Backend::DomainExact {
             return Ok(None);
@@ -2956,11 +3013,12 @@ impl PyModel {
             return Ok(Some(self.unknown_collection_solution()));
         }
         if let Some(schedule) = &model.schedule {
-            return self.try_solve_domain_schedule(py, schedule, model, selection, budget, seed, verbose);
+            return self.try_solve_domain_schedule(py, schedule, model, selection, budget, seed, verbose, schedule_cdcl);
         }
         self.try_solve_domain_lists(py, model, selection, budget, verbose)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_solve_routing_integer(
         &self,
         py: Python<'_>,
@@ -2969,6 +3027,7 @@ impl PyModel {
         budget: &CollectionBudget,
         seed: u64,
         verbose: bool,
+        options: routing_engine::RoutingOptions,
     ) -> PyResult<Option<PySolution>> {
         if selection.class != shared_model::ModelClass::Routing || selection.backend != shared_model::Backend::IntegerExact {
             return Ok(None);
@@ -2997,7 +3056,9 @@ impl PyModel {
                 println!("  o {objective}  ({primary_sense}, {:.2}s)", budget.elapsed_seconds());
             }
         };
-        let Some(outcome) = with_interrupts(py, &budget.stop, || routing_engine::solve_collection(model, seed, &budget.stop, &mut report))?
+        let Some(outcome) = with_interrupts(py, &budget.stop, || {
+            routing_engine::solve_collection_with_options(model, seed, &budget.stop, &mut report, options)
+        })?
         else {
             // Defence in depth: the classifier admitted this model but the engine
             // parse declined it (a lockstep gap). Every admitted routing model is
@@ -3059,6 +3120,10 @@ impl PyModel {
             absolute_gap,
             relative_gap,
             bound_method,
+            alns_iterations: None,
+            candidates_evaluated: None,
+            candidates_per_second: None,
+            full_recompute_percentage: None,
         }))
     }
 
@@ -3153,6 +3218,10 @@ impl PyModel {
             absolute_gap,
             relative_gap,
             bound_method,
+            alns_iterations: None,
+            candidates_evaluated: None,
+            candidates_per_second: None,
+            full_recompute_percentage: None,
         }))
     }
 
@@ -3166,6 +3235,7 @@ impl PyModel {
         budget: &CollectionBudget,
         seed: u64,
         verbose: bool,
+        schedule_cdcl: bool,
     ) -> PyResult<Option<PySolution>> {
         if !model.objectives.is_empty() || !model.constraints.is_empty() || !model.globals.is_empty() || !model.items.is_empty() {
             return Ok(None);
@@ -3191,10 +3261,7 @@ impl PyModel {
             println!("  preprocessing: {:.3}s", budget.elapsed_seconds());
         }
 
-        let options = schedule_engine::Options {
-            seed,
-            optional_modes_cdcl: schedule.minimize_makespan && std::env::var_os("QAYD_SCHEDULE_CDCL").is_some(),
-        };
+        let options = schedule_engine::Options { seed, optional_modes_cdcl: schedule.minimize_makespan && schedule_cdcl };
         let outcome = with_interrupts(py, &budget.stop, || {
             schedule_engine::solve(schedule, &budget.stop, options, |value| {
                 if verbose {
@@ -3249,6 +3316,10 @@ impl PyModel {
             absolute_gap,
             relative_gap,
             bound_method,
+            alns_iterations: None,
+            candidates_evaluated: None,
+            candidates_per_second: None,
+            full_recompute_percentage: None,
         }))
     }
 
@@ -3275,6 +3346,10 @@ impl PyModel {
             absolute_gap: None,
             relative_gap: None,
             bound_method: None,
+            alns_iterations: None,
+            candidates_evaluated: None,
+            candidates_per_second: None,
+            full_recompute_percentage: None,
         }
     }
 
@@ -3318,6 +3393,10 @@ impl PyModel {
         verbose: bool,
         engine: PythonEngine,
         list_hint: Option<Vec<Vec<i32>>>,
+        max_iterations: Option<u64>,
+        profile: bool,
+        schedule_cdcl: bool,
+        routing_options: routing_engine::RoutingOptions,
     ) -> PyResult<PySolution> {
         let budget = CollectionBudget::new(time_limit.unwrap_or(5));
         if budget.expired() {
@@ -3349,10 +3428,10 @@ impl PyModel {
             return Ok(self.unknown_collection_solution());
         }
         if let Some(selection) = &selection {
-            if let Some(solution) = self.try_solve_routing_integer(py, &model, selection, &budget, seed, verbose)? {
+            if let Some(solution) = self.try_solve_routing_integer(py, &model, selection, &budget, seed, verbose, routing_options)? {
                 return Ok(solution);
             }
-            if let Some(solution) = self.try_solve_domain_collection(py, &model, selection, &budget, seed, verbose)? {
+            if let Some(solution) = self.try_solve_domain_collection(py, &model, selection, &budget, seed, verbose, schedule_cdcl)? {
                 return Ok(solution);
             }
             if engine == PythonEngine::Exact {
@@ -3390,11 +3469,40 @@ impl PyModel {
                 println!("  o {objective}  ({primary_sense}, {:.2}s)", budget.elapsed_seconds());
             }
         };
-        let sol = with_interrupts(py, &budget.stop, || {
+        let max_iterations = max_iterations.unwrap_or(u64::MAX);
+        let (sol, search_profile) = with_interrupts(py, &budget.stop, || {
             if threads > 1 {
-                lists::solve_collection_parallel_validated(&model, seed, &budget.stop, threads, list_hint.as_deref(), &mut report)
+                let (solution, metrics) = lists::solve_collection_parallel_validated(
+                    &model,
+                    seed,
+                    &budget.stop,
+                    threads,
+                    max_iterations,
+                    list_hint.as_deref(),
+                    &mut report,
+                    profile,
+                );
+                let iterations = metrics.worker_metrics.iter().map(|worker| worker.search.alns.iterations).sum();
+                let candidates = metrics.worker_metrics.iter().map(|worker| worker.search.candidates).sum();
+                let elapsed_nanos = metrics.worker_metrics.iter().map(|worker| worker.search.elapsed_nanos).max().unwrap_or(0);
+                let trials: u64 = metrics.worker_metrics.iter().map(|worker| worker.search.trial_list_evaluations).sum();
+                let full: u64 = metrics.worker_metrics.iter().map(|worker| worker.search.full_recompute_trial_list_evaluations).sum();
+                let rate = if elapsed_nanos == 0 { 0.0 } else { candidates as f64 * 1_000_000_000.0 / elapsed_nanos as f64 };
+                let full_percentage = if trials == 0 { 0.0 } else { full as f64 * 100.0 / trials as f64 };
+                (solution, profile.then_some((iterations, candidates, rate, full_percentage)))
             } else {
-                lists::solve_collection_validated(&model, seed, &budget.stop, list_hint.as_deref(), &mut report)
+                let (solution, metrics) = lists::solve_collection_validated(
+                    &model,
+                    seed,
+                    &budget.stop,
+                    max_iterations,
+                    list_hint.as_deref(),
+                    &mut report,
+                    profile,
+                );
+                let values =
+                    (metrics.alns.iterations, metrics.candidates, metrics.candidates_per_second(), metrics.full_recompute_percentage());
+                (solution, profile.then_some(values))
             }
         })?;
         if verbose {
@@ -3409,12 +3517,22 @@ impl PyModel {
                 println!("  bound method: {}", bound.method);
             }
             println!("  improvements: {improvements}");
+            if let Some((iterations, candidates, rate, full_percentage)) = search_profile {
+                println!("  ALNS iterations: {iterations}");
+                println!("  candidates: {candidates}");
+                println!("  candidates/s: {rate:.1}");
+                println!("  full recomputations: {full_percentage:.2}%");
+            }
         }
         // Only expose objectives and lists for a feasible incumbent. An
         // infeasible best-effort partition may violate constraints, so hiding
         // it stops a caller from accidentally consuming an invalid solution.
         let objectives = if sol.feasible { sol.objectives.clone() } else { Vec::new() };
         let (dual_bound, absolute_gap, relative_gap, bound_method) = bound_fields(sol.bound.as_ref());
+        let (alns_iterations, candidates_evaluated, candidates_per_second, full_recompute_percentage) = search_profile
+            .map_or((None, None, None, None), |(iterations, candidates, rate, full_percentage)| {
+                (Some(iterations), Some(candidates), Some(rate), Some(full_percentage))
+            });
         Ok(PySolution {
             status: if sol.feasible { "SATISFIABLE".to_string() } else { "UNKNOWN".to_string() },
             objective: sol.feasible.then(|| sol.objectives.first().copied().unwrap_or(0)),
@@ -3435,6 +3553,10 @@ impl PyModel {
             absolute_gap,
             relative_gap,
             bound_method,
+            alns_iterations,
+            candidates_evaluated,
+            candidates_per_second,
+            full_recompute_percentage,
         })
     }
 

@@ -439,6 +439,7 @@ fn write_ls_result<W: Write>(w: &mut W, output: &SolutionOutput, result: LocalSe
 fn solve_single<W: Write>(xcsp: XcspProblem, verbose: bool, stop: &AtomicBool, w: &mut W, options: RunOptions) -> Result<(), String> {
     let XcspProblem { problem, output, .. } = xcsp;
     let mut solver = problem.solver;
+    solver.set_force_scope_reasons(options.force_scope_reasons);
     let vars = problem.search;
 
     match problem.objective {

@@ -48,7 +48,7 @@ fn is_instance(arg: &str) -> bool {
 }
 
 const USAGE: &str =
-    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--mem-limit MB] [--ls] [--split] [--probe N] [--lns N] [--no-learn-csp] <instance.xml[.lzma|.xz]>";
+    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--mem-limit MB] [--ls] [--split] [--probe N] [--lns N] [--no-learn-csp] [--force-scope-reasons] [--shared-pool-cap N] <instance.xml[.lzma|.xz]>";
 
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
@@ -87,6 +87,8 @@ fn main() {
     let mut probes = 0;
     let mut lns = 0;
     let mut no_learn_csp = false;
+    let mut force_scope_reasons = false;
+    let mut shared_pool_capacity = 1 << 14;
     let mut mem_limit: Option<usize> = None;
     let mut path: Option<String> = None;
 
@@ -103,6 +105,10 @@ fn main() {
             "--probe" => probes = positive(it.next().map(String::as_str), "--probe needs a positive integer"),
             "--lns" => lns = positive(it.next().map(String::as_str), "--lns needs a positive integer"),
             "--no-learn-csp" => no_learn_csp = true,
+            "--force-scope-reasons" => force_scope_reasons = true,
+            "--shared-pool-cap" => {
+                shared_pool_capacity = positive(it.next().map(String::as_str), "--shared-pool-cap needs a positive integer")
+            }
             "--mem-limit" => mem_limit = Some(positive(it.next().map(String::as_str), "--mem-limit needs a positive integer (megabytes)")),
             other if other.starts_with('-') => {
                 eprintln!("unknown option {other}");
@@ -117,17 +123,11 @@ fn main() {
     if !is_instance(&path) {
         usage();
     }
-    let seed = seed.unwrap_or_else(|| std::env::var("RANDOMSEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
+    let seed = seed.unwrap_or(0);
     if ls && time_limit.is_none() {
         time_limit = Some(240);
     }
-    let workers = match workers {
-        Some(workers) => workers,
-        None => match std::env::var("NBCORE") {
-            Ok(s) => positive(Some(&s), "NBCORE needs a positive integer"),
-            Err(_) => 1,
-        },
-    };
+    let workers = workers.unwrap_or(1);
 
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -165,6 +165,17 @@ fn main() {
         &path,
         verbose,
         &stop,
-        qayd::frontends::xcsp::RunOptions { seed, workers, mode, split, probes, lns, no_learn_csp, mem_limit },
+        qayd::frontends::xcsp::RunOptions {
+            seed,
+            workers,
+            mode,
+            split,
+            probes,
+            lns,
+            no_learn_csp,
+            force_scope_reasons,
+            shared_pool_capacity,
+            mem_limit,
+        },
     );
 }

@@ -33,6 +33,22 @@ const MAX_INTEGER_ROUTING_NODES: usize = 32;
 /// good incumbent on small models, bounded so it terminates without a stop flag.
 const WARM_START_ITERS: u64 = 2000;
 
+/// Explicit controls for the exact routing lowering. These used to be hidden
+/// process-wide environment switches, which made API and native launcher runs
+/// difficult to reproduce in the same process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RoutingOptions {
+    pub two_way: bool,
+    pub nearest_neighbor: bool,
+    pub warm_start: bool,
+}
+
+impl Default for RoutingOptions {
+    fn default() -> Self {
+        Self { two_way: true, nearest_neighbor: true, warm_start: true }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MatrixOrientation {
     Direct,
@@ -257,7 +273,7 @@ impl RoutingSpec {
         self.pool_list.is_some()
     }
 
-    fn lower(&self) -> LoweredProblem {
+    fn lower(&self, options: RoutingOptions) -> LoweredProblem {
         let mut solver = Solver::new();
         let mut nodes = Vec::with_capacity(self.depot_count + self.items.len());
         nodes.extend((0..self.depot_count).map(|_| self.depot));
@@ -382,16 +398,15 @@ impl RoutingSpec {
                 lists,
                 items: self.items.clone(),
                 depot_count: self.depot_count,
-                two_way: std::env::var("QAYD_ROUTING_TWOWAY").as_deref() != Ok("0"),
+                two_way: options.two_way,
             }));
         }
 
         // Nearest-neighbour seed: each node's successor defaults to its cheapest
-        // outgoing arc. A value-ordering hint only -- circuit/symmetry refine it,
-        // and the saved phase takes over after the first dive. `QAYD_ROUTING_NN=0`
-        // disables it (ablation).
+        // outgoing arc. A value-ordering hint only: circuit/symmetry refine it,
+        // and the saved phase takes over after the first dive.
         let mut initial_phase = vec![None; solver.store.num_vars()];
-        if std::env::var("QAYD_ROUTING_NN").as_deref() != Ok("0") {
+        if options.nearest_neighbor {
             for from in 0..n {
                 if let Some(to) =
                     (0..n).filter(|&to| to != from).min_by_key(|&to| self.edge.cost(nodes[from], nodes[to]).expect("validated edge cost"))
@@ -781,19 +796,29 @@ impl RoutingSpec {
 
 /// Solve a supported collection routing model by lowering it to integer CP.
 /// Returns `None` when the model shape is outside this exact lowering.
+#[allow(dead_code)]
 pub(crate) fn solve_collection(
     model: &CollectionModel,
     seed: u64,
     stop: &AtomicBool,
     report: &mut dyn FnMut(i64),
 ) -> Option<RoutingIntegerOutcome> {
+    solve_collection_with_options(model, seed, stop, report, RoutingOptions::default())
+}
+
+pub(crate) fn solve_collection_with_options(
+    model: &CollectionModel,
+    seed: u64,
+    stop: &AtomicBool,
+    report: &mut dyn FnMut(i64),
+    options: RoutingOptions,
+) -> Option<RoutingIntegerOutcome> {
     let spec = RoutingSpec::from_model(model)?;
     // Warm start: a quick local-search incumbent seeds the first dive and, after
-    // replay verification, supplies an initial exact objective bound.
-    // `QAYD_ROUTING_WARMSTART=0` disables it (ablation). Pool models are included:
+    // replay verification, supplies an initial exact objective bound. Pool models are included:
     // `ls_tour_succ` chains the pool list through the fixed pool depot, and replay
     // verifies the decode -- an infeasible one degrades gracefully to bound-less.
-    let warm = if std::env::var("QAYD_ROUTING_WARMSTART").as_deref() != Ok("0") {
+    let warm = if options.warm_start {
         // A bounded local-search pass: enough to find a good incumbent, capped so
         // it terminates even without a stop flag and leaves the exact search the
         // bulk of the time.
@@ -812,7 +837,7 @@ pub(crate) fn solve_collection(
     let verified: Option<(Vec<Vec<i32>>, i64)> = warm.as_ref().filter(|ls| ls.feasible).and_then(|ls| {
         let n = spec.depot_count + spec.items.len();
         let tour = spec.ls_tour_succ(n, &ls.lists)?;
-        let mut check = spec.lower();
+        let mut check = spec.lower(options);
         let cost = replay_tour(&mut check.solver, &check.search_vars[..n], &check.cost_vars, &tour)?;
         let tour_i32: Vec<i32> = tour.iter().map(|&node| node as i32).collect();
         let routes = routes_from_successors(&check.nodes, check.depot_count, &tour_i32)?;
@@ -820,7 +845,7 @@ pub(crate) fn solve_collection(
     });
     let bound = verified.as_ref().map(|&(_, cost)| AtomicI64::new(cost));
 
-    let lowered = spec.lower();
+    let lowered = spec.lower(options);
     let LoweredProblem { mut solver, search_vars, cost_vars, nodes, depot_count, initial_phase } = lowered;
 
     let coeffs = vec![1i64; cost_vars.len()];
@@ -958,8 +983,7 @@ struct RouteSegmentChannel {
     lists: Vec<ListId>,
     items: Vec<i32>,
     depot_count: usize,
-    /// Whether the reverse `member -> segment_of -> succ` pruning is enabled
-    /// (`QAYD_ROUTING_TWOWAY=0` disables it, for ablation/benchmarking).
+    /// Whether the reverse `member -> segment_of -> succ` pruning is enabled.
     two_way: bool,
 }
 
@@ -1500,7 +1524,10 @@ mod tests {
     use crate::model::list::{CollectionModel, Constraint, ExprArena, GlobalConstraint, Iterable, ObjectiveTier, Op, ReduceOp, Reduction};
     use crate::search::{self, SearchControl};
 
-    use super::{routes_from_successors, scan_routing_signature, solve_collection, CapacityCheck, RoutingSpec};
+    use super::{
+        routes_from_successors, scan_routing_signature, solve_collection, solve_collection_with_options, CapacityCheck, RoutingOptions,
+        RoutingSpec,
+    };
 
     #[test]
     fn lowers_closed_tsp_to_integer_circuit() {
@@ -1627,7 +1654,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "benchmark, run with --ignored --nocapture; ablate QAYD_ROUTING_TWOWAY / QAYD_ROUTING_WARMSTART"]
+    #[ignore = "benchmark, run with --ignored --nocapture"]
     fn measure_two_way() {
         // Membership-routing instance: 2 routes, 8 customers, capacity 4 per route,
         // two same_list pairs, and each route exactly 4 customers. Exercises the
@@ -1665,17 +1692,17 @@ mod tests {
             schedule: None,
         };
         let stop = AtomicBool::new(false);
-        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported membership routing model");
-        eprintln!(
-            "TWOWAY={:?} WARM={:?} nodes={} failures={} learned_lits={} obj={:?} complete={}",
-            std::env::var("QAYD_ROUTING_TWOWAY").ok(),
-            std::env::var("QAYD_ROUTING_WARMSTART").ok(),
-            outcome.stats.nodes,
-            outcome.stats.failures,
-            outcome.stats.learned_lits,
-            outcome.solution.objectives,
-            outcome.complete,
-        );
+        for two_way in [false, true] {
+            for warm_start in [false, true] {
+                let options = RoutingOptions { two_way, warm_start, ..RoutingOptions::default() };
+                let outcome =
+                    solve_collection_with_options(&model, 0, &stop, &mut |_| {}, options).expect("supported membership routing model");
+                eprintln!(
+                    "two_way={two_way} warm_start={warm_start} nodes={} failures={} learned_lits={} obj={:?} complete={}",
+                    outcome.stats.nodes, outcome.stats.failures, outcome.stats.learned_lits, outcome.solution.objectives, outcome.complete,
+                );
+            }
+        }
     }
 
     #[test]
@@ -1688,17 +1715,15 @@ mod tests {
         let items: Vec<i32> = (1..n as i32).collect();
         let model = closed_tsp_model(items, 0, &Arc::new(dist));
         let stop = AtomicBool::new(false);
-        let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported");
-        eprintln!(
-            "NN={:?} nodes={} failures={} solutions={} obj={:?} complete={}",
-            std::env::var("QAYD_ROUTING_NN").ok(),
-            outcome.stats.nodes,
-            outcome.stats.failures,
-            outcome.stats.solutions,
-            outcome.solution.objectives,
-            outcome.complete,
-        );
-        assert!(outcome.complete);
+        for nearest_neighbor in [false, true] {
+            let options = RoutingOptions { nearest_neighbor, ..RoutingOptions::default() };
+            let outcome = solve_collection_with_options(&model, 0, &stop, &mut |_| {}, options).expect("supported");
+            eprintln!(
+                "nearest_neighbor={nearest_neighbor} nodes={} failures={} solutions={} obj={:?} complete={}",
+                outcome.stats.nodes, outcome.stats.failures, outcome.stats.solutions, outcome.solution.objectives, outcome.complete,
+            );
+            assert!(outcome.complete);
+        }
     }
 
     fn closed_tsp_model(items: Vec<i32>, depot: i32, dist: &Arc<Vec<Vec<i64>>>) -> CollectionModel {
@@ -2072,7 +2097,7 @@ mod tests {
 
     fn cdcl_successor_set(model: &CollectionModel) -> BTreeSet<Vec<i32>> {
         let spec = RoutingSpec::from_model(model).expect("supported route lowering");
-        let mut lowered = spec.lower();
+        let mut lowered = spec.lower(RoutingOptions::default());
         let n = lowered.nodes.len();
         let mut out = BTreeSet::new();
         search::solve(&mut lowered.solver, &lowered.search_vars, |solver| {
@@ -3490,16 +3515,18 @@ mod tests {
         // (serve required only) -- the primal is never worse than dropping all
         // optionals. Disposables must land in the pool, requireds in the real route.
         let reward = 100_000i64;
-        // A safety timeout turns a hang into a clear failure rather than blocking CI.
-        let stop = Arc::new(AtomicBool::new(false));
-        {
-            let flag = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(120));
-                flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            });
-        }
         let solve = |model: &CollectionModel| -> (i64, bool, std::time::Duration) {
+            // Give each M=0 reference solve its own safety budget. A shared
+            // deadline made later sizes fail solely because earlier cases had
+            // consumed the cumulative wall clock.
+            let stop = Arc::new(AtomicBool::new(false));
+            {
+                let flag = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(120));
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
             let start = std::time::Instant::now();
             let out = solve_collection(model, 0, &stop, &mut |_| {}).expect("supported disposable-optional lowering");
             (if out.complete { out.solution.objectives[0] } else { i64::MAX }, out.complete, start.elapsed())

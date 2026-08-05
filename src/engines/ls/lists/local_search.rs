@@ -16,7 +16,7 @@ use smallvec::SmallVec;
 use super::alns::{build_candidate, AcceptanceKind, AlnsController, SearchProfile};
 use super::eval::{eval_reduction, violation_of, INFEASIBLE};
 use super::incremental::{EvalScratch, InsertView, ListView, ReductionCache};
-use super::metrics::{metrics_enabled_from_env, ListSearchMetrics, MetricsRecorder};
+use super::metrics::{ListSearchMetrics, MetricsRecorder};
 use super::moves::{apply_move, best_improving_move, better, shuffle, snapshot, trial_list_score_view, SearchMemory};
 use super::portfolio::WorkerCoordination;
 use super::schedule_ls::solve_schedule;
@@ -149,9 +149,7 @@ pub(super) struct PerList {
     /// edge objective is available.
     pub(super) candidates: Option<CandidateNeighbors>,
     /// Whether cost-refiner moves (2-opt* / cross / reverse) may prune by the
-    /// geometric candidate lists even while a route still overflows. On by
-    /// default (lets an infeasible-heavy instance afford more passes); set
-    /// `QAYD_LS_INFEAS_CAND=0` to revert to the conservative feasible-only gate.
+    /// geometric candidate lists even while a route still overflows.
     pub(super) infeas_cand: bool,
     penalties: GlsPenalties,
     pub(super) metrics: MetricsRecorder,
@@ -347,7 +345,7 @@ impl PerList {
             has_edges,
             route_bounds,
             candidates: candidate_matrix.flatten().and_then(|matrix| CandidateNeighbors::build(model, matrix, stop)),
-            infeas_cand: std::env::var("QAYD_LS_INFEAS_CAND").as_deref() != Ok("0"),
+            infeas_cand: true,
             penalties,
             metrics: MetricsRecorder::new(metrics_enabled),
         }
@@ -996,13 +994,7 @@ pub(super) fn score_scalar(score: &Score) -> i128 {
 /// `report` is called with the objective each time a strictly better *feasible*
 /// incumbent is found, for progress output; pass `&mut |_| {}` to ignore it.
 pub fn solve_collection(model: &CollectionModel, seed: u64, stop: &AtomicBool, report: &mut dyn FnMut(i64)) -> CollectionSolution {
-    // `QAYD_LS_MAX_ITERS` caps the local-search iterations for *deterministic,
-    // machine-load-independent* benchmarking: with a large time limit the
-    // iteration count (not the wall clock) becomes the binding budget, so the
-    // exact same trajectory runs every time regardless of host speed. Unset in
-    // normal use (the wall-clock stop flag is the only budget).
-    let max_iters = std::env::var("QAYD_LS_MAX_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX);
-    solve_collection_capped(model, seed, stop, max_iters, None, report)
+    solve_collection_capped(model, seed, stop, u64::MAX, None, report)
 }
 
 /// Run [`solve_collection`] with profiling enabled and return the metrics
@@ -1013,8 +1005,7 @@ pub fn solve_collection_profiled(
     stop: &AtomicBool,
     report: &mut dyn FnMut(i64),
 ) -> (CollectionSolution, ListSearchMetrics) {
-    let max_iters = std::env::var("QAYD_LS_MAX_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX);
-    solve_collection_capped_internal(model, seed, stop, max_iters, None, report, true, true)
+    solve_collection_capped_internal(model, seed, stop, u64::MAX, None, report, true, true)
 }
 
 /// Like [`solve_collection`], but seeds the initial incumbent from `hint` -- one
@@ -1031,8 +1022,7 @@ pub fn solve_collection_hinted(
     hint: &[Vec<i32>],
     report: &mut dyn FnMut(i64),
 ) -> CollectionSolution {
-    let max_iters = std::env::var("QAYD_LS_MAX_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX);
-    solve_collection_capped(model, seed, stop, max_iters, Some(hint), report)
+    solve_collection_capped(model, seed, stop, u64::MAX, Some(hint), report)
 }
 
 /// Frontend entry point after the model has already passed budget-aware
@@ -1043,16 +1033,12 @@ pub(crate) fn solve_collection_validated(
     model: &CollectionModel,
     seed: u64,
     stop: &AtomicBool,
+    max_iters: u64,
     hint: Option<&[Vec<i32>]>,
     report: &mut dyn FnMut(i64),
-) -> CollectionSolution {
-    let max_iters = std::env::var("QAYD_LS_MAX_ITERS").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX);
-    let metrics_enabled = metrics_enabled_from_env();
-    let (solution, metrics) = solve_collection_capped_internal(model, seed, stop, max_iters, hint, report, metrics_enabled, false);
-    if metrics_enabled {
-        eprint!("{metrics}");
-    }
-    solution
+    profile: bool,
+) -> (CollectionSolution, ListSearchMetrics) {
+    solve_collection_capped_internal(model, seed, stop, max_iters, hint, report, profile, false)
 }
 
 /// Complete a warm-start hint into a full `k`-list partition for [`State::from_lists`]:
@@ -1093,17 +1079,11 @@ pub fn solve_collection_capped(
     hint: Option<&[Vec<i32>]>,
     report: &mut dyn FnMut(i64),
 ) -> CollectionSolution {
-    let metrics_enabled = metrics_enabled_from_env();
-    let (solution, metrics) = solve_collection_capped_internal(model, seed, stop, max_iters, hint, report, metrics_enabled, true);
-    if metrics_enabled {
-        eprint!("{metrics}");
-    }
-    solution
+    solve_collection_capped_internal(model, seed, stop, max_iters, hint, report, false, true).0
 }
 
 /// Deterministic iteration-capped variant of [`solve_collection_profiled`].
-/// It always collects metrics, independently of `QAYD_LS_METRICS`, and leaves
-/// presentation to the caller.
+/// It always collects metrics and leaves presentation to the caller.
 pub fn solve_collection_capped_profiled(
     model: &CollectionModel,
     seed: u64,
@@ -1223,7 +1203,7 @@ pub(super) fn solve_collection_capped_worker(
     let mut stagnant = 0u64;
     let mut iter = 0u64;
     let mut state_consistent = true;
-    let (mut local_optima, mut alns_candidates, mut alns_accepted) = (0u64, 0u64, 0u64);
+    let mut local_optima = 0u64;
 
     while !stop.load(Ordering::Relaxed) && iter < max_iters {
         iter += 1;
@@ -1281,7 +1261,6 @@ pub(super) fn solve_collection_capped_worker(
                     alns.record_failed(choice.destroy, choice.repair);
                     continue;
                 };
-                alns_candidates = alns_candidates.saturating_add(1);
                 let candidate_guided = full_score(&per, &candidate);
                 let candidate_raw = full_score_raw(&per, &candidate);
                 let improved_current = candidate_raw < current_raw;
@@ -1291,7 +1270,6 @@ pub(super) fn solve_collection_capped_worker(
                 }
                 let acceptance = alns.accept(&current_guided, &candidate_guided, &current_raw, &candidate_raw, operator_seed, iter);
                 if !matches!(acceptance, AcceptanceKind::Rejected) {
-                    alns_accepted = alns_accepted.saturating_add(1);
                     state = candidate;
                     memory.reset_all();
                 }
@@ -1308,10 +1286,6 @@ pub(super) fn solve_collection_capped_worker(
         && coordination.as_ref().is_some_and(|shared| shared.publish(&best_lists, &best_score, best_feasible))
     {
         alns.record_shared_publication();
-    }
-
-    if std::env::var("QAYD_LS_DEBUG").is_ok() {
-        eprintln!("LS: iters={iter} local_optima={local_optima} alns_candidates={alns_candidates} alns_accepted={alns_accepted}");
     }
 
     // Report objective values from the exact unpenalized incumbent score. GLS
