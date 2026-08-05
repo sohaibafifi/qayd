@@ -153,7 +153,29 @@ pub fn solve_collection_parallel(
 ) -> CollectionSolution {
     let max_iters = std::env::var("QAYD_LS_MAX_ITERS").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX);
     let metrics_enabled = metrics_enabled_from_env();
-    let (solution, metrics) = solve_collection_parallel_internal(model, seed, stop, workers, max_iters, hint, report, metrics_enabled);
+    let (solution, metrics) =
+        solve_collection_parallel_internal(model, seed, stop, workers, max_iters, hint, report, metrics_enabled, true);
+    if metrics_enabled {
+        eprint!("{metrics}");
+    }
+    solution
+}
+
+/// Portfolio entry point for a frontend that already validated the collection
+/// model against the shared solve budget.
+#[cfg(feature = "python")]
+pub(crate) fn solve_collection_parallel_validated(
+    model: &CollectionModel,
+    seed: u64,
+    stop: &AtomicBool,
+    workers: usize,
+    hint: Option<&[Vec<i32>]>,
+    report: &mut dyn FnMut(i64),
+) -> CollectionSolution {
+    let max_iters = std::env::var("QAYD_LS_MAX_ITERS").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX);
+    let metrics_enabled = metrics_enabled_from_env();
+    let (solution, metrics) =
+        solve_collection_parallel_internal(model, seed, stop, workers, max_iters, hint, report, metrics_enabled, false);
     if metrics_enabled {
         eprint!("{metrics}");
     }
@@ -170,7 +192,7 @@ pub fn solve_collection_parallel_capped_profiled(
     hint: Option<&[Vec<i32>]>,
     report: &mut dyn FnMut(i64),
 ) -> (CollectionSolution, ListPortfolioMetrics) {
-    solve_collection_parallel_internal(model, seed, stop, workers, max_iters, hint, report, true)
+    solve_collection_parallel_internal(model, seed, stop, workers, max_iters, hint, report, true, true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -183,11 +205,22 @@ fn solve_collection_parallel_internal(
     hint: Option<&[Vec<i32>]>,
     report: &mut dyn FnMut(i64),
     metrics_enabled: bool,
+    validate_model: bool,
 ) -> (CollectionSolution, ListPortfolioMetrics) {
     let workers = workers.max(1);
     if workers == 1 {
-        let (solution, search) =
-            solve_collection_capped_worker(model, seed, stop, max_iters, hint, report, metrics_enabled, SearchProfile::Sequential, None);
+        let (solution, search) = solve_collection_capped_worker(
+            model,
+            seed,
+            stop,
+            max_iters,
+            hint,
+            report,
+            metrics_enabled,
+            validate_model,
+            SearchProfile::Sequential,
+            None,
+        );
         let worker_metrics = ListPortfolioWorkerMetrics {
             worker: 0,
             seed,
@@ -224,6 +257,7 @@ fn solve_collection_parallel_internal(
                     worker_hint,
                     &mut progress,
                     metrics_enabled,
+                    validate_model,
                     profile,
                     coordination,
                 );

@@ -1035,14 +1035,15 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
     None
 }
 
-pub(super) fn apply_move(per: &PerList, state: &mut State, mv: Move) {
+pub(super) fn apply_move(per: &PerList, state: &mut State, mv: Move, stop: &AtomicBool) -> bool {
     match mv {
         Move::Relocate { src, src_pos, dst, dst_pos } => {
             let item = state.lists[src].remove(src_pos);
             let pos = dst_pos.min(state.lists[dst].len());
             state.lists[dst].insert(pos, item);
-            state.rescore(per, src);
-            state.rescore(per, dst);
+            if !state.rescore_interruptible(per, src, stop) || !state.rescore_interruptible(per, dst, stop) {
+                return false;
+            }
             if src != dst {
                 state.set_item_list(per, item, dst);
                 state.global_viol = per.globals.total(&state.item_list);
@@ -1054,9 +1055,13 @@ pub(super) fn apply_move(per: &PerList, state: &mut State, mv: Move) {
             for (offset, &item) in segment.iter().enumerate() {
                 state.lists[dst].insert(pos + offset, item);
             }
-            state.rescore(per, src);
+            if !state.rescore_interruptible(per, src, stop) {
+                return false;
+            }
             if src != dst {
-                state.rescore(per, dst);
+                if !state.rescore_interruptible(per, dst, stop) {
+                    return false;
+                }
                 for &item in &segment {
                     state.set_item_list(per, item, dst);
                 }
@@ -1068,8 +1073,9 @@ pub(super) fn apply_move(per: &PerList, state: &mut State, mv: Move) {
             let tail_b = state.lists[b].split_off(cut_b);
             state.lists[a].extend(tail_b.iter().copied());
             state.lists[b].extend(tail_a.iter().copied());
-            state.rescore(per, a);
-            state.rescore(per, b);
+            if !state.rescore_interruptible(per, a, stop) || !state.rescore_interruptible(per, b, stop) {
+                return false;
+            }
             for item in tail_a {
                 state.set_item_list(per, item, b);
             }
@@ -1087,8 +1093,9 @@ pub(super) fn apply_move(per: &PerList, state: &mut State, mv: Move) {
             for (offset, &item) in seg_a.iter().enumerate() {
                 state.lists[b].insert(start_b + offset, item);
             }
-            state.rescore(per, a);
-            state.rescore(per, b);
+            if !state.rescore_interruptible(per, a, stop) || !state.rescore_interruptible(per, b, stop) {
+                return false;
+            }
             for &item in &seg_a {
                 state.set_item_list(per, item, b);
             }
@@ -1101,8 +1108,9 @@ pub(super) fn apply_move(per: &PerList, state: &mut State, mv: Move) {
             let tmp = state.lists[a][a_pos];
             state.lists[a][a_pos] = state.lists[b][b_pos];
             state.lists[b][b_pos] = tmp;
-            state.rescore(per, a);
-            state.rescore(per, b);
+            if !state.rescore_interruptible(per, a, stop) || !state.rescore_interruptible(per, b, stop) {
+                return false;
+            }
             // After the swap, lists[a][a_pos] holds the item that was in b.
             state.set_item_list(per, state.lists[a][a_pos], a);
             state.set_item_list(per, state.lists[b][b_pos], b);
@@ -1110,10 +1118,13 @@ pub(super) fn apply_move(per: &PerList, state: &mut State, mv: Move) {
         }
         Move::Reverse { list, i, j } => {
             state.lists[list][i..=j].reverse();
-            state.rescore(per, list);
+            if !state.rescore_interruptible(per, list, stop) {
+                return false;
+            }
             // Reversal keeps every item in the same list, so globals are unchanged.
         }
     }
+    true
 }
 
 pub(super) fn shuffle(order: &mut [usize], seed: u64) {

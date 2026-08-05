@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use super::eval::eval_expr;
 use crate::model::list::{Iterable, ReduceOp, Reduction};
 
@@ -158,27 +160,46 @@ pub(super) struct ReductionCache {
 
 impl ReductionCache {
     pub(super) fn build(reduction: &Reduction, contents: &[i32]) -> Self {
+        let stop = AtomicBool::new(false);
+        Self::build_interruptible(reduction, contents, &stop).expect("an uninterrupted cache build must complete")
+    }
+
+    pub(super) fn build_interruptible(reduction: &Reduction, contents: &[i32], stop: &AtomicBool) -> Option<Self> {
         let mut outputs = Vec::new();
         let mut scan_acc = Vec::new();
-        emit_slice(reduction, contents, &mut outputs, &mut scan_acc);
+        if !emit_slice(reduction, contents, &mut outputs, &mut scan_acc, stop) {
+            return None;
+        }
         let raw = aggregate(reduction.op, &outputs);
         let value = raw.map(|value| value.saturating_mul(reduction.coeff));
         let mut sorted =
             if matches!(reduction.op, ReduceOp::Min | ReduceOp::Max | ReduceOp::SelectKth(_)) { outputs.clone() } else { Vec::new() };
         sorted.sort_unstable();
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
         let mut sum_prefix = Vec::with_capacity(outputs.len() + 1);
         sum_prefix.push(0);
-        for &output in &outputs {
+        for (index, &output) in outputs.iter().enumerate() {
+            if index.is_multiple_of(1024) && stop.load(Ordering::Relaxed) {
+                return None;
+            }
             let next = sum_prefix.last().copied().unwrap_or(0i64).saturating_add(output);
             sum_prefix.push(next);
         }
         let mut sum_suffix = vec![SatTransform::identity(); outputs.len() + 1];
         for index in (0..outputs.len()).rev() {
+            if index.is_multiple_of(1024) && stop.load(Ordering::Relaxed) {
+                return None;
+            }
             sum_suffix[index] = SatTransform::value(outputs[index]).then(sum_suffix[index + 1]);
         }
-        let sum_ranges = (matches!(reduction.op, ReduceOp::Sum) && matches!(reduction.iterable, Iterable::Pairs(_)))
-            .then(|| SumRangeCache::build(&outputs));
-        Self { raw, value, outputs, sorted, scan_acc, sum_prefix, sum_suffix, sum_ranges }
+        let sum_ranges = if matches!(reduction.op, ReduceOp::Sum) && matches!(reduction.iterable, Iterable::Pairs(_)) {
+            Some(SumRangeCache::build_interruptible(&outputs, stop)?)
+        } else {
+            None
+        };
+        Some(Self { raw, value, outputs, sorted, scan_acc, sum_prefix, sum_suffix, sum_ranges })
     }
 
     pub(super) fn value(&self) -> Option<i64> {
@@ -395,19 +416,38 @@ impl ReductionCache {
     }
 }
 
-fn emit_slice(reduction: &Reduction, contents: &[i32], outputs: &mut Vec<i64>, scan_acc: &mut Vec<i64>) {
+fn emit_slice(reduction: &Reduction, contents: &[i32], outputs: &mut Vec<i64>, scan_acc: &mut Vec<i64>, stop: &AtomicBool) -> bool {
+    if stop.load(Ordering::Relaxed) {
+        return false;
+    }
     let arena = &reduction.arena.exprs;
     match reduction.iterable {
         Iterable::Items(_) => {
-            outputs.extend(contents.iter().map(|&item| eval_expr(arena, reduction.body, &[i64::from(item)])));
+            for (index, &item) in contents.iter().enumerate() {
+                if index.is_multiple_of(1024) && stop.load(Ordering::Relaxed) {
+                    return false;
+                }
+                outputs.push(eval_expr(arena, reduction.body, &[i64::from(item)]));
+            }
         }
         Iterable::SetItems(_) => {
             let mut members = contents.to_vec();
             members.sort_unstable();
-            outputs.extend(members.into_iter().map(|item| eval_expr(arena, reduction.body, &[i64::from(item)])));
+            if stop.load(Ordering::Relaxed) {
+                return false;
+            }
+            for (index, item) in members.into_iter().enumerate() {
+                if index.is_multiple_of(1024) && stop.load(Ordering::Relaxed) {
+                    return false;
+                }
+                outputs.push(eval_expr(arena, reduction.body, &[i64::from(item)]));
+            }
         }
         Iterable::Edges { start, end, .. } => {
             for edge in 0..=contents.len() {
+                if edge.is_multiple_of(1024) && stop.load(Ordering::Relaxed) {
+                    return false;
+                }
                 let from = if edge == 0 { start } else { contents[edge - 1] };
                 let to = if edge == contents.len() { end } else { contents[edge] };
                 outputs.push(eval_expr(arena, reduction.body, &[i64::from(from), i64::from(to)]));
@@ -416,6 +456,9 @@ fn emit_slice(reduction: &Reduction, contents: &[i32], outputs: &mut Vec<i64>, s
         Iterable::Pairs(_) => {
             for (i, &left) in contents.iter().enumerate() {
                 for (j, &right) in contents.iter().enumerate() {
+                    if (i.saturating_mul(contents.len()).saturating_add(j)).is_multiple_of(1024) && stop.load(Ordering::Relaxed) {
+                        return false;
+                    }
                     outputs.push(eval_expr(arena, reduction.body, &[i64::from(left), i64::from(right), i as i64, j as i64]));
                 }
             }
@@ -424,7 +467,10 @@ fn emit_slice(reduction: &Reduction, contents: &[i32], outputs: &mut Vec<i64>, s
             let mut acc = init;
             let mut prev = boundary;
             scan_acc.push(acc);
-            for &current in contents {
+            for (index, &current) in contents.iter().enumerate() {
+                if index.is_multiple_of(1024) && stop.load(Ordering::Relaxed) {
+                    return false;
+                }
                 let next = eval_expr(arena, step, &[i64::from(current), acc, i64::from(prev)]);
                 outputs.push(eval_expr(arena, reduction.body, &[i64::from(current), next, i64::from(prev)]));
                 acc = next;
@@ -438,10 +484,14 @@ fn emit_slice(reduction: &Reduction, contents: &[i32], outputs: &mut Vec<i64>, s
         }
         Iterable::Windows { size, inner, .. } => {
             for start in 0..window_count(contents.len(), size) {
+                if start.is_multiple_of(1024) && stop.load(Ordering::Relaxed) {
+                    return false;
+                }
                 outputs.push(window_value(reduction, contents, start, size, inner));
             }
         }
     }
+    !stop.load(Ordering::Relaxed)
 }
 
 fn candidate_aggregate(cache: &ReductionCache, reduction: &Reduction, scratch: &mut EvalScratch) -> Option<i64> {
@@ -516,12 +566,15 @@ struct SumRangeCache {
 impl SumRangeCache {
     const BLOCK_SIZE: usize = 32;
 
-    fn build(values: &[i64]) -> Self {
-        let blocks = values
-            .chunks(Self::BLOCK_SIZE)
-            .map(|chunk| chunk.iter().fold(SatTransform::identity(), |transform, &value| transform.then(SatTransform::value(value))))
-            .collect();
-        Self { blocks }
+    fn build_interruptible(values: &[i64], stop: &AtomicBool) -> Option<Self> {
+        let mut blocks = Vec::with_capacity(values.len().div_ceil(Self::BLOCK_SIZE));
+        for (index, chunk) in values.chunks(Self::BLOCK_SIZE).enumerate() {
+            if index.is_multiple_of(32) && stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            blocks.push(chunk.iter().fold(SatTransform::identity(), |transform, &value| transform.then(SatTransform::value(value))));
+        }
+        Some(Self { blocks })
     }
 
     fn range(&self, values: &[i64], mut start: usize, end: usize) -> SatTransform {

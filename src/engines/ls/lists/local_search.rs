@@ -32,10 +32,19 @@ pub(super) struct Globals {
 }
 
 impl Globals {
-    pub(super) fn build(model: &CollectionModel) -> Self {
-        let value_to_idx: HashMap<i32, usize> = model.items.iter().enumerate().map(|(i, &v)| (v, i)).collect();
+    pub(super) fn build(model: &CollectionModel, stop: &AtomicBool) -> Self {
+        let mut value_to_idx: HashMap<i32, usize> = HashMap::with_capacity(model.items.len());
+        for (index, &value) in model.items.iter().enumerate() {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            value_to_idx.insert(value, index);
+        }
         let mut of_idx = vec![Vec::new(); model.items.len()];
         for (g, c) in model.globals.iter().enumerate() {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             for v in c.items() {
                 if let Some(&i) = value_to_idx.get(&v) {
                     if !of_idx[i].contains(&g) {
@@ -157,7 +166,7 @@ pub(super) struct CandidateNeighbors {
 }
 
 impl CandidateNeighbors {
-    fn build(model: &CollectionModel, matrix: Arc<Vec<Vec<i64>>>) -> Option<Self> {
+    fn build(model: &CollectionModel, matrix: Arc<Vec<Vec<i64>>>, stop: &AtomicBool) -> Option<Self> {
         const LIMIT: usize = 24;
         let n = matrix.len();
         if n == 0 || matrix.iter().any(|row| row.len() != n) {
@@ -193,6 +202,9 @@ impl CandidateNeighbors {
 
         let mut map = HashMap::with_capacity(values.len());
         for &from in &values {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
             let from_idx = usize::try_from(from).ok()?;
             let mut near = targets
                 .iter()
@@ -255,10 +267,11 @@ fn reduction_delta_kind(r: &Reduction) -> ReductionDeltaKind {
 
 impl PerList {
     pub(super) fn build(model: &CollectionModel) -> Self {
-        Self::build_profiled(model, false)
+        let stop = AtomicBool::new(false);
+        Self::build_profiled(model, false, &stop)
     }
 
-    fn build_profiled(model: &CollectionModel, metrics_enabled: bool) -> Self {
+    fn build_profiled(model: &CollectionModel, metrics_enabled: bool, stop: &AtomicBool) -> Self {
         let tiers = model.objectives.len();
         let mut objective = vec![vec![Vec::new(); tiers]; model.lists];
         let mut max_objective = vec![Vec::new(); tiers];
@@ -270,8 +283,14 @@ impl PerList {
         let mut route_bounds = vec![None; model.lists];
         let mut candidate_matrix = None;
         for (t, tier) in model.objectives.iter().enumerate() {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             senses[t] = tier.minimize;
             for r in &tier.terms {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 let list = r.iterable.list();
                 if let Iterable::Edges { start, end, .. } = &r.iterable {
                     has_edges = true;
@@ -283,6 +302,9 @@ impl PerList {
             }
             if let Some(max_terms) = &tier.max_terms {
                 for term in max_terms {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
                     for r in term.groups.iter().flatten() {
                         let list = r.iterable.list();
                         if let Iterable::Edges { start, end, .. } = &r.iterable {
@@ -296,6 +318,9 @@ impl PerList {
             }
         }
         for c in &model.constraints {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             let list = c.reduction.iterable.list();
             if let Iterable::Edges { start, end, .. } = &c.reduction.iterable {
                 has_edges = true;
@@ -317,10 +342,10 @@ impl PerList {
             constraint_delta,
             senses,
             tiers: model.objectives.len(),
-            globals: Globals::build(model),
+            globals: Globals::build(model, stop),
             has_edges,
             route_bounds,
-            candidates: candidate_matrix.flatten().and_then(|matrix| CandidateNeighbors::build(model, matrix)),
+            candidates: candidate_matrix.flatten().and_then(|matrix| CandidateNeighbors::build(model, matrix, stop)),
             infeas_cand: std::env::var("QAYD_LS_INFEAS_CAND").as_deref() != Ok("0"),
             penalties,
             metrics: MetricsRecorder::new(metrics_enabled),
@@ -447,6 +472,10 @@ fn reduction_cache(per: &PerList, reduction: &Reduction, contents: &[i32]) -> Re
     per.metrics.measure_full(reduction, contents.len(), || ReductionCache::build(reduction, contents))
 }
 
+fn reduction_cache_interruptible(per: &PerList, reduction: &Reduction, contents: &[i32], stop: &AtomicBool) -> Option<ReductionCache> {
+    per.metrics.measure_full(reduction, contents.len(), || ReductionCache::build_interruptible(reduction, contents, stop))
+}
+
 impl ListReductionCaches {
     pub(super) fn build(per: &PerList, idx: usize, contents: &[i32]) -> Self {
         let objective = per.objective[idx]
@@ -455,6 +484,20 @@ impl ListReductionCaches {
             .collect();
         let constraints = per.constraints[idx].iter().map(|constraint| reduction_cache(per, &constraint.reduction, contents)).collect();
         Self { objective, constraints }
+    }
+
+    pub(super) fn build_interruptible(per: &PerList, idx: usize, contents: &[i32], stop: &AtomicBool) -> Option<Self> {
+        let objective = per.objective[idx]
+            .iter()
+            .map(|tier| {
+                tier.iter().map(|reduction| reduction_cache_interruptible(per, reduction, contents, stop)).collect::<Option<Vec<_>>>()
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let constraints = per.constraints[idx]
+            .iter()
+            .map(|constraint| reduction_cache_interruptible(per, &constraint.reduction, contents, stop))
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self { objective, constraints })
     }
 
     pub(super) fn score(&self, per: &PerList, idx: usize) -> ListScore {
@@ -556,6 +599,28 @@ fn build_max_caches(per: &PerList, lists: &[Vec<i32>]) -> Vec<Vec<Vec<Vec<Reduct
                 .collect()
         })
         .collect()
+}
+
+fn build_max_caches_interruptible(per: &PerList, lists: &[Vec<i32>], stop: &AtomicBool) -> Option<Vec<Vec<Vec<Vec<ReductionCache>>>>> {
+    per.max_objective
+        .iter()
+        .map(|terms| {
+            terms
+                .iter()
+                .map(|term| {
+                    term.groups
+                        .iter()
+                        .map(|group| {
+                            group
+                                .iter()
+                                .map(|reduction| reduction_cache_interruptible(per, reduction, &lists[reduction.iterable.list()], stop))
+                                .collect::<Option<Vec<_>>>()
+                        })
+                        .collect::<Option<Vec<_>>>()
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .collect::<Option<Vec<_>>>()
 }
 
 /// Apply each tier's optimisation direction to raw tier sums (smaller better).
@@ -747,11 +812,17 @@ impl State {
     /// `min`/`max` constraint get filled, far better than a blind round robin
     /// on tight instances, while different `order`s give diverse seeded starts.
     /// Global constraints are ignored here; the search repairs them.
-    fn greedy(model: &CollectionModel, per: &PerList, order: &[usize]) -> Self {
+    fn greedy(model: &CollectionModel, per: &PerList, order: &[usize], stop: &AtomicBool) -> Option<Self> {
         let k = model.lists.max(1);
-        let mut state = Self::from_lists(model, per, vec![Vec::new(); k]);
+        let mut state = Self::from_lists_interruptible(model, per, vec![Vec::new(); k], stop)?;
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
         let mut scratch = EvalScratch::default();
         for &item_idx in order {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
             let item = model.items[item_idx];
             let mut best_l = 0;
             let mut best_key = Score { violation: i64::MAX, tiers: tier_values(per.tiers, i64::MAX) };
@@ -772,11 +843,13 @@ impl State {
                 }
             }
             state.lists[best_l].push(item);
-            state.rescore(per, best_l);
+            if !state.rescore_interruptible(per, best_l, stop) {
+                return None;
+            }
             state.item_list[item_idx] = best_l;
         }
         state.global_viol = per.globals.total(&state.item_list);
-        state
+        Some(state)
     }
 
     pub(super) fn from_lists(model: &CollectionModel, per: &PerList, mut lists: Vec<Vec<i32>>) -> Self {
@@ -798,20 +871,62 @@ impl State {
         Self { lists, scores, caches, max_caches, item_list, global_viol }
     }
 
-    pub(super) fn rescore(&mut self, per: &PerList, idx: usize) {
-        self.caches[idx] = ListReductionCaches::build(per, idx, &self.lists[idx]);
-        self.scores[idx] = self.caches[idx].score(per, idx);
+    pub(super) fn from_lists_interruptible(
+        model: &CollectionModel,
+        per: &PerList,
+        mut lists: Vec<Vec<i32>>,
+        stop: &AtomicBool,
+    ) -> Option<Self> {
+        let k = model.lists.max(1);
+        lists.truncate(k);
+        lists.resize_with(k, Vec::new);
+        let caches = (0..k).map(|idx| ListReductionCaches::build_interruptible(per, idx, &lists[idx], stop)).collect::<Option<Vec<_>>>()?;
+        let scores = (0..k).map(|idx| caches[idx].score(per, idx)).collect();
+        let max_caches = build_max_caches_interruptible(per, &lists, stop)?;
+        let mut item_list = vec![0usize; model.items.len()];
+        for (list_index, contents) in lists.iter().enumerate() {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            for (item_index, &value) in contents.iter().enumerate() {
+                if item_index.is_multiple_of(1024) && stop.load(Ordering::Relaxed) {
+                    return None;
+                }
+                if let Some(&idx) = per.globals.value_to_idx.get(&value) {
+                    item_list[idx] = list_index;
+                }
+            }
+        }
+        let global_viol = per.globals.total(&item_list);
+        (!stop.load(Ordering::Relaxed)).then_some(Self { lists, scores, caches, max_caches, item_list, global_viol })
+    }
+
+    pub(super) fn rescore_interruptible(&mut self, per: &PerList, idx: usize, stop: &AtomicBool) -> bool {
+        let Some(cache) = ListReductionCaches::build_interruptible(per, idx, &self.lists[idx], stop) else {
+            return false;
+        };
+        let score = cache.score(per, idx);
+        let mut max_updates = Vec::new();
         for (tier, terms) in per.max_objective.iter().enumerate() {
             for (term_idx, term) in terms.iter().enumerate() {
                 for (group_idx, group) in term.groups.iter().enumerate() {
                     for (reduction_idx, reduction) in group.iter().enumerate() {
                         if reduction.iterable.list() == idx {
-                            self.max_caches[tier][term_idx][group_idx][reduction_idx] = reduction_cache(per, reduction, &self.lists[idx]);
+                            let Some(reduction_cache) = reduction_cache_interruptible(per, reduction, &self.lists[idx], stop) else {
+                                return false;
+                            };
+                            max_updates.push((tier, term_idx, group_idx, reduction_idx, reduction_cache));
                         }
                     }
                 }
             }
         }
+        self.caches[idx] = cache;
+        self.scores[idx] = score;
+        for (tier, term_idx, group_idx, reduction_idx, cache) in max_updates {
+            self.max_caches[tier][term_idx][group_idx][reduction_idx] = cache;
+        }
+        true
     }
 
     /// Record that `value` now lives in list `l`, for global-constraint tracking.
@@ -898,7 +1013,7 @@ pub fn solve_collection_profiled(
     report: &mut dyn FnMut(i64),
 ) -> (CollectionSolution, ListSearchMetrics) {
     let max_iters = std::env::var("QAYD_LS_MAX_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX);
-    solve_collection_capped_internal(model, seed, stop, max_iters, None, report, true)
+    solve_collection_capped_internal(model, seed, stop, max_iters, None, report, true, true)
 }
 
 /// Like [`solve_collection`], but seeds the initial incumbent from `hint` -- one
@@ -917,6 +1032,26 @@ pub fn solve_collection_hinted(
 ) -> CollectionSolution {
     let max_iters = std::env::var("QAYD_LS_MAX_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX);
     solve_collection_capped(model, seed, stop, max_iters, Some(hint), report)
+}
+
+/// Frontend entry point after the model has already passed budget-aware
+/// validation. Avoids validating the same large model again inside the search
+/// worker while preserving validation on every public engine entry point.
+#[cfg(feature = "python")]
+pub(crate) fn solve_collection_validated(
+    model: &CollectionModel,
+    seed: u64,
+    stop: &AtomicBool,
+    hint: Option<&[Vec<i32>]>,
+    report: &mut dyn FnMut(i64),
+) -> CollectionSolution {
+    let max_iters = std::env::var("QAYD_LS_MAX_ITERS").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX);
+    let metrics_enabled = metrics_enabled_from_env();
+    let (solution, metrics) = solve_collection_capped_internal(model, seed, stop, max_iters, hint, report, metrics_enabled, false);
+    if metrics_enabled {
+        eprint!("{metrics}");
+    }
+    solution
 }
 
 /// Complete a warm-start hint into a full `k`-list partition for [`State::from_lists`]:
@@ -958,7 +1093,7 @@ pub fn solve_collection_capped(
     report: &mut dyn FnMut(i64),
 ) -> CollectionSolution {
     let metrics_enabled = metrics_enabled_from_env();
-    let (solution, metrics) = solve_collection_capped_internal(model, seed, stop, max_iters, hint, report, metrics_enabled);
+    let (solution, metrics) = solve_collection_capped_internal(model, seed, stop, max_iters, hint, report, metrics_enabled, true);
     if metrics_enabled {
         eprint!("{metrics}");
     }
@@ -976,9 +1111,10 @@ pub fn solve_collection_capped_profiled(
     hint: Option<&[Vec<i32>]>,
     report: &mut dyn FnMut(i64),
 ) -> (CollectionSolution, ListSearchMetrics) {
-    solve_collection_capped_internal(model, seed, stop, max_iters, hint, report, true)
+    solve_collection_capped_internal(model, seed, stop, max_iters, hint, report, true, true)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn solve_collection_capped_internal(
     model: &CollectionModel,
     seed: u64,
@@ -987,8 +1123,20 @@ fn solve_collection_capped_internal(
     hint: Option<&[Vec<i32>]>,
     report: &mut dyn FnMut(i64),
     metrics_enabled: bool,
+    validate_model: bool,
 ) -> (CollectionSolution, ListSearchMetrics) {
-    solve_collection_capped_worker(model, seed, stop, max_iters, hint, report, metrics_enabled, SearchProfile::Sequential, None)
+    solve_collection_capped_worker(
+        model,
+        seed,
+        stop,
+        max_iters,
+        hint,
+        report,
+        metrics_enabled,
+        validate_model,
+        SearchProfile::Sequential,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1000,16 +1148,12 @@ pub(super) fn solve_collection_capped_worker(
     hint: Option<&[Vec<i32>]>,
     report: &mut dyn FnMut(i64),
     metrics_enabled: bool,
+    validate_model: bool,
     profile: SearchProfile,
     mut coordination: Option<WorkerCoordination<'_>>,
 ) -> (CollectionSolution, ListSearchMetrics) {
     let started = metrics_enabled.then(Instant::now);
-    // Guard the search path: an invalid model would otherwise panic (bad list
-    // index) or read silent zeros (out-of-range table index). Callers like the
-    // Python frontend validate first to raise a precise error; this is the
-    // backstop for direct Rust callers so the engine never panics or corrupts.
-    if let Err(_e) = model.validate() {
-        debug_assert!(false, "solve_collection called on an invalid model: {_e}");
+    let no_solution = || {
         let solution = CollectionSolution {
             lists: vec![Vec::new(); model.lists.max(1)],
             objectives: Vec::new(),
@@ -1019,23 +1163,46 @@ pub(super) fn solve_collection_capped_worker(
             machines: Vec::new(),
         };
         let metrics = MetricsRecorder::new(metrics_enabled).snapshot(started.map(|instant| instant.elapsed()).unwrap_or_default());
-        return (solution, metrics);
+        (solution, metrics)
+    };
+    if stop.load(Ordering::Relaxed) {
+        return no_solution();
+    }
+    // Guard the search path: an invalid model would otherwise panic (bad list
+    // index) or read silent zeros (out-of-range table index). Callers like the
+    // Python frontend validate first to raise a precise error; this is the
+    // backstop for direct Rust callers so the engine never panics or corrupts.
+    if validate_model {
+        match model.validate_interruptible(stop) {
+            Ok(true) => {}
+            Ok(false) => return no_solution(),
+            Err(_e) => {
+                debug_assert!(false, "solve_collection called on an invalid model: {_e}");
+                return no_solution();
+            }
+        }
     }
     if let Some(sched) = &model.schedule {
         let solution = solve_schedule(sched, seed, stop, report);
         let metrics = MetricsRecorder::new(metrics_enabled).snapshot(started.map(|instant| instant.elapsed()).unwrap_or_default());
         return (solution, metrics);
     }
-    let per = PerList::build_profiled(model, metrics_enabled);
+    let per = PerList::build_profiled(model, metrics_enabled, stop);
+    if stop.load(Ordering::Relaxed) {
+        return no_solution();
+    }
     let n = model.items.len();
     let mut order: Vec<usize> = (0..n).collect();
     shuffle(&mut order, seed);
     // Warm start from the caller's hint when given (completed to a full
     // partition); otherwise the greedy random construction. Either way the search
     // loop, ALNS controller, and incumbent tracking below are identical.
-    let mut state = match hint {
-        Some(h) => State::from_lists(model, &per, hint_partition(model, h)),
-        None => State::greedy(model, &per, &order),
+    let state = match hint {
+        Some(h) => State::from_lists_interruptible(model, &per, hint_partition(model, h), stop),
+        None => State::greedy(model, &per, &order, stop),
+    };
+    let Some(mut state) = state.filter(|_| !stop.load(Ordering::Relaxed)) else {
+        return no_solution();
     };
     let mut memory = SearchMemory::new(model.lists.max(1));
 
@@ -1049,13 +1216,17 @@ pub(super) fn solve_collection_capped_worker(
     }
     let mut stagnant = 0u64;
     let mut iter = 0u64;
+    let mut state_consistent = true;
     let (mut local_optima, mut alns_candidates, mut alns_accepted) = (0u64, 0u64, 0u64);
 
     while !stop.load(Ordering::Relaxed) && iter < max_iters {
         iter += 1;
         match best_improving_move(&per, &state, stop, &mut memory) {
             Some(mv) => {
-                apply_move(&per, &mut state, mv);
+                if !apply_move(&per, &mut state, mv, stop) {
+                    state_consistent = false;
+                    break;
+                }
                 memory.reset_touched(mv);
                 if record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report) {
                     if coordination.as_ref().is_some_and(|shared| shared.publish(&best_lists, &best_score, best_feasible)) {
@@ -1080,7 +1251,10 @@ pub(super) fn solve_collection_capped_worker(
 
                 if let Some(lists) = coordination.as_mut().and_then(|shared| shared.maybe_inject(local_optima, &best_score, best_feasible))
                 {
-                    state = State::from_lists(model, &per, lists);
+                    let Some(injected_state) = State::from_lists_interruptible(model, &per, lists, stop) else {
+                        break;
+                    };
+                    state = injected_state;
                     let injected = record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report);
                     debug_assert!(injected, "a shared incumbent must strictly improve the worker incumbent");
                     alns.record_shared_injection();
@@ -1123,7 +1297,8 @@ pub(super) fn solve_collection_capped_worker(
         }
     }
 
-    if record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report)
+    if state_consistent
+        && record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report)
         && coordination.as_ref().is_some_and(|shared| shared.publish(&best_lists, &best_score, best_feasible))
     {
         alns.record_shared_publication();

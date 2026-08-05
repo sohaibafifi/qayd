@@ -701,6 +701,10 @@ fn verbose_finish(solution: &PySolution) {
 
 fn stop_after(limit: u64) -> Arc<AtomicBool> {
     let stop = Arc::new(AtomicBool::new(false));
+    if limit == 0 {
+        stop.store(true, Ordering::SeqCst);
+        return stop;
+    }
     {
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
@@ -709,6 +713,29 @@ fn stop_after(limit: u64) -> Arc<AtomicBool> {
         });
     }
     stop
+}
+
+/// One wall-clock budget for every phase of a collection solve. It is created
+/// before the collection IR is copied, then shared unchanged by validation,
+/// backend selection, backend construction, fallbacks, and search.
+struct CollectionBudget {
+    limit: u64,
+    started: Instant,
+    stop: Arc<AtomicBool>,
+}
+
+impl CollectionBudget {
+    fn new(limit: u64) -> Self {
+        Self { limit, started: Instant::now(), stop: stop_after(limit) }
+    }
+
+    fn expired(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    fn elapsed_seconds(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
+    }
 }
 
 /// Deadline flag for a solve: armed by a background timer when `time_limit` is
@@ -2879,17 +2906,20 @@ impl PyModel {
         py: Python<'_>,
         model: &list::CollectionModel,
         selection: &shared_model::BackendSelection,
-        time_limit: Option<u64>,
+        budget: &CollectionBudget,
         seed: u64,
         verbose: bool,
     ) -> PyResult<Option<PySolution>> {
         if selection.backend != shared_model::Backend::DomainExact {
             return Ok(None);
         }
-        if let Some(schedule) = &model.schedule {
-            return self.try_solve_domain_schedule(py, schedule, model, selection, time_limit, seed, verbose);
+        if budget.expired() {
+            return Ok(Some(self.unknown_collection_solution()));
         }
-        self.try_solve_domain_lists(py, model, selection, time_limit, verbose)
+        if let Some(schedule) = &model.schedule {
+            return self.try_solve_domain_schedule(py, schedule, model, selection, budget, seed, verbose);
+        }
+        self.try_solve_domain_lists(py, model, selection, budget, verbose)
     }
 
     fn try_solve_routing_integer(
@@ -2897,7 +2927,7 @@ impl PyModel {
         py: Python<'_>,
         model: &list::CollectionModel,
         selection: &shared_model::BackendSelection,
-        time_limit: Option<u64>,
+        budget: &CollectionBudget,
         seed: u64,
         verbose: bool,
     ) -> PyResult<Option<PySolution>> {
@@ -2905,7 +2935,10 @@ impl PyModel {
             return Ok(None);
         }
 
-        let limit = time_limit.unwrap_or(5);
+        if budget.expired() {
+            return Ok(Some(self.unknown_collection_solution()));
+        }
+        let limit = budget.limit;
         let primary_sense = model.objectives.first().map_or("min", |tier| if tier.minimize { "min" } else { "max" });
         if verbose {
             println!("qayd solve (integer routing)");
@@ -2917,16 +2950,16 @@ impl PyModel {
             println!("  constraints: {}", model.constraints.len());
             println!("  objective tiers: {}", model.objectives.len());
             println!("  time limit: {limit}s");
+            println!("  preprocessing: {:.3}s", budget.elapsed_seconds());
         }
 
-        let stop = stop_after(limit);
-        let start = Instant::now();
         let mut report = |objective: i64| {
             if verbose {
-                println!("  o {objective}  ({primary_sense}, {:.2}s)", start.elapsed().as_secs_f64());
+                println!("  o {objective}  ({primary_sense}, {:.2}s)", budget.elapsed_seconds());
             }
         };
-        let Some(outcome) = with_interrupts(py, &stop, || routing_engine::solve_collection(model, seed, &stop, &mut report))? else {
+        let Some(outcome) = with_interrupts(py, &budget.stop, || routing_engine::solve_collection(model, seed, &budget.stop, &mut report))?
+        else {
             // Defence in depth: the classifier admitted this model but the engine
             // parse declined it (a lockstep gap). Every admitted routing model is
             // enumeration-checkable, so fall through to the exact list enumeration
@@ -2936,7 +2969,7 @@ impl PyModel {
                 py,
                 model,
                 &shared_model::BackendSelection { backend: shared_model::Backend::DomainExact, ..*selection },
-                time_limit,
+                budget,
                 verbose,
             );
         };
@@ -2985,7 +3018,7 @@ impl PyModel {
         py: Python<'_>,
         model: &list::CollectionModel,
         selection: &shared_model::BackendSelection,
-        time_limit: Option<u64>,
+        budget: &CollectionBudget,
         verbose: bool,
     ) -> PyResult<Option<PySolution>> {
         if selection.backend != shared_model::Backend::DomainExact {
@@ -2997,7 +3030,10 @@ impl PyModel {
         let has_objective = !objective_tiers.is_empty();
         let minimize = objective_tiers.first().is_none_or(|tier| tier.minimize);
 
-        let limit = time_limit.unwrap_or(5);
+        if budget.expired() {
+            return Ok(Some(self.unknown_collection_solution()));
+        }
+        let limit = budget.limit;
         let constraint_count = 1 + model.constraints.len() + model.globals.len();
         if verbose {
             println!("qayd solve (domain exact)");
@@ -3010,11 +3046,11 @@ impl PyModel {
             println!("  constraints: {constraint_count}");
             println!("  objective tiers: {}", model.objectives.len());
             println!("  time limit: {limit}s");
+            println!("  preprocessing: {:.3}s", budget.elapsed_seconds());
         }
 
-        let stop = stop_after(limit);
-        let solved = with_interrupts(py, &stop, || {
-            list_exact_engine::solve(model, &objective_tiers, &stop, |candidate| {
+        let solved = with_interrupts(py, &budget.stop, || {
+            list_exact_engine::solve(model, &objective_tiers, &budget.stop, |candidate| {
                 if verbose {
                     println!("  o {}  ({})", candidate[0], if minimize { "min" } else { "max" });
                 }
@@ -3060,7 +3096,7 @@ impl PyModel {
         schedule: &list::Schedule,
         model: &list::CollectionModel,
         selection: &shared_model::BackendSelection,
-        time_limit: Option<u64>,
+        budget: &CollectionBudget,
         seed: u64,
         verbose: bool,
     ) -> PyResult<Option<PySolution>> {
@@ -3068,7 +3104,10 @@ impl PyModel {
             return Ok(None);
         }
 
-        let limit = time_limit.unwrap_or(5);
+        if budget.expired() {
+            return Ok(Some(self.unknown_collection_solution()));
+        }
+        let limit = budget.limit;
         let moded = schedule.intervals.iter().any(|iv| !iv.modes.is_empty());
         if verbose {
             println!("qayd solve (domain exact)");
@@ -3081,15 +3120,15 @@ impl PyModel {
             println!("  resources: {}", schedule.resources.len());
             println!("  objective: {}", if schedule.minimize_makespan { "makespan" } else { "no" });
             println!("  time limit: {limit}s");
+            println!("  preprocessing: {:.3}s", budget.elapsed_seconds());
         }
 
-        let stop = stop_after(limit);
         let options = schedule_engine::Options {
             seed,
             optional_modes_cdcl: schedule.minimize_makespan && std::env::var_os("QAYD_SCHEDULE_CDCL").is_some(),
         };
-        let outcome = with_interrupts(py, &stop, || {
-            schedule_engine::solve(schedule, &stop, options, |value| {
+        let outcome = with_interrupts(py, &budget.stop, || {
+            schedule_engine::solve(schedule, &budget.stop, options, |value| {
                 if verbose {
                     println!("  o {value}  (min)");
                 }
@@ -3125,6 +3164,28 @@ impl PyModel {
             presences: outcome.presences,
             machines: outcome.machines,
         }))
+    }
+
+    fn unknown_collection_solution(&self) -> PySolution {
+        let schedule_makespan = self.col_schedule.as_ref().is_some_and(|schedule| schedule.minimize_makespan);
+        let objective_sense = self
+            .col_objectives
+            .first()
+            .map(|tier| if tier.minimize { "min" } else { "max" }.to_string())
+            .or_else(|| schedule_makespan.then(|| "min".to_string()));
+        PySolution {
+            status: "UNKNOWN".to_string(),
+            objective: None,
+            objective_sense,
+            objective_expr: schedule_makespan.then(|| "makespan".to_string()),
+            values: Vec::new(),
+            stats: SolveStats::default().into(),
+            lists: None,
+            objectives: Vec::new(),
+            starts: Vec::new(),
+            presences: Vec::new(),
+            machines: Vec::new(),
+        }
     }
 
     /// Parse and validate a list-shaped warm start: `list[list[int]]`, one
@@ -3168,6 +3229,10 @@ impl PyModel {
         engine: PythonEngine,
         list_hint: Option<Vec<Vec<i32>>>,
     ) -> PyResult<PySolution> {
+        let budget = CollectionBudget::new(time_limit.unwrap_or(5));
+        if budget.expired() {
+            return Ok(self.unknown_collection_solution());
+        }
         let model = list::CollectionModel {
             items: self.col_universe.clone().unwrap_or_default(),
             lists: self.col_lists,
@@ -3176,27 +3241,35 @@ impl PyModel {
             globals: self.col_globals.clone(),
             schedule: self.col_schedule.clone(),
         };
-        model.validate().map_err(PyValueError::new_err)?;
-        // The exact-engine classifier (`BackendSelection::for_model`) parses every
-        // scan-fed constraint via `scan_routing_signature`, which is O(pool^2..3)
-        // per constraint scan over the shared universe. It exists only to pick an
-        // exact backend, so an `engine="ls"` solve -- which never runs the exact
-        // engines below -- must not pay it. Compute it only off the LS path; on LS
-        // it stays `None` and the whole pre-search classification is skipped.
-        let selection =
-            (engine != PythonEngine::Ls).then(|| shared_model::BackendSelection::for_model(&shared_model::Model::from_collection(&model)));
+        if budget.expired() {
+            return Ok(self.unknown_collection_solution());
+        }
+        if !model.validate_interruptible(&budget.stop).map_err(PyValueError::new_err)? {
+            return Ok(self.unknown_collection_solution());
+        }
+        // LS skips exact classification entirely. Auto first applies cheap size
+        // gates on the collection IR, while explicit exact uses the larger but
+        // still deterministic classifier-work bound.
+        let selection = match engine {
+            PythonEngine::Ls => None,
+            PythonEngine::Auto => Some(shared_model::BackendSelection::for_collection_auto(&model)),
+            PythonEngine::Exact => Some(shared_model::BackendSelection::for_collection_exact_bounded(&model)),
+        };
+        if budget.expired() {
+            return Ok(self.unknown_collection_solution());
+        }
         if let Some(selection) = &selection {
-            if let Some(solution) = self.try_solve_routing_integer(py, &model, selection, time_limit, seed, verbose)? {
+            if let Some(solution) = self.try_solve_routing_integer(py, &model, selection, &budget, seed, verbose)? {
                 return Ok(solution);
             }
-            if let Some(solution) = self.try_solve_domain_collection(py, &model, selection, time_limit, seed, verbose)? {
+            if let Some(solution) = self.try_solve_domain_collection(py, &model, selection, &budget, seed, verbose)? {
                 return Ok(solution);
             }
             if engine == PythonEngine::Exact {
                 return Err(PyValueError::new_err(format!("model is not supported by an exact engine: {}", selection.reason)));
             }
         }
-        let limit = time_limit.unwrap_or(5);
+        let limit = budget.limit;
         // The first tier drives the progress line; report its sense.
         let primary_sense = self.col_objectives.first().map_or("min", |t| if t.minimize { "min" } else { "max" });
         if verbose {
@@ -3218,24 +3291,20 @@ impl PyModel {
             println!("  objective tiers: {}", model.objectives.len());
             println!("  threads: {threads}");
             println!("  time limit: {limit}s");
+            println!("  preprocessing: {:.3}s", budget.elapsed_seconds());
         }
-        let stop = stop_after(limit);
-        let start = Instant::now();
         let mut improvements = 0u64;
         let mut report = |objective: i64| {
             if verbose {
                 improvements += 1;
-                println!("  o {objective}  ({primary_sense}, {:.2}s)", start.elapsed().as_secs_f64());
+                println!("  o {objective}  ({primary_sense}, {:.2}s)", budget.elapsed_seconds());
             }
         };
-        let sol = with_interrupts(py, &stop, || {
+        let sol = with_interrupts(py, &budget.stop, || {
             if threads > 1 {
-                lists::solve_collection_parallel(&model, seed, &stop, threads, list_hint.as_deref(), &mut report)
+                lists::solve_collection_parallel_validated(&model, seed, &budget.stop, threads, list_hint.as_deref(), &mut report)
             } else {
-                match &list_hint {
-                    Some(hint) => lists::solve_collection_hinted(&model, seed, &stop, hint, &mut report),
-                    None => lists::solve_collection(&model, seed, &stop, &mut report),
-                }
+                lists::solve_collection_validated(&model, seed, &budget.stop, list_hint.as_deref(), &mut report)
             }
         })?;
         if verbose {

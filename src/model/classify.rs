@@ -7,6 +7,21 @@ type ItemSumBound = (usize, Vec<(i32, i64)>, i64, i64);
 type ItemSumSignature = (Vec<(i32, i64)>, i64, i64);
 const MAX_INTEGER_ROUTING_NODES: usize = 32;
 
+// `auto` is a performance policy, not only a capability check. Ordered-list
+// enumeration grows factorially, assignment enumeration grows exponentially,
+// and the current exact scheduling backend is intended for compact models. The
+// explicit exact path may use larger models, but its classifier is still capped
+// by `MAX_CLASSIFICATION_WORK` so model inspection itself can never become an
+// unbounded pre-search phase.
+const AUTO_ORDERED_EXACT_ITEMS: usize = 10;
+const AUTO_ASSIGNMENT_EXACT_ITEMS: usize = 24;
+const AUTO_ASSIGNMENT_EXACT_CELLS: usize = 192;
+const AUTO_SCHEDULE_EXACT_INTERVALS: usize = 48;
+const AUTO_SCHEDULE_EXACT_MODES: usize = 96;
+const MAX_CLASSIFICATION_WORK: u128 = 1_000_000;
+const MAX_SCHEDULE_CLASSIFICATION_OBJECTS: usize = 100_000;
+const MAX_EXACT_CONSTRUCTION_CELLS: usize = 100_000;
+
 /// High-level model shape used to choose a solver engine.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ModelClass {
@@ -263,6 +278,151 @@ impl BackendSelection {
     pub fn for_collection(model: &list::CollectionModel) -> Self {
         Self::for_model(&Model::from_collection(model))
     }
+
+    /// Select the fastest appropriate backend for an automatic collection
+    /// solve. This performs cheap shape and size checks directly on the
+    /// collection IR before building the shared-model mirror. Large routing,
+    /// sequencing, packing, and scheduling models therefore reach local search
+    /// without paying exact-backend classification.
+    pub fn for_collection_auto(model: &list::CollectionModel) -> Self {
+        if let Some(selection) = auto_collection_size_fallback(model) {
+            return selection;
+        }
+        if let Some(selection) = bounded_classification_fallback(model) {
+            return selection;
+        }
+        let selection = Self::for_collection(model);
+        // Some ordered shapes only become visible after the full classifier.
+        // Keep the exponential enumerator confined to deliberately small auto
+        // models even when the cheap scan above was inconclusive.
+        if selection.backend == Backend::DomainExact
+            && matches!(selection.class, ModelClass::Routing | ModelClass::Sequencing)
+            && model.items.len() > AUTO_ORDERED_EXACT_ITEMS
+        {
+            return heuristic_selection(model, "ordered-list size exceeds the auto exact threshold");
+        }
+        selection
+    }
+
+    /// Capability-oriented selection for an explicit exact request, with a
+    /// deterministic upper bound on classifier work. Returning a heuristic
+    /// backend tells the caller that exact classification was intentionally not
+    /// attempted within the bounded preprocessing envelope.
+    pub fn for_collection_exact_bounded(model: &list::CollectionModel) -> Self {
+        bounded_classification_fallback(model).unwrap_or_else(|| Self::for_collection(model))
+    }
+}
+
+fn collection_reductions(model: &list::CollectionModel) -> impl Iterator<Item = &list::Reduction> {
+    model.objectives.iter().flat_map(|tier| tier.reductions()).chain(model.constraints.iter().map(|constraint| &constraint.reduction))
+}
+
+#[derive(Clone, Copy, Default)]
+struct CollectionShape {
+    has_edges: bool,
+    has_sequence: bool,
+    has_scan: bool,
+    reductions: usize,
+}
+
+fn collection_shape(model: &list::CollectionModel) -> CollectionShape {
+    let mut shape = CollectionShape::default();
+    for reduction in collection_reductions(model) {
+        shape.reductions = shape.reductions.saturating_add(1);
+        match &reduction.iterable {
+            list::Iterable::Edges { .. } => shape.has_edges = true,
+            list::Iterable::Pairs(_) | list::Iterable::Windows { .. } => shape.has_sequence = true,
+            list::Iterable::Scan { .. } => {
+                shape.has_sequence = true;
+                shape.has_scan = true;
+            }
+            list::Iterable::Items(_) | list::Iterable::SetItems(_) => {}
+        }
+    }
+    shape
+}
+
+fn heuristic_selection(model: &list::CollectionModel, reason: &'static str) -> BackendSelection {
+    if model.schedule.is_some() {
+        return BackendSelection { class: ModelClass::Schedule, backend: Backend::ScheduleLocalSearch, reason, routing: None };
+    }
+    let shape = collection_shape(model);
+    let class = if shape.has_edges {
+        ModelClass::Routing
+    } else if shape.has_sequence {
+        ModelClass::Sequencing
+    } else {
+        ModelClass::ListAssignmentPacking
+    };
+    let routing = shape.has_edges.then_some(RoutingShape {
+        has_edges: true,
+        multi_route: model.lists > 1,
+        has_capacity_like_constraints: model.constraints.iter().any(|constraint| {
+            matches!(constraint.op, list::Op::Le)
+                && matches!(constraint.reduction.op, list::ReduceOp::Sum)
+                && matches!(constraint.reduction.iterable, list::Iterable::Items(_) | list::Iterable::SetItems(_))
+        }),
+        has_scan: shape.has_scan,
+        has_same_list: model.globals.iter().any(|global| matches!(global, list::GlobalConstraint::SameList { .. })),
+        has_item_precedence: model.globals.iter().any(|global| matches!(global, list::GlobalConstraint::ListLe { .. })),
+        has_fleet_objective: collection_reductions(model).any(|reduction| matches!(reduction.op, list::ReduceOp::Used)),
+    });
+    BackendSelection { class, backend: Backend::ListLocalSearch, reason, routing }
+}
+
+fn auto_collection_size_fallback(model: &list::CollectionModel) -> Option<BackendSelection> {
+    if let Some(schedule) = &model.schedule {
+        let modes = schedule.intervals.iter().map(|interval| interval.modes.len().max(1)).sum::<usize>();
+        if schedule.intervals.len() > AUTO_SCHEDULE_EXACT_INTERVALS || modes > AUTO_SCHEDULE_EXACT_MODES {
+            return Some(heuristic_selection(model, "schedule size exceeds the auto exact threshold"));
+        }
+        return None;
+    }
+
+    let shape = collection_shape(model);
+    if shape.has_edges {
+        // The integer routing lowering already has a hard node cap. Above it,
+        // neither its classifier nor factorial list enumeration is appropriate
+        // for an automatic solve.
+        if model.items.len().saturating_add(model.lists) > MAX_INTEGER_ROUTING_NODES {
+            return Some(heuristic_selection(model, "routing size exceeds the auto exact threshold"));
+        }
+        return None;
+    }
+    if shape.has_sequence && model.items.len() > AUTO_ORDERED_EXACT_ITEMS {
+        return Some(heuristic_selection(model, "ordered-list size exceeds the auto exact threshold"));
+    }
+    if !shape.has_sequence
+        && (model.items.len() > AUTO_ASSIGNMENT_EXACT_ITEMS || model.items.len().saturating_mul(model.lists) > AUTO_ASSIGNMENT_EXACT_CELLS)
+    {
+        return Some(heuristic_selection(model, "list assignment size exceeds the auto exact threshold"));
+    }
+    None
+}
+
+fn bounded_classification_fallback(model: &list::CollectionModel) -> Option<BackendSelection> {
+    if let Some(schedule) = &model.schedule {
+        let objects = schedule
+            .intervals
+            .len()
+            .saturating_add(schedule.precedences.len())
+            .saturating_add(schedule.resources.len())
+            .saturating_add(schedule.intervals.iter().map(|interval| interval.modes.len()).sum::<usize>());
+        return (objects > MAX_SCHEDULE_CLASSIFICATION_OBJECTS)
+            .then(|| heuristic_selection(model, "schedule classification exceeds the bounded work threshold"));
+    }
+
+    let shape = collection_shape(model);
+    let n = model.items.len() as u128;
+    let reductions = shape.reductions.max(1) as u128;
+    // Scan signature derivation computes an n-step accumulator fixpoint over
+    // all (current, previous) node pairs. Other reductions are linear in the
+    // item universe during shared-model construction and validation.
+    let per_reduction = if shape.has_scan { n.saturating_mul(n).saturating_mul(n) } else { n.max(1) };
+    let work = reductions.saturating_mul(per_reduction).saturating_add((model.lists as u128).saturating_mul(n));
+    let construction_cells = model.items.len().saturating_mul(model.lists.max(1));
+    (work > MAX_CLASSIFICATION_WORK || construction_cells > MAX_EXACT_CONSTRUCTION_CELLS)
+        .then(|| heuristic_selection(model, "classification work exceeds the bounded exact threshold"))
 }
 
 #[derive(Clone, Copy, Default)]

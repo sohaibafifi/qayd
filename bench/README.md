@@ -43,6 +43,21 @@ release and CI builds stay portable.
 `pipeline.sh [TIMEOUT_S] [LIMIT]` - per-instance wall-clock timeout and an
 optional instance cap (0 = all fetched).
 
+## Collection backend policy
+
+The Python collection frontend uses a size-aware `engine="auto"` policy. Exact
+enumeration is limited to 10 items for ordered lists, and exact assignment or
+packing to 24 items and 192 item-list cells. Exact scheduling is limited to 48
+intervals and 96 modes. Integer routing lowering retains its 32-node cap.
+Larger models go directly to the matching local-search backend, without first
+building the exact model mirror. Explicit `engine="exact"` has a larger
+capability envelope, with classification work capped at 1,000,000 estimated
+units and exact construction at 100,000 item-list cells.
+
+`time_limit` is one wall-clock budget shared by validation, classification,
+construction, exact fallbacks, portfolio workers, and search. This matters for
+campaign results: reported solve time is not a search-only measurement.
+
 ## Session probe
 
 The Python session probe measures rolling-horizon re-solves under the current

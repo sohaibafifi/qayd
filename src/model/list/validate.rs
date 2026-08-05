@@ -1,5 +1,16 @@
 use super::external::call_external_function;
 use super::ir::{CollectionModel, Expr, ExprId, GlobalConstraint, Iterable, Reduction, Resource};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+const VALIDATION_STOPPED: &str = "qayd validation stopped by solve budget";
+
+fn check_stop(stop: Option<&AtomicBool>) -> Result<(), String> {
+    if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        Err(VALIDATION_STOPPED.to_string())
+    } else {
+        Ok(())
+    }
+}
 
 fn eval_expr_checked(arena: &[Expr], id: ExprId, args: &[i64]) -> Result<i64, String> {
     let node = arena.get(id.0 as usize).ok_or_else(|| format!("expr id {} out of arena range", id.0))?;
@@ -158,15 +169,18 @@ fn for_each_combo(
     varying: &[usize],
     args: &mut [i64],
     depth: usize,
+    stop: Option<&AtomicBool>,
     f: &mut dyn FnMut(&[i64]) -> Result<(), String>,
 ) -> Result<(), String> {
+    check_stop(stop)?;
     if depth == varying.len() {
         return f(args);
     }
     let slot = varying[depth];
     for &val in domains[slot] {
+        check_stop(stop)?;
         args[slot] = val;
-        for_each_combo(domains, varying, args, depth + 1, f)?;
+        for_each_combo(domains, varying, args, depth + 1, stop, f)?;
     }
     Ok(())
 }
@@ -174,11 +188,11 @@ fn for_each_combo(
 /// Check that an index expression stays in `0..hi` for every value of the args
 /// it uses. Only the used arg slots are enumerated, so a separable index like
 /// `Arg(0)` is linear in the node count rather than quadratic.
-fn check_index(arena: &[Expr], idx: ExprId, domains: &[&[i64]], hi: usize, what: &str) -> Result<(), String> {
+fn check_index(arena: &[Expr], idx: ExprId, domains: &[&[i64]], hi: usize, what: &str, stop: Option<&AtomicBool>) -> Result<(), String> {
     let mask = args_used(arena, idx);
     let varying: Vec<usize> = (0..domains.len()).filter(|&s| mask & (1u8 << s) != 0).collect();
     let mut args = vec![0i64; domains.len()];
-    for_each_combo(domains, &varying, &mut args, 0, &mut |a| {
+    for_each_combo(domains, &varying, &mut args, 0, stop, &mut |a| {
         let v = eval_expr_checked(arena, idx, a)?;
         if v < 0 || v as usize >= hi {
             return Err(format!("{what} index {v} out of range 0..{hi}"));
@@ -190,8 +204,9 @@ fn check_index(arena: &[Expr], idx: ExprId, domains: &[&[i64]], hi: usize, what:
 /// Reject indexing any array/matrix by `Arg(1)`, used where that binder is an
 /// unbounded computed value (a scan accumulator or a window total) with no
 /// finite domain to validate against.
-fn reject_arg1_index(arena: &[Expr], what: &str) -> Result<(), String> {
+fn reject_arg1_index(arena: &[Expr], what: &str, stop: Option<&AtomicBool>) -> Result<(), String> {
     for node in arena {
+        check_stop(stop)?;
         let uses_arg1 = match node {
             Expr::Array(_, i) => args_used(arena, *i) & 0b10 != 0,
             Expr::Matrix(_, i, j) => (args_used(arena, *i) | args_used(arena, *j)) & 0b10 != 0,
@@ -208,7 +223,8 @@ fn reject_arg1_index(arena: &[Expr], what: &str) -> Result<(), String> {
 /// every array/matrix access stays in bounds for any value its index can take.
 /// Checks each access against only the args its index uses, so the common
 /// `dist[i][j]` / `demand[i]` shapes validate in linear time, not quadratic.
-fn validate_reduction(reduction: &Reduction, items: &[i32], lists: usize) -> Result<(), String> {
+fn validate_reduction(reduction: &Reduction, items: &[i32], lists: usize, stop: Option<&AtomicBool>) -> Result<(), String> {
+    check_stop(stop)?;
     if reduction.iterable.list() >= lists {
         return Err(format!("reduction reads list {} but only {} exist", reduction.iterable.list(), lists));
     }
@@ -246,7 +262,7 @@ fn validate_reduction(reduction: &Reduction, items: &[i32], lists: usize) -> Res
             }
             // The accumulator (`Arg(1)`) has no finite domain, so it must never
             // index a table; reject that rather than read a silent 0.
-            reject_arg1_index(arena, "scan accumulator")?;
+            reject_arg1_index(arena, "scan accumulator", stop)?;
             let mut prev_nodes = items_i.clone();
             prev_nodes.push(i64::from(boundary));
             scan_nodes = prev_nodes;
@@ -268,13 +284,14 @@ fn validate_reduction(reduction: &Reduction, items: &[i32], lists: usize) -> Res
                 return Err("window inner expression is missing".to_string());
             }
             // The window total (`Arg(1)`) is unbounded; it must not index a table.
-            reject_arg1_index(arena, "window total")?;
+            reject_arg1_index(arena, "window total", stop)?;
             // Arg(0)=window item ranges over items; the total slot is a dummy.
             vec![&items_i, &acc_dummy]
         }
     };
 
     for node in arena {
+        check_stop(stop)?;
         match node {
             Expr::MulScaled(_, _, scale) | Expr::DivScaled(_, _, scale) if *scale <= 0 => {
                 return Err("fixed-point scale must be positive".to_string());
@@ -306,7 +323,7 @@ fn validate_reduction(reduction: &Reduction, items: &[i32], lists: usize) -> Res
         let mask = args_used(arena, reduction.body);
         let varying: Vec<usize> = (0..domains.len()).filter(|&s| mask & (1u8 << s) != 0).collect();
         let mut args = vec![0i64; domains.len()];
-        for_each_combo(&domains, &varying, &mut args, 0, &mut |a| {
+        for_each_combo(&domains, &varying, &mut args, 0, stop, &mut |a| {
             eval_expr_checked(arena, reduction.body, a)?;
             Ok(())
         })?;
@@ -314,21 +331,22 @@ fn validate_reduction(reduction: &Reduction, items: &[i32], lists: usize) -> Res
     }
 
     for node in arena {
+        check_stop(stop)?;
         match node {
-            Expr::Array(arr, idx) => check_index(arena, *idx, &domains, arr.len(), "array")?,
+            Expr::Array(arr, idx) => check_index(arena, *idx, &domains, arr.len(), "array", stop)?,
             Expr::Matrix(m, ri, ci) => {
-                check_index(arena, *ri, &domains, m.len(), "matrix row")?;
+                check_index(arena, *ri, &domains, m.len(), "matrix row", stop)?;
                 let rectangular = m.iter().map(Vec::len).min() == m.iter().map(Vec::len).max();
                 if rectangular {
                     let cols = m.first().map_or(0, Vec::len);
-                    check_index(arena, *ci, &domains, cols, "matrix column")?;
+                    check_index(arena, *ci, &domains, cols, "matrix column", stop)?;
                 } else {
                     // Ragged rows: the column bound depends on the row, so the
                     // two indices must be checked jointly.
                     let mask = args_used(arena, *ri) | args_used(arena, *ci);
                     let varying: Vec<usize> = (0..domains.len()).filter(|&s| mask & (1u8 << s) != 0).collect();
                     let mut args = vec![0i64; domains.len()];
-                    for_each_combo(&domains, &varying, &mut args, 0, &mut |a| {
+                    for_each_combo(&domains, &varying, &mut args, 0, stop, &mut |a| {
                         let r = eval_expr_checked(arena, *ri, a)?;
                         if r < 0 || r as usize >= m.len() {
                             return Err(format!("matrix row index {r} out of range 0..{}", m.len()));
@@ -363,6 +381,23 @@ impl CollectionModel {
     /// matrices within bounds for any placement of items. Returns a
     /// human-readable error otherwise, so the engine never reads a silent zero.
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_impl(None)
+    }
+
+    /// Budget-aware validation. `Ok(false)` means the stop flag fired while
+    /// validation was still in progress; malformed models remain ordinary
+    /// errors. This lets frontends count validation against the same wall-clock
+    /// budget as classification and search.
+    pub fn validate_interruptible(&self, stop: &AtomicBool) -> Result<bool, String> {
+        match self.validate_impl(Some(stop)) {
+            Ok(()) => Ok(true),
+            Err(error) if error == VALIDATION_STOPPED => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn validate_impl(&self, stop: Option<&AtomicBool>) -> Result<(), String> {
+        check_stop(stop)?;
         // A schedule model is a disjoint mode: validate the intervals only.
         if let Some(sched) = &self.schedule {
             let n = sched.intervals.len();
@@ -370,6 +405,7 @@ impl CollectionModel {
                 return Err("a schedule needs at least one interval".to_string());
             }
             for iv in &sched.intervals {
+                check_stop(stop)?;
                 if iv.modes.is_empty() {
                     if iv.duration < 0 || iv.duration > iv.horizon {
                         return Err("interval duration must be in 0..=horizon".to_string());
@@ -387,11 +423,13 @@ impl CollectionModel {
             }
             let in_range = |i: usize| i < n;
             for &(a, b) in &sched.precedences {
+                check_stop(stop)?;
                 if !in_range(a) || !in_range(b) {
                     return Err("precedence references a missing interval".to_string());
                 }
             }
             for res in &sched.resources {
+                check_stop(stop)?;
                 match res {
                     Resource::NoOverlap(ivs) => {
                         if ivs.iter().any(|&i| !in_range(i)) {
@@ -427,13 +465,14 @@ impl CollectionModel {
         }
         for tier in &self.objectives {
             for r in tier.reductions() {
-                validate_reduction(r, &self.items, self.lists)?;
+                validate_reduction(r, &self.items, self.lists, stop)?;
             }
         }
         for c in &self.constraints {
-            validate_reduction(&c.reduction, &self.items, self.lists)?;
+            validate_reduction(&c.reduction, &self.items, self.lists, stop)?;
         }
         for g in &self.globals {
+            check_stop(stop)?;
             for v in g.items() {
                 if !self.items.contains(&v) {
                     return Err(format!("global constraint references item {v}, which is not in the universe"));

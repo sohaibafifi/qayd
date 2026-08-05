@@ -432,7 +432,7 @@ pub(super) fn build_candidate(
     if removed.is_empty() || stop.load(Ordering::Relaxed) {
         return None;
     }
-    let mut state = State::from_lists(model, per, lists);
+    let mut state = State::from_lists_interruptible(model, per, lists, stop)?;
     let repaired = match choice.repair.regret() {
         Some(k) => repair_regret(per, &mut state, &removed, k, seed ^ 0xA076_1D64_78BD_642F, stop),
         None => repair_greedy(per, &mut state, &removed, seed ^ 0xA076_1D64_78BD_642F, stop),
@@ -440,10 +440,9 @@ pub(super) fn build_candidate(
     if !repaired {
         return None;
     }
-    state = State::from_lists(model, per, state.lists);
+    state = State::from_lists_interruptible(model, per, state.lists, stop)?;
     let polish_steps = removed.len().saturating_mul(choice.repair.regret().unwrap_or(1));
-    polish(per, &mut state, stop, polish_steps);
-    Some(state)
+    polish(per, &mut state, stop, polish_steps).then_some(state)
 }
 
 fn destroy_segments(lists: &mut [Vec<i32>], target: usize, seed: u64) -> Vec<i32> {
@@ -597,7 +596,9 @@ fn repair_greedy(per: &PerList, state: &mut State, removed: &[i32], seed: u64, s
         }
         let Some((_, _, list, pos, expected)) = best else { return false };
         state.lists[list].insert(pos, item);
-        state.rescore(per, list);
+        if !state.rescore_interruptible(per, list, stop) {
+            return false;
+        }
         debug_assert_eq!(state.scores[list].violation, expected.violation);
         state.set_item_list(per, item, list);
         state.global_viol = per.globals.total(&state.item_list);
@@ -655,7 +656,9 @@ fn repair_regret(per: &PerList, state: &mut State, removed: &[i32], k: usize, se
         let (idx, _, _, list, pos, expected) = choice.expect("pending is non-empty");
         let item = pending.swap_remove(idx);
         state.lists[list].insert(pos, item);
-        state.rescore(per, list);
+        if !state.rescore_interruptible(per, list, stop) {
+            return false;
+        }
         debug_assert_eq!(state.scores[list].violation, expected.violation);
         state.set_item_list(per, item, list);
         state.global_viol = per.globals.total(&state.item_list);
@@ -663,16 +666,21 @@ fn repair_regret(per: &PerList, state: &mut State, removed: &[i32], k: usize, se
     true
 }
 
-fn polish(per: &PerList, state: &mut State, stop: &AtomicBool, steps: usize) {
+fn polish(per: &PerList, state: &mut State, stop: &AtomicBool, steps: usize) -> bool {
     let mut memory = SearchMemory::new(state.lists.len());
     for _ in 0..steps {
         if stop.load(Ordering::Relaxed) {
-            return;
+            return false;
         }
-        let Some(mv) = best_improving_move(per, state, stop, &mut memory) else { return };
-        apply_move(per, state, mv);
+        let Some(mv) = best_improving_move(per, state, stop, &mut memory) else {
+            return !stop.load(Ordering::Relaxed);
+        };
+        if !apply_move(per, state, mv, stop) {
+            return false;
+        }
         memory.reset_touched(mv);
     }
+    true
 }
 
 fn shuffle_values(values: &mut [i32], seed: u64) {
