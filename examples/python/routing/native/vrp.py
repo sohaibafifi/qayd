@@ -1,86 +1,141 @@
-"""Capacitated vehicle routing on real CVRPLIB instances.
+"""Capacitated VRP with an optional CVRPLIB instance.
 
-Modeled the usual way: a Model with k list variables (one per vehicle), a total
-distance objective, and a per-route capacity constraint. solve() picks the
-list-domain engine because the model has list variables.
+Without a positional file this generates a deterministic CVRP. Pass a CVRPLIB
+file to solve it directly:
 
-Instance: set ``QAYD_VRP_INSTANCE`` to any CVRPLIB ``.vrp`` file. If it is not
-set, the script tries the local scratch path
-``data/vrplib/CVRP/X-n101-k25.vrp``. More at http://vrp.galgos.inf.puc-rio.br.
-Tune time via ``QAYD_VRP_T`` and the list-search portfolio via
-``QAYD_VRP_THREADS``; trace with ``QAYD_VERBOSE=1``.
+    uv run examples/python/routing/native/vrp.py X-n101-k25.vrp --threads 4
 """
 
+import argparse
+import contextlib
+import json
+import math
 import os
+import sys
+import time
+from random import Random
 
 import qayd as cp
-from qayd.datasets import read_cvrplib
+from qayd.datasets import read_cvrplib, read_vrp_solution
 
-here = os.path.dirname(os.path.abspath(__file__))
-repo_root = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))
-path = os.environ.get(
-    "QAYD_VRP_INSTANCE",
-    os.path.join(repo_root, "data", "vrplib", "CVRP", "X-n101-k25.vrp"),
-)
-time_limit = int(os.environ.get("QAYD_VRP_T", "10"))
-threads = int(os.environ.get("QAYD_VRP_THREADS", "1"))
 
-if not os.path.exists(path):
-    raise SystemExit("set QAYD_VRP_INSTANCE to a CVRPLIB .vrp file")
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("instance", nargs="?", default=os.environ.get("QAYD_VRP_INSTANCE"))
+parser.add_argument("--customers", type=int, default=int(os.environ.get("QAYD_VRP_N", "30")))
+parser.add_argument("--vehicles", type=int, default=None)
+parser.add_argument("--capacity", type=int, default=40, help="generated-instance capacity")
+parser.add_argument("--time-limit", type=int, default=int(os.environ.get("QAYD_VRP_T", "10")))
+parser.add_argument("--threads", type=int, default=int(os.environ.get("QAYD_VRP_THREADS", "1")))
+parser.add_argument("--seed", type=int, default=int(os.environ.get("QAYD_VRP_SEED", "0")))
+parser.add_argument("--engine", choices=("auto", "exact", "ls"), default="ls")
+parser.add_argument("--solution", help="VRP solution file used as an LS warm start")
+parser.add_argument("--verbose", action="store_true", default=os.environ.get("QAYD_VERBOSE") == "1")
+parser.add_argument("--json", action="store_true", help="emit one machine-readable result")
+args = parser.parse_args()
 
-inst = read_cvrplib(path)
-name = inst.name
-depot = inst.depot
-capacity = inst.capacity
-demand = list(inst.demands)
-customers = list(inst.customers)
-dist = [list(row) for row in inst.edge_weights]
+if args.threads <= 0 or args.time_limit < 0 or args.seed < 0:
+    raise SystemExit("threads must be positive; time limit and seed must be non-negative")
 
-# Available vehicles: CVRPLIB names encode the fixed benchmark fleet as "-kN".
-# Override QAYD_VRP_K only when intentionally solving a different fleet size.
-min_k = inst.vehicles or -(-sum(demand) // capacity)
-k = int(os.environ.get("QAYD_VRP_K", str(min_k)))
+instance = read_cvrplib(args.instance) if args.instance else None
+if instance is None:
+    n = args.customers
+    rng = Random(args.seed)
+    coordinates = [(50, 50)] + [(rng.randint(0, 100), rng.randint(0, 100)) for _ in range(n)]
+    demand = [0] + [rng.randint(1, 9) for _ in range(n)]
+    distance = [
+        [round(math.hypot(x1 - x2, y1 - y2)) for x2, y2 in coordinates]
+        for x1, y1 in coordinates
+    ]
+    depot = 0
+    customers = list(range(1, n + 1))
+    capacity = args.capacity
+    vehicles = args.vehicles or (-(-sum(demand) // capacity) + 1)
+    name = f"generated-cvrp-n{n}"
+    node_ids = list(range(n + 1))
+    best_known = None
+else:
+    demand = list(instance.demands)
+    distance = [list(row) for row in instance.edge_weights]
+    depot = instance.depot
+    customers = list(instance.customers)
+    capacity = instance.capacity
+    vehicles = args.vehicles or instance.vehicles
+    if vehicles is None:
+        raise SystemExit("instance name has no -kN fleet; pass --vehicles")
+    name = instance.name
+    node_ids = list(instance.node_ids)
+    best_known = instance.best_known
 
-D = cp.matrix(dist)  # constant tables, indexed by node id inside lambdas
-Q = cp.array(demand)
+if vehicles <= 0 or capacity <= 0:
+    raise SystemExit("vehicle count and capacity must be positive")
+if args.solution and (instance is None or args.engine != "ls"):
+    raise SystemExit("--solution requires a real instance and --engine ls")
 
+D, Q = cp.matrix(distance), cp.array(demand)
 model = cp.Model()
-routes = model.list_vars(customers, count=k)  # k vehicles partition the customers
-model.minimize(
-    cp.sum(
-        cp.sum_edges(r, lambda i, j: D[i][j], start=depot, end=depot) for r in routes
-    )
-)
-for r in routes:
-    model.add(cp.sum(r, lambda i: Q[i]) <= capacity)  # each route within capacity
+routes = model.list_vars(customers, count=vehicles)
+model.minimize(cp.sum(cp.sum_edges(route, lambda i, j: D[i][j], start=depot, end=depot) for route in routes))
+for route in routes:
+    model.add(cp.sum(route, lambda customer: Q[customer]) <= capacity)
 
-solution = model.solve(
-    engine="ls",
-    threads=threads,
-    time_limit=time_limit,
-    verbose=os.environ.get("QAYD_VERBOSE") == "1",
-)
+hint = None
+if args.solution:
+    hint = [list(route) for route in read_vrp_solution(args.solution, instance=instance).routes]
+solve_options = {
+    "engine": args.engine,
+    "threads": args.threads,
+    "time_limit": args.time_limit,
+    "seed": args.seed,
+    "verbose": args.verbose,
+}
+if hint is not None:
+    solve_options["list_hint"] = hint
+started = time.perf_counter()
+output = contextlib.redirect_stdout(sys.stderr) if args.json else contextlib.nullcontext()
+with output:
+    solution = model.solve(**solve_options)
+elapsed = time.perf_counter() - started
 
-# Known optimum, if the instance comment records it (CVRPLIB convention).
-gap = f"  (known optimum {inst.best_known})" if inst.best_known is not None else ""
-
-print(
-    f"instance: {name}  customers: {len(customers)}  vehicles: {k}  capacity: {capacity}"
-)
 if solution.lists is None:
-    raise SystemExit(
-        f"status: {solution.status} - no feasible solution within {time_limit}s"
-    )
-fleet = sum(1 for route in solution.lists if route)
-distance = solution.objectives[-1]
-print(f"status: {solution.status}  fleet: {fleet}  total distance: {distance}{gap}")
-for r, route in enumerate(solution.lists):
-    if not route:
-        continue
-    load = sum(demand[c] for c in route)
-    print(f"  route {r}: load {load:5d}  {[depot, *route, depot]}")
+    record = {"instance": name, "status": solution.status, "elapsed_seconds": elapsed, "objectives": []}
+    print(json.dumps(record, sort_keys=True) if args.json else f"instance: {name}  status: {solution.status}")
+    raise SystemExit(0)
 
-served = sorted(c for route in solution.lists for c in route)
+served = sorted(customer for route in solution.lists for customer in route)
 assert served == sorted(customers), "every customer served exactly once"
+route_records = []
+total_distance = 0
 for route in solution.lists:
-    assert sum(demand[c] for c in route) <= capacity, "capacity respected"
+    load = sum(demand[customer] for customer in route)
+    assert load <= capacity, "capacity respected"
+    sequence = [depot, *route, depot]
+    route_distance = sum(distance[before][after] for before, after in zip(sequence, sequence[1:]))
+    total_distance += route_distance
+    route_records.append({"nodes": [node_ids[customer] for customer in route], "load": load, "distance": route_distance})
+assert list(solution.objectives) == [total_distance], "reported objective matches replay"
+
+record = {
+    "instance": name,
+    "status": solution.status,
+    "customers": len(customers),
+    "vehicles": vehicles,
+    "vehicles_used": sum(bool(route) for route in solution.lists),
+    "capacity": capacity,
+    "objectives": [total_distance],
+    "best_known": best_known,
+    "elapsed_seconds": elapsed,
+    "seed": args.seed,
+    "threads": args.threads,
+    "engine": args.engine,
+    "routes": route_records,
+    "verified": True,
+}
+if args.json:
+    print(json.dumps(record, sort_keys=True))
+else:
+    gap = f"  known optimum: {best_known}" if best_known is not None else ""
+    print(f"instance: {name}  customers: {len(customers)}  vehicles: {vehicles}  capacity: {capacity}")
+    print(f"status: {solution.status}  distance: {total_distance}{gap}  elapsed: {elapsed:.3f}s")
+    for index, route in enumerate(route_records):
+        if route["nodes"]:
+            print(f"  route {index}: load {route['load']:5d}  {[node_ids[depot], *route['nodes'], node_ids[depot]]}")

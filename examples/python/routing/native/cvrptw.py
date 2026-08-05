@@ -1,71 +1,179 @@
-"""Capacitated vehicle routing with time windows.
+"""Capacitated VRPTW with an optional Solomon/Homberger instance.
 
-Adds time windows to the CVRP model. The end-of-service time along each route is
-a prefix scan: ``end = max(earliest[cust], arrival) + service[cust]``, threaded
-with ``cp.scan_sum``. Lateness ``max(0, end - latest[cust])`` is summed per route
-and constrained to 0, so the violation-driven search drives windows to feasible
-with the same feasibility-first scoring used by the list-domain engine. The
-objective is lexicographic: fewest vehicles, then shortest distance.
+Without a positional file this keeps the original deterministic generated
+example. Pass a Solomon or Gehring-Homberger file to solve that benchmark:
 
-Tune via ``QAYD_CVRPTW_N`` / ``QAYD_CVRPTW_T``; trace with ``QAYD_VERBOSE=1``.
+    uv run examples/python/routing/native/cvrptw.py C101.txt --threads 4
 """
 
+import argparse
+import contextlib
+import json
 import math
 import os
+import sys
+import time
 from random import Random
 
 import qayd as cp
+from qayd.datasets import read_solomon, read_vrp_solution
 
-n = int(os.environ.get("QAYD_CVRPTW_N", "15"))
-time_limit = int(os.environ.get("QAYD_CVRPTW_T", "10"))
 
-rng = Random(0)
-# Node 0 is the depot; 1..n are customers with a demand, service time, window.
-coords = [(50, 50)] + [(rng.randint(0, 100), rng.randint(0, 100)) for _ in range(n)]
-demand = [0] + [rng.randint(1, 9) for _ in range(n)]
-service = [0] + [10 for _ in range(n)]
-dist = [[round(math.hypot(coords[i][0] - coords[j][0], coords[i][1] - coords[j][1])) for j in range(n + 1)] for i in range(n + 1)]
-# Each customer opens at a random time and stays open for a generous span; the
-# depot-to-customer travel keeps some routes window-constrained.
-earliest = [0] + [rng.randint(0, 60) for _ in range(n)]
-latest = [0] + [earliest[i] + 80 for i in range(1, n + 1)]
-capacity = 40
-min_k = -(-sum(demand) // capacity)
-k = min_k + 3
+def arguments():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("instance", nargs="?", default=os.environ.get("QAYD_CVRPTW_INSTANCE"))
+    parser.add_argument("--customers", type=int, default=int(os.environ.get("QAYD_CVRPTW_N", "15")))
+    parser.add_argument("--vehicles", type=int)
+    parser.add_argument("--time-limit", type=int, default=int(os.environ.get("QAYD_CVRPTW_T", "10")))
+    parser.add_argument("--threads", type=int, default=int(os.environ.get("QAYD_CVRPTW_THREADS", "1")))
+    parser.add_argument("--seed", type=int, default=int(os.environ.get("QAYD_CVRPTW_SEED", "0")))
+    parser.add_argument("--engine", choices=("auto", "exact", "ls"), default="ls")
+    parser.add_argument("--distance-scale", type=int, default=10)
+    parser.add_argument("--rounding", choices=("truncate", "nearest", "ceil"), default="truncate")
+    parser.add_argument("--solution", help="VRP solution file used as an LS warm start")
+    parser.add_argument("--verbose", action="store_true", default=os.environ.get("QAYD_VERBOSE") == "1")
+    parser.add_argument("--json", action="store_true", help="emit one machine-readable result")
+    return parser.parse_args()
 
-D, Q, E, L, S = cp.matrix(dist), cp.array(demand), cp.array(earliest), cp.array(latest), cp.array(service)
 
+args = arguments()
+if args.threads <= 0 or args.time_limit < 0 or args.seed < 0:
+    raise SystemExit("threads must be positive; time limit and seed must be non-negative")
+
+instance = read_solomon(args.instance) if args.instance else None
+if instance is None:
+    n = args.customers
+    rng = Random(args.seed)
+    coordinates = [(50, 50)] + [(rng.randint(0, 100), rng.randint(0, 100)) for _ in range(n)]
+    demand = [0] + [rng.randint(1, 9) for _ in range(n)]
+    service = [0] + [10 for _ in range(n)]
+    distance = [
+        [round(math.hypot(x1 - x2, y1 - y2)) for x2, y2 in coordinates]
+        for x1, y1 in coordinates
+    ]
+    earliest = [0] + [rng.randint(0, 60) for _ in range(n)]
+    latest = [1_000] + [earliest[index] + 80 for index in range(1, n + 1)]
+    capacity = 40
+    depot = 0
+    customers = list(range(1, n + 1))
+    vehicles = args.vehicles or (-(-sum(demand) // capacity) + 3)
+    scale = 1
+    name = f"generated-vrptw-n{n}"
+    node_ids = list(range(n + 1))
+else:
+    if args.distance_scale <= 0:
+        raise SystemExit("distance scale must be positive")
+    scale = args.distance_scale
+    distance = [list(row) for row in instance.distance_matrix(scale=scale, rounding=args.rounding)]
+    demand = list(instance.demands)
+    service = [value * scale for value in instance.service_times]
+    earliest = [window[0] * scale for window in instance.time_windows]
+    latest = [window[1] * scale for window in instance.time_windows]
+    capacity = instance.capacity
+    depot = instance.depot
+    customers = list(instance.customers)
+    vehicles = args.vehicles or instance.vehicles
+    name = instance.name
+    node_ids = list(instance.node_ids)
+
+if vehicles <= 0:
+    raise SystemExit("vehicle count must be positive")
+if args.solution and (instance is None or args.engine != "ls"):
+    raise SystemExit("--solution requires a real instance and --engine ls")
+
+D, Q = cp.matrix(distance), cp.array(demand)
+E, L, S = cp.array(earliest), cp.array(latest), cp.array(service)
 model = cp.Model()
-routes = model.list_vars(list(range(1, n + 1)), count=k)
-model.minimize(cp.sum(cp.used(r) for r in routes))                                  # fewest vehicles
-model.then_minimize(cp.sum(cp.sum_edges(r, lambda i, j: D[i][j], start=0, end=0) for r in routes))  # then distance
-for r in routes:
-    model.add(cp.sum(r, lambda i: Q[i]) <= capacity)
+routes = model.list_vars(customers, count=vehicles)
+model.minimize(cp.sum(cp.used(route) for route in routes))
+model.then_minimize(cp.sum(cp.sum_edges(route, lambda i, j: D[i][j], start=depot, end=depot) for route in routes))
+for route in routes:
+    model.add(cp.sum(route, lambda customer: Q[customer]) <= capacity)
     lateness = cp.scan_sum(
-        r,
-        step=lambda cur, acc, prev: cp.max(E[cur], acc + D[prev][cur]) + S[cur],
-        emit=lambda cur, end, prev: cp.max(0, end - L[cur]),
-        init=0,
-        boundary=0,
+        route,
+        step=lambda current, clock, previous: cp.max(E[current], clock + D[previous][current]) + S[current],
+        emit=lambda current, departure, previous: cp.max(0, departure - S[current] - L[current]),
+        init=earliest[depot],
+        boundary=depot,
+        end=depot,
     )
     model.add(lateness <= 0)
 
-solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
+hint = None
+if args.solution:
+    hint = [list(route) for route in read_vrp_solution(args.solution, instance=instance).routes]
 
-print(f"customers: {n}  vehicles<={k}  capacity: {capacity}  status: {solution.status}")
+solve_options = {
+    "engine": args.engine,
+    "threads": args.threads,
+    "time_limit": args.time_limit,
+    "seed": args.seed,
+    "verbose": args.verbose,
+}
+if hint is not None:
+    solve_options["list_hint"] = hint
+started = time.perf_counter()
+output = contextlib.redirect_stdout(sys.stderr) if args.json else contextlib.nullcontext()
+with output:
+    solution = model.solve(**solve_options)
+elapsed = time.perf_counter() - started
+
 if solution.lists is None:
-    raise SystemExit(f"status: {solution.status} - no feasible plan within {time_limit}s")
-fleet, distance = solution.objectives
-print(f"fleet: {fleet}  total distance: {distance}")
-for r, route in enumerate(solution.lists):
-    if not route:
-        continue
-    # Replay the schedule to show every stop is on time.
-    acc, prev = 0, 0
-    for c in route:
-        acc = max(earliest[c], acc + dist[prev][c]) + service[c]
-        assert acc <= latest[c], "every stop served within its window"
-        prev = c
-    print(f"  route {r}: load {sum(demand[c] for c in route):3d}  {[0, *route, 0]}")
+    record = {"instance": name, "status": solution.status, "elapsed_seconds": elapsed, "objectives": []}
+    print(json.dumps(record, sort_keys=True) if args.json else f"instance: {name}  status: {solution.status}")
+    raise SystemExit(0)
 
-assert sorted(c for route in solution.lists for c in route) == list(range(1, n + 1))
+served = sorted(customer for route in solution.lists for customer in route)
+assert served == sorted(customers), "every customer served exactly once"
+total_distance = 0
+route_records = []
+for route in solution.lists:
+    load = sum(demand[customer] for customer in route)
+    assert load <= capacity, "capacity respected"
+    clock, previous = earliest[depot], depot
+    starts = []
+    for customer in route:
+        start = max(earliest[customer], clock + distance[previous][customer])
+        assert start <= latest[customer], "every service starts within its time window"
+        starts.append(start)
+        clock = start + service[customer]
+        previous = customer
+    depot_return = max(earliest[depot], clock + distance[previous][depot])
+    assert depot_return <= latest[depot], "route returns within the depot window"
+    sequence = [depot, *route, depot]
+    route_distance = sum(distance[before][after] for before, after in zip(sequence, sequence[1:]))
+    total_distance += route_distance
+    route_records.append(
+        {
+            "nodes": [node_ids[customer] for customer in route],
+            "starts": [start / scale for start in starts],
+            "load": load,
+            "distance": route_distance / scale,
+        }
+    )
+
+fleet = sum(bool(route) for route in solution.lists)
+assert list(solution.objectives) == [fleet, total_distance], "reported objectives match replay"
+record = {
+    "instance": name,
+    "status": solution.status,
+    "customers": len(customers),
+    "vehicles": vehicles,
+    "capacity": capacity,
+    "objectives": [fleet, total_distance],
+    "distance": total_distance / scale,
+    "elapsed_seconds": elapsed,
+    "seed": args.seed,
+    "threads": args.threads,
+    "engine": args.engine,
+    "routes": route_records,
+    "verified": True,
+}
+if args.json:
+    print(json.dumps(record, sort_keys=True))
+else:
+    print(f"instance: {name}  customers: {len(customers)}  vehicles<={vehicles}  capacity: {capacity}")
+    print(f"status: {solution.status}  fleet: {fleet}  distance: {total_distance / scale:g}  elapsed: {elapsed:.3f}s")
+    for index, route in enumerate(route_records):
+        if route["nodes"]:
+            print(f"  route {index}: load {route['load']:3d}  {[node_ids[depot], *route['nodes'], node_ids[depot]]}")

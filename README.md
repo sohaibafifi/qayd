@@ -124,7 +124,10 @@ The Python examples live under `examples/python/`, grouped by domain: `routing/`
 `scheduling/`, `packing/`, `optimization/`, and `mus/` (infeasibility analysis).
 
 ```bash
-QAYD_VRP_INSTANCE=/path/to/instance.vrp uv run examples/python/routing/api/vrp.py
+uv run examples/python/routing/native/vrp.py /path/to/X-n101-k25.vrp --threads 4
+uv run examples/python/routing/native/cvrptw.py /path/to/C101.txt --threads 4
+uv run examples/python/scheduling/native/jssp.py /path/to/abz5.txt --threads 4
+uv run examples/python/scheduling/native/rcpsp.py /path/to/j301_1.sm --threads 4
 uv run examples/python/routing/api/cvrptw.py
 uv run examples/python/scheduling/api/jssp.py
 uv run examples/python/scheduling/api/rcpsp.py
@@ -138,10 +141,11 @@ uv run examples/python/mus/mus_enumerate.py # all MUSes + MSSes/MCSes (MARCO): m
 ```
 
 The API routing examples live under `examples/python/routing/api/`; the raw
-list-lambda equivalents live under `examples/python/routing/native/`. The VRP
-example uses qayd's built-in parser and expects a local CVRPLIB file via
-`QAYD_VRP_INSTANCE`. Set `QAYD_VRP_THREADS=4` to exercise the ordered-list
-portfolio, equivalent to `model.solve(engine="ls", threads=4, ...)`.
+list-lambda equivalents live under `examples/python/routing/native/`. The
+native VRP, VRPTW, JSSP and RCPSP scripts generate a deterministic instance
+when called without an argument, or parse and solve a benchmark file passed as
+their positional argument. Add `--json` for machine-readable output and
+`--threads 4` to exercise the relevant portfolio.
 Interval scheduling API examples live under `examples/python/scheduling/api/`;
 the raw interval/list equivalents live under `examples/python/scheduling/native/`.
 Benchmark data under `data/` is local scratch data and is not part of the source

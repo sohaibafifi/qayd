@@ -61,7 +61,7 @@ Use `--format jsonl` or `--format csv` for scripts. The reported
 claim about a true live push/pop continuation. Epoch solves are capped at one
 second by default; pass `--epoch-time-limit 0` for an unbounded exact run.
 
-## Phase 8 dataset parsers
+## Dataset parsers and native launchers
 
 The pure-Python `qayd.datasets` package supplies the normalized input layer for
 the routing and scheduling campaign:
@@ -82,6 +82,12 @@ For the DIMACS VRPTW convention, use
 `solomon.distance_matrix(scale=10, rounding="truncate")`. This stores distances
 truncated to one decimal place as integers and makes objective replay stable
 across solvers.
+
+The existing native examples double as qayd launchers for CVRPLIB,
+Solomon/Homberger, JSPLIB and PSPLIB. With no positional argument they retain
+their generated demonstration; with a file argument they parse, solve and
+independently verify that instance. `--json` produces a campaign-ready record.
+Small format-correct smoke instances live under `examples/instances/`.
 
 ## Data sources
 
