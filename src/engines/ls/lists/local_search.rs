@@ -13,11 +13,12 @@ use std::time::Instant;
 
 use smallvec::SmallVec;
 
-use super::alns::{build_candidate, AcceptanceKind, AlnsController};
+use super::alns::{build_candidate, AcceptanceKind, AlnsController, SearchProfile};
 use super::eval::{eval_reduction, violation_of, INFEASIBLE};
 use super::incremental::{EvalScratch, InsertView, ListView, ReductionCache};
 use super::metrics::{metrics_enabled_from_env, ListSearchMetrics, MetricsRecorder};
 use super::moves::{apply_move, best_improving_move, better, shuffle, snapshot, trial_list_score_view, SearchMemory};
+use super::portfolio::WorkerCoordination;
 use super::schedule_ls::solve_schedule;
 use crate::mix64;
 use crate::model::list::{
@@ -987,6 +988,21 @@ fn solve_collection_capped_internal(
     report: &mut dyn FnMut(i64),
     metrics_enabled: bool,
 ) -> (CollectionSolution, ListSearchMetrics) {
+    solve_collection_capped_worker(model, seed, stop, max_iters, hint, report, metrics_enabled, SearchProfile::Sequential, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn solve_collection_capped_worker(
+    model: &CollectionModel,
+    seed: u64,
+    stop: &AtomicBool,
+    max_iters: u64,
+    hint: Option<&[Vec<i32>]>,
+    report: &mut dyn FnMut(i64),
+    metrics_enabled: bool,
+    profile: SearchProfile,
+    mut coordination: Option<WorkerCoordination<'_>>,
+) -> (CollectionSolution, ListSearchMetrics) {
     let started = metrics_enabled.then(Instant::now);
     // Guard the search path: an invalid model would otherwise panic (bad list
     // index) or read silent zeros (out-of-range table index). Callers like the
@@ -1024,12 +1040,15 @@ fn solve_collection_capped_internal(
     let mut memory = SearchMemory::new(model.lists.max(1));
 
     let (mut best_lists, mut best_score, mut best_feasible) = snapshot(&per, &state);
+    let mut alns = AlnsController::new_profile(n, &best_score, profile);
+    if coordination.as_ref().is_some_and(|shared| shared.publish(&best_lists, &best_score, best_feasible)) {
+        alns.record_shared_publication();
+    }
     if best_feasible && per.tiers > 0 {
         report(tier_value(&per, &best_score, 0));
     }
     let mut stagnant = 0u64;
     let mut iter = 0u64;
-    let mut alns = AlnsController::new(n, &best_score);
     let (mut local_optima, mut alns_candidates, mut alns_accepted) = (0u64, 0u64, 0u64);
 
     while !stop.load(Ordering::Relaxed) && iter < max_iters {
@@ -1039,6 +1058,9 @@ fn solve_collection_capped_internal(
                 apply_move(&per, &mut state, mv);
                 memory.reset_touched(mv);
                 if record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report) {
+                    if coordination.as_ref().is_some_and(|shared| shared.publish(&best_lists, &best_score, best_feasible)) {
+                        alns.record_shared_publication();
+                    }
                     stagnant = 0;
                 }
             }
@@ -1048,9 +1070,24 @@ fn solve_collection_capped_internal(
                 }
                 local_optima += 1;
                 if record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report) {
+                    if coordination.as_ref().is_some_and(|shared| shared.publish(&best_lists, &best_score, best_feasible)) {
+                        alns.record_shared_publication();
+                    }
                     stagnant = 0;
                 } else {
                     stagnant = stagnant.saturating_add(1);
+                }
+
+                if let Some(lists) = coordination.as_mut().and_then(|shared| shared.maybe_inject(local_optima, &best_score, best_feasible))
+                {
+                    state = State::from_lists(model, &per, lists);
+                    let injected = record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report);
+                    debug_assert!(injected, "a shared incumbent must strictly improve the worker incumbent");
+                    alns.record_shared_injection();
+                    alns.reset_after_injection(&best_score);
+                    memory.reset_all();
+                    stagnant = 0;
+                    continue;
                 }
 
                 let penalties = per.bump_gls(&state);
@@ -1069,6 +1106,9 @@ fn solve_collection_capped_internal(
                 let candidate_raw = full_score_raw(&per, &candidate);
                 let improved_current = candidate_raw < current_raw;
                 let global_best = record_state(&per, &candidate, &mut best_lists, &mut best_score, &mut best_feasible, report);
+                if global_best && coordination.as_ref().is_some_and(|shared| shared.publish(&best_lists, &best_score, best_feasible)) {
+                    alns.record_shared_publication();
+                }
                 let acceptance = alns.accept(&current_guided, &candidate_guided, &current_raw, &candidate_raw, operator_seed, iter);
                 if !matches!(acceptance, AcceptanceKind::Rejected) {
                     alns_accepted = alns_accepted.saturating_add(1);
@@ -1083,7 +1123,11 @@ fn solve_collection_capped_internal(
         }
     }
 
-    record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report);
+    if record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report)
+        && coordination.as_ref().is_some_and(|shared| shared.publish(&best_lists, &best_score, best_feasible))
+    {
+        alns.record_shared_publication();
+    }
 
     if std::env::var("QAYD_LS_DEBUG").is_ok() {
         eprintln!("LS: iters={iter} local_optima={local_optima} alns_candidates={alns_candidates} alns_accepted={alns_accepted}");

@@ -31,6 +31,10 @@ pub struct AlnsSearchMetrics {
     pub late_acceptance_accepts: u64,
     pub gls_updates: u64,
     pub gls_penalties: u64,
+    /// Strict improvements published to a shared list-search incumbent.
+    pub shared_publications: u64,
+    /// Better shared incumbents injected into this worker.
+    pub shared_injections: u64,
     pub destroy: Vec<AdaptiveOperatorMetrics>,
     pub repair: Vec<AdaptiveOperatorMetrics>,
 }
@@ -214,7 +218,7 @@ impl fmt::Display for ListSearchMetrics {
         )?;
         writeln!(
             f,
-            "  alns-iterations={} accepted={} improving={} global-bests={} sa-accepts={} late-accepts={} gls-updates={} gls-penalties={}",
+            "  alns-iterations={} accepted={} improving={} global-bests={} sa-accepts={} late-accepts={} gls-updates={} gls-penalties={} shared-publications={} shared-injections={}",
             self.alns.iterations,
             self.alns.accepted,
             self.alns.improving,
@@ -222,7 +226,9 @@ impl fmt::Display for ListSearchMetrics {
             self.alns.simulated_annealing_accepts,
             self.alns.late_acceptance_accepts,
             self.alns.gls_updates,
-            self.alns.gls_penalties
+            self.alns.gls_penalties,
+            self.alns.shared_publications,
+            self.alns.shared_injections
         )?;
         for operator in self.alns.destroy.iter().chain(&self.alns.repair) {
             writeln!(

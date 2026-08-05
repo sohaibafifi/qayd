@@ -7,7 +7,8 @@ list-domain engine because the model has list variables.
 Instance: set ``QAYD_VRP_INSTANCE`` to any CVRPLIB ``.vrp`` file. If it is not
 set, the script tries the local scratch path
 ``data/vrplib/CVRP/X-n101-k25.vrp``. More at http://vrp.galgos.inf.puc-rio.br.
-Tune time via ``QAYD_VRP_T``; trace with ``QAYD_VERBOSE=1``.
+Tune time via ``QAYD_VRP_T`` and the list-search portfolio via
+``QAYD_VRP_THREADS``; trace with ``QAYD_VERBOSE=1``.
 """
 
 import os
@@ -22,6 +23,7 @@ path = os.environ.get(
     os.path.join(repo_root, "data", "vrplib", "CVRP", "X-n101-k25.vrp"),
 )
 time_limit = int(os.environ.get("QAYD_VRP_T", "10"))
+threads = int(os.environ.get("QAYD_VRP_THREADS", "1"))
 
 if not os.path.exists(path):
     raise SystemExit("set QAYD_VRP_INSTANCE to a CVRPLIB .vrp file")
@@ -53,7 +55,10 @@ for r in routes:
     model.add(cp.sum(r, lambda i: Q[i]) <= capacity)  # each route within capacity
 
 solution = model.solve(
-    time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1"
+    engine="ls",
+    threads=threads,
+    time_limit=time_limit,
+    verbose=os.environ.get("QAYD_VERBOSE") == "1",
 )
 
 # Known optimum, if the instance comment records it (CVRPLIB convention).

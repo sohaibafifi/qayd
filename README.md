@@ -72,7 +72,8 @@ Priority order: correct, simple, fast.
   use ALNS with online-scored Shaw, segment, and worst removals plus greedy,
   regret-2, and regret-3 insertion. Simulated annealing and late acceptance
   preserve diversification, while GLS penalties steer violated and objective
-  list reductions.
+  list reductions. The Python list engine can run a multithread portfolio with
+  distinct intensification, balanced, and diversification profiles. 
 - **Beta MiniZinc support.** The `qayd-fzn` driver speaks the MiniZinc solver protocol,
   so it can be used as a backend for the MiniZinc CLI and IDE. See
   [the MiniZinc integration notes](frontends/flatzinc/minizinc/README.md).
@@ -139,7 +140,8 @@ uv run examples/python/mus/mus_enumerate.py # all MUSes + MSSes/MCSes (MARCO): m
 The API routing examples live under `examples/python/routing/api/`; the raw
 list-lambda equivalents live under `examples/python/routing/native/`. The VRP
 example uses qayd's built-in parser and expects a local CVRPLIB file via
-`QAYD_VRP_INSTANCE`.
+`QAYD_VRP_INSTANCE`. Set `QAYD_VRP_THREADS=4` to exercise the ordered-list
+portfolio, equivalent to `model.solve(engine="ls", threads=4, ...)`.
 Interval scheduling API examples live under `examples/python/scheduling/api/`;
 the raw interval/list equivalents live under `examples/python/scheduling/native/`.
 Benchmark data under `data/` is local scratch data and is not part of the source

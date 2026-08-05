@@ -755,6 +755,7 @@ class Model:
         verbose: bool = ...,
         time_limit: Optional[int] = ...,
         seed: int = ...,
+        threads: int = ...,
         engine: str = ...,
         conflict_budget: Optional[int] = ...,
         list_hint: Optional[list[list[int]]] = ...,

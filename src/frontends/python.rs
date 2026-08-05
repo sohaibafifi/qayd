@@ -2340,7 +2340,7 @@ impl PyModel {
         Ok(())
     }
 
-    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, engine="auto", conflict_budget=None, list_hint=None))]
+    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, threads=1, engine="auto", conflict_budget=None, list_hint=None))]
     #[allow(clippy::too_many_arguments)]
     fn solve(
         &self,
@@ -2353,10 +2353,14 @@ impl PyModel {
         verbose: bool,
         time_limit: Option<u64>,
         seed: u64,
+        threads: usize,
         engine: &str,
         conflict_budget: Option<u64>,
         list_hint: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PySolution> {
+        if threads == 0 {
+            return Err(PyValueError::new_err("threads must be a positive integer"));
+        }
         let engine = parse_engine(engine)?;
         let exact_hooks = assumptions.is_some_and(|obj| !obj.is_none())
             || hints.is_some_and(|obj| !obj.is_none())
@@ -2365,6 +2369,9 @@ impl PyModel {
             || conflict_budget.is_some();
         let list_hint = list_hint.filter(|obj| !obj.is_none());
         if self.col_universe.is_some() || self.col_schedule.is_some() {
+            if threads > 1 && engine != PythonEngine::Ls {
+                return Err(PyValueError::new_err("threads > 1 on list and schedule models requires engine='ls'"));
+            }
             if exact_hooks {
                 return Err(PyValueError::new_err(
                     "assumptions, hints, branch_order, callbacks, and conflict_budget are only supported by the integer exact engine",
@@ -2387,7 +2394,10 @@ impl PyModel {
                 }
                 None => None,
             };
-            return self.solve_collection(py, time_limit, seed, verbose, engine, list_hint);
+            return self.solve_collection(py, time_limit, seed, threads, verbose, engine, list_hint);
+        }
+        if threads > 1 {
+            return Err(PyValueError::new_err("threads > 1 is currently supported only for list and schedule models with engine='ls'"));
         }
         if list_hint.is_some() {
             return Err(PyValueError::new_err("list_hint is only supported for list_vars models on engine='ls'"));
@@ -3147,11 +3157,13 @@ impl PyModel {
         Ok(hint)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn solve_collection(
         &self,
         py: Python<'_>,
         time_limit: Option<u64>,
         seed: u64,
+        threads: usize,
         verbose: bool,
         engine: PythonEngine,
         list_hint: Option<Vec<Vec<i32>>>,
@@ -3204,6 +3216,7 @@ impl PyModel {
             println!("  lists: {}", model.lists);
             println!("  constraints: {}", model.constraints.len());
             println!("  objective tiers: {}", model.objectives.len());
+            println!("  threads: {threads}");
             println!("  time limit: {limit}s");
         }
         let stop = stop_after(limit);
@@ -3215,9 +3228,15 @@ impl PyModel {
                 println!("  o {objective}  ({primary_sense}, {:.2}s)", start.elapsed().as_secs_f64());
             }
         };
-        let sol = with_interrupts(py, &stop, || match &list_hint {
-            Some(hint) => lists::solve_collection_hinted(&model, seed, &stop, hint, &mut report),
-            None => lists::solve_collection(&model, seed, &stop, &mut report),
+        let sol = with_interrupts(py, &stop, || {
+            if threads > 1 {
+                lists::solve_collection_parallel(&model, seed, &stop, threads, list_hint.as_deref(), &mut report)
+            } else {
+                match &list_hint {
+                    Some(hint) => lists::solve_collection_hinted(&model, seed, &stop, hint, &mut report),
+                    None => lists::solve_collection(&model, seed, &stop, &mut report),
+                }
+            }
         })?;
         if verbose {
             println!("qayd result (collection)");

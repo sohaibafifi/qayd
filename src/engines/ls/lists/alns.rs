@@ -16,6 +16,25 @@ const WEIGHT_SCALE: u64 = 1_000;
 const MIN_WEIGHT: u64 = 100;
 
 #[derive(Clone, Copy)]
+pub(super) enum SearchProfile {
+    Sequential,
+    Intensify,
+    Balanced,
+    Diversify,
+}
+
+impl SearchProfile {
+    pub(super) const fn name(self) -> &'static str {
+        match self {
+            Self::Sequential => "sequential",
+            Self::Intensify => "intensify",
+            Self::Balanced => "balanced",
+            Self::Diversify => "diversify",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(super) enum DestroyOperator {
     Shaw = 0,
     Segments = 1,
@@ -96,14 +115,20 @@ struct AlnsConfig {
 }
 
 impl AlnsConfig {
-    fn from_env(items: usize) -> Self {
+    fn from_env(items: usize, profile: SearchProfile) -> Self {
+        let root = integer_sqrt(items.max(1));
+        let (temperature, cooling, late_window, destroy_min, destroy_max) = match profile {
+            SearchProfile::Sequential | SearchProfile::Balanced => (0.12, 0.997, root.saturating_mul(2), 6, 45),
+            SearchProfile::Intensify => (0.05, 0.995, root, 3, 28),
+            SearchProfile::Diversify => (0.30, 0.999, root.saturating_mul(4), 15, 65),
+        };
         let reaction_milli = env_u64("QAYD_LS_ALNS_REACTION", 200).clamp(1, WEIGHT_SCALE);
-        let segment_length = env_u64("QAYD_LS_ALNS_SEGMENT", integer_sqrt(items.max(1)) as u64).max(1);
-        let initial_temperature = env_f64("QAYD_LS_ALNS_TEMPERATURE", 0.12).clamp(1.0e-6, 100.0);
-        let cooling = env_f64("QAYD_LS_ALNS_COOLING", 0.997).clamp(0.5, 1.0);
-        let late_window = env_usize("QAYD_LS_LATE_WINDOW", integer_sqrt(items.max(1)).saturating_mul(2)).max(1);
-        let min_destroy_percent = env_usize("QAYD_LS_DESTROY_MIN", 6).clamp(1, 100);
-        let max_destroy_percent = env_usize("QAYD_LS_DESTROY_MAX", 45).clamp(min_destroy_percent, 100);
+        let segment_length = env_u64("QAYD_LS_ALNS_SEGMENT", root as u64).max(1);
+        let initial_temperature = env_f64("QAYD_LS_ALNS_TEMPERATURE", temperature).clamp(1.0e-6, 100.0);
+        let cooling = env_f64("QAYD_LS_ALNS_COOLING", cooling).clamp(0.5, 1.0);
+        let late_window = env_usize("QAYD_LS_LATE_WINDOW", late_window).max(1);
+        let min_destroy_percent = env_usize("QAYD_LS_DESTROY_MIN", destroy_min).clamp(1, 100);
+        let max_destroy_percent = env_usize("QAYD_LS_DESTROY_MAX", destroy_max).clamp(min_destroy_percent, 100);
         Self { reaction_milli, segment_length, initial_temperature, cooling, late_window, min_destroy_percent, max_destroy_percent }
     }
 }
@@ -158,7 +183,11 @@ pub(super) struct AlnsController {
 
 impl AlnsController {
     pub(super) fn new(items: usize, initial: &Score) -> Self {
-        let config = AlnsConfig::from_env(items);
+        Self::new_profile(items, initial, SearchProfile::Sequential)
+    }
+
+    pub(super) fn new_profile(items: usize, initial: &Score, profile: SearchProfile) -> Self {
+        let config = AlnsConfig::from_env(items, profile);
         Self {
             temperature: config.initial_temperature,
             late_scores: vec![initial.clone(); config.late_window],
@@ -288,6 +317,20 @@ impl AlnsController {
             self.metrics.gls_updates = self.metrics.gls_updates.saturating_add(1);
             self.metrics.gls_penalties = self.metrics.gls_penalties.saturating_add(penalties as u64);
         }
+    }
+
+    pub(super) fn record_shared_publication(&mut self) {
+        self.metrics.shared_publications = self.metrics.shared_publications.saturating_add(1);
+    }
+
+    pub(super) fn record_shared_injection(&mut self) {
+        self.metrics.shared_injections = self.metrics.shared_injections.saturating_add(1);
+    }
+
+    pub(super) fn reset_after_injection(&mut self, score: &Score) {
+        self.temperature = self.config.initial_temperature;
+        self.late_scores.fill(score.clone());
+        self.late_cursor = 0;
     }
 
     pub(super) fn metrics(mut self) -> AlnsSearchMetrics {

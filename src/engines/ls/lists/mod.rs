@@ -9,6 +9,7 @@ mod incremental;
 mod local_search;
 mod metrics;
 mod moves;
+mod portfolio;
 mod schedule_ls;
 
 #[doc(hidden)]
@@ -20,3 +21,8 @@ pub use metrics::{
     AdaptiveOperatorMetrics, AlnsSearchMetrics, ListIterableKind, ListReduceOpKind, ListSearchMetrics, ReductionSearchMetrics,
 };
 pub use moves::audit_incremental;
+#[doc(hidden)]
+pub use portfolio::{audit_incumbent_exchange, audit_portfolio_merge};
+pub use portfolio::{
+    solve_collection_parallel, solve_collection_parallel_capped_profiled, ListPortfolioMetrics, ListPortfolioWorkerMetrics,
+};
