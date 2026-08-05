@@ -3,13 +3,19 @@
 //! Every method in this module is a relaxation. It may return no bound, but it
 //! must never return a heuristic estimate as a certificate.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::engines::ls::lists::eval::eval_expr;
-use crate::model::list::{BoundReport, CollectionModel, CollectionSolution, Iterable, Op, ReduceOp, Resource};
+use crate::model::list::{
+    BoundReport, CollectionModel, CollectionSolution, Expr, ExprArena, ExprId, GlobalConstraint, Iterable, Op, ReduceOp, Resource,
+};
 
 const MAX_COLUMN_GENERATION_CUSTOMERS: usize = 16;
 const COLUMN_DUAL_SCALE: i128 = 1 << 12;
+const MAX_EXACT_PACKING_ITEMS: usize = 35;
+const PACKING_NODE_LIMIT: u64 = 20_000;
+const MAX_ENERGY_INTERVAL_PAIRS: usize = 50_000;
 const INF: i64 = i64::MAX;
 
 /// A certified bound before a primal solution is known.
@@ -153,7 +159,30 @@ fn used_list_bound(model: &CollectionModel, stop: &AtomicBool) -> Option<DualBou
     if coefficients.iter().try_fold(0i128, |sum, coefficient| sum.checked_add(coefficient.abs()))? > i128::from(i64::MAX) {
         return None;
     }
-    let min_routes = if model.items.is_empty() { 0 } else { capacity_relaxation(model).map_or(1, |capacity| capacity.min_routes.max(1)) };
+    let capacity = capacity_relaxation(model, stop);
+    let (min_routes, method) = if model.items.is_empty() {
+        (0, "used-list relaxation")
+    } else {
+        let mut bound = capacity.as_ref().map_or(1, |capacity| capacity.min_routes.max(1));
+        let mut method = capacity.as_ref().map_or("used-list relaxation", |capacity| capacity.method);
+        let conflicts = list_conflicts(model, capacity.as_ref());
+        if let Some(capacity) = &capacity {
+            let candidate = conflict_packing_bound(&capacity.demands, capacity.capacity, &conflicts, stop);
+            if candidate > bound {
+                bound = candidate;
+                method = "conflict-aware bin-packing relaxation";
+            }
+        }
+        if let Some(vrptw) = VrptwRelaxation::from_model(model, capacity.as_ref()) {
+            if let Some(candidate) = vrptw.fleet_bound(stop) {
+                if candidate.value >= bound {
+                    bound = candidate.value;
+                    method = candidate.method;
+                }
+            }
+        }
+        (bound, method)
+    };
     let max_routes = model.items.len().min(model.lists);
     if min_routes > max_routes {
         return None;
@@ -170,10 +199,7 @@ fn used_list_bound(model: &CollectionModel, stop: &AtomicBool) -> Option<DualBou
     if min_routes == 0 {
         best = Some(best.map_or(0, |value| value.min(0)));
     }
-    Some(DualBound {
-        value: i64::try_from(best?).ok()?,
-        method: if min_routes > 1 { "capacity assignment relaxation" } else { "used-list relaxation" },
-    })
+    Some(DualBound { value: i64::try_from(best?).ok()?, method })
 }
 
 #[derive(Clone)]
@@ -181,9 +207,10 @@ struct CapacityRelaxation {
     demands: Vec<i64>,
     capacity: i64,
     min_routes: usize,
+    method: &'static str,
 }
 
-fn capacity_relaxation(model: &CollectionModel) -> Option<CapacityRelaxation> {
+fn capacity_relaxation(model: &CollectionModel, stop: &AtomicBool) -> Option<CapacityRelaxation> {
     struct Family {
         demands: Vec<i64>,
         capacity: i64,
@@ -233,12 +260,709 @@ fn capacity_relaxation(model: &CollectionModel) -> Option<CapacityRelaxation> {
         .filter_map(|family| {
             let total = family.demands.iter().try_fold(0i128, |sum, &demand| sum.checked_add(i128::from(demand)))?;
             if family.capacity == 0 {
-                return (total == 0).then_some(CapacityRelaxation { demands: family.demands, capacity: 0, min_routes: 0 });
+                return (total == 0).then_some(CapacityRelaxation {
+                    demands: family.demands,
+                    capacity: 0,
+                    min_routes: 0,
+                    method: "capacity assignment relaxation",
+                });
             }
-            let min_routes = usize::try_from((total + i128::from(family.capacity) - 1) / i128::from(family.capacity)).ok()?;
-            Some(CapacityRelaxation { demands: family.demands, capacity: family.capacity, min_routes })
+            let volume = usize::try_from((total + i128::from(family.capacity) - 1) / i128::from(family.capacity)).ok()?;
+            let min_routes = bin_packing_bound(&family.demands, family.capacity, stop).max(volume);
+            let method = if min_routes > volume { "bin-packing relaxation" } else { "capacity assignment relaxation" };
+            Some(CapacityRelaxation { demands: family.demands, capacity: family.capacity, min_routes, method })
         })
         .max_by_key(|family| family.min_routes)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PackingSearch {
+    Feasible,
+    Infeasible,
+    Limit,
+    Interrupted,
+}
+
+fn ceil_ratio(total: i128, capacity: i128) -> Option<usize> {
+    if total <= 0 {
+        return Some(0);
+    }
+    usize::try_from((total + capacity - 1) / capacity).ok()
+}
+
+fn packing_seed_bound(sizes: &[i64], capacity: i64) -> usize {
+    if capacity <= 0 {
+        return usize::from(sizes.iter().any(|&size| size > 0));
+    }
+    let positive = sizes.iter().copied().filter(|&size| size > 0).collect::<Vec<_>>();
+    if positive.iter().any(|&size| size > capacity) {
+        return positive.len().saturating_add(1);
+    }
+    let total = positive.iter().map(|&size| i128::from(size)).sum::<i128>();
+    let mut bound = ceil_ratio(total, i128::from(capacity)).unwrap_or(usize::MAX);
+    bound = bound.max(positive.iter().filter(|&&size| i128::from(size) * 2 > i128::from(capacity)).count());
+
+    let mut thresholds = positive.iter().copied().filter(|&size| i128::from(size) * 2 <= i128::from(capacity)).collect::<Vec<_>>();
+    thresholds.sort_unstable();
+    thresholds.dedup();
+    for threshold in thresholds {
+        let transformed = positive
+            .iter()
+            .map(|&size| {
+                if size > capacity - threshold {
+                    capacity
+                } else if size < threshold {
+                    0
+                } else {
+                    size
+                }
+            })
+            .map(i128::from)
+            .sum::<i128>();
+        bound = bound.max(ceil_ratio(transformed, i128::from(capacity)).unwrap_or(usize::MAX));
+    }
+    bound
+}
+
+fn bin_packing_bound(sizes: &[i64], capacity: i64, stop: &AtomicBool) -> usize {
+    let mut sizes = sizes.iter().copied().filter(|&size| size > 0).collect::<Vec<_>>();
+    let seed = packing_seed_bound(&sizes, capacity);
+    if capacity <= 0 || sizes.is_empty() || sizes.len() > MAX_EXACT_PACKING_ITEMS || seed > sizes.len() {
+        return seed;
+    }
+    sizes.sort_unstable_by(|a, b| b.cmp(a));
+    for bins in seed..=sizes.len() {
+        let mut loads = vec![0i64; bins];
+        let mut nodes = 0u64;
+        match pack_plain(&sizes, capacity, 0, &mut loads, &mut nodes, stop) {
+            PackingSearch::Feasible => return bins,
+            PackingSearch::Infeasible => {}
+            PackingSearch::Limit | PackingSearch::Interrupted => return bins,
+        }
+    }
+    sizes.len()
+}
+
+fn pack_plain(sizes: &[i64], capacity: i64, item: usize, loads: &mut [i64], nodes: &mut u64, stop: &AtomicBool) -> PackingSearch {
+    *nodes = nodes.saturating_add(1);
+    if *nodes > PACKING_NODE_LIMIT {
+        return PackingSearch::Limit;
+    }
+    if (*nodes).is_multiple_of(256) && stop.load(Ordering::Relaxed) {
+        return PackingSearch::Interrupted;
+    }
+    if item == sizes.len() {
+        return PackingSearch::Feasible;
+    }
+    let size = sizes[item];
+    let mut tried = Vec::new();
+    for bin in 0..loads.len() {
+        let load = loads[bin];
+        if load.checked_add(size).is_none_or(|next| next > capacity) || tried.contains(&load) {
+            continue;
+        }
+        tried.push(load);
+        loads[bin] += size;
+        match pack_plain(sizes, capacity, item + 1, loads, nodes, stop) {
+            PackingSearch::Feasible => return PackingSearch::Feasible,
+            PackingSearch::Limit => {
+                loads[bin] -= size;
+                return PackingSearch::Limit;
+            }
+            PackingSearch::Interrupted => {
+                loads[bin] -= size;
+                return PackingSearch::Interrupted;
+            }
+            PackingSearch::Infeasible => {}
+        }
+        loads[bin] -= size;
+        if load == 0 {
+            break;
+        }
+    }
+    PackingSearch::Infeasible
+}
+
+#[allow(clippy::needless_range_loop)]
+fn list_conflicts(model: &CollectionModel, capacity: Option<&CapacityRelaxation>) -> Vec<Vec<bool>> {
+    let count = model.items.len();
+    let mut conflicts = vec![vec![false; count]; count];
+    if let Some(capacity) = capacity {
+        for left in 0..count {
+            for right in left + 1..count {
+                if capacity.demands[left].checked_add(capacity.demands[right]).is_none_or(|sum| sum > capacity.capacity) {
+                    conflicts[left][right] = true;
+                    conflicts[right][left] = true;
+                }
+            }
+        }
+    }
+    let positions = model.items.iter().enumerate().map(|(index, &item)| (item, index)).collect::<HashMap<_, _>>();
+    let mut mark = |a: i32, b: i32| {
+        if let (Some(&left), Some(&right)) = (positions.get(&a), positions.get(&b)) {
+            conflicts[left][right] = true;
+            conflicts[right][left] = true;
+        }
+    };
+    for constraint in &model.globals {
+        match constraint {
+            GlobalConstraint::DifferentList { a, b } | GlobalConstraint::ListDistance { a, b, min: 1.., .. } => mark(*a, *b),
+            GlobalConstraint::AllDifferentLists { items } => {
+                for left in 0..items.len() {
+                    for right in left + 1..items.len() {
+                        mark(items[left], items[right]);
+                    }
+                }
+            }
+            GlobalConstraint::ListLe { .. }
+            | GlobalConstraint::SameList { .. }
+            | GlobalConstraint::AllSameList { .. }
+            | GlobalConstraint::ListDistance { .. } => {}
+        }
+    }
+    conflicts
+}
+
+fn greedy_clique_bound(conflicts: &[Vec<bool>], active: &[bool]) -> usize {
+    let mut best = usize::from(active.iter().any(|&enabled| enabled));
+    for start in 0..conflicts.len() {
+        if !active[start] {
+            continue;
+        }
+        let mut candidates = (0..conflicts.len()).filter(|&node| active[node] && conflicts[start][node]).collect::<Vec<_>>();
+        let mut size = 1usize;
+        while !candidates.is_empty() {
+            let (position, &picked) = candidates
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, &node)| candidates.iter().filter(|&&other| conflicts[node][other]).count())
+                .expect("non-empty candidate set");
+            let _ = candidates.swap_remove(position);
+            size += 1;
+            candidates.retain(|&node| conflicts[picked][node]);
+        }
+        best = best.max(size);
+    }
+    best
+}
+
+fn conflict_packing_bound(sizes: &[i64], capacity: i64, conflicts: &[Vec<bool>], stop: &AtomicBool) -> usize {
+    let active = sizes.iter().map(|&size| size > 0).collect::<Vec<_>>();
+    let bound = packing_seed_bound(sizes, capacity).max(greedy_clique_bound(conflicts, &active));
+    let mut order = (0..sizes.len()).filter(|&item| active[item]).collect::<Vec<_>>();
+    if capacity <= 0 || order.is_empty() || order.len() > MAX_EXACT_PACKING_ITEMS || bound > order.len() {
+        return bound;
+    }
+    order.sort_unstable_by(|&left, &right| sizes[right].cmp(&sizes[left]).then_with(|| right.cmp(&left)));
+    for bins in bound..=order.len() {
+        let mut loads = vec![0i64; bins];
+        let mut members = vec![Vec::<usize>::new(); bins];
+        let mut nodes = 0u64;
+        match pack_conflicts(&order, sizes, capacity, conflicts, 0, &mut loads, &mut members, &mut nodes, stop) {
+            PackingSearch::Feasible => return bins,
+            PackingSearch::Infeasible => {}
+            PackingSearch::Limit | PackingSearch::Interrupted => return bins,
+        }
+    }
+    order.len()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pack_conflicts(
+    order: &[usize],
+    sizes: &[i64],
+    capacity: i64,
+    conflicts: &[Vec<bool>],
+    position: usize,
+    loads: &mut [i64],
+    members: &mut [Vec<usize>],
+    nodes: &mut u64,
+    stop: &AtomicBool,
+) -> PackingSearch {
+    *nodes = nodes.saturating_add(1);
+    if *nodes > PACKING_NODE_LIMIT {
+        return PackingSearch::Limit;
+    }
+    if (*nodes).is_multiple_of(256) && stop.load(Ordering::Relaxed) {
+        return PackingSearch::Interrupted;
+    }
+    if position == order.len() {
+        return PackingSearch::Feasible;
+    }
+    let item = order[position];
+    for bin in 0..loads.len() {
+        let load = loads[bin];
+        if load.checked_add(sizes[item]).is_none_or(|next| next > capacity) || members[bin].iter().any(|&other| conflicts[item][other]) {
+            continue;
+        }
+        loads[bin] += sizes[item];
+        members[bin].push(item);
+        match pack_conflicts(order, sizes, capacity, conflicts, position + 1, loads, members, nodes, stop) {
+            PackingSearch::Feasible => return PackingSearch::Feasible,
+            PackingSearch::Limit => {
+                let _ = members[bin].pop();
+                loads[bin] -= sizes[item];
+                return PackingSearch::Limit;
+            }
+            PackingSearch::Interrupted => {
+                let _ = members[bin].pop();
+                loads[bin] -= sizes[item];
+                return PackingSearch::Interrupted;
+            }
+            PackingSearch::Infeasible => {}
+        }
+        let _ = members[bin].pop();
+        loads[bin] -= sizes[item];
+        if load == 0 {
+            break;
+        }
+    }
+    PackingSearch::Infeasible
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct VrptwData {
+    depot: i32,
+    initial_time: i64,
+    travel: Vec<Vec<i64>>,
+    earliest: Vec<i64>,
+    latest: Vec<i64>,
+    service: Vec<i64>,
+}
+
+struct VrptwRelaxation {
+    items: Vec<i32>,
+    data: VrptwData,
+    capacity: CapacityRelaxation,
+}
+
+#[derive(Clone, Copy)]
+struct FleetBound {
+    value: usize,
+    method: &'static str,
+}
+
+fn arena_expr(arena: &ExprArena, id: ExprId) -> Option<&Expr> {
+    arena.exprs.get(id.0 as usize)
+}
+
+fn is_arg(arena: &ExprArena, id: ExprId, argument: u8) -> bool {
+    matches!(arena_expr(arena, id), Some(Expr::Arg(found)) if *found == argument)
+}
+
+fn is_zero(arena: &ExprArena, id: ExprId) -> bool {
+    matches!(arena_expr(arena, id), Some(Expr::Const(0)))
+}
+
+fn array_on_arg(arena: &ExprArena, id: ExprId, argument: u8) -> Option<Vec<i64>> {
+    let Expr::Array(values, index) = arena_expr(arena, id)? else { return None };
+    is_arg(arena, *index, argument).then(|| values.as_ref().clone())
+}
+
+fn matrix_on_args(arena: &ExprArena, id: ExprId, row_argument: u8, column_argument: u8) -> Option<Vec<Vec<i64>>> {
+    let Expr::Matrix(values, row, column) = arena_expr(arena, id)? else { return None };
+    (is_arg(arena, *row, row_argument) && is_arg(arena, *column, column_argument)).then(|| values.as_ref().clone())
+}
+
+type ParsedVrptwStep = (Vec<Vec<i64>>, Vec<i64>, Vec<i64>);
+
+fn parse_vrptw_step(arena: &ExprArena, root: ExprId) -> Option<ParsedVrptwStep> {
+    let Expr::Add(left, right) = arena_expr(arena, root)? else { return None };
+    for (clock, service_expr) in [(*left, *right), (*right, *left)] {
+        let Some(service) = array_on_arg(arena, service_expr, 0) else { continue };
+        let Some(Expr::Max(first, second)) = arena_expr(arena, clock) else { continue };
+        for (release_expr, advance) in [(*first, *second), (*second, *first)] {
+            let Some(earliest) = array_on_arg(arena, release_expr, 0) else { continue };
+            let Some(Expr::Add(a, b)) = arena_expr(arena, advance) else { continue };
+            for (accumulator, travel_expr) in [(*a, *b), (*b, *a)] {
+                if !is_arg(arena, accumulator, 1) {
+                    continue;
+                }
+                if let Some(travel) = matrix_on_args(arena, travel_expr, 2, 0) {
+                    return Some((travel, earliest, service));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_vrptw_emit(arena: &ExprArena, root: ExprId) -> Option<(Vec<i64>, Vec<i64>)> {
+    let Expr::Max(left, right) = arena_expr(arena, root)? else { return None };
+    let lateness = if is_zero(arena, *left) {
+        *right
+    } else if is_zero(arena, *right) {
+        *left
+    } else {
+        return None;
+    };
+    let Expr::Sub(without_service, latest_expr) = arena_expr(arena, lateness)? else { return None };
+    let latest = array_on_arg(arena, *latest_expr, 0)?;
+    let Expr::Sub(accumulator, service_expr) = arena_expr(arena, *without_service)? else { return None };
+    if !is_arg(arena, *accumulator, 1) {
+        return None;
+    }
+    Some((array_on_arg(arena, *service_expr, 0)?, latest))
+}
+
+fn parse_vrptw_constraint(constraint: &crate::model::list::Constraint) -> Option<(usize, VrptwData)> {
+    if !matches!(constraint.op, Op::Le)
+        || constraint.rhs != 0
+        || !matches!(constraint.reduction.op, ReduceOp::Sum)
+        || constraint.reduction.coeff != 1
+    {
+        return None;
+    }
+    let Iterable::Scan { list, init, boundary, step, end: Some(end) } = constraint.reduction.iterable else { return None };
+    if boundary != end {
+        return None;
+    }
+    let arena = &constraint.reduction.arena;
+    let (travel, earliest, service) = parse_vrptw_step(arena, step)?;
+    let (emit_service, latest) = parse_vrptw_emit(arena, constraint.reduction.body)?;
+    if service != emit_service {
+        return None;
+    }
+    Some((list, VrptwData { depot: boundary, initial_time: init, travel, earliest, latest, service }))
+}
+
+impl VrptwRelaxation {
+    fn from_model(model: &CollectionModel, capacity: Option<&CapacityRelaxation>) -> Option<Self> {
+        let capacity = capacity?.clone();
+        if capacity.capacity <= 0 || model.lists == 0 || model.items.is_empty() {
+            return None;
+        }
+        let mut by_list = vec![None; model.lists];
+        for constraint in &model.constraints {
+            let Some((list, data)) = parse_vrptw_constraint(constraint) else { continue };
+            let slot = by_list.get_mut(list)?;
+            if slot.as_ref().is_some_and(|known| known != &data) {
+                return None;
+            }
+            *slot = Some(data);
+        }
+        let data = by_list.first()?.clone()?;
+        if by_list.iter().any(|entry| entry.as_ref() != Some(&data)) {
+            return None;
+        }
+        let depot = usize::try_from(data.depot).ok()?;
+        let node_indices = model.items.iter().map(|&item| usize::try_from(item).ok()).collect::<Option<Vec<_>>>()?;
+        let max_node = node_indices.iter().copied().chain(std::iter::once(depot)).max()?;
+        if data.earliest.len() <= max_node
+            || data.latest.len() <= max_node
+            || data.service.len() <= max_node
+            || data.travel.len() <= max_node
+            || data.travel.iter().any(|row| row.len() <= max_node)
+            || data.initial_time != data.earliest[depot]
+        {
+            return None;
+        }
+        let nodes = std::iter::once(depot).chain(node_indices.iter().copied()).collect::<Vec<_>>();
+        for &node in &nodes {
+            if data.earliest[node] > data.latest[node] || data.service[node] < 0 || data.travel[node][node] != 0 {
+                return None;
+            }
+            for &other in &nodes {
+                if data.travel[node][other] < 0 {
+                    return None;
+                }
+            }
+        }
+        for &from in &nodes {
+            for &via in &nodes {
+                for &to in &nodes {
+                    if i128::from(data.travel[from][to]) > i128::from(data.travel[from][via]) + i128::from(data.travel[via][to]) {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(Self { items: model.items.clone(), data, capacity })
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    fn fleet_bound(&self, stop: &AtomicBool) -> Option<FleetBound> {
+        let mut best = FleetBound { value: self.capacity.min_routes.max(1), method: self.capacity.method };
+        let mut conflicts = vec![vec![false; self.items.len()]; self.items.len()];
+        for left in 0..self.items.len() {
+            for right in left + 1..self.items.len() {
+                let incompatible =
+                    self.capacity.demands[left].checked_add(self.capacity.demands[right]).is_none_or(|sum| sum > self.capacity.capacity)
+                        || (!self.route_feasible(&[left, right]) && !self.route_feasible(&[right, left]));
+                conflicts[left][right] = incompatible;
+                conflicts[right][left] = incompatible;
+            }
+        }
+        let packing = conflict_packing_bound(&self.capacity.demands, self.capacity.capacity, &conflicts, stop);
+        if packing >= best.value {
+            best = FleetBound { value: packing, method: "VRPTW conflict-aware bin-packing relaxation" };
+        }
+        if let Some(energy) = self.energy_bound(&conflicts, stop) {
+            if energy.value >= best.value {
+                best = energy;
+            }
+        }
+        if let Some(route_cover) = self.route_cover_bound(stop) {
+            if route_cover >= best.value {
+                best = FleetBound { value: route_cover, method: "exact VRPTW route-cover dual" };
+            }
+        }
+        Some(best)
+    }
+
+    fn node(&self, customer: usize) -> Option<usize> {
+        usize::try_from(*self.items.get(customer)?).ok()
+    }
+
+    fn route_feasible(&self, customers: &[usize]) -> bool {
+        let Ok(depot) = usize::try_from(self.data.depot) else { return false };
+        let mut departure = self.data.initial_time;
+        let mut previous = depot;
+        for &customer in customers {
+            let Some(node) = self.node(customer) else { return false };
+            let Some(arrival) = departure.checked_add(self.data.travel[previous][node]) else { return false };
+            let start = self.data.earliest[node].max(arrival);
+            if start > self.data.latest[node] {
+                return false;
+            }
+            let Some(next) = start.checked_add(self.data.service[node]) else { return false };
+            departure = next;
+            previous = node;
+        }
+        departure.checked_add(self.data.travel[previous][depot]).is_some_and(|arrival| arrival <= self.data.latest[depot])
+    }
+
+    fn route_cover_bound(&self, stop: &AtomicBool) -> Option<usize> {
+        let customers = self.items.len();
+        if customers == 0 || customers > MAX_COLUMN_GENERATION_CUSTOMERS {
+            return None;
+        }
+        let depot = usize::try_from(self.data.depot).ok()?;
+        let states = 1usize.checked_shl(u32::try_from(customers).ok()?)?;
+        let mut loads = vec![0i64; states];
+        for mask in 1..states {
+            let bit = mask.trailing_zeros() as usize;
+            loads[mask] = loads[mask & (mask - 1)].checked_add(self.capacity.demands[bit])?;
+        }
+        let mut completion = vec![INF; states.checked_mul(customers)?];
+        for customer in 0..customers {
+            let node = self.node(customer)?;
+            let arrival = self.data.initial_time.checked_add(self.data.travel[depot][node])?;
+            let start = self.data.earliest[node].max(arrival);
+            if self.capacity.demands[customer] <= self.capacity.capacity && start <= self.data.latest[node] {
+                completion[(1usize << customer) * customers + customer] = start.checked_add(self.data.service[node])?;
+            }
+        }
+        for mask in 1..states {
+            if mask.is_multiple_of(256) && stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            if loads[mask] > self.capacity.capacity {
+                continue;
+            }
+            for last in 0..customers {
+                if mask & (1usize << last) == 0 {
+                    continue;
+                }
+                let previous = mask ^ (1usize << last);
+                if previous == 0 {
+                    continue;
+                }
+                let last_node = self.node(last)?;
+                let mut best = INF;
+                for before in 0..customers {
+                    if previous & (1usize << before) == 0 {
+                        continue;
+                    }
+                    let prefix = completion[previous * customers + before];
+                    if prefix == INF {
+                        continue;
+                    }
+                    let before_node = self.node(before)?;
+                    let Some(arrival) = prefix.checked_add(self.data.travel[before_node][last_node]) else { continue };
+                    let start = self.data.earliest[last_node].max(arrival);
+                    if start <= self.data.latest[last_node] {
+                        if let Some(value) = start.checked_add(self.data.service[last_node]) {
+                            best = best.min(value);
+                        }
+                    }
+                }
+                completion[mask * customers + last] = best;
+            }
+        }
+        let mut feasible = vec![false; states];
+        for mask in 1..states {
+            if loads[mask] > self.capacity.capacity {
+                continue;
+            }
+            feasible[mask] = (0..customers).any(|last| {
+                if mask & (1usize << last) == 0 {
+                    return false;
+                }
+                let prefix = completion[mask * customers + last];
+                let Some(node) = self.node(last) else { return false };
+                prefix != INF && prefix.checked_add(self.data.travel[node][depot]).is_some_and(|arrival| arrival <= self.data.latest[depot])
+            });
+        }
+        if (0..customers).any(|customer| !feasible[1usize << customer]) {
+            return None;
+        }
+        covering_dual_bound(&feasible, customers, stop)
+    }
+
+    fn energy_bound(&self, conflicts: &[Vec<bool>], stop: &AtomicBool) -> Option<FleetBound> {
+        let depot = usize::try_from(self.data.depot).ok()?;
+        let count = self.items.len();
+        let nodes = (0..count).map(|customer| self.node(customer)).collect::<Option<Vec<_>>>()?;
+        let mut dprime = vec![vec![None; count]; count];
+        let mut outgoing = vec![0i128; count];
+        for left in 0..count {
+            let from = nodes[left];
+            let mut best = i128::from(self.data.travel[from][depot]);
+            for right in 0..count {
+                if left == right {
+                    continue;
+                }
+                let to = nodes[right];
+                let earliest_departure = i128::from(self.data.earliest[from]) + i128::from(self.data.service[from]);
+                if earliest_departure + i128::from(self.data.travel[from][to]) > i128::from(self.data.latest[to]) {
+                    continue;
+                }
+                let forced_wait =
+                    i128::from(self.data.earliest[to]) - (i128::from(self.data.latest[from]) + i128::from(self.data.service[from]));
+                let weight = i128::from(self.data.travel[from][to]).max(forced_wait);
+                dprime[left][right] = Some(weight);
+                best = best.min(weight);
+            }
+            outgoing[left] = best;
+        }
+        let mut est = vec![0i128; count];
+        let mut lst = vec![0i128; count];
+        let mut duration = vec![0i128; count];
+        for right in 0..count {
+            let node = nodes[right];
+            let mut incoming = i128::from(self.data.travel[depot][node]);
+            for left in 0..count {
+                if let Some(weight) = dprime[left][right] {
+                    incoming = incoming.min(weight - outgoing[left]);
+                }
+            }
+            incoming = incoming.max(0);
+            est[right] = i128::from(self.data.earliest[node])
+                .max(i128::from(self.data.initial_time) + i128::from(self.data.travel[depot][node]))
+                - incoming;
+            lst[right] = i128::from(self.data.latest[node])
+                .min(i128::from(self.data.latest[depot]) - i128::from(self.data.service[node]) - i128::from(self.data.travel[node][depot]))
+                - incoming;
+            duration[right] = i128::from(self.data.service[node]) + outgoing[right] + incoming;
+            if duration[right] < 0 || est[right] > lst[right] {
+                return None;
+            }
+        }
+        let mut starts = vec![i128::from(self.data.initial_time)];
+        let mut ends = vec![i128::from(self.data.latest[depot])];
+        for customer in 0..count {
+            starts.extend([est[customer], lst[customer], est[customer] + duration[customer]]);
+            ends.extend([lst[customer], est[customer] + duration[customer], lst[customer] + duration[customer]]);
+        }
+        starts.sort_unstable();
+        starts.dedup();
+        ends.sort_unstable();
+        ends.dedup();
+        let total_pairs = starts.len().saturating_mul(ends.len());
+        let mut stride = 1usize;
+        while total_pairs > MAX_ENERGY_INTERVAL_PAIRS.saturating_mul(stride).saturating_mul(stride) {
+            stride += 1;
+        }
+        let mut best = FleetBound { value: 1, method: "VRPTW interval-energy relaxation" };
+        let mut examined = 0usize;
+        for &left in starts.iter().step_by(stride) {
+            for &right in ends.iter().step_by(stride) {
+                if left >= right {
+                    continue;
+                }
+                examined += 1;
+                if examined.is_multiple_of(256) && stop.load(Ordering::Relaxed) {
+                    return Some(best);
+                }
+                let width = right - left;
+                let work = (0..count)
+                    .map(|customer| {
+                        interval_overlap_i128(est[customer], duration[customer], left, right).min(interval_overlap_i128(
+                            lst[customer],
+                            duration[customer],
+                            left,
+                            right,
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                let total = work.iter().sum::<i128>();
+                let energy = ceil_ratio(total, width)?;
+                if energy > best.value {
+                    best.value = energy;
+                    best.method = "VRPTW interval-energy relaxation";
+                }
+                if let (Ok(width), Some(work)) =
+                    (i64::try_from(width), work.iter().map(|&value| i64::try_from(value).ok()).collect::<Option<Vec<_>>>())
+                {
+                    let active = work.iter().map(|&value| value > 0).collect::<Vec<_>>();
+                    let packing = packing_seed_bound(&work, width).max(greedy_clique_bound(conflicts, &active));
+                    if packing > best.value {
+                        best.value = packing;
+                        best.method = "VRPTW interval-energy/BPPC relaxation";
+                    }
+                }
+            }
+        }
+        Some(best)
+    }
+}
+
+fn interval_overlap_i128(start: i128, duration: i128, left: i128, right: i128) -> i128 {
+    0.max((start + duration).min(right) - start.max(left))
+}
+
+fn covering_dual_bound(feasible: &[bool], customers: usize, stop: &AtomicBool) -> Option<usize> {
+    let states = feasible.len();
+    let mut active = vec![false; states];
+    for customer in 0..customers {
+        active[1usize << customer] = true;
+    }
+    let mut dual = vec![0i128; customers];
+    let mut center = dual.clone();
+    let mut best_value = 0i128;
+    for iteration in 0..48usize {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let mut proposal = dual.clone();
+        for offset in 0..customers {
+            let customer = (offset + iteration) % customers;
+            let slack = (1..states)
+                .filter(|&mask| active[mask] && mask & (1usize << customer) != 0)
+                .map(|mask| COLUMN_DUAL_SCALE - subset_sum(mask, &proposal))
+                .min()?;
+            if slack > 0 {
+                proposal[customer] += if iteration % 4 == 3 { slack } else { 3 * slack / 4 };
+            }
+        }
+        let (priced_mask, reduced_cost) = (1..states)
+            .filter(|&mask| feasible[mask])
+            .map(|mask| (mask, COLUMN_DUAL_SCALE - subset_sum(mask, &proposal)))
+            .min_by_key(|&(_, reduced_cost)| reduced_cost)?;
+        let shift = reduced_cost.min(0);
+        let corrected = proposal.iter().map(|&value| value + shift).collect::<Vec<_>>();
+        let corrected_value = corrected.iter().sum::<i128>();
+        if corrected_value > best_value {
+            best_value = corrected_value;
+            center = corrected;
+        }
+        if reduced_cost < 0 {
+            active[priced_mask] = true;
+        }
+        dual = proposal.iter().zip(&center).map(|(&value, &anchor)| (3 * value + anchor).div_euclid(4)).collect();
+    }
+    ceil_ratio(best_value, COLUMN_DUAL_SCALE)
 }
 
 struct RoutingRelaxation {
@@ -330,7 +1054,7 @@ impl RoutingRelaxation {
         let max_cost = i128::from(costs.iter().flatten().copied().max().unwrap_or(0));
         i64::try_from(max_cost.checked_mul(max_edges)?).ok()?;
         let symmetric = (0..costs.len()).all(|i| (0..costs.len()).all(|j| costs[i][j] == costs[j][i]));
-        Some(Self { costs, routes: model.lists, symmetric, capacity: capacity_relaxation(model) })
+        Some(Self { costs, routes: model.lists, symmetric, capacity: capacity_relaxation(model, stop) })
     }
 
     fn min_routes(&self) -> usize {
