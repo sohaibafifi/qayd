@@ -32,14 +32,20 @@ fn mode_view(sched: &Schedule, chosen: &[usize]) -> (Vec<i64>, Vec<i64>) {
 }
 
 /// Overlap (>= 0) of two intervals' time spans.
-fn pair_overlap(starts: &[i64], dur: &[i64], i: usize, j: usize) -> i64 {
+fn pair_overlap(starts: &[i64], dur: &[i64], present: &[bool], i: usize, j: usize) -> i64 {
+    if !present[i] || !present[j] {
+        return 0;
+    }
     ((starts[i] + dur[i]).min(starts[j] + dur[j]) - starts[i].max(starts[j])).max(0)
 }
 
-fn schedule_score(sched: &Schedule, dur: &[i64], mach: &[i64], starts: &[i64]) -> (i64, i64) {
+fn schedule_score(sched: &Schedule, dur: &[i64], mach: &[i64], starts: &[i64], present: &[bool]) -> (i64, i64) {
     let mut viol = 0i64;
     let mut makespan = 0i64;
     for (i, iv) in sched.intervals.iter().enumerate() {
+        if !present[i] {
+            continue;
+        }
         let end = starts[i].saturating_add(dur[i]);
         if starts[i] < 0 {
             viol = viol.saturating_add(-starts[i]);
@@ -50,14 +56,16 @@ fn schedule_score(sched: &Schedule, dur: &[i64], mach: &[i64], starts: &[i64]) -
         makespan = makespan.max(end);
     }
     for &(a, b) in &sched.precedences {
-        viol = viol.saturating_add((starts[a].saturating_add(dur[a]) - starts[b]).max(0));
+        if present[a] && present[b] {
+            viol = viol.saturating_add((starts[a].saturating_add(dur[a]) - starts[b]).max(0));
+        }
     }
     for res in &sched.resources {
         match res {
             Resource::NoOverlap(ivs) => {
                 for x in 0..ivs.len() {
                     for y in (x + 1)..ivs.len() {
-                        viol = viol.saturating_add(pair_overlap(starts, dur, ivs[x], ivs[y]));
+                        viol = viol.saturating_add(pair_overlap(starts, dur, present, ivs[x], ivs[y]));
                     }
                 }
             }
@@ -71,13 +79,13 @@ fn schedule_score(sched: &Schedule, dur: &[i64], mach: &[i64], starts: &[i64]) -
                     }
                     for j in (i + 1)..n {
                         if mach[i] == mach[j] {
-                            viol = viol.saturating_add(pair_overlap(starts, dur, i, j));
+                            viol = viol.saturating_add(pair_overlap(starts, dur, present, i, j));
                         }
                     }
                 }
             }
             Resource::Cumulative { demands, capacity } => {
-                viol = viol.saturating_add(cumulative_overload(demands, *capacity, dur, starts));
+                viol = viol.saturating_add(cumulative_overload(demands, *capacity, dur, starts, present));
             }
         }
     }
@@ -86,9 +94,12 @@ fn schedule_score(sched: &Schedule, dur: &[i64], mach: &[i64], starts: &[i64]) -
 
 /// Total resource-overload area of a cumulative resource (usage above capacity,
 /// integrated over time). Usage changes only at interval boundaries.
-fn cumulative_overload(demands: &[(usize, i64)], capacity: i64, dur: &[i64], starts: &[i64]) -> i64 {
+fn cumulative_overload(demands: &[(usize, i64)], capacity: i64, dur: &[i64], starts: &[i64], present: &[bool]) -> i64 {
     let mut times: Vec<i64> = Vec::with_capacity(demands.len() * 2);
     for &(i, _) in demands {
+        if !present[i] {
+            continue;
+        }
         times.push(starts[i]);
         times.push(starts[i].saturating_add(dur[i]));
     }
@@ -97,7 +108,7 @@ fn cumulative_overload(demands: &[(usize, i64)], capacity: i64, dur: &[i64], sta
     let mut total = 0i64;
     for w in times.windows(2) {
         let (t0, t1) = (w[0], w[1]);
-        let usage: i64 = demands.iter().filter(|&&(i, _)| starts[i] <= t0 && t0 < starts[i] + dur[i]).map(|&(_, d)| d).sum();
+        let usage: i64 = demands.iter().filter(|&&(i, _)| present[i] && starts[i] <= t0 && t0 < starts[i] + dur[i]).map(|&(_, d)| d).sum();
         let over = (usage - capacity).max(0);
         total = total.saturating_add(over.saturating_mul(t1 - t0));
     }
@@ -106,11 +117,14 @@ fn cumulative_overload(demands: &[(usize, i64)], capacity: i64, dur: &[i64], sta
 
 /// Earliest start of each interval respecting precedence only (a longest-path
 /// forward pass); resources are left to the search to fix.
-fn earliest_starts(sched: &Schedule, dur: &[i64]) -> Vec<i64> {
+fn earliest_starts(sched: &Schedule, dur: &[i64], present: &[bool]) -> Vec<i64> {
     let mut s = vec![0i64; sched.intervals.len()];
     for _ in 0..sched.intervals.len() {
         let mut changed = false;
         for &(a, b) in &sched.precedences {
+            if !present[a] || !present[b] {
+                continue;
+            }
             let need = s[a].saturating_add(dur[a]);
             if need > s[b] {
                 s[b] = need;
@@ -126,12 +140,13 @@ fn earliest_starts(sched: &Schedule, dur: &[i64]) -> Vec<i64> {
 
 /// Candidate start times for shifting interval `i`: its precedence-earliest, the
 /// ends of other intervals (for resource packing), and 0; clamped to its window.
-fn schedule_candidates(sched: &Schedule, dur: &[i64], starts: &[i64], i: usize) -> Vec<i64> {
+fn schedule_candidates(sched: &Schedule, dur: &[i64], starts: &[i64], present: &[bool], i: usize) -> Vec<i64> {
     let hi = (sched.intervals[i].horizon - dur[i]).max(0);
-    let est = sched.precedences.iter().filter(|&&(_, b)| b == i).map(|&(a, _)| starts[a] + dur[a]).max().unwrap_or(0);
+    let est =
+        sched.precedences.iter().filter(|&&(a, b)| b == i && present[a] && present[b]).map(|&(a, _)| starts[a] + dur[a]).max().unwrap_or(0);
     let mut cands = vec![0, est];
     for (j, &sj) in starts.iter().enumerate() {
-        if j != i {
+        if j != i && present[j] {
             cands.push(sj + dur[j]);
             cands.push((sj - dur[i]).max(0));
         }
@@ -150,11 +165,13 @@ fn schedule_candidates(sched: &Schedule, dur: &[i64], starts: &[i64], i: usize) 
 pub(super) fn solve_schedule(sched: &Schedule, seed: u64, stop: &AtomicBool, report: &mut dyn FnMut(i64)) -> CollectionSolution {
     let n = sched.intervals.len();
     let mut chosen = vec![0usize; n];
+    let mut present: Vec<bool> = sched.intervals.iter().map(|interval| !interval.optional).collect();
     let (mut dur, mut mach) = mode_view(sched, &chosen);
-    let mut starts = earliest_starts(sched, &dur);
-    let mut cur = schedule_score(sched, &dur, &mach, &starts);
+    let mut starts = earliest_starts(sched, &dur, &present);
+    let mut cur = schedule_score(sched, &dur, &mach, &starts, &present);
     let mut best_starts = starts.clone();
     let mut best_chosen = chosen.clone();
+    let mut best_present = present.clone();
     let mut best = cur;
     if best.0 == 0 {
         report(best.1);
@@ -168,13 +185,13 @@ pub(super) fn solve_schedule(sched: &Schedule, seed: u64, stop: &AtomicBool, rep
         let mut moved = false;
         'scan: for i in 0..n {
             // (a) Shift the start under the current mode.
-            for t in schedule_candidates(sched, &dur, &starts, i) {
+            for t in schedule_candidates(sched, &dur, &starts, &present, i) {
                 if t == starts[i] {
                     continue;
                 }
                 let old = starts[i];
                 starts[i] = t;
-                let trial = schedule_score(sched, &dur, &mach, &starts);
+                let trial = schedule_score(sched, &dur, &mach, &starts, &present);
                 if trial < cur {
                     cur = trial;
                     moved = true;
@@ -193,7 +210,7 @@ pub(super) fn solve_schedule(sched: &Schedule, seed: u64, stop: &AtomicBool, rep
                 dur[i] = iv_duration(&sched.intervals[i], m);
                 mach[i] = iv_machine(&sched.intervals[i], m);
                 starts[i] = os.clamp(0, (sched.intervals[i].horizon - dur[i]).max(0));
-                let trial = schedule_score(sched, &dur, &mach, &starts);
+                let trial = schedule_score(sched, &dur, &mach, &starts, &present);
                 if trial < cur {
                     cur = trial;
                     moved = true;
@@ -203,6 +220,16 @@ pub(super) fn solve_schedule(sched: &Schedule, seed: u64, stop: &AtomicBool, rep
                 dur[i] = od;
                 mach[i] = oma;
                 starts[i] = os;
+            }
+            if sched.intervals[i].optional {
+                present[i] = !present[i];
+                let trial = schedule_score(sched, &dur, &mach, &starts, &present);
+                if trial < cur {
+                    cur = trial;
+                    moved = true;
+                    break 'scan;
+                }
+                present[i] = !present[i];
             }
             if i % 64 == 0 && stop.load(Ordering::Relaxed) {
                 break;
@@ -216,6 +243,7 @@ pub(super) fn solve_schedule(sched: &Schedule, seed: u64, stop: &AtomicBool, rep
             best = cur;
             best_starts = starts.clone();
             best_chosen = chosen.clone();
+            best_present = present.clone();
             if cur.0 == 0 {
                 report(cur.1);
             }
@@ -230,7 +258,10 @@ pub(super) fn solve_schedule(sched: &Schedule, seed: u64, stop: &AtomicBool, rep
                 *c = (mix64(seed ^ mix64(iter ^ 0x9e37).wrapping_add(i as u64)) % modes as u64) as usize;
             }
             (dur, mach) = mode_view(sched, &chosen);
-            starts = earliest_starts(sched, &dur);
+            for (i, interval) in sched.intervals.iter().enumerate() {
+                present[i] = !interval.optional || mix64(seed ^ iter.wrapping_add(i as u64)) & 1 == 1;
+            }
+            starts = earliest_starts(sched, &dur, &present);
             for (i, s) in starts.iter_mut().enumerate() {
                 let hi = (sched.intervals[i].horizon - dur[i]).max(0);
                 if hi > 0 {
@@ -245,21 +276,29 @@ pub(super) fn solve_schedule(sched: &Schedule, seed: u64, stop: &AtomicBool, rep
                 starts[i] = (mix64(seed ^ mix64(iter ^ 0x5151)) % (hi as u64 + 1)) as i64;
             }
         }
-        cur = schedule_score(sched, &dur, &mach, &starts);
+        cur = schedule_score(sched, &dur, &mach, &starts, &present);
     }
 
     if cur < best {
         best = cur;
         best_starts = starts.clone();
         best_chosen = chosen.clone();
+        best_present = present.clone();
     }
     let feasible = best.0 == 0;
-    let machines: Vec<i64> = sched.intervals.iter().zip(&best_chosen).map(|(iv, &m)| iv_machine(iv, m)).collect();
+    let machines: Vec<i64> = sched
+        .intervals
+        .iter()
+        .zip(&best_chosen)
+        .zip(&best_present)
+        .map(|((iv, &m), &present)| if present { iv_machine(iv, m) } else { -1 })
+        .collect();
     CollectionSolution {
         lists: Vec::new(),
         objectives: if feasible && sched.minimize_makespan { vec![best.1] } else { Vec::new() },
         feasible,
         starts: if feasible { best_starts } else { Vec::new() },
+        presences: if feasible { best_present } else { Vec::new() },
         machines: if feasible { machines } else { Vec::new() },
     }
 }

@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::eval::{eval_expr, violation_of, INFEASIBLE};
 use super::incremental::{EvalScratch, ListView};
 use super::local_search::{
-    full_score, full_score_exact_lists, list_score_exact, score_with_replacements, ListScore, PerList, ReductionDeltaKind, Score, State,
-    TrialList,
+    full_score, full_score_exact_lists, list_score_exact, score_with_replacements, tier_values, ListScore, PerList, ReductionDeltaKind,
+    Score, State, TrialList,
 };
 use crate::mix64;
 use crate::model::list::{CollectionModel, Iterable, Reduction};
@@ -16,7 +16,7 @@ pub(super) fn snapshot(per: &PerList, state: &State) -> (Vec<Vec<i32>>, Score, b
 }
 
 /// Prefer feasible over infeasible, then better lexicographic score.
-pub(super) fn better(feasible: bool, score: Score, best_feasible: bool, best_score: Score) -> bool {
+pub(super) fn better(feasible: bool, score: &Score, best_feasible: bool, best_score: &Score) -> bool {
     match (feasible, best_feasible) {
         (true, false) => true,
         (false, true) => false,
@@ -41,7 +41,7 @@ fn score_one(
     per: &PerList,
     state: &State,
     list: usize,
-    score: ListScore,
+    score: &ListScore,
     contents: &dyn ListView,
     global_delta: i64,
     scratch: &mut EvalScratch,
@@ -457,7 +457,7 @@ pub(super) fn trial_list_score_view(
     let old = &state.lists[idx];
     let caches = &state.caches[idx];
     let mut violation = 0i64;
-    let mut objectives = [0i64; crate::model::list::MAX_TIERS];
+    let mut objectives = tier_values(per.tiers, 0);
     for (tier, slot) in objectives.iter_mut().enumerate() {
         for ((reduction, kind), cache) in per.objective[idx][tier].iter().zip(&per.objective_delta[idx][tier]).zip(&caches.objective[tier])
         {
@@ -540,7 +540,7 @@ pub fn audit_incremental(model: &CollectionModel, lists: &[Vec<i32>]) -> usize {
             let view = EditView::new(list, edit);
             let inc = trial_list_score(&per, &state, idx, edit, &mut scratch);
             let incremental_total =
-                score_with_replacements(&per, &state, &[TrialList { list: idx, score: inc, contents: &view }], 0, &mut score_scratch);
+                score_with_replacements(&per, &state, &[TrialList { list: idx, score: &inc, contents: &view }], 0, &mut score_scratch);
             edit.apply(&mut full_buf, list);
             let full = list_score_exact(&per, idx, &full_buf);
             assert!(
@@ -581,8 +581,8 @@ pub fn audit_incremental(model: &CollectionModel, lists: &[Vec<i32>]) -> usize {
                         &per,
                         &state,
                         &[
-                            TrialList { list: left, score: left_score, contents: &left_view },
-                            TrialList { list: right, score: right_score, contents: &right_view },
+                            TrialList { list: left, score: &left_score, contents: &left_view },
+                            TrialList { list: right, score: &right_score, contents: &right_view },
                         ],
                         0,
                         &mut score_scratch,
@@ -619,8 +619,8 @@ pub fn audit_incremental(model: &CollectionModel, lists: &[Vec<i32>]) -> usize {
                                 &per,
                                 &state,
                                 &[
-                                    TrialList { list: left, score: left_score, contents: &left_view },
-                                    TrialList { list: right, score: right_score, contents: &right_view },
+                                    TrialList { list: left, score: &left_score, contents: &left_view },
+                                    TrialList { list: right, score: &right_score, contents: &right_view },
                                 ],
                                 0,
                                 &mut score_scratch,
@@ -762,7 +762,7 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                         let nl = trial_list_score(per, state, src, edit, &mut scratch_a);
                         let view = EditView::new(&state.lists[src], edit);
                         // Within-list move: no item changes list, so gdelta = 0.
-                        if score_one(per, state, src, nl, &view, 0, &mut score_scratch) < current {
+                        if score_one(per, state, src, &nl, &view, 0, &mut score_scratch) < current {
                             return Some(Move::Relocate { src, src_pos, dst, dst_pos });
                         }
                     }
@@ -784,8 +784,8 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                         if score_two(
                             per,
                             state,
-                            TrialList { list: src, score: na, contents: &source_view },
-                            TrialList { list: dst, score: nb, contents: &destination_view },
+                            TrialList { list: src, score: &na, contents: &source_view },
+                            TrialList { list: dst, score: &nb, contents: &destination_view },
                             gd,
                             &mut score_scratch,
                         ) < current
@@ -817,8 +817,8 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                     if score_two(
                         per,
                         state,
-                        TrialList { list: src, score: na, contents: &left_view },
-                        TrialList { list: y, score: nb, contents: &right_view },
+                        TrialList { list: src, score: &na, contents: &left_view },
+                        TrialList { list: y, score: &nb, contents: &right_view },
                         gd,
                         &mut score_scratch,
                     ) < current
@@ -848,7 +848,7 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                                 let edit = Edit::SegmentMoveWithin { start, len, to: dst_pos };
                                 let nl = trial_list_score(per, state, src, edit, &mut scratch_a);
                                 let view = EditView::new(&state.lists[src], edit);
-                                if score_one(per, state, src, nl, &view, 0, &mut score_scratch) < current {
+                                if score_one(per, state, src, &nl, &view, 0, &mut score_scratch) < current {
                                     return Some(Move::OrOpt { src, start, len, dst, dst_pos });
                                 }
                             }
@@ -874,8 +874,8 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                                 if score_two(
                                     per,
                                     state,
-                                    TrialList { list: src, score: na, contents: &source_view },
-                                    TrialList { list: dst, score: nb, contents: &destination_view },
+                                    TrialList { list: src, score: &na, contents: &source_view },
+                                    TrialList { list: dst, score: &nb, contents: &destination_view },
                                     gd,
                                     &mut score_scratch,
                                 ) < current
@@ -916,8 +916,8 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                         if score_two(
                             per,
                             state,
-                            TrialList { list: src, score: na, contents: &left_view },
-                            TrialList { list: y, score: nb, contents: &right_view },
+                            TrialList { list: src, score: &na, contents: &left_view },
+                            TrialList { list: y, score: &nb, contents: &right_view },
                             gd,
                             &mut score_scratch,
                         ) < current
@@ -966,8 +966,8 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                                 if score_two(
                                     per,
                                     state,
-                                    TrialList { list: src, score: na, contents: &left_view },
-                                    TrialList { list: y, score: nb, contents: &right_view },
+                                    TrialList { list: src, score: &na, contents: &left_view },
+                                    TrialList { list: y, score: &nb, contents: &right_view },
                                     gd,
                                     &mut score_scratch,
                                 ) < current
@@ -1004,7 +1004,7 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                     let edit = Edit::Reverse { i, j };
                     let nl = trial_list_score(per, state, src, edit, &mut scratch_a);
                     let view = EditView::new(&state.lists[src], edit);
-                    if score_one(per, state, src, nl, &view, 0, &mut score_scratch) < current {
+                    if score_one(per, state, src, &nl, &view, 0, &mut score_scratch) < current {
                         return Some(Move::Reverse { list: src, i, j });
                     }
                 }

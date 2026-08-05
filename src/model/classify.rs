@@ -168,8 +168,13 @@ impl BackendSelection {
                     Constraint::ListPartition { .. }
                         | Constraint::SameList { .. }
                         | Constraint::ItemPrecedence { .. }
+                        | Constraint::CollectionGlobal(_)
                         | Constraint::ListLength { .. }
                         | Constraint::ListItemSum { .. }
+                        | Constraint::ListReduction(list::Constraint {
+                            reduction: list::Reduction { iterable: list::Iterable::SetItems(_), .. },
+                            ..
+                        })
                 )
             });
 
@@ -294,6 +299,7 @@ impl ListSummary {
                 }
                 Constraint::SameList { .. } => summary.has_same_list = true,
                 Constraint::ItemPrecedence { .. } => summary.has_item_precedence = true,
+                Constraint::CollectionGlobal(_) => {}
                 Constraint::ListItemSum { .. } => summary.has_capacity_like_constraints = true,
                 Constraint::ListPartition { .. }
                 | Constraint::ListLength { .. }
@@ -312,7 +318,7 @@ impl ListSummary {
                 self.has_sequence_reduction = true;
                 self.has_scan |= matches!(&reduction.iterable, list::Iterable::Scan { .. });
             }
-            list::Iterable::Items(_) => {}
+            list::Iterable::Items(_) | list::Iterable::SetItems(_) => {}
         }
     }
 
@@ -344,6 +350,7 @@ fn constraints_domain_exact_checkable(model: &Model) -> bool {
         Constraint::ListPartition { .. }
         | Constraint::SameList { .. }
         | Constraint::ItemPrecedence { .. }
+        | Constraint::CollectionGlobal(_)
         | Constraint::ListLength { .. }
         | Constraint::ListItemSum { .. } => true,
         Constraint::ListReduction(constraint) => {
@@ -417,7 +424,7 @@ fn objectives_are_list_simple(model: &Model) -> bool {
 }
 
 fn is_list_simple_objective_reduction(reduction: &list::Reduction) -> bool {
-    matches!(&reduction.iterable, list::Iterable::Items(_))
+    matches!(&reduction.iterable, list::Iterable::Items(_) | list::Iterable::SetItems(_))
         && match reduction.op {
             list::ReduceOp::Sum | list::ReduceOp::Count => expr_uses_at_most_first_arg(&reduction.arena.exprs, reduction.body),
             list::ReduceOp::Used => true,
@@ -466,7 +473,8 @@ fn routing_integer_lowering_supported(model: &Model) -> bool {
     let Some(pool_list) = single_free_pool_list(model, terms, n_lists) else {
         // `single_free_pool_list` returns `None` for zero or >1 free lists; only >1
         // is unsupported. Distinguish by recomputing the free count.
-        return free_pool_count(model, terms, n_lists) == 0 && edges_and_side_supported(model, &edge_terms, &scan_terms, items, n_lists, None);
+        return free_pool_count(model, terms, n_lists) == 0
+            && edges_and_side_supported(model, &edge_terms, &scan_terms, items, n_lists, None);
     };
     edges_and_side_supported(model, &edge_terms, &scan_terms, items, n_lists, Some(pool_list))
 }
@@ -603,9 +611,10 @@ fn pool_side_constraints_supported(model: &Model, items: &[i32], pool_list: usiz
         match constraint {
             Constraint::ListPartition { .. } => {}
             Constraint::ListReduction(reduction) if list::scan::scan_constraint_list(reduction).is_some() => {
-                let (Some(list), Some(spec)) =
-                    (list::scan::scan_constraint_list(reduction), list::scan::scan_routing_signature(reduction, items).filter(|s| s.end.is_none()))
-                else {
+                let (Some(list), Some(spec)) = (
+                    list::scan::scan_constraint_list(reduction),
+                    list::scan::scan_routing_signature(reduction, items).filter(|s| s.end.is_none()),
+                ) else {
                     return false;
                 };
                 if list >= n_lists || list == pool_list {
@@ -663,8 +672,10 @@ fn list_constraints_are_integer_routing_supported(model: &Model, items: &[i32]) 
             // else on `ListReduction` stays with local search. A route may carry
             // several scans (e.g. one time window per customer).
             Constraint::ListReduction(reduction) if list::scan::scan_constraint_list(reduction).is_some() => {
-                let (Some(list), Some(spec)) = (list::scan::scan_constraint_list(reduction), list::scan::scan_routing_signature(reduction, items).filter(|s| s.end.is_none()))
-                else {
+                let (Some(list), Some(spec)) = (
+                    list::scan::scan_constraint_list(reduction),
+                    list::scan::scan_routing_signature(reduction, items).filter(|s| s.end.is_none()),
+                ) else {
                     return false;
                 };
                 if list >= scans.len() {
@@ -706,6 +717,7 @@ fn list_constraints_are_integer_routing_supported(model: &Model, items: &[i32]) 
                 }
             }
             Constraint::ItemPrecedence { .. }
+            | Constraint::CollectionGlobal(_)
             | Constraint::ListReduction(_)
             | Constraint::IntervalPrecedence { .. }
             | Constraint::IntervalResource(_)
@@ -816,10 +828,16 @@ fn expr_uses_at_most_first_arg(arena: &[list::Expr], id: list::ExprId) -> bool {
     match expr {
         list::Expr::Const(_) | list::Expr::Arg(0) => true,
         list::Expr::Arg(_) | list::Expr::Matrix(_, _, _) => false,
-        list::Expr::Array(_, index) | list::Expr::Abs(index) => expr_uses_at_most_first_arg(arena, *index),
+        list::Expr::Array(_, index)
+        | list::Expr::Abs(index)
+        | list::Expr::Pow(index, _)
+        | list::Expr::PiecewiseLinear { input: index, .. } => expr_uses_at_most_first_arg(arena, *index),
         list::Expr::Add(a, b)
         | list::Expr::Sub(a, b)
         | list::Expr::Mul(a, b)
+        | list::Expr::Mod(a, b)
+        | list::Expr::MulScaled(a, b, _)
+        | list::Expr::DivScaled(a, b, _)
         | list::Expr::Min(a, b)
         | list::Expr::Max(a, b)
         | list::Expr::Div(a, b)
@@ -830,6 +848,7 @@ fn expr_uses_at_most_first_arg(arena: &[list::Expr], id: list::ExprId) -> bool {
         list::Expr::IfThenElse(c, a, b) => {
             expr_uses_at_most_first_arg(arena, *c) && expr_uses_at_most_first_arg(arena, *a) && expr_uses_at_most_first_arg(arena, *b)
         }
+        list::Expr::External { args, .. } => args.iter().all(|id| expr_uses_at_most_first_arg(arena, *id)),
     }
 }
 
@@ -914,41 +933,5 @@ pub(crate) fn item_sum_bound_from_collection_constraint(constraint: &list::Const
 }
 
 pub(crate) fn eval_collection_expr_one(arena: &[list::Expr], id: list::ExprId, arg0: i64) -> Option<i64> {
-    let node = arena.get(id.0 as usize)?;
-    Some(match node {
-        list::Expr::Const(value) => *value,
-        list::Expr::Arg(0) => arg0,
-        list::Expr::Arg(_) => return None,
-        list::Expr::Array(values, index) => {
-            let index = eval_collection_expr_one(arena, *index, arg0)?;
-            *values.get(usize::try_from(index).ok()?)?
-        }
-        list::Expr::Matrix(_, _, _) => return None,
-        list::Expr::Add(a, b) => eval_collection_expr_one(arena, *a, arg0)?.checked_add(eval_collection_expr_one(arena, *b, arg0)?)?,
-        list::Expr::Sub(a, b) => eval_collection_expr_one(arena, *a, arg0)?.checked_sub(eval_collection_expr_one(arena, *b, arg0)?)?,
-        list::Expr::Mul(a, b) => eval_collection_expr_one(arena, *a, arg0)?.checked_mul(eval_collection_expr_one(arena, *b, arg0)?)?,
-        list::Expr::Min(a, b) => eval_collection_expr_one(arena, *a, arg0)?.min(eval_collection_expr_one(arena, *b, arg0)?),
-        list::Expr::Max(a, b) => eval_collection_expr_one(arena, *a, arg0)?.max(eval_collection_expr_one(arena, *b, arg0)?),
-        list::Expr::Div(a, b) => {
-            let numerator = eval_collection_expr_one(arena, *a, arg0)?;
-            let denominator = eval_collection_expr_one(arena, *b, arg0)?;
-            if denominator == 0 {
-                0
-            } else {
-                numerator.checked_div(denominator)?
-            }
-        }
-        list::Expr::Abs(a) => eval_collection_expr_one(arena, *a, arg0)?.saturating_abs(),
-        list::Expr::Lt(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? < eval_collection_expr_one(arena, *b, arg0)?),
-        list::Expr::Le(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? <= eval_collection_expr_one(arena, *b, arg0)?),
-        list::Expr::Eq(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? == eval_collection_expr_one(arena, *b, arg0)?),
-        list::Expr::Ne(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? != eval_collection_expr_one(arena, *b, arg0)?),
-        list::Expr::IfThenElse(c, a, b) => {
-            if eval_collection_expr_one(arena, *c, arg0)? != 0 {
-                eval_collection_expr_one(arena, *a, arg0)?
-            } else {
-                eval_collection_expr_one(arena, *b, arg0)?
-            }
-        }
-    })
+    list::eval_expr_checked(arena, id, &[arg0])
 }

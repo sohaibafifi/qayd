@@ -507,7 +507,8 @@ impl RoutingSpec {
             *slot = Some(solver.new_var_range(scan.acc_dom.0 as i32, scan.acc_dom.1 as i32));
             route_sum[node] = Some(solver.new_var_range(scan.total_dom.0 as i32, scan.total_dom.1 as i32));
         }
-        let a_of = |from: usize| if from < depot_count { expr::int(scan.init) } else { expr::var(acc[from].expect("customer accumulator")) };
+        let a_of =
+            |from: usize| if from < depot_count { expr::int(scan.init) } else { expr::var(acc[from].expect("customer accumulator")) };
         let sum_in = |from: usize| if from < depot_count { expr::int(0) } else { expr::var(route_sum[from].expect("customer route sum")) };
 
         for (from, &from_var) in succ.iter().enumerate() {
@@ -637,6 +638,9 @@ impl RoutingSpec {
                 Expr::Add(a, b)
                 | Expr::Sub(a, b)
                 | Expr::Mul(a, b)
+                | Expr::Mod(a, b)
+                | Expr::MulScaled(a, b, _)
+                | Expr::DivScaled(a, b, _)
                 | Expr::Min(a, b)
                 | Expr::Max(a, b)
                 | Expr::Div(a, b)
@@ -647,12 +651,13 @@ impl RoutingSpec {
                     stack.push(*a);
                     stack.push(*b);
                 }
-                Expr::Abs(a) => stack.push(*a),
+                Expr::Abs(a) | Expr::Pow(a, _) | Expr::PiecewiseLinear { input: a, .. } => stack.push(*a),
                 Expr::IfThenElse(c, a, b) => {
                     stack.push(*c);
                     stack.push(*a);
                     stack.push(*b);
                 }
+                Expr::External { args, .. } => stack.extend(args.iter().copied()),
             }
         }
         true
@@ -703,7 +708,14 @@ impl RoutingSpec {
     /// [`Self::post_scan_constraint`]), pins each customer's `coeff * emit` by its
     /// incoming arc, then gates it by `in_pool` so a pooled customer contributes 0.
     /// Returns the contribution vars to append to the objective's cost vars.
-    fn post_scan_objective(&self, solver: &mut Solver, succ: &[VarId], nodes: &[i32], scan: &ScanRoutingSpec, in_pool: &[VarId]) -> Vec<VarId> {
+    fn post_scan_objective(
+        &self,
+        solver: &mut Solver,
+        succ: &[VarId],
+        nodes: &[i32],
+        scan: &ScanRoutingSpec,
+        in_pool: &[VarId],
+    ) -> Vec<VarId> {
         let n = nodes.len();
         let depot_count = self.depot_count;
         let arena = &scan.arena.exprs;
@@ -713,7 +725,8 @@ impl RoutingSpec {
         for slot in acc.iter_mut().take(n).skip(depot_count) {
             *slot = Some(solver.new_var_range(scan.acc_dom.0 as i32, scan.acc_dom.1 as i32));
         }
-        let a_of = |from: usize| if from < depot_count { expr::int(scan.init) } else { expr::var(acc[from].expect("customer accumulator")) };
+        let a_of =
+            |from: usize| if from < depot_count { expr::int(scan.init) } else { expr::var(acc[from].expect("customer accumulator")) };
 
         for (from, &from_var) in succ.iter().enumerate() {
             for to in depot_count..n {
@@ -856,6 +869,7 @@ pub(crate) fn solve_collection(
             objectives: objective.map(|value| vec![value]).unwrap_or_default(),
             feasible,
             starts: Vec::new(),
+            presences: Vec::new(),
             machines: Vec::new(),
         },
         stats,
@@ -1472,41 +1486,7 @@ fn items_are_unique(items: &[i32]) -> bool {
 }
 
 fn eval_collection_expr_one(arena: &[Expr], id: ExprId, arg0: i64) -> Option<i64> {
-    let node = arena.get(id.0 as usize)?;
-    Some(match node {
-        Expr::Const(value) => *value,
-        Expr::Arg(0) => arg0,
-        Expr::Arg(_) | Expr::Matrix(_, _, _) => return None,
-        Expr::Array(values, index) => {
-            let index = eval_collection_expr_one(arena, *index, arg0)?;
-            *values.get(usize::try_from(index).ok()?)?
-        }
-        Expr::Add(a, b) => eval_collection_expr_one(arena, *a, arg0)?.checked_add(eval_collection_expr_one(arena, *b, arg0)?)?,
-        Expr::Sub(a, b) => eval_collection_expr_one(arena, *a, arg0)?.checked_sub(eval_collection_expr_one(arena, *b, arg0)?)?,
-        Expr::Mul(a, b) => eval_collection_expr_one(arena, *a, arg0)?.checked_mul(eval_collection_expr_one(arena, *b, arg0)?)?,
-        Expr::Min(a, b) => eval_collection_expr_one(arena, *a, arg0)?.min(eval_collection_expr_one(arena, *b, arg0)?),
-        Expr::Max(a, b) => eval_collection_expr_one(arena, *a, arg0)?.max(eval_collection_expr_one(arena, *b, arg0)?),
-        Expr::Div(a, b) => {
-            let numerator = eval_collection_expr_one(arena, *a, arg0)?;
-            let denominator = eval_collection_expr_one(arena, *b, arg0)?;
-            if denominator == 0 {
-                return None;
-            }
-            numerator / denominator
-        }
-        Expr::Abs(a) => eval_collection_expr_one(arena, *a, arg0)?.saturating_abs(),
-        Expr::Lt(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? < eval_collection_expr_one(arena, *b, arg0)?),
-        Expr::Le(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? <= eval_collection_expr_one(arena, *b, arg0)?),
-        Expr::Eq(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? == eval_collection_expr_one(arena, *b, arg0)?),
-        Expr::Ne(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? != eval_collection_expr_one(arena, *b, arg0)?),
-        Expr::IfThenElse(c, a, b) => {
-            if eval_collection_expr_one(arena, *c, arg0)? != 0 {
-                eval_collection_expr_one(arena, *a, arg0)?
-            } else {
-                eval_collection_expr_one(arena, *b, arg0)?
-            }
-        }
-    })
+    crate::model::list::eval_expr_checked(arena, id, &[arg0])
 }
 
 #[cfg(test)]
@@ -2375,7 +2355,13 @@ mod tests {
         let over = arena.sub(end, lat);
         let zero = arena.constant(0);
         let emit = arena.max(zero, over);
-        Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list, init: 0, boundary: depot, step, end: None }, arena, body: emit, coeff: 1 }
+        Reduction {
+            op: ReduceOp::Sum,
+            iterable: Iterable::Scan { list, init: 0, boundary: depot, step, end: None },
+            arena,
+            body: emit,
+            coeff: 1,
+        }
     }
 
     /// Oracle replaying the lateness scan over an ordered route.
@@ -2483,8 +2469,8 @@ mod tests {
         let latest = vec![0i64, 5, 5, 20, 20];
         let items = vec![1, 2, 3, 4];
         let depot = 0;
-        let brute =
-            min_two_routes_scan(&items, &dist, &demand, Some(2), &earliest, &latest, &service, depot, Op::Le, 0).expect("feasible plan exists");
+        let brute = min_two_routes_scan(&items, &dist, &demand, Some(2), &earliest, &latest, &service, depot, Op::Le, 0)
+            .expect("feasible plan exists");
 
         let dist_arc = Arc::new(dist.clone());
         let demand_arc = Arc::new(demand.clone());
@@ -2495,7 +2481,11 @@ mod tests {
         let model = CollectionModel {
             items: items.clone(),
             lists: 2,
-            objectives: vec![ObjectiveTier { minimize: true, terms: vec![scan_edge(&dist_arc, 0), scan_edge(&dist_arc, 1)], max_terms: None }],
+            objectives: vec![ObjectiveTier {
+                minimize: true,
+                terms: vec![scan_edge(&dist_arc, 0), scan_edge(&dist_arc, 1)],
+                max_terms: None,
+            }],
             constraints,
             globals: Vec::new(),
             schedule: None,
@@ -2524,13 +2514,7 @@ mod tests {
         // gives each route lateness 1+3 = 4 <= 5 (feasible per route) but a fleet
         // total of 8 > 5. A global-sum lowering would wrongly reject every split and
         // return UNSAT; a correct per-route lowering keeps it feasible.
-        let dist = vec![
-            vec![0, 1, 1, 1, 1],
-            vec![1, 0, 1, 1, 1],
-            vec![1, 1, 0, 1, 1],
-            vec![1, 1, 1, 0, 1],
-            vec![1, 1, 1, 1, 0],
-        ];
+        let dist = vec![vec![0, 1, 1, 1, 1], vec![1, 0, 1, 1, 1], vec![1, 1, 0, 1, 1], vec![1, 1, 1, 0, 1], vec![1, 1, 1, 1, 0]];
         let service = vec![0i64, 1, 1, 1, 1];
         let earliest = vec![0i64, 0, 0, 0, 0];
         let latest = vec![0i64, 1, 1, 1, 1];
@@ -2548,7 +2532,11 @@ mod tests {
         let model = CollectionModel {
             items: items.clone(),
             lists: 2,
-            objectives: vec![ObjectiveTier { minimize: true, terms: vec![scan_edge(&dist_arc, 0), scan_edge(&dist_arc, 1)], max_terms: None }],
+            objectives: vec![ObjectiveTier {
+                minimize: true,
+                terms: vec![scan_edge(&dist_arc, 0), scan_edge(&dist_arc, 1)],
+                max_terms: None,
+            }],
             constraints,
             globals: Vec::new(),
             schedule: None,
@@ -2604,21 +2592,29 @@ mod tests {
         let latest = vec![0i64, 5, 5, 20, 20];
         let items = vec![1, 2, 3, 4];
         let depot = 0;
-        let brute =
-            min_two_routes_scan(&items, &dist, &demand, Some(2), &earliest, &latest, &service, depot, Op::Le, 0).expect("feasible plan exists");
+        let brute = min_two_routes_scan(&items, &dist, &demand, Some(2), &earliest, &latest, &service, depot, Op::Le, 0)
+            .expect("feasible plan exists");
 
         let dist_arc = Arc::new(dist.clone());
         let demand_arc = Arc::new(demand.clone());
         let mut constraints = vec![scan_load(&demand_arc, 0, 2), scan_load(&demand_arc, 1, 2)];
         for l in 0..2 {
             for _ in 0..2 {
-                constraints.push(Constraint { reduction: lateness_scan(l, &dist, &earliest, &latest, &service, depot), op: Op::Le, rhs: 0 });
+                constraints.push(Constraint {
+                    reduction: lateness_scan(l, &dist, &earliest, &latest, &service, depot),
+                    op: Op::Le,
+                    rhs: 0,
+                });
             }
         }
         let model = CollectionModel {
             items: items.clone(),
             lists: 2,
-            objectives: vec![ObjectiveTier { minimize: true, terms: vec![scan_edge(&dist_arc, 0), scan_edge(&dist_arc, 1)], max_terms: None }],
+            objectives: vec![ObjectiveTier {
+                minimize: true,
+                terms: vec![scan_edge(&dist_arc, 0), scan_edge(&dist_arc, 1)],
+                max_terms: None,
+            }],
             constraints,
             globals: Vec::new(),
             schedule: None,
@@ -2647,7 +2643,11 @@ mod tests {
         CollectionModel {
             items: vec![1, 2, 3, 4],
             lists: 2,
-            objectives: vec![ObjectiveTier { minimize: true, terms: vec![scan_edge(&dist_arc, 0), scan_edge(&dist_arc, 1)], max_terms: None }],
+            objectives: vec![ObjectiveTier {
+                minimize: true,
+                terms: vec![scan_edge(&dist_arc, 0), scan_edge(&dist_arc, 1)],
+                max_terms: None,
+            }],
             constraints,
             globals: Vec::new(),
             schedule: None,
@@ -2697,7 +2697,13 @@ mod tests {
             let step = arena.div(cur, acc); // divides by the accumulator: rejected
             let body = arena.constant(0);
             Some(Constraint {
-                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list: l, init: 1, boundary: 0, step, end: None }, arena, body, coeff: 1 },
+                reduction: Reduction {
+                    op: ReduceOp::Sum,
+                    iterable: Iterable::Scan { list: l, init: 1, boundary: 0, step, end: None },
+                    arena,
+                    body,
+                    coeff: 1,
+                },
                 op: Op::Le,
                 rhs: 0,
             })
@@ -2719,7 +2725,13 @@ mod tests {
             let rate = arena.array(Arc::new(vec![9, 0, 2, 2, 2]), cur_e); // rate[item 1] == 0
             let body = arena.div(cur_e, rate);
             Some(Constraint {
-                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list: l, init: 0, boundary: 0, step, end: None }, arena, body, coeff: 1 },
+                reduction: Reduction {
+                    op: ReduceOp::Sum,
+                    iterable: Iterable::Scan { list: l, init: 0, boundary: 0, step, end: None },
+                    arena,
+                    body,
+                    coeff: 1,
+                },
                 op: Op::Le,
                 rhs: 100,
             })
@@ -2740,7 +2752,13 @@ mod tests {
             let two = arena.constant(2);
             let body = arena.div(acc_e, two);
             Some(Constraint {
-                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list: l, init: 0, boundary: 0, step, end: None }, arena, body, coeff: 1 },
+                reduction: Reduction {
+                    op: ReduceOp::Sum,
+                    iterable: Iterable::Scan { list: l, init: 0, boundary: 0, step, end: None },
+                    arena,
+                    body,
+                    coeff: 1,
+                },
                 op: Op::Le,
                 rhs: 100,
             })
@@ -2760,7 +2778,13 @@ mod tests {
             let step = arena.add(acc, huge);
             let body = arena.arg(1);
             Some(Constraint {
-                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list: l, init: 0, boundary: 0, step, end: None }, arena, body, coeff: 1 },
+                reduction: Reduction {
+                    op: ReduceOp::Sum,
+                    iterable: Iterable::Scan { list: l, init: 0, boundary: 0, step, end: None },
+                    arena,
+                    body,
+                    coeff: 1,
+                },
                 op: Op::Le,
                 rhs: 100,
             })
@@ -2782,7 +2806,13 @@ mod tests {
             let rate = arena.array(Arc::new(vec![9, 0, 2, 2, 2]), cur_e);
             let body = arena.div(cur_e, rate);
             Constraint {
-                reduction: Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list: 0, init: 0, boundary: 0, step, end: None }, arena, body, coeff: 1 },
+                reduction: Reduction {
+                    op: ReduceOp::Sum,
+                    iterable: Iterable::Scan { list: 0, init: 0, boundary: 0, step, end: None },
+                    arena,
+                    body,
+                    coeff: 1,
+                },
                 op: Op::Le,
                 rhs: 100,
             }
@@ -2890,7 +2920,9 @@ mod tests {
     fn enum_pool_optimum(model: &CollectionModel) -> i64 {
         let tiers = crate::model::list_objective_tiers(&model.objectives, &model.items).expect("objective parses for enumeration");
         let stop = AtomicBool::new(false);
-        let outcome = crate::engines::list_exact::solve(model, &tiers, &stop, |_| {}).expect("enumeration runs").expect("enumeration supports the model");
+        let outcome = crate::engines::list_exact::solve(model, &tiers, &stop, |_| {})
+            .expect("enumeration runs")
+            .expect("enumeration supports the model");
         assert_eq!(outcome.status, crate::engines::list_exact::Status::Optimal, "enumeration proves optimality on the small instance");
         outcome.objectives[0]
     }
@@ -2899,7 +2931,14 @@ mod tests {
     /// free pool, referenced by nothing).
     fn pool_edge_model(items: Vec<i32>, dist: &Arc<Vec<Vec<i64>>>, k: usize) -> CollectionModel {
         let terms = (0..k).map(|list| scan_edge(dist, list)).collect();
-        CollectionModel { items, lists: k + 1, objectives: vec![ObjectiveTier { minimize: true, terms, max_terms: None }], constraints: Vec::new(), globals: Vec::new(), schedule: None }
+        CollectionModel {
+            items,
+            lists: k + 1,
+            objectives: vec![ObjectiveTier { minimize: true, terms, max_terms: None }],
+            constraints: Vec::new(),
+            globals: Vec::new(),
+            schedule: None,
+        }
     }
 
     /// A reified scan objective term paying a constant `reward` per served stop
@@ -2909,14 +2948,27 @@ mod tests {
         let mut arena = ExprArena::default();
         let step = arena.arg(1); // accumulator threaded unchanged (unused)
         let emit = arena.constant(-reward);
-        Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list, init: 0, boundary: 0, step, end: None }, arena, body: emit, coeff: 1 }
+        Reduction {
+            op: ReduceOp::Sum,
+            iterable: Iterable::Scan { list, init: 0, boundary: 0, step, end: None },
+            arena,
+            body: emit,
+            coeff: 1,
+        }
     }
 
     /// A `k`-real-route pool model: edges plus a reified reward scan per real route.
     fn pool_reward_model(items: Vec<i32>, dist: &Arc<Vec<Vec<i64>>>, k: usize, reward: i64) -> CollectionModel {
         let mut terms: Vec<Reduction> = (0..k).map(|list| scan_edge(dist, list)).collect();
         terms.extend((0..k).map(|list| reward_scan(list, reward)));
-        CollectionModel { items, lists: k + 1, objectives: vec![ObjectiveTier { minimize: true, terms, max_terms: None }], constraints: Vec::new(), globals: Vec::new(), schedule: None }
+        CollectionModel {
+            items,
+            lists: k + 1,
+            objectives: vec![ObjectiveTier { minimize: true, terms, max_terms: None }],
+            constraints: Vec::new(),
+            globals: Vec::new(),
+            schedule: None,
+        }
     }
 
     fn allow_all(_: &[i32]) -> bool {
@@ -3161,14 +3213,14 @@ mod tests {
         });
 
         let battery: Vec<CollectionModel> = vec![
-            pool_edge_model(vec![1, 2, 3], &dist4, 1),                                  // pool, single route
-            pool_edge_model(vec![1], &dist4, 1),                                        // pool, single node
-            pool_edge_model(vec![1, 2, 3], &dist4, 2),                                  // pool, multi route
+            pool_edge_model(vec![1, 2, 3], &dist4, 1),                                    // pool, single route
+            pool_edge_model(vec![1], &dist4, 1),                                          // pool, single node
+            pool_edge_model(vec![1, 2, 3], &dist4, 2),                                    // pool, multi route
             pool_reward_model(vec![1, 2, 3], &Arc::new(line_dist(&[0, 1, 2, 10])), 1, 6), // pool + reward objective
             pool_reward_model(vec![1, 2, 3, 4, 5], &Arc::new(line_dist(&[0, 1, 2, 20, 21, 50])), 2, 8), // pool + reward, multi
-            cap_pool,                                                                   // pool + capacity -> enumeration
-            route_specific,                                                             // pool + route-specific scan -> enumeration
-            closed_tsp_model(vec![1, 2, 3], 0, &dist4),                                 // non-pool TSP
+            cap_pool,                                                                     // pool + capacity -> enumeration
+            route_specific,                                                               // pool + route-specific scan -> enumeration
+            closed_tsp_model(vec![1, 2, 3], 0, &dist4),                                   // non-pool TSP
         ];
 
         for model in &battery {
@@ -3190,7 +3242,13 @@ mod tests {
         let acc = arena.arg(1);
         let step = arena.add(acc, cur);
         let emit = arena.arg(1); // the new accumulator = load after this stop
-        Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list, init: 0, boundary: 0, step, end: None }, arena, body: emit, coeff: 1 }
+        Reduction {
+            op: ReduceOp::Sum,
+            iterable: Iterable::Scan { list, init: 0, boundary: 0, step, end: None },
+            arena,
+            body: emit,
+            coeff: 1,
+        }
     }
 
     #[test]
@@ -3262,7 +3320,10 @@ mod tests {
             let stop = AtomicBool::new(false);
             let outcome = solve_collection(&model, 0, &stop, &mut |_| {}).expect("supported random pool lowering");
             assert!(outcome.complete, "integer path proves optimality on the small instance");
-            assert_eq!(outcome.solution.objectives[0], enumerated, "integer optimum == enumeration optimum (n={n}, k={k}, reward={reward})");
+            assert_eq!(
+                outcome.solution.objectives[0], enumerated,
+                "integer optimum == enumeration optimum (n={n}, k={k}, reward={reward})"
+            );
         }
     }
 
@@ -3274,7 +3335,13 @@ mod tests {
         let step = arena.arg(1); // accumulator threaded unchanged (unused)
         let cur = arena.arg(0);
         let emit = arena.array(Arc::clone(reward_table), cur);
-        Reduction { op: ReduceOp::Sum, iterable: Iterable::Scan { list, init: 0, boundary: 0, step, end: None }, arena, body: emit, coeff: 1 }
+        Reduction {
+            op: ReduceOp::Sum,
+            iterable: Iterable::Scan { list, init: 0, boundary: 0, step, end: None },
+            arena,
+            body: emit,
+            coeff: 1,
+        }
     }
 
     /// The same per-item reward as `item_reward_scan` (`emit = table[cur]`), but
@@ -3302,7 +3369,14 @@ mod tests {
         let reward_table = Arc::new(reward_table);
         let items: Vec<i32> = (1..=total as i32).collect();
         let terms = vec![scan_edge(&dist, 0), item_reward_scan(0, &reward_table)];
-        CollectionModel { items, lists: 2, objectives: vec![ObjectiveTier { minimize: true, terms, max_terms: None }], constraints: Vec::new(), globals: Vec::new(), schedule: None }
+        CollectionModel {
+            items,
+            lists: 2,
+            objectives: vec![ObjectiveTier { minimize: true, terms, max_terms: None }],
+            constraints: Vec::new(),
+            globals: Vec::new(),
+            schedule: None,
+        }
     }
 
     /// `disposable_model` with the per-served reward expressed as an `Items` sum
@@ -3318,7 +3392,14 @@ mod tests {
         let reward_table = Arc::new(reward_table);
         let items: Vec<i32> = (1..=total as i32).collect();
         let terms = vec![scan_edge(&dist, 0), item_reward_items(0, &reward_table)];
-        CollectionModel { items, lists: 2, objectives: vec![ObjectiveTier { minimize: true, terms, max_terms: None }], constraints: Vec::new(), globals: Vec::new(), schedule: None }
+        CollectionModel {
+            items,
+            lists: 2,
+            objectives: vec![ObjectiveTier { minimize: true, terms, max_terms: None }],
+            constraints: Vec::new(),
+            globals: Vec::new(),
+            schedule: None,
+        }
     }
 
     #[test]
@@ -3375,7 +3456,14 @@ mod tests {
             let mk = |scan: bool| {
                 let mut terms: Vec<Reduction> = (0..k).map(|l| scan_edge(&dist, l)).collect();
                 terms.extend((0..k).map(|l| if scan { item_reward_scan(l, &reward_table) } else { item_reward_items(l, &reward_table) }));
-                CollectionModel { items: items.clone(), lists: k + 1, objectives: vec![ObjectiveTier { minimize: true, terms, max_terms: None }], constraints: Vec::new(), globals: Vec::new(), schedule: None }
+                CollectionModel {
+                    items: items.clone(),
+                    lists: k + 1,
+                    objectives: vec![ObjectiveTier { minimize: true, terms, max_terms: None }],
+                    constraints: Vec::new(),
+                    globals: Vec::new(),
+                    schedule: None,
+                }
             };
             let items_model = mk(false);
             let enumerated = enum_pool_optimum(&items_model);
@@ -3384,7 +3472,10 @@ mod tests {
             let scan_out = solve_collection(&mk(true), 0, &stop, &mut |_| {}).expect("scan-reward lowering");
             assert!(items_out.complete, "items-reward integer path proves optimality (n={n}, k={k})");
             assert_eq!(items_out.solution.objectives[0], enumerated, "items optimum == enumeration (n={n}, k={k})");
-            assert_eq!(items_out.solution.objectives[0], scan_out.solution.objectives[0], "items reward == scan reward optimum (n={n}, k={k})");
+            assert_eq!(
+                items_out.solution.objectives[0], scan_out.solution.objectives[0],
+                "items reward == scan reward optimum (n={n}, k={k})"
+            );
         }
     }
 
@@ -3419,7 +3510,12 @@ mod tests {
                 let start = std::time::Instant::now();
                 let out = solve_collection(&model, 0, &stop_local, &mut |_| {}).expect("supported");
                 let elapsed = start.elapsed();
-                eprintln!("G10 n={n} m={m} status={} obj={} time={:?}", if out.complete { "OPTIMAL" } else { "SATISFIABLE" }, out.solution.objectives[0], elapsed);
+                eprintln!(
+                    "G10 n={n} m={m} status={} obj={} time={:?}",
+                    if out.complete { "OPTIMAL" } else { "SATISFIABLE" },
+                    out.solution.objectives[0],
+                    elapsed
+                );
                 assert!(out.complete, "OPTIMAL proven for n={n} m={m} in {elapsed:?}");
                 assert!(
                     out.solution.objectives[0] <= v_star,

@@ -115,7 +115,7 @@ Common options:
 ## Python Examples
 
 The Python examples live under `examples/python/`, grouped by domain: `routing/`,
-`scheduling/`, `packing/`, and `mus/` (infeasibility analysis).
+`scheduling/`, `packing/`, `optimization/`, and `mus/` (infeasibility analysis).
 
 ```bash
 QAYD_VRP_INSTANCE=/path/to/instance.vrp uv run --extra examples examples/python/routing/api/vrp.py
@@ -123,6 +123,9 @@ uv run examples/python/routing/api/cvrptw.py
 uv run examples/python/scheduling/api/jssp.py
 uv run examples/python/scheduling/api/rcpsp.py
 uv run examples/python/packing/bin_packing.py
+uv run examples/python/packing/set_partition.py
+uv run examples/python/optimization/tiered_pricing.py
+uv run examples/python/scheduling/native/optional_jobs.py
 uv run examples/python/mus/mus.py           # diagnose an infeasible model: model.soft(...) / model.mus()
 uv run examples/python/mus/mus_explain.py   # sub-constraint MUS explanation: model.explain_mus()
 uv run examples/python/mus/mus_enumerate.py # all MUSes + MSSes/MCSes (MARCO): model.enumerate_mus()

@@ -32,6 +32,8 @@ pub enum Constraint {
     SameList { lists: Vec<ListVarRef>, a: i32, b: i32 },
     /// `before` must be assigned to a list no later than `after`.
     ItemPrecedence { lists: Vec<ListVarRef>, before: i32, after: i32 },
+    /// Cross-list relation represented directly by the collection IR.
+    CollectionGlobal(list::GlobalConstraint),
     /// Bounds a list length.
     ListLength { list: ListVarRef, min: usize, max: usize },
     /// Bounds a weighted sum over items in a list.
@@ -128,7 +130,13 @@ impl Model {
                     };
                     let start_max = interval.horizon.saturating_sub(duration);
                     let id = IntervalVarRef(model.intervals.len());
-                    model.intervals.push(IntervalDecl { start_min: 0, start_max, duration: interval.duration, modes, optional: false });
+                    model.intervals.push(IntervalDecl {
+                        start_min: 0,
+                        start_max,
+                        duration: interval.duration,
+                        modes,
+                        optional: interval.optional,
+                    });
                     id
                 })
                 .collect::<Vec<_>>();
@@ -161,13 +169,14 @@ impl Model {
             }
         }
         for global in &collection_model.globals {
-            match *global {
+            match global {
                 list::GlobalConstraint::ListLe { before, after } => {
-                    model.add_constraint(Constraint::ItemPrecedence { lists: lists.clone(), before, after });
+                    model.add_constraint(Constraint::ItemPrecedence { lists: lists.clone(), before: *before, after: *after });
                 }
                 list::GlobalConstraint::SameList { a, b } => {
-                    model.add_constraint(Constraint::SameList { lists: lists.clone(), a, b });
+                    model.add_constraint(Constraint::SameList { lists: lists.clone(), a: *a, b: *b });
                 }
+                other => model.add_constraint(Constraint::CollectionGlobal(other.clone())),
             }
         }
         for tier in &collection_model.objectives {

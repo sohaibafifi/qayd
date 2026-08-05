@@ -53,6 +53,8 @@ pub struct Outcome {
     pub status: Status,
     pub objective: Option<i64>,
     pub starts: Vec<i64>,
+    /// Presence of each operation. Moded operations are mandatory.
+    pub presences: Vec<bool>,
     /// Chosen machine per operation, or `-1` for fixed intervals.
     pub machines: Vec<i64>,
     pub stats: SolveStats,
@@ -100,7 +102,11 @@ where
     for interval in &schedule.intervals {
         let duration = checked_i32(interval.duration, "interval duration")?;
         let start_max = checked_start_max(interval.horizon, interval.duration, "interval")?;
-        intervals.push(solver.store.new_interval(0, start_max, duration));
+        intervals.push(if interval.optional {
+            solver.store.new_optional_interval(0, start_max, duration)
+        } else {
+            solver.store.new_interval(0, start_max, duration)
+        });
         durations_i32.push(duration);
     }
     for &(before, after) in &schedule.precedences {
@@ -136,10 +142,25 @@ where
         let makespan = solver.store.new_var_range(0, max_horizon);
         for (&iv, &dur) in intervals.iter().zip(&durations_i32) {
             let start = solver.store.interval_start_var(iv);
-            intension::intension(&mut solver, expr::ge(expr::var(makespan), expr::add(vec![expr::var(start), expr::int(i64::from(dur))])));
+            let bound = expr::ge(expr::var(makespan), expr::add(vec![expr::var(start), expr::int(i64::from(dur))]));
+            let bound = solver
+                .store
+                .interval_presence_var(iv)
+                .map_or(bound.clone(), |presence| expr::imp(expr::eq(expr::var(presence), expr::int(1)), bound));
+            intension::intension(&mut solver, bound);
         }
         let mut search_vars: Vec<VarId> = intervals.iter().map(|&iv| solver.store.interval_start_var(iv)).collect();
         let n_starts = search_vars.len();
+        let presence_positions = intervals
+            .iter()
+            .map(|&iv| {
+                solver.store.interval_presence_var(iv).map(|presence| {
+                    let position = search_vars.len();
+                    search_vars.push(presence);
+                    position
+                })
+            })
+            .collect::<Vec<_>>();
         search_vars.extend((0..solver.store.disjunctive_pair_count()).map(|i| solver.store.disjunctive_order_var(i)));
         search_vars.push(makespan);
 
@@ -163,30 +184,52 @@ where
                 status: if complete { Status::Optimal } else { Status::Satisfiable },
                 objective: Some(value),
                 starts: assignment[..n_starts].iter().map(|&s| i64::from(s)).collect(),
+                presences: presence_positions.iter().map(|position| position.is_none_or(|position| assignment[position] != 0)).collect(),
                 machines: vec![-1; schedule.intervals.len()],
                 stats,
             },
-            (None, true) => Outcome { status: Status::Unsatisfiable, objective: None, starts: Vec::new(), machines: Vec::new(), stats },
-            (None, false) => Outcome { status: Status::Unknown, objective: None, starts: Vec::new(), machines: Vec::new(), stats },
+            (None, true) => Outcome {
+                status: Status::Unsatisfiable,
+                objective: None,
+                starts: Vec::new(),
+                presences: Vec::new(),
+                machines: Vec::new(),
+                stats,
+            },
+            (None, false) => {
+                Outcome { status: Status::Unknown, objective: None, starts: Vec::new(), presences: Vec::new(), machines: Vec::new(), stats }
+            }
         };
         return Ok(Some(outcome));
     }
 
-    let mut starts: Option<Vec<i64>> = None;
+    let mut assignment: Option<(Vec<i64>, Vec<bool>)> = None;
     let (stats, complete) = search::solve_domains_interruptible(
         &mut solver,
         |_, domain| {
-            starts = Some(domain.interval_starts.iter().map(|start| i64::from(start.unwrap_or(0))).collect());
+            assignment = Some((
+                domain.interval_starts.iter().map(|start| i64::from(start.unwrap_or(0))).collect(),
+                domain.interval_starts.iter().map(Option::is_some).collect(),
+            ));
             SearchControl::Stop
         },
         stop,
     );
-    let outcome = match (starts, complete) {
-        (Some(starts), _) => {
-            Outcome { status: Status::Satisfiable, objective: None, starts, machines: vec![-1; schedule.intervals.len()], stats }
+    let outcome = match (assignment, complete) {
+        (Some((starts, presences)), _) => {
+            Outcome { status: Status::Satisfiable, objective: None, starts, presences, machines: vec![-1; schedule.intervals.len()], stats }
         }
-        (None, true) => Outcome { status: Status::Unsatisfiable, objective: None, starts: Vec::new(), machines: Vec::new(), stats },
-        (None, false) => Outcome { status: Status::Unknown, objective: None, starts: Vec::new(), machines: Vec::new(), stats },
+        (None, true) => Outcome {
+            status: Status::Unsatisfiable,
+            objective: None,
+            starts: Vec::new(),
+            presences: Vec::new(),
+            machines: Vec::new(),
+            stats,
+        },
+        (None, false) => {
+            Outcome { status: Status::Unknown, objective: None, starts: Vec::new(), presences: Vec::new(), machines: Vec::new(), stats }
+        }
     };
     Ok(Some(outcome))
 }
@@ -253,12 +296,29 @@ where
             status: if complete { Status::Optimal } else { Status::Satisfiable },
             objective: Some(objective),
             starts,
+            presences: vec![true; schedule.intervals.len()],
             machines,
             stats,
         },
-        (Some((_, starts, machines)), _) => Outcome { status: Status::Satisfiable, objective: None, starts, machines, stats },
-        (None, true) => Outcome { status: Status::Unsatisfiable, objective: None, starts: Vec::new(), machines: Vec::new(), stats },
-        (None, false) => Outcome { status: Status::Unknown, objective: None, starts: Vec::new(), machines: Vec::new(), stats },
+        (Some((_, starts, machines)), _) => Outcome {
+            status: Status::Satisfiable,
+            objective: None,
+            starts,
+            presences: vec![true; schedule.intervals.len()],
+            machines,
+            stats,
+        },
+        (None, true) => Outcome {
+            status: Status::Unsatisfiable,
+            objective: None,
+            starts: Vec::new(),
+            presences: Vec::new(),
+            machines: Vec::new(),
+            stats,
+        },
+        (None, false) => {
+            Outcome { status: Status::Unknown, objective: None, starts: Vec::new(), presences: Vec::new(), machines: Vec::new(), stats }
+        }
     };
     Ok(Some(outcome))
 }
@@ -327,9 +387,16 @@ where
 
     let Some((assignment, value)) = best else {
         return Ok(if complete {
-            Outcome { status: Status::Unsatisfiable, objective: None, starts: Vec::new(), machines: Vec::new(), stats }
+            Outcome {
+                status: Status::Unsatisfiable,
+                objective: None,
+                starts: Vec::new(),
+                presences: Vec::new(),
+                machines: Vec::new(),
+                stats,
+            }
         } else {
-            Outcome { status: Status::Unknown, objective: None, starts: Vec::new(), machines: Vec::new(), stats }
+            Outcome { status: Status::Unknown, objective: None, starts: Vec::new(), presences: Vec::new(), machines: Vec::new(), stats }
         });
     };
 
@@ -369,6 +436,7 @@ where
         status: if complete { Status::Optimal } else { Status::Satisfiable },
         objective: Some(makespan_value),
         starts,
+        presences: vec![true; schedule.intervals.len()],
         machines: chosen,
         stats,
     })

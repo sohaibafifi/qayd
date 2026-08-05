@@ -1,9 +1,11 @@
 //! List variable declarations and list-objective evaluation.
 
+pub(crate) mod external;
 mod ir;
 pub(crate) mod scan;
 mod validate;
 
+pub use external::{external_function_registered, register_external_function};
 pub use ir::*;
 
 /// Reference to a list declaration inside [`Model`].
@@ -207,6 +209,13 @@ pub(crate) fn eval_reduction_on_lists(reduction: &Reduction, lists: &[Vec<i32>])
                 fold(eval_objective_expr(arena, body, &[i64::from(item)]));
             }
         }
+        Iterable::SetItems(_) => {
+            let mut members = contents.clone();
+            members.sort_unstable();
+            for item in members {
+                fold(eval_objective_expr(arena, body, &[i64::from(item)]));
+            }
+        }
         Iterable::Edges { start, end, .. } => {
             let n = contents.len();
             for p in 0..=n {
@@ -271,50 +280,98 @@ pub(crate) fn eval_reduction_on_lists(reduction: &Reduction, lists: &[Vec<i32>])
     value.map(|value| value.saturating_mul(reduction.coeff))
 }
 
-fn eval_objective_expr(arena: &[Expr], id: ExprId, args: &[i64]) -> i64 {
-    match &arena[id.0 as usize] {
+pub(crate) fn eval_expr_checked(arena: &[Expr], id: ExprId, args: &[i64]) -> Option<i64> {
+    let rec = |child| eval_expr_checked(arena, child, args);
+    Some(match arena.get(id.0 as usize)? {
         Expr::Const(c) => *c,
-        Expr::Arg(k) => args.get(*k as usize).copied().unwrap_or(0),
-        Expr::Array(a, i) => {
-            let idx = eval_objective_expr(arena, *i, args);
-            usize::try_from(idx).ok().and_then(|u| a.get(u)).copied().unwrap_or(0)
-        }
-        Expr::Matrix(m, i, j) => {
-            let ri = eval_objective_expr(arena, *i, args);
-            let ci = eval_objective_expr(arena, *j, args);
-            usize::try_from(ri)
-                .ok()
-                .and_then(|r| m.get(r))
-                .and_then(|row| usize::try_from(ci).ok().and_then(|c| row.get(c)))
-                .copied()
-                .unwrap_or(0)
-        }
-        Expr::Add(a, b) => eval_objective_expr(arena, *a, args).saturating_add(eval_objective_expr(arena, *b, args)),
-        Expr::Sub(a, b) => eval_objective_expr(arena, *a, args).saturating_sub(eval_objective_expr(arena, *b, args)),
-        Expr::Mul(a, b) => eval_objective_expr(arena, *a, args).saturating_mul(eval_objective_expr(arena, *b, args)),
-        Expr::Min(a, b) => eval_objective_expr(arena, *a, args).min(eval_objective_expr(arena, *b, args)),
-        Expr::Max(a, b) => eval_objective_expr(arena, *a, args).max(eval_objective_expr(arena, *b, args)),
-        Expr::Div(a, b) => {
-            let d = eval_objective_expr(arena, *b, args);
-            if d == 0 {
-                0
-            } else {
-                eval_objective_expr(arena, *a, args).checked_div(d).unwrap_or(0)
-            }
-        }
-        Expr::Abs(a) => eval_objective_expr(arena, *a, args).saturating_abs(),
-        Expr::Lt(a, b) => i64::from(eval_objective_expr(arena, *a, args) < eval_objective_expr(arena, *b, args)),
-        Expr::Le(a, b) => i64::from(eval_objective_expr(arena, *a, args) <= eval_objective_expr(arena, *b, args)),
-        Expr::Eq(a, b) => i64::from(eval_objective_expr(arena, *a, args) == eval_objective_expr(arena, *b, args)),
-        Expr::Ne(a, b) => i64::from(eval_objective_expr(arena, *a, args) != eval_objective_expr(arena, *b, args)),
+        Expr::Arg(k) => *args.get(*k as usize)?,
+        Expr::Array(a, i) => *a.get(usize::try_from(rec(*i)?).ok()?)?,
+        Expr::Matrix(m, i, j) => *m.get(usize::try_from(rec(*i)?).ok()?)?.get(usize::try_from(rec(*j)?).ok()?)?,
+        Expr::Add(a, b) => rec(*a)?.saturating_add(rec(*b)?),
+        Expr::Sub(a, b) => rec(*a)?.saturating_sub(rec(*b)?),
+        Expr::Mul(a, b) => rec(*a)?.saturating_mul(rec(*b)?),
+        Expr::Mod(a, b) => rec(*a)?.checked_rem(rec(*b)?).unwrap_or(0),
+        Expr::Pow(base, exponent) => saturating_pow(rec(*base)?, *exponent),
+        Expr::MulScaled(a, b, scale) => scaled_ratio(rec(*a)?, rec(*b)?, *scale, false),
+        Expr::DivScaled(a, b, scale) => scaled_ratio(rec(*a)?, rec(*b)?, *scale, true),
+        Expr::Min(a, b) => rec(*a)?.min(rec(*b)?),
+        Expr::Max(a, b) => rec(*a)?.max(rec(*b)?),
+        Expr::Div(a, b) => rec(*a)?.checked_div(rec(*b)?).unwrap_or(0),
+        Expr::Abs(a) => rec(*a)?.saturating_abs(),
+        Expr::Lt(a, b) => i64::from(rec(*a)? < rec(*b)?),
+        Expr::Le(a, b) => i64::from(rec(*a)? <= rec(*b)?),
+        Expr::Eq(a, b) => i64::from(rec(*a)? == rec(*b)?),
+        Expr::Ne(a, b) => i64::from(rec(*a)? != rec(*b)?),
         Expr::IfThenElse(c, a, b) => {
-            if eval_objective_expr(arena, *c, args) != 0 {
-                eval_objective_expr(arena, *a, args)
+            if rec(*c)? != 0 {
+                rec(*a)?
             } else {
-                eval_objective_expr(arena, *b, args)
+                rec(*b)?
             }
+        }
+        Expr::PiecewiseLinear { input, points } => piecewise(rec(*input)?, points),
+        Expr::External { name, args: external_args } => {
+            let values = external_args.iter().map(|id| rec(*id)).collect::<Option<Vec<_>>>()?;
+            external::call_external_function(name, &values).unwrap_or(0)
+        }
+    })
+}
+
+fn eval_objective_expr(arena: &[Expr], id: ExprId, args: &[i64]) -> i64 {
+    eval_expr_checked(arena, id, args).unwrap_or(0)
+}
+
+fn saturating_pow(mut base: i64, mut exponent: u32) -> i64 {
+    let mut result = 1i64;
+    while exponent > 0 {
+        if exponent & 1 == 1 {
+            result = result.saturating_mul(base);
+        }
+        exponent >>= 1;
+        if exponent > 0 {
+            base = base.saturating_mul(base);
         }
     }
+    result
+}
+
+fn round_ratio(numerator: i128, denominator: i128) -> i128 {
+    if denominator == 0 {
+        return 0;
+    }
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    if remainder.abs().saturating_mul(2) >= denominator.abs() {
+        quotient + if numerator.signum() == denominator.signum() { 1 } else { -1 }
+    } else {
+        quotient
+    }
+}
+
+fn scaled_ratio(a: i64, b: i64, scale: i64, divide: bool) -> i64 {
+    if scale <= 0 || (divide && b == 0) {
+        return 0;
+    }
+    let (numerator, denominator) =
+        if divide { (i128::from(a) * i128::from(scale), i128::from(b)) } else { (i128::from(a) * i128::from(b), i128::from(scale)) };
+    round_ratio(numerator, denominator).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+fn piecewise(input: i64, points: &[(i64, i64)]) -> i64 {
+    let Some(&(first_x, first_y)) = points.first() else { return 0 };
+    if input <= first_x {
+        return first_y;
+    }
+    for window in points.windows(2) {
+        let [(x0, y0), (x1, y1)] = window else { unreachable!() };
+        if input <= *x1 {
+            let dx = i128::from(input) - i128::from(*x0);
+            let dy = i128::from(*y1) - i128::from(*y0);
+            let width = i128::from(*x1) - i128::from(*x0);
+            return (i128::from(*y0) + round_ratio(dx * dy, width)).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+        }
+    }
+    points.last().map_or(first_y, |&(_, y)| y)
 }
 
 fn list_item_values(reduction: &Reduction, items: &[i32]) -> Option<Vec<(i32, i64)>> {

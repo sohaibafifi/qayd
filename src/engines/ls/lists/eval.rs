@@ -1,3 +1,4 @@
+use crate::model::list::external::call_external_function;
 use crate::model::list::{Expr, ExprId, Iterable, Op, ReduceOp, Reduction};
 
 /// Violation weight for an undefined reduction (empty `min`/`max`) or a broken
@@ -25,6 +26,10 @@ pub(super) fn eval_expr(arena: &[Expr], id: ExprId, args: &[i64]) -> i64 {
         Expr::Add(a, b) => eval_expr(arena, *a, args).saturating_add(eval_expr(arena, *b, args)),
         Expr::Sub(a, b) => eval_expr(arena, *a, args).saturating_sub(eval_expr(arena, *b, args)),
         Expr::Mul(a, b) => eval_expr(arena, *a, args).saturating_mul(eval_expr(arena, *b, args)),
+        Expr::Mod(a, b) => eval_expr(arena, *a, args).checked_rem(eval_expr(arena, *b, args)).unwrap_or(0),
+        Expr::Pow(base, exponent) => saturating_pow(eval_expr(arena, *base, args), *exponent),
+        Expr::MulScaled(a, b, scale) => scaled_ratio(eval_expr(arena, *a, args), eval_expr(arena, *b, args), *scale, false),
+        Expr::DivScaled(a, b, scale) => scaled_ratio(eval_expr(arena, *a, args), eval_expr(arena, *b, args), *scale, true),
         Expr::Min(a, b) => eval_expr(arena, *a, args).min(eval_expr(arena, *b, args)),
         Expr::Max(a, b) => eval_expr(arena, *a, args).max(eval_expr(arena, *b, args)),
         Expr::Div(a, b) => {
@@ -47,7 +52,64 @@ pub(super) fn eval_expr(arena: &[Expr], id: ExprId, args: &[i64]) -> i64 {
                 eval_expr(arena, *b, args)
             }
         }
+        Expr::PiecewiseLinear { input, points } => piecewise(eval_expr(arena, *input, args), points),
+        Expr::External { name, args: external_args } => {
+            let values: Vec<i64> = external_args.iter().map(|id| eval_expr(arena, *id, args)).collect();
+            call_external_function(name, &values).unwrap_or(0)
+        }
     }
+}
+
+fn saturating_pow(mut base: i64, mut exponent: u32) -> i64 {
+    let mut result = 1i64;
+    while exponent > 0 {
+        if exponent & 1 == 1 {
+            result = result.saturating_mul(base);
+        }
+        exponent >>= 1;
+        if exponent > 0 {
+            base = base.saturating_mul(base);
+        }
+    }
+    result
+}
+
+fn round_ratio(numerator: i128, denominator: i128) -> i128 {
+    if denominator == 0 {
+        return 0;
+    }
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    if remainder.abs().saturating_mul(2) >= denominator.abs() {
+        quotient + if numerator.signum() == denominator.signum() { 1 } else { -1 }
+    } else {
+        quotient
+    }
+}
+
+fn scaled_ratio(a: i64, b: i64, scale: i64, divide: bool) -> i64 {
+    if scale <= 0 || (divide && b == 0) {
+        return 0;
+    }
+    let (numerator, denominator) =
+        if divide { (i128::from(a) * i128::from(scale), i128::from(b)) } else { (i128::from(a) * i128::from(b), i128::from(scale)) };
+    round_ratio(numerator, denominator).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+fn piecewise(input: i64, points: &[(i64, i64)]) -> i64 {
+    let Some(&(first_x, first_y)) = points.first() else { return 0 };
+    if input <= first_x {
+        return first_y;
+    }
+    for window in points.windows(2) {
+        let [(x0, y0), (x1, y1)] = window else { unreachable!() };
+        if input <= *x1 {
+            let delta =
+                round_ratio((i128::from(input) - i128::from(*x0)) * (i128::from(*y1) - i128::from(*y0)), i128::from(*x1) - i128::from(*x0));
+            return i128::from(*y0).saturating_add(delta).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+        }
+    }
+    points.last().map_or(first_y, |&(_, y)| y)
 }
 
 /// Evaluate a reduction over a list's contents. `None` means undefined (an
@@ -84,6 +146,13 @@ pub(super) fn eval_reduction(reduction: &Reduction, contents: &[i32]) -> Option<
     match reduction.iterable {
         Iterable::Items(_) => {
             for &item in contents {
+                fold(eval_expr(arena, body, &[i64::from(item)]));
+            }
+        }
+        Iterable::SetItems(_) => {
+            let mut members = contents.to_vec();
+            members.sort_unstable();
+            for item in members {
                 fold(eval_expr(arena, body, &[i64::from(item)]));
             }
         }

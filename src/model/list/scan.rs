@@ -124,10 +124,14 @@ pub(crate) fn scan_routing_signature(constraint: &Constraint, items: &[i32]) -> 
         let reject = match node {
             Expr::Const(c) => !within_i32_half((*c, *c)),
             Expr::Array(a, i) => uses_acc(arena, *i) || a.iter().any(|&v| !within_i32_half((v, v))),
-            Expr::Matrix(m, i, j) => {
-                uses_acc(arena, *i) || uses_acc(arena, *j) || m.iter().flatten().any(|&v| !within_i32_half((v, v)))
-            }
+            Expr::Matrix(m, i, j) => uses_acc(arena, *i) || uses_acc(arena, *j) || m.iter().flatten().any(|&v| !within_i32_half((v, v))),
             Expr::Div(_, b) => uses_acc(arena, *b) || cv.iter().any(|&cur| cv.iter().any(|&prev| eval_index(arena, *b, cur, prev) == 0)),
+            Expr::Mod(_, _)
+            | Expr::Pow(_, _)
+            | Expr::MulScaled(_, _, _)
+            | Expr::DivScaled(_, _, _)
+            | Expr::PiecewiseLinear { .. }
+            | Expr::External { .. } => true,
             Expr::Arg(k) => *k >= 3,
             _ => false,
         };
@@ -140,8 +144,11 @@ pub(crate) fn scan_routing_signature(constraint: &Constraint, items: &[i32]) -> 
     // set; acc_dom unions reach_1..reach_n. A route holds at most n customers, so
     // exactly n iterations cover every position (the recurrence keeps growing, so
     // this is not a to-fixpoint loop).
-    let step_lowered: Vec<KExpr> =
-        cv.iter().flat_map(|&cur| cv.iter().map(move |&prev| (cur, prev))).map(|(cur, prev)| lower_scan(arena, step, cur, prev, &expr::var(ACC))).collect();
+    let step_lowered: Vec<KExpr> = cv
+        .iter()
+        .flat_map(|&cur| cv.iter().map(move |&prev| (cur, prev)))
+        .map(|(cur, prev)| lower_scan(arena, step, cur, prev, &expr::var(ACC)))
+        .collect();
     let mut reach = (init, init);
     let mut acc_dom: Option<(i64, i64)> = None;
     for _ in 0..n {
@@ -230,6 +237,12 @@ pub(crate) fn lower_scan(arena: &[Expr], id: ExprId, cur: i64, prev: i64, acc: &
         Expr::Add(a, b) => expr::add(vec![rec(*a), rec(*b)]),
         Expr::Sub(a, b) => expr::sub(rec(*a), rec(*b)),
         Expr::Mul(a, b) => expr::mul(vec![rec(*a), rec(*b)]),
+        Expr::Mod(_, _)
+        | Expr::Pow(_, _)
+        | Expr::MulScaled(_, _, _)
+        | Expr::DivScaled(_, _, _)
+        | Expr::PiecewiseLinear { .. }
+        | Expr::External { .. } => unreachable!("unsupported scan expression passed the routing signature"),
         Expr::Min(a, b) => expr::min_of(vec![rec(*a), rec(*b)]),
         Expr::Max(a, b) => expr::max_of(vec![rec(*a), rec(*b)]),
         Expr::Div(a, b) => expr::div(rec(*a), rec(*b)),
@@ -268,6 +281,12 @@ fn eval_index(arena: &[Expr], id: ExprId, cur: i64, prev: i64) -> i64 {
         Expr::Add(a, b) => rec(*a).saturating_add(rec(*b)),
         Expr::Sub(a, b) => rec(*a).saturating_sub(rec(*b)),
         Expr::Mul(a, b) => rec(*a).saturating_mul(rec(*b)),
+        Expr::Mod(_, _)
+        | Expr::Pow(_, _)
+        | Expr::MulScaled(_, _, _)
+        | Expr::DivScaled(_, _, _)
+        | Expr::PiecewiseLinear { .. }
+        | Expr::External { .. } => unreachable!("unsupported scan expression passed the routing signature"),
         Expr::Min(a, b) => rec(*a).min(rec(*b)),
         Expr::Max(a, b) => rec(*a).max(rec(*b)),
         Expr::Div(a, b) => {
@@ -300,11 +319,14 @@ fn reads_non_item_arg(arena: &[Expr], id: ExprId) -> bool {
     match &arena[id.0 as usize] {
         Expr::Const(_) => false,
         Expr::Arg(k) => *k >= 1,
-        Expr::Array(_, i) | Expr::Abs(i) => reads_non_item_arg(arena, *i),
+        Expr::Array(_, i) | Expr::Abs(i) | Expr::Pow(i, _) | Expr::PiecewiseLinear { input: i, .. } => reads_non_item_arg(arena, *i),
         Expr::Matrix(_, i, j)
         | Expr::Add(i, j)
         | Expr::Sub(i, j)
         | Expr::Mul(i, j)
+        | Expr::Mod(i, j)
+        | Expr::MulScaled(i, j, _)
+        | Expr::DivScaled(i, j, _)
         | Expr::Min(i, j)
         | Expr::Max(i, j)
         | Expr::Div(i, j)
@@ -313,6 +335,7 @@ fn reads_non_item_arg(arena: &[Expr], id: ExprId) -> bool {
         | Expr::Eq(i, j)
         | Expr::Ne(i, j) => reads_non_item_arg(arena, *i) || reads_non_item_arg(arena, *j),
         Expr::IfThenElse(c, a, b) => reads_non_item_arg(arena, *c) || reads_non_item_arg(arena, *a) || reads_non_item_arg(arena, *b),
+        Expr::External { args, .. } => args.iter().any(|id| reads_non_item_arg(arena, *id)),
     }
 }
 
@@ -321,11 +344,14 @@ fn uses_acc(arena: &[Expr], id: ExprId) -> bool {
     match &arena[id.0 as usize] {
         Expr::Const(_) => false,
         Expr::Arg(k) => *k == 1,
-        Expr::Array(_, i) | Expr::Abs(i) => uses_acc(arena, *i),
+        Expr::Array(_, i) | Expr::Abs(i) | Expr::Pow(i, _) | Expr::PiecewiseLinear { input: i, .. } => uses_acc(arena, *i),
         Expr::Matrix(_, i, j)
         | Expr::Add(i, j)
         | Expr::Sub(i, j)
         | Expr::Mul(i, j)
+        | Expr::Mod(i, j)
+        | Expr::MulScaled(i, j, _)
+        | Expr::DivScaled(i, j, _)
         | Expr::Min(i, j)
         | Expr::Max(i, j)
         | Expr::Div(i, j)
@@ -334,6 +360,7 @@ fn uses_acc(arena: &[Expr], id: ExprId) -> bool {
         | Expr::Eq(i, j)
         | Expr::Ne(i, j) => uses_acc(arena, *i) || uses_acc(arena, *j),
         Expr::IfThenElse(c, a, b) => uses_acc(arena, *c) || uses_acc(arena, *a) || uses_acc(arena, *b),
+        Expr::External { args, .. } => args.iter().any(|id| uses_acc(arena, *id)),
     }
 }
 

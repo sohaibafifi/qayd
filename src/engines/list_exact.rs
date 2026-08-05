@@ -101,23 +101,33 @@ pub struct Outcome {
 
 #[derive(Clone)]
 enum ListConstraint {
-    Length { list: usize, min: usize, max: usize },
-    ItemSum { list: usize, weights: Vec<(i32, i64)>, min: i64, max: i64 },
+    Length {
+        list: usize,
+        min: usize,
+        max: usize,
+    },
+    ItemSum {
+        list: usize,
+        weights: Vec<(i32, i64)>,
+        min: i64,
+        max: i64,
+    },
     /// A sequence reduction (scan) checked by evaluating it on the completed
     /// ordered lists during enumeration, rather than posted into the solver.
-    Reduction { reduction: list::Reduction, op: list::Op, rhs: i64 },
+    Reduction {
+        reduction: list::Reduction,
+        op: list::Op,
+        rhs: i64,
+    },
     Impossible,
 }
 
 fn list_constraint(constraint: &list::Constraint, items: &[i32]) -> Option<ListConstraint> {
     let list::Iterable::Items(list) = &constraint.reduction.iterable else {
-        // A scan constraint has no linearizable posting; it is enumeration-checked.
-        if matches!(constraint.reduction.iterable, list::Iterable::Scan { .. }) {
-            return Some(ListConstraint::Reduction {
-                reduction: constraint.reduction.clone(),
-                op: constraint.op,
-                rhs: constraint.rhs,
-            });
+        // Order-sensitive and set reductions have no linearizable posting here;
+        // they are checked on completed assignments.
+        if matches!(constraint.reduction.iterable, list::Iterable::Scan { .. } | list::Iterable::SetItems(_)) {
+            return Some(ListConstraint::Reduction { reduction: constraint.reduction.clone(), op: constraint.op, rhs: constraint.rhs });
         }
         return None;
     };
@@ -194,43 +204,7 @@ fn used_constraint_as_length(list: usize, op: list::Op, rhs: i64, item_count: us
 }
 
 fn eval_collection_expr_one(arena: &[list::Expr], id: list::ExprId, arg0: i64) -> Option<i64> {
-    let node = arena.get(id.0 as usize)?;
-    Some(match node {
-        list::Expr::Const(value) => *value,
-        list::Expr::Arg(0) => arg0,
-        list::Expr::Arg(_) => return None,
-        list::Expr::Array(values, index) => {
-            let index = eval_collection_expr_one(arena, *index, arg0)?;
-            *values.get(usize::try_from(index).ok()?)?
-        }
-        list::Expr::Matrix(_, _, _) => return None,
-        list::Expr::Add(a, b) => eval_collection_expr_one(arena, *a, arg0)?.checked_add(eval_collection_expr_one(arena, *b, arg0)?)?,
-        list::Expr::Sub(a, b) => eval_collection_expr_one(arena, *a, arg0)?.checked_sub(eval_collection_expr_one(arena, *b, arg0)?)?,
-        list::Expr::Mul(a, b) => eval_collection_expr_one(arena, *a, arg0)?.checked_mul(eval_collection_expr_one(arena, *b, arg0)?)?,
-        list::Expr::Min(a, b) => eval_collection_expr_one(arena, *a, arg0)?.min(eval_collection_expr_one(arena, *b, arg0)?),
-        list::Expr::Max(a, b) => eval_collection_expr_one(arena, *a, arg0)?.max(eval_collection_expr_one(arena, *b, arg0)?),
-        list::Expr::Div(a, b) => {
-            let numerator = eval_collection_expr_one(arena, *a, arg0)?;
-            let denominator = eval_collection_expr_one(arena, *b, arg0)?;
-            if denominator == 0 {
-                0
-            } else {
-                numerator.checked_div(denominator)?
-            }
-        }
-        list::Expr::Abs(a) => eval_collection_expr_one(arena, *a, arg0)?.saturating_abs(),
-        list::Expr::Lt(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? < eval_collection_expr_one(arena, *b, arg0)?),
-        list::Expr::Le(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? <= eval_collection_expr_one(arena, *b, arg0)?),
-        list::Expr::Eq(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? == eval_collection_expr_one(arena, *b, arg0)?),
-        list::Expr::Ne(a, b) => i64::from(eval_collection_expr_one(arena, *a, arg0)? != eval_collection_expr_one(arena, *b, arg0)?),
-        list::Expr::IfThenElse(c, a, b) => {
-            if eval_collection_expr_one(arena, *c, arg0)? != 0 {
-                eval_collection_expr_one(arena, *a, arg0)?
-            } else {
-                eval_collection_expr_one(arena, *b, arg0)?
-            }
-        }
-    })
+    list::eval_expr_checked(arena, id, &[arg0])
 }
 
 /// Solve a supported list model. `objective_tiers` is parsed by the
@@ -253,7 +227,11 @@ pub fn solve(
     // on completed ordered lists, so it needs the enumeration path. The member-var
     // and chrono paths would accept assignments that violate it.
     let has_unposted_reduction = parsed.iter().any(|c| matches!(c, ListConstraint::Reduction { .. }));
-    if has_unposted_reduction || objective_tiers_order_dependent(objective_tiers) {
+    let has_unposted_global = model
+        .globals
+        .iter()
+        .any(|global| !matches!(global, list::GlobalConstraint::ListLe { .. } | list::GlobalConstraint::SameList { .. }));
+    if has_unposted_reduction || has_unposted_global || objective_tiers_order_dependent(objective_tiers) {
         return Ok(Some(run_ordered_search(model, &parsed, objective_tiers, stop, &mut on_improve)));
     }
 
@@ -423,16 +401,31 @@ fn ordered_lists_feasible(parsed: &[ListConstraint], globals: &[list::GlobalCons
             None => false,
         },
         ListConstraint::Impossible => false,
-    }) && globals.iter().all(|global| match *global {
+    }) && globals.iter().all(|global| match global {
         list::GlobalConstraint::ListLe { before, after } => {
-            let Some(before_list) = ordered_item_owner(lists, before) else { return false };
-            let Some(after_list) = ordered_item_owner(lists, after) else { return false };
+            let Some(before_list) = ordered_item_owner(lists, *before) else { return false };
+            let Some(after_list) = ordered_item_owner(lists, *after) else { return false };
             before_list <= after_list
         }
         list::GlobalConstraint::SameList { a, b } => {
-            let Some(a_list) = ordered_item_owner(lists, a) else { return false };
-            let Some(b_list) = ordered_item_owner(lists, b) else { return false };
+            let Some(a_list) = ordered_item_owner(lists, *a) else { return false };
+            let Some(b_list) = ordered_item_owner(lists, *b) else { return false };
             a_list == b_list
+        }
+        list::GlobalConstraint::DifferentList { a, b } => {
+            ordered_item_owner(lists, *a).zip(ordered_item_owner(lists, *b)).is_some_and(|(a, b)| a != b)
+        }
+        list::GlobalConstraint::AllSameList { items } => {
+            let mut owners = items.iter().map(|item| ordered_item_owner(lists, *item));
+            let Some(Some(first)) = owners.next() else { return false };
+            owners.all(|owner| owner == Some(first))
+        }
+        list::GlobalConstraint::AllDifferentLists { items } => {
+            let mut owners = std::collections::HashSet::with_capacity(items.len());
+            items.iter().all(|item| ordered_item_owner(lists, *item).is_some_and(|owner| owners.insert(owner)))
+        }
+        list::GlobalConstraint::ListDistance { a, b, min, max } => {
+            ordered_item_owner(lists, *a).zip(ordered_item_owner(lists, *b)).is_some_and(|(a, b)| (*min..=*max).contains(&a.abs_diff(b)))
         }
     })
 }
@@ -662,13 +655,17 @@ fn build_solver(model: &CollectionModel, parsed: &[ListConstraint]) -> (Solver, 
         }
     }
     for global in &model.globals {
-        match *global {
+        match global {
             list::GlobalConstraint::ListLe { before, after } => {
-                list_constraints::item_precedence(&mut solver, &lists, before, after);
+                list_constraints::item_precedence(&mut solver, &lists, *before, *after);
             }
             list::GlobalConstraint::SameList { a, b } => {
-                list_constraints::same_list(&mut solver, &lists, a, b);
+                list_constraints::same_list(&mut solver, &lists, *a, *b);
             }
+            list::GlobalConstraint::DifferentList { .. }
+            | list::GlobalConstraint::AllSameList { .. }
+            | list::GlobalConstraint::AllDifferentLists { .. }
+            | list::GlobalConstraint::ListDistance { .. } => {}
         }
     }
 

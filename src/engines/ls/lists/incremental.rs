@@ -88,6 +88,7 @@ impl ListView for InsertView<'_> {
 pub(super) struct EvalScratch {
     removed: Vec<i64>,
     added: Vec<i64>,
+    members: Vec<i32>,
     recomputed_scan_steps: u64,
     sum_value: Option<i64>,
 }
@@ -96,6 +97,7 @@ impl EvalScratch {
     fn clear(&mut self) {
         self.removed.clear();
         self.added.clear();
+        self.members.clear();
         self.recomputed_scan_steps = 0;
         self.sum_value = None;
     }
@@ -169,6 +171,7 @@ impl ReductionCache {
         let suffix = candidate.common_suffix_len(old, prefix);
         match &reduction.iterable {
             Iterable::Items(_) => self.items_delta(reduction, old, candidate, prefix, suffix, scratch),
+            Iterable::SetItems(_) => self.set_items_delta(reduction, candidate, scratch),
             Iterable::Edges { start, end, .. } => self.edges_delta(reduction, old, candidate, prefix, suffix, *start, *end, scratch),
             Iterable::Pairs(_) => self.pairs_delta(reduction, old, candidate, scratch),
             Iterable::Scan { init: _, boundary, step, end, .. } => {
@@ -195,6 +198,18 @@ impl ReductionCache {
             scratch.added.push(eval_expr(&reduction.arena.exprs, reduction.body, &[i64::from(candidate.at(pos))]));
         }
         self.finish_contiguous_sum(prefix, old_end, scratch);
+    }
+
+    fn set_items_delta(&self, reduction: &Reduction, candidate: &dyn ListView, scratch: &mut EvalScratch) {
+        scratch.removed.extend_from_slice(&self.outputs);
+        scratch.members.extend((0..candidate.len()).map(|index| candidate.at(index)));
+        scratch.members.sort_unstable();
+        for &item in &scratch.members {
+            scratch.added.push(eval_expr(&reduction.arena.exprs, reduction.body, &[i64::from(item)]));
+        }
+        if matches!(reduction.op, ReduceOp::Sum) {
+            scratch.sum_value = Some(scratch.added.iter().fold(0i64, |sum, &value| sum.saturating_add(value)));
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -350,6 +365,11 @@ fn emit_slice(reduction: &Reduction, contents: &[i32], outputs: &mut Vec<i64>, s
     match reduction.iterable {
         Iterable::Items(_) => {
             outputs.extend(contents.iter().map(|&item| eval_expr(arena, reduction.body, &[i64::from(item)])));
+        }
+        Iterable::SetItems(_) => {
+            let mut members = contents.to_vec();
+            members.sort_unstable();
+            outputs.extend(members.into_iter().map(|item| eval_expr(arena, reduction.body, &[i64::from(item)])));
         }
         Iterable::Edges { start, end, .. } => {
             for edge in 0..=contents.len() {

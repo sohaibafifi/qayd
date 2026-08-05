@@ -1,4 +1,5 @@
-use super::ir::{CollectionModel, Expr, ExprId, Iterable, Reduction, Resource, MAX_TIERS};
+use super::external::call_external_function;
+use super::ir::{CollectionModel, Expr, ExprId, GlobalConstraint, Iterable, Reduction, Resource};
 
 fn eval_expr_checked(arena: &[Expr], id: ExprId, args: &[i64]) -> Result<i64, String> {
     let node = arena.get(id.0 as usize).ok_or_else(|| format!("expr id {} out of arena range", id.0))?;
@@ -33,6 +34,16 @@ fn eval_expr_checked(arena: &[Expr], id: ExprId, args: &[i64]) -> Result<i64, St
         Expr::Mul(a, b) => eval_expr_checked(arena, *a, args)?
             .checked_mul(eval_expr_checked(arena, *b, args)?)
             .ok_or_else(|| "integer overflow in a lambda body (*)".to_string())?,
+        Expr::Mod(a, b) => eval_expr_checked(arena, *a, args)?.checked_rem(eval_expr_checked(arena, *b, args)?).unwrap_or(0),
+        Expr::Pow(base, exponent) => eval_expr_checked(arena, *base, args)?
+            .checked_pow(*exponent)
+            .ok_or_else(|| "integer overflow in a lambda body (pow)".to_string())?,
+        Expr::MulScaled(a, b, scale) => {
+            checked_scaled(eval_expr_checked(arena, *a, args)?, eval_expr_checked(arena, *b, args)?, *scale, false)?
+        }
+        Expr::DivScaled(a, b, scale) => {
+            checked_scaled(eval_expr_checked(arena, *a, args)?, eval_expr_checked(arena, *b, args)?, *scale, true)?
+        }
         Expr::Min(a, b) => eval_expr_checked(arena, *a, args)?.min(eval_expr_checked(arena, *b, args)?),
         Expr::Max(a, b) => eval_expr_checked(arena, *a, args)?.max(eval_expr_checked(arena, *b, args)?),
         Expr::Div(a, b) => {
@@ -59,7 +70,56 @@ fn eval_expr_checked(arena: &[Expr], id: ExprId, args: &[i64]) -> Result<i64, St
                 eval_expr_checked(arena, *b, args)?
             }
         }
+        Expr::PiecewiseLinear { input, points } => checked_piecewise(eval_expr_checked(arena, *input, args)?, points)?,
+        Expr::External { name, args: external_args } => {
+            let values = external_args.iter().map(|id| eval_expr_checked(arena, *id, args)).collect::<Result<Vec<_>, _>>()?;
+            call_external_function(name, &values)?
+        }
     })
+}
+
+fn checked_round_ratio(numerator: i128, denominator: i128) -> i128 {
+    if denominator == 0 {
+        return 0;
+    }
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    if remainder.abs().saturating_mul(2) >= denominator.abs() {
+        quotient + if numerator.signum() == denominator.signum() { 1 } else { -1 }
+    } else {
+        quotient
+    }
+}
+
+fn checked_scaled(a: i64, b: i64, scale: i64, divide: bool) -> Result<i64, String> {
+    if scale <= 0 {
+        return Err("fixed-point scale must be positive".to_string());
+    }
+    if divide && b == 0 {
+        return Ok(0);
+    }
+    let (numerator, denominator) =
+        if divide { (i128::from(a) * i128::from(scale), i128::from(b)) } else { (i128::from(a) * i128::from(b), i128::from(scale)) };
+    i64::try_from(checked_round_ratio(numerator, denominator)).map_err(|_| "fixed-point result overflows i64".to_string())
+}
+
+fn checked_piecewise(input: i64, points: &[(i64, i64)]) -> Result<i64, String> {
+    if points.is_empty() || points.windows(2).any(|window| window[0].0 >= window[1].0) {
+        return Err("piecewise-linear knots must be non-empty with strictly increasing x coordinates".to_string());
+    }
+    if input <= points[0].0 {
+        return Ok(points[0].1);
+    }
+    for window in points.windows(2) {
+        let (x0, y0) = window[0];
+        let (x1, y1) = window[1];
+        if input <= x1 {
+            let numerator = (i128::from(input) - i128::from(x0)) * (i128::from(y1) - i128::from(y0));
+            let value = i128::from(y0) + checked_round_ratio(numerator, i128::from(x1) - i128::from(x0));
+            return i64::try_from(value).map_err(|_| "piecewise-linear result overflows i64".to_string());
+        }
+    }
+    Ok(points.last().map_or(0, |&(_, y)| y))
 }
 
 /// Bitmask of which `Arg(k)` binders (k < 8) appear in a subtree.
@@ -70,11 +130,14 @@ fn args_used(arena: &[Expr], id: ExprId) -> u8 {
         Some(Expr::Arg(k)) => 1u8.checked_shl(u32::from(*k)).unwrap_or(0),
         Some(Expr::Array(_, i)) => args_used(arena, *i),
         Some(Expr::Matrix(_, i, j)) => args_used(arena, *i) | args_used(arena, *j),
-        Some(Expr::Abs(a)) => args_used(arena, *a),
+        Some(Expr::Abs(a) | Expr::Pow(a, _) | Expr::PiecewiseLinear { input: a, .. }) => args_used(arena, *a),
         Some(
             Expr::Add(a, b)
             | Expr::Sub(a, b)
             | Expr::Mul(a, b)
+            | Expr::Mod(a, b)
+            | Expr::MulScaled(a, b, _)
+            | Expr::DivScaled(a, b, _)
             | Expr::Min(a, b)
             | Expr::Max(a, b)
             | Expr::Div(a, b)
@@ -84,6 +147,7 @@ fn args_used(arena: &[Expr], id: ExprId) -> u8 {
             | Expr::Ne(a, b),
         ) => args_used(arena, *a) | args_used(arena, *b),
         Some(Expr::IfThenElse(c, a, b)) => args_used(arena, *c) | args_used(arena, *a) | args_used(arena, *b),
+        Some(Expr::External { args, .. }) => args.iter().fold(0, |mask, &id| mask | args_used(arena, id)),
     }
 }
 
@@ -164,7 +228,7 @@ fn validate_reduction(reduction: &Reduction, items: &[i32], lists: usize) -> Res
     let scan_cur: Vec<i64>;
     let acc_dummy = [0i64];
     let domains: Vec<&[i64]> = match reduction.iterable {
-        Iterable::Items(_) => vec![&items_i],
+        Iterable::Items(_) | Iterable::SetItems(_) => vec![&items_i],
         Iterable::Edges { start, end, .. } => {
             let mut n = items_i.clone();
             n.push(i64::from(start));
@@ -210,6 +274,21 @@ fn validate_reduction(reduction: &Reduction, items: &[i32], lists: usize) -> Res
         }
     };
 
+    for node in arena {
+        match node {
+            Expr::MulScaled(_, _, scale) | Expr::DivScaled(_, _, scale) if *scale <= 0 => {
+                return Err("fixed-point scale must be positive".to_string());
+            }
+            Expr::PiecewiseLinear { points, .. } if points.is_empty() || points.windows(2).any(|window| window[0].0 >= window[1].0) => {
+                return Err("piecewise-linear knots must be non-empty with strictly increasing x coordinates".to_string());
+            }
+            Expr::External { name, .. } if !super::external_function_registered(name) => {
+                return Err(format!("external function '{name}' is not registered"));
+            }
+            _ => {}
+        }
+    }
+
     // A conditional body is evaluated lazily at solve (only the selected branch
     // runs), so a guarded out-of-range index in an unselected branch is never
     // reached. Validate it the same way -- lazily, over every argument combination
@@ -221,7 +300,8 @@ fn validate_reduction(reduction: &Reduction, items: &[i32], lists: usize) -> Res
     // evaluation miss an out-of-range access; they keep the conservative static
     // check below.
     let has_conditional = arena.iter().any(|node| matches!(node, Expr::IfThenElse(..)));
-    let single_finite_root = matches!(reduction.iterable, Iterable::Items(_) | Iterable::Edges { .. } | Iterable::Pairs(_));
+    let single_finite_root =
+        matches!(reduction.iterable, Iterable::Items(_) | Iterable::SetItems(_) | Iterable::Edges { .. } | Iterable::Pairs(_));
     if has_conditional && single_finite_root {
         let mask = args_used(arena, reduction.body);
         let varying: Vec<usize> = (0..domains.len()).filter(|&s| mask & (1u8 << s) != 0).collect();
@@ -262,6 +342,15 @@ fn validate_reduction(reduction: &Reduction, items: &[i32], lists: usize) -> Res
                     })?;
                 }
             }
+            Expr::MulScaled(_, _, scale) | Expr::DivScaled(_, _, scale) if *scale <= 0 => {
+                return Err("fixed-point scale must be positive".to_string());
+            }
+            Expr::PiecewiseLinear { points, .. } if points.is_empty() || points.windows(2).any(|window| window[0].0 >= window[1].0) => {
+                return Err("piecewise-linear knots must be non-empty with strictly increasing x coordinates".to_string());
+            }
+            Expr::External { name, .. } if !super::external_function_registered(name) => {
+                return Err(format!("external function '{name}' is not registered"));
+            }
             _ => {}
         }
     }
@@ -286,6 +375,9 @@ impl CollectionModel {
                         return Err("interval duration must be in 0..=horizon".to_string());
                     }
                 } else {
+                    if iv.optional {
+                        return Err("a moded operation cannot also be optional; make its mode intervals optional instead".to_string());
+                    }
                     for mode in &iv.modes {
                         if mode.duration < 0 || mode.duration > iv.horizon {
                             return Err("interval mode duration must be in 0..=horizon".to_string());
@@ -333,9 +425,6 @@ impl CollectionModel {
         if let Some(dup) = self.items.iter().find(|v| !seen.insert(**v)) {
             return Err(format!("duplicate item {dup}; items must be distinct"));
         }
-        if self.objectives.len() > MAX_TIERS {
-            return Err(format!("at most {MAX_TIERS} objective tiers are supported"));
-        }
         for tier in &self.objectives {
             for r in tier.reductions() {
                 validate_reduction(r, &self.items, self.lists)?;
@@ -349,6 +438,21 @@ impl CollectionModel {
                 if !self.items.contains(&v) {
                     return Err(format!("global constraint references item {v}, which is not in the universe"));
                 }
+            }
+            match g {
+                GlobalConstraint::AllSameList { items } | GlobalConstraint::AllDifferentLists { items } => {
+                    if items.len() < 2 {
+                        return Err("an all-same/all-different list group needs at least two items".to_string());
+                    }
+                    let mut seen = std::collections::HashSet::with_capacity(items.len());
+                    if items.iter().any(|item| !seen.insert(*item)) {
+                        return Err("an all-same/all-different list group cannot contain duplicate items".to_string());
+                    }
+                }
+                GlobalConstraint::ListDistance { min, max, .. } if min > max => {
+                    return Err("list-distance minimum cannot exceed its maximum".to_string());
+                }
+                _ => {}
             }
         }
         Ok(())

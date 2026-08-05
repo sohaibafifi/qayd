@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::model::list::{Iterable, ReduceOp, Reduction};
 
-const ITERABLE_KINDS: usize = 5;
+const ITERABLE_KINDS: usize = 6;
 const REDUCE_OP_KINDS: usize = 6;
 const REDUCTION_KINDS: usize = ITERABLE_KINDS * REDUCE_OP_KINDS;
 
@@ -12,6 +12,7 @@ const REDUCTION_KINDS: usize = ITERABLE_KINDS * REDUCE_OP_KINDS;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListIterableKind {
     Items,
+    SetItems,
     Edges,
     Pairs,
     Scan,
@@ -19,15 +20,16 @@ pub enum ListIterableKind {
 }
 
 impl ListIterableKind {
-    const ALL: [Self; ITERABLE_KINDS] = [Self::Items, Self::Edges, Self::Pairs, Self::Scan, Self::Windows];
+    const ALL: [Self; ITERABLE_KINDS] = [Self::Items, Self::SetItems, Self::Edges, Self::Pairs, Self::Scan, Self::Windows];
 
     const fn index(self) -> usize {
         match self {
             Self::Items => 0,
-            Self::Edges => 1,
-            Self::Pairs => 2,
-            Self::Scan => 3,
-            Self::Windows => 4,
+            Self::SetItems => 1,
+            Self::Edges => 2,
+            Self::Pairs => 3,
+            Self::Scan => 4,
+            Self::Windows => 5,
         }
     }
 }
@@ -36,6 +38,7 @@ impl fmt::Display for ListIterableKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Items => "items",
+            Self::SetItems => "set_items",
             Self::Edges => "edges",
             Self::Pairs => "pairs",
             Self::Scan => "scan",
@@ -352,6 +355,7 @@ pub(super) fn metrics_enabled_from_env() -> bool {
 fn reduction_kind(reduction: &Reduction) -> (ListIterableKind, ListReduceOpKind) {
     let iterable = match reduction.iterable {
         Iterable::Items(_) => ListIterableKind::Items,
+        Iterable::SetItems(_) => ListIterableKind::SetItems,
         Iterable::Edges { .. } => ListIterableKind::Edges,
         Iterable::Pairs(_) => ListIterableKind::Pairs,
         Iterable::Scan { .. } => ListIterableKind::Scan,
@@ -374,7 +378,7 @@ const fn kind_index(iterable: ListIterableKind, op: ListReduceOpKind) -> usize {
 
 fn iterable_steps(iterable: &Iterable, contents_len: usize) -> u64 {
     let steps = match iterable {
-        Iterable::Items(_) => contents_len,
+        Iterable::Items(_) | Iterable::SetItems(_) => contents_len,
         Iterable::Edges { .. } => contents_len.saturating_add(1),
         Iterable::Pairs(_) => contents_len.saturating_mul(contents_len),
         Iterable::Scan { end, .. } => contents_len.saturating_add(usize::from(end.is_some())),

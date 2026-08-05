@@ -6,8 +6,37 @@
 
 use std::sync::Arc;
 
-/// Maximum number of lexicographic objective tiers a model may declare.
-pub const MAX_TIERS: usize = 4;
+/// Deterministic fixed-point value used for controlled real modeling. Every
+/// value is represented exactly as `raw / scale`; the scale must be positive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FixedPoint {
+    pub raw: i64,
+    pub scale: i64,
+}
+
+impl FixedPoint {
+    pub fn new(raw: i64, scale: i64) -> Result<Self, String> {
+        if scale <= 0 {
+            return Err("fixed-point scale must be positive".to_string());
+        }
+        Ok(Self { raw, scale })
+    }
+
+    pub fn from_f64(value: f64, scale: i64) -> Result<Self, String> {
+        if !value.is_finite() || scale <= 0 {
+            return Err("fixed-point value must be finite and its scale positive".to_string());
+        }
+        let scaled = value * scale as f64;
+        if scaled < i64::MIN as f64 || scaled > i64::MAX as f64 {
+            return Err("fixed-point value is outside the i64 range".to_string());
+        }
+        Ok(Self { raw: scaled.round() as i64, scale })
+    }
+
+    pub fn to_f64(self) -> f64 {
+        self.raw as f64 / self.scale as f64
+    }
+}
 
 /// How a reduction aggregates its body values over the iterable.
 #[derive(Clone, Copy)]
@@ -55,6 +84,12 @@ pub enum Expr {
     Add(ExprId, ExprId),
     Sub(ExprId, ExprId),
     Mul(ExprId, ExprId),
+    Mod(ExprId, ExprId),
+    Pow(ExprId, u32),
+    /// Fixed-point multiplication: `round(a * b / scale)`.
+    MulScaled(ExprId, ExprId, i64),
+    /// Fixed-point division: `round(a * scale / b)`.
+    DivScaled(ExprId, ExprId, i64),
     Min(ExprId, ExprId),
     Max(ExprId, ExprId),
     /// Integer division (`b == 0` yields 0, so it never panics).
@@ -68,6 +103,17 @@ pub enum Expr {
     Ne(ExprId, ExprId),
     /// `cond != 0 ? then : otherwise`.
     IfThenElse(ExprId, ExprId, ExprId),
+    /// Continuous piecewise-linear interpolation over strictly increasing
+    /// `(x, y)` knots. Values outside the knot range are clamped to an endpoint.
+    PiecewiseLinear {
+        input: ExprId,
+        points: Arc<Vec<(i64, i64)>>,
+    },
+    /// Call a process-registered deterministic external function.
+    External {
+        name: Arc<str>,
+        args: Arc<Vec<ExprId>>,
+    },
 }
 
 /// A flat arena of [`Expr`] nodes; the body is the last/returned [`ExprId`].
@@ -103,6 +149,18 @@ impl ExprArena {
     pub fn mul(&mut self, a: ExprId, b: ExprId) -> ExprId {
         self.push(Expr::Mul(a, b))
     }
+    pub fn modulo(&mut self, a: ExprId, b: ExprId) -> ExprId {
+        self.push(Expr::Mod(a, b))
+    }
+    pub fn pow(&mut self, base: ExprId, exponent: u32) -> ExprId {
+        self.push(Expr::Pow(base, exponent))
+    }
+    pub fn mul_scaled(&mut self, a: ExprId, b: ExprId, scale: i64) -> ExprId {
+        self.push(Expr::MulScaled(a, b, scale))
+    }
+    pub fn div_scaled(&mut self, a: ExprId, b: ExprId, scale: i64) -> ExprId {
+        self.push(Expr::DivScaled(a, b, scale))
+    }
     pub fn min(&mut self, a: ExprId, b: ExprId) -> ExprId {
         self.push(Expr::Min(a, b))
     }
@@ -130,6 +188,12 @@ impl ExprArena {
     pub fn if_then_else(&mut self, c: ExprId, a: ExprId, b: ExprId) -> ExprId {
         self.push(Expr::IfThenElse(c, a, b))
     }
+    pub fn piecewise_linear(&mut self, input: ExprId, points: Arc<Vec<(i64, i64)>>) -> ExprId {
+        self.push(Expr::PiecewiseLinear { input, points })
+    }
+    pub fn external(&mut self, name: impl Into<Arc<str>>, args: Vec<ExprId>) -> ExprId {
+        self.push(Expr::External { name: name.into(), args: Arc::new(args) })
+    }
 }
 
 /// What a reduction iterates over. Every form names the list it reads.
@@ -137,6 +201,9 @@ impl ExprArena {
 pub enum Iterable {
     /// Each item of the list once; the body sees the item value as `Arg(0)`.
     Items(usize),
+    /// Each member of an unordered set. Evaluation uses increasing item order,
+    /// giving deterministic fixed-point and saturating arithmetic semantics.
+    SetItems(usize),
     /// Each edge of `[start, items.., end]`; the body sees source as `Arg(0)`
     /// and target as `Arg(1)`. Used for closed-tour distance with a depot.
     Edges { list: usize, start: i32, end: i32 },
@@ -174,7 +241,11 @@ impl Iterable {
     /// The list variable this reduction reads.
     pub fn list(&self) -> usize {
         match self {
-            Iterable::Items(l) | Iterable::Pairs(l) | Iterable::Scan { list: l, .. } | Iterable::Windows { list: l, .. } => *l,
+            Iterable::Items(l)
+            | Iterable::SetItems(l)
+            | Iterable::Pairs(l)
+            | Iterable::Scan { list: l, .. }
+            | Iterable::Windows { list: l, .. } => *l,
             Iterable::Edges { list, .. } => *list,
         }
     }
@@ -202,20 +273,31 @@ pub struct Constraint {
 /// [`Reduction`], it is global (spans lists), so it is tracked separately from
 /// the per-list scores. Used for assembly-line precedence and pickup/delivery
 /// same-vehicle.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum GlobalConstraint {
     /// `list_of(before) <= list_of(after)`: `before` is assigned to a list whose
     /// index is no greater than `after`'s (a precedence over ordered stations).
     ListLe { before: i32, after: i32 },
     /// `list_of(a) == list_of(b)`: both items share a list (same vehicle/bin).
     SameList { a: i32, b: i32 },
+    /// Two items must be assigned to different lists.
+    DifferentList { a: i32, b: i32 },
+    /// Every item in the group must share one list.
+    AllSameList { items: Arc<Vec<i32>> },
+    /// Every item in the group must use a distinct list.
+    AllDifferentLists { items: Arc<Vec<i32>> },
+    /// The absolute distance between the owner-list indices must be bounded.
+    ListDistance { a: i32, b: i32, min: usize, max: usize },
 }
 
 impl GlobalConstraint {
-    pub(crate) fn items(&self) -> [i32; 2] {
-        match *self {
-            GlobalConstraint::ListLe { before, after } => [before, after],
-            GlobalConstraint::SameList { a, b } => [a, b],
+    pub(crate) fn items(&self) -> Vec<i32> {
+        match self {
+            GlobalConstraint::ListLe { before, after } => vec![*before, *after],
+            GlobalConstraint::SameList { a, b }
+            | GlobalConstraint::DifferentList { a, b }
+            | GlobalConstraint::ListDistance { a, b, .. } => vec![*a, *b],
+            GlobalConstraint::AllSameList { items } | GlobalConstraint::AllDifferentLists { items } => items.as_ref().clone(),
         }
     }
 }
@@ -230,7 +312,8 @@ pub struct MaxTerm {
 
 /// One lexicographic objective tier. The tier value is the sum of its reductions
 /// plus each `max_terms` component. Earlier tiers dominate later ones (e.g. fleet
-/// size before distance). At most [`MAX_TIERS`] tiers.
+/// size before distance). The number of tiers is dynamic and unbounded by the
+/// IR; practical limits are memory and evaluation time only.
 #[derive(Clone)]
 pub struct ObjectiveTier {
     pub minimize: bool,
@@ -268,6 +351,9 @@ pub struct IntervalVar {
     pub duration: i64,
     pub horizon: i64,
     pub modes: Vec<Mode>,
+    /// Whether a fixed-duration interval may be absent. Moded operations remain
+    /// mandatory because their modes already use optional member intervals.
+    pub optional: bool,
 }
 
 /// A renewable-resource limit over interval variables. `NoOverlap` is a unary
@@ -323,6 +409,8 @@ pub struct CollectionSolution {
     pub feasible: bool,
     /// Interval start times, for a [`Schedule`] model (empty otherwise).
     pub starts: Vec<i64>,
+    /// Interval presence flags for a schedule model (empty for list models).
+    pub presences: Vec<bool>,
     /// Chosen machine of each interval (`-1` if it has no modes), for a moded
     /// [`Schedule`] model (empty otherwise).
     pub machines: Vec<i64>,
