@@ -7,34 +7,30 @@ Tune time via ``QAYD_VRP_T``; trace with ``QAYD_VERBOSE=1``.
 """
 
 import os
-import re
-
-try:
-    import vrplib
-except ImportError as exc:
-    raise SystemExit("install example dependencies with `uv run --extra examples ...`") from exc
 
 import qayd as cp
+from qayd.datasets import read_cvrplib
 
 here = os.path.dirname(os.path.abspath(__file__))
 repo_root = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))
-path = os.environ.get("QAYD_VRP_INSTANCE", os.path.join(repo_root, "data", "vrplib", "CVRP", "X-n101-k25.vrp"))
+path = os.environ.get(
+    "QAYD_VRP_INSTANCE",
+    os.path.join(repo_root, "data", "vrplib", "CVRP", "X-n101-k25.vrp"),
+)
 time_limit = int(os.environ.get("QAYD_VRP_T", "10"))
 
 if not os.path.exists(path):
     raise SystemExit("set QAYD_VRP_INSTANCE to a CVRPLIB .vrp file")
 
-inst = vrplib.read_instance(path)
-name = inst.get("name", os.path.basename(path))
-dim = len(inst["demand"])
-depot = int(inst["depot"][0])
-capacity = int(inst["capacity"])
-demand = [int(d) for d in inst["demand"]]
-customer_ids = [i for i in range(dim) if i != depot]
-dist = [[int(w + 0.5) for w in row] for row in inst["edge_weight"]]
+inst = read_cvrplib(path)
+name = inst.name
+depot = inst.depot
+capacity = inst.capacity
+demand = list(inst.demands)
+customer_ids = list(inst.customers)
+dist = [list(row) for row in inst.edge_weights]
 
-m = re.search(r"-k(\d+)", name)
-min_k = int(m.group(1)) if m else -(-sum(demand) // capacity)
+min_k = inst.vehicles or -(-sum(demand) // capacity)
 k = int(os.environ.get("QAYD_VRP_K", str(min_k)))
 
 model = cp.Model()
@@ -47,14 +43,19 @@ for route in routes:
     model.add(route.sum(lambda customer: customer.demand) <= capacity)
 model.minimize(routes.sum(lambda route: route.distance()))
 
-solution = model.solve(time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1")
+solution = model.solve(
+    time_limit=time_limit, verbose=os.environ.get("QAYD_VERBOSE") == "1"
+)
 
-opt = re.search(r"Optimal value:\s*(\d+)", inst.get("comment", ""))
-gap = f"  (known optimum {opt.group(1)})" if opt else ""
+gap = f"  (known optimum {inst.best_known})" if inst.best_known is not None else ""
 
-print(f"instance: {name}  customers: {len(customers)}  vehicles: {k}  capacity: {capacity}")
+print(
+    f"instance: {name}  customers: {len(customers)}  vehicles: {k}  capacity: {capacity}"
+)
 if solution.lists is None:
-    raise SystemExit(f"status: {solution.status} - no feasible solution within {time_limit}s")
+    raise SystemExit(
+        f"status: {solution.status} - no feasible solution within {time_limit}s"
+    )
 fleet = sum(1 for route in solution.lists if route)
 distance = solution.objectives[-1]
 print(f"status: {solution.status}  fleet: {fleet}  total distance: {distance}{gap}")

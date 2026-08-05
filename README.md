@@ -118,7 +118,7 @@ The Python examples live under `examples/python/`, grouped by domain: `routing/`
 `scheduling/`, `packing/`, `optimization/`, and `mus/` (infeasibility analysis).
 
 ```bash
-QAYD_VRP_INSTANCE=/path/to/instance.vrp uv run --extra examples examples/python/routing/api/vrp.py
+QAYD_VRP_INSTANCE=/path/to/instance.vrp uv run examples/python/routing/api/vrp.py
 uv run examples/python/routing/api/cvrptw.py
 uv run examples/python/scheduling/api/jssp.py
 uv run examples/python/scheduling/api/rcpsp.py
@@ -133,11 +133,24 @@ uv run examples/python/mus/mus_enumerate.py # all MUSes + MSSes/MCSes (MARCO): m
 
 The API routing examples live under `examples/python/routing/api/`; the raw
 list-lambda equivalents live under `examples/python/routing/native/`. The VRP
-example uses `vrplib` and expects a local CVRPLIB file via `QAYD_VRP_INSTANCE`.
+example uses qayd's built-in parser and expects a local CVRPLIB file via
+`QAYD_VRP_INSTANCE`.
 Interval scheduling API examples live under `examples/python/scheduling/api/`;
 the raw interval/list equivalents live under `examples/python/scheduling/native/`.
 Benchmark data under `data/` is local scratch data and is not part of the source
 release.
+
+Benchmark parsers are available without optional dependencies:
+
+```python
+from qayd.datasets import load_instance, read_cvrplib, read_jsplib, read_psplib, read_solomon
+
+instance = load_instance("data/X-n101-k25.vrp")  # marker-based detection
+distance = instance.edge_weights
+```
+
+Supported families are CVRPLIB/TSPLIB CVRP, Solomon and Gehring-Homberger
+VRPTW, JSPLIB job shop, and PSPLIB RCPSP/MRCPSP.
 
 Typical routing API shape:
 

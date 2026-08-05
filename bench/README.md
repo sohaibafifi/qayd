@@ -61,6 +61,28 @@ Use `--format jsonl` or `--format csv` for scripts. The reported
 claim about a true live push/pop continuation. Epoch solves are capped at one
 second by default; pass `--epoch-time-limit 0` for an unbounded exact run.
 
+## Phase 8 dataset parsers
+
+The pure-Python `qayd.datasets` package supplies the normalized input layer for
+the routing and scheduling campaign:
+
+| Parser | Benchmark families | Normalization contract |
+|--------|--------------------|------------------------|
+| `read_cvrplib` | CVRPLIB X and TSPLIB-style CVRP | zero-based nodes, TSPLIB integer distances |
+| `read_solomon` | Solomon and Gehring-Homberger VRPTW | zero-based nodes, explicit windows and service times |
+| `read_jsplib` | ABZ, FT, LA, ORB, SWV, Taillard and YN job shop | zero-based machine ids |
+| `read_psplib` | PSPLIB RCPSP/MRCPSP `.sm` and `.mm` | typed modes, successors and resource kinds |
+| `read_vrp_solution` | CVRPLIB/Solomon route solutions | routes plus numeric BKS cost |
+
+`load_instance(path)` detects these formats from structural markers. SAT,
+linear OPB and XCSP3 continue to use their existing qayd frontends rather than
+duplicating parsers in Python.
+
+For the DIMACS VRPTW convention, use
+`solomon.distance_matrix(scale=10, rounding="truncate")`. This stores distances
+truncated to one decimal place as integers and makes objective replay stable
+across solvers.
+
 ## Data sources
 
 - **SAT** - Global Benchmark Database, <https://benchmark-database.de>, which
