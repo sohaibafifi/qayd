@@ -170,6 +170,49 @@ Python equivalents are keyword arguments to `Model.solve`. The XCSP binary
 uses `--force-scope-reasons` and `--shared-pool-cap N` for its LCG ablations.
 There is no process-wide solver configuration through environment variables.
 
+## Clean-room behavior probes
+
+`behavior_probe.py` studies solver behavior through generated CVRPLIB inputs and
+documented solver API outputs only. Vendor-distributed runtime files are loaded
+only to call that API, and the campaign may record an opaque executable hash for
+provenance. It does not disassemble, decompile, inspect executable code, read
+non-public files, or call hidden APIs. Four paired transformations are generated
+at each requested size:
+
+| Factor | Controlled change | Measurement |
+|---|---|---|
+| `distance-scale` | multiply every edge cost by a constant | numerical scale invariance after objective normalization |
+| `index-permutation` | apply an isomorphic customer permutation | sensitivity to indices and tie-breaking |
+| `single-edge` | change one symmetric customer edge | locality of the search response |
+| `capacity-threshold` | tighten capacity without changing demands | response near a feasibility threshold |
+
+The runner reuses `campaign.py`, so every solution is replayed and the same
+wall time, process-tree RSS, certified dual, throughput, version, seed, and
+thread fields are retained. Multiple budgets are independent checkpoints. They
+provide an anytime quality curve without claiming access to an internal
+incumbent event stream.
+
+```sh
+# Fast local qayd fingerprint, about 40 one-second or three-second solves
+uv run python bench/behavior_probe.py \
+  --workspace bench/results/behavior-qayd \
+  --solver qayd-api --customers 40 --budget 1,3 \
+  --seed 0,1,2,3,4 --threads 1
+
+# Paired public-interface comparison when a licensed Hexaly install is present
+uv run python bench/behavior_probe.py \
+  --workspace bench/results/behavior-qayd-hexaly \
+  --solver qayd-api --solver hexaly --hexaly-home /opt/hexaly_14_5 \
+  --customers 40,80 --budget 1,10,60 \
+  --seed 0,1,2,3,4 --threads 1
+```
+
+The workspace contains the exact generated instances, `manifest.json`, the
+campaign JSONL and provenance sidecar, plus `report.json` and `report.md`.
+Runs resume by default. Use `--restart` to replace the campaign, `--generate-only`
+to inspect inputs before solving, or `--analyze-only` to rebuild reports from
+existing results. All configuration is passed as command-line arguments.
+
 ## Data sources
 
 - **SAT** - Global Benchmark Database, <https://benchmark-database.de>, which
