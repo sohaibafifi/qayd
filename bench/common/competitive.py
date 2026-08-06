@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import platform
 import subprocess
+import threading
 import time
 from typing import Any, Iterable, Optional, Sequence
 
@@ -176,6 +177,20 @@ def run_measured(
         stderr=subprocess.PIPE, start_new_session=(os.name == "posix"),
         preexec_fn=preexec_fn,
     )
+    captured = {"stdout": "", "stderr": ""}
+
+    def drain(name: str, stream: Any) -> None:
+        try:
+            captured[name] = stream.read()
+        finally:
+            stream.close()
+
+    readers = [
+        threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),
+        threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
     peak_rss = 0
     timed_out = False
     while process.poll() is None:
@@ -192,7 +207,9 @@ def run_measured(
                 process.kill()
             break
         time.sleep(0.01)
-    stdout, stderr = process.communicate()
+    process.wait()
+    for reader in readers:
+        reader.join()
     peak_rss = max(peak_rss, process_tree_rss_kib(process.pid))
     return {
         "argv": list(argv),
@@ -200,8 +217,8 @@ def run_measured(
         "peak_memory_mb": peak_rss / 1024.0,
         "return_code": process.returncode,
         "timed_out": timed_out,
-        "stdout": stdout,
-        "stderr": stderr,
+        "stdout": captured["stdout"],
+        "stderr": captured["stderr"],
     }
 
 

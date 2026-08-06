@@ -360,7 +360,7 @@ pub fn solve_under_assumptions(
     for &bl in cube {
         validate_bool_var(&cdcl, bl.var)?;
         match cdcl.atoms.eq(bl.var, bool_value(&cdcl, bl.var, bl.value)) {
-            LitOrConst::True => {} // trivially satisfied: never in a core
+            LitOrConst::True => {}                                             // trivially satisfied: never in a core
             LitOrConst::False => return Ok(AssumptionResult::Unsat(vec![bl])), // impossible alone
             LitOrConst::Lit(l) => {
                 if !cube_lits.contains(&l) {

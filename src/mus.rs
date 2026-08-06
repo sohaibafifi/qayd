@@ -205,10 +205,8 @@ pub fn explain_mus<'a>(solver: &'a mut Solver, vars: &[VarId], mus: &[VarId], st
         }
     }
     let footprint = cdcl.explain_by_propagation(&on)?;
-    let constraints = footprint
-        .into_iter()
-        .map(|(selector, atoms)| (selector, atoms.iter().map(|&lit| decode_atom(&cdcl, lit)).collect()))
-        .collect();
+    let constraints =
+        footprint.into_iter().map(|(selector, atoms)| (selector, atoms.iter().map(|&lit| decode_atom(&cdcl, lit)).collect())).collect();
     Some(MusExplanation { constraints })
 }
 
@@ -425,7 +423,7 @@ fn map_seed(blocks: &[Vec<BoolLit>], n: usize, stop: &AtomicBool) -> MapOutcome 
     match solve_bool_cnf_interruptible(&mut map, &mvars, blocks, stop) {
         Ok((Some(model), _, _)) => MapOutcome::Seed((0..n).filter(|&i| model[i] == 1).collect()),
         Ok((None, _, true)) => MapOutcome::Exhausted, // `complete` true ⇒ genuine UNSAT
-        _ => MapOutcome::Stopped,                      // interrupted, or a map error
+        _ => MapOutcome::Stopped,                     // interrupted, or a map error
     }
 }
 

@@ -1,0 +1,32 @@
+{
+  "name": "positioning",
+  "description": "Small stratified sample for the first five-seed qayd positioning study.",
+  "datasets": [
+    {"family": "positioning-cvrp", "problem": "cvrp", "glob": "data/vrplib/CVRP/X-n101-k25.vrp"},
+    {"family": "positioning-cvrp", "problem": "cvrp", "glob": "data/vrplib/CVRP/X-n200-k36.vrp"},
+    {"family": "positioning-cvrp", "problem": "cvrp", "glob": "data/vrplib/CVRP/X-n401-k29.vrp"},
+    {"family": "positioning-cvrp", "problem": "cvrp", "glob": "data/vrplib/CVRP/X-n701-k44.vrp"},
+    {"family": "positioning-cvrp", "problem": "cvrp", "glob": "data/vrplib/CVRP/X-n1001-k43.vrp"},
+
+    {"family": "positioning-vrptw", "problem": "cvrptw", "glob": "bench/routing/instances/solomon/In/c101.txt"},
+    {"family": "positioning-vrptw", "problem": "cvrptw", "glob": "bench/routing/instances/solomon/In/r101.txt"},
+    {"family": "positioning-vrptw", "problem": "cvrptw", "glob": "bench/routing/instances/solomon/In/rc101.txt"},
+    {"family": "positioning-vrptw", "problem": "cvrptw", "glob": "bench/routing/instances/solomon/In/c201.txt"},
+    {"family": "positioning-vrptw", "problem": "cvrptw", "glob": "bench/routing/instances/solomon/In/r201.txt"},
+    {"family": "positioning-vrptw", "problem": "cvrptw", "glob": "bench/routing/instances/solomon/In/rc201.txt"},
+
+    {"family": "positioning-jssp", "problem": "jssp", "glob": "bench/scheduling/instances/jsplib/instances/ft06"},
+    {"family": "positioning-jssp", "problem": "jssp", "glob": "bench/scheduling/instances/jsplib/instances/la38"},
+    {"family": "positioning-jssp", "problem": "jssp", "glob": "bench/scheduling/instances/jsplib/instances/orb10"},
+    {"family": "positioning-jssp", "problem": "jssp", "glob": "bench/scheduling/instances/jsplib/instances/swv10"},
+    {"family": "positioning-jssp", "problem": "jssp", "glob": "bench/scheduling/instances/jsplib/instances/ta40"},
+    {"family": "positioning-jssp", "problem": "jssp", "glob": "bench/scheduling/instances/jsplib/instances/ta80"},
+
+    {"family": "positioning-rcpsp", "problem": "rcpsp", "glob": "bench/scheduling/instances/psplib/sm/j30/j3021_1.sm"},
+    {"family": "positioning-rcpsp", "problem": "rcpsp", "glob": "bench/scheduling/instances/psplib/sm/j30/j304_9.sm"},
+    {"family": "positioning-rcpsp", "problem": "rcpsp", "glob": "bench/scheduling/instances/psplib/sm/j30/j3032_8.sm"},
+    {"family": "positioning-rcpsp", "problem": "rcpsp", "glob": "bench/scheduling/instances/psplib/sm/j30/j3048_9.sm"},
+    {"family": "positioning-rcpsp", "problem": "rcpsp", "glob": "bench/scheduling/instances/psplib/sm/j30/j3015_3.sm"},
+    {"family": "positioning-rcpsp", "problem": "rcpsp", "glob": "bench/scheduling/instances/psplib/sm/j30/j307_10.sm"}
+  ]
+}

@@ -148,6 +148,8 @@ pub(super) struct PerList {
     /// Nearest-neighbor candidate edges for routing moves, when a direct matrix
     /// edge objective is available.
     pub(super) candidates: Option<CandidateNeighbors>,
+    /// Routing data parsed once from the reductions and reused by construction.
+    routing: Option<RoutingSignature>,
     /// Whether cost-refiner moves (2-opt* / cross / reverse) may prune by the
     /// geometric candidate lists even while a route still overflows.
     pub(super) infeas_cand: bool,
@@ -171,6 +173,15 @@ struct RoutingGls {
     lambda: Cell<i64>,
     coeff: i64,
     symmetric: bool,
+}
+
+struct RoutingSignature {
+    depot: i32,
+    matrix: Arc<Vec<Vec<i64>>>,
+    demands: Option<Arc<Vec<i64>>>,
+    capacity: Option<i64>,
+    has_time_windows: bool,
+    has_fleet_objective: bool,
 }
 
 pub(super) struct CandidateNeighbors {
@@ -237,6 +248,10 @@ impl CandidateNeighbors {
         self.map.get(&a).is_some_and(|near| near.contains(&b)) || self.map.get(&b).is_some_and(|near| near.contains(&a))
     }
 
+    fn neighbors(&self, item: i32) -> &[i32] {
+        self.map.get(&item).map_or(&[], Vec::as_slice)
+    }
+
     /// The nearest neighbour of `from` (by edge cost) that is currently present and
     /// not already removed -- the relatedness ranking used by Shaw removal.
     pub(super) fn nearest_present(&self, from: i32, removed: &HashSet<i32>, present: &HashSet<i32>) -> Option<i32> {
@@ -263,6 +278,37 @@ fn direct_edge_matrix(r: &Reduction) -> Option<Arc<Vec<Vec<i64>>>> {
         }
         _ => None,
     }
+}
+
+fn direct_item_array(reduction: &Reduction) -> Option<Arc<Vec<i64>>> {
+    let Expr::Array(values, index) = reduction.arena.exprs.get(reduction.body.0 as usize)? else {
+        return None;
+    };
+    expr_is_arg(&reduction.arena.exprs, *index, 0).then(|| Arc::clone(values))
+}
+
+fn routing_signature(
+    model: &CollectionModel,
+    route_bounds: &[Option<(i32, i32)>],
+    matrix: Option<Arc<Vec<Vec<i64>>>>,
+) -> Option<RoutingSignature> {
+    let matrix = matrix?;
+    let (depot, end) = route_bounds.iter().flatten().next().copied()?;
+    if depot != end || route_bounds.iter().flatten().any(|&(start, finish)| start != depot || finish != depot) {
+        return None;
+    }
+    let capacity_constraint = model.constraints.iter().find(|constraint| {
+        matches!(constraint.op, crate::model::list::Op::Le)
+            && matches!(constraint.reduction.op, ReduceOp::Sum)
+            && matches!(constraint.reduction.iterable, Iterable::Items(_))
+            && direct_item_array(&constraint.reduction).is_some()
+    });
+    let demands = capacity_constraint.and_then(|constraint| direct_item_array(&constraint.reduction));
+    let capacity = capacity_constraint.map(|constraint| constraint.rhs);
+    let has_time_windows = model.constraints.iter().any(|constraint| matches!(constraint.reduction.iterable, Iterable::Scan { .. }));
+    let has_fleet_objective =
+        model.objectives.iter().flat_map(|tier| tier.reductions()).any(|reduction| matches!(reduction.op, ReduceOp::Used));
+    Some(RoutingSignature { depot, matrix, demands, capacity, has_time_windows, has_fleet_objective })
 }
 
 /// How a reduction can be scored incrementally from the old list plus a local
@@ -392,7 +438,7 @@ impl PerList {
         let mut senses = vec![true; tiers];
         let mut has_edges = false;
         let mut route_bounds = vec![None; model.lists];
-        let mut candidate_matrix = None;
+        let mut candidate_matrix: Option<Arc<Vec<Vec<i64>>>> = None;
         for (t, tier) in model.objectives.iter().enumerate() {
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -406,7 +452,9 @@ impl PerList {
                 if let Iterable::Edges { start, end, .. } = &r.iterable {
                     has_edges = true;
                     route_bounds[list].get_or_insert((*start, *end));
-                    candidate_matrix.get_or_insert_with(|| direct_edge_matrix(r));
+                    if candidate_matrix.is_none() {
+                        candidate_matrix = direct_edge_matrix(r);
+                    }
                 }
                 objective_delta[list][t].push(reduction_delta_kind(r));
                 objective[list][t].push(r.clone());
@@ -421,7 +469,9 @@ impl PerList {
                         if let Iterable::Edges { start, end, .. } = &r.iterable {
                             has_edges = true;
                             route_bounds[list].get_or_insert((*start, *end));
-                            candidate_matrix.get_or_insert_with(|| direct_edge_matrix(r));
+                            if candidate_matrix.is_none() {
+                                candidate_matrix = direct_edge_matrix(r);
+                            }
                         }
                     }
                 }
@@ -436,7 +486,9 @@ impl PerList {
             if let Iterable::Edges { start, end, .. } = &c.reduction.iterable {
                 has_edges = true;
                 route_bounds[list].get_or_insert((*start, *end));
-                candidate_matrix.get_or_insert_with(|| direct_edge_matrix(&c.reduction));
+                if candidate_matrix.is_none() {
+                    candidate_matrix = direct_edge_matrix(&c.reduction);
+                }
             }
             constraint_delta[list].push(reduction_delta_kind(&c.reduction));
             constraints[list].push(c.clone());
@@ -448,6 +500,8 @@ impl PerList {
         let interchangeable_lists =
             (enable_routing_gls || diversify_descent) && lists_are_interchangeable(model, &objective, &constraints, &max_objective);
         let routing_gls = enable_routing_gls.then(|| routing_gls(&objective, &senses)).flatten();
+        let routing = has_edges.then(|| routing_signature(model, &route_bounds, candidate_matrix.clone())).flatten();
+        let construction_limit = ((model.items.len() as f64).sqrt().ceil() as usize).clamp(8, 64);
         Self {
             objective,
             max_objective,
@@ -459,7 +513,9 @@ impl PerList {
             globals: Globals::build(model, stop),
             has_edges,
             route_bounds,
-            candidates: candidate_matrix.flatten().and_then(|matrix| CandidateNeighbors::build(model, matrix, candidate_limit, stop)),
+            candidates: candidate_matrix
+                .and_then(|matrix| CandidateNeighbors::build(model, matrix, candidate_limit.max(construction_limit), stop)),
+            routing,
             infeas_cand: true,
             interchangeable_lists: Cell::new(interchangeable_lists),
             penalties,
@@ -1144,6 +1200,453 @@ impl State {
     }
 }
 
+struct InitialConstruction {
+    state: State,
+    name: &'static str,
+    elapsed: std::time::Duration,
+    first_feasible: Option<std::time::Duration>,
+    candidates: u64,
+}
+
+#[derive(Clone)]
+struct InsertionPlacement {
+    list: usize,
+    position: usize,
+    score: Score,
+}
+
+fn construction_positions(per: &PerList, route: &[i32], item: i32) -> Vec<usize> {
+    let all: Vec<usize> = (0..=route.len()).collect();
+    let Some(neighbors) = &per.candidates else {
+        return all;
+    };
+    let granular: Vec<usize> = all
+        .iter()
+        .copied()
+        .filter(|&position| {
+            position.checked_sub(1).is_some_and(|before| neighbors.contains(item, route[before]))
+                || route.get(position).is_some_and(|&after| neighbors.contains(item, after))
+                || route.is_empty()
+        })
+        .collect();
+    if granular.is_empty() {
+        all
+    } else {
+        granular
+    }
+}
+
+fn insertion_placements(
+    per: &PerList,
+    state: &State,
+    item: i32,
+    scratch: &mut EvalScratch,
+    candidates: &mut u64,
+    candidate_budget: u64,
+) -> Vec<InsertionPlacement> {
+    let mut placements = Vec::new();
+    for list in active_list_indices(&state.lists, per.interchangeable_lists.get()) {
+        for position in construction_positions(per, &state.lists[list], item) {
+            if *candidates >= candidate_budget {
+                return placements;
+            }
+            *candidates = candidates.saturating_add(1);
+            per.metrics.record_candidate();
+            let candidate = InsertView::new(&state.lists[list], position, item);
+            let list_score = trial_list_score_view(per, state, list, &candidate, None, scratch);
+            if list_score.violation != 0 {
+                continue;
+            }
+            let global_delta = per.globals.delta(&state.item_list, &[(item, list)]);
+            let score = score_with_replaced_list(per, state, list, &list_score, &candidate, global_delta, scratch);
+            placements.push(InsertionPlacement { list, position, score });
+        }
+    }
+    placements.sort_by(|left, right| {
+        left.score.cmp(&right.score).then_with(|| left.list.cmp(&right.list)).then_with(|| left.position.cmp(&right.position))
+    });
+    placements
+}
+
+fn apply_insertion(state: &mut State, per: &PerList, item: i32, placement: &InsertionPlacement, stop: &AtomicBool) -> bool {
+    state.lists[placement.list].insert(placement.position, item);
+    if !state.rescore_interruptible(per, placement.list, stop) {
+        return false;
+    }
+    state.set_item_list(per, item, placement.list);
+    state.global_viol = per.globals.total(&state.item_list);
+    true
+}
+
+fn cheapest_insertion_state(
+    model: &CollectionModel,
+    per: &PerList,
+    order: &[usize],
+    stop: &AtomicBool,
+    candidates: &mut u64,
+    candidate_budget: u64,
+) -> Option<State> {
+    let mut state = State::from_lists_interruptible(model, per, vec![Vec::new(); model.lists.max(1)], stop)?;
+    let mut scratch = EvalScratch::default();
+    for &index in order {
+        if stop.load(Ordering::Relaxed) || *candidates >= candidate_budget {
+            return None;
+        }
+        let item = model.items[index];
+        let placement = insertion_placements(per, &state, item, &mut scratch, candidates, candidate_budget).into_iter().next()?;
+        if !apply_insertion(&mut state, per, item, &placement, stop) {
+            return None;
+        }
+    }
+    Some(state)
+}
+
+fn regret_insertion_state(
+    model: &CollectionModel,
+    per: &PerList,
+    order: &[usize],
+    seed: u64,
+    stop: &AtomicBool,
+    candidates: &mut u64,
+    candidate_budget: u64,
+) -> Option<State> {
+    let mut state = State::from_lists_interruptible(model, per, vec![Vec::new(); model.lists.max(1)], stop)?;
+    let mut remaining: Vec<i32> = order.iter().map(|&index| model.items[index]).collect();
+    let mut scratch = EvalScratch::default();
+    while !remaining.is_empty() {
+        if stop.load(Ordering::Relaxed) || *candidates >= candidate_budget {
+            return None;
+        }
+        let mut selected: Option<(i128, u64, usize, InsertionPlacement)> = None;
+        for (remaining_index, &item) in remaining.iter().enumerate() {
+            let placements = insertion_placements(per, &state, item, &mut scratch, candidates, candidate_budget);
+            let Some(best) = placements.first().cloned() else {
+                continue;
+            };
+            let regret =
+                placements.get(1).map_or(i128::MAX / 4, |second| score_scalar(&second.score).saturating_sub(score_scalar(&best.score)));
+            let tie = mix64(seed ^ mix64(item as u64));
+            if selected
+                .as_ref()
+                .is_none_or(|&(old_regret, old_tie, _, _)| (regret, std::cmp::Reverse(tie)) > (old_regret, std::cmp::Reverse(old_tie)))
+            {
+                selected = Some((regret, tie, remaining_index, best));
+            }
+        }
+        let (_, _, remaining_index, placement) = selected?;
+        let item = remaining.swap_remove(remaining_index);
+        if !apply_insertion(&mut state, per, item, &placement, stop) {
+            return None;
+        }
+    }
+    Some(state)
+}
+
+fn singleton_state(model: &CollectionModel, per: &PerList, stop: &AtomicBool) -> Option<State> {
+    if model.lists < model.items.len() {
+        return None;
+    }
+    let mut lists = vec![Vec::new(); model.lists.max(1)];
+    for (list, &item) in model.items.iter().enumerate() {
+        lists[list].push(item);
+    }
+    State::from_lists_interruptible(model, per, lists, stop)
+}
+
+fn route_for_item(per: &PerList, state: &State, item: i32) -> Option<usize> {
+    per.globals.value_to_idx.get(&item).map(|&index| state.item_list[index])
+}
+
+fn oriented_route(route: &[i32], endpoint: i32, at_end: bool, may_reverse: bool) -> Option<Vec<i32>> {
+    let already_oriented = if at_end { route.last() == Some(&endpoint) } else { route.first() == Some(&endpoint) };
+    if already_oriented {
+        return Some(route.to_vec());
+    }
+    let reversible = if at_end { route.first() == Some(&endpoint) } else { route.last() == Some(&endpoint) };
+    if may_reverse && reversible {
+        return Some(route.iter().rev().copied().collect());
+    }
+    None
+}
+
+fn matrix_cost(matrix: &[Vec<i64>], from: i32, to: i32) -> Option<i64> {
+    let from = usize::try_from(from).ok()?;
+    let to = usize::try_from(to).ok()?;
+    matrix.get(from)?.get(to).copied()
+}
+
+fn savings_state(
+    model: &CollectionModel,
+    per: &PerList,
+    mut state: State,
+    seed: u64,
+    stop: &AtomicBool,
+    candidates: &mut u64,
+    candidate_budget: u64,
+) -> State {
+    let Some(routing) = &per.routing else {
+        return state;
+    };
+    let mut savings = Vec::new();
+    let mut seen = HashSet::new();
+    let base_neighbor_limit = ((model.items.len() as f64).sqrt().ceil() as usize).clamp(8, 64);
+    let neighbor_limit = if routing.has_time_windows { base_neighbor_limit.saturating_mul(2).min(64) } else { base_neighbor_limit };
+    for &from in &model.items {
+        let nearby: Vec<i32> = if let Some(neighbors) = &per.candidates {
+            neighbors.neighbors(from).iter().copied().take(neighbor_limit).collect()
+        } else {
+            model.items.iter().copied().filter(|&item| item != from).take(neighbor_limit).collect()
+        };
+        for to in nearby {
+            if from == to || !seen.insert((from, to)) {
+                continue;
+            }
+            let Some(value) = matrix_cost(&routing.matrix, routing.depot, from)
+                .zip(matrix_cost(&routing.matrix, to, routing.depot))
+                .zip(matrix_cost(&routing.matrix, from, to))
+                .map(|((out, back), direct)| out.saturating_add(back).saturating_sub(direct))
+            else {
+                continue;
+            };
+            savings.push((value, mix64(seed ^ mix64(from as u64) ^ to as u64), from, to));
+        }
+    }
+    savings.sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    // Reversal is a candidate orientation, not an assumption of symmetry. The
+    // complete merged route is checked below, so time-window-infeasible reverse
+    // orientations are rejected exactly.
+    let may_reverse = true;
+    let mut scratch = EvalScratch::default();
+    for (_, _, from, to) in savings {
+        if stop.load(Ordering::Relaxed) || *candidates >= candidate_budget {
+            break;
+        }
+        let (Some(left), Some(right)) = (route_for_item(per, &state, from), route_for_item(per, &state, to)) else {
+            continue;
+        };
+        if left == right {
+            continue;
+        }
+        let (Some(mut left_route), Some(right_route)) =
+            (oriented_route(&state.lists[left], from, true, may_reverse), oriented_route(&state.lists[right], to, false, may_reverse))
+        else {
+            continue;
+        };
+        left_route.extend_from_slice(&right_route);
+        let empty: Vec<i32> = Vec::new();
+        *candidates = candidates.saturating_add(1);
+        per.metrics.record_candidate();
+        let left_score = trial_list_score_view(per, &state, left, &left_route, None, &mut scratch);
+        let right_score = trial_list_score_view(per, &state, right, &empty, None, &mut scratch);
+        if left_score.violation != 0 || right_score.violation != 0 {
+            continue;
+        }
+        let overrides: Vec<(i32, usize)> = state.lists[right].iter().map(|&item| (item, left)).collect();
+        let global_delta = per.globals.delta(&state.item_list, &overrides);
+        let candidate_score = score_with_replacements_mode(
+            per,
+            &state,
+            &[
+                TrialList { list: left, score: &left_score, contents: &left_route },
+                TrialList { list: right, score: &right_score, contents: &empty },
+            ],
+            global_delta,
+            &mut scratch,
+            false,
+        );
+        if candidate_score.violation != 0 || candidate_score >= full_score_raw(per, &state) {
+            continue;
+        }
+        state.lists[left] = left_route;
+        state.lists[right].clear();
+        if !state.rescore_interruptible(per, left, stop) || !state.rescore_interruptible(per, right, stop) {
+            break;
+        }
+        for &(item, list) in &overrides {
+            state.set_item_list(per, item, list);
+        }
+        state.global_viol = per.globals.total(&state.item_list);
+    }
+    state
+}
+
+/// Clarke-Wright construction for a model whose route count is smaller than
+/// the customer count. The singleton routes live only in this temporary
+/// representation, so a safe VRPTW start does not require allocating one model
+/// list per customer. Every merge is replayed through the regular per-list
+/// evaluator before it is accepted, which keeps capacity and scan constraints
+/// hard during construction.
+fn savings_from_singletons_state(
+    model: &CollectionModel,
+    per: &PerList,
+    seed: u64,
+    stop: &AtomicBool,
+    candidates: &mut u64,
+    candidate_budget: u64,
+) -> Option<State> {
+    let routing = per.routing.as_ref()?;
+    if model.lists == 0 || model.items.is_empty() {
+        return State::from_lists_interruptible(model, per, vec![Vec::new(); model.lists.max(1)], stop);
+    }
+    let mut routes: Vec<Vec<i32>> = model.items.iter().map(|&item| vec![item]).collect();
+    if routes.iter().any(|route| list_score_exact(per, 0, route).violation != 0) {
+        return None;
+    }
+    let mut owner: HashMap<i32, usize> = model.items.iter().enumerate().map(|(index, &item)| (item, index)).collect();
+    let mut savings = Vec::new();
+    let mut seen = HashSet::new();
+    let base_neighbor_limit = ((model.items.len() as f64).sqrt().ceil() as usize).clamp(8, 64);
+    let neighbor_limit = if routing.has_time_windows { base_neighbor_limit.saturating_mul(2).min(64) } else { base_neighbor_limit };
+    for &from in &model.items {
+        let nearby: Vec<i32> = if let Some(neighbors) = &per.candidates {
+            neighbors.neighbors(from).iter().copied().take(neighbor_limit).collect()
+        } else {
+            model.items.iter().copied().filter(|&item| item != from).take(neighbor_limit).collect()
+        };
+        for to in nearby {
+            if from == to || !seen.insert((from, to)) {
+                continue;
+            }
+            let value = matrix_cost(&routing.matrix, routing.depot, from)
+                .zip(matrix_cost(&routing.matrix, to, routing.depot))
+                .zip(matrix_cost(&routing.matrix, from, to))
+                .map(|((out, back), direct)| out.saturating_add(back).saturating_sub(direct))?;
+            savings.push((value, mix64(seed ^ mix64(from as u64) ^ to as u64), from, to));
+        }
+    }
+    savings.sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    // Try both endpoint orientations even with time windows. Exact list
+    // scoring below is the authority on whether the oriented merge is feasible.
+    let may_reverse = true;
+    let mut active_routes = routes.len();
+    for (_, _, from, to) in savings {
+        if stop.load(Ordering::Relaxed) || *candidates >= candidate_budget {
+            break;
+        }
+        let (Some(&left), Some(&right)) = (owner.get(&from), owner.get(&to)) else {
+            continue;
+        };
+        if left == right {
+            continue;
+        }
+        let (Some(mut merged), Some(right_route)) =
+            (oriented_route(&routes[left], from, true, may_reverse), oriented_route(&routes[right], to, false, may_reverse))
+        else {
+            continue;
+        };
+        merged.extend_from_slice(&right_route);
+        *candidates = candidates.saturating_add(1);
+        per.metrics.record_candidate();
+        if list_score_exact(per, 0, &merged).violation != 0 {
+            continue;
+        }
+        routes[left] = merged;
+        let moved = std::mem::take(&mut routes[right]);
+        for item in moved {
+            owner.insert(item, left);
+        }
+        active_routes -= 1;
+    }
+    if active_routes > model.lists {
+        return None;
+    }
+    let mut lists: Vec<Vec<i32>> = routes.into_iter().filter(|route| !route.is_empty()).collect();
+    lists.resize(model.lists.max(1), Vec::new());
+    State::from_lists_interruptible(model, per, lists, stop).filter(|state| full_score_raw(per, state).violation == 0)
+}
+
+fn routing_construction(
+    model: &CollectionModel,
+    per: &PerList,
+    order: &[usize],
+    seed: u64,
+    stop: &AtomicBool,
+    report: &mut dyn FnMut(i64),
+) -> Option<InitialConstruction> {
+    let routing = per.routing.as_ref()?;
+    if let (Some(demands), Some(capacity)) = (&routing.demands, routing.capacity) {
+        if model
+            .items
+            .iter()
+            .any(|&item| usize::try_from(item).ok().and_then(|index| demands.get(index)).is_some_and(|&demand| demand > capacity))
+        {
+            return None;
+        }
+    }
+    let started = Instant::now();
+    let root = ((model.items.len() as f64).sqrt().ceil() as u64).clamp(8, 64);
+    let candidate_budget = (model.items.len() as u64).saturating_mul(root).saturating_mul(96).clamp(10_000, 2_000_000);
+    let mut candidates = 0u64;
+    let mut first_feasible = None;
+    let mut best: Option<(State, &'static str)> = None;
+
+    if let Some(singletons) = singleton_state(model, per, stop) {
+        let singleton_score = full_score_raw(per, &singletons);
+        if singleton_score.violation == 0 {
+            first_feasible = Some(started.elapsed());
+            if per.tiers > 0 {
+                report(tier_value(per, &singleton_score, 0));
+            }
+            let saved = savings_state(model, per, singletons, seed, stop, &mut candidates, candidate_budget);
+            best = Some((saved, "parallel-savings"));
+        }
+    } else if let Some(saved) = savings_from_singletons_state(model, per, seed, stop, &mut candidates, candidate_budget) {
+        let score = full_score_raw(per, &saved);
+        first_feasible = Some(started.elapsed());
+        if per.tiers > 0 {
+            report(tier_value(per, &score, 0));
+        }
+        best = Some((saved, "parallel-savings"));
+    }
+
+    if model.items.len() <= 256 || best.is_none() {
+        let stable: Vec<usize> = (0..model.items.len()).collect();
+        let mut reversed = stable.clone();
+        reversed.reverse();
+        let mut orders = vec![stable, order.to_vec(), reversed];
+        orders.dedup();
+        for attempt in orders {
+            if stop.load(Ordering::Relaxed) || candidates >= candidate_budget {
+                break;
+            }
+            if let Some(cheapest) = cheapest_insertion_state(model, per, &attempt, stop, &mut candidates, candidate_budget) {
+                let score = full_score_raw(per, &cheapest);
+                if score.violation == 0 {
+                    if first_feasible.is_none() {
+                        first_feasible = Some(started.elapsed());
+                        if per.tiers > 0 {
+                            report(tier_value(per, &score, 0));
+                        }
+                    }
+                    if best.as_ref().is_none_or(|(incumbent, _)| score < full_score_raw(per, incumbent)) {
+                        best = Some((cheapest, "cheapest-insertion"));
+                    }
+                }
+            }
+        }
+    }
+
+    if model.items.len() <= 160 && candidates < candidate_budget {
+        if let Some(regret) = regret_insertion_state(model, per, order, seed, stop, &mut candidates, candidate_budget) {
+            let score = full_score_raw(per, &regret);
+            if score.violation == 0 {
+                if first_feasible.is_none() {
+                    first_feasible = Some(started.elapsed());
+                    if per.tiers > 0 {
+                        report(tier_value(per, &score, 0));
+                    }
+                }
+                if best.as_ref().is_none_or(|(incumbent, _)| score < full_score_raw(per, incumbent)) {
+                    best = Some((regret, "regret-insertion"));
+                }
+            }
+        }
+    }
+
+    let (state, name) = best?;
+    Some(InitialConstruction { state, name, elapsed: started.elapsed(), first_feasible, candidates })
+}
+
 /// Raw (unsigned) value of a tier, undoing the maximisation sign flip.
 fn tier_value(per: &PerList, score: &Score, tier: usize) -> i64 {
     if per.senses[tier] {
@@ -1314,8 +1817,6 @@ fn solve_collection_capped_internal(
     metrics_enabled: bool,
     validate_model: bool,
 ) -> (CollectionSolution, ListSearchMetrics) {
-    let dual_bound =
-        if !validate_model || model.validate_interruptible(stop).ok() == Some(true) { dual::compute(model, stop) } else { None };
     let (mut solution, metrics) = solve_collection_capped_worker(
         model,
         seed,
@@ -1328,6 +1829,10 @@ fn solve_collection_capped_internal(
         SearchProfile::Sequential,
         None,
     );
+    // Construction owns the time-to-first-incumbent contract. Structural
+    // bounds are useful after that point, but must never consume the solve
+    // budget before a cheap feasible fallback is published.
+    let dual_bound = if !stop.load(Ordering::Relaxed) { dual::compute(model, stop) } else { None };
     dual::attach(model, &mut solution, dual_bound);
     (solution, metrics)
 }
@@ -1377,8 +1882,17 @@ pub(super) fn solve_collection_capped_worker(
         }
     }
     if let Some(sched) = &model.schedule {
-        let solution = solve_schedule(sched, seed, stop, report);
-        let metrics = MetricsRecorder::new(metrics_enabled).snapshot(started.map(|instant| instant.elapsed()).unwrap_or_default());
+        let recorder = MetricsRecorder::new(metrics_enabled);
+        let (solution, construction) = solve_schedule(sched, seed, stop, report);
+        recorder.record_construction(
+            "serial-sgs",
+            construction.elapsed,
+            construction.first_feasible,
+            construction.candidates,
+            None,
+            solution.objectives.first().copied(),
+        );
+        let metrics = recorder.snapshot(started.map(|instant| instant.elapsed()).unwrap_or_default());
         return (solution, metrics);
     }
     let per = PerList::build_profiled(
@@ -1398,13 +1912,57 @@ pub(super) fn solve_collection_capped_worker(
     // Warm start from the caller's hint when given (completed to a full
     // partition); otherwise the greedy random construction. Either way the search
     // loop, ALNS controller, and incumbent tracking below are identical.
-    let state = match hint {
-        Some(h) => State::from_lists_interruptible(model, &per, hint_partition(model, h), stop),
-        None => State::greedy(model, &per, &order, seed, profile.diversify_initial_descent(), stop),
+    let construction_started = Instant::now();
+    let construction = match hint {
+        Some(h) => State::from_lists_interruptible(model, &per, hint_partition(model, h), stop).map(|state| {
+            let score = full_score_raw(&per, &state);
+            InitialConstruction {
+                state,
+                name: "warm-start",
+                elapsed: construction_started.elapsed(),
+                first_feasible: (score.violation == 0).then_some(construction_started.elapsed()),
+                candidates: 0,
+            }
+        }),
+        None => routing_construction(model, &per, &order, seed, stop, report).or_else(|| {
+            State::greedy(model, &per, &order, seed, profile.diversify_initial_descent(), stop).map(|state| {
+                let score = full_score_raw(&per, &state);
+                InitialConstruction {
+                    state,
+                    name: "generic-greedy",
+                    elapsed: construction_started.elapsed(),
+                    first_feasible: (score.violation == 0).then_some(construction_started.elapsed()),
+                    candidates: 0,
+                }
+            })
+        }),
     };
-    let Some(mut state) = state.filter(|_| !stop.load(Ordering::Relaxed)) else {
+    let Some(construction) = construction.filter(|_| !stop.load(Ordering::Relaxed)) else {
         return no_solution();
     };
+    let mut state = construction.state;
+    let construction_score = full_score_raw(&per, &state);
+    let construction_objectives = objective_values(&per, &construction_score);
+    let fleet = Some(state.lists.iter().filter(|route| !route.is_empty()).count());
+    let constructor_cost = per
+        .routing
+        .as_ref()
+        .and_then(|routing| {
+            if routing.has_fleet_objective {
+                construction_objectives.last().copied()
+            } else {
+                construction_objectives.first().copied()
+            }
+        })
+        .or_else(|| construction_objectives.first().copied());
+    per.metrics.record_construction(
+        construction.name,
+        construction.elapsed,
+        construction.first_feasible,
+        construction.candidates,
+        fleet,
+        constructor_cost,
+    );
     let mut memory = SearchMemory::new(model.lists.max(1));
 
     let (mut best_lists, mut best_score, mut best_feasible) = snapshot(&per, &state);

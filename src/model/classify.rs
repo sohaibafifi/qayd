@@ -304,6 +304,18 @@ impl BackendSelection {
         selection
     }
 
+    /// Automatic selection with a caller-provided exact-backend memory ceiling.
+    /// The estimate is computed from the compact IR and therefore runs before
+    /// any CP variables, disjunctive pairs, or propagators are allocated.
+    pub fn for_collection_auto_with_memory(model: &list::CollectionModel, max_bytes: u64) -> Self {
+        let selection = Self::for_collection_auto(model);
+        if selection.backend.is_exact() && estimated_exact_backend_bytes(model) > max_bytes {
+            heuristic_selection(model, "estimated exact backend exceeds the memory limit")
+        } else {
+            selection
+        }
+    }
+
     /// Capability-oriented selection for an explicit exact request, with a
     /// deterministic upper bound on classifier work. Returning a heuristic
     /// backend tells the caller that exact classification was intentionally not
@@ -311,6 +323,53 @@ impl BackendSelection {
     pub fn for_collection_exact_bounded(model: &list::CollectionModel) -> Self {
         bounded_classification_fallback(model).unwrap_or_else(|| Self::for_collection(model))
     }
+}
+
+/// Conservative allocation estimate for lowering a compact collection IR to an
+/// exact backend. It is a guardrail, not a live RSS prediction. Schedule pairs
+/// dominate the estimate because every disjunction creates state, propagation,
+/// and search metadata in addition to its two endpoints.
+pub fn estimated_exact_backend_bytes(model: &list::CollectionModel) -> u64 {
+    let mut bytes = 64u128 * 1024;
+    if let Some(schedule) = &model.schedule {
+        let intervals = schedule.intervals.len() as u128;
+        let modes = schedule.intervals.iter().map(|interval| interval.modes.len().max(1) as u128).sum::<u128>();
+        bytes = bytes
+            .saturating_add(intervals.saturating_mul(4 * 1024))
+            .saturating_add(modes.saturating_mul(6 * 1024))
+            .saturating_add((schedule.precedences.len() as u128).saturating_mul(2 * 1024));
+        for resource in &schedule.resources {
+            match resource {
+                list::Resource::NoOverlap(group) => {
+                    let size = group.len() as u128;
+                    let pairs = size.saturating_mul(size.saturating_sub(1)) / 2;
+                    bytes = bytes.saturating_add(pairs.saturating_mul(8 * 1024));
+                }
+                list::Resource::MachineNoOverlap => {
+                    let mut by_machine = std::collections::HashMap::<usize, u128>::new();
+                    for interval in &schedule.intervals {
+                        for mode in &interval.modes {
+                            *by_machine.entry(mode.machine).or_default() += 1;
+                        }
+                    }
+                    for size in by_machine.into_values() {
+                        let pairs = size.saturating_mul(size.saturating_sub(1)) / 2;
+                        bytes = bytes.saturating_add(pairs.saturating_mul(8 * 1024));
+                    }
+                }
+                list::Resource::Cumulative { demands, .. } => {
+                    bytes = bytes.saturating_add((demands.len() as u128).saturating_mul(4 * 1024));
+                }
+            }
+        }
+    } else {
+        let cells = (model.items.len() as u128).saturating_mul(model.lists.max(1) as u128);
+        let reductions = collection_reductions(model).count().max(1) as u128;
+        bytes = bytes
+            .saturating_add(cells.saturating_mul(128))
+            .saturating_add((model.items.len() as u128).saturating_mul(reductions).saturating_mul(256));
+    }
+    u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
 fn collection_reductions(model: &list::CollectionModel) -> impl Iterator<Item = &list::Reduction> {

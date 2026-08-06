@@ -213,6 +213,46 @@ Runs resume by default. Use `--restart` to replace the campaign, `--generate-onl
 to inspect inputs before solving, or `--analyze-only` to rebuild reports from
 existing results. All configuration is passed as command-line arguments.
 
+## Linear backend probe
+
+`linear_backend_probe.py` compares Amthal and HiGHS on the same MIPLIB easy
+instances. Runs are sequential and single-threaded. The order alternates by
+instance to reduce systematic thermal bias. Every record contains solver and
+instance hashes, external wall time, process-tree RSS, primal, dual, gap, node
+count, and validation against the official `miplib.solu` reference bundled by
+the Amthal fetcher.
+
+```sh
+cargo build --manifest-path ../amthal/Cargo.toml --release
+uv run python bench/linear_backend_probe.py \
+  --amthal-binary ../amthal/target/release/amthal \
+  --highs-binary /opt/homebrew/bin/highs \
+  --time-limit 10 --restart \
+  --out bench/results/linear-backends/results.jsonl
+```
+
+The report includes solved counts, reference disagreements, PAR2, paired speed
+wins, memory, and the median Amthal/HiGHS time ratio. `--limit N` provides a
+smoke subset, and runs resume by stable run id when `--restart` is omitted.
+
+The `positioning` suite is a fixed, stratified first-study sample containing
+five CVRPLIB X instances up to 1000 customers, six Solomon VRPTW instances,
+six JSPLIB job shops, and six PSPLIB j30 projects. It is intended for five-seed
+local studies before committing to the full `competitive` suite.
+
+After the four family campaigns, build a per-instance study with actual
+lexicographic medians, paired wins, BKS gaps, failure counts, and memory:
+
+```sh
+uv run python bench/positioning_report.py \
+  bench/results/positioning-cvrp.jsonl \
+  bench/results/positioning-vrptw.jsonl \
+  bench/results/positioning-jssp.jsonl \
+  bench/results/positioning-rcpsp.jsonl \
+  --markdown bench/results/positioning-study.md \
+  --json bench/results/positioning-study.json
+```
+
 ## Data sources
 
 - **SAT** - Global Benchmark Database, <https://benchmark-database.de>, which

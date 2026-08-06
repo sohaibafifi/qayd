@@ -23,15 +23,17 @@ parser.add_argument("instance", nargs="?")
 parser.add_argument("--tasks", type=int, default=12)
 parser.add_argument("--resources", type=int, default=2)
 parser.add_argument("--time-limit", type=int, default=8)
+parser.add_argument("--memory-limit-mb", type=int, default=256)
 parser.add_argument("--threads", type=int, default=1)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--engine", choices=("auto", "exact", "ls"))
 parser.add_argument("--verbose", action="store_true")
+parser.add_argument("--profile", action="store_true")
 parser.add_argument("--json", action="store_true", help="emit one machine-readable result")
 args = parser.parse_args()
 
-if args.threads <= 0 or args.time_limit < 0 or args.seed < 0:
-    raise SystemExit("threads must be positive; time limit and seed must be non-negative")
+if args.threads <= 0 or args.time_limit < 0 or args.seed < 0 or args.memory_limit_mb <= 0:
+    raise SystemExit("threads and memory limit must be positive; time limit and seed must be non-negative")
 
 instance = read_psplib(args.instance) if args.instance else None
 if instance is None:
@@ -144,11 +146,23 @@ with output:
         time_limit=args.time_limit,
         seed=args.seed,
         verbose=args.verbose,
+        profile=args.profile,
+        memory_limit_mb=args.memory_limit_mb,
     )
 elapsed = time.perf_counter() - started
+profile_record = {
+    "backend_build_seconds": solution.backend_build_seconds,
+    "construction_seconds": solution.construction_seconds,
+    "time_to_first_feasible": solution.time_to_first_feasible,
+    "construction_candidates": solution.construction_candidates,
+    "estimated_backend_bytes": solution.estimated_backend_bytes,
+    "constructor": solution.constructor,
+    "memory_limit_mb": args.memory_limit_mb,
+}
 
 if not solution.starts:
     record = {
+        **profile_record,
         "instance": name,
         "status": solution.status,
         "elapsed_seconds": elapsed,
@@ -210,6 +224,7 @@ assert list(solution.objectives) == [makespan], "reported makespan matches repla
 
 public_schedule = [{key: value for key, value in job.items() if key != "demands"} for job in schedule]
 record = {
+    **profile_record,
     "instance": name,
     "status": solution.status,
     "problem": "mrcpsp" if multi_mode else "rcpsp",

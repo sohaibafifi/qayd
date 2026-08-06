@@ -198,8 +198,6 @@ fn solve_collection_parallel_internal(
     validate_model: bool,
 ) -> (CollectionSolution, ListPortfolioMetrics) {
     let workers = workers.max(1);
-    let dual_bound =
-        if !validate_model || model.validate_interruptible(stop).ok() == Some(true) { dual::compute(model, stop) } else { None };
     if workers == 1 {
         let (mut solution, search) = solve_collection_capped_worker(
             model,
@@ -213,6 +211,7 @@ fn solve_collection_parallel_internal(
             SearchProfile::Sequential,
             None,
         );
+        let dual_bound = if !stop.load(Ordering::Relaxed) { dual::compute(model, stop) } else { None };
         dual::attach(model, &mut solution, dual_bound);
         let worker_metrics = ListPortfolioWorkerMetrics {
             worker: 0,
@@ -287,6 +286,7 @@ fn solve_collection_parallel_internal(
         })
         .expect("a non-empty portfolio must complete at least one worker");
     let mut solution = completed[best_idx].3.clone();
+    let dual_bound = if !stop.load(Ordering::Relaxed) { dual::compute(model, stop) } else { None };
     dual::attach(model, &mut solution, dual_bound);
     let best_worker = completed[best_idx].0;
     let worker_metrics = completed

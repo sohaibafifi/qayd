@@ -368,7 +368,7 @@ class ScheduleSet:
             self._intervals = model.alternatives(modes, self.horizon)
         else:
             durations = [self._task_duration(task) for task in tasks]
-            self._intervals = model.intervals(durations, self.horizon, optional=optional)
+            self._intervals = model.schedule_intervals(durations, self.horizon, optional=optional)
         self._interval_by_id = {task.id: interval for task, interval in zip(tasks, self._intervals)}
 
     def __iter__(self) -> Iterator[ScheduledTaskView]:

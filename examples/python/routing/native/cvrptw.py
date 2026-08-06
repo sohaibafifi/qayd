@@ -114,12 +114,12 @@ solve_options = {
     "time_limit": args.time_limit,
     "seed": args.seed,
     "verbose": args.verbose,
-        "max_iterations": args.max_iterations,
-        "profile": args.profile,
-        "routing_two_way": args.routing_two_way,
-        "routing_nearest_neighbor": args.routing_nearest_neighbor,
-        "routing_warm_start": args.routing_warm_start,
-    }
+    "max_iterations": args.max_iterations,
+    "profile": args.profile,
+    "routing_two_way": args.routing_two_way,
+    "routing_nearest_neighbor": args.routing_nearest_neighbor,
+    "routing_warm_start": args.routing_warm_start,
+}
 if hint is not None:
     solve_options["list_hint"] = hint
 started = time.perf_counter()
@@ -127,9 +127,20 @@ output = contextlib.redirect_stdout(sys.stderr) if args.json else contextlib.nul
 with output:
     solution = model.solve(**solve_options)
 elapsed = time.perf_counter() - started
+construction_record = {
+    "backend_build_seconds": solution.backend_build_seconds,
+    "construction_seconds": solution.construction_seconds,
+    "time_to_first_feasible": solution.time_to_first_feasible,
+    "construction_candidates": solution.construction_candidates,
+    "estimated_backend_bytes": solution.estimated_backend_bytes,
+    "constructor": solution.constructor,
+    "constructor_fleet": solution.constructor_fleet,
+    "constructor_cost": solution.constructor_cost,
+}
 
 if solution.lists is None:
     record = {
+        **construction_record,
         "instance": name,
         "status": solution.status,
         "elapsed_seconds": elapsed,
@@ -184,6 +195,7 @@ for route in solution.lists:
 fleet = sum(bool(route) for route in solution.lists)
 assert list(solution.objectives) == [fleet, total_distance], "reported objectives match replay"
 record = {
+    **construction_record,
     "instance": name,
     "status": solution.status,
     "customers": len(customers),

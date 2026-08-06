@@ -148,6 +148,13 @@ impl ReductionSearchMetrics {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ListSearchMetrics {
     pub elapsed_nanos: u64,
+    /// Initial solution strategy selected by the bounded constructor portfolio.
+    pub constructor: Option<String>,
+    pub construction_nanos: u64,
+    pub time_to_first_feasible_nanos: Option<u64>,
+    pub construction_candidates: u64,
+    pub constructor_fleet: Option<usize>,
+    pub constructor_cost: Option<i64>,
     /// Complete move or repair placements whose score was compared.
     pub candidates: u64,
     /// Candidate list contributions evaluated either incrementally or in full.
@@ -200,6 +207,16 @@ impl fmt::Display for ListSearchMetrics {
             self.elapsed_nanos as f64 / 1_000_000_000.0,
             self.candidates,
             self.candidates_per_second()
+        )?;
+        writeln!(
+            f,
+            "  constructor={} construction={:.6}s first-feasible={} construction-candidates={} fleet={} cost={}",
+            self.constructor.as_deref().unwrap_or("none"),
+            self.construction_nanos as f64 / 1_000_000_000.0,
+            self.time_to_first_feasible_nanos.map_or_else(|| "none".to_owned(), |value| format!("{:.6}s", value as f64 / 1_000_000_000.0)),
+            self.construction_candidates,
+            self.constructor_fleet.map_or_else(|| "none".to_owned(), |value| value.to_string()),
+            self.constructor_cost.map_or_else(|| "none".to_owned(), |value| value.to_string()),
         )?;
         writeln!(
             f,
@@ -281,6 +298,12 @@ struct RawReductionMetrics {
 
 struct RawMetrics {
     candidates: u64,
+    constructor: Option<String>,
+    construction_nanos: u64,
+    time_to_first_feasible_nanos: Option<u64>,
+    construction_candidates: u64,
+    constructor_fleet: Option<usize>,
+    constructor_cost: Option<i64>,
     incremental_trials: u64,
     full_trials: u64,
     scan_recomputations: u64,
@@ -293,6 +316,12 @@ impl Default for RawMetrics {
     fn default() -> Self {
         Self {
             candidates: 0,
+            constructor: None,
+            construction_nanos: 0,
+            time_to_first_feasible_nanos: None,
+            construction_candidates: 0,
+            constructor_fleet: None,
+            constructor_cost: None,
             incremental_trials: 0,
             full_trials: 0,
             scan_recomputations: 0,
@@ -357,6 +386,27 @@ impl MetricsRecorder {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_construction(
+        &self,
+        constructor: impl Into<String>,
+        elapsed: Duration,
+        first_feasible: Option<Duration>,
+        candidates: u64,
+        fleet: Option<usize>,
+        cost: Option<i64>,
+    ) {
+        if let Some(raw) = &self.raw {
+            let mut raw = raw.borrow_mut();
+            raw.constructor = Some(constructor.into());
+            raw.construction_nanos = nanos(elapsed);
+            raw.time_to_first_feasible_nanos = first_feasible.map(nanos);
+            raw.construction_candidates = candidates;
+            raw.constructor_fleet = fleet;
+            raw.constructor_cost = cost;
+        }
+    }
+
     pub(super) fn record_incremental_trial(&self) {
         if let Some(raw) = &self.raw {
             let mut raw = raw.borrow_mut();
@@ -403,6 +453,12 @@ impl MetricsRecorder {
         }
         ListSearchMetrics {
             elapsed_nanos: nanos(elapsed),
+            constructor: raw.constructor.clone(),
+            construction_nanos: raw.construction_nanos,
+            time_to_first_feasible_nanos: raw.time_to_first_feasible_nanos,
+            construction_candidates: raw.construction_candidates,
+            constructor_fleet: raw.constructor_fleet,
+            constructor_cost: raw.constructor_cost,
             candidates: raw.candidates,
             trial_list_evaluations: raw.incremental_trials.saturating_add(raw.full_trials),
             incremental_trial_list_evaluations: raw.incremental_trials,

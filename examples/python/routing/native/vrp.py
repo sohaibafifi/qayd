@@ -110,9 +110,20 @@ output = contextlib.redirect_stdout(sys.stderr) if args.json else contextlib.nul
 with output:
     solution = model.solve(**solve_options)
 elapsed = time.perf_counter() - started
+construction_record = {
+    "backend_build_seconds": solution.backend_build_seconds,
+    "construction_seconds": solution.construction_seconds,
+    "time_to_first_feasible": solution.time_to_first_feasible,
+    "construction_candidates": solution.construction_candidates,
+    "estimated_backend_bytes": solution.estimated_backend_bytes,
+    "constructor": solution.constructor,
+    "constructor_fleet": solution.constructor_fleet,
+    "constructor_cost": solution.constructor_cost,
+}
 
 if solution.lists is None:
     record = {
+        **construction_record,
         "instance": name,
         "status": solution.status,
         "elapsed_seconds": elapsed,
@@ -147,6 +158,7 @@ for route in solution.lists:
 assert list(solution.objectives) == [total_distance], "reported objective matches replay"
 
 record = {
+    **construction_record,
     "instance": name,
     "status": solution.status,
     "customers": len(customers),
