@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::eval::{eval_expr, violation_of, INFEASIBLE};
 use super::incremental::{EvalScratch, ListView};
 use super::local_search::{
-    full_score, full_score_exact_lists, full_score_raw, list_score_exact, score_with_replacements, tier_values, ConstraintViolations,
-    ListScore, ObjectiveReductionValues, PerList, ReductionDeltaKind, ReductionValues, Score, State, TrialList,
+    active_list_indices, full_score, full_score_exact_lists, full_score_raw, list_score_exact, score_with_replacements, tier_values,
+    ConstraintViolations, ListScore, ObjectiveReductionValues, PerList, ReductionDeltaKind, ReductionValues, Score, State, TrialList,
 };
 use crate::mix64;
 use crate::model::list::{CollectionModel, Iterable, Reduction};
@@ -493,7 +493,16 @@ pub(super) fn trial_list_score_view(
             }
         }
     }
-    ListScore { violation, objectives, constraint_violations, objective_reductions, undefined_violation }
+    let edge_penalty = per.edge_penalty(idx, candidate);
+    ListScore { violation, objectives, constraint_violations, objective_reductions, undefined_violation, edge_penalty }
+}
+
+fn rotated_routes(mut routes: Vec<usize>, seed: u64) -> Vec<usize> {
+    if seed != 0 && !routes.is_empty() {
+        let offset = (mix64(seed) % routes.len() as u64) as usize;
+        routes.rotate_left(offset);
+    }
+    routes
 }
 
 fn trial_list_score(per: &PerList, state: &State, idx: usize, edit: Edit, scratch: &mut EvalScratch) -> ListScore {
@@ -732,7 +741,13 @@ fn candidate_cross_exchange(per: &PerList, state: &State, a: (usize, usize, usiz
 /// applied move touches it again, so settled routes are not re-scanned every
 /// pass. Candidate buffers are reused, so no allocation happens per candidate.
 /// `stop` is polled per candidate so even very long lists honour the time limit.
-pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBool, memory: &mut SearchMemory) -> Option<Move> {
+pub(super) fn best_improving_move(
+    per: &PerList,
+    state: &State,
+    stop: &AtomicBool,
+    memory: &mut SearchMemory,
+    scan_seed: u64,
+) -> Option<Move> {
     let current = full_score(per, state);
     // Repair-capable moves (relocate / or-opt insert filters) only prune by the
     // geometric candidate lists once feasible: while a route still overflows, the
@@ -744,7 +759,12 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
     // instance afford enough passes to reach feasibility.
     let use_candidates = per.has_edges && current.violation == 0 && per.candidates.is_some();
     let cand_cost = if per.infeas_cand { per.has_edges && per.candidates.is_some() } else { use_candidates };
-    let k = state.lists.len();
+    let interchangeable_lists = per.interchangeable_lists.get();
+    let active_routes = active_list_indices(&state.lists, interchangeable_lists);
+    let sources = rotated_routes(
+        active_routes.iter().copied().filter(|&list| !interchangeable_lists || !state.lists[list].is_empty()).collect(),
+        scan_seed,
+    );
     let mut scratch_a = EvalScratch::default();
     let mut scratch_b = EvalScratch::default();
     let mut score_scratch = EvalScratch::default();
@@ -761,14 +781,16 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
     // scanned from both endpoints, so a pair (src, y) is still examined when src
     // is active even if y is inactive; the redundant active/active double-scan is
     // bounded because relocate returns early while the search is still dense.
-    for src in 0..k {
+    for src in sources {
         if memory.skip(src) {
             continue;
         }
+        let destination_seed = if scan_seed == 0 { 0 } else { scan_seed ^ mix64(src as u64) };
+        let destinations = rotated_routes(active_routes.clone(), destination_seed);
         // --- Relocate a single item out of `src`. ---
         for src_pos in 0..state.lists[src].len() {
             let item = state.lists[src][src_pos];
-            for dst in 0..k {
+            for &dst in &destinations {
                 if dst == src {
                     let len = state.lists[src].len();
                     for dst_pos in 0..len {
@@ -817,7 +839,7 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
             }
         }
         // --- Swap one item of `src` with one item of another route. ---
-        for y in 0..k {
+        for &y in &destinations {
             if y == src {
                 continue;
             }
@@ -855,7 +877,7 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
             for len in 2..=MAX_OR_OPT.min(src_len) {
                 for start in 0..=src_len - len {
                     let items = segment_items(&state.lists[src], start, len);
-                    for dst in 0..k {
+                    for &dst in &destinations {
                         if dst == src {
                             let post_len = src_len - len;
                             for dst_pos in 0..=post_len {
@@ -908,7 +930,7 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                 }
             }
             // 2-opt*: swap the tails of `src` and another route.
-            for y in 0..k {
+            for &y in &destinations {
                 if y == src {
                     continue;
                 }
@@ -948,7 +970,7 @@ pub(super) fn best_improving_move(per: &PerList, state: &State, stop: &AtomicBoo
                 }
             }
             // Cross-exchange: swap a segment of `src` with a segment of another route.
-            for y in 0..k {
+            for &y in &destinations {
                 if y == src {
                     continue;
                 }

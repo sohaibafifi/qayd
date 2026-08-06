@@ -5,7 +5,7 @@
 //! shared Rust model and backend classifier first, then teach this heuristic to
 //! search it as a fallback or incumbent generator.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -151,7 +151,12 @@ pub(super) struct PerList {
     /// Whether cost-refiner moves (2-opt* / cross / reverse) may prune by the
     /// geometric candidate lists even while a route still overflows.
     pub(super) infeas_cand: bool,
+    /// Whether permuting the list variables leaves the model unchanged. Search
+    /// then keeps a single representative empty list in each neighbourhood,
+    /// avoiding the large symmetry created by optional vehicle fleets.
+    pub(super) interchangeable_lists: Cell<bool>,
     penalties: GlsPenalties,
+    routing_gls: Option<RoutingGls>,
     pub(super) metrics: MetricsRecorder,
 }
 
@@ -160,13 +165,20 @@ struct GlsPenalties {
     objectives: RefCell<Vec<Vec<Vec<i64>>>>,
 }
 
+struct RoutingGls {
+    matrix: Arc<Vec<Vec<i64>>>,
+    penalties: RefCell<Vec<Vec<i64>>>,
+    lambda: Cell<i64>,
+    coeff: i64,
+    symmetric: bool,
+}
+
 pub(super) struct CandidateNeighbors {
     map: HashMap<i32, Vec<i32>>,
 }
 
 impl CandidateNeighbors {
-    fn build(model: &CollectionModel, matrix: Arc<Vec<Vec<i64>>>, stop: &AtomicBool) -> Option<Self> {
-        const LIMIT: usize = 24;
+    fn build(model: &CollectionModel, matrix: Arc<Vec<Vec<i64>>>, limit: usize, stop: &AtomicBool) -> Option<Self> {
         let n = matrix.len();
         if n == 0 || matrix.iter().any(|row| row.len() != n) {
             return None;
@@ -215,7 +227,7 @@ impl CandidateNeighbors {
                 })
                 .collect::<Option<Vec<_>>>()?;
             near.sort_unstable_by_key(|&(cost, to)| (cost, to));
-            near.truncate(LIMIT.min(near.len()));
+            near.truncate(limit.min(near.len()));
             map.insert(from, near.into_iter().map(|(_, to)| to).collect());
         }
         Some(Self { map })
@@ -264,13 +276,113 @@ fn reduction_delta_kind(r: &Reduction) -> ReductionDeltaKind {
     }
 }
 
+fn same_iterable_shape(a: &Iterable, b: &Iterable) -> bool {
+    match (a, b) {
+        (Iterable::Items(_), Iterable::Items(_))
+        | (Iterable::SetItems(_), Iterable::SetItems(_))
+        | (Iterable::Pairs(_), Iterable::Pairs(_)) => true,
+        (Iterable::Edges { start: a_start, end: a_end, .. }, Iterable::Edges { start: b_start, end: b_end, .. }) => {
+            a_start == b_start && a_end == b_end
+        }
+        (
+            Iterable::Scan { init: a_init, boundary: a_boundary, step: a_step, end: a_end, .. },
+            Iterable::Scan { init: b_init, boundary: b_boundary, step: b_step, end: b_end, .. },
+        ) => a_init == b_init && a_boundary == b_boundary && a_step == b_step && a_end == b_end,
+        (Iterable::Windows { size: a_size, inner: a_inner, .. }, Iterable::Windows { size: b_size, inner: b_inner, .. }) => {
+            a_size == b_size && a_inner == b_inner
+        }
+        _ => false,
+    }
+}
+
+fn same_reduction_shape(a: &Reduction, b: &Reduction) -> bool {
+    let same_op = match (a.op, b.op) {
+        (ReduceOp::Sum, ReduceOp::Sum)
+        | (ReduceOp::Count, ReduceOp::Count)
+        | (ReduceOp::Used, ReduceOp::Used)
+        | (ReduceOp::Min, ReduceOp::Min)
+        | (ReduceOp::Max, ReduceOp::Max) => true,
+        (ReduceOp::SelectKth(a), ReduceOp::SelectKth(b)) => a == b,
+        _ => false,
+    };
+    same_op && a.arena == b.arena && a.body == b.body && a.coeff == b.coeff && same_iterable_shape(&a.iterable, &b.iterable)
+}
+
+fn lists_are_interchangeable(
+    model: &CollectionModel,
+    objective: &[Vec<Vec<Reduction>>],
+    constraints: &[Vec<Constraint>],
+    max_objective: &[Vec<MaxTerm>],
+) -> bool {
+    if model.lists < 2 || !model.globals.is_empty() || max_objective.iter().any(|terms| !terms.is_empty()) {
+        return false;
+    }
+    (1..model.lists).all(|list| {
+        objective[0]
+            .iter()
+            .zip(&objective[list])
+            .all(|(left, right)| left.len() == right.len() && left.iter().zip(right).all(|(a, b)| same_reduction_shape(a, b)))
+            && constraints[0].len() == constraints[list].len()
+            && constraints[0]
+                .iter()
+                .zip(&constraints[list])
+                .all(|(a, b)| a.op == b.op && a.rhs == b.rhs && same_reduction_shape(&a.reduction, &b.reduction))
+    })
+}
+
+fn routing_gls(objective: &[Vec<Vec<Reduction>>], senses: &[bool]) -> Option<RoutingGls> {
+    if objective.is_empty() || senses.first().copied() != Some(true) {
+        return None;
+    }
+    let first = objective.first()?.first()?.first()?;
+    let matrix = direct_edge_matrix(first)?;
+    if !matches!(first.op, ReduceOp::Sum) || first.coeff <= 0 || matrix.is_empty() || matrix.iter().any(|row| row.len() != matrix.len()) {
+        return None;
+    }
+    let same_feature = objective.iter().all(|list| {
+        list.first().is_some_and(|tier| {
+            tier.len() == 1
+                && matches!(tier[0].iterable, Iterable::Edges { .. })
+                && matches!(tier[0].op, ReduceOp::Sum)
+                && tier[0].coeff == first.coeff
+                && direct_edge_matrix(&tier[0]).is_some_and(|other| other.as_ref() == matrix.as_ref())
+        })
+    });
+    let symmetric = (0..matrix.len()).all(|row| (0..row).all(|col| matrix[row][col] == matrix[col][row]));
+    same_feature.then(|| RoutingGls {
+        penalties: RefCell::new(vec![vec![0; matrix.len()]; matrix.len()]),
+        matrix,
+        lambda: Cell::new(1),
+        coeff: first.coeff,
+        symmetric,
+    })
+}
+
+/// Active representatives of interchangeable routes. Every nonempty route is
+/// retained, plus the first empty route. If a move fills it, a different empty
+/// route becomes the representative on the next neighbourhood scan.
+pub(super) fn active_list_indices(lists: &[Vec<i32>], interchangeable: bool) -> Vec<usize> {
+    if !interchangeable {
+        return (0..lists.len()).collect();
+    }
+    let first_empty = lists.iter().position(Vec::is_empty);
+    (0..lists.len()).filter(|&list| !lists[list].is_empty() || Some(list) == first_empty).collect()
+}
+
 impl PerList {
     pub(super) fn build(model: &CollectionModel) -> Self {
         let stop = AtomicBool::new(false);
-        Self::build_profiled(model, false, &stop)
+        Self::build_profiled(model, false, 24, true, false, &stop)
     }
 
-    fn build_profiled(model: &CollectionModel, metrics_enabled: bool, stop: &AtomicBool) -> Self {
+    fn build_profiled(
+        model: &CollectionModel,
+        metrics_enabled: bool,
+        candidate_limit: usize,
+        enable_routing_gls: bool,
+        diversify_descent: bool,
+        stop: &AtomicBool,
+    ) -> Self {
         let tiers = model.objectives.len();
         let mut objective = vec![vec![Vec::new(); tiers]; model.lists];
         let mut max_objective = vec![Vec::new(); tiers];
@@ -333,6 +445,9 @@ impl PerList {
             constraints: RefCell::new(constraints.iter().map(|list| vec![1; list.len()]).collect()),
             objectives: RefCell::new(objective.iter().map(|list| list.iter().map(|tier| vec![1; tier.len()]).collect()).collect()),
         };
+        let interchangeable_lists =
+            (enable_routing_gls || diversify_descent) && lists_are_interchangeable(model, &objective, &constraints, &max_objective);
+        let routing_gls = enable_routing_gls.then(|| routing_gls(&objective, &senses)).flatten();
         Self {
             objective,
             max_objective,
@@ -344,11 +459,75 @@ impl PerList {
             globals: Globals::build(model, stop),
             has_edges,
             route_bounds,
-            candidates: candidate_matrix.flatten().and_then(|matrix| CandidateNeighbors::build(model, matrix, stop)),
+            candidates: candidate_matrix.flatten().and_then(|matrix| CandidateNeighbors::build(model, matrix, candidate_limit, stop)),
             infeas_cand: true,
+            interchangeable_lists: Cell::new(interchangeable_lists),
             penalties,
+            routing_gls,
             metrics: MetricsRecorder::new(metrics_enabled),
         }
+    }
+
+    pub(super) fn edge_penalty(&self, list: usize, contents: &(impl ListView + ?Sized)) -> i64 {
+        let Some(gls) = &self.routing_gls else { return 0 };
+        let Some((start, end)) = self.route_bounds[list] else { return 0 };
+        let penalties = gls.penalties.borrow();
+        let mut penalty = 0i64;
+        for pos in 0..=contents.len() {
+            let from = if pos == 0 { start } else { contents.at(pos - 1) };
+            let to = if pos == contents.len() { end } else { contents.at(pos) };
+            let (Ok(from), Ok(to)) = (usize::try_from(from), usize::try_from(to)) else { continue };
+            penalty = penalty.saturating_add(penalties.get(from).and_then(|row| row.get(to)).copied().unwrap_or(0));
+        }
+        penalty
+    }
+
+    fn bump_routing_gls(&self, state: &State, primary_objective: i64) -> Option<usize> {
+        let gls = self.routing_gls.as_ref()?;
+        let item_count = state.lists.iter().map(Vec::len).sum::<usize>().max(1);
+        let average_edge = primary_objective.saturating_abs() / i64::try_from(item_count).unwrap_or(i64::MAX).max(1);
+        gls.lambda.set((average_edge / 10).max(1));
+
+        let penalties = gls.penalties.borrow();
+        let mut best: Option<(i64, i64)> = None;
+        let mut edges = Vec::new();
+        for (list, contents) in state.lists.iter().enumerate() {
+            let Some((start, end)) = self.route_bounds[list] else { continue };
+            for pos in 0..=contents.len() {
+                let from_value = if pos == 0 { start } else { contents[pos - 1] };
+                let to_value = if pos == contents.len() { end } else { contents[pos] };
+                let (Ok(from), Ok(to)) = (usize::try_from(from_value), usize::try_from(to_value)) else { continue };
+                let Some(cost) = gls.matrix.get(from).and_then(|row| row.get(to)).copied() else { continue };
+                let penalty = penalties[from][to];
+                let utility = cost.saturating_mul(gls.coeff).max(0);
+                if utility == 0 {
+                    continue;
+                }
+                if best.is_none_or(|(best_value, best_denominator)| {
+                    i128::from(utility) * i128::from(best_denominator) > i128::from(best_value) * i128::from(penalty.saturating_add(1))
+                }) {
+                    best = Some((utility, penalty.saturating_add(1)));
+                }
+                edges.push((from, to, utility, penalty.saturating_add(1)));
+            }
+        }
+        drop(penalties);
+        let (best_value, best_denominator) = best?;
+        let mut penalties = gls.penalties.borrow_mut();
+        let mut bumped = 0usize;
+        let mut seen = HashSet::new();
+        for (from, to, utility, denominator) in edges {
+            if i128::from(utility) * i128::from(best_denominator) == i128::from(best_value) * i128::from(denominator)
+                && seen.insert(if gls.symmetric && from > to { (to, from) } else { (from, to) })
+            {
+                penalties[from][to] = penalties[from][to].saturating_add(1);
+                if gls.symmetric && from != to {
+                    penalties[to][from] = penalties[to][from].saturating_add(1);
+                }
+                bumped += 1;
+            }
+        }
+        Some(bumped)
     }
 
     pub(super) fn has_max_objective(&self) -> bool {
@@ -361,6 +540,7 @@ impl PerList {
     pub(super) fn bump_gls(&self, state: &State) -> usize {
         let raw = full_score_raw(self, state);
         if raw.violation > 0 {
+            self.interchangeable_lists.set(false);
             let mut weights = self.penalties.constraints.borrow_mut();
             let mut best: Option<(i64, i64)> = None;
             for (list, score) in state.scores.iter().enumerate() {
@@ -393,6 +573,10 @@ impl PerList {
         if self.tiers == 0 {
             return 0;
         }
+        if let Some(bumped) = self.bump_routing_gls(state, raw.tiers[0]) {
+            return bumped;
+        }
+        self.interchangeable_lists.set(false);
         let minimize = self.senses[0];
         let mut weights = self.penalties.objectives.borrow_mut();
         let mut best: Option<(i64, i64)> = None;
@@ -454,6 +638,7 @@ pub(super) struct ListScore {
     pub(super) constraint_violations: ConstraintViolations,
     pub(super) objective_reductions: ObjectiveReductionValues,
     pub(super) undefined_violation: i64,
+    pub(super) edge_penalty: i64,
 }
 
 pub(super) struct ListReductionCaches {
@@ -499,7 +684,7 @@ impl ListReductionCaches {
         Some(Self { objective, constraints })
     }
 
-    pub(super) fn score(&self, per: &PerList, idx: usize) -> ListScore {
+    pub(super) fn score(&self, per: &PerList, idx: usize, contents: &dyn ListView) -> ListScore {
         let mut violation = 0i64;
         let mut undefined_violation = 0i64;
         let mut objectives = tier_values(per.tiers, 0);
@@ -536,7 +721,8 @@ impl ListReductionCaches {
                 }
             }
         }
-        ListScore { violation, objectives, constraint_violations, objective_reductions, undefined_violation }
+        let edge_penalty = per.edge_penalty(idx, contents);
+        ListScore { violation, objectives, constraint_violations, objective_reductions, undefined_violation, edge_penalty }
     }
 }
 
@@ -578,7 +764,8 @@ pub(super) fn list_score_exact(per: &PerList, idx: usize, contents: &[i32]) -> L
             }
         }
     }
-    ListScore { violation, objectives, constraint_violations, objective_reductions, undefined_violation }
+    let edge_penalty = per.edge_penalty(idx, contents);
+    ListScore { violation, objectives, constraint_violations, objective_reductions, undefined_violation, edge_penalty }
 }
 
 fn build_max_caches(per: &PerList, lists: &[Vec<i32>]) -> Vec<Vec<Vec<Vec<ReductionCache>>>> {
@@ -728,6 +915,11 @@ fn score_with_replacements_mode<'a>(
                     }
                 }
             }
+            if tier == 0 && guided {
+                if let Some(gls) = &per.routing_gls {
+                    *slot = slot.saturating_add(score.edge_penalty.saturating_mul(gls.lambda.get()));
+                }
+            }
         }
     }
     violation = violation.saturating_add(state.global_viol).saturating_add(global_delta);
@@ -811,7 +1003,14 @@ impl State {
     /// `min`/`max` constraint get filled, far better than a blind round robin
     /// on tight instances, while different `order`s give diverse seeded starts.
     /// Global constraints are ignored here; the search repairs them.
-    fn greedy(model: &CollectionModel, per: &PerList, order: &[usize], stop: &AtomicBool) -> Option<Self> {
+    fn greedy(
+        model: &CollectionModel,
+        per: &PerList,
+        order: &[usize],
+        seed: u64,
+        randomized_ties: bool,
+        stop: &AtomicBool,
+    ) -> Option<Self> {
         let k = model.lists.max(1);
         let mut state = Self::from_lists_interruptible(model, per, vec![Vec::new(); k], stop)?;
         if stop.load(Ordering::Relaxed) {
@@ -825,7 +1024,8 @@ impl State {
             let item = model.items[item_idx];
             let mut best_l = 0;
             let mut best_key = Score { violation: i64::MAX, tiers: tier_values(per.tiers, i64::MAX) };
-            for l in 0..k {
+            let mut best_tie = u64::MAX;
+            for l in active_list_indices(&state.lists, per.interchangeable_lists.get()) {
                 let candidate = InsertView::new(&state.lists[l], state.lists[l].len(), item);
                 per.metrics.record_candidate();
                 let sc = trial_list_score_view(per, &state, l, &candidate, None, &mut scratch);
@@ -836,8 +1036,10 @@ impl State {
                     *d = new.saturating_sub(old);
                 }
                 let key = signed(per, dv, draw);
-                if key < best_key {
+                let tie = mix64(seed ^ mix64(item_idx as u64) ^ mix64(l as u64));
+                if key < best_key || (randomized_ties && key == best_key && tie < best_tie) {
                     best_key = key;
+                    best_tie = tie;
                     best_l = l;
                 }
             }
@@ -856,7 +1058,7 @@ impl State {
         lists.truncate(k);
         lists.resize_with(k, Vec::new);
         let caches: Vec<ListReductionCaches> = (0..k).map(|idx| ListReductionCaches::build(per, idx, &lists[idx])).collect();
-        let scores: Vec<ListScore> = (0..k).map(|idx| caches[idx].score(per, idx)).collect();
+        let scores: Vec<ListScore> = (0..k).map(|idx| caches[idx].score(per, idx, &lists[idx])).collect();
         let max_caches = build_max_caches(per, &lists);
         let mut item_list = vec![0usize; model.items.len()];
         for (l, contents) in lists.iter().enumerate() {
@@ -880,7 +1082,7 @@ impl State {
         lists.truncate(k);
         lists.resize_with(k, Vec::new);
         let caches = (0..k).map(|idx| ListReductionCaches::build_interruptible(per, idx, &lists[idx], stop)).collect::<Option<Vec<_>>>()?;
-        let scores = (0..k).map(|idx| caches[idx].score(per, idx)).collect();
+        let scores = (0..k).map(|idx| caches[idx].score(per, idx, &lists[idx])).collect();
         let max_caches = build_max_caches_interruptible(per, &lists, stop)?;
         let mut item_list = vec![0usize; model.items.len()];
         for (list_index, contents) in lists.iter().enumerate() {
@@ -904,7 +1106,7 @@ impl State {
         let Some(cache) = ListReductionCaches::build_interruptible(per, idx, &self.lists[idx], stop) else {
             return false;
         };
-        let score = cache.score(per, idx);
+        let score = cache.score(per, idx, &self.lists[idx]);
         let mut max_updates = Vec::new();
         for (tier, terms) in per.max_objective.iter().enumerate() {
             for (term_idx, term) in terms.iter().enumerate() {
@@ -932,6 +1134,12 @@ impl State {
     pub(super) fn set_item_list(&mut self, per: &PerList, value: i32, l: usize) {
         if let Some(&i) = per.globals.value_to_idx.get(&value) {
             self.item_list[i] = l;
+        }
+    }
+
+    fn refresh_edge_penalties(&mut self, per: &PerList) {
+        for (list, score) in self.scores.iter_mut().enumerate() {
+            score.edge_penalty = per.edge_penalty(list, &self.lists[list]);
         }
     }
 }
@@ -1173,7 +1381,14 @@ pub(super) fn solve_collection_capped_worker(
         let metrics = MetricsRecorder::new(metrics_enabled).snapshot(started.map(|instant| instant.elapsed()).unwrap_or_default());
         return (solution, metrics);
     }
-    let per = PerList::build_profiled(model, metrics_enabled, stop);
+    let per = PerList::build_profiled(
+        model,
+        metrics_enabled,
+        profile.candidate_limit(),
+        profile.use_arc_gls(),
+        profile.diversify_initial_descent(),
+        stop,
+    );
     if stop.load(Ordering::Relaxed) {
         return no_solution();
     }
@@ -1185,7 +1400,7 @@ pub(super) fn solve_collection_capped_worker(
     // loop, ALNS controller, and incumbent tracking below are identical.
     let state = match hint {
         Some(h) => State::from_lists_interruptible(model, &per, hint_partition(model, h), stop),
-        None => State::greedy(model, &per, &order, stop),
+        None => State::greedy(model, &per, &order, seed, profile.diversify_initial_descent(), stop),
     };
     let Some(mut state) = state.filter(|_| !stop.load(Ordering::Relaxed)) else {
         return no_solution();
@@ -1207,7 +1422,8 @@ pub(super) fn solve_collection_capped_worker(
 
     while !stop.load(Ordering::Relaxed) && iter < max_iters {
         iter += 1;
-        match best_improving_move(&per, &state, stop, &mut memory) {
+        let scan_seed = if profile.diversify_initial_descent() { seed ^ mix64(iter) } else { 0 };
+        match best_improving_move(&per, &state, stop, &mut memory, scan_seed) {
             Some(mv) => {
                 if !apply_move(&per, &mut state, mv, stop) {
                     state_consistent = false;
@@ -1250,7 +1466,18 @@ pub(super) fn solve_collection_capped_worker(
                     continue;
                 }
 
+                let elite_period = profile.elite_restart_period();
+                if stagnant > 0 && stagnant.is_multiple_of(elite_period) {
+                    let Some(elite_state) = State::from_lists_interruptible(model, &per, best_lists.clone(), stop) else {
+                        break;
+                    };
+                    state = elite_state;
+                    memory.reset_all();
+                    alns.reset_after_injection(&best_score);
+                }
+
                 let penalties = per.bump_gls(&state);
+                state.refresh_edge_penalties(&per);
                 alns.record_gls(penalties);
 
                 let operator_seed = seed ^ mix64(iter) ^ mix64(stagnant);

@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import json
 import math
+import os
 import sys
 import time
 from random import Random
@@ -24,7 +25,7 @@ parser.add_argument("--customers", type=int, default=30)
 parser.add_argument("--vehicles", type=int, default=None)
 parser.add_argument("--capacity", type=int, default=40, help="generated-instance capacity")
 parser.add_argument("--time-limit", type=int, default=10)
-parser.add_argument("--threads", type=int, default=1)
+parser.add_argument("--threads", type=int, default=min(8, os.cpu_count() or 1), help="portfolio workers (default: up to 8 cores)")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--max-iterations", type=int)
 parser.add_argument("--profile", action="store_true")

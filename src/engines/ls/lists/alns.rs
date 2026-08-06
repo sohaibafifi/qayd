@@ -4,14 +4,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use smallvec::SmallVec;
 
 use super::incremental::{EvalScratch, InsertView, RemoveView};
-use super::local_search::{score_scalar, score_with_replaced_list, tier_values, CandidateNeighbors, ListScore, PerList, Score, State};
+use super::local_search::{
+    active_list_indices, score_scalar, score_with_replaced_list, tier_values, CandidateNeighbors, ListScore, PerList, Score, State,
+};
 use super::metrics::{AdaptiveOperatorMetrics, AlnsSearchMetrics};
 use super::moves::{apply_move, best_improving_move, trial_list_score_view, SearchMemory};
 use crate::mix64;
 use crate::model::list::CollectionModel;
 
-const DESTROY_OPERATORS: usize = 3;
-const REPAIR_OPERATORS: usize = 3;
+const DESTROY_OPERATORS: usize = 4;
+const REPAIR_OPERATORS: usize = 4;
 const WEIGHT_SCALE: u64 = 1_000;
 const MIN_WEIGHT: u64 = 100;
 
@@ -32,6 +34,32 @@ impl SearchProfile {
             Self::Diversify => "diversify",
         }
     }
+
+    pub(super) const fn candidate_limit(self) -> usize {
+        match self {
+            Self::Sequential => 24,
+            Self::Intensify => 16,
+            Self::Balanced => 32,
+            Self::Diversify => 48,
+        }
+    }
+
+    pub(super) const fn diversify_initial_descent(self) -> bool {
+        !matches!(self, Self::Sequential)
+    }
+
+    pub(super) const fn use_arc_gls(self) -> bool {
+        true
+    }
+
+    pub(super) const fn elite_restart_period(self) -> u64 {
+        match self {
+            Self::Sequential => 24,
+            Self::Intensify => 8,
+            Self::Balanced => 16,
+            Self::Diversify => 32,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -39,16 +67,18 @@ pub(super) enum DestroyOperator {
     Shaw = 0,
     Segments = 1,
     Worst = 2,
+    Route = 3,
 }
 
 impl DestroyOperator {
-    const ALL: [Self; DESTROY_OPERATORS] = [Self::Shaw, Self::Segments, Self::Worst];
+    const ALL: [Self; DESTROY_OPERATORS] = [Self::Shaw, Self::Segments, Self::Worst, Self::Route];
 
     const fn name(self) -> &'static str {
         match self {
             Self::Shaw => "shaw",
             Self::Segments => "segments",
             Self::Worst => "worst",
+            Self::Route => "route",
         }
     }
 }
@@ -58,6 +88,7 @@ pub(super) enum RepairOperator {
     Greedy = 0,
     Regret2 = 1,
     Regret3 = 2,
+    BlinkRegret2 = 3,
 }
 
 #[derive(Clone, Copy)]
@@ -68,21 +99,23 @@ pub(super) struct AlnsChoice {
 }
 
 impl RepairOperator {
-    const ALL: [Self; REPAIR_OPERATORS] = [Self::Greedy, Self::Regret2, Self::Regret3];
+    const ALL: [Self; REPAIR_OPERATORS] = [Self::Greedy, Self::Regret2, Self::Regret3, Self::BlinkRegret2];
 
     const fn name(self) -> &'static str {
         match self {
             Self::Greedy => "greedy",
             Self::Regret2 => "regret-2",
             Self::Regret3 => "regret-3",
+            Self::BlinkRegret2 => "blink-regret-2",
         }
     }
 
-    const fn regret(self) -> Option<usize> {
+    const fn regret(self) -> Option<(usize, bool)> {
         match self {
             Self::Greedy => None,
-            Self::Regret2 => Some(2),
-            Self::Regret3 => Some(3),
+            Self::Regret2 => Some((2, false)),
+            Self::Regret3 => Some((3, false)),
+            Self::BlinkRegret2 => Some((2, true)),
         }
     }
 }
@@ -190,8 +223,8 @@ impl AlnsController {
     }
 
     pub(super) fn select(&self, seed: u64, iteration: u64) -> (DestroyOperator, RepairOperator) {
-        let destroy = roulette(&self.destroy, seed ^ mix64(iteration));
-        let repair = roulette(&self.repair, seed ^ mix64(iteration ^ 0xA076_1D64_78BD_642F));
+        let destroy = roulette(&self.destroy, 4, seed ^ mix64(iteration));
+        let repair = roulette(&self.repair, 4, seed ^ mix64(iteration ^ 0xA076_1D64_78BD_642F));
         (DestroyOperator::ALL[destroy], RepairOperator::ALL[repair])
     }
 
@@ -333,16 +366,17 @@ impl AlnsController {
     }
 }
 
-fn roulette<const N: usize>(operators: &[OperatorState; N], seed: u64) -> usize {
-    let total: u64 = operators.iter().map(|operator| operator.weight).sum();
+fn roulette<const N: usize>(operators: &[OperatorState; N], limit: usize, seed: u64) -> usize {
+    let limit = limit.min(N).max(1);
+    let total: u64 = operators[..limit].iter().map(|operator| operator.weight).sum();
     let mut pick = mix64(seed) % total.max(1);
-    for (idx, operator) in operators.iter().enumerate() {
+    for (idx, operator) in operators[..limit].iter().enumerate() {
         if pick < operator.weight {
             return idx;
         }
         pick -= operator.weight;
     }
-    N - 1
+    limit - 1
 }
 
 fn update_operator(operator: &mut OperatorState, reward: u64, accepted: bool, improved: bool, global_best: bool) {
@@ -413,25 +447,46 @@ pub(super) fn build_candidate(
         return None;
     }
     let mut lists = current.lists.clone();
-    let removed = match choice.destroy {
-        DestroyOperator::Shaw => destroy_shaw(&mut lists, per.candidates.as_ref(), choice.target, seed),
-        DestroyOperator::Segments => destroy_segments(&mut lists, choice.target, seed),
-        DestroyOperator::Worst => destroy_worst(per, current, &mut lists, choice.target, seed, stop),
+    let (removed, allow_empty_route) = match choice.destroy {
+        DestroyOperator::Shaw => (destroy_shaw(&mut lists, per.candidates.as_ref(), choice.target, seed), true),
+        DestroyOperator::Segments => (destroy_segments(&mut lists, choice.target, seed), true),
+        DestroyOperator::Worst => (destroy_worst(per, current, &mut lists, choice.target, seed, stop), true),
+        DestroyOperator::Route => (destroy_route(&mut lists, choice.target, seed), false),
     };
     if removed.is_empty() || stop.load(Ordering::Relaxed) {
         return None;
     }
     let mut state = State::from_lists_interruptible(model, per, lists, stop)?;
     let repaired = match choice.repair.regret() {
-        Some(k) => repair_regret(per, &mut state, &removed, k, seed ^ 0xA076_1D64_78BD_642F, stop),
-        None => repair_greedy(per, &mut state, &removed, seed ^ 0xA076_1D64_78BD_642F, stop),
+        Some((k, blink)) => repair_regret(
+            per,
+            &mut state,
+            &removed,
+            RegretRepair { k, blink, allow_empty: allow_empty_route, seed: seed ^ 0xA076_1D64_78BD_642F },
+            stop,
+        ),
+        None => repair_greedy(per, &mut state, &removed, allow_empty_route, seed ^ 0xA076_1D64_78BD_642F, stop),
     };
     if !repaired {
         return None;
     }
     state = State::from_lists_interruptible(model, per, state.lists, stop)?;
-    let polish_steps = removed.len().saturating_mul(choice.repair.regret().unwrap_or(1));
-    polish(per, &mut state, stop, polish_steps).then_some(state)
+    let polish_factor = choice.repair.regret().map_or(1, |(regret, _)| regret);
+    let polish_steps = removed.len().saturating_mul(polish_factor);
+    polish(per, &mut state, stop, polish_steps, seed ^ 0xD1B5_4A32_D192_ED03).then_some(state)
+}
+
+fn destroy_route(lists: &mut [Vec<i32>], target: usize, seed: u64) -> Vec<i32> {
+    let nonempty: Vec<usize> = lists.iter().enumerate().filter_map(|(idx, list)| (!list.is_empty()).then_some(idx)).collect();
+    let Some(min_len) = nonempty.iter().map(|&route| lists[route].len()).min() else { return Vec::new() };
+    let smallest: Vec<usize> = nonempty.into_iter().filter(|&route| lists[route].len() == min_len).collect();
+    let route = smallest[(mix64(seed) % smallest.len() as u64) as usize];
+    let mut removed = std::mem::take(&mut lists[route]);
+    if removed.len() < target {
+        removed.extend(destroy_segments(lists, target - removed.len(), seed ^ 0xE703_7ED1_A0B4_28DB));
+    }
+    shuffle_values(&mut removed, seed ^ 0xD1B5_4A32_D192_ED03);
+    removed
 }
 
 fn destroy_segments(lists: &mut [Vec<i32>], target: usize, seed: u64) -> Vec<i32> {
@@ -558,12 +613,24 @@ fn destroy_worst(per: &PerList, state: &State, lists: &mut [Vec<i32>], target: u
     removed
 }
 
-fn repair_greedy(per: &PerList, state: &mut State, removed: &[i32], seed: u64, stop: &AtomicBool) -> bool {
+fn repair_routes(state: &State, per: &PerList, allow_empty: bool) -> Vec<usize> {
+    if allow_empty {
+        return active_list_indices(&state.lists, per.interchangeable_lists.get());
+    }
+    let nonempty: Vec<usize> = (0..state.lists.len()).filter(|&list| !state.lists[list].is_empty()).collect();
+    if nonempty.is_empty() {
+        active_list_indices(&state.lists, per.interchangeable_lists.get())
+    } else {
+        nonempty
+    }
+}
+
+fn repair_greedy(per: &PerList, state: &mut State, removed: &[i32], allow_empty: bool, seed: u64, stop: &AtomicBool) -> bool {
     let mut scratch = EvalScratch::default();
     let mut polled = 0u32;
     for &item in removed {
         let mut best: Option<(Score, u64, usize, usize, ListScore)> = None;
-        for list in 0..state.lists.len() {
+        for list in repair_routes(state, per, allow_empty) {
             for pos in 0..=state.lists[list].len() {
                 polled = polled.wrapping_add(1);
                 if polled.is_multiple_of(1024) && stop.load(Ordering::Relaxed) {
@@ -595,31 +662,42 @@ fn repair_greedy(per: &PerList, state: &mut State, removed: &[i32], seed: u64, s
     true
 }
 
-fn repair_regret(per: &PerList, state: &mut State, removed: &[i32], k: usize, seed: u64, stop: &AtomicBool) -> bool {
+struct RegretRepair {
+    k: usize,
+    blink: bool,
+    allow_empty: bool,
+    seed: u64,
+}
+
+fn repair_regret(per: &PerList, state: &mut State, removed: &[i32], settings: RegretRepair, stop: &AtomicBool) -> bool {
     let mut pending = removed.to_vec();
     let mut scratch = EvalScratch::default();
     let mut polled = 0u32;
     while !pending.is_empty() {
         let mut choice: Option<(usize, i128, u64, usize, usize, ListScore)> = None;
         for (idx, &item) in pending.iter().enumerate() {
-            let mut topk: SmallVec<[i128; 4]> = SmallVec::with_capacity(k);
+            let mut topk: SmallVec<[i128; 4]> = SmallVec::with_capacity(settings.k);
             let mut best_place: Option<(i128, u64, usize, usize, ListScore)> = None;
-            for list in 0..state.lists.len() {
+            for list in repair_routes(state, per, settings.allow_empty) {
                 for pos in 0..=state.lists[list].len() {
                     polled = polled.wrapping_add(1);
                     if polled.is_multiple_of(1024) && stop.load(Ordering::Relaxed) {
                         return false;
+                    }
+                    let blink_sample = mix64(settings.seed ^ mix64(item as i64 as u64) ^ mix64(list as u64) ^ mix64(pos as u64));
+                    if settings.blink && best_place.is_some() && blink_sample % 100 < 15 {
+                        continue;
                     }
                     let candidate = InsertView::new(&state.lists[list], pos, item);
                     per.metrics.record_candidate();
                     let next = trial_list_score_view(per, state, list, &candidate, None, &mut scratch);
                     let global_delta = per.globals.delta(&state.item_list, &[(item, list)]);
                     let cost = score_scalar(&score_with_replaced_list(per, state, list, &next, &candidate, global_delta, &mut scratch));
-                    let tie = mix64(seed ^ item as i64 as u64 ^ ((list as u64) << 32) ^ pos as u64);
+                    let tie = mix64(settings.seed ^ item as i64 as u64 ^ ((list as u64) << 32) ^ pos as u64);
                     let insert = topk.partition_point(|&candidate_cost| candidate_cost <= cost);
-                    if insert < k {
+                    if insert < settings.k {
                         topk.insert(insert, cost);
-                        topk.truncate(k);
+                        topk.truncate(settings.k);
                     }
                     if best_place
                         .as_ref()
@@ -631,7 +709,7 @@ fn repair_regret(per: &PerList, state: &mut State, removed: &[i32], k: usize, se
             }
             let Some((best_cost, best_tie, best_list, best_pos, best_score)) = best_place else { return false };
             let mut regret = 0i128;
-            for rank in 1..k {
+            for rank in 1..settings.k {
                 let alternative = topk.get(rank).copied().unwrap_or_else(|| best_cost.saturating_add(1i128 << 60));
                 regret = regret.saturating_add(alternative.saturating_sub(best_cost));
             }
@@ -655,13 +733,13 @@ fn repair_regret(per: &PerList, state: &mut State, removed: &[i32], k: usize, se
     true
 }
 
-fn polish(per: &PerList, state: &mut State, stop: &AtomicBool, steps: usize) -> bool {
+fn polish(per: &PerList, state: &mut State, stop: &AtomicBool, steps: usize, seed: u64) -> bool {
     let mut memory = SearchMemory::new(state.lists.len());
-    for _ in 0..steps {
+    for step in 0..steps {
         if stop.load(Ordering::Relaxed) {
             return false;
         }
-        let Some(mv) = best_improving_move(per, state, stop, &mut memory) else {
+        let Some(mv) = best_improving_move(per, state, stop, &mut memory, seed ^ mix64(step as u64)) else {
             return !stop.load(Ordering::Relaxed);
         };
         if !apply_move(per, state, mv, stop) {
