@@ -58,14 +58,16 @@
 //! a dedicated branching. That is the list-ordering domain, a separate tranche -
 //! not "one more constraint" over membership.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::constraints::list as list_constraints;
 use crate::ids::{ListId, VarId};
-use crate::model::list::{self, CollectionModel, ListObjectiveTerm};
+use crate::model::list::{self, CollectionModel, ListObjectiveMaxTerm, ListObjectiveTerm};
 use crate::model::{evaluate_list_objectives, list_objectives_better, ListObjectiveTier};
 use crate::search::{self, Objective as SearchObjective, SearchControl, SolveStats};
 use crate::store::Solver;
+
+use super::{CollectionCompileContext, CompileFailure};
 
 /// Solver status returned by the list exact engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +101,23 @@ pub struct Outcome {
     pub stats: SolveStats,
 }
 
+fn interrupted_outcome(stats: SolveStats) -> Outcome {
+    Outcome { status: Status::Unknown, objectives: Vec::new(), solution: None, stats }
+}
+
+fn stop_requested(stop: &AtomicBool) -> bool {
+    stop.load(Ordering::Acquire)
+}
+
+/// List model already parsed into the exact engine's physical constraint and
+/// objective representation. A successful compilation cannot be declined by
+/// execution later.
+#[derive(Clone)]
+pub(crate) struct CompiledListExact {
+    objective_tiers: Vec<ListObjectiveTier>,
+    constraints: Vec<ListConstraint>,
+}
+
 #[derive(Clone)]
 enum ListConstraint {
     Length {
@@ -122,7 +141,10 @@ enum ListConstraint {
     Impossible,
 }
 
-fn list_constraint(constraint: &list::Constraint, items: &[i32]) -> Option<ListConstraint> {
+fn list_constraint(constraint: &list::Constraint, items: &[i32], stop: Option<&AtomicBool>) -> Option<ListConstraint> {
+    if stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Acquire)) {
+        return None;
+    }
     let list::Iterable::Items(list) = &constraint.reduction.iterable else {
         // Order-sensitive and set reductions have no linearizable posting here;
         // they are checked on completed assignments.
@@ -171,6 +193,9 @@ fn list_constraint(constraint: &list::Constraint, items: &[i32]) -> Option<ListC
     if matches!(constraint.reduction.op, list::ReduceOp::Sum) {
         let mut weights = Vec::with_capacity(items.len());
         for &item in items {
+            if stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Acquire)) {
+                return None;
+            }
             weights.push((
                 item,
                 eval_collection_expr_one(&constraint.reduction.arena.exprs, constraint.reduction.body, i64::from(item))?
@@ -216,32 +241,242 @@ pub fn solve(
     stop: &AtomicBool,
     mut on_improve: impl FnMut(&[i64]),
 ) -> Result<Option<Outcome>, String> {
-    let Some(parsed) = parse_constraints(model) else {
-        return Ok(None);
+    if stop_requested(stop) {
+        return Ok(Some(interrupted_outcome(SolveStats::default())));
+    }
+    let Some(parsed) = parse_constraints_interruptible(model, stop) else {
+        return Ok(stop_requested(stop).then(|| interrupted_outcome(SolveStats::default())));
     };
-    if parsed.iter().any(|c| matches!(c, ListConstraint::Impossible)) {
-        return Ok(Some(Outcome { status: Status::Unsatisfiable, objectives: Vec::new(), solution: None, stats: SolveStats::default() }));
+    Ok(Some(solve_parsed(model, objective_tiers, &parsed, stop, &mut on_improve)))
+}
+
+/// Compile the model and its objective tiers in one capability operation.
+pub(crate) fn compile(context: &CollectionCompileContext<'_>, stop: &AtomicBool) -> Result<CompiledListExact, CompileFailure> {
+    #[cfg(test)]
+    COMPILE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+    let model = context.physical();
+    if stop_requested(stop) {
+        return Err(CompileFailure::Interrupted { phase: "before list exact capability analysis" });
+    }
+    debug_assert!(context.semantic().intervals().is_empty());
+    let should_stop = || stop_requested(stop);
+    let Some(objective_tiers) = list_objective_tiers_interruptible(&model.objectives, &model.items, &should_stop) else {
+        return if should_stop() {
+            Err(CompileFailure::Interrupted { phase: "during list exact objective lowering" })
+        } else {
+            Err(CompileFailure::Unsupported { code: "list-objective", detail: "list objective is outside the exact list backend" })
+        };
+    };
+    if should_stop() {
+        return Err(CompileFailure::Interrupted { phase: "after list exact objective lowering" });
+    }
+    let Some(constraints) = parse_constraints_interruptible(model, stop) else {
+        return if should_stop() {
+            Err(CompileFailure::Interrupted { phase: "during list exact constraint lowering" })
+        } else {
+            Err(CompileFailure::Unsupported { code: "list-constraint", detail: "list constraint is outside the exact list backend" })
+        };
+    };
+    if should_stop() {
+        return Err(CompileFailure::Interrupted { phase: "after list exact constraint lowering" });
+    }
+    if should_stop() {
+        return Err(CompileFailure::Interrupted { phase: "during list exact physical model construction" });
+    }
+    Ok(CompiledListExact { objective_tiers, constraints })
+}
+
+#[cfg(test)]
+pub(crate) fn lower(context: &CollectionCompileContext<'_>, stop: &AtomicBool) -> Option<CompiledListExact> {
+    compile(context, stop).ok()
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static COMPILE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_compile_calls_for_test() {
+    COMPILE_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn compile_calls_for_test() -> usize {
+    COMPILE_CALLS.with(std::cell::Cell::get)
+}
+
+fn list_objective_tiers_interruptible(
+    tiers: &[list::ObjectiveTier],
+    items: &[i32],
+    should_stop: &dyn Fn() -> bool,
+) -> Option<Vec<ListObjectiveTier>> {
+    if should_stop() {
+        return None;
+    }
+    let mut parsed = Vec::with_capacity(tiers.len());
+    for tier in tiers {
+        if should_stop() {
+            return None;
+        }
+        let mut terms = Vec::with_capacity(tier.terms.len());
+        for reduction in &tier.terms {
+            terms.push(list_objective_term_interruptible(reduction, items, should_stop)?);
+        }
+
+        let max_terms = if let Some(terms) = &tier.max_terms {
+            let mut parsed_terms = Vec::with_capacity(terms.len());
+            for term in terms {
+                if should_stop() {
+                    return None;
+                }
+                let mut groups = Vec::with_capacity(term.groups.len());
+                for group in &term.groups {
+                    let mut parsed_group = Vec::with_capacity(group.len());
+                    for reduction in group {
+                        parsed_group.push(list_objective_term_interruptible(reduction, items, should_stop)?);
+                    }
+                    groups.push(parsed_group);
+                }
+                parsed_terms.push(ListObjectiveMaxTerm { groups, coeff: term.coeff });
+            }
+            Some(parsed_terms)
+        } else {
+            None
+        };
+        parsed.push(ListObjectiveTier { minimize: tier.minimize, terms, max_terms });
+    }
+    (!should_stop()).then_some(parsed)
+}
+
+fn list_objective_term_interruptible(
+    reduction: &list::Reduction,
+    items: &[i32],
+    should_stop: &dyn Fn() -> bool,
+) -> Option<ListObjectiveTerm> {
+    if should_stop() {
+        return None;
+    }
+    if let list::Iterable::Items(list) = &reduction.iterable {
+        match reduction.op {
+            list::ReduceOp::Sum | list::ReduceOp::Count => {
+                let mut weights = Vec::with_capacity(items.len());
+                for &item in items {
+                    if should_stop() {
+                        return None;
+                    }
+                    let value = list::eval_expr_checked(&reduction.arena.exprs, reduction.body, &[i64::from(item)])?;
+                    weights.push((item, value));
+                }
+                return match reduction.op {
+                    list::ReduceOp::Sum => Some(ListObjectiveTerm::Sum { list: *list, weights, coeff: reduction.coeff }),
+                    list::ReduceOp::Count => Some(ListObjectiveTerm::Count { list: *list, weights, coeff: reduction.coeff }),
+                    _ => unreachable!("sum/count branch was checked above"),
+                };
+            }
+            list::ReduceOp::Used => return Some(ListObjectiveTerm::Used { list: *list, coeff: reduction.coeff }),
+            list::ReduceOp::Min | list::ReduceOp::Max | list::ReduceOp::SelectKth(_) => {}
+        }
+    }
+    if should_stop() {
+        return None;
+    }
+    let term = ListObjectiveTerm::Reduction(reduction.clone());
+    (!should_stop()).then_some(term)
+}
+
+pub(crate) fn solve_compiled(
+    compiled: &CompiledListExact,
+    model: &CollectionModel,
+    stop: &AtomicBool,
+    mut on_improve: impl FnMut(&[i64]),
+) -> Outcome {
+    solve_parsed(model, &compiled.objective_tiers, &compiled.constraints, stop, &mut on_improve)
+}
+
+#[cfg(test)]
+pub(crate) fn solve_compiled_with_build_stop_for_test(
+    compiled: &CompiledListExact,
+    model: &CollectionModel,
+    stop: &AtomicBool,
+    should_stop: &dyn Fn() -> bool,
+) -> Outcome {
+    solve_parsed_until(model, &compiled.objective_tiers, &compiled.constraints, stop, should_stop, &mut |_| {})
+}
+
+fn solve_parsed(
+    model: &CollectionModel,
+    objective_tiers: &[ListObjectiveTier],
+    parsed: &[ListConstraint],
+    stop: &AtomicBool,
+    on_improve: &mut impl FnMut(&[i64]),
+) -> Outcome {
+    let should_stop = || stop_requested(stop);
+    solve_parsed_until(model, objective_tiers, parsed, stop, &should_stop, on_improve)
+}
+
+fn solve_parsed_until(
+    model: &CollectionModel,
+    objective_tiers: &[ListObjectiveTier],
+    parsed: &[ListConstraint],
+    stop: &AtomicBool,
+    should_stop: &dyn Fn() -> bool,
+    on_improve: &mut impl FnMut(&[i64]),
+) -> Outcome {
+    if should_stop() {
+        return interrupted_outcome(SolveStats::default());
+    }
+    let mut impossible = false;
+    for constraint in parsed {
+        if should_stop() {
+            return interrupted_outcome(SolveStats::default());
+        }
+        impossible |= matches!(constraint, ListConstraint::Impossible);
+    }
+    if impossible {
+        return if should_stop() {
+            interrupted_outcome(SolveStats::default())
+        } else {
+            Outcome { status: Status::Unsatisfiable, objectives: Vec::new(), solution: None, stats: SolveStats::default() }
+        };
     }
 
     // A `Reduction` constraint (scan) is not posted into the solver, only checked
     // on completed ordered lists, so it needs the enumeration path. The member-var
     // and chrono paths would accept assignments that violate it.
-    let has_unposted_reduction = parsed.iter().any(|c| matches!(c, ListConstraint::Reduction { .. }));
-    let has_unposted_global = model
-        .globals
-        .iter()
-        .any(|global| !matches!(global, list::GlobalConstraint::ListLe { .. } | list::GlobalConstraint::SameList { .. }));
-    if has_unposted_reduction || has_unposted_global || objective_tiers_order_dependent(objective_tiers) {
-        return Ok(Some(run_ordered_search(model, &parsed, objective_tiers, stop, &mut on_improve)));
+    let Some(has_unposted_reduction) = any_until(parsed, should_stop, |constraint| matches!(constraint, ListConstraint::Reduction { .. }))
+    else {
+        return interrupted_outcome(SolveStats::default());
+    };
+    let Some(has_unposted_global) = any_until(&model.globals, should_stop, |global| {
+        !matches!(global, list::GlobalConstraint::ListLe { .. } | list::GlobalConstraint::SameList { .. })
+    }) else {
+        return interrupted_outcome(SolveStats::default());
+    };
+    let Some(order_dependent_objective) = objective_tiers_order_dependent_until(objective_tiers, should_stop) else {
+        return interrupted_outcome(SolveStats::default());
+    };
+    if has_unposted_reduction || has_unposted_global || order_dependent_objective {
+        if should_stop() {
+            return interrupted_outcome(SolveStats::default());
+        }
+        return run_ordered_search(model, parsed, objective_tiers, stop, on_improve);
     }
 
-    let (solver, lists) = build_solver(model, &parsed);
-    let outcome = if member_var_exact_supported(&parsed, &model.globals, objective_tiers) {
-        run_member_var_search(solver, &lists, &model.items, objective_tiers, stop, &mut on_improve)
-    } else {
-        run_domain_search(solver, objective_tiers, stop, &mut on_improve)
+    let Some(member_var_supported) = member_var_exact_supported_until(parsed, &model.globals, objective_tiers, should_stop) else {
+        return interrupted_outcome(SolveStats::default());
     };
-    Ok(Some(outcome))
+    let Some((solver, lists)) = build_solver(model, parsed, should_stop) else {
+        return interrupted_outcome(SolveStats::default());
+    };
+    if should_stop() {
+        return interrupted_outcome(SolveStats::default());
+    }
+    if member_var_supported {
+        run_member_var_search(solver, &lists, &model.items, objective_tiers, stop, should_stop, on_improve)
+    } else {
+        run_domain_search(solver, objective_tiers, stop, on_improve)
+    }
 }
 
 /// Whether the member-variable CDCL backend should solve this model exactly.
@@ -254,21 +489,61 @@ pub fn solve(
 /// separate (perf) decision still pending, so it stays on chrono for now. The
 /// routed set: partition + `Length` + `same_list`, with objectives that do not
 /// depend on list order.
-fn member_var_exact_supported(
+fn member_var_exact_supported_until(
     parsed: &[ListConstraint],
     globals: &[list::GlobalConstraint],
     objective_tiers: &[ListObjectiveTier],
-) -> bool {
-    parsed.iter().all(|c| matches!(c, ListConstraint::Length { .. }))
-        && globals.iter().all(|global| matches!(global, list::GlobalConstraint::SameList { .. }))
-        && objective_tiers.iter().all(member_var_objective_supported)
+    should_stop: &dyn Fn() -> bool,
+) -> Option<bool> {
+    for constraint in parsed {
+        if should_stop() {
+            return None;
+        }
+        if !matches!(constraint, ListConstraint::Length { .. }) {
+            return Some(false);
+        }
+    }
+    for global in globals {
+        if should_stop() {
+            return None;
+        }
+        if !matches!(global, list::GlobalConstraint::SameList { .. }) {
+            return Some(false);
+        }
+    }
+    for tier in objective_tiers {
+        match member_var_objective_supported_until(tier, should_stop) {
+            Some(true) => {}
+            result => return result,
+        }
+    }
+    Some(!should_stop())
 }
 
-fn member_var_objective_supported(tier: &ListObjectiveTier) -> bool {
-    tier.terms.iter().all(member_var_objective_term_supported)
-        && tier.max_terms.as_ref().is_none_or(|terms| {
-            terms.iter().all(|term| term.groups.iter().all(|group| group.iter().all(member_var_objective_term_supported)))
-        })
+fn member_var_objective_supported_until(tier: &ListObjectiveTier, should_stop: &dyn Fn() -> bool) -> Option<bool> {
+    for term in &tier.terms {
+        if should_stop() {
+            return None;
+        }
+        if !member_var_objective_term_supported(term) {
+            return Some(false);
+        }
+    }
+    if let Some(max_terms) = &tier.max_terms {
+        for max_term in max_terms {
+            for group in &max_term.groups {
+                for term in group {
+                    if should_stop() {
+                        return None;
+                    }
+                    if !member_var_objective_term_supported(term) {
+                        return Some(false);
+                    }
+                }
+            }
+        }
+    }
+    Some(!should_stop())
 }
 
 fn member_var_objective_term_supported(term: &ListObjectiveTerm) -> bool {
@@ -278,8 +553,27 @@ fn member_var_objective_term_supported(term: &ListObjectiveTerm) -> bool {
     }
 }
 
-fn objective_tiers_order_dependent(tiers: &[ListObjectiveTier]) -> bool {
-    tiers.iter().any(|tier| !member_var_objective_supported(tier))
+fn objective_tiers_order_dependent_until(tiers: &[ListObjectiveTier], should_stop: &dyn Fn() -> bool) -> Option<bool> {
+    for tier in tiers {
+        match member_var_objective_supported_until(tier, should_stop) {
+            Some(true) => {}
+            Some(false) => return Some(true),
+            None => return None,
+        }
+    }
+    Some(false)
+}
+
+fn any_until<T>(values: &[T], should_stop: &dyn Fn() -> bool, predicate: impl Fn(&T) -> bool) -> Option<bool> {
+    for value in values {
+        if should_stop() {
+            return None;
+        }
+        if predicate(value) {
+            return Some(true);
+        }
+    }
+    (!should_stop()).then_some(false)
 }
 
 fn run_ordered_search(
@@ -308,7 +602,11 @@ fn run_ordered_search(
         &mut stats,
         stop,
         on_improve,
-    ) && !stop.load(std::sync::atomic::Ordering::Relaxed);
+    ) && !stop_requested(stop);
+
+    if stop_requested(stop) {
+        return interrupted_outcome(stats);
+    }
 
     Outcome { status: outcome_status(solution.is_some(), has_objective, complete), objectives: best_objectives, solution, stats }
 }
@@ -328,7 +626,7 @@ fn enumerate_ordered_partitions(
     stop: &AtomicBool,
     on_improve: &mut impl FnMut(&[i64]),
 ) -> bool {
-    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+    if stop_requested(stop) {
         return false;
     }
     if item_idx == items.len() {
@@ -338,12 +636,22 @@ fn enumerate_ordered_partitions(
             return true;
         }
         if !has_objective {
-            *solution = Some(lists.to_vec());
+            let candidate = lists.to_vec();
+            if stop_requested(stop) {
+                return false;
+            }
+            *solution = Some(candidate);
             return false;
         }
         let candidate = evaluate_list_objectives(objective_tiers, lists);
+        if stop_requested(stop) {
+            return false;
+        }
         if solution.is_none() || list_objectives_better(&candidate, best_objectives, objective_tiers) {
             on_improve(&candidate);
+            if stop_requested(stop) {
+                return false;
+            }
             *solution = Some(lists.to_vec());
             *best_objectives = candidate;
         }
@@ -444,19 +752,41 @@ fn run_member_var_search(
     items: &[i32],
     objective_tiers: &[ListObjectiveTier],
     stop: &AtomicBool,
+    should_stop: &dyn Fn() -> bool,
     on_improve: &mut impl FnMut(&[i64]),
 ) -> Outcome {
+    if should_stop() {
+        return interrupted_outcome(SolveStats::default());
+    }
     // A single linearizable tier is integer-backed and solved by branch-and-bound
     // (a real objective bound), instead of enumerating every feasible solution and
     // scoring it externally. Multiple tiers (lex) keep the enumerate path.
     if objective_tiers.len() == 1 {
-        if let Some((coeffs, obj_vars)) = lower_linear_tier(&mut solver, lists, &objective_tiers[0]) {
-            return optimize_linear_tier(solver, lists, items, objective_tiers[0].minimize, coeffs, obj_vars, stop, on_improve);
+        if let Some((coeffs, obj_vars)) = lower_linear_tier(&mut solver, lists, &objective_tiers[0], should_stop) {
+            if should_stop() {
+                return interrupted_outcome(SolveStats::default());
+            }
+            return optimize_linear_tier(
+                solver,
+                lists,
+                items,
+                objective_tiers[0].minimize,
+                coeffs,
+                obj_vars,
+                stop,
+                should_stop,
+                on_improve,
+            );
+        }
+        if should_stop() {
+            return interrupted_outcome(SolveStats::default());
         }
     }
 
     let has_objective = !objective_tiers.is_empty();
-    let vars = member_vars(&solver, lists, items);
+    let Some(vars) = member_vars(&solver, lists, items, should_stop) else {
+        return interrupted_outcome(SolveStats::default());
+    };
     let mut halted_early = false;
     let mut solution = None;
     let mut best_objectives = Vec::new();
@@ -464,15 +794,23 @@ fn run_member_var_search(
         &mut solver,
         &vars,
         |solver| {
-            let candidate_solution = collect_list_solution(solver, lists, items);
+            let Some(candidate_solution) = collect_list_solution_until(solver, lists, items, should_stop) else {
+                return SearchControl::Stop;
+            };
             if !has_objective {
                 solution = Some(candidate_solution);
                 halted_early = true;
                 return SearchControl::Stop;
             }
             let candidate = evaluate_list_objectives(objective_tiers, &candidate_solution);
+            if should_stop() {
+                return SearchControl::Stop;
+            }
             if solution.is_none() || list_objectives_better(&candidate, &best_objectives, objective_tiers) {
                 on_improve(&candidate);
+                if should_stop() {
+                    return SearchControl::Stop;
+                }
                 solution = Some(candidate_solution);
                 best_objectives = candidate;
             }
@@ -480,7 +818,10 @@ fn run_member_var_search(
         },
         stop,
     );
-    let complete = !halted_early && !stop.load(std::sync::atomic::Ordering::Relaxed);
+    if should_stop() || stop_requested(stop) {
+        return interrupted_outcome(stats);
+    }
+    let complete = !halted_early;
 
     Outcome { status: outcome_status(solution.is_some(), has_objective, complete), objectives: best_objectives, solution, stats }
 }
@@ -489,16 +830,30 @@ fn run_member_var_search(
 /// member variables (`Sum` terms) and freshly posted `used = length >= 1`
 /// indicators (`Used` terms). Returns `None` for anything not yet linearizable
 /// (currently `Count`), so the caller falls back to the enumerate path.
-fn lower_linear_tier(solver: &mut Solver, lists: &[ListId], tier: &ListObjectiveTier) -> Option<(Vec<i64>, Vec<VarId>)> {
+fn lower_linear_tier(
+    solver: &mut Solver,
+    lists: &[ListId],
+    tier: &ListObjectiveTier,
+    should_stop: &dyn Fn() -> bool,
+) -> Option<(Vec<i64>, Vec<VarId>)> {
+    if should_stop() {
+        return None;
+    }
     if tier.max_terms.as_ref().is_some_and(|terms| !terms.is_empty()) {
         return None;
     }
     let mut coeffs = Vec::new();
     let mut vars = Vec::new();
     for term in &tier.terms {
+        if should_stop() {
+            return None;
+        }
         match term {
             ListObjectiveTerm::Sum { list, weights, coeff } => {
                 for &(item, weight) in weights {
+                    if should_stop() {
+                        return None;
+                    }
                     let weight = weight.saturating_mul(*coeff);
                     if weight == 0 {
                         continue;
@@ -511,15 +866,18 @@ fn lower_linear_tier(solver: &mut Solver, lists: &[ListId], tier: &ListObjective
                 if *coeff == 0 {
                     continue;
                 }
+                if should_stop() {
+                    return None;
+                }
                 let used = solver.store.new_var_range(0, 1);
-                list_constraints::list_used(solver, lists[*list], used);
+                list_constraints::list_used_until(solver, lists[*list], used, should_stop)?;
                 coeffs.push(*coeff);
                 vars.push(used);
             }
             ListObjectiveTerm::Count { .. } | ListObjectiveTerm::Reduction(_) => return None,
         }
     }
-    Some((coeffs, vars))
+    (!should_stop()).then_some((coeffs, vars))
 }
 
 /// Branch-and-bound over the member variables with an integer-backed linear
@@ -534,11 +892,17 @@ fn optimize_linear_tier(
     coeffs: Vec<i64>,
     obj_vars: Vec<VarId>,
     stop: &AtomicBool,
+    should_stop: &dyn Fn() -> bool,
     on_improve: &mut impl FnMut(&[i64]),
 ) -> Outcome {
-    let mut search_vars = member_vars(&solver, lists, items);
+    let Some(mut search_vars) = member_vars(&solver, lists, items, should_stop) else {
+        return interrupted_outcome(SolveStats::default());
+    };
     let n_members = search_vars.len();
     for &var in &obj_vars {
+        if should_stop() {
+            return interrupted_outcome(SolveStats::default());
+        }
         if !search_vars.contains(&var) {
             search_vars.push(var);
         }
@@ -558,13 +922,21 @@ fn optimize_linear_tier(
         Vec::new(),
         |value, _| on_improve(&[value]),
     );
+    if should_stop() || stop_requested(stop) {
+        return interrupted_outcome(stats);
+    }
     match best {
-        Some((assignment, value)) => Outcome {
-            status: if complete { Status::Optimal } else { Status::Satisfiable },
-            objectives: vec![value],
-            solution: Some(list_solution_from_members(&assignment[..n_members], lists.len(), items)),
-            stats,
-        },
+        Some((assignment, value)) => {
+            let Some(solution) = list_solution_from_members(&assignment[..n_members], lists.len(), items, should_stop) else {
+                return interrupted_outcome(stats);
+            };
+            Outcome {
+                status: if complete { Status::Optimal } else { Status::Satisfiable },
+                objectives: vec![value],
+                solution: Some(solution),
+                stats,
+            }
+        }
         None => Outcome {
             status: if complete { Status::Unsatisfiable } else { Status::Unknown },
             objectives: Vec::new(),
@@ -576,11 +948,27 @@ fn optimize_linear_tier(
 
 /// Reconstruct each list's contents from a flat member-variable assignment, in
 /// `member_vars` order (list-major, item-minor).
-fn list_solution_from_members(member_values: &[i32], n_lists: usize, items: &[i32]) -> Vec<Vec<i32>> {
+fn list_solution_from_members(
+    member_values: &[i32],
+    n_lists: usize,
+    items: &[i32],
+    should_stop: &dyn Fn() -> bool,
+) -> Option<Vec<Vec<i32>>> {
     let n = items.len();
-    (0..n_lists)
-        .map(|li| items.iter().enumerate().filter(|&(idx, _)| member_values[li * n + idx] == 1).map(|(_, &item)| item).collect())
-        .collect()
+    let mut lists = Vec::with_capacity(n_lists);
+    for li in 0..n_lists {
+        let mut contents = Vec::new();
+        for (idx, &item) in items.iter().enumerate() {
+            if should_stop() {
+                return None;
+            }
+            if member_values[li * n + idx] == 1 {
+                contents.push(item);
+            }
+        }
+        lists.push(contents);
+    }
+    (!should_stop()).then_some(lists)
 }
 
 fn run_domain_search(
@@ -595,13 +983,26 @@ fn run_domain_search(
     let (stats, complete) = search::solve_domains_interruptible(
         &mut solver,
         |_, domain| {
+            if stop_requested(stop) {
+                return SearchControl::Stop;
+            }
             if !has_objective {
-                solution = Some(domain.lists.clone());
+                let candidate = domain.lists.clone();
+                if stop_requested(stop) {
+                    return SearchControl::Stop;
+                }
+                solution = Some(candidate);
                 return SearchControl::Stop;
             }
             let candidate = evaluate_list_objectives(objective_tiers, &domain.lists);
+            if stop_requested(stop) {
+                return SearchControl::Stop;
+            }
             if solution.is_none() || list_objectives_better(&candidate, &best_objectives, objective_tiers) {
                 on_improve(&candidate);
+                if stop_requested(stop) {
+                    return SearchControl::Stop;
+                }
                 solution = Some(domain.lists.clone());
                 best_objectives = candidate;
             }
@@ -609,6 +1010,9 @@ fn run_domain_search(
         },
         stop,
     );
+    if stop_requested(stop) {
+        return interrupted_outcome(stats);
+    }
     Outcome { status: outcome_status(solution.is_some(), has_objective, complete), objectives: best_objectives, solution, stats }
 }
 
@@ -627,40 +1031,67 @@ fn outcome_status(has_solution: bool, has_objective: bool, complete: bool) -> St
 }
 
 fn parse_constraints(model: &CollectionModel) -> Option<Vec<ListConstraint>> {
+    let stop = AtomicBool::new(false);
+    parse_constraints_interruptible(model, &stop)
+}
+
+fn parse_constraints_interruptible(model: &CollectionModel, stop: &AtomicBool) -> Option<Vec<ListConstraint>> {
     let mut parsed = Vec::with_capacity(model.constraints.len());
     for constraint in &model.constraints {
-        parsed.push(list_constraint(constraint, &model.items)?);
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        parsed.push(list_constraint(constraint, &model.items, Some(stop))?);
     }
     Some(parsed)
 }
 
-fn build_solver(model: &CollectionModel, parsed: &[ListConstraint]) -> (Solver, Vec<ListId>) {
+fn build_solver(model: &CollectionModel, parsed: &[ListConstraint], should_stop: &dyn Fn() -> bool) -> Option<(Solver, Vec<ListId>)> {
+    if should_stop() {
+        return None;
+    }
     let mut solver = Solver::new();
-    let lists: Vec<ListId> = (0..model.lists).map(|_| solver.store.new_list(model.items.clone())).collect();
+    let mut lists = Vec::with_capacity(model.lists);
+    for _ in 0..model.lists {
+        let universe = clone_slice_until(&model.items, should_stop)?;
+        lists.push(solver.store.new_list_interruptible(universe, should_stop)?);
+    }
     // Couple each list's memberships to its length variable.
     for &list in &lists {
-        list_constraints::list_cardinality(&mut solver, list);
+        let items = clone_slice_until(&model.items, should_stop)?;
+        list_constraints::list_cardinality_until(&mut solver, list, items, should_stop)?;
     }
-    list_constraints::partition(&mut solver, &lists, &model.items);
+    let partition_lists = clone_slice_until(&lists, should_stop)?;
+    let partition_items = clone_slice_until(&model.items, should_stop)?;
+    list_constraints::partition_until(&mut solver, partition_lists, partition_items, should_stop)?;
     for constraint in parsed {
+        if should_stop() {
+            return None;
+        }
         match constraint {
             ListConstraint::Length { list, min, max } => {
-                list_constraints::list_len(&mut solver, lists[*list], *min, *max);
+                list_constraints::list_len_until(&mut solver, lists[*list], *min, *max, should_stop)?;
             }
             ListConstraint::ItemSum { list, weights, min, max } => {
-                list_constraints::list_item_sum(&mut solver, lists[*list], weights.clone(), *min, *max);
+                let weights = clone_slice_until(weights, should_stop)?;
+                list_constraints::list_item_sum_until(&mut solver, lists[*list], weights, *min, *max, should_stop)?;
             }
             // Enumeration-checked in `ordered_lists_feasible`; nothing to post.
             ListConstraint::Reduction { .. } | ListConstraint::Impossible => {}
         }
     }
     for global in &model.globals {
+        if should_stop() {
+            return None;
+        }
         match global {
             list::GlobalConstraint::ListLe { before, after } => {
-                list_constraints::item_precedence(&mut solver, &lists, *before, *after);
+                let global_lists = clone_slice_until(&lists, should_stop)?;
+                list_constraints::item_precedence_until(&mut solver, global_lists, *before, *after, should_stop)?;
             }
             list::GlobalConstraint::SameList { a, b } => {
-                list_constraints::same_list(&mut solver, &lists, *a, *b);
+                let global_lists = clone_slice_until(&lists, should_stop)?;
+                list_constraints::same_list_until(&mut solver, global_lists, *a, *b, should_stop)?;
             }
             list::GlobalConstraint::DifferentList { .. }
             | list::GlobalConstraint::AllSameList { .. }
@@ -669,21 +1100,54 @@ fn build_solver(model: &CollectionModel, parsed: &[ListConstraint]) -> (Solver, 
         }
     }
 
-    (solver, lists)
+    (!should_stop()).then_some((solver, lists))
 }
 
-fn member_vars(solver: &Solver, lists: &[ListId], items: &[i32]) -> Vec<crate::ids::VarId> {
+fn clone_slice_until<T: Copy>(values: &[T], should_stop: &dyn Fn() -> bool) -> Option<Vec<T>> {
+    if should_stop() {
+        return None;
+    }
+    let mut cloned = Vec::with_capacity(values.len());
+    for &value in values {
+        if should_stop() {
+            return None;
+        }
+        cloned.push(value);
+    }
+    (!should_stop()).then_some(cloned)
+}
+
+fn member_vars(solver: &Solver, lists: &[ListId], items: &[i32], should_stop: &dyn Fn() -> bool) -> Option<Vec<crate::ids::VarId>> {
+    if should_stop() {
+        return None;
+    }
     let mut vars = Vec::with_capacity(lists.len().saturating_mul(items.len()));
     for &list in lists {
         for &item in items {
+            if should_stop() {
+                return None;
+            }
             vars.push(solver.store.list_member_var(list, item).expect("new list contains every model item"));
         }
     }
-    vars
+    (!should_stop()).then_some(vars)
 }
 
-fn collect_list_solution(solver: &Solver, lists: &[ListId], items: &[i32]) -> Vec<Vec<i32>> {
-    lists.iter().map(|&list| items.iter().copied().filter(|&item| solver.store.list_required(list, item)).collect()).collect()
+fn collect_list_solution_until(solver: &Solver, lists: &[ListId], items: &[i32], should_stop: &dyn Fn() -> bool) -> Option<Vec<Vec<i32>>> {
+    let mut solution = Vec::with_capacity(lists.len());
+    for &list in lists {
+        let mut contents = Vec::new();
+        for &item in items {
+            if should_stop() {
+                return None;
+            }
+            if solver.store.list_required(list, item) {
+                contents.push(item);
+            }
+        }
+        solution.push(contents);
+    }
+    (!should_stop()).then_some(solution)
 }
 
 #[cfg(test)]
@@ -693,7 +1157,7 @@ mod tests {
 
     fn chrono_solve(model: &CollectionModel, objective_tiers: &[ListObjectiveTier]) -> Outcome {
         let parsed = parse_constraints(model).expect("supported test model");
-        let (mut solver, _) = build_solver(model, &parsed);
+        let (mut solver, _) = build_solver(model, &parsed, &|| false).expect("non-interruptible test build completes");
         let stop = AtomicBool::new(false);
         let has_objective = !objective_tiers.is_empty();
         let mut solution = None;

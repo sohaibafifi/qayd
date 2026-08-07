@@ -143,6 +143,16 @@ pub struct NoOverlap {
     prec: Vec<usize>,
 }
 
+#[inline]
+fn interruption_polled(should_stop: Option<&dyn Fn() -> bool>, work: usize) -> bool {
+    should_stop.is_some_and(|stop| work.is_multiple_of(256) && stop())
+}
+
+#[inline]
+fn interruption_requested(should_stop: Option<&dyn Fn() -> bool>) -> bool {
+    should_stop.is_some_and(|stop| stop())
+}
+
 /// Whether group interval `i` is decided to run before group interval `j`.
 fn decided_before(store: &Store, pair_index: &[Vec<usize>], i: usize, j: usize) -> bool {
     let (lo, hi, want) = if i < j { (i, j, 1) } else { (j, i, 2) };
@@ -212,27 +222,71 @@ impl Propagator for NoOverlap {
     }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
-        for &interval in &self.intervals {
+        let completed = self.register_core(store, me, None);
+        debug_assert!(completed);
+    }
+
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        self.register_core(store, me, Some(should_stop))
+    }
+
+    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+        self.propagate_core(store, None)
+    }
+
+    fn propagate_until(&mut self, store: &mut Store, should_stop: &dyn Fn() -> bool) -> Result<(), Inconsistency> {
+        self.propagate_core(store, Some(should_stop))
+    }
+}
+
+impl NoOverlap {
+    fn register_core(&mut self, store: &mut Store, me: PropId, should_stop: Option<&dyn Fn() -> bool>) -> bool {
+        if interruption_requested(should_stop) {
+            return false;
+        }
+        for (index, &interval) in self.intervals.iter().enumerate() {
+            if interruption_polled(should_stop, index) {
+                return false;
+            }
             store.subscribe_interval(interval, me, IntervalEvent::StartBoundChange);
             store.subscribe_interval(interval, me, IntervalEvent::EndBoundChange);
             store.subscribe_interval(interval, me, IntervalEvent::PresenceChange);
         }
         self.pairs.clear();
         let n = self.intervals.len();
-        self.pair_index = vec![vec![usize::MAX; n]; n];
+        self.pair_index.clear();
+        self.pair_index.reserve(n);
+        for row in 0..n {
+            if interruption_polled(should_stop, row) {
+                return false;
+            }
+            self.pair_index.push(vec![usize::MAX; n]);
+        }
+        let mut pair_count = 0usize;
         for a in 0..n {
             for b in (a + 1)..n {
+                if interruption_polled(should_stop, pair_count) {
+                    return false;
+                }
                 let order = store.register_disjunctive_pair(self.intervals[a], self.intervals[b], me);
                 self.pairs.push((a, b, order));
                 self.pair_index[a][b] = order;
+                pair_count = pair_count.saturating_add(1);
             }
         }
+        !interruption_requested(should_stop)
     }
 
-    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+    fn propagate_core(&mut self, store: &mut Store, should_stop: Option<&dyn Fn() -> bool>) -> Result<(), Inconsistency> {
         loop {
+            if interruption_requested(should_stop) {
+                return Ok(());
+            }
             let mut changed = false;
-            for &(a, b, order_index) in &self.pairs {
+            for (pair_count, &(a, b, order_index)) in self.pairs.iter().enumerate() {
+                if interruption_polled(should_stop, pair_count) {
+                    return Ok(());
+                }
                 let i = self.intervals[a];
                 let j = self.intervals[b];
                 let pi = store.interval_presence(i);
@@ -313,31 +367,41 @@ impl Propagator for NoOverlap {
             // that must run before it (decided, or because they cannot fit after
             // it) must all complete first, so its start is at least that set's
             // earliest completion time -- stronger than any single predecessor.
-            changed |= self.detectable_precedences(store)?;
+            let Some(detectable_changed) = self.detectable_precedences(store, should_stop)? else {
+                return Ok(());
+            };
+            changed |= detectable_changed;
 
             if !changed {
                 return Ok(());
             }
         }
     }
-}
 
-impl NoOverlap {
-    fn detectable_precedences(&mut self, store: &mut Store) -> Result<bool, Inconsistency> {
+    fn detectable_precedences(&mut self, store: &mut Store, should_stop: Option<&dyn Fn() -> bool>) -> Result<Option<bool>, Inconsistency> {
         self.present.clear();
         for k in 0..self.intervals.len() {
+            if interruption_polled(should_stop, k) {
+                return Ok(None);
+            }
             if store.interval_presence(self.intervals[k]) == IntervalPresence::Present && store.interval_duration(self.intervals[k]) > 0 {
                 self.present.push(k);
             }
         }
         let mut changed = false;
         for index in 0..self.present.len() {
+            if interruption_polled(should_stop, index) {
+                return Ok(None);
+            }
             let qj = self.present[index];
             let j = self.intervals[qj];
             // Predecessors that must run before j: decided so, or unable to fit
             // after j (their latest start is before j's earliest end).
             self.prec.clear();
-            for &pi in &self.present {
+            for (candidate, &pi) in self.present.iter().enumerate() {
+                if interruption_polled(should_stop, candidate) {
+                    return Ok(None);
+                }
                 if pi == qj {
                     continue;
                 }
@@ -352,8 +416,14 @@ impl NoOverlap {
             // Earliest completion of the whole predecessor set on the unary
             // resource: schedule them in est order, each after the previous ends.
             self.prec.sort_by_key(|&pi| store.interval_start_min(self.intervals[pi]));
+            if interruption_requested(should_stop) {
+                return Ok(None);
+            }
             let mut ect = i32::MIN;
-            for &pi in &self.prec {
+            for (predecessor, &pi) in self.prec.iter().enumerate() {
+                if interruption_polled(should_stop, predecessor) {
+                    return Ok(None);
+                }
                 let i = self.intervals[pi];
                 ect = ect.max(store.interval_start_min(i)).saturating_add(store.interval_duration(i));
             }
@@ -363,7 +433,10 @@ impl NoOverlap {
             // j's earliest end), and its start lower bound, which feeds the ECT.
             let mut why: Vec<Premise> = present_premise(store, j).into_iter().collect();
             let mut uses_j_end_min = false;
-            for &pi in &self.prec {
+            for (predecessor, &pi) in self.prec.iter().enumerate() {
+                if interruption_polled(should_stop, predecessor) {
+                    return Ok(None);
+                }
                 let i = self.intervals[pi];
                 why.extend(present_premise(store, i));
                 if let Some(order) = decided_before_premise(store, &self.pair_index, pi, qj) {
@@ -379,7 +452,7 @@ impl NoOverlap {
             }
             changed |= store.set_interval_start_min_because(j, ect, why)?;
         }
-        Ok(changed)
+        Ok(Some(changed))
     }
 }
 
@@ -392,6 +465,16 @@ pub fn no_overlap(solver: &mut Solver, intervals: &[IntervalId]) -> PropId {
         present: Vec::new(),
         prec: Vec::new(),
     }))
+}
+
+/// Interruptible owned-input variant used by scheduling physical builders.
+/// `None` requires discarding `solver` because posting may have stopped after
+/// partially registering the propagator.
+pub(crate) fn no_overlap_until(solver: &mut Solver, intervals: Vec<IntervalId>, should_stop: &dyn Fn() -> bool) -> Option<PropId> {
+    solver.post_until(
+        Box::new(NoOverlap { intervals, pairs: Vec::new(), pair_index: Vec::new(), present: Vec::new(), prec: Vec::new() }),
+        should_stop,
+    )
 }
 
 /// Makespan upper bound for branch-and-bound: every interval must end no later
@@ -417,6 +500,16 @@ impl Propagator for MakespanBound {
         }
     }
 
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        for (index, &interval) in self.intervals.iter().enumerate() {
+            if interruption_polled(Some(should_stop), index) {
+                return false;
+            }
+            store.subscribe_interval(interval, me, IntervalEvent::StartBoundChange);
+        }
+        !should_stop()
+    }
+
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
         let ub = self.upper_bound.load(Ordering::Relaxed);
         for (&interval, &duration) in self.intervals.iter().zip(&self.durations) {
@@ -436,6 +529,17 @@ impl Propagator for MakespanBound {
 /// it as better solutions are found.
 pub fn makespan_bound(solver: &mut Solver, intervals: &[IntervalId], durations: &[i32], upper_bound: Arc<AtomicI32>) -> PropId {
     solver.post(Box::new(MakespanBound { intervals: intervals.to_vec(), durations: durations.to_vec(), upper_bound }))
+}
+
+/// Interruptible owned-input variant used during physical schedule construction.
+pub(crate) fn makespan_bound_until(
+    solver: &mut Solver,
+    intervals: Vec<IntervalId>,
+    durations: Vec<i32>,
+    upper_bound: Arc<AtomicI32>,
+    should_stop: &dyn Fn() -> bool,
+) -> Option<PropId> {
+    solver.post_until(Box::new(MakespanBound { intervals, durations, upper_bound }), should_stop)
 }
 
 /// Structured cumulative resource by time-tabling.
@@ -467,6 +571,18 @@ impl Propagator for Cumulative {
             store.subscribe_interval(interval, me, IntervalEvent::EndBoundChange);
             store.subscribe_interval(interval, me, IntervalEvent::PresenceChange);
         }
+    }
+
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        for (index, &interval) in self.intervals.iter().enumerate() {
+            if interruption_polled(Some(should_stop), index) {
+                return false;
+            }
+            store.subscribe_interval(interval, me, IntervalEvent::StartBoundChange);
+            store.subscribe_interval(interval, me, IntervalEvent::EndBoundChange);
+            store.subscribe_interval(interval, me, IntervalEvent::PresenceChange);
+        }
+        !should_stop()
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
@@ -606,6 +722,17 @@ pub fn cumulative(solver: &mut Solver, intervals: &[IntervalId], demands: &[i32]
     solver.post(Box::new(Cumulative { intervals: intervals.to_vec(), demands: demands.to_vec(), capacity, profile: Vec::new() }))
 }
 
+/// Interruptible owned-input variant used during physical schedule construction.
+pub(crate) fn cumulative_until(
+    solver: &mut Solver,
+    intervals: Vec<IntervalId>,
+    demands: Vec<i32>,
+    capacity: i32,
+    should_stop: &dyn Fn() -> bool,
+) -> Option<PropId> {
+    solver.post_until(Box::new(Cumulative { intervals, demands, capacity, profile: Vec::new() }), should_stop)
+}
+
 /// Exactly one of a set of optional intervals is present (an `alternative`):
 /// the building block for machine/mode choice (flexible job shop). Each operation
 /// becomes one optional fixed-duration interval per eligible machine; this keeps
@@ -627,6 +754,16 @@ impl Propagator for ExactlyOneMode {
         for &mode in &self.modes {
             store.subscribe_interval(mode, me, IntervalEvent::PresenceChange);
         }
+    }
+
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        for (index, &mode) in self.modes.iter().enumerate() {
+            if interruption_polled(Some(should_stop), index) {
+                return false;
+            }
+            store.subscribe_interval(mode, me, IntervalEvent::PresenceChange);
+        }
+        !should_stop()
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
@@ -698,6 +835,11 @@ impl Propagator for ExactlyOneMode {
 /// Post an `alternative`: exactly one of `modes` (optional intervals) is present.
 pub fn exactly_one_mode(solver: &mut Solver, modes: &[IntervalId]) -> PropId {
     solver.post(Box::new(ExactlyOneMode { modes: modes.to_vec() }))
+}
+
+/// Interruptible owned-input variant used during physical schedule construction.
+pub(crate) fn exactly_one_mode_until(solver: &mut Solver, modes: Vec<IntervalId>, should_stop: &dyn Fn() -> bool) -> Option<PropId> {
+    solver.post_until(Box::new(ExactlyOneMode { modes }), should_stop)
 }
 
 /// Raise a plain variable's lower bound, explained, reporting whether it moved.
@@ -774,6 +916,21 @@ impl Propagator for AlternativeChannel {
             store.subscribe_interval(mode, me, IntervalEvent::StartBoundChange);
             store.subscribe_interval(mode, me, IntervalEvent::PresenceChange);
         }
+    }
+
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        if should_stop() {
+            return false;
+        }
+        store.subscribe(self.shared_start, me, Event::BoundChange);
+        for &mode in &self.modes {
+            if should_stop() {
+                return false;
+            }
+            store.subscribe_interval(mode, me, IntervalEvent::StartBoundChange);
+            store.subscribe_interval(mode, me, IntervalEvent::PresenceChange);
+        }
+        !should_stop()
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
@@ -903,4 +1060,13 @@ impl Propagator for AlternativeChannel {
 /// so exactly one mode is present.
 pub fn alternative_channel(solver: &mut Solver, shared_start: VarId, modes: &[IntervalId]) -> PropId {
     solver.post(Box::new(AlternativeChannel { shared_start, modes: modes.to_vec() }))
+}
+
+pub(crate) fn alternative_channel_until(
+    solver: &mut Solver,
+    shared_start: VarId,
+    modes: Vec<IntervalId>,
+    should_stop: &dyn Fn() -> bool,
+) -> Option<PropId> {
+    solver.post_until(Box::new(AlternativeChannel { shared_start, modes }), should_stop)
 }

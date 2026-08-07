@@ -3,12 +3,27 @@
 !/.github/
 !/.github/workflows/
 !/.github/workflows/*.yml
-/tests/
 /vendor/
-/frontends/flatzinc/tests/
-/frontends/pb/tests/
 __pycache__/
 *.py[cod]
 *.so
 /data/
 .DS_Store
+
+# Architecture and regression artefacts are source files, even when a global
+# user ignore file hides Markdown or test directories.
+!bench/golden/README.md
+!bench/parallel/README.md
+!tests/
+!tests/**
+!frontends/flatzinc/tests/
+!frontends/flatzinc/tests/**
+!frontends/pb/tests/
+!frontends/pb/tests/**
+!frontends/sat/tests/
+!frontends/sat/tests/**
+
+# The explicit test-tree inclusions above must not re-include interpreter
+# caches produced by pytest or unittest.
+tests/**/__pycache__/
+tests/**/*.py[cod]

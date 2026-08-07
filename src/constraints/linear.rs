@@ -1,6 +1,8 @@
 //! Linear (weighted-sum) constraints. All arithmetic in `i64` so sums of `i32`
 //! terms cannot overflow.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::ids::{PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Priority, Propagator};
 use crate::store::{Premise, Solver, Store};
@@ -64,6 +66,10 @@ impl Propagator for LinearLeq {
         for &v in &self.vars {
             store.subscribe(v, me, Event::BoundChange);
         }
+    }
+
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        register_variables_until(store, me, &self.vars, Event::BoundChange, should_stop)
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
@@ -170,6 +176,10 @@ impl Propagator for LinearEq {
         }
     }
 
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        register_variables_until(store, me, &self.vars, Event::BoundChange, should_stop)
+    }
+
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
         loop {
             let mut sum_min: i64 = 0;
@@ -247,6 +257,10 @@ impl Propagator for LinearNeq {
         }
     }
 
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        register_variables_until(store, me, &self.vars, Event::Fix, should_stop)
+    }
+
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
         let mut fixed_sum: i64 = 0;
         let mut free: Option<usize> = None;
@@ -317,6 +331,16 @@ fn neg(coeffs: &[i64]) -> Vec<i64> {
     coeffs.iter().map(|&a| -a).collect()
 }
 
+fn register_variables_until(store: &mut Store, me: PropId, variables: &[VarId], event: Event, should_stop: &dyn Fn() -> bool) -> bool {
+    for &variable in variables {
+        if should_stop() {
+            return false;
+        }
+        store.subscribe(variable, me, event);
+    }
+    !should_stop()
+}
+
 fn post_leq(solver: &mut Solver, coeffs: &[i64], vars: &[VarId], c: i64) {
     solver.post(Box::new(LinearLeq::new(coeffs, vars, c)));
 }
@@ -338,8 +362,58 @@ pub fn linear(solver: &mut Solver, coeffs: &[i64], vars: &[VarId], rel: Relation
     }
 }
 
+/// Owned-input interruptible posting used by physical compilers. A `false`
+/// result requires discarding `solver`.
+pub(crate) fn linear_interruptible(
+    solver: &mut Solver,
+    mut coeffs: Vec<i64>,
+    vars: Vec<VarId>,
+    rel: Relation,
+    rhs: i64,
+    stop: &AtomicBool,
+) -> bool {
+    assert_eq!(coeffs.len(), vars.len(), "linear: coeffs/vars length mismatch");
+    if stop.load(Ordering::Acquire) {
+        return false;
+    }
+    let should_stop = || stop.load(Ordering::Acquire);
+    let propagator: Box<dyn Propagator> = match rel {
+        Relation::Le => Box::new(LinearLeq { term_min: vec![0; vars.len()], coeffs, vars, c: rhs }),
+        Relation::Lt => Box::new(LinearLeq { term_min: vec![0; vars.len()], coeffs, vars, c: rhs - 1 }),
+        Relation::Ge | Relation::Gt => {
+            for coefficient in &mut coeffs {
+                if stop.load(Ordering::Acquire) {
+                    return false;
+                }
+                *coefficient = -*coefficient;
+            }
+            let bound = if rel == Relation::Ge { -rhs } else { -(rhs + 1) };
+            Box::new(LinearLeq { term_min: vec![0; vars.len()], coeffs, vars, c: bound })
+        }
+        Relation::Eq => Box::new(LinearEq { term_min: vec![0; vars.len()], term_max: vec![0; vars.len()], coeffs, vars, c: rhs }),
+        Relation::Ne => Box::new(LinearNeq { coeffs, vars, c: rhs }),
+    };
+    if stop.load(Ordering::Acquire) {
+        return false;
+    }
+    solver.post_until(propagator, &should_stop).is_some()
+}
+
 /// Post \( \sum_i \texttt{vars}[i] \;\texttt{rel}\; \texttt{rhs} \) (all coefficients 1).
 pub fn sum(solver: &mut Solver, vars: &[VarId], rel: Relation, rhs: i64) {
     let coeffs = vec![1i64; vars.len()];
     linear(solver, &coeffs, vars, rel, rhs);
+}
+
+pub(crate) fn sum_interruptible(solver: &mut Solver, vars: &[VarId], rel: Relation, rhs: i64, stop: &AtomicBool) -> bool {
+    let mut coefficients = Vec::with_capacity(vars.len());
+    let mut variables = Vec::with_capacity(vars.len());
+    for &variable in vars {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        coefficients.push(1);
+        variables.push(variable);
+    }
+    linear_interruptible(solver, coefficients, variables, rel, rhs, stop)
 }

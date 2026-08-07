@@ -1,0 +1,19 @@
+<instance format="XCSP3" type="COP">
+  <variables>
+    <var id="x"> 0..3 </var>
+    <var id="y"> 0..3 </var>
+  </variables>
+  <constraints>
+    <sum>
+      <list>x y</list>
+      <condition>(eq,3)</condition>
+    </sum>
+    <sum>
+      <list>y</list>
+      <condition>(le,2)</condition>
+    </sum>
+  </constraints>
+  <objectives>
+    <minimize>x</minimize>
+  </objectives>
+</instance>

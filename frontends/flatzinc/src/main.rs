@@ -1,7 +1,7 @@
 //! `qayd-fzn`: a minimal FlatZinc front-end for the `qayd` solver.
 //!
-//! Reads a `.fzn` model, posts it onto a [`qayd::Solver`], searches, and prints
-//! solutions in the MiniZinc solver protocol.
+//! Reads a `.fzn` model, builds a canonical semantic package, delegates the
+//! solve, and prints solutions in the MiniZinc solver protocol.
 
 mod model;
 mod parse;
@@ -56,7 +56,12 @@ fn main() {
         std::process::exit(1);
     });
     match parse::parse(&input) {
-        Ok(model) => solve::solve(model, &opts),
+        Ok(model) => {
+            if let Err(error) = solve::solve(model, &opts) {
+                eprintln!("error: {error}");
+                std::process::exit(2);
+            }
+        }
         Err(e) => {
             eprintln!("error: {e}");
             std::process::exit(2);

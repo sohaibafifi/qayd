@@ -6,10 +6,8 @@
 //! per-customer accumulator variables pinned by the chosen predecessor arc, with
 //! a per-route cumulative sum bounded against the constraint's rhs.
 //!
-//! This module is the single predicate shared by the classifier gate
-//! ([`crate::model::classify`]) and the engine parse ([`crate::engines::routing`])
-//! so they never disagree on which scans lower. Anything it rejects falls back to
-//! local search.
+//! This module is used by the routing compiler itself. Capability recognition
+//! and lowering are therefore one operation, with no predictive classifier.
 
 use crate::expr::{self, Expr as KExpr};
 use crate::ids::VarId;
@@ -54,14 +52,6 @@ pub(crate) struct ScanRoutingSpec {
     pub total_dom: (i64, i64),
 }
 
-/// The list this scan constraint reads, if it is a `Sum` scan; `None` otherwise.
-pub(crate) fn scan_constraint_list(constraint: &Constraint) -> Option<usize> {
-    match (&constraint.reduction.op, &constraint.reduction.iterable) {
-        (ReduceOp::Sum, Iterable::Scan { list, .. }) => Some(*list),
-        _ => None,
-    }
-}
-
 /// Parse a scan constraint into a lowerable signature, or `None` (fall back to
 /// local search). Rejects non-`Sum` ops, an accumulator inside a divisor or a
 /// table index, and any derived interval that leaves the i32-safe band.
@@ -72,8 +62,8 @@ pub(crate) fn scan_routing_signature(constraint: &Constraint, items: &[i32]) -> 
     // Accept a reified `Sum` scan directly, or a per-item `Sum` over `Items`
     // (`cp.sum(x, |i| ...)`), which is exactly the identity-accumulator scan: the
     // accumulator stays at 0 and the body reads only the current item (`Arg(0)`).
-    // Normalising it here -- the one parser both classify and the engine funnel
-    // through -- keeps them in lockstep and reuses the whole scan lowering, so a
+    // Normalising it here keeps the routing compiler self-contained and reuses
+    // the whole scan lowering, so a
     // per-item reward gets the same dominance bound and warm start as a scan reward.
     let (owned_arena, step, init, boundary, end) = match constraint.reduction.iterable {
         Iterable::Scan { init, boundary, step, end, .. } => (constraint.reduction.arena.clone(), step, init, boundary, end),

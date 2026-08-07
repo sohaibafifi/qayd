@@ -1,0 +1,36 @@
+<instance format="XCSP3" type="CSP">
+  <variables>
+    <array id="x" size="[9][8]"> 0 1 </array>
+  </variables>
+  <constraints>
+    <group note="each pigeon uses exactly one hole">
+      <sum>
+        <list> %... </list>
+        <condition> (eq,1) </condition>
+      </sum>
+      <args> x[0][] </args>
+      <args> x[1][] </args>
+      <args> x[2][] </args>
+      <args> x[3][] </args>
+      <args> x[4][] </args>
+      <args> x[5][] </args>
+      <args> x[6][] </args>
+      <args> x[7][] </args>
+      <args> x[8][] </args>
+    </group>
+    <group note="each hole receives at most one pigeon">
+      <sum>
+        <list> %... </list>
+        <condition> (le,1) </condition>
+      </sum>
+      <args> x[][0] </args>
+      <args> x[][1] </args>
+      <args> x[][2] </args>
+      <args> x[][3] </args>
+      <args> x[][4] </args>
+      <args> x[][5] </args>
+      <args> x[][6] </args>
+      <args> x[][7] </args>
+    </group>
+  </constraints>
+</instance>

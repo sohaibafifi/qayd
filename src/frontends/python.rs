@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use pyo3::class::basic::CompareOp;
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyTimeoutError, PyTypeError, PyValueError};
@@ -10,30 +10,65 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyIterator, PyModule, PyTuple};
 
-use crate::constraints::count;
-use crate::constraints::graph;
-use crate::constraints::intension;
-use crate::constraints::interval as interval_constraints;
-use crate::constraints::lex;
-use crate::constraints::linear::{self, Relation};
-use crate::constraints::primitives;
-use crate::constraints::scheduling;
-use crate::constraints::table;
-use crate::engines::ls::cop::{solve_ls, LocalRhs, LocalSearchSpec, LsConfig};
-use crate::engines::ls::lists;
-use crate::engines::{dual as dual_engine, list_exact as list_exact_engine, routing as routing_engine, schedule as schedule_engine};
-use crate::expr::{self, Expr};
-use crate::ids::{IntervalId, VarId};
-use crate::lcg::clause::{ClauseSharing, SharedClausePool};
-use crate::lcg::lit::{AtomKind, AtomTable, Lit};
 use crate::model as shared_model;
 use crate::model::list;
-use crate::mus::{enumerate_mus, explain_mus, extract_mus, MusRel, MusResult};
-use crate::problem::{Objective as ProblemObjective, Problem};
-use crate::search::{self, Assumption, AssumptionOp, Objective as SearchObjective, SearchControl, SolveStats};
-use crate::Solver;
+use crate::model::{Constraint, IntDomain, IntExpr as Expr, IntGlobalConstraint, IntVarRef, ModelObject, Relation};
+use crate::orchestrator::{
+    count_model_solutions_with_external_stop, enumerate_model_mus_with_external_stop, explain_model_mus_with_external_stop,
+    extract_model_mus_with_external_stop, solve_model_with_external_stop, EngineKind, EngineReport, EventControl, EventSink,
+    ModelMusEnumeration, ModelMusResult, MusAtomRelation, RoutingControls, SearchStats, SemanticAssumption, SemanticAssumptionOp,
+    SemanticNogoodRelation, SemanticSolveSession, SolveError, SolveEvent, SolveLimits, SolveMode, SolveRequest, SolveResult, SolveStatus,
+    VerificationLevel,
+};
+
+mod expr {
+    use super::{Expr, IntVarRef};
+
+    pub(super) fn int(value: i64) -> Expr {
+        Expr::Constant(value)
+    }
+
+    pub(super) fn var(variable: IntVarRef) -> Expr {
+        Expr::Variable(variable)
+    }
+
+    pub(super) fn add(values: Vec<Expr>) -> Expr {
+        Expr::Add(values)
+    }
+
+    pub(super) fn mul(values: Vec<Expr>) -> Expr {
+        Expr::Mul(values)
+    }
+
+    pub(super) fn eq(left: Expr, right: Expr) -> Expr {
+        Expr::Eq(Box::new(left), Box::new(right))
+    }
+
+    pub(super) fn ne(left: Expr, right: Expr) -> Expr {
+        Expr::Ne(Box::new(left), Box::new(right))
+    }
+
+    pub(super) fn ge(left: Expr, right: Expr) -> Expr {
+        Expr::Ge(Box::new(left), Box::new(right))
+    }
+
+    pub(super) fn le(left: Expr, right: Expr) -> Expr {
+        Expr::Le(Box::new(left), Box::new(right))
+    }
+
+    pub(super) fn and(values: Vec<Expr>) -> Expr {
+        Expr::And(values)
+    }
+
+    pub(super) fn imp(left: Expr, right: Expr) -> Expr {
+        Expr::Imp(Box::new(left), Box::new(right))
+    }
+}
 
 static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PythonIntervalRef(usize);
 
 #[derive(Clone)]
 struct ExprLike {
@@ -44,11 +79,11 @@ struct ExprLike {
 
 impl ExprLike {
     fn int(value: i64) -> Self {
-        Self { model_id: None, expr: Expr::Const(value), text: value.to_string() }
+        Self { model_id: None, expr: Expr::Constant(value), text: value.to_string() }
     }
 
     fn var(var: &PyIntVar) -> Self {
-        Self { model_id: Some(var.model_id), expr: Expr::Var(VarId(var.index)), text: var.display_name() }
+        Self { model_id: Some(var.model_id), expr: Expr::Variable(IntVarRef(var.index as usize)), text: var.display_name() }
     }
 }
 
@@ -101,9 +136,9 @@ struct PyIntervalVar {
     gen: u64,
     index: u32,
     kind: PyIntervalKind,
-    interval: Option<IntervalId>,
-    start: Option<VarId>,
-    presence: Option<VarId>,
+    interval: Option<PythonIntervalRef>,
+    start: Option<IntVarRef>,
+    presence: Option<IntVarRef>,
     /// Fixed duration; `None` for an `alternative` master whose realised
     /// duration depends on the selected member.
     duration: Option<i64>,
@@ -122,7 +157,7 @@ struct AlternativeInterval {
     /// The member intervals, echoed for `.members`.
     members: Vec<PyIntervalVar>,
     /// Per-member presence variable.
-    presences: Vec<VarId>,
+    presences: Vec<IntVarRef>,
     /// Per-member duration.
     durations: Vec<i64>,
 }
@@ -135,9 +170,9 @@ enum PyIntervalKind {
 
 #[derive(Clone)]
 struct NativeIntervalSpec {
-    interval: IntervalId,
-    start: VarId,
-    presence: Option<VarId>,
+    interval: PythonIntervalRef,
+    start: IntVarRef,
+    presence: Option<IntVarRef>,
     duration: i32,
 }
 
@@ -156,12 +191,12 @@ impl PyIntervalVar {
 
     #[getter]
     fn start(&self) -> Option<PyIntVar> {
-        self.start.map(|var| PyIntVar { model_id: self.model_id, index: var.0, name: None })
+        self.start.map(|var| PyIntVar { model_id: self.model_id, index: var.0 as u32, name: None })
     }
 
     #[getter]
     fn presence(&self) -> Option<PyIntVar> {
-        self.presence.map(|var| PyIntVar { model_id: self.model_id, index: var.0, name: None })
+        self.presence.map(|var| PyIntVar { model_id: self.model_id, index: var.0 as u32, name: None })
     }
 
     #[getter]
@@ -269,10 +304,13 @@ struct PySoftGroup {
 impl PySoftGroup {
     fn __enter__(&self, py: Python<'_>) -> PyResult<()> {
         let mut model = self.model.borrow_mut(py);
-        let sel = model.solver.new_var_range(0, 1);
+        if model.active_soft_selector.is_some() {
+            return Err(PyValueError::new_err("soft groups cannot be nested"));
+        }
+        let sel = model.semantic.model_mut().bool_var();
         let name = self.name.clone().unwrap_or_else(|| format!("c{}", model.mus_selectors.len()));
-        model.names.push(None); // keep VarId ↔ names alignment; hidden from `variables()`
-        model.solver.set_selector(Some(sel));
+        model.names.push(None);
+        model.active_soft_selector = Some(sel);
         model.mus_selectors.push((name, sel));
         Ok(())
     }
@@ -284,7 +322,7 @@ impl PySoftGroup {
         _exc_value: &Bound<'_, PyAny>,
         _traceback: &Bound<'_, PyAny>,
     ) -> PyResult<bool> {
-        self.model.borrow_mut(py).solver.set_selector(None);
+        self.model.borrow_mut(py).active_soft_selector = None;
         Ok(false) // do not suppress exceptions
     }
 }
@@ -364,6 +402,13 @@ struct PySolution {
     constructor: Option<String>,
     constructor_fleet: Option<usize>,
     constructor_cost: Option<i64>,
+    /// Integer local-search counters carried by the canonical engine report.
+    ls_moves: Option<u64>,
+    ls_constraints: Option<usize>,
+    ls_functionals: Option<usize>,
+    ls_unsupported: Option<usize>,
+    ls_rejected_incumbents: Option<usize>,
+    ls_checkpoint_replays: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -383,96 +428,204 @@ fn canonicalize_unordered_lists(mut lists: Option<Vec<Vec<i32>>>, unordered: &Ha
     lists
 }
 
-fn bound_fields(bound: Option<&list::BoundReport>) -> (Option<i64>, Option<u64>, Option<f64>, Option<String>) {
-    match bound {
-        Some(bound) => (Some(bound.dual), Some(bound.absolute_gap), Some(bound.relative_gap), Some(bound.method.clone())),
-        None => (None, None, None, None),
+/// Semantic collection model plus the small amount of Python handle state that
+/// is not part of the solver IR. Objective declarations are kept separately so
+/// Python's replacing `minimize` operation can rebuild a package without
+/// exposing mutation of the model's objective arena.
+#[derive(Clone, Default)]
+struct SemanticConstruction {
+    package: shared_model::ModelPackage,
+    objectives: Vec<shared_model::Objective>,
+    list_generation: u64,
+    schedule_generation: u64,
+    reified_values: Vec<Option<list::Reduction>>,
+}
+
+impl SemanticConstruction {
+    fn model(&self) -> &shared_model::Model {
+        &self.package.model
+    }
+
+    fn model_mut(&mut self) -> &mut shared_model::Model {
+        &mut self.package.model
+    }
+
+    fn has_lists(&self) -> bool {
+        !self.model().lists().is_empty()
+    }
+
+    fn has_intervals(&self) -> bool {
+        !self.model().intervals().is_empty()
+    }
+
+    fn has_collection(&self) -> bool {
+        self.has_lists() || self.has_intervals()
+    }
+
+    fn list_scope(&self) -> Vec<shared_model::ListVarRef> {
+        (0..self.model().lists().len()).map(shared_model::ListVarRef).collect()
+    }
+
+    fn list_universe(&self) -> Option<&[i32]> {
+        self.model().lists().first().map(|declaration| declaration.universe.as_slice())
+    }
+
+    fn schedule_makespan(&self) -> bool {
+        self.objectives.iter().any(|objective| matches!(objective, shared_model::Objective::Makespan { minimize: true, .. }))
+    }
+
+    fn primary_list_sense(&self) -> Option<bool> {
+        self.objectives.first().and_then(|objective| match objective {
+            shared_model::Objective::ListTerms { minimize, .. } => Some(*minimize),
+            shared_model::Objective::IntExpr { .. } | shared_model::Objective::Makespan { .. } => None,
+        })
+    }
+}
+
+fn populate_python_metadata(package: &mut shared_model::ModelPackage) {
+    use shared_model::ModelObject;
+
+    for index in 0..package.model.int_vars().len() {
+        let object = ModelObject::IntVar(shared_model::IntVarRef(index));
+        package.metadata.names.entry(object).or_insert_with(|| format!("int[{index}]"));
+        package.metadata.frontend_ids.entry(("python".to_string(), format!("int:{index}"))).or_insert(object);
+        if !package.metadata.outputs.contains(&object) {
+            package.metadata.outputs.push(object);
+        }
+    }
+    for index in 0..package.model.sets().len() {
+        let object = ModelObject::SetVar(shared_model::SetVarRef(index));
+        package.metadata.names.entry(object).or_insert_with(|| format!("set[{index}]"));
+        package.metadata.frontend_ids.entry(("python".to_string(), format!("set:{index}"))).or_insert(object);
+        if !package.metadata.outputs.contains(&object) {
+            package.metadata.outputs.push(object);
+        }
+    }
+    for (index, declaration) in package.model.lists().iter().enumerate() {
+        let object = ModelObject::ListVar(shared_model::ListVarRef(index));
+        package.metadata.names.entry(object).or_insert_with(|| format!("list[{index}]"));
+        package.metadata.frontend_ids.entry(("python".to_string(), format!("list:{index}"))).or_insert(object);
+        if declaration.role == shared_model::ListRole::Decision && !package.metadata.outputs.contains(&object) {
+            package.metadata.outputs.push(object);
+        }
+    }
+    for index in 0..package.model.intervals().len() {
+        let object = ModelObject::IntervalVar(shared_model::IntervalVarRef(index));
+        package.metadata.names.entry(object).or_insert_with(|| format!("interval[{index}]"));
+        package.metadata.frontend_ids.entry(("python".to_string(), format!("interval:{index}"))).or_insert(object);
+        if !package.metadata.outputs.contains(&object) {
+            package.metadata.outputs.push(object);
+        }
+    }
+    for index in 0..package.model.interval_modes().len() {
+        let object = ModelObject::IntervalMode(shared_model::IntervalModeRef(index));
+        package.metadata.names.entry(object).or_insert_with(|| format!("mode[{index}]"));
+        package.metadata.frontend_ids.entry(("python".to_string(), format!("mode:{index}"))).or_insert(object);
+    }
+    for index in 0..package.model.constraints().len() {
+        let object = ModelObject::Constraint(shared_model::ConstraintRef(index));
+        package.metadata.names.entry(object).or_insert_with(|| format!("constraint[{index}]"));
+    }
+    for index in 0..package.model.objectives().len() {
+        let object = ModelObject::Objective(shared_model::ObjectiveRef(index));
+        package.metadata.names.entry(object).or_insert_with(|| format!("objective[{index}]"));
     }
 }
 
 #[pyclass(name = "Model", module = "qayd", unsendable)]
 struct PyModel {
     id: u64,
-    solver: Solver,
     names: Vec<Option<String>>,
     objective: Option<ObjectiveSpec>,
     then_objectives: Vec<ObjectiveSpec>,
     native_intervals: Vec<NativeIntervalSpec>,
-    /// Local-search model built in parallel with the CP posts, so `--ls`-style
-    /// LS (`solve(engine="ls")`) can run on the same model.
-    local: LocalSearchSpec,
-    /// Set once `list_vars` is called: the universe of items partitioned among
-    /// the list variables. Its presence makes `solve()` dispatch to the
-    /// list-domain engine instead of the integer CP/LS path.
-    col_universe: Option<Vec<i32>>,
-    col_lists: usize,
-    /// Bumped on each `list_vars` call so route handles from an earlier call (or
-    /// another model) are rejected instead of silently aliasing the wrong list.
-    col_gen: u64,
-    col_objectives: Vec<list::ObjectiveTier>,
-    col_constraints: Vec<list::Constraint>,
-    col_globals: Vec<list::GlobalConstraint>,
-    /// Indices declared through `set_vars`, used to canonicalize returned members.
-    col_unordered: HashSet<usize>,
-    /// Scan reductions bound to a `list_value()` handle by `add(scan == v)`, keyed
-    /// by the handle's value id. Resolved into objective terms at tier push time,
-    /// so a reified scan total feeds a linear objective without an integer var.
-    col_reified: Vec<Option<list::Reduction>>,
-    col_schedule: Option<list::Schedule>,
-    col_sched_gen: u64,
+    /// Canonical semantic construction for integer, list, and compact schedule
+    /// models.
+    /// Generations and reified-value slots only protect Python handles; all
+    /// solver declarations live in the contained `ModelPackage`.
+    semantic: SemanticConstruction,
     /// Soft-constraint groups for MUS extraction: `(name, selector)`. Each is a
     /// `{0,1}` variable guarding the constraints posted inside a `with
     /// model.soft(name):` block; selectors occupy a `names` slot (to keep
-    /// `VarId ↔ names` alignment) but are hidden from the user-facing variable
+    /// `IntVarRef ↔ names` alignment) but are hidden from the user-facing variable
     /// enumerations.
-    mus_selectors: Vec<(String, VarId)>,
+    mus_selectors: Vec<(String, IntVarRef)>,
+    active_soft_selector: Option<IntVarRef>,
+    constants: HashMap<i32, IntVarRef>,
 }
 
 impl PyModel {
     fn is_selector(&self, index: u32) -> bool {
-        self.mus_selectors.iter().any(|&(_, sel)| sel.0 == index)
+        self.mus_selectors.iter().any(|&(_, sel)| sel.0 == index as usize)
     }
 
     /// The user's decision variables (every named slot that is not a selector).
-    fn decision_var_ids(&self) -> Vec<VarId> {
-        (0..self.names.len() as u32).filter(|&i| !self.is_selector(i)).map(VarId).collect()
+    fn decision_var_ids(&self) -> Vec<IntVarRef> {
+        (0..self.names.len()).filter(|&i| !self.is_selector(i as u32)).map(IntVarRef).collect()
     }
 
-    fn selector_name(&self, sel: VarId) -> String {
+    fn selector_name(&self, sel: IntVarRef) -> String {
         self.mus_selectors.iter().find(|&&(_, v)| v == sel).map(|(name, _)| name.clone()).unwrap_or_default()
     }
 
     /// Format a semantic atom `var rel value` using the variable's name.
-    fn atom_text(&self, var: VarId, rel: MusRel, value: i32) -> String {
-        let name = self.names.get(var.index()).and_then(|n| n.clone()).unwrap_or_else(|| format!("x{}", var.index()));
+    fn atom_text(&self, var: IntVarRef, rel: MusAtomRelation, value: i32) -> String {
+        let name = self.names.get(var.0).and_then(|n| n.clone()).unwrap_or_else(|| format!("x{}", var.0));
         let op = match rel {
-            MusRel::Eq => "==",
-            MusRel::Ne => "!=",
-            MusRel::Ge => ">=",
-            MusRel::Le => "<=",
+            MusAtomRelation::Eq => "==",
+            MusAtomRelation::Ne => "!=",
+            MusAtomRelation::Ge => ">=",
+            MusAtomRelation::Le => "<=",
         };
         format!("{name} {op} {value}")
+    }
+
+    fn add_integer_constraint(&mut self, constraint: Constraint) {
+        let constraint = if let Some(selector) = self.active_soft_selector {
+            Constraint::Selected { selector, constraint: Box::new(constraint) }
+        } else {
+            constraint
+        };
+        self.semantic.model_mut().add_constraint(constraint);
+    }
+
+    fn integer_package(&self) -> shared_model::ModelPackage {
+        let mut package = self.semantic.package.clone();
+        for objective in objective_specs(&self.objective, &self.then_objectives) {
+            package.model.add_objective(shared_model::Objective::IntExpr { minimize: objective.minimizing, expr: objective.expr.expr });
+        }
+        for (index, name) in self.names.iter().enumerate() {
+            let object = ModelObject::IntVar(IntVarRef(index));
+            if let Some(name) = name {
+                package.metadata.names.insert(object, name.clone());
+            }
+            package.metadata.frontend_ids.insert(("python".to_string(), format!("int:{index}")), object);
+            if !self.is_selector(index as u32) && !package.metadata.outputs.contains(&object) {
+                package.metadata.outputs.push(object);
+            }
+        }
+        populate_python_metadata(&mut package);
+        package
+    }
+
+    fn solve_package(&self) -> shared_model::ModelPackage {
+        let mut package = self.integer_package();
+        for objective in &self.semantic.objectives {
+            package.model.add_objective(objective.clone());
+        }
+        populate_python_metadata(&mut package);
+        package
     }
 }
 
 #[pyclass(name = "SolveSession", module = "qayd", unsendable)]
 struct PySolveSession {
     id: u64,
-    solver: Solver,
     names: Vec<Option<String>>,
-    objectives: Vec<MaterializedObjective>,
-    search: Vec<VarId>,
+    objectives: Vec<ObjectiveSpec>,
+    search: Vec<usize>,
     native_intervals: Vec<NativeIntervalSpec>,
-    clauses: Arc<SharedClausePool>,
-    next_worker: usize,
-}
-
-#[derive(Clone)]
-struct MaterializedObjective {
-    minimizing: bool,
-    var: VarId,
-    text: String,
-    support: Vec<VarId>,
+    session: SemanticSolveSession,
 }
 
 type PyRawNogood = (u32, Vec<u32>);
@@ -485,8 +638,8 @@ impl PyIntVar {
     }
 }
 
-impl From<SolveStats> for PySolveStats {
-    fn from(stats: SolveStats) -> Self {
+impl From<SearchStats> for PySolveStats {
+    fn from(stats: SearchStats) -> Self {
         Self {
             solutions: stats.solutions,
             nodes: stats.nodes,
@@ -558,34 +711,34 @@ fn interval_list_from_py(obj: &Bound<'_, PyAny>) -> PyResult<Vec<PyIntervalVar>>
     iter.map(|item| interval_from_py(&item?)).collect()
 }
 
-fn ids_for(model_id: u64, vars: &[PyIntVar]) -> PyResult<Vec<VarId>> {
+fn ids_for(model_id: u64, vars: &[PyIntVar]) -> PyResult<Vec<IntVarRef>> {
     let mut out = Vec::with_capacity(vars.len());
     for var in vars {
         if var.model_id != model_id {
             return Err(PyValueError::new_err("variable belongs to a different model"));
         }
-        out.push(VarId(var.index));
+        out.push(IntVarRef(var.index as usize));
     }
     Ok(out)
 }
 
-fn one_id_for(model_id: u64, var: &PyIntVar) -> PyResult<VarId> {
+fn one_id_for(model_id: u64, var: &PyIntVar) -> PyResult<IntVarRef> {
     if var.model_id != model_id {
         return Err(PyValueError::new_err("variable belongs to a different model"));
     }
-    Ok(VarId(var.index))
+    Ok(IntVarRef(var.index as usize))
 }
 
-fn search_ids_for(model_id: u64, num_vars: usize, search: Option<&Bound<'_, PyAny>>, extra: Option<VarId>) -> PyResult<Vec<VarId>> {
-    search_ids_with_default(model_id, (0..num_vars).map(|i| VarId(i as u32)).collect(), search, extra)
+fn search_ids_for(model_id: u64, num_vars: usize, search: Option<&Bound<'_, PyAny>>, extra: Option<IntVarRef>) -> PyResult<Vec<IntVarRef>> {
+    search_ids_with_default(model_id, (0..num_vars).map(IntVarRef).collect(), search, extra)
 }
 
 fn search_ids_with_default(
     model_id: u64,
-    default_vars: Vec<VarId>,
+    default_vars: Vec<IntVarRef>,
     search: Option<&Bound<'_, PyAny>>,
-    extra: Option<VarId>,
-) -> PyResult<Vec<VarId>> {
+    extra: Option<IntVarRef>,
+) -> PyResult<Vec<IntVarRef>> {
     let mut vars = match search {
         Some(obj) if !obj.is_none() => ids_for(model_id, &var_list_from_py(obj)?)?,
         _ => default_vars,
@@ -598,35 +751,8 @@ fn search_ids_with_default(
     Ok(vars)
 }
 
-fn search_ids(model: &PyModel, search: Option<&Bound<'_, PyAny>>, extra: Option<VarId>) -> PyResult<Vec<VarId>> {
+fn search_ids(model: &PyModel, search: Option<&Bound<'_, PyAny>>, extra: Option<IntVarRef>) -> PyResult<Vec<IntVarRef>> {
     search_ids_with_default(model.id, model.decision_var_ids(), search, extra)
-}
-
-fn append_expr_vars(vars: &mut Vec<VarId>, expr: &Expr) {
-    let mut objective_vars = Vec::new();
-    expr.collect_vars(&mut objective_vars);
-    for var in objective_vars {
-        append_var(vars, var);
-    }
-}
-
-fn append_var(vars: &mut Vec<VarId>, var: VarId) {
-    if !vars.contains(&var) {
-        vars.push(var);
-    }
-}
-
-fn append_interval_domain_vars(vars: &mut Vec<VarId>, solver: &Solver) {
-    for i in 0..solver.store.num_intervals() {
-        let interval = IntervalId(i as u32);
-        append_var(vars, solver.store.interval_start_var(interval));
-        if let Some(presence) = solver.store.interval_presence_var(interval) {
-            append_var(vars, presence);
-        }
-    }
-    for i in 0..solver.store.disjunctive_pair_count() {
-        append_var(vars, solver.store.disjunctive_order_var(i));
-    }
 }
 
 fn attach_native_interval_solution(solution: &mut PySolution, intervals: &[NativeIntervalSpec]) {
@@ -636,9 +762,9 @@ fn attach_native_interval_solution(solution: &mut PySolution, intervals: &[Nativ
     let mut starts = Vec::with_capacity(intervals.len());
     let mut presences = Vec::with_capacity(intervals.len());
     for interval in intervals {
-        let present = interval.presence.and_then(|var| solution.values.get(var.index()).copied().flatten()) != Some(0);
+        let present = interval.presence.and_then(|var| solution.values.get(var.0).copied().flatten()) != Some(0);
         presences.push(present);
-        starts.push(if present { solution.values.get(interval.start.index()).copied().flatten().map(i64::from) } else { None });
+        starts.push(if present { solution.values.get(interval.start.0).copied().flatten().map(i64::from) } else { None });
     }
     solution.starts = starts;
     solution.presences = presences;
@@ -658,18 +784,18 @@ fn checked_interval_start_max(horizon: i64, duration: i64) -> PyResult<i32> {
 #[allow(clippy::too_many_arguments)]
 fn make_solution(
     status: &str,
-    vars: &[VarId],
+    vars: &[IntVarRef],
     assignment: Option<&[i32]>,
     objective: Option<i64>,
     objective_sense: Option<&str>,
     objective_expr: Option<&str>,
-    stats: SolveStats,
+    stats: SearchStats,
     num_vars: usize,
 ) -> PySolution {
     let mut values = vec![None; num_vars];
     if let Some(assignment) = assignment {
         for (&var, &value) in vars.iter().zip(assignment) {
-            if let Some(slot) = values.get_mut(var.index()) {
+            if let Some(slot) = values.get_mut(var.0) {
                 *slot = Some(value);
             }
         }
@@ -703,6 +829,12 @@ fn make_solution(
         constructor: None,
         constructor_fleet: None,
         constructor_cost: None,
+        ls_moves: None,
+        ls_constraints: None,
+        ls_functionals: None,
+        ls_unsupported: None,
+        ls_rejected_incumbents: None,
+        ls_checkpoint_replays: None,
     }
 }
 
@@ -713,6 +845,16 @@ enum PythonEngine {
     Ls,
 }
 
+impl PythonEngine {
+    fn solve_mode(self) -> SolveMode {
+        match self {
+            Self::Auto => SolveMode::Auto,
+            Self::Exact => SolveMode::Exact,
+            Self::Ls => SolveMode::LocalSearch,
+        }
+    }
+}
+
 fn parse_engine(engine: &str) -> PyResult<PythonEngine> {
     match engine {
         "auto" => Ok(PythonEngine::Auto),
@@ -720,6 +862,127 @@ fn parse_engine(engine: &str) -> PyResult<PythonEngine> {
         "ls" => Ok(PythonEngine::Ls),
         _ => Err(PyValueError::new_err("engine must be 'auto', 'exact', or 'ls'")),
     }
+}
+
+#[derive(Default)]
+struct CollectionEventSummary {
+    improvements: u64,
+    first_feasible_at: Option<f64>,
+}
+
+struct PythonCollectionEventSink {
+    primary_sense: &'static str,
+    verbose: bool,
+    summary: CollectionEventSummary,
+}
+
+impl PythonCollectionEventSink {
+    fn new(primary_sense: &'static str, verbose: bool) -> Self {
+        Self { primary_sense, verbose, summary: CollectionEventSummary::default() }
+    }
+}
+
+impl EventSink for PythonCollectionEventSink {
+    fn emit(&mut self, event: SolveEvent) -> Result<EventControl, SolveError> {
+        let SolveEvent::Progress { engine, objectives, elapsed } = event else {
+            return Ok(EventControl::Continue);
+        };
+        let Some(&objective) = objectives.first() else {
+            return Ok(EventControl::Continue);
+        };
+        self.summary.improvements += 1;
+        self.summary.first_feasible_at.get_or_insert(elapsed.as_secs_f64());
+        if self.verbose {
+            match engine {
+                EngineKind::ListExact | EngineKind::ScheduleExact => {
+                    println!("  o {objective}  ({})", self.primary_sense);
+                }
+                EngineKind::RoutingExact | EngineKind::ListLocalSearch | EngineKind::ScheduleLocalSearch => {
+                    println!("  o {objective}  ({}, {:.2}s)", self.primary_sense, elapsed.as_secs_f64());
+                }
+                EngineKind::IntegerExact | EngineKind::IntegerLocalSearch | EngineKind::Linear | EngineKind::Verifier => {}
+            }
+        }
+        Ok(EventControl::Continue)
+    }
+}
+
+struct CollectionRun {
+    result: SolveResult,
+    engine: EngineKind,
+    events: CollectionEventSummary,
+}
+
+fn verbose_collection_start(construction: &SemanticConstruction, request: &SolveRequest, time_limit: Option<u64>) {
+    let model = construction.model();
+    println!("qayd solve (semantic collection)");
+    if construction.has_intervals() {
+        let moded = model.intervals().iter().any(|interval| !interval.modes.is_empty());
+        println!("  kind: {}", if moded { "intervals (machine choice)" } else { "intervals" });
+        println!("  operations: {}", model.intervals().len());
+    } else {
+        println!("  kind: lists");
+        println!("  items: {}", construction.list_universe().map_or(0, <[i32]>::len));
+        println!("  lists: {}", model.lists().len());
+    }
+    println!("  requested mode: {:?}", request.mode);
+    println!("  constraints: {}", model.constraints().len());
+    println!("  objective tiers: {}", construction.objectives.len());
+    println!("  threads: {}", request.threads);
+    match time_limit {
+        Some(seconds) => println!("  time limit: {seconds}s"),
+        None => println!("  time limit: none"),
+    }
+}
+
+fn result_engine_report(result: &SolveResult, engine: EngineKind) -> Option<&EngineReport> {
+    result.reports().iter().find(|report| report.engine == Some(engine)).or_else(|| result.reports().first())
+}
+
+fn collection_result_engine(result: &SolveResult) -> EngineKind {
+    result
+        .reports()
+        .iter()
+        .rev()
+        .find_map(|report| report.engine)
+        .or_else(|| result.primal().map(|candidate| candidate.source()))
+        .unwrap_or(EngineKind::Verifier)
+}
+
+fn report_metadata<'a>(report: Option<&'a EngineReport>, key: &str) -> Option<&'a str> {
+    report?.metadata.iter().find(|(name, _)| name == key).map(|(_, value)| value.as_str())
+}
+
+fn parse_report_metadata<T: std::str::FromStr>(report: Option<&EngineReport>, key: &str) -> Option<T> {
+    report_metadata(report, key)?.parse().ok()
+}
+
+fn attach_result_profile(solution: &mut PySolution, result: &SolveResult, engine: EngineKind) {
+    let orchestration_report = result.reports().first();
+    let engine_report = result_engine_report(result, engine);
+    solution.backend_build_seconds = parse_report_metadata(orchestration_report, "backend_build_seconds");
+    solution.estimated_backend_bytes = parse_report_metadata(orchestration_report, "estimated_backend_bytes");
+    solution.ls_moves = parse_report_metadata(engine_report, "ls_moves");
+    solution.ls_constraints = parse_report_metadata(engine_report, "ls_constraints");
+    solution.ls_functionals = parse_report_metadata(engine_report, "ls_functionals");
+    solution.ls_unsupported = parse_report_metadata(engine_report, "ls_unsupported");
+    solution.ls_rejected_incumbents = parse_report_metadata(engine_report, "ls_rejected_incumbents");
+    solution.ls_checkpoint_replays = parse_report_metadata(engine_report, "ls_checkpoint_replays");
+}
+
+fn collection_bound_fields(
+    result: &SolveResult,
+    primal: Option<i64>,
+    minimizing: bool,
+) -> (Option<i64>, Option<u64>, Option<f64>, Option<String>) {
+    let (Some(_primal), Some(bound)) = (primal, result.bounds().iter().find(|bound| bound.tier == 0).or_else(|| result.bounds().first()))
+    else {
+        return (None, None, None, None);
+    };
+    let Some(gap) = result.optimality_gap(0, minimizing) else {
+        return (None, None, None, None);
+    };
+    (Some(bound.value), Some(gap.absolute), Some(gap.relative), Some(bound.method.clone()))
 }
 
 fn verbose_start(num_vars: usize, num_constraints: usize, has_objective: bool) {
@@ -741,83 +1004,72 @@ fn verbose_finish(solution: &PySolution) {
     println!("  learned_lits: {}", solution.stats.learned_lits);
 }
 
-fn stop_after(limit: u64) -> Arc<AtomicBool> {
-    let stop = Arc::new(AtomicBool::new(false));
-    if limit == 0 {
-        stop.store(true, Ordering::SeqCst);
-        return stop;
-    }
-    {
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(limit));
-            stop.store(true, Ordering::SeqCst);
-        });
-    }
-    stop
-}
-
-/// One wall-clock budget for every phase of a collection solve. It is created
-/// before the collection IR is copied, then shared unchanged by validation,
-/// backend selection, backend construction, fallbacks, and search.
-struct CollectionBudget {
-    limit: u64,
-    started: Instant,
-    stop: Arc<AtomicBool>,
-}
-
-#[derive(Default)]
-struct CollectionProfileSummary {
-    alns_iterations: u64,
-    candidates: u64,
-    candidates_per_second: f64,
-    full_recompute_percentage: f64,
-    construction_seconds: f64,
-    time_to_first_feasible: Option<f64>,
-    construction_candidates: u64,
-    constructor: Option<String>,
-    constructor_fleet: Option<usize>,
-    constructor_cost: Option<i64>,
-}
-
-impl CollectionProfileSummary {
-    fn from_search(metrics: &lists::ListSearchMetrics) -> Self {
-        Self {
-            alns_iterations: metrics.alns.iterations,
-            candidates: metrics.candidates,
-            candidates_per_second: metrics.candidates_per_second(),
-            full_recompute_percentage: metrics.full_recompute_percentage(),
-            construction_seconds: metrics.construction_nanos as f64 / 1_000_000_000.0,
-            time_to_first_feasible: metrics.time_to_first_feasible_nanos.map(|value| value as f64 / 1_000_000_000.0),
-            construction_candidates: metrics.construction_candidates,
-            constructor: metrics.constructor.clone(),
-            constructor_fleet: metrics.constructor_fleet,
-            constructor_cost: metrics.constructor_cost,
+fn verbose_collection_finish(solution: &PySolution, run: &CollectionRun, profile: bool) {
+    let report = result_engine_report(&run.result, run.engine);
+    match run.engine {
+        EngineKind::RoutingExact => {
+            println!("qayd result (integer routing)");
+            println!("  status: {}", solution.status);
+            if run.result.primal().is_some() {
+                println!("  objectives: {:?}", solution.objectives);
+            }
+            verbose_collection_bound(solution);
+            println!("  improvements: {}", report.map_or(0, |report| report.improvements));
+            println!("  solutions: {}", solution.stats.solutions);
+            println!("  nodes: {}", solution.stats.nodes);
+            println!("  failures: {}", solution.stats.failures);
         }
+        EngineKind::ListExact => {
+            println!("qayd result (domain exact)");
+            println!("  status: {}", solution.status);
+            if !solution.objectives.is_empty() {
+                println!("  objectives: {:?}", solution.objectives);
+            }
+            verbose_collection_bound(solution);
+            println!("  solutions: {}", solution.stats.solutions);
+            println!("  nodes: {}", solution.stats.nodes);
+            println!("  failures: {}", solution.stats.failures);
+        }
+        EngineKind::ScheduleExact => {
+            println!("qayd result (domain exact)");
+            println!("  status: {}", solution.status);
+            if let Some(objective) = solution.objective {
+                println!("  objective: {objective}");
+            }
+            verbose_collection_bound(solution);
+            println!("  solutions: {}", solution.stats.solutions);
+            println!("  nodes: {}", solution.stats.nodes);
+            println!("  failures: {}", solution.stats.failures);
+        }
+        EngineKind::ListLocalSearch | EngineKind::ScheduleLocalSearch => {
+            println!("qayd result (collection)");
+            println!("  status: {}", solution.status);
+            if run.result.primal().is_some() {
+                println!("  objectives: {:?}", solution.objectives);
+            }
+            verbose_collection_bound(solution);
+            println!("  improvements: {}", run.events.improvements);
+            if profile {
+                println!("  constructor: {}", solution.constructor.as_deref().unwrap_or("none"));
+                println!("  construction: {:.6}s", solution.construction_seconds.unwrap_or(0.0));
+                println!("  construction candidates: {}", solution.construction_candidates.unwrap_or(0));
+                println!("  ALNS iterations: {}", solution.alns_iterations.unwrap_or(0));
+                println!("  candidates: {}", solution.candidates_evaluated.unwrap_or(0));
+                println!("  candidates/s: {:.1}", solution.candidates_per_second.unwrap_or(0.0));
+                println!("  full recomputations: {:.2}%", solution.full_recompute_percentage.unwrap_or(0.0));
+            }
+        }
+        EngineKind::IntegerExact | EngineKind::IntegerLocalSearch | EngineKind::Linear | EngineKind::Verifier => {}
     }
 }
 
-impl CollectionBudget {
-    fn new(limit: u64) -> Self {
-        Self { limit, started: Instant::now(), stop: stop_after(limit) }
-    }
-
-    fn expired(&self) -> bool {
-        self.stop.load(Ordering::Relaxed)
-    }
-
-    fn elapsed_seconds(&self) -> f64 {
-        self.started.elapsed().as_secs_f64()
-    }
-}
-
-/// Deadline flag for a solve: armed by a background timer when `time_limit` is
-/// set, otherwise never fires on its own (the search runs until it completes or
-/// is interrupted).
-fn deadline(time_limit: Option<u64>) -> Arc<AtomicBool> {
-    match time_limit {
-        Some(limit) => stop_after(limit),
-        None => Arc::new(AtomicBool::new(false)),
+fn verbose_collection_bound(solution: &PySolution) {
+    if let Some(dual) = solution.dual_bound {
+        println!("  dual: {dual}");
+        println!("  gap: {:.2}%", 100.0 * solution.relative_gap.unwrap_or(0.0));
+        if let Some(method) = &solution.bound_method {
+            println!("  bound method: {method}");
+        }
     }
 }
 
@@ -873,36 +1125,17 @@ impl Drop for SigintGuard {
 }
 
 /// Run the pure-Rust `compute` region of a solve with the GIL released, so
-/// Python background threads keep running. A watcher thread bridges a Ctrl-C
-/// (caught by our OS SIGINT handler) into the shared `stop`, so the stop-aware
-/// search unwinds; a `KeyboardInterrupt` is then raised on return.
-fn with_interrupts<T, F>(py: Python<'_>, stop: &Arc<AtomicBool>, compute: F) -> PyResult<T>
+/// Python background threads keep running. Canonical orchestrator services
+/// observe the SIGINT flag directly, and a `KeyboardInterrupt` is raised when
+/// the interrupted solve returns.
+fn with_interrupts<T, F>(py: Python<'_>, compute: F) -> PyResult<T>
 where
     F: FnOnce() -> T + Send,
     T: Send,
 {
     let _sigint = SigintGuard::arm();
-    let done = Arc::new(AtomicBool::new(false));
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let watcher = {
-        let stop = Arc::clone(stop);
-        let done = Arc::clone(&done);
-        let interrupted = Arc::clone(&interrupted);
-        std::thread::spawn(move || {
-            while !done.load(Ordering::Relaxed) {
-                if SIGINT_TRIPPED.load(Ordering::Relaxed) {
-                    interrupted.store(true, Ordering::SeqCst);
-                    stop.store(true, Ordering::SeqCst);
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        })
-    };
     let result = py.detach(compute);
-    done.store(true, Ordering::SeqCst);
-    let _ = watcher.join();
-    if interrupted.load(Ordering::SeqCst) {
+    if SIGINT_TRIPPED.load(Ordering::SeqCst) {
         return Err(PyKeyboardInterrupt::new_err("solve interrupted"));
     }
     Ok(result)
@@ -970,62 +1203,66 @@ fn checked_i32(value: i64, name: &str) -> PyResult<i32> {
     i32::try_from(value).map_err(|_| PyValueError::new_err(format!("{name} is outside the i32 domain range")))
 }
 
-fn relation_to_assumption_op(relation: &str) -> PyResult<AssumptionOp> {
+fn relation_to_assumption_op(relation: &str) -> PyResult<SemanticAssumptionOp> {
     match relation {
-        "==" | "=" | "eq" | "Eq" => Ok(AssumptionOp::Eq),
-        "!=" | "<>" | "ne" | "Ne" => Ok(AssumptionOp::Ne),
-        "<=" | "le" | "Le" => Ok(AssumptionOp::Le),
-        "<" | "lt" | "Lt" => Ok(AssumptionOp::Lt),
-        ">=" | "ge" | "Ge" => Ok(AssumptionOp::Ge),
-        ">" | "gt" | "Gt" => Ok(AssumptionOp::Gt),
+        "==" | "=" | "eq" | "Eq" => Ok(SemanticAssumptionOp::Eq),
+        "!=" | "<>" | "ne" | "Ne" => Ok(SemanticAssumptionOp::Ne),
+        "<=" | "le" | "Le" => Ok(SemanticAssumptionOp::Le),
+        "<" | "lt" | "Lt" => Ok(SemanticAssumptionOp::Lt),
+        ">=" | "ge" | "Ge" => Ok(SemanticAssumptionOp::Ge),
+        ">" | "gt" | "Gt" => Ok(SemanticAssumptionOp::Gt),
         _ => Err(PyValueError::new_err("assumption relation must be one of == != <= < >= >")),
     }
 }
 
-fn flipped_op(op: AssumptionOp) -> AssumptionOp {
+fn flipped_op(op: SemanticAssumptionOp) -> SemanticAssumptionOp {
     match op {
-        AssumptionOp::Eq => AssumptionOp::Eq,
-        AssumptionOp::Ne => AssumptionOp::Ne,
-        AssumptionOp::Le => AssumptionOp::Ge,
-        AssumptionOp::Lt => AssumptionOp::Gt,
-        AssumptionOp::Ge => AssumptionOp::Le,
-        AssumptionOp::Gt => AssumptionOp::Lt,
+        SemanticAssumptionOp::Eq => SemanticAssumptionOp::Eq,
+        SemanticAssumptionOp::Ne => SemanticAssumptionOp::Ne,
+        SemanticAssumptionOp::Le => SemanticAssumptionOp::Ge,
+        SemanticAssumptionOp::Lt => SemanticAssumptionOp::Gt,
+        SemanticAssumptionOp::Ge => SemanticAssumptionOp::Le,
+        SemanticAssumptionOp::Gt => SemanticAssumptionOp::Lt,
     }
 }
 
-fn var_const_assumption(lhs: &Expr, rhs: &Expr, op: AssumptionOp) -> Option<Assumption> {
+fn var_const_assumption(lhs: &Expr, rhs: &Expr, op: SemanticAssumptionOp) -> Option<SemanticAssumption> {
     match (lhs, rhs) {
-        (Expr::Var(var), Expr::Const(value)) => i32::try_from(*value).ok().map(|value| Assumption { var: *var, op, value }),
-        (Expr::Const(value), Expr::Var(var)) => i32::try_from(*value).ok().map(|value| Assumption { var: *var, op: flipped_op(op), value }),
+        (Expr::Variable(var), Expr::Constant(value)) => {
+            i32::try_from(*value).ok().map(|value| SemanticAssumption { variable: var.0, operation: op, value })
+        }
+        (Expr::Constant(value), Expr::Variable(var)) => {
+            i32::try_from(*value).ok().map(|value| SemanticAssumption { variable: var.0, operation: flipped_op(op), value })
+        }
         _ => None,
     }
 }
 
-fn simple_assumption_expr(expr: &Expr) -> Option<Assumption> {
+fn simple_assumption_expr(expr: &Expr) -> Option<SemanticAssumption> {
     match expr {
-        Expr::Eq(lhs, rhs) => var_const_assumption(lhs, rhs, AssumptionOp::Eq),
-        Expr::Ne(lhs, rhs) => var_const_assumption(lhs, rhs, AssumptionOp::Ne),
-        Expr::Le(lhs, rhs) => var_const_assumption(lhs, rhs, AssumptionOp::Le),
-        Expr::Lt(lhs, rhs) => var_const_assumption(lhs, rhs, AssumptionOp::Lt),
-        Expr::Ge(lhs, rhs) => var_const_assumption(lhs, rhs, AssumptionOp::Ge),
-        Expr::Gt(lhs, rhs) => var_const_assumption(lhs, rhs, AssumptionOp::Gt),
+        Expr::Eq(lhs, rhs) => var_const_assumption(lhs, rhs, SemanticAssumptionOp::Eq),
+        Expr::Ne(lhs, rhs) => var_const_assumption(lhs, rhs, SemanticAssumptionOp::Ne),
+        Expr::Le(lhs, rhs) => var_const_assumption(lhs, rhs, SemanticAssumptionOp::Le),
+        Expr::Lt(lhs, rhs) => var_const_assumption(lhs, rhs, SemanticAssumptionOp::Lt),
+        Expr::Ge(lhs, rhs) => var_const_assumption(lhs, rhs, SemanticAssumptionOp::Ge),
+        Expr::Gt(lhs, rhs) => var_const_assumption(lhs, rhs, SemanticAssumptionOp::Gt),
         Expr::Not(inner) => simple_assumption_expr(inner).map(|assumption| {
-            let op = match assumption.op {
-                AssumptionOp::Eq => AssumptionOp::Ne,
-                AssumptionOp::Ne => AssumptionOp::Eq,
-                AssumptionOp::Le => AssumptionOp::Gt,
-                AssumptionOp::Lt => AssumptionOp::Ge,
-                AssumptionOp::Ge => AssumptionOp::Lt,
-                AssumptionOp::Gt => AssumptionOp::Le,
+            let operation = match assumption.operation {
+                SemanticAssumptionOp::Eq => SemanticAssumptionOp::Ne,
+                SemanticAssumptionOp::Ne => SemanticAssumptionOp::Eq,
+                SemanticAssumptionOp::Le => SemanticAssumptionOp::Gt,
+                SemanticAssumptionOp::Lt => SemanticAssumptionOp::Ge,
+                SemanticAssumptionOp::Ge => SemanticAssumptionOp::Lt,
+                SemanticAssumptionOp::Gt => SemanticAssumptionOp::Le,
             };
-            Assumption { op, ..assumption }
+            SemanticAssumption { operation, ..assumption }
         }),
-        Expr::Var(var) => Some(Assumption::eq(*var, 1)),
+        Expr::Variable(var) => Some(SemanticAssumption { variable: var.0, operation: SemanticAssumptionOp::Eq, value: 1 }),
         _ => None,
     }
 }
 
-fn assumption_from_py(model_id: u64, item: &Bound<'_, PyAny>) -> PyResult<Assumption> {
+fn assumption_from_py(model_id: u64, item: &Bound<'_, PyAny>) -> PyResult<SemanticAssumption> {
     if let Ok(constraint) = item.extract::<PyRef<'_, PyConstraint>>() {
         if let Some(owner) = constraint.inner.model_id {
             if owner != model_id {
@@ -1036,18 +1273,18 @@ fn assumption_from_py(model_id: u64, item: &Bound<'_, PyAny>) -> PyResult<Assump
             .ok_or_else(|| PyValueError::new_err("assumptions must be simple variable bounds such as x == v, x <= v, or x >= v"));
     }
     if let Ok(var) = item.extract::<PyRef<'_, PyIntVar>>() {
-        return Ok(Assumption::eq(one_id_for(model_id, &var)?, 1));
+        return Ok(SemanticAssumption { variable: one_id_for(model_id, &var)?.0, operation: SemanticAssumptionOp::Eq, value: 1 });
     }
     if let Ok((var, value)) = item.extract::<(PyRef<'_, PyIntVar>, i32)>() {
-        return Ok(Assumption::eq(one_id_for(model_id, &var)?, value));
+        return Ok(SemanticAssumption { variable: one_id_for(model_id, &var)?.0, operation: SemanticAssumptionOp::Eq, value });
     }
     if let Ok((var, relation, value)) = item.extract::<(PyRef<'_, PyIntVar>, String, i32)>() {
-        return Ok(Assumption { var: one_id_for(model_id, &var)?, op: relation_to_assumption_op(&relation)?, value });
+        return Ok(SemanticAssumption { variable: one_id_for(model_id, &var)?.0, operation: relation_to_assumption_op(&relation)?, value });
     }
     Err(PyTypeError::new_err("assumption must be a simple Constraint, an IntVar, (IntVar, value), or (IntVar, relation, value)"))
 }
 
-fn assumptions_from_py(model_id: u64, assumptions: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<Assumption>> {
+fn assumptions_from_py(model_id: u64, assumptions: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<SemanticAssumption>> {
     let Some(assumptions) = assumptions else {
         return Ok(Vec::new());
     };
@@ -1058,7 +1295,7 @@ fn assumptions_from_py(model_id: u64, assumptions: Option<&Bound<'_, PyAny>>) ->
     iter.map(|item| assumption_from_py(model_id, &item?)).collect()
 }
 
-fn hint_pairs_from_py(model_id: u64, hints: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<(VarId, i32)>> {
+fn hint_pairs_from_py(model_id: u64, hints: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<(usize, i32)>> {
     let Some(hints) = hints else {
         return Ok(Vec::new());
     };
@@ -1070,7 +1307,7 @@ fn hint_pairs_from_py(model_id: u64, hints: Option<&Bound<'_, PyAny>>) -> PyResu
     for item in iter {
         let item = item?;
         if let Ok((var, value)) = item.extract::<(PyRef<'_, PyIntVar>, i32)>() {
-            out.push((one_id_for(model_id, &var)?, value));
+            out.push((one_id_for(model_id, &var)?.0, value));
         } else {
             return Err(PyTypeError::new_err("hints must be an iterable of (IntVar, value) pairs"));
         }
@@ -1078,24 +1315,14 @@ fn hint_pairs_from_py(model_id: u64, hints: Option<&Bound<'_, PyAny>>) -> PyResu
     Ok(out)
 }
 
-fn branch_order_from_py(model_id: u64, branch_order: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<VarId>> {
+fn branch_order_from_py(model_id: u64, branch_order: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<usize>> {
     let Some(branch_order) = branch_order else {
         return Ok(Vec::new());
     };
     if branch_order.is_none() {
         return Ok(Vec::new());
     }
-    ids_for(model_id, &var_list_from_py(branch_order)?)
-}
-
-fn phase_from_hints(num_vars: usize, hints: &[(VarId, i32)]) -> Vec<Option<i32>> {
-    let mut phase = vec![None; num_vars];
-    for &(var, value) in hints {
-        if let Some(slot) = phase.get_mut(var.index()) {
-            *slot = Some(value);
-        }
-    }
-    phase
+    Ok(ids_for(model_id, &var_list_from_py(branch_order)?)?.into_iter().map(|variable| variable.0).collect())
 }
 
 fn objective_specs(primary: &Option<ObjectiveSpec>, tiers: &[ObjectiveSpec]) -> Vec<ObjectiveSpec> {
@@ -1107,246 +1334,161 @@ fn objective_specs(primary: &Option<ObjectiveSpec>, tiers: &[ObjectiveSpec]) -> 
     out
 }
 
-fn expr_bounds_i32(solver: &Solver, expr: &Expr) -> PyResult<(i32, i32)> {
-    let (lo, hi) = expr.bounds(&|var| (i64::from(solver.store.min(var)), i64::from(solver.store.max(var))));
-    Ok((checked_i32(lo, "objective lower bound")?, checked_i32(hi, "objective upper bound")?))
-}
-
-fn materialize_objectives(solver: &mut Solver, objectives: &[ObjectiveSpec]) -> PyResult<Vec<MaterializedObjective>> {
-    let mut out = Vec::with_capacity(objectives.len());
-    for objective in objectives {
-        let mut support = Vec::new();
-        objective.expr.expr.collect_vars(&mut support);
-        support.sort_unstable();
-        support.dedup();
-        let var = match &objective.expr.expr {
-            Expr::Var(var) => *var,
-            expr => {
-                let (lo, hi) = expr_bounds_i32(solver, expr)?;
-                let obj = solver.new_var_range(lo, hi);
-                intension::intension(solver, expr::eq(expr::var(obj), expr.clone()));
-                obj
-            }
-        };
-        out.push(MaterializedObjective { minimizing: objective.minimizing, var, text: objective.expr.text.clone(), support });
-    }
-    Ok(out)
-}
-
-fn call_incumbent(
+fn call_incumbent_candidate(
     py: Python<'_>,
-    callback: Option<&Bound<'_, PyAny>>,
-    value: i64,
-    vars: &[VarId],
-    assignment: &[i32],
-    num_vars: usize,
+    callback: &Bound<'_, PyAny>,
+    candidate: &crate::orchestrator::CandidateSolution,
 ) -> PyResult<()> {
-    let Some(callback) = callback else {
+    let Some(&value) = candidate.objectives().last() else {
         return Ok(());
     };
     let values = PyDict::new(py);
-    for (&var, &value) in vars.iter().zip(assignment) {
-        if var.index() < num_vars {
-            values.set_item(var.0, value)?;
+    for (index, value) in candidate.assignment().integers.iter().enumerate() {
+        if let Some(value) = value {
+            values.set_item(index as u32, value)?;
         }
     }
     callback.call1((value, values))?;
     Ok(())
 }
 
-fn add_stats(total: &mut SolveStats, stats: SolveStats) {
-    total.solutions += stats.solutions;
-    total.nodes += stats.nodes;
-    total.failures += stats.failures;
-    total.learned_lits += stats.learned_lits;
-    total.vivified_clauses += stats.vivified_clauses;
-    total.vivified_lits += stats.vivified_lits;
-    total.binary_clause_visits += stats.binary_clause_visits;
-    total.watched_clause_visits += stats.watched_clause_visits;
-    total.watched_literal_scans += stats.watched_literal_scans;
-    total.binary_implications += stats.binary_implications;
-}
-
-fn next_clause_sharing(clauses: Option<&Arc<SharedClausePool>>, next_worker: &mut usize) -> Option<ClauseSharing> {
-    clauses.map(|clauses| {
-        let worker = *next_worker;
-        *next_worker = next_worker.saturating_add(1);
-        ClauseSharing::new(Arc::clone(clauses), worker)
-    })
-}
-
-fn atom_table_for_solver(solver: &Solver, vars: &[VarId], clauses: &SharedClausePool) -> AtomTable {
-    let nvars = solver.store.num_vars();
-    let mut active = (0..nvars).map(|i| solver.store.is_relevant(VarId(i as u32))).collect::<Vec<_>>();
-    for &var in vars {
-        if var.index() < active.len() {
-            active[var.index()] = true;
+fn integer_solve_error(error: SolveError) -> PyErr {
+    match error {
+        SolveError::InvalidRequest(message) | SolveError::Unsupported(message) | SolveError::Compile(message) => {
+            PyValueError::new_err(message)
+        }
+        SolveError::Engine(message) | SolveError::InvalidResult(message) | SolveError::Interrupted(message) => {
+            PyRuntimeError::new_err(message)
         }
     }
-    AtomTable::build_active_sparse_with_registry(
-        nvars,
-        |v: VarId| active[v.index()],
-        |v: VarId| solver.store.size(v) == 2 && solver.store.contains(v, -1) && solver.store.contains(v, 1),
-        |v: VarId| solver.store.sparse_values(v),
-        |v: VarId| (solver.store.min(v), solver.store.max(v)),
-        clauses.lazy_atoms(),
-    )
 }
 
-fn decode_nogood_lit(atoms: &AtomTable, lit: Lit) -> (u32, String, i32) {
-    match atoms.decode(lit.atom()) {
-        AtomKind::Ge { var, k } if lit.is_positive() => (var.0, ">=".to_string(), k),
-        AtomKind::Ge { var, k } => (var.0, "<".to_string(), k),
-        AtomKind::Eq { var, v } if lit.is_positive() => (var.0, "==".to_string(), v),
-        AtomKind::Eq { var, v } => (var.0, "!=".to_string(), v),
-    }
-}
-
-fn append_objective_search_vars(vars: &mut Vec<VarId>, objectives: &[MaterializedObjective]) {
-    for objective in objectives {
-        for &var in &objective.support {
-            append_var(vars, var);
-        }
-        append_var(vars, objective.var);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn solve_integer_template(
-    solver_template: &Solver,
-    model_id: u64,
-    num_vars: usize,
-    search_vars: &[VarId],
-    objectives: &[MaterializedObjective],
-    assumptions: &[Assumption],
-    hints: &[(VarId, i32)],
-    stop: &Arc<AtomicBool>,
-    seed: u64,
-    clauses: Option<&Arc<SharedClausePool>>,
-    next_worker: &mut usize,
-    conflict_budget: Option<u64>,
-    branch_order: &[VarId],
+struct PythonIntegerEventSink {
     verbose: bool,
-    on_incumbent: Option<Py<PyAny>>,
-) -> PyResult<PySolution> {
-    let mut vars = search_vars.to_vec();
-    for &var in branch_order {
-        append_var(&mut vars, var);
+    callback: Option<Py<PyAny>>,
+    callback_error: Option<PyErr>,
+}
+
+impl PythonIntegerEventSink {
+    fn new(verbose: bool, callback: Option<Py<PyAny>>) -> Self {
+        Self { verbose, callback, callback_error: None }
     }
-    append_interval_domain_vars(&mut vars, solver_template);
-    append_objective_search_vars(&mut vars, objectives);
-    let mut remaining_conflicts = conflict_budget;
+}
 
-    if objectives.is_empty() {
-        let mut solver = solver_template.clone();
-        let phase = phase_from_hints(solver.store.num_vars(), hints);
-        let sharing = next_clause_sharing(clauses, next_worker);
-        let (assignment, stats, complete) = search::decide_sat_assuming_seeded(
-            &mut solver,
-            &vars,
-            assumptions,
-            stop,
-            seed,
-            sharing,
-            remaining_conflicts,
-            phase,
-            branch_order.to_vec(),
-        );
-        let status = match (assignment.is_some(), complete) {
-            (true, _) => "SATISFIABLE",
-            (false, true) => "UNSATISFIABLE",
-            (false, false) => "UNKNOWN",
-        };
-        return Ok(make_solution(status, &vars, assignment.as_deref(), None, None, None, stats, num_vars));
-    }
-
-    let mut active_assumptions = assumptions.to_vec();
-    let mut total_stats = SolveStats::default();
-    let mut best_assignment: Option<Vec<i32>> = None;
-    let mut objective_values = Vec::with_capacity(objectives.len());
-    let mut complete = true;
-
-    for (tier, objective) in objectives.iter().enumerate() {
-        if remaining_conflicts == Some(0) || stop.load(Ordering::Relaxed) {
-            complete = false;
-            break;
-        }
-        let mut solver = solver_template.clone();
-        let phase = phase_from_hints(solver.store.num_vars(), hints);
-        let sharing = next_clause_sharing(clauses, next_worker);
-        let mut callback_error: Option<PyErr> = None;
-        let (best, stats, tier_complete) = search::optimize_assuming_seeded(
-            &mut solver,
-            &vars,
-            &active_assumptions,
-            SearchObjective::Var(objective.var),
-            objective.minimizing,
-            stop,
-            seed.wrapping_add(tier as u64),
-            None,
-            sharing,
-            remaining_conflicts,
-            phase,
-            branch_order.to_vec(),
-            |value, assignment| {
-                if verbose {
-                    println!("  incumbent tier {tier}: {value}");
-                }
-                if callback_error.is_none() {
-                    if let Some(cb) = &on_incumbent {
-                        // The solve runs with the GIL released; reacquire it
-                        // only for the callback invocation itself.
-                        let res = Python::attach(|py| call_incumbent(py, Some(cb.bind(py)), value, &vars, assignment, num_vars));
-                        if let Err(err) = res {
-                            callback_error = Some(err);
-                            stop.store(true, Ordering::SeqCst);
-                        }
+impl EventSink for PythonIntegerEventSink {
+    fn emit(&mut self, event: SolveEvent) -> Result<EventControl, SolveError> {
+        match event {
+            SolveEvent::Progress { engine, objectives, .. } if self.verbose => {
+                if let Some(&value) = objectives.last() {
+                    if engine == EngineKind::IntegerLocalSearch {
+                        println!("  incumbent: {value}");
+                    } else {
+                        println!("  incumbent tier {}: {value}", objectives.len().saturating_sub(1));
                     }
                 }
-            },
-        );
-        if let Some(err) = callback_error {
-            return Err(err);
+            }
+            SolveEvent::Candidate(candidate)
+                if candidate.verification() == VerificationLevel::Transfer && self.callback.is_some() && self.callback_error.is_none() =>
+            {
+                let result = Python::attach(|py| {
+                    let callback = self.callback.as_ref().expect("callback checked above").bind(py);
+                    call_incumbent_candidate(py, callback, &candidate)
+                });
+                if let Err(error) = result {
+                    self.callback_error = Some(error);
+                    return Err(SolveError::Engine("Python incumbent callback failed".to_string()));
+                }
+            }
+            _ => {}
         }
-        if let Some(limit) = remaining_conflicts.as_mut() {
-            *limit = limit.saturating_sub(stats.failures);
-        }
-        add_stats(&mut total_stats, stats);
-        let Some((assignment, value)) = best else {
-            let status = if tier == 0 && tier_complete { "UNSATISFIABLE" } else { "UNKNOWN" };
-            return Ok(make_solution(
-                status,
-                &vars,
-                best_assignment.as_deref(),
-                objective_values.first().copied(),
-                Some(if objectives[0].minimizing { "min" } else { "max" }),
-                Some(&objectives[0].text),
-                total_stats,
-                num_vars,
-            ));
-        };
-        best_assignment = Some(assignment);
-        objective_values.push(value);
-        let value_i32 = checked_i32(value, "objective value")?;
-        active_assumptions.push(Assumption::eq(objective.var, value_i32));
-        if !tier_complete {
-            complete = false;
-            break;
+        Ok(EventControl::Continue)
+    }
+}
+
+struct PythonSolveEventSink {
+    integer: PythonIntegerEventSink,
+    collection: PythonCollectionEventSink,
+}
+
+impl PythonSolveEventSink {
+    fn new(verbose: bool, callback: Option<Py<PyAny>>, primary_sense: &'static str) -> Self {
+        Self { integer: PythonIntegerEventSink::new(verbose, callback), collection: PythonCollectionEventSink::new(primary_sense, verbose) }
+    }
+}
+
+impl EventSink for PythonSolveEventSink {
+    fn emit(&mut self, event: SolveEvent) -> Result<EventControl, SolveError> {
+        if matches!(
+            &event,
+            SolveEvent::Progress {
+                engine: EngineKind::RoutingExact
+                    | EngineKind::ListExact
+                    | EngineKind::ScheduleExact
+                    | EngineKind::ListLocalSearch
+                    | EngineKind::ScheduleLocalSearch,
+                ..
+            }
+        ) {
+            self.collection.emit(event)
+        } else {
+            self.integer.emit(event)
         }
     }
+}
 
-    let mut solution = make_solution(
-        if complete && objective_values.len() == objectives.len() { "OPTIMAL" } else { "SATISFIABLE" },
-        &vars,
-        best_assignment.as_deref(),
-        objective_values.first().copied(),
-        Some(if objectives[0].minimizing { "min" } else { "max" }),
-        Some(&objectives[0].text),
-        total_stats,
-        num_vars,
-    );
+fn result_search_stats(result: &SolveResult, _engine: EngineKind) -> SearchStats {
+    result.aggregate_search_stats()
+}
+
+fn visible_integer_values(result: &SolveResult, num_vars: usize) -> PyResult<Vec<Option<i32>>> {
+    let Some(candidate) = result.primal() else {
+        return Ok(vec![None; num_vars]);
+    };
+    if candidate.assignment().integers.len() < num_vars {
+        return Err(PyRuntimeError::new_err(format!(
+            "canonical integer assignment has {} entries, expected {num_vars}",
+            candidate.assignment().integers.len()
+        )));
+    }
+    candidate
+        .assignment()
+        .integers
+        .iter()
+        .take(num_vars)
+        .map(|value| {
+            value
+                .map(|value| i32::try_from(value).map_err(|_| PyRuntimeError::new_err("canonical integer assignment is outside i32")))
+                .transpose()
+        })
+        .collect()
+}
+
+fn integer_solution_from_result(
+    result: &SolveResult,
+    objectives: &[ObjectiveSpec],
+    num_vars: usize,
+    engine: EngineKind,
+    profile: bool,
+) -> PyResult<PySolution> {
+    let objective_values = result.primal().map(|candidate| candidate.objectives().to_vec()).unwrap_or_default();
+    let objective = objective_values.first().copied();
+    let primary = objectives.first();
+    let sense = primary.map(|objective| if objective.minimizing { "min" } else { "max" });
+    let text = primary.map(|objective| objective.expr.text.as_str());
+    let mut solution =
+        make_solution(result.status().as_str(), &[], None, objective, sense, text, result_search_stats(result, engine), num_vars);
+    solution.values = visible_integer_values(result, num_vars)?;
     solution.objectives = objective_values;
-    let _ = model_id;
+    if let Some(primary) = primary.filter(|_| engine == EngineKind::IntegerExact) {
+        let (dual_bound, absolute_gap, relative_gap, bound_method) = collection_bound_fields(result, objective, primary.minimizing);
+        solution.dual_bound = dual_bound;
+        solution.absolute_gap = absolute_gap;
+        solution.relative_gap = relative_gap;
+        solution.bound_method = if result.status() == SolveStatus::Optimal { Some("exact proof".to_string()) } else { bound_method };
+    }
+    if profile {
+        attach_result_profile(&mut solution, result, engine);
+    }
     Ok(solution)
 }
 
@@ -1546,7 +1688,7 @@ impl PyConstraint {
 #[pymethods]
 impl PySolveStats {
     fn __repr__(&self) -> String {
-        format!("SolveStats(solutions={}, nodes={}, failures={})", self.solutions, self.nodes, self.failures)
+        format!("SearchStats(solutions={}, nodes={}, failures={})", self.solutions, self.nodes, self.failures)
     }
 }
 
@@ -1644,6 +1786,36 @@ impl PySolution {
         self.constructor_cost
     }
 
+    #[getter]
+    fn ls_moves(&self) -> Option<u64> {
+        self.ls_moves
+    }
+
+    #[getter]
+    fn ls_constraints(&self) -> Option<usize> {
+        self.ls_constraints
+    }
+
+    #[getter]
+    fn ls_functionals(&self) -> Option<usize> {
+        self.ls_functionals
+    }
+
+    #[getter]
+    fn ls_unsupported(&self) -> Option<usize> {
+        self.ls_unsupported
+    }
+
+    #[getter]
+    fn ls_rejected_incumbents(&self) -> Option<usize> {
+        self.ls_rejected_incumbents
+    }
+
+    #[getter]
+    fn ls_checkpoint_replays(&self) -> Option<u64> {
+        self.ls_checkpoint_replays
+    }
+
     /// Per-tier objective values for a lexicographic (multi-objective) model.
     #[getter]
     fn objectives(&self) -> Vec<i64> {
@@ -1678,6 +1850,12 @@ impl PySolution {
         self.objective_expr.clone()
     }
 
+    /// Values of the integer variables declared through the Python model.
+    #[getter]
+    fn values(&self) -> Vec<Option<i32>> {
+        self.values.clone()
+    }
+
     /// List variable contents (one list per list variable), or `None` otherwise.
     #[getter]
     fn lists(&self) -> Option<Vec<Vec<i32>>> {
@@ -1690,7 +1868,7 @@ impl PySolution {
     }
 
     fn is_sat(&self) -> bool {
-        self.status != "UNSATISFIABLE"
+        matches!(self.status.as_str(), "SATISFIABLE" | "OPTIMAL")
     }
 
     fn value(&self, var: &PyIntVar) -> PyResult<i32> {
@@ -1721,31 +1899,41 @@ impl PySolution {
 impl PySolveSession {
     #[getter]
     fn learned_nogoods(&self) -> usize {
-        self.clauses.len()
+        self.session.learned_nogoods()
     }
 
     fn clear_nogoods(&mut self) {
-        self.clauses = Arc::new(SharedClausePool::default());
-        self.next_worker = 0;
+        self.session.clear_nogoods();
     }
 
     #[pyo3(signature = (limit=None))]
     fn raw_nogoods(&self, limit: Option<usize>) -> Vec<PyRawNogood> {
-        self.clauses
-            .snapshot(limit.unwrap_or(0))
-            .into_iter()
-            .map(|(lbd, lits)| (lbd, lits.iter().map(|lit| lit.code()).collect()))
-            .collect()
+        self.session.raw_nogoods(limit)
     }
 
     #[pyo3(signature = (limit=None))]
-    fn nogoods(&self, limit: Option<usize>) -> Vec<PyNogood> {
-        let atoms = atom_table_for_solver(&self.solver, &self.search, &self.clauses);
-        self.clauses
-            .snapshot(limit.unwrap_or(0))
+    fn nogoods(&self, limit: Option<usize>) -> PyResult<Vec<PyNogood>> {
+        Ok(self
+            .session
+            .nogoods(limit)
+            .map_err(integer_solve_error)?
             .into_iter()
-            .map(|(lbd, lits)| (lbd, lits.iter().copied().map(|lit| decode_nogood_lit(&atoms, lit)).collect()))
-            .collect()
+            .map(|(lbd, literals)| {
+                let literals = literals
+                    .into_iter()
+                    .map(|literal| {
+                        let relation = match literal.relation {
+                            SemanticNogoodRelation::Eq => "==",
+                            SemanticNogoodRelation::Ne => "!=",
+                            SemanticNogoodRelation::Ge => ">=",
+                            SemanticNogoodRelation::Lt => "<",
+                        };
+                        (literal.variable as u32, relation.to_string(), literal.value)
+                    })
+                    .collect();
+                (lbd, literals)
+            })
+            .collect())
     }
 
     #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, conflict_budget=None))]
@@ -1769,47 +1957,43 @@ impl PySolveSession {
             }
         }
         if verbose {
-            verbose_start(self.names.len(), self.solver.num_propagators(), !self.objectives.is_empty());
+            verbose_start(self.names.len(), 0, !self.objectives.is_empty());
         }
         let assumptions = assumptions_from_py(self.id, assumptions)?;
         let hints = hint_pairs_from_py(self.id, hints)?;
-        let branch_order = branch_order_from_py(self.id, branch_order)?;
+        let mut guidance = branch_order_from_py(self.id, branch_order)?;
         let search_vars = match search {
-            Some(obj) if !obj.is_none() => search_ids_for(self.id, self.names.len(), Some(obj), None)?,
+            Some(obj) if !obj.is_none() => {
+                search_ids_for(self.id, self.names.len(), Some(obj), None)?.into_iter().map(|variable| variable.0).collect()
+            }
             _ => self.search.clone(),
         };
-        let stop = deadline(time_limit);
-        let clauses = Arc::clone(&self.clauses);
-        // Owned/plain captures so the compute closure is Send and the solve
-        // runs with the GIL released (the callback reacquires it on its own).
+        for variable in search_vars {
+            if !guidance.contains(&variable) {
+                guidance.push(variable);
+            }
+        }
+        let request = SolveRequest {
+            mode: SolveMode::Exact,
+            seed,
+            limits: SolveLimits { time: time_limit.map(Duration::from_secs), conflicts: conflict_budget, ..SolveLimits::default() },
+            assumptions,
+            hints,
+            branch_order: guidance,
+            publish_incumbent_assignments: on_incumbent.is_some(),
+            ..SolveRequest::default()
+        };
         let on_incumbent = on_incumbent.map(|cb| cb.clone().unbind());
-        let solver_template = self.solver.clone();
-        let (model_id, num_vars, objectives) = (self.id, self.names.len(), self.objectives.clone());
-        let worker0 = self.next_worker;
-        let stop_inner = Arc::clone(&stop);
-        let (solution, worker) = with_interrupts(py, &stop, move || {
-            let mut worker = worker0;
-            let solution = solve_integer_template(
-                &solver_template,
-                model_id,
-                num_vars,
-                &search_vars,
-                &objectives,
-                &assumptions,
-                &hints,
-                &stop_inner,
-                seed,
-                Some(&clauses),
-                &mut worker,
-                conflict_budget,
-                &branch_order,
-                verbose,
-                on_incumbent,
-            );
-            (solution, worker)
-        })?;
-        self.next_worker = worker;
-        let mut solution = solution?;
+        let (num_vars, objectives) = (self.names.len(), self.objectives.clone());
+        let result = with_interrupts(py, || {
+            let mut sink = PythonIntegerEventSink::new(verbose, on_incumbent);
+            let result = self.session.solve_with_external_stop(&request, &SIGINT_TRIPPED, &mut sink);
+            if let Some(error) = sink.callback_error {
+                return Err(error);
+            }
+            result.map_err(integer_solve_error)
+        })??;
+        let mut solution = integer_solution_from_result(&result, &objectives, num_vars, EngineKind::IntegerExact, false)?;
         attach_native_interval_solution(&mut solution, &self.native_intervals);
         if verbose {
             verbose_finish(&solution);
@@ -1818,7 +2002,12 @@ impl PySolveSession {
     }
 
     fn __repr__(&self) -> String {
-        format!("SolveSession(num_vars={}, objectives={}, learned_nogoods={})", self.names.len(), self.objectives.len(), self.clauses.len())
+        format!(
+            "SolveSession(num_vars={}, objectives={}, learned_nogoods={})",
+            self.names.len(),
+            self.objectives.len(),
+            self.session.learned_nogoods()
+        )
     }
 }
 
@@ -1828,23 +2017,14 @@ impl PyModel {
     fn new() -> Self {
         Self {
             id: NEXT_MODEL_ID.fetch_add(1, Ordering::Relaxed),
-            solver: Solver::new(),
             names: Vec::new(),
             objective: None,
             then_objectives: Vec::new(),
             native_intervals: Vec::new(),
-            local: LocalSearchSpec::default(),
-            col_universe: None,
-            col_lists: 0,
-            col_gen: 0,
-            col_objectives: Vec::new(),
-            col_constraints: Vec::new(),
-            col_globals: Vec::new(),
-            col_unordered: HashSet::new(),
-            col_reified: Vec::new(),
-            col_schedule: None,
-            col_sched_gen: 0,
+            semantic: SemanticConstruction::default(),
             mus_selectors: Vec::new(),
+            active_soft_selector: None,
+            constants: HashMap::new(),
         }
     }
 
@@ -1855,7 +2035,7 @@ impl PyModel {
 
     #[getter]
     fn num_constraints(&self) -> usize {
-        self.solver.num_propagators()
+        self.semantic.model().constraints().len()
     }
 
     #[getter]
@@ -1875,19 +2055,18 @@ impl PyModel {
                 if values.is_empty() {
                     return Err(PyValueError::new_err("domain values cannot be empty"));
                 }
-                self.solver.new_var_set(&values)
+                self.semantic.model_mut().int_set(values)
             }
             (Some(lo), Some(hi), None) => {
                 if lo > hi {
                     return Err(PyValueError::new_err("lower bound must be <= upper bound"));
                 }
-                self.solver.new_var_range(lo, hi)
+                self.semantic.model_mut().int_range(lo, hi)
             }
             _ => return Err(PyValueError::new_err("use int_var(lo, hi, name=...) or int_var(values=[...], name=...)")),
         };
         self.names.push(name.clone());
-        self.local.add_var(id);
-        Ok(PyIntVar { model_id: self.id, index: id.0, name })
+        Ok(PyIntVar { model_id: self.id, index: id.0 as u32, name })
     }
 
     #[pyo3(signature = (name=None))]
@@ -1918,7 +2097,11 @@ impl PyModel {
         // A term comparison is a constraint on the list it references.
         if let Ok(lc) = constraint.extract::<PyRef<'_, PyListConstraint>>() {
             self.check_term_scope(lc.model_id, lc.gen)?;
-            self.col_constraints.push(list::Constraint { reduction: lc.reduction.clone(), op: lc.op, rhs: lc.rhs });
+            self.semantic.model_mut().add_constraint(shared_model::Constraint::ListReduction(list::Constraint {
+                reduction: lc.reduction.clone(),
+                op: lc.op,
+                rhs: lc.rhs,
+            }));
             return Ok(());
         }
         // `add(scan == v)` binds a scan total to a `list_value()` handle. The
@@ -1927,7 +2110,8 @@ impl PyModel {
         if let Ok(reified) = constraint.extract::<PyRef<'_, PyReified>>() {
             self.check_term_scope(reified.model_id, reified.gen)?;
             let slot = self
-                .col_reified
+                .semantic
+                .reified_values
                 .get_mut(reified.value)
                 .ok_or_else(|| PyValueError::new_err("this list value is stale; rebuild it from the current list_vars()"))?;
             *slot = Some(reified.reduction.clone());
@@ -1939,8 +2123,7 @@ impl PyModel {
                     return Err(PyValueError::new_err("constraint belongs to a different model"));
                 }
             }
-            self.local.add_expr(constraint.inner.expr.clone());
-            intension::intension(&mut self.solver, constraint.inner.expr);
+            self.add_integer_constraint(Constraint::Intension(constraint.inner.expr));
             return Ok(());
         }
         let iter = PyIterator::from_object(constraint)
@@ -1958,8 +2141,7 @@ impl PyModel {
             return Err(PyValueError::new_err("coeffs and vars must have the same length"));
         }
         let rel = parse_relation(relation)?;
-        self.local.add_linear(coeffs.clone(), vars.clone(), rel, rhs);
-        linear::linear(&mut self.solver, &coeffs, &vars, rel, rhs);
+        self.add_integer_constraint(Constraint::Linear { terms: coeffs.into_iter().zip(vars).collect(), relation: rel, rhs });
         Ok(())
     }
 
@@ -1967,30 +2149,30 @@ impl PyModel {
     fn sum(&mut self, vars: &Bound<'_, PyAny>, relation: &str, rhs: i64) -> PyResult<()> {
         let vars = ids_for(self.id, &var_list_from_py(vars)?)?;
         let rel = parse_relation(relation)?;
-        self.local.add_linear(vec![1; vars.len()], vars.clone(), rel, rhs);
-        linear::sum(&mut self.solver, &vars, rel, rhs);
+        self.add_integer_constraint(Constraint::Linear {
+            terms: vars.into_iter().map(|variable| (1, variable)).collect(),
+            relation: rel,
+            rhs,
+        });
         Ok(())
     }
 
     fn all_different(&mut self, vars: &Bound<'_, PyAny>) -> PyResult<()> {
         let vars = ids_for(self.id, &var_list_from_py(vars)?)?;
-        self.local.add_all_different(vars.clone());
-        primitives::all_different(&mut self.solver, &vars);
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::AllDifferent { variables: vars, except: Vec::new() }));
         Ok(())
     }
 
     fn all_equal(&mut self, vars: &Bound<'_, PyAny>) -> PyResult<()> {
         let vars = ids_for(self.id, &var_list_from_py(vars)?)?;
-        self.local.add_all_equal(vars.clone());
-        primitives::all_equal(&mut self.solver, &vars);
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::AllEqual(vars)));
         Ok(())
     }
 
     fn not_equal(&mut self, x: &PyIntVar, y: &PyIntVar) -> PyResult<()> {
         let x = one_id_for(self.id, x)?;
         let y = one_id_for(self.id, y)?;
-        self.local.add_expr(expr::ne(expr::var(x), expr::var(y)));
-        primitives::not_equal(&mut self.solver, x, y);
+        self.add_integer_constraint(Constraint::Intension(expr::ne(expr::var(x), expr::var(y))));
         Ok(())
     }
 
@@ -1998,18 +2180,14 @@ impl PyModel {
     fn not_equal_offset(&mut self, x: &PyIntVar, y: &PyIntVar, offset: i32) -> PyResult<()> {
         let x = one_id_for(self.id, x)?;
         let y = one_id_for(self.id, y)?;
-        self.local.add_expr(expr::ne(expr::var(x), expr::add(vec![expr::var(y), expr::int(offset as i64)])));
-        primitives::not_equal_offset(&mut self.solver, x, y, offset);
+        self.add_integer_constraint(Constraint::Intension(expr::ne(expr::var(x), expr::add(vec![expr::var(y), expr::int(offset as i64)]))));
         Ok(())
     }
 
     fn ordered(&mut self, vars: &Bound<'_, PyAny>, relation: &str) -> PyResult<()> {
         let vars = ids_for(self.id, &var_list_from_py(vars)?)?;
         let rel = parse_relation(relation)?;
-        for pair in vars.windows(2) {
-            self.local.add_linear(vec![1, -1], vec![pair[0], pair[1]], rel, 0);
-        }
-        primitives::ordered(&mut self.solver, &vars, rel);
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Ordered { variables: vars, relation: rel }));
         Ok(())
     }
 
@@ -2018,10 +2196,7 @@ impl PyModel {
         if vars.len() != values.len() {
             return Err(PyValueError::new_err("vars and values must have the same length"));
         }
-        for (&var, &value) in vars.iter().zip(&values) {
-            self.local.add_linear(vec![1], vec![var], Relation::Eq, value as i64);
-        }
-        primitives::instantiation(&mut self.solver, &vars, &values);
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Instantiation { variables: vars, values }));
         Ok(())
     }
 
@@ -2031,8 +2206,7 @@ impl PyModel {
         if vars.is_empty() {
             return Err(PyValueError::new_err("minimum requires at least one variable"));
         }
-        self.local.add_extremum(vars.clone(), true, Relation::Eq, LocalRhs::Var(target));
-        primitives::minimum(&mut self.solver, target, &vars);
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Minimum { target, variables: vars }));
         Ok(())
     }
 
@@ -2042,8 +2216,7 @@ impl PyModel {
         if vars.is_empty() {
             return Err(PyValueError::new_err("maximum requires at least one variable"));
         }
-        self.local.add_extremum(vars.clone(), false, Relation::Eq, LocalRhs::Var(target));
-        primitives::maximum(&mut self.solver, target, &vars);
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Maximum { target, variables: vars }));
         Ok(())
     }
 
@@ -2054,8 +2227,7 @@ impl PyModel {
         }
         let index = one_id_for(self.id, index)?;
         let value = one_id_for(self.id, value)?;
-        self.local.add_element(array.clone(), index, value, 0);
-        primitives::element(&mut self.solver, &array, index, value);
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Element { array, index, value }));
         Ok(())
     }
 
@@ -2065,18 +2237,19 @@ impl PyModel {
         }
         let index = one_id_for(self.id, index)?;
         let value = one_id_for(self.id, value)?;
-        // LS has no constant-array element; model it as element over fixed vars.
-        let const_vars: Vec<VarId> = array.iter().map(|&v| self.const_var(v)).collect();
-        self.local.add_element(const_vars, index, value, 0);
-        primitives::element_const(&mut self.solver, &array, index, value);
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::ElementConst { array, index, value }));
         Ok(())
     }
 
     fn count(&mut self, vars: &Bound<'_, PyAny>, value: i32, relation: &str, k: i64) -> PyResult<()> {
         let vars = ids_for(self.id, &var_list_from_py(vars)?)?;
         let rel = parse_relation(relation)?;
-        self.local.add_count(vars.clone(), vec![value], rel, LocalRhs::Const(k));
-        count::count(&mut self.solver, &vars, value, rel, k);
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Count {
+            variables: vars,
+            value,
+            relation: rel,
+            count: k,
+        }));
         Ok(())
     }
 
@@ -2086,16 +2259,20 @@ impl PyModel {
         if values.len() != low.len() || values.len() != high.len() {
             return Err(PyValueError::new_err("values, low, and high must have the same length"));
         }
-        self.local.add_cardinality(vars.clone(), values.clone(), low.clone(), high.clone(), closed);
-        count::cardinality(&mut self.solver, &vars, &values, &low, &high, closed);
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Cardinality {
+            variables: vars,
+            values,
+            lower: low,
+            upper: high,
+            closed,
+        }));
         Ok(())
     }
 
     fn n_values(&mut self, vars: &Bound<'_, PyAny>, relation: &str, k: i64) -> PyResult<()> {
         let vars = ids_for(self.id, &var_list_from_py(vars)?)?;
         let rel = parse_relation(relation)?;
-        self.local.add_n_values(vars.clone(), rel, LocalRhs::Const(k));
-        count::n_values(&mut self.solver, &vars, rel, k);
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::NValues { variables: vars, relation: rel, count: k }));
         Ok(())
     }
 
@@ -2105,8 +2282,7 @@ impl PyModel {
         if tuples.iter().any(|tuple| tuple.len() != vars.len()) {
             return Err(PyValueError::new_err("every tuple must match the variable arity"));
         }
-        self.local.add_extension(vars.clone(), tuples.clone(), positive);
-        table::extension(&mut self.solver, &vars, &tuples, positive);
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table { variables: vars, tuples, positive }));
         Ok(())
     }
 
@@ -2117,17 +2293,15 @@ impl PyModel {
         if x.len() != y.len() {
             return Err(PyValueError::new_err("lex vectors must have the same length"));
         }
-        self.local.add_lex_chain(vec![x.clone(), y.clone()], strict);
-        lex::lex(&mut self.solver, &x, &y, strict);
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Lex { left: x, right: y, strict }));
         Ok(())
     }
 
     #[pyo3(signature = (rows, *, strict=false))]
     fn lex_chain(&mut self, rows: &Bound<'_, PyAny>, strict: bool) -> PyResult<()> {
         let rows = var_matrix_from_py(rows)?;
-        let rows: Vec<Vec<VarId>> = rows.iter().map(|row| ids_for(self.id, row)).collect::<PyResult<_>>()?;
-        self.local.add_lex_chain(rows.clone(), strict);
-        lex::lex_chain(&mut self.solver, &rows, strict);
+        let rows: Vec<Vec<IntVarRef>> = rows.iter().map(|row| ids_for(self.id, row)).collect::<PyResult<_>>()?;
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::LexChain { rows, strict }));
         Ok(())
     }
 
@@ -2137,8 +2311,7 @@ impl PyModel {
         if x.len() != y.len() {
             return Err(PyValueError::new_err("channel vectors must have the same length"));
         }
-        self.local.mark_unsupported();
-        lex::channel(&mut self.solver, &x, &y);
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Channel { left: x, right: y }));
         Ok(())
     }
 
@@ -2149,24 +2322,20 @@ impl PyModel {
             if starts.len() != durations.len() {
                 return Err(PyValueError::new_err("starts and durations must have the same length"));
             }
-            let origins: Vec<Vec<VarId>> = starts.iter().map(|&s| vec![s]).collect();
-            let lengths: Vec<Vec<Expr>> = durations.iter().map(|&d| vec![expr::int(d)]).collect();
-            self.local.add_no_overlap(origins, lengths, false);
-            scheduling::no_overlap(&mut self.solver, &starts, &durations);
+            self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::NoOverlap { starts, durations }));
             return Ok(());
         }
 
         let intervals = interval_list_from_py(items)?;
         if intervals.iter().all(|iv| iv.kind == PyIntervalKind::Native) {
-            let ids = self.native_interval_specs(&intervals)?.into_iter().map(|spec| spec.interval).collect::<Vec<_>>();
-            interval_constraints::no_overlap(&mut self.solver, &ids);
+            let specs = self.native_interval_specs(&intervals)?;
+            self.post_optional_no_overlap(&specs);
         } else if intervals.iter().all(|iv| iv.kind == PyIntervalKind::Schedule) {
             for iv in &intervals {
                 self.check_interval_scope(iv)?;
             }
-            let idx = intervals.iter().map(|iv| iv.index as usize).collect();
-            let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("create intervals before no_overlap"))?;
-            sched.resources.push(list::Resource::NoOverlap(idx));
+            let indices = intervals.iter().map(|iv| iv.index as usize).collect();
+            self.semantic.model_mut().add_constraint(shared_model::Constraint::IntervalResource(list::Resource::NoOverlap(indices)));
         } else {
             return Err(PyValueError::new_err("cannot mix native intervals and schedule intervals in one no_overlap"));
         }
@@ -2178,11 +2347,12 @@ impl PyModel {
         if starts.len() != durations.len() || starts.len() != heights.len() {
             return Err(PyValueError::new_err("starts, durations, and heights must have the same length"));
         }
-        // LS cumulative wants per-task duration/height vars; pin constants as fixed vars.
-        let dur_vars: Vec<VarId> = durations.iter().map(|&d| self.const_var(d as i32)).collect();
-        let height_vars: Vec<VarId> = heights.iter().map(|&h| self.const_var(h as i32)).collect();
-        self.local.add_cumulative(starts.clone(), dur_vars, height_vars, LocalRhs::Const(capacity));
-        scheduling::cumulative(&mut self.solver, &starts, &durations, &heights, capacity);
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Cumulative {
+            starts,
+            durations,
+            demands: heights,
+            capacity,
+        }));
         Ok(())
     }
 
@@ -2200,8 +2370,12 @@ impl PyModel {
             return Err(PyValueError::new_err("starts, durations, and heights must have the same length"));
         }
         let capacity = one_id_for(self.id, capacity)?;
-        self.local.add_cumulative(starts.clone(), durations.clone(), heights.clone(), LocalRhs::Var(capacity));
-        scheduling::cumulative_var(&mut self.solver, &starts, &durations, &heights, capacity);
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::CumulativeVar {
+            starts,
+            durations,
+            demands: heights,
+            capacity,
+        }));
         Ok(())
     }
 
@@ -2210,9 +2384,7 @@ impl PyModel {
         if items.len() != sizes.len() {
             return Err(PyValueError::new_err("items and sizes must have the same length"));
         }
-        let limits: Vec<LocalRhs> = capacities.iter().map(|&c| LocalRhs::Const(c)).collect();
-        self.local.add_bin_packing(items.clone(), sizes.clone(), limits, false);
-        scheduling::bin_packing(&mut self.solver, &items, &sizes, &capacities);
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::BinPacking { items, sizes, capacities }));
         Ok(())
     }
 
@@ -2231,24 +2403,21 @@ impl PyModel {
         if vars.len() != weights.len() || vars.len() != profits.len() {
             return Err(PyValueError::new_err("vars, weights, and profits must have the same length"));
         }
-        self.local.mark_unsupported();
-        scheduling::knapsack(
-            &mut self.solver,
-            &vars,
-            &weights,
-            &profits,
-            parse_relation(weight_relation)?,
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Knapsack {
+            variables: vars,
+            weights,
+            profits,
+            weight_relation: parse_relation(weight_relation)?,
             weight_limit,
-            parse_relation(profit_relation)?,
+            profit_relation: parse_relation(profit_relation)?,
             profit_limit,
-        );
+        }));
         Ok(())
     }
 
     fn circuit(&mut self, successors: &Bound<'_, PyAny>) -> PyResult<()> {
         let successors = ids_for(self.id, &var_list_from_py(successors)?)?;
-        self.local.add_circuit(successors.clone());
-        graph::circuit(&mut self.solver, &successors);
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Circuit { successors, cutset: false }));
         Ok(())
     }
 
@@ -2258,59 +2427,25 @@ impl PyModel {
     /// handle references, so items may remain unassigned to the visible lists.
     #[pyo3(signature = (items, count, *, optional=false))]
     fn list_vars(&mut self, items: Vec<i32>, count: usize, optional: bool) -> PyResult<Vec<PyListVar>> {
-        if items.is_empty() {
-            return Err(PyValueError::new_err("list items cannot be empty"));
-        }
-        if count == 0 {
-            return Err(PyValueError::new_err("need at least one list"));
-        }
-        if !self.names.is_empty() || self.objective.is_some() || !self.then_objectives.is_empty() {
-            return Err(PyValueError::new_err("cannot mix integer variables with list_vars; use one modeling style per model"));
-        }
-        if self.col_schedule.is_some() {
-            return Err(PyValueError::new_err("model already has interval variables; use one domain style per model (list or interval)"));
-        }
-        // The item set is partitioned among the lists; duplicate ids would
-        // be independent positions that share a value, which silently diverges
-        // from set semantics (and from how reductions aggregate by value).
-        let mut seen = std::collections::HashSet::with_capacity(items.len());
-        if let Some(dup) = items.iter().find(|v| !seen.insert(**v)) {
-            return Err(PyValueError::new_err(format!("list items have a duplicate value {dup}; items must be distinct")));
-        }
-        self.col_universe = Some(items);
-        self.col_lists = if optional { count + 1 } else { count };
-        self.col_gen += 1;
-        // Reset any reductions recorded against a previous `list_vars` generation.
-        self.col_objectives.clear();
-        self.col_constraints.clear();
-        self.col_globals.clear();
-        self.col_unordered.clear();
-        self.col_reified.clear();
-        let gen = self.col_gen;
-        Ok((0..count).map(|i| PyListVar { model_id: self.id, gen, index: i as u32, unordered: false }).collect())
+        self.create_semantic_lists(items, count, optional, shared_model::ListOrdering::Ordered)
     }
 
     /// Declare unordered set variables partitioning the item universe.
     #[pyo3(signature = (items, count, *, optional=false))]
     fn set_vars(&mut self, items: Vec<i32>, count: usize, optional: bool) -> PyResult<Vec<PyListVar>> {
-        let mut sets = self.list_vars(items, count, optional)?;
-        self.col_unordered.extend(0..self.col_lists);
-        for set in &mut sets {
-            set.unordered = true;
-        }
-        Ok(sets)
+        self.create_semantic_lists(items, count, optional, shared_model::ListOrdering::Unordered)
     }
 
     /// Mint a collection-scoped scalar to reify a scan total into: bind it with
     /// `add(scan_sum(r, ...) == v)`, then use `v` in a linear objective. Requires
     /// an active `list_vars` generation.
     fn list_value(&mut self) -> PyResult<ListValue> {
-        if self.col_universe.is_none() {
+        if !self.semantic.has_lists() {
             return Err(PyValueError::new_err("call list_vars() before list_value()"));
         }
-        let value = self.col_reified.len();
-        self.col_reified.push(None);
-        Ok(ListValue { model_id: self.id, gen: self.col_gen, value })
+        let value = self.semantic.reified_values.len();
+        self.semantic.reified_values.push(None);
+        Ok(ListValue { model_id: self.id, gen: self.semantic.list_generation, value })
     }
 
     /// Precedence over list items or interval variables.
@@ -2320,14 +2455,26 @@ impl PyModel {
                 return Err(PyValueError::new_err("cannot mix native intervals and schedule intervals in one precedence"));
             }
             if a.kind == PyIntervalKind::Native {
-                let before = self.native_interval_spec(&a)?.interval;
-                let after = self.native_interval_spec(&b)?.interval;
-                interval_constraints::interval_precedence(&mut self.solver, before, after);
+                let before = self.native_interval_spec(&a)?;
+                let after = self.native_interval_spec(&b)?;
+                let precedence =
+                    expr::le(expr::add(vec![expr::var(before.start), expr::int(i64::from(before.duration))]), expr::var(after.start));
+                let mut active = Vec::new();
+                if let Some(presence) = before.presence {
+                    active.push(expr::eq(expr::var(presence), expr::int(1)));
+                }
+                if let Some(presence) = after.presence {
+                    active.push(expr::eq(expr::var(presence), expr::int(1)));
+                }
+                let constraint = if active.is_empty() { precedence } else { expr::imp(expr::and(active), precedence) };
+                self.add_integer_constraint(Constraint::Intension(constraint));
             } else {
                 self.check_interval_scope(&a)?;
                 self.check_interval_scope(&b)?;
-                let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("create intervals before precedence"))?;
-                sched.precedences.push((a.index as usize, b.index as usize));
+                self.semantic.model_mut().add_constraint(shared_model::Constraint::IntervalPrecedence {
+                    before: shared_model::IntervalVarRef(a.index as usize),
+                    after: shared_model::IntervalVarRef(b.index as usize),
+                });
             }
             return Ok(());
         }
@@ -2335,34 +2482,47 @@ impl PyModel {
             before.extract::<i32>().map_err(|_| PyTypeError::new_err("precedence expects two item ids or two IntervalVar handles"))?;
         let after =
             after.extract::<i32>().map_err(|_| PyTypeError::new_err("precedence expects two item ids or two IntervalVar handles"))?;
-        self.col_globals.push(list::GlobalConstraint::ListLe { before, after });
+        let lists = self.semantic.list_scope();
+        self.semantic.model_mut().add_constraint(shared_model::Constraint::ItemPrecedence { lists, before, after });
         Ok(())
     }
 
     /// Require two items to share a list (same vehicle, same bin).
     fn same_list(&mut self, a: i32, b: i32) {
-        self.col_globals.push(list::GlobalConstraint::SameList { a, b });
+        let lists = self.semantic.list_scope();
+        self.semantic.model_mut().add_constraint(shared_model::Constraint::SameList { lists, a, b });
     }
 
     /// Require two items to be assigned to different lists or sets.
     fn different_list(&mut self, a: i32, b: i32) {
-        self.col_globals.push(list::GlobalConstraint::DifferentList { a, b });
+        self.semantic
+            .model_mut()
+            .add_constraint(shared_model::Constraint::CollectionGlobal(list::GlobalConstraint::DifferentList { a, b }));
     }
 
     /// Require all supplied items to share one list or set.
     fn all_same_list(&mut self, items: Vec<i32>) {
-        self.col_globals.push(list::GlobalConstraint::AllSameList { items: Arc::new(items) });
+        self.semantic
+            .model_mut()
+            .add_constraint(shared_model::Constraint::CollectionGlobal(list::GlobalConstraint::AllSameList { items: Arc::new(items) }));
     }
 
     /// Require all supplied items to have distinct owner lists or sets.
     fn all_different_lists(&mut self, items: Vec<i32>) {
-        self.col_globals.push(list::GlobalConstraint::AllDifferentLists { items: Arc::new(items) });
+        self.semantic.model_mut().add_constraint(shared_model::Constraint::CollectionGlobal(list::GlobalConstraint::AllDifferentLists {
+            items: Arc::new(items),
+        }));
     }
 
     /// Bound the absolute difference between the owner-list indices.
     #[pyo3(signature = (a, b, *, min=0, max=usize::MAX))]
     fn list_distance(&mut self, a: i32, b: i32, min: usize, max: usize) {
-        self.col_globals.push(list::GlobalConstraint::ListDistance { a, b, min, max });
+        self.semantic.model_mut().add_constraint(shared_model::Constraint::CollectionGlobal(list::GlobalConstraint::ListDistance {
+            a,
+            b,
+            min,
+            max,
+        }));
     }
 
     /// Create one fixed-duration native interval.
@@ -2394,8 +2554,9 @@ impl PyModel {
         if members.is_empty() {
             return Err(PyValueError::new_err("alternative needs at least one member interval"));
         }
-        let mut ids: Vec<IntervalId> = Vec::with_capacity(members.len());
-        let mut presences: Vec<VarId> = Vec::with_capacity(members.len());
+        let mut ids: Vec<PythonIntervalRef> = Vec::with_capacity(members.len());
+        let mut starts: Vec<IntVarRef> = Vec::with_capacity(members.len());
+        let mut presences: Vec<IntVarRef> = Vec::with_capacity(members.len());
         let mut durations: Vec<i64> = Vec::with_capacity(members.len());
         let (mut start_lo, mut start_hi) = (i32::MAX, i32::MIN);
         for member in &members {
@@ -2406,18 +2567,22 @@ impl PyModel {
             if ids.contains(&spec.interval) {
                 return Err(PyValueError::new_err("alternative members must be distinct intervals"));
             }
-            start_lo = start_lo.min(self.solver.store.interval_start_min(spec.interval));
-            start_hi = start_hi.max(self.solver.store.interval_start_max(spec.interval));
+            start_lo = start_lo.min(self.domain_min(spec.start));
+            start_hi = start_hi.max(self.domain_max(spec.start));
             ids.push(spec.interval);
+            starts.push(spec.start);
             presences.push(presence);
             durations.push(i64::from(spec.duration));
         }
 
-        let shared_start = self.solver.new_var_range(start_lo, start_hi);
+        let shared_start = self.semantic.model_mut().int_range(start_lo, start_hi);
         self.register_native_backing_var(shared_start, name.as_ref().map(|name| format!("{name}.start")));
-
-        interval_constraints::exactly_one_mode(&mut self.solver, &ids);
-        interval_constraints::alternative_channel(&mut self.solver, shared_start, &ids);
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::AlternativeChannel {
+            shared_start,
+            starts,
+            durations: durations.clone(),
+            presences: presences.clone(),
+        }));
 
         let name = name.unwrap_or_else(|| format!("alternative{}", shared_start.0));
         Ok(PyIntervalVar {
@@ -2438,18 +2603,30 @@ impl PyModel {
         if modes.iter().any(|m| m.is_empty()) {
             return Err(PyValueError::new_err("each interval needs at least one (machine, duration) mode"));
         }
-        self.enter_schedule_mode()?;
-        let intervals = modes
+        let start_windows = modes
             .iter()
-            .map(|opts| list::IntervalVar {
-                duration: 0,
-                horizon,
-                modes: opts.iter().map(|&(machine, duration)| list::Mode { machine, duration }).collect(),
-                optional: false,
+            .map(|options| {
+                options
+                    .iter()
+                    .map(|&(_, duration)| checked_interval_start_max(horizon, duration).map(i64::from))
+                    .collect::<PyResult<Vec<_>>>()
             })
-            .collect();
-        self.col_schedule = Some(list::Schedule { intervals, precedences: Vec::new(), resources: Vec::new(), minimize_makespan: true });
-        let gen = self.col_sched_gen;
+            .collect::<PyResult<Vec<_>>>()?;
+        self.enter_schedule_mode()?;
+        let model = self.semantic.model_mut();
+        model.clear_interval_family();
+        let mut intervals = Vec::with_capacity(modes.len());
+        for (options, windows) in modes.iter().zip(&start_windows) {
+            let start_max = windows.iter().copied().max().unwrap_or(0);
+            let interval = model.interval(0, start_max, 0);
+            for (&(machine, duration), &mode_start_max) in options.iter().zip(windows) {
+                model.add_interval_mode(interval, machine, duration, Some((0, mode_start_max))).map_err(PyValueError::new_err)?;
+            }
+            intervals.push(interval);
+        }
+        self.semantic.objectives.retain(|objective| !matches!(objective, shared_model::Objective::Makespan { .. }));
+        self.semantic.objectives.push(shared_model::Objective::Makespan { minimize: true, intervals: intervals.clone() });
+        let gen = self.semantic.schedule_generation;
         Ok((0..modes.len())
             .map(|i| PyIntervalVar {
                 model_id: self.id,
@@ -2479,9 +2656,22 @@ impl PyModel {
             checked_interval_start_max(horizon, duration)?;
         }
         self.enter_schedule_mode()?;
-        let intervals = durations.iter().map(|&duration| list::IntervalVar { duration, horizon, modes: Vec::new(), optional }).collect();
-        self.col_schedule = Some(list::Schedule { intervals, precedences: Vec::new(), resources: Vec::new(), minimize_makespan: true });
-        let gen = self.col_sched_gen;
+        let model = self.semantic.model_mut();
+        model.clear_interval_family();
+        let intervals = durations
+            .iter()
+            .map(|&duration| {
+                let start_max = horizon - duration;
+                if optional {
+                    model.optional_interval(0, start_max, duration)
+                } else {
+                    model.interval(0, start_max, duration)
+                }
+            })
+            .collect::<Vec<_>>();
+        self.semantic.objectives.retain(|objective| !matches!(objective, shared_model::Objective::Makespan { .. }));
+        self.semantic.objectives.push(shared_model::Objective::Makespan { minimize: true, intervals });
+        let gen = self.semantic.schedule_generation;
         Ok(durations
             .into_iter()
             .enumerate()
@@ -2501,8 +2691,10 @@ impl PyModel {
 
     /// Moded intervals that choose the same machine never overlap.
     fn no_overlap_by_machine(&mut self) -> PyResult<()> {
-        let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("create alternatives before no_overlap_by_machine"))?;
-        sched.resources.push(list::Resource::MachineNoOverlap);
+        if !self.semantic.has_intervals() {
+            return Err(PyValueError::new_err("create alternatives before no_overlap_by_machine"));
+        }
+        self.semantic.model_mut().add_constraint(shared_model::Constraint::IntervalResource(list::Resource::MachineNoOverlap));
         Ok(())
     }
 
@@ -2527,8 +2719,13 @@ impl PyModel {
                 self.check_interval_scope(&iv)?;
             }
         }
-        let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("create intervals before minimize_makespan"))?;
-        sched.minimize_makespan = true;
+        if !self.semantic.has_intervals() {
+            return Err(PyValueError::new_err("create intervals before minimize_makespan"));
+        }
+        if !self.semantic.schedule_makespan() {
+            let intervals = (0..self.semantic.model().intervals().len()).map(shared_model::IntervalVarRef).collect();
+            self.semantic.objectives.push(shared_model::Objective::Makespan { minimize: true, intervals });
+        }
         Ok(())
     }
 
@@ -2536,20 +2733,35 @@ impl PyModel {
     /// pairs whose total over any instant may not exceed the capacity.
     fn resource(&mut self, demands: Vec<(PyIntervalVar, i64)>, capacity: i64) -> PyResult<()> {
         if demands.iter().all(|(iv, _)| iv.kind == PyIntervalKind::Native) {
-            let mut intervals = Vec::with_capacity(demands.len());
+            let mut starts = Vec::with_capacity(demands.len());
+            let mut durations = Vec::with_capacity(demands.len());
             let mut heights = Vec::with_capacity(demands.len());
             for (iv, amount) in &demands {
-                intervals.push(self.native_interval_spec(iv)?.interval);
-                heights.push(checked_i32(*amount, "cumulative demand")?);
+                let spec = self.native_interval_spec(iv)?;
+                starts.push(spec.start);
+                durations.push(self.const_var(spec.duration));
+                let demand = checked_i32(*amount, "cumulative demand")?;
+                heights.push(if let Some(presence) = spec.presence {
+                    self.aux_for(expr::mul(vec![expr::var(presence), expr::int(i64::from(demand))]))
+                } else {
+                    self.const_var(demand)
+                });
             }
-            interval_constraints::cumulative(&mut self.solver, &intervals, &heights, checked_i32(capacity, "cumulative capacity")?);
+            let capacity = self.const_var(checked_i32(capacity, "cumulative capacity")?);
+            self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::CumulativeVar {
+                starts,
+                durations,
+                demands: heights,
+                capacity,
+            }));
         } else if demands.iter().all(|(iv, _)| iv.kind == PyIntervalKind::Schedule) {
             for (iv, _) in &demands {
                 self.check_interval_scope(iv)?;
             }
             let demands = demands.iter().map(|(iv, amount)| (iv.index as usize, *amount)).collect();
-            let sched = self.col_schedule.as_mut().ok_or_else(|| PyValueError::new_err("create intervals before resource"))?;
-            sched.resources.push(list::Resource::Cumulative { demands, capacity });
+            self.semantic
+                .model_mut()
+                .add_constraint(shared_model::Constraint::IntervalResource(list::Resource::Cumulative { demands, capacity }));
         } else {
             return Err(PyValueError::new_err("cannot mix native intervals and schedule intervals in one resource"));
         }
@@ -2588,162 +2800,101 @@ impl PyModel {
             return Err(PyValueError::new_err("memory_limit_mb must be a positive integer when provided"));
         }
         let engine = parse_engine(engine)?;
-        let exact_hooks = assumptions.is_some_and(|obj| !obj.is_none())
-            || hints.is_some_and(|obj| !obj.is_none())
-            || branch_order.is_some_and(|obj| !obj.is_none())
-            || on_incumbent.is_some()
-            || conflict_budget.is_some();
-        let list_hint = list_hint.filter(|obj| !obj.is_none());
-        if self.col_universe.is_some() || self.col_schedule.is_some() {
-            if threads > 1 && engine != PythonEngine::Ls {
-                return Err(PyValueError::new_err("threads > 1 on list and schedule models requires engine='ls'"));
+        let list_hint = list_hint.filter(|obj| !obj.is_none()).map(|obj| self.parse_list_hint(obj)).transpose()?;
+        let objective_specs = objective_specs(&self.objective, &self.then_objectives);
+        if let Some(callback) = on_incumbent {
+            if !callback.is_callable() {
+                return Err(PyTypeError::new_err("on_incumbent must be callable"));
             }
-            if exact_hooks {
-                return Err(PyValueError::new_err(
-                    "assumptions, hints, branch_order, callbacks, and conflict_budget are only supported by the integer exact engine",
-                ));
+        }
+        let has_collection = self.semantic.has_collection();
+        if verbose && !has_collection {
+            verbose_start(self.names.len(), self.semantic.model().constraints().len(), !objective_specs.is_empty());
+            if let Some(objective) = objective_specs.first() {
+                println!("  direction: {}", if objective.minimizing { "min" } else { "max" });
+                println!("  expression: {}", objective.expr.text);
             }
-            if !self.names.is_empty() || self.objective.is_some() || !self.then_objectives.is_empty() {
-                return Err(PyValueError::new_err(
-                    "model mixes integer variables with list/interval variables; use one modeling style per model",
-                ));
+            if engine == PythonEngine::Ls {
+                println!("  engine: local-search");
             }
-            // A list-shaped warm start (`list[list[int]]`, one visiting-order
-            // sequence per list variable) seeds the local-search incumbent. Only
-            // meaningful for a `list_vars` model, and only consumed on the LS path.
-            let list_hint = match list_hint {
-                Some(obj) => {
-                    if self.col_universe.is_none() {
-                        return Err(PyValueError::new_err("list_hint is only supported for list_vars models"));
-                    }
-                    Some(self.parse_list_hint(obj)?)
+        }
+        let assumptions = assumptions_from_py(self.id, assumptions)?;
+        let hints = hint_pairs_from_py(self.id, hints)?;
+        let mut guidance = branch_order_from_py(self.id, branch_order)?;
+        if search.is_some_and(|search| !search.is_none()) {
+            for variable in search_ids(self, search, None)? {
+                if !guidance.contains(&variable.0) {
+                    guidance.push(variable.0);
                 }
-                None => None,
-            };
-            let routing_options = routing_engine::RoutingOptions {
+            }
+        }
+        let package = self.solve_package();
+        let request = SolveRequest {
+            mode: engine.solve_mode(),
+            seed,
+            threads,
+            limits: SolveLimits {
+                time: time_limit.map(Duration::from_secs),
+                memory_bytes: memory_limit_mb.map(|limit| limit.saturating_mul(1024 * 1024)),
+                conflicts: conflict_budget,
+                iterations: max_iterations,
+            },
+            profile,
+            assumptions,
+            hints,
+            list_hint,
+            branch_order: guidance,
+            publish_incumbent_assignments: on_incumbent.is_some(),
+            schedule_cdcl,
+            routing: RoutingControls {
                 two_way: routing_two_way,
                 nearest_neighbor: routing_nearest_neighbor,
                 warm_start: routing_warm_start,
-            };
-            return self.solve_collection(
-                py,
-                time_limit,
-                seed,
-                threads,
-                verbose,
-                engine,
-                list_hint,
-                max_iterations,
-                profile,
-                memory_limit_mb,
-                schedule_cdcl,
-                routing_options,
-            );
+            },
+            ..SolveRequest::default()
+        };
+        if verbose && has_collection {
+            verbose_collection_start(&self.semantic, &request, time_limit);
         }
-        if max_iterations.is_some() || profile || schedule_cdcl {
-            return Err(PyValueError::new_err("max_iterations, profile, and schedule_cdcl are only supported by list and schedule models"));
-        }
-        if threads > 1 {
-            return Err(PyValueError::new_err("threads > 1 is currently supported only for list and schedule models with engine='ls'"));
-        }
-        if list_hint.is_some() {
-            return Err(PyValueError::new_err("list_hint is only supported for list_vars models on engine='ls'"));
-        }
-        if engine == PythonEngine::Ls {
-            if !self.native_intervals.is_empty() {
-                return Err(PyValueError::new_err("engine='ls' does not support native interval variables"));
+        let on_incumbent = on_incumbent.map(|cb| cb.clone().unbind());
+        let num_vars = self.names.len();
+        let primary_sense = if self.semantic.primary_list_sense().unwrap_or(true) { "min" } else { "max" };
+        let run = with_interrupts(py, move || {
+            let mut sink = PythonSolveEventSink::new(verbose, on_incumbent, primary_sense);
+            let result = solve_model_with_external_stop(&package, &request, &SIGINT_TRIPPED, &mut sink);
+            if let Some(error) = sink.integer.callback_error {
+                return Err(error);
             }
-            if exact_hooks {
-                return Err(PyValueError::new_err(
-                    "assumptions, hints, branch_order, callbacks, and conflict_budget are only supported by the integer exact engine",
-                ));
-            }
-            let Some(objective) = &self.objective else {
-                return Err(PyValueError::new_err("engine='ls' requires an objective"));
-            };
-            return self.solve_ls(py, objective, search, verbose, time_limit, seed);
-        }
-        if !exact_hooks && self.then_objectives.is_empty() {
-            if let Some(objective) = &self.objective {
-                return self.solve_single_optimization(py, objective, search, &[], verbose, time_limit, seed);
-            }
-        }
-        let objective_specs = objective_specs(&self.objective, &self.then_objectives);
-        if !objective_specs.is_empty() || exact_hooks {
-            if let Some(callback) = on_incumbent {
-                if !callback.is_callable() {
-                    return Err(PyTypeError::new_err("on_incumbent must be callable"));
-                }
-            }
+            result
+                .map(|result| {
+                    let engine = collection_result_engine(&result);
+                    CollectionRun { result, engine, events: sink.collection.summary }
+                })
+                .map_err(integer_solve_error)
+        })??;
+        let collection_engine = matches!(
+            run.engine,
+            EngineKind::RoutingExact
+                | EngineKind::ListExact
+                | EngineKind::ScheduleExact
+                | EngineKind::ListLocalSearch
+                | EngineKind::ScheduleLocalSearch
+        );
+        if has_collection || collection_engine {
+            let solution = self.collection_solution_from_result(&run, profile)?;
             if verbose {
-                verbose_start(self.names.len(), self.solver.num_propagators(), !objective_specs.is_empty());
+                verbose_collection_finish(&solution, &run, profile);
             }
-            let assumptions = assumptions_from_py(self.id, assumptions)?;
-            let hints = hint_pairs_from_py(self.id, hints)?;
-            let branch_order = branch_order_from_py(self.id, branch_order)?;
-            let mut solver = self.solver.clone();
-            let objectives = materialize_objectives(&mut solver, &objective_specs)?;
-            let mut search_vars = search_ids(self, search, None)?;
-            append_interval_domain_vars(&mut search_vars, &solver);
-            let stop = deadline(time_limit);
-            // Owned/plain captures: the solve detaches from the GIL, and only
-            // the incumbent callback reattaches per invocation.
-            let on_incumbent = on_incumbent.map(|cb| cb.clone().unbind());
-            let (model_id, num_vars) = (self.id, self.names.len());
-            let stop_inner = Arc::clone(&stop);
-            let mut solution = with_interrupts(py, &stop, move || {
-                let mut worker = 0usize;
-                solve_integer_template(
-                    &solver,
-                    model_id,
-                    num_vars,
-                    &search_vars,
-                    &objectives,
-                    &assumptions,
-                    &hints,
-                    &stop_inner,
-                    seed,
-                    None,
-                    &mut worker,
-                    conflict_budget,
-                    &branch_order,
-                    verbose,
-                    on_incumbent,
-                )
-            })??;
+            Ok(solution)
+        } else {
+            let result_engine = if engine == PythonEngine::Ls { EngineKind::IntegerLocalSearch } else { EngineKind::IntegerExact };
+            let mut solution = integer_solution_from_result(&run.result, &objective_specs, num_vars, result_engine, profile)?;
             attach_native_interval_solution(&mut solution, &self.native_intervals);
             if verbose {
                 verbose_finish(&solution);
             }
-            return Ok(solution);
+            Ok(solution)
         }
-        if verbose {
-            verbose_start(self.names.len(), self.solver.num_propagators(), false);
-        }
-        let mut vars = search_ids(self, search, None)?;
-        let mut solver = self.solver.clone();
-        append_interval_domain_vars(&mut vars, &solver);
-        let stop = deadline(time_limit);
-        let mut assignment = None;
-        let stats = with_interrupts(py, &stop, || {
-            search::solve_interruptible_seeded(
-                &mut solver,
-                &vars,
-                |solver| {
-                    assignment = Some(vars.iter().map(|&var| solver.store.value(var)).collect::<Vec<_>>());
-                    SearchControl::Stop
-                },
-                &stop,
-                seed,
-            )
-        })?;
-        let status = if assignment.is_some() { "SATISFIABLE" } else { "UNSATISFIABLE" };
-        let mut solution = make_solution(status, &vars, assignment.as_deref(), None, None, None, stats, self.names.len());
-        attach_native_interval_solution(&mut solution, &self.native_intervals);
-        if verbose {
-            verbose_finish(&solution);
-        }
-        Ok(solution)
     }
 
     /// A soft-constraint group for MUS extraction. Use as a context manager:
@@ -2767,18 +2918,23 @@ impl PyModel {
     /// in the MUS, or `None` if the model is satisfiable. Raises on time-out.
     #[pyo3(signature = (time_limit=None))]
     fn mus(&self, py: Python<'_>, time_limit: Option<u64>) -> PyResult<Option<Vec<String>>> {
-        if self.col_universe.is_some() || self.col_schedule.is_some() {
+        if self.semantic.has_collection() {
             return Err(PyValueError::new_err("mus() is not supported for list/interval models"));
         }
-        let vars = self.decision_var_ids();
-        let selectors: Vec<VarId> = self.mus_selectors.iter().map(|&(_, sel)| sel).collect();
-        let mut solver = self.solver.clone();
-        let stop = deadline(time_limit);
-        let result = with_interrupts(py, &stop, || extract_mus(&mut solver, &vars, &selectors, &stop))?;
+        let package = self.integer_package();
+        let vars = self.decision_var_ids().into_iter().map(|variable| variable.0).collect::<Vec<_>>();
+        let selectors = self.mus_selectors.iter().map(|(_, selector)| selector.0).collect::<Vec<_>>();
+        let request = SolveRequest {
+            limits: SolveLimits { time: time_limit.map(Duration::from_secs), ..SolveLimits::default() },
+            ..SolveRequest::default()
+        };
+        let result =
+            with_interrupts(py, move || extract_model_mus_with_external_stop(&package, &vars, &selectors, &request, &SIGINT_TRIPPED))?
+                .map_err(integer_solve_error)?;
         match result {
-            MusResult::Sat(_) => Ok(None),
-            MusResult::Interrupted => Err(PyTimeoutError::new_err("mus() timed out")),
-            MusResult::Mus(core) => Ok(Some(core.iter().map(|&sel| self.selector_name(sel)).collect())),
+            ModelMusResult::Sat(_) => Ok(None),
+            ModelMusResult::Interrupted => Err(PyTimeoutError::new_err("mus() timed out")),
+            ModelMusResult::Mus(core) => Ok(Some(core.into_iter().map(|selector| self.selector_name(IntVarRef(selector))).collect())),
         }
     }
 
@@ -2790,15 +2946,21 @@ impl PyModel {
     /// of MUS + MSS returned (there can be exponentially many).
     #[pyo3(signature = (time_limit=None, limit=None))]
     fn enumerate_mus(&self, py: Python<'_>, time_limit: Option<u64>, limit: Option<usize>) -> PyResult<PyMusEnumeration> {
-        if self.col_universe.is_some() || self.col_schedule.is_some() {
+        if self.semantic.has_collection() {
             return Err(PyValueError::new_err("enumerate_mus() is not supported for list/interval models"));
         }
-        let vars = self.decision_var_ids();
-        let selectors: Vec<VarId> = self.mus_selectors.iter().map(|&(_, sel)| sel).collect();
-        let mut solver = self.solver.clone();
-        let stop = deadline(time_limit);
-        let result = with_interrupts(py, &stop, || enumerate_mus(&mut solver, &vars, &selectors, &stop, limit))?;
-        let names = |group: &[VarId]| group.iter().map(|&sel| self.selector_name(sel)).collect::<Vec<_>>();
+        let package = self.integer_package();
+        let vars = self.decision_var_ids().into_iter().map(|variable| variable.0).collect::<Vec<_>>();
+        let selectors = self.mus_selectors.iter().map(|(_, selector)| selector.0).collect::<Vec<_>>();
+        let request = SolveRequest {
+            limits: SolveLimits { time: time_limit.map(Duration::from_secs), ..SolveLimits::default() },
+            ..SolveRequest::default()
+        };
+        let result: ModelMusEnumeration = with_interrupts(py, move || {
+            enumerate_model_mus_with_external_stop(&package, &vars, &selectors, limit, &request, &SIGINT_TRIPPED)
+        })?
+        .map_err(integer_solve_error)?;
+        let names = |group: &[usize]| group.iter().map(|&selector| self.selector_name(IntVarRef(selector))).collect::<Vec<_>>();
         Ok(PyMusEnumeration {
             muses: result.muses.iter().map(|m| names(m)).collect(),
             msses: result.msses.iter().map(|m| names(m)).collect(),
@@ -2813,30 +2975,46 @@ impl PyModel {
     /// refute (use [`mus`](PyModel::mus) for the constraint-level core then).
     #[pyo3(signature = (time_limit=None))]
     fn explain_mus(&self, py: Python<'_>, time_limit: Option<u64>) -> PyResult<Option<HashMap<String, Vec<String>>>> {
-        if self.col_universe.is_some() || self.col_schedule.is_some() {
+        if self.semantic.has_collection() {
             return Err(PyValueError::new_err("explain_mus() is not supported for list/interval models"));
         }
-        let vars = self.decision_var_ids();
-        let selectors: Vec<VarId> = self.mus_selectors.iter().map(|&(_, sel)| sel).collect();
-        let mut solver = self.solver.clone();
-        let stop = deadline(time_limit);
-        let explained = with_interrupts(py, &stop, || match extract_mus(&mut solver, &vars, &selectors, &stop) {
-            MusResult::Mus(mus) if !mus.is_empty() => explain_mus(&mut solver, &vars, &mus, &stop).map(|e| e.constraints),
-            _ => None, // satisfiable, empty (root unsat), or interrupted
-        })?;
+        let package = self.integer_package();
+        let vars = self.decision_var_ids().into_iter().map(|variable| variable.0).collect::<Vec<_>>();
+        let selectors = self.mus_selectors.iter().map(|(_, selector)| selector.0).collect::<Vec<_>>();
+        let request = SolveRequest {
+            limits: SolveLimits { time: time_limit.map(Duration::from_secs), ..SolveLimits::default() },
+            ..SolveRequest::default()
+        };
+        let explained = with_interrupts(py, move || {
+            let extracted = extract_model_mus_with_external_stop(&package, &vars, &selectors, &request, &SIGINT_TRIPPED)?;
+            match extracted {
+                ModelMusResult::Mus(core) if !core.is_empty() => {
+                    explain_model_mus_with_external_stop(&package, &vars, &core, &request, &SIGINT_TRIPPED)
+                }
+                ModelMusResult::Sat(_) | ModelMusResult::Mus(_) | ModelMusResult::Interrupted => Ok(None),
+            }
+        })?
+        .map_err(integer_solve_error)?;
         Ok(explained.map(|constraints| {
             constraints
                 .into_iter()
-                .map(|(sel, atoms)| (self.selector_name(sel), atoms.iter().map(|a| self.atom_text(a.var, a.rel, a.value)).collect()))
+                .map(|(selector, atoms)| {
+                    (
+                        self.selector_name(IntVarRef(selector)),
+                        atoms.iter().map(|atom| self.atom_text(IntVarRef(atom.variable), atom.relation, atom.value)).collect(),
+                    )
+                })
                 .collect()
         }))
     }
 
     #[pyo3(signature = (search=None))]
     fn count_solutions(&self, search: Option<&Bound<'_, PyAny>>) -> PyResult<u64> {
-        let vars = search_ids(self, search, None)?;
-        let mut solver = self.solver.clone();
-        Ok(search::count_solutions(&mut solver, &vars))
+        let package = self.integer_package();
+        let variables = search_ids(self, search, None)?.into_iter().map(|variable| variable.0).collect::<Vec<_>>();
+        let request = SolveRequest::default();
+        let stop = AtomicBool::new(false);
+        count_model_solutions_with_external_stop(&package, &variables, &request, &stop).map_err(integer_solve_error)
     }
 
     /// Set the primary minimization objective.
@@ -2873,66 +3051,191 @@ impl PyModel {
     }
 
     fn session(&self) -> PyResult<PySolveSession> {
-        if self.col_universe.is_some() || self.col_schedule.is_some() {
+        if self.semantic.has_collection() {
             return Err(PyValueError::new_err("SolveSession is currently supported for integer exact models"));
         }
-        let objective_specs = objective_specs(&self.objective, &self.then_objectives);
-        let mut solver = self.solver.clone();
-        let objectives = materialize_objectives(&mut solver, &objective_specs)?;
-        let mut search = self.decision_var_ids();
-        append_interval_domain_vars(&mut search, &solver);
-        append_objective_search_vars(&mut search, &objectives);
-        // Freeze the atom layout for the whole session: the eager LCG atom ids
-        // depend on the ACTIVE set (relevant ∪ search vars), and the session's
-        // kept nogoods are re-injected by raw atom id across epochs. Marking the
-        // full session universe relevant makes the layout invariant, so a
-        // per-epoch `search` only guides branching and can never reinterpret a
-        // stored nogood (nor trip `set_base`'s layout assert).
-        for &v in &search {
-            solver.store.mark_relevant(v);
-        }
+        let objectives = objective_specs(&self.objective, &self.then_objectives);
+        let search = self.decision_var_ids().into_iter().map(|variable| variable.0).collect();
+        let session = SemanticSolveSession::new(self.integer_package()).map_err(integer_solve_error)?;
         Ok(PySolveSession {
             id: self.id,
-            solver,
             names: self.names.clone(),
             objectives,
             search,
             native_intervals: self.native_intervals.clone(),
-            clauses: Arc::new(SharedClausePool::default()),
-            next_worker: 0,
+            session,
         })
     }
 
     fn __repr__(&self) -> String {
-        format!("Model(num_vars={}, num_constraints={})", self.names.len(), self.solver.num_propagators())
+        format!("Model(num_vars={}, num_constraints={})", self.names.len(), self.semantic.model().constraints().len())
     }
 }
 
 impl PyModel {
-    /// Create a fixed (single-value) variable and register it with both the CP
-    /// solver and the LS spec. Used to express constant arrays/durations in the LS
-    /// model, which only takes variable operands.
-    fn const_var(&mut self, value: i32) -> VarId {
-        let id = self.solver.new_var_set(&[value]);
+    fn create_semantic_lists(
+        &mut self,
+        items: Vec<i32>,
+        count: usize,
+        optional: bool,
+        ordering: shared_model::ListOrdering,
+    ) -> PyResult<Vec<PyListVar>> {
+        if items.is_empty() {
+            return Err(PyValueError::new_err("list items cannot be empty"));
+        }
+        if count == 0 {
+            return Err(PyValueError::new_err("need at least one list"));
+        }
+        let mut seen = HashSet::with_capacity(items.len());
+        if let Some(duplicate) = items.iter().find(|value| !seen.insert(**value)) {
+            return Err(PyValueError::new_err(format!("list items have a duplicate value {duplicate}; items must be distinct")));
+        }
+
+        let model = self.semantic.model_mut();
+        model.clear_list_family();
+        let mut lists = Vec::with_capacity(count + usize::from(optional));
+        for _ in 0..count {
+            lists.push(match ordering {
+                shared_model::ListOrdering::Ordered => model.list(items.clone()),
+                shared_model::ListOrdering::Unordered => model.unordered_list(items.clone()),
+            });
+        }
+        if optional {
+            lists.push(model.remainder_list(items.clone(), ordering));
+        }
+        model.add_constraint(shared_model::Constraint::ListPartition { lists, items });
+
+        let list_generation = self.semantic.list_generation + 1;
+        self.semantic.list_generation = list_generation;
+        self.semantic.objectives.retain(|objective| !matches!(objective, shared_model::Objective::ListTerms { .. }));
+        self.semantic.reified_values.clear();
+        let unordered = ordering == shared_model::ListOrdering::Unordered;
+        Ok((0..count).map(|index| PyListVar { model_id: self.id, gen: list_generation, index: index as u32, unordered }).collect())
+    }
+
+    /// Create or reuse a fixed semantic integer variable.
+    fn const_var(&mut self, value: i32) -> IntVarRef {
+        if let Some(&variable) = self.constants.get(&value) {
+            return variable;
+        }
+        let id = self.semantic.model_mut().int_set(vec![value]);
         self.names.push(None);
-        self.local.add_var(id);
+        self.constants.insert(value, id);
         id
     }
 
-    fn register_native_backing_var(&mut self, var: VarId, name: Option<String>) {
-        while self.names.len() <= var.index() {
+    fn domain_min(&self, variable: IntVarRef) -> i32 {
+        match &self.semantic.model().int_vars()[variable.0] {
+            IntDomain::Bool => 0,
+            IntDomain::Range { lo, .. } => *lo,
+            IntDomain::Set(values) => values.iter().copied().min().expect("validated non-empty integer domain"),
+        }
+    }
+
+    fn domain_max(&self, variable: IntVarRef) -> i32 {
+        match &self.semantic.model().int_vars()[variable.0] {
+            IntDomain::Bool => 1,
+            IntDomain::Range { hi, .. } => *hi,
+            IntDomain::Set(values) => values.iter().copied().max().expect("validated non-empty integer domain"),
+        }
+    }
+
+    fn expression_bounds(&self, expression: &Expr) -> (i64, i64) {
+        match expression {
+            Expr::Constant(value) => (*value, *value),
+            Expr::Variable(variable) => (i64::from(self.domain_min(*variable)), i64::from(self.domain_max(*variable))),
+            Expr::Neg(value) => {
+                let (lo, hi) = self.expression_bounds(value);
+                (hi.saturating_neg(), lo.saturating_neg())
+            }
+            Expr::Abs(value) => {
+                let (lo, hi) = self.expression_bounds(value);
+                (0, lo.saturating_abs().max(hi.saturating_abs()))
+            }
+            Expr::Add(values) => values.iter().fold((0i64, 0i64), |(lo, hi), value| {
+                let (value_lo, value_hi) = self.expression_bounds(value);
+                (lo.saturating_add(value_lo), hi.saturating_add(value_hi))
+            }),
+            Expr::Sub(left, right) => {
+                let (left_lo, left_hi) = self.expression_bounds(left);
+                let (right_lo, right_hi) = self.expression_bounds(right);
+                (left_lo.saturating_sub(right_hi), left_hi.saturating_sub(right_lo))
+            }
+            Expr::Mul(values) => values.iter().fold((1i64, 1i64), |(left_lo, left_hi), value| {
+                let (right_lo, right_hi) = self.expression_bounds(value);
+                let products = [
+                    left_lo.saturating_mul(right_lo),
+                    left_lo.saturating_mul(right_hi),
+                    left_hi.saturating_mul(right_lo),
+                    left_hi.saturating_mul(right_hi),
+                ];
+                (*products.iter().min().unwrap(), *products.iter().max().unwrap())
+            }),
+            Expr::Min(values) => {
+                let bounds = values.iter().map(|value| self.expression_bounds(value)).collect::<Vec<_>>();
+                (
+                    bounds.iter().map(|bounds| bounds.0).min().unwrap_or(i32::MIN as i64),
+                    bounds.iter().map(|bounds| bounds.1).min().unwrap_or(i32::MAX as i64),
+                )
+            }
+            Expr::Max(values) => {
+                let bounds = values.iter().map(|value| self.expression_bounds(value)).collect::<Vec<_>>();
+                (
+                    bounds.iter().map(|bounds| bounds.0).max().unwrap_or(i32::MIN as i64),
+                    bounds.iter().map(|bounds| bounds.1).max().unwrap_or(i32::MAX as i64),
+                )
+            }
+            Expr::IfThenElse(_, then_value, else_value) => {
+                let then_bounds = self.expression_bounds(then_value);
+                let else_bounds = self.expression_bounds(else_value);
+                (then_bounds.0.min(else_bounds.0), then_bounds.1.max(else_bounds.1))
+            }
+            Expr::Div(_, _) | Expr::Mod(_, _) => (i32::MIN as i64, i32::MAX as i64),
+            Expr::Eq(_, _)
+            | Expr::Ne(_, _)
+            | Expr::Lt(_, _)
+            | Expr::Le(_, _)
+            | Expr::Gt(_, _)
+            | Expr::Ge(_, _)
+            | Expr::Not(_)
+            | Expr::And(_)
+            | Expr::Or(_)
+            | Expr::Imp(_, _)
+            | Expr::Iff(_, _) => (0, 1),
+        }
+    }
+
+    fn aux_for(&mut self, expression: Expr) -> IntVarRef {
+        let (lo, hi) = self.expression_bounds(&expression);
+        let clamp = |value: i64| value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        let variable = self.semantic.model_mut().int_range(clamp(lo), clamp(hi));
+        self.names.push(None);
+        self.add_integer_constraint(Constraint::Intension(expr::eq(expr::var(variable), expression)));
+        variable
+    }
+
+    fn post_optional_no_overlap(&mut self, intervals: &[NativeIntervalSpec]) {
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::OptionalNoOverlap {
+            starts: intervals.iter().map(|interval| interval.start).collect(),
+            durations: intervals.iter().map(|interval| i64::from(interval.duration)).collect(),
+            presences: intervals.iter().map(|interval| interval.presence).collect(),
+        }));
+    }
+
+    fn register_native_backing_var(&mut self, var: IntVarRef, name: Option<String>) {
+        while self.names.len() <= var.0 {
             self.names.push(None);
         }
-        if name.is_some() || self.names[var.index()].is_none() {
-            self.names[var.index()] = name;
+        if name.is_some() || self.names[var.0].is_none() {
+            self.names[var.0] = name;
         }
     }
 
     fn enter_native_interval_mode(&self) -> PyResult<()> {
-        if self.col_universe.is_some() {
+        if self.semantic.has_lists() {
             return Err(PyValueError::new_err("model already has list variables; use one domain style per model"));
         }
-        if self.col_schedule.is_some() {
+        if self.semantic.has_intervals() {
             return Err(PyValueError::new_err("model already has schedule intervals; use native intervals or alternatives, not both"));
         }
         Ok(())
@@ -2942,14 +3245,10 @@ impl PyModel {
         self.enter_native_interval_mode()?;
         let duration_i32 = checked_i32(duration, "interval duration")?;
         let start_max = checked_interval_start_max(horizon, duration)?;
-        let interval = if optional {
-            self.solver.store.new_optional_interval(0, start_max, duration_i32)
-        } else {
-            self.solver.store.new_interval(0, start_max, duration_i32)
-        };
-        let start = self.solver.store.interval_start_var(interval);
+        let interval = PythonIntervalRef(self.native_intervals.len());
+        let start = self.semantic.model_mut().int_range(0, start_max);
         self.register_native_backing_var(start, name.as_ref().map(|name| format!("{name}.start")));
-        let presence = self.solver.store.interval_presence_var(interval);
+        let presence = optional.then(|| self.semantic.model_mut().bool_var());
         if let Some(var) = presence {
             self.register_native_backing_var(var, name.as_ref().map(|name| format!("{name}.presence")));
         }
@@ -2996,33 +3295,31 @@ impl PyModel {
         if intervals.is_empty() {
             return Err(PyValueError::new_err("minimize_makespan needs at least one interval"));
         }
-        let upper = intervals.iter().map(|spec| self.solver.store.interval_end_max(spec.interval)).max().unwrap_or(0);
-        let makespan = self.solver.new_var_range(0, upper.max(0));
+        let upper = intervals.iter().map(|spec| self.domain_max(spec.start).saturating_add(spec.duration)).max().unwrap_or(0);
+        let makespan = self.semantic.model_mut().int_range(0, upper.max(0));
         self.register_native_backing_var(makespan, Some("makespan".to_string()));
         for spec in intervals {
             let end = expr::add(vec![expr::var(spec.start), expr::int(i64::from(spec.duration))]);
             let bound = expr::ge(expr::var(makespan), end);
             let constraint =
                 if let Some(presence) = spec.presence { expr::imp(expr::eq(expr::var(presence), expr::int(1)), bound) } else { bound };
-            intension::intension(&mut self.solver, constraint);
+            self.add_integer_constraint(Constraint::Intension(constraint));
         }
         self.objective = Some(ObjectiveSpec {
             minimizing: true,
-            expr: ExprLike { model_id: Some(self.id), expr: Expr::Var(makespan), text: "makespan".to_string() },
+            expr: ExprLike { model_id: Some(self.id), expr: Expr::Variable(makespan), text: "makespan".to_string() },
         });
         self.then_objectives.clear();
         Ok(())
     }
 
-    /// Solve the recorded list-domain model (list variables + reductions) with the
-    /// collection local-search engine, time-limited (default 5s).
     /// Reject a term that belongs to a different model or to a superseded
     /// `list_vars` generation.
     fn check_term_scope(&self, model_id: u64, gen: u64) -> PyResult<()> {
         if model_id != self.id {
             return Err(PyValueError::new_err("this list term belongs to a different model"));
         }
-        if gen != self.col_gen {
+        if gen != self.semantic.list_generation {
             return Err(PyValueError::new_err("this list term is stale; rebuild it from the current list_vars()"));
         }
         Ok(())
@@ -3034,25 +3331,23 @@ impl PyModel {
     fn push_collection_tier(&mut self, term: &PyTerm, minimize: bool, replace: bool) -> PyResult<()> {
         self.check_term_scope(term.model_id, term.gen)?;
         if replace {
-            self.col_objectives.clear();
+            self.semantic.objectives.clear();
         }
         let mut terms = term.reductions.clone();
         for &(value, coeff) in &term.values {
             let reduction = self
-                .col_reified
+                .semantic
+                .reified_values
                 .get(value)
                 .and_then(|slot| slot.as_ref())
                 .ok_or_else(|| PyValueError::new_err("a list value in the objective was never bound with add(scan == value)"))?;
             terms.push(scale_reduction(reduction, coeff)?);
         }
-        self.col_objectives.push(list::ObjectiveTier { minimize, terms, max_terms: term.max_terms.clone() });
+        self.semantic.objectives.push(shared_model::Objective::ListTerms { minimize, terms, max_terms: term.max_terms.clone() });
         Ok(())
     }
 
     fn set_integer_objective(&mut self, objective: &Bound<'_, PyAny>, minimizing: bool) -> PyResult<()> {
-        if self.col_universe.is_some() || self.col_schedule.is_some() {
-            return Err(PyValueError::new_err("integer objectives cannot be mixed with list or interval models"));
-        }
         let expr = expr_from_py(objective)?;
         if let Some(model_id) = expr.model_id {
             if model_id != self.id {
@@ -3060,7 +3355,7 @@ impl PyModel {
             }
         }
         let mut objective_vars = Vec::new();
-        expr.expr.collect_vars(&mut objective_vars);
+        expr.expr.variables(&mut objective_vars);
         if objective_vars.is_empty() {
             return Err(PyValueError::new_err("objective must reference at least one model variable"));
         }
@@ -3073,9 +3368,6 @@ impl PyModel {
         if self.objective.is_none() {
             return Err(PyValueError::new_err("then_minimize/then_maximize requires a primary integer objective first"));
         }
-        if self.col_universe.is_some() || self.col_schedule.is_some() {
-            return Err(PyValueError::new_err("integer objective tiers cannot be mixed with list or interval models"));
-        }
         let expr = expr_from_py(objective)?;
         if let Some(model_id) = expr.model_id {
             if model_id != self.id {
@@ -3083,7 +3375,7 @@ impl PyModel {
             }
         }
         let mut objective_vars = Vec::new();
-        expr.expr.collect_vars(&mut objective_vars);
+        expr.expr.variables(&mut objective_vars);
         if objective_vars.is_empty() {
             return Err(PyValueError::new_err("objective must reference at least one model variable"));
         }
@@ -3091,17 +3383,10 @@ impl PyModel {
         Ok(())
     }
 
-    /// Begin (or restart) interval-schedule mode. Rejects mixing with integer or
-    /// list variables, and bumps the schedule generation so handles from an
-    /// earlier `intervals`/`alternatives` call become stale.
+    /// Begin (or restart) interval-schedule mode and invalidate prior compact
+    /// schedule handles. Other independent semantic families are preserved.
     fn enter_schedule_mode(&mut self) -> PyResult<()> {
-        if !self.names.is_empty() || !self.native_intervals.is_empty() || self.objective.is_some() || !self.then_objectives.is_empty() {
-            return Err(PyValueError::new_err("cannot mix integer variables with interval variables; use one modeling style per model"));
-        }
-        if self.col_universe.is_some() {
-            return Err(PyValueError::new_err("model already has list variables; use one domain style per model (list or interval)"));
-        }
-        self.col_sched_gen += 1;
+        self.semantic.schedule_generation += 1;
         Ok(())
     }
 
@@ -3115,658 +3400,99 @@ impl PyModel {
             self.native_interval_spec(iv)?;
             return Ok(());
         }
-        if iv.gen != self.col_sched_gen {
+        if iv.gen != self.semantic.schedule_generation || iv.index as usize >= self.semantic.model().intervals().len() {
             return Err(PyValueError::new_err("this interval is stale; rebuild it from the current intervals()/alternatives()"));
         }
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn try_solve_domain_collection(
-        &self,
-        py: Python<'_>,
-        model: &list::CollectionModel,
-        selection: &shared_model::BackendSelection,
-        budget: &CollectionBudget,
-        seed: u64,
-        verbose: bool,
-        profile: bool,
-        schedule_cdcl: bool,
-    ) -> PyResult<Option<PySolution>> {
-        if selection.backend != shared_model::Backend::DomainExact {
-            return Ok(None);
-        }
-        if budget.expired() {
-            return Ok(Some(self.unknown_collection_solution()));
-        }
-        if let Some(schedule) = &model.schedule {
-            return self.try_solve_domain_schedule(py, schedule, model, selection, budget, seed, verbose, profile, schedule_cdcl);
-        }
-        self.try_solve_domain_lists(py, model, selection, budget, verbose)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn try_solve_routing_integer(
-        &self,
-        py: Python<'_>,
-        model: &list::CollectionModel,
-        selection: &shared_model::BackendSelection,
-        budget: &CollectionBudget,
-        seed: u64,
-        verbose: bool,
-        options: routing_engine::RoutingOptions,
-    ) -> PyResult<Option<PySolution>> {
-        if selection.class != shared_model::ModelClass::Routing || selection.backend != shared_model::Backend::IntegerExact {
-            return Ok(None);
-        }
-
-        if budget.expired() {
-            return Ok(Some(self.unknown_collection_solution()));
-        }
-        let limit = budget.limit;
-        let primary_sense = model.objectives.first().map_or("min", |tier| if tier.minimize { "min" } else { "max" });
-        if verbose {
-            println!("qayd solve (integer routing)");
-            println!("  class: {}", selection.class.name());
-            println!("  backend: {}", selection.backend.name());
-            println!("  reason: {}", selection.reason);
-            println!("  items: {}", model.items.len());
-            println!("  lists: {}", model.lists);
-            println!("  constraints: {}", model.constraints.len());
-            println!("  objective tiers: {}", model.objectives.len());
-            println!("  time limit: {limit}s");
-            println!("  preprocessing: {:.3}s", budget.elapsed_seconds());
-        }
-
-        let mut report = |objective: i64| {
-            if verbose {
-                println!("  o {objective}  ({primary_sense}, {:.2}s)", budget.elapsed_seconds());
-            }
-        };
-        let Some(outcome) = with_interrupts(py, &budget.stop, || {
-            routing_engine::solve_collection_with_options(model, seed, &budget.stop, &mut report, options)
-        })?
-        else {
-            // Defence in depth: the classifier admitted this model but the engine
-            // parse declined it (a lockstep gap). Every admitted routing model is
-            // enumeration-checkable, so fall through to the exact list enumeration
-            // rather than erroring or silently dropping to local search -- the worst
-            // case is still the exact enumeration optimum, never a wrong one.
-            return self.try_solve_domain_lists(
-                py,
-                model,
-                &shared_model::BackendSelection { backend: shared_model::Backend::DomainExact, ..*selection },
-                budget,
-                verbose,
-            );
-        };
-        let sol = outcome.solution;
-        let status = if sol.feasible {
-            if outcome.complete {
-                "OPTIMAL"
-            } else {
-                "SATISFIABLE"
-            }
-        } else if outcome.complete {
-            "UNSATISFIABLE"
-        } else {
-            "UNKNOWN"
-        };
-        if verbose {
-            println!("qayd result (integer routing)");
-            println!("  status: {status}");
-            if sol.feasible {
-                println!("  objectives: {:?}", sol.objectives);
-            }
-            if let Some(bound) = &sol.bound {
-                println!("  dual: {}", bound.dual);
-                println!("  gap: {:.2}%", 100.0 * bound.relative_gap);
-                println!("  bound method: {}", bound.method);
-            }
-            println!("  improvements: {}", outcome.improvements);
-            println!("  solutions: {}", outcome.stats.solutions);
-            println!("  nodes: {}", outcome.stats.nodes);
-            println!("  failures: {}", outcome.stats.failures);
-        }
-
-        let objectives = if sol.feasible { sol.objectives.clone() } else { Vec::new() };
-        let (dual_bound, absolute_gap, relative_gap, bound_method) = bound_fields(sol.bound.as_ref());
-        Ok(Some(PySolution {
-            status: status.to_string(),
-            objective: sol.feasible.then(|| sol.objectives.first().copied().unwrap_or(0)),
-            objective_sense: Some(primary_sense.to_string()),
-            objective_expr: Some("integer routing edge-sum".to_string()),
-            values: Vec::new(),
-            stats: outcome.stats.into(),
-            lists: canonicalize_unordered_lists(sol.feasible.then(|| sol.lists.clone()), &self.col_unordered),
-            objectives,
-            starts: Vec::new(),
-            presences: Vec::new(),
-            machines: Vec::new(),
-            dual_bound,
-            absolute_gap,
-            relative_gap,
-            bound_method,
-            alns_iterations: None,
-            candidates_evaluated: None,
-            candidates_per_second: None,
-            full_recompute_percentage: None,
-            backend_build_seconds: None,
-            construction_seconds: None,
-            time_to_first_feasible: None,
-            construction_candidates: None,
-            estimated_backend_bytes: None,
-            constructor: None,
-            constructor_fleet: None,
-            constructor_cost: None,
-        }))
-    }
-
-    fn try_solve_domain_lists(
-        &self,
-        py: Python<'_>,
-        model: &list::CollectionModel,
-        selection: &shared_model::BackendSelection,
-        budget: &CollectionBudget,
-        verbose: bool,
-    ) -> PyResult<Option<PySolution>> {
-        if selection.backend != shared_model::Backend::DomainExact {
-            return Ok(None);
-        }
-        let Some(objective_tiers) = shared_model::list_objective_tiers(&model.objectives, &model.items) else {
-            return Ok(None);
-        };
-        let has_objective = !objective_tiers.is_empty();
-        let minimize = objective_tiers.first().is_none_or(|tier| tier.minimize);
-
-        if budget.expired() {
-            return Ok(Some(self.unknown_collection_solution()));
-        }
-        let structural_bound = dual_engine::compute(model, &budget.stop);
-        let limit = budget.limit;
-        let constraint_count = 1 + model.constraints.len() + model.globals.len();
-        if verbose {
-            println!("qayd solve (domain exact)");
-            println!("  class: {}", selection.class.name());
-            println!("  backend: {}", selection.backend.name());
-            println!("  reason: {}", selection.reason);
-            println!("  kind: lists");
-            println!("  items: {}", model.items.len());
-            println!("  lists: {}", model.lists);
-            println!("  constraints: {constraint_count}");
-            println!("  objective tiers: {}", model.objectives.len());
-            println!("  time limit: {limit}s");
-            println!("  preprocessing: {:.3}s", budget.elapsed_seconds());
-        }
-
-        let solved = with_interrupts(py, &budget.stop, || {
-            list_exact_engine::solve(model, &objective_tiers, &budget.stop, |candidate| {
-                if verbose {
-                    println!("  o {}  ({})", candidate[0], if minimize { "min" } else { "max" });
-                }
-            })
-        })?;
-        let outcome = match solved.map_err(PyValueError::new_err)? {
-            Some(outcome) => outcome,
-            None => return Ok(None),
-        };
-
-        let status = outcome.status.as_str();
-        let objective = outcome.objectives.first().copied();
-        let bound = objective.and_then(|primal| {
-            if status == "OPTIMAL" {
-                dual_engine::make_report(primal, primal, minimize, "exact list proof".to_string())
-            } else {
-                structural_bound.and_then(|dual| dual_engine::make_report(primal, dual.value, minimize, dual.method.to_string()))
-            }
-        });
-        if verbose {
-            println!("qayd result (domain exact)");
-            println!("  status: {status}");
-            if has_objective && !outcome.objectives.is_empty() {
-                println!("  objectives: {:?}", outcome.objectives);
-            }
-            if let Some(bound) = &bound {
-                println!("  dual: {}", bound.dual);
-                println!("  gap: {:.2}%", 100.0 * bound.relative_gap);
-                println!("  bound method: {}", bound.method);
-            }
-            println!("  solutions: {}", outcome.stats.solutions);
-            println!("  nodes: {}", outcome.stats.nodes);
-            println!("  failures: {}", outcome.stats.failures);
-        }
-
-        let (dual_bound, absolute_gap, relative_gap, bound_method) = bound_fields(bound.as_ref());
-        Ok(Some(PySolution {
-            status: status.to_string(),
-            objective,
-            objective_sense: has_objective.then(|| if minimize { "min" } else { "max" }.to_string()),
-            objective_expr: has_objective.then(|| "list objective".to_string()),
-            values: Vec::new(),
-            stats: outcome.stats.into(),
-            lists: canonicalize_unordered_lists(outcome.solution, &self.col_unordered),
-            objectives: outcome.objectives,
-            starts: Vec::new(),
-            presences: Vec::new(),
-            machines: Vec::new(),
-            dual_bound,
-            absolute_gap,
-            relative_gap,
-            bound_method,
-            alns_iterations: None,
-            candidates_evaluated: None,
-            candidates_per_second: None,
-            full_recompute_percentage: None,
-            backend_build_seconds: None,
-            construction_seconds: None,
-            time_to_first_feasible: None,
-            construction_candidates: None,
-            estimated_backend_bytes: None,
-            constructor: None,
-            constructor_fleet: None,
-            constructor_cost: None,
-        }))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn try_solve_domain_schedule(
-        &self,
-        py: Python<'_>,
-        schedule: &list::Schedule,
-        model: &list::CollectionModel,
-        selection: &shared_model::BackendSelection,
-        budget: &CollectionBudget,
-        seed: u64,
-        verbose: bool,
-        profile: bool,
-        schedule_cdcl: bool,
-    ) -> PyResult<Option<PySolution>> {
-        if !model.objectives.is_empty() || !model.constraints.is_empty() || !model.globals.is_empty() || !model.items.is_empty() {
-            return Ok(None);
-        }
-
-        if budget.expired() {
-            return Ok(Some(self.unknown_collection_solution()));
-        }
-        let structural_bound = dual_engine::compute(model, &budget.stop);
-        let limit = budget.limit;
-        let moded = schedule.intervals.iter().any(|iv| !iv.modes.is_empty());
-        if verbose {
-            println!("qayd solve (domain exact)");
-            println!("  class: {}", selection.class.name());
-            println!("  backend: {}", selection.backend.name());
-            println!("  reason: {}", selection.reason);
-            println!("  kind: {}", if moded { "intervals (machine choice)" } else { "intervals" });
-            println!("  operations: {}", schedule.intervals.len());
-            println!("  precedences: {}", schedule.precedences.len());
-            println!("  resources: {}", schedule.resources.len());
-            println!("  objective: {}", if schedule.minimize_makespan { "makespan" } else { "no" });
-            println!("  time limit: {limit}s");
-            println!("  preprocessing: {:.3}s", budget.elapsed_seconds());
-        }
-
-        let options = schedule_engine::Options { seed, optional_modes_cdcl: schedule.minimize_makespan && schedule_cdcl };
-        let mut first_feasible_at = None;
-        let outcome = with_interrupts(py, &budget.stop, || {
-            schedule_engine::solve(schedule, &budget.stop, options, |value| {
-                first_feasible_at.get_or_insert_with(|| budget.elapsed_seconds());
-                if verbose {
-                    println!("  o {value}  (min)");
-                }
-            })
-        })?
-        .map_err(PyValueError::new_err)?;
-        let Some(outcome) = outcome else {
-            return Ok(None);
-        };
-
-        let status = outcome.status.as_str();
-        let bound = outcome.objective.and_then(|primal| {
-            if status == "OPTIMAL" {
-                dual_engine::make_report(primal, primal, true, "exact schedule proof".to_string())
-            } else {
-                structural_bound.and_then(|dual| dual_engine::make_report(primal, dual.value, true, dual.method.to_string()))
-            }
-        });
-        if verbose {
-            println!("qayd result (domain exact)");
-            println!("  status: {status}");
-            if let Some(objective) = outcome.objective {
-                println!("  objective: {objective}");
-            }
-            if let Some(bound) = &bound {
-                println!("  dual: {}", bound.dual);
-                println!("  gap: {:.2}%", 100.0 * bound.relative_gap);
-                println!("  bound method: {}", bound.method);
-            }
-            println!("  solutions: {}", outcome.stats.solutions);
-            println!("  nodes: {}", outcome.stats.nodes);
-            println!("  failures: {}", outcome.stats.failures);
-        }
-
-        let starts = outcome.starts.iter().zip(&outcome.presences).map(|(&start, &present)| present.then_some(start)).collect();
-        let (dual_bound, absolute_gap, relative_gap, bound_method) = bound_fields(bound.as_ref());
-        Ok(Some(PySolution {
-            status: status.to_string(),
-            objective: outcome.objective,
-            objective_sense: schedule.minimize_makespan.then(|| "min".to_string()),
-            objective_expr: schedule.minimize_makespan.then(|| "makespan".to_string()),
-            values: Vec::new(),
-            stats: outcome.stats.into(),
-            lists: None,
-            objectives: outcome.objective.map(|value| vec![value]).unwrap_or_default(),
-            starts,
-            presences: outcome.presences,
-            machines: outcome.machines,
-            dual_bound,
-            absolute_gap,
-            relative_gap,
-            bound_method,
-            alns_iterations: None,
-            candidates_evaluated: None,
-            candidates_per_second: None,
-            full_recompute_percentage: None,
-            backend_build_seconds: None,
-            construction_seconds: None,
-            time_to_first_feasible: profile.then_some(first_feasible_at).flatten(),
-            construction_candidates: None,
-            estimated_backend_bytes: None,
-            constructor: None,
-            constructor_fleet: None,
-            constructor_cost: None,
-        }))
-    }
-
-    fn unknown_collection_solution(&self) -> PySolution {
-        let schedule_makespan = self.col_schedule.as_ref().is_some_and(|schedule| schedule.minimize_makespan);
-        let objective_sense = self
-            .col_objectives
-            .first()
-            .map(|tier| if tier.minimize { "min" } else { "max" }.to_string())
-            .or_else(|| schedule_makespan.then(|| "min".to_string()));
-        PySolution {
-            status: "UNKNOWN".to_string(),
-            objective: None,
-            objective_sense,
-            objective_expr: schedule_makespan.then(|| "makespan".to_string()),
-            values: Vec::new(),
-            stats: SolveStats::default().into(),
-            lists: None,
-            objectives: Vec::new(),
-            starts: Vec::new(),
-            presences: Vec::new(),
-            machines: Vec::new(),
-            dual_bound: None,
-            absolute_gap: None,
-            relative_gap: None,
-            bound_method: None,
-            alns_iterations: None,
-            candidates_evaluated: None,
-            candidates_per_second: None,
-            full_recompute_percentage: None,
-            backend_build_seconds: None,
-            construction_seconds: None,
-            time_to_first_feasible: None,
-            construction_candidates: None,
-            estimated_backend_bytes: None,
-            constructor: None,
-            constructor_fleet: None,
-            constructor_cost: None,
-        }
-    }
-
-    /// Parse and validate a list-shaped warm start: `list[list[int]]`, one
-    /// visiting-order sequence per list variable. Rejects more sequences than the
-    /// model has lists, a node outside the universe, or a node assigned to two
-    /// lists. Unnamed universe nodes are legal (the engine pools them).
+    /// Parse a list-shaped warm start. Semantic scope, coverage, and capability
+    /// checks belong to the canonical compiler.
     fn parse_list_hint(&self, obj: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<i32>>> {
-        let hint: Vec<Vec<i32>> = obj
-            .extract()
-            .map_err(|_| PyValueError::new_err("list_hint must be a list of lists of ints (one node sequence per list variable)"))?;
-        if hint.len() > self.col_lists {
-            return Err(PyValueError::new_err(format!(
-                "list_hint has {} sequences but the model has {} list variable(s)",
-                hint.len(),
-                self.col_lists
-            )));
-        }
-        let universe: std::collections::HashSet<i32> = self.col_universe.as_deref().unwrap_or(&[]).iter().copied().collect();
-        let mut seen: std::collections::HashSet<i32> = std::collections::HashSet::new();
-        for seq in &hint {
-            for &value in seq {
-                if !universe.contains(&value) {
-                    return Err(PyValueError::new_err(format!("list_hint node {value} is not in the list_vars universe")));
-                }
-                if !seen.insert(value) {
-                    return Err(PyValueError::new_err(format!("list_hint assigns node {value} to more than one list")));
-                }
-            }
-        }
-        Ok(hint)
+        obj.extract().map_err(|_| PyValueError::new_err("list_hint must be a list of lists of ints (one node sequence per list variable)"))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn solve_collection(
-        &self,
-        py: Python<'_>,
-        time_limit: Option<u64>,
-        seed: u64,
-        threads: usize,
-        verbose: bool,
-        engine: PythonEngine,
-        list_hint: Option<Vec<Vec<i32>>>,
-        max_iterations: Option<u64>,
-        profile: bool,
-        memory_limit_mb: Option<u64>,
-        schedule_cdcl: bool,
-        routing_options: routing_engine::RoutingOptions,
-    ) -> PyResult<PySolution> {
-        let budget = CollectionBudget::new(time_limit.unwrap_or(5));
-        if budget.expired() {
-            return Ok(self.unknown_collection_solution());
-        }
-        let model = list::CollectionModel {
-            items: self.col_universe.clone().unwrap_or_default(),
-            lists: self.col_lists,
-            objectives: self.col_objectives.clone(),
-            constraints: self.col_constraints.clone(),
-            globals: self.col_globals.clone(),
-            schedule: self.col_schedule.clone(),
+    fn collection_solution_from_result(&self, run: &CollectionRun, profile: bool) -> PyResult<PySolution> {
+        let result = &run.result;
+        let primal = result.primal();
+        let schedule_makespan = self.semantic.schedule_makespan();
+        let has_list_objective = self.semantic.primary_list_sense().is_some();
+        let primary_minimizing = self.semantic.primary_list_sense().unwrap_or(true);
+        let primary_sense = if primary_minimizing { "min" } else { "max" };
+        let local_search = matches!(run.engine, EngineKind::ListLocalSearch | EngineKind::ScheduleLocalSearch);
+        let objectives = primal.map_or_else(Vec::new, |candidate| candidate.objectives().to_vec());
+        let objective = objectives.first().copied();
+        let objective_sense =
+            has_list_objective.then(|| primary_sense.to_string()).or_else(|| schedule_makespan.then(|| "min".to_string()));
+        let objective_expr = match run.engine {
+            EngineKind::RoutingExact => Some("integer routing edge-sum".to_string()),
+            _ if has_list_objective => Some("list objective".to_string()),
+            _ if schedule_makespan => Some("makespan".to_string()),
+            _ => None,
         };
-        let estimated_backend_bytes = shared_model::estimated_exact_backend_bytes(&model);
-        let memory_limit_bytes = memory_limit_mb.map(|limit| limit.saturating_mul(1024 * 1024));
-        if budget.expired() {
-            return Ok(self.unknown_collection_solution());
-        }
-        if !model.validate_interruptible(&budget.stop).map_err(PyValueError::new_err)? {
-            return Ok(self.unknown_collection_solution());
-        }
-        // LS skips exact classification entirely. Auto first applies cheap size
-        // gates on the collection IR, while explicit exact uses the larger but
-        // still deterministic classifier-work bound.
-        let selection = match engine {
-            PythonEngine::Ls => None,
-            PythonEngine::Auto => Some(memory_limit_bytes.map_or_else(
-                || shared_model::BackendSelection::for_collection_auto(&model),
-                |limit| shared_model::BackendSelection::for_collection_auto_with_memory(&model, limit),
-            )),
-            PythonEngine::Exact => {
-                if memory_limit_bytes.is_some_and(|limit| estimated_backend_bytes > limit) {
-                    return Err(PyValueError::new_err(format!(
-                        "estimated exact backend requires {estimated_backend_bytes} bytes, above memory_limit_mb={}",
-                        memory_limit_mb.unwrap_or(0)
-                    )));
-                }
-                Some(shared_model::BackendSelection::for_collection_exact_bounded(&model))
-            }
+        let report = result_engine_report(result, run.engine);
+        let orchestration_report = result.reports().first();
+        let stats = result.aggregate_search_stats();
+        let lists = if self.semantic.has_lists() {
+            let unordered = self
+                .semantic
+                .model()
+                .lists()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, declaration)| (declaration.ordering == shared_model::ListOrdering::Unordered).then_some(index))
+                .collect();
+            canonicalize_unordered_lists(primal.map(|candidate| candidate.assignment().lists.clone()), &unordered)
+        } else {
+            None
         };
-        let backend_build_seconds = budget.elapsed_seconds();
-        if budget.expired() {
-            return Ok(self.unknown_collection_solution());
-        }
-        if let Some(selection) = &selection {
-            if let Some(mut solution) = self.try_solve_routing_integer(py, &model, selection, &budget, seed, verbose, routing_options)? {
-                solution.backend_build_seconds = profile.then_some(backend_build_seconds);
-                solution.estimated_backend_bytes = profile.then_some(estimated_backend_bytes);
-                return Ok(solution);
-            }
-            if let Some(mut solution) =
-                self.try_solve_domain_collection(py, &model, selection, &budget, seed, verbose, profile, schedule_cdcl)?
-            {
-                solution.backend_build_seconds = profile.then_some(backend_build_seconds);
-                solution.estimated_backend_bytes = profile.then_some(estimated_backend_bytes);
-                return Ok(solution);
-            }
-            if engine == PythonEngine::Exact {
-                return Err(PyValueError::new_err(format!("model is not supported by an exact engine: {}", selection.reason)));
-            }
-        }
-        let limit = budget.limit;
-        // The first tier drives the progress line; report its sense.
-        let primary_sense = self.col_objectives.first().map_or("min", |t| if t.minimize { "min" } else { "max" });
-        if verbose {
-            println!("qayd solve (collection)");
-            match &selection {
-                Some(selection) => {
-                    println!("  class: {}", selection.class.name());
-                    println!("  backend: {}", selection.backend.name());
-                    println!("  reason: {}", selection.reason);
-                }
-                None => {
-                    println!("  backend: list local search");
-                    println!("  reason: engine=ls; exact-backend classification skipped");
-                }
-            }
-            println!("  items: {}", model.items.len());
-            println!("  lists: {}", model.lists);
-            println!("  constraints: {}", model.constraints.len());
-            println!("  objective tiers: {}", model.objectives.len());
-            println!("  threads: {threads}");
-            println!("  time limit: {limit}s");
-            println!("  preprocessing: {:.3}s", budget.elapsed_seconds());
-        }
-        let mut improvements = 0u64;
-        let mut first_feasible_at = None;
-        let max_iterations = max_iterations.unwrap_or(u64::MAX);
-        let (sol, search_profile) = {
-            let mut report = |objective: i64| {
-                improvements += 1;
-                if first_feasible_at.is_none() {
-                    first_feasible_at = Some(budget.elapsed_seconds());
-                }
-                if verbose {
-                    println!("  o {objective}  ({primary_sense}, {:.2}s)", budget.elapsed_seconds());
-                }
-            };
-            with_interrupts(py, &budget.stop, || {
-                if threads > 1 {
-                    let (solution, metrics) = lists::solve_collection_parallel_validated(
-                        &model,
-                        seed,
-                        &budget.stop,
-                        threads,
-                        max_iterations,
-                        list_hint.as_deref(),
-                        &mut report,
-                        profile,
-                    );
-                    let summary = profile.then(|| {
-                        let iterations = metrics.worker_metrics.iter().map(|worker| worker.search.alns.iterations).sum();
-                        let candidates = metrics.worker_metrics.iter().map(|worker| worker.search.candidates).sum();
-                        let elapsed_nanos = metrics.worker_metrics.iter().map(|worker| worker.search.elapsed_nanos).max().unwrap_or(0);
-                        let trials: u64 = metrics.worker_metrics.iter().map(|worker| worker.search.trial_list_evaluations).sum();
-                        let full: u64 =
-                            metrics.worker_metrics.iter().map(|worker| worker.search.full_recompute_trial_list_evaluations).sum();
-                        let construction_candidates =
-                            metrics.worker_metrics.iter().map(|worker| worker.search.construction_candidates).sum();
-                        let best = metrics
-                            .best_worker
-                            .and_then(|best| metrics.worker_metrics.iter().find(|worker| worker.worker == best))
-                            .map_or_else(CollectionProfileSummary::default, |worker| CollectionProfileSummary::from_search(&worker.search));
-                        CollectionProfileSummary {
-                            alns_iterations: iterations,
-                            candidates,
-                            candidates_per_second: if elapsed_nanos == 0 {
-                                0.0
-                            } else {
-                                candidates as f64 * 1_000_000_000.0 / elapsed_nanos as f64
-                            },
-                            full_recompute_percentage: if trials == 0 { 0.0 } else { full as f64 * 100.0 / trials as f64 },
-                            construction_candidates,
-                            ..best
-                        }
-                    });
-                    (solution, summary)
-                } else {
-                    let (solution, metrics) = lists::solve_collection_validated(
-                        &model,
-                        seed,
-                        &budget.stop,
-                        max_iterations,
-                        list_hint.as_deref(),
-                        &mut report,
-                        profile,
-                    );
-                    let summary = profile.then(|| CollectionProfileSummary::from_search(&metrics));
-                    (solution, summary)
-                }
-            })?
-        };
-        if verbose {
-            println!("qayd result (collection)");
-            println!("  status: {}", if sol.feasible { "SATISFIABLE" } else { "UNKNOWN" });
-            if sol.feasible {
-                println!("  objectives: {:?}", sol.objectives);
-            }
-            if let Some(bound) = &sol.bound {
-                println!("  dual: {}", bound.dual);
-                println!("  gap: {:.2}%", 100.0 * bound.relative_gap);
-                println!("  bound method: {}", bound.method);
-            }
-            println!("  improvements: {improvements}");
-            if let Some(search_profile) = &search_profile {
-                println!("  constructor: {}", search_profile.constructor.as_deref().unwrap_or("none"));
-                println!("  construction: {:.6}s", search_profile.construction_seconds);
-                println!("  construction candidates: {}", search_profile.construction_candidates);
-                println!("  ALNS iterations: {}", search_profile.alns_iterations);
-                println!("  candidates: {}", search_profile.candidates);
-                println!("  candidates/s: {:.1}", search_profile.candidates_per_second);
-                println!("  full recomputations: {:.2}%", search_profile.full_recompute_percentage);
-            }
-        }
-        // Only expose objectives and lists for a feasible incumbent. An
-        // infeasible best-effort partition may violate constraints, so hiding
-        // it stops a caller from accidentally consuming an invalid solution.
-        let objectives = if sol.feasible { sol.objectives.clone() } else { Vec::new() };
-        let (dual_bound, absolute_gap, relative_gap, bound_method) = bound_fields(sol.bound.as_ref());
-        let alns_iterations = search_profile.as_ref().map(|summary| summary.alns_iterations);
-        let candidates_evaluated = search_profile.as_ref().map(|summary| summary.candidates);
-        let candidates_per_second = search_profile.as_ref().map(|summary| summary.candidates_per_second);
-        let full_recompute_percentage = search_profile.as_ref().map(|summary| summary.full_recompute_percentage);
-        let construction_seconds = search_profile.as_ref().map(|summary| summary.construction_seconds);
-        let construction_candidates = search_profile.as_ref().map(|summary| summary.construction_candidates);
-        let constructor = search_profile.as_ref().and_then(|summary| summary.constructor.clone());
-        let constructor_fleet = search_profile.as_ref().and_then(|summary| summary.constructor_fleet);
-        let constructor_cost = search_profile.as_ref().and_then(|summary| summary.constructor_cost);
-        let time_to_first_feasible = profile.then_some(first_feasible_at).flatten().or_else(|| {
-            search_profile.as_ref().and_then(|summary| summary.time_to_first_feasible.map(|time| backend_build_seconds + time))
+        let intervals = primal
+            .filter(|_| self.semantic.has_intervals())
+            .map(|candidate| candidate.assignment().intervals.as_slice())
+            .unwrap_or_default();
+        let starts = intervals.iter().map(|interval| interval.start).collect();
+        let presences = intervals.iter().map(|interval| interval.present).collect();
+        let machines =
+            intervals.iter().map(|interval| interval.machine.and_then(|machine| i64::try_from(machine).ok()).unwrap_or(-1)).collect();
+        let (dual_bound, absolute_gap, relative_gap, bound_method) =
+            collection_bound_fields(result, objectives.first().copied(), primary_minimizing);
+
+        let expose_search_profile = profile && local_search;
+        let alns_iterations = expose_search_profile.then(|| parse_report_metadata(report, "alns_iterations").unwrap_or_default());
+        let candidates_evaluated = expose_search_profile.then(|| parse_report_metadata(report, "candidates_evaluated").unwrap_or_default());
+        let candidates_per_second =
+            expose_search_profile.then(|| parse_report_metadata(report, "candidates_per_second").unwrap_or_default());
+        let full_recompute_percentage =
+            expose_search_profile.then(|| parse_report_metadata(report, "full_recompute_percentage").unwrap_or_default());
+        let construction_seconds = expose_search_profile.then(|| parse_report_metadata(report, "construction_seconds").unwrap_or_default());
+        let construction_candidates =
+            expose_search_profile.then(|| parse_report_metadata(report, "construction_candidates").unwrap_or_default());
+        let constructor = expose_search_profile.then(|| report_metadata(report, "constructor").map(str::to_string)).flatten();
+        let constructor_fleet = expose_search_profile.then(|| parse_report_metadata(report, "constructor_fleet")).flatten();
+        let constructor_cost = expose_search_profile.then(|| parse_report_metadata(report, "constructor_cost")).flatten();
+        let backend_build_seconds = parse_report_metadata(orchestration_report, "backend_build_seconds");
+        let estimated_backend_bytes = parse_report_metadata(orchestration_report, "estimated_backend_bytes");
+        let records_first_feasible =
+            matches!(run.engine, EngineKind::ScheduleExact | EngineKind::ListLocalSearch | EngineKind::ScheduleLocalSearch);
+        let time_to_first_feasible = (profile && records_first_feasible).then_some(run.events.first_feasible_at).flatten().or_else(|| {
+            expose_search_profile
+                .then(|| parse_report_metadata::<f64>(report, "time_to_first_feasible"))
+                .flatten()
+                .map(|time| backend_build_seconds.unwrap_or_default() + time)
         });
+
         Ok(PySolution {
-            status: if sol.feasible { "SATISFIABLE".to_string() } else { "UNKNOWN".to_string() },
-            objective: sol.feasible.then(|| sol.objectives.first().copied().unwrap_or(0)),
-            objective_sense: Some(primary_sense.to_string()),
-            objective_expr: None,
-            values: Vec::new(),
-            stats: SolveStats::default().into(),
-            lists: canonicalize_unordered_lists(sol.feasible.then(|| sol.lists.clone()), &self.col_unordered),
+            status: result.status().as_str().to_string(),
+            objective,
+            objective_sense,
+            objective_expr,
+            values: visible_integer_values(result, self.names.len())?,
+            stats: stats.into(),
+            lists,
             objectives,
-            starts: if sol.feasible {
-                sol.starts.iter().zip(&sol.presences).map(|(&start, &present)| present.then_some(start)).collect()
-            } else {
-                Vec::new()
-            },
-            presences: if sol.feasible { sol.presences.clone() } else { Vec::new() },
-            machines: if sol.feasible { sol.machines.clone() } else { Vec::new() },
+            starts,
+            presences,
+            machines,
             dual_bound,
             absolute_gap,
             relative_gap,
@@ -3775,174 +3501,21 @@ impl PyModel {
             candidates_evaluated,
             candidates_per_second,
             full_recompute_percentage,
-            backend_build_seconds: profile.then_some(backend_build_seconds),
+            backend_build_seconds: profile.then_some(backend_build_seconds).flatten(),
             construction_seconds,
             time_to_first_feasible,
             construction_candidates,
-            estimated_backend_bytes: profile.then_some(estimated_backend_bytes),
+            estimated_backend_bytes: profile.then_some(estimated_backend_bytes).flatten(),
             constructor,
             constructor_fleet,
             constructor_cost,
+            ls_moves: None,
+            ls_constraints: None,
+            ls_functionals: None,
+            ls_unsupported: None,
+            ls_rejected_incumbents: None,
+            ls_checkpoint_replays: None,
         })
-    }
-
-    /// Solve a COP with the local-search engine (`solve_ls`) - the same
-    /// incumbent-only LS that powers `--ls`. Requires an objective and a time
-    /// limit (defaults to 10s, since LS never terminates on its own).
-    fn solve_ls(
-        &self,
-        py: Python<'_>,
-        objective: &ObjectiveSpec,
-        search: Option<&Bound<'_, PyAny>>,
-        verbose: bool,
-        time_limit: Option<u64>,
-        seed: u64,
-    ) -> PyResult<PySolution> {
-        if let Some(model_id) = objective.expr.model_id {
-            if model_id != self.id {
-                return Err(PyValueError::new_err("objective belongs to a different model"));
-            }
-        }
-        let mut vars = search_ids(self, search, None)?;
-        append_expr_vars(&mut vars, &objective.expr.expr);
-        if verbose {
-            verbose_start(self.names.len(), self.solver.num_propagators(), true);
-            println!("  direction: {}", if objective.minimizing { "min" } else { "max" });
-            println!("  expression: {}", objective.expr.text);
-            println!("  engine: local-search");
-        }
-        let problem = Problem {
-            solver: self.solver.clone(),
-            search: vars.clone(),
-            objective: Some(ProblemObjective::Expr(objective.minimizing, objective.expr.expr.clone())),
-        };
-        let stop = stop_after(time_limit.unwrap_or(10));
-        let config = LsConfig { gls: true, min_conflicts: true, kick_bandit: false };
-        let local = self.local.clone();
-        let outcome = with_interrupts(py, &stop, || {
-            solve_ls(problem, local, &stop, seed, config, |value, _solution, _source| {
-                if verbose {
-                    println!("  incumbent: {value}");
-                }
-            })
-        })?;
-        let sense = if objective.minimizing { "min" } else { "max" };
-        let solution = match outcome.best {
-            Some((assignment, objective_value)) => make_solution(
-                "SATISFIABLE",
-                &vars,
-                Some(&assignment),
-                Some(objective_value),
-                Some(sense),
-                Some(&objective.expr.text),
-                SolveStats::default(),
-                self.names.len(),
-            ),
-            None => make_solution(
-                "UNKNOWN",
-                &vars,
-                None,
-                None,
-                Some(sense),
-                Some(&objective.expr.text),
-                SolveStats::default(),
-                self.names.len(),
-            ),
-        };
-        if verbose {
-            verbose_finish(&solution);
-        }
-        Ok(solution)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn solve_single_optimization(
-        &self,
-        py: Python<'_>,
-        objective: &ObjectiveSpec,
-        search: Option<&Bound<'_, PyAny>>,
-        branch_order: &[VarId],
-        verbose: bool,
-        time_limit: Option<u64>,
-        seed: u64,
-    ) -> PyResult<PySolution> {
-        if let Some(model_id) = objective.expr.model_id {
-            if model_id != self.id {
-                return Err(PyValueError::new_err("objective belongs to a different model"));
-            }
-        }
-        if verbose {
-            verbose_start(self.names.len(), self.solver.num_propagators(), true);
-            println!("  direction: {}", if objective.minimizing { "min" } else { "max" });
-            println!("  expression: {}", objective.expr.text);
-        }
-        let mut vars = search_ids(self, search, None)?;
-        for &var in branch_order {
-            append_var(&mut vars, var);
-        }
-        append_expr_vars(&mut vars, &objective.expr.expr);
-        let mut solver = self.solver.clone();
-        append_interval_domain_vars(&mut vars, &solver);
-        let stop = deadline(time_limit);
-        let minimizing = objective.minimizing;
-        let obj_expr = objective.expr.expr.clone();
-        let (best, stats, complete) = with_interrupts(py, &stop, || {
-            let search_objective = match &obj_expr {
-                Expr::Var(var) => SearchObjective::Var(*var),
-                expr => SearchObjective::Expr(expr),
-            };
-            search::optimize_seeded(
-                &mut solver,
-                &vars,
-                search_objective,
-                minimizing,
-                &stop,
-                seed,
-                None,
-                None,
-                &[],
-                None,
-                Vec::new(),
-                branch_order.to_vec(),
-                |value, _| {
-                    if verbose {
-                        println!("  incumbent: {value}");
-                    }
-                },
-            )
-        })?;
-        let Some((assignment, objective_value)) = best else {
-            let mut solution = make_solution(
-                if complete { "UNSATISFIABLE" } else { "UNKNOWN" },
-                &vars,
-                None,
-                None,
-                Some(if objective.minimizing { "min" } else { "max" }),
-                Some(&objective.expr.text),
-                stats,
-                self.names.len(),
-            );
-            attach_native_interval_solution(&mut solution, &self.native_intervals);
-            if verbose {
-                verbose_finish(&solution);
-            }
-            return Ok(solution);
-        };
-        let mut solution = make_solution(
-            if complete { "OPTIMAL" } else { "SATISFIABLE" },
-            &vars,
-            Some(&assignment),
-            Some(objective_value),
-            Some(if objective.minimizing { "min" } else { "max" }),
-            Some(&objective.expr.text),
-            stats,
-            self.names.len(),
-        );
-        attach_native_interval_solution(&mut solution, &self.native_intervals);
-        if verbose {
-            verbose_finish(&solution);
-        }
-        Ok(solution)
     }
 }
 
@@ -4956,6 +4529,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(windows, m)?)?;
     m.add_function(wrap_pyfunction!(used, m)?)?;
     m.add_function(wrap_pyfunction!(_rust_panic, m)?)?;
-    m.add("STAR", table::STAR)?;
+    m.add("STAR", i32::MIN)?;
     Ok(())
 }

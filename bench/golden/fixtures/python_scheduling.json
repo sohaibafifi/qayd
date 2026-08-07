@@ -1,0 +1,12 @@
+{
+  "schema": "qayd.python-golden/v1",
+  "kind": "scheduling",
+  "horizon": 8,
+  "tasks": [
+    {"id": 0, "duration": 3, "demands": [1]},
+    {"id": 1, "duration": 2, "demands": [1]}
+  ],
+  "precedences": [[0, 1]],
+  "resources": [{"capacity": 1, "demand_index": 0}],
+  "objective": {"kind": "makespan", "sense": "minimize"}
+}

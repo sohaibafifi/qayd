@@ -70,8 +70,30 @@ pub trait Propagator: PropagatorClone + Send {
     /// Subscribe to the variables/events this propagator reacts to. `me` is its own id.
     fn register(&mut self, store: &mut Store, me: PropId);
 
+    /// Interruptible registration used while constructing large physical models.
+    /// Returning `false` means registration stopped before completion and the
+    /// caller must discard the partially built solver.
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        if should_stop() {
+            return false;
+        }
+        self.register(store, me);
+        !should_stop()
+    }
+
     /// Filter domains toward consistency. Must be idempotent; `Err(Inconsistency)` on wipeout.
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency>;
+
+    /// Interruptible filtering for propagators whose single invocation may be
+    /// expensive. Returning `Ok` after `should_stop` fires is not a fixpoint;
+    /// the caller must abandon the interrupted solve.
+    fn propagate_until(&mut self, store: &mut Store, should_stop: &dyn Fn() -> bool) -> Result<(), Inconsistency> {
+        if should_stop() {
+            Ok(())
+        } else {
+            self.propagate(store)
+        }
+    }
 
     /// Scheduling cost band. Defaults to the neutral middle; override to
     /// [`Priority::Cheap`] for bound/arith primitives or [`Priority::Expensive`]
@@ -114,6 +136,14 @@ impl Propagator for Selected {
         self.inner.register(store, me);
     }
 
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        if should_stop() {
+            return false;
+        }
+        store.subscribe(self.sel, me, Event::Fix);
+        self.inner.register_until(store, me, should_stop) && !should_stop()
+    }
+
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
         if !store.is_fixed(self.sel) {
             return Ok(()); // selector undecided: constraint not yet required
@@ -129,6 +159,20 @@ impl Propagator for Selected {
         let premise = Premise::Eq { var: self.sel, val: 1 };
         store.set_injected_premise(premise);
         let result = self.inner.propagate(store);
+        if result.is_err() {
+            store.push_conflict_premise(premise);
+        }
+        store.clear_injected_premise();
+        result
+    }
+
+    fn propagate_until(&mut self, store: &mut Store, should_stop: &dyn Fn() -> bool) -> Result<(), Inconsistency> {
+        if should_stop() || !store.is_fixed(self.sel) || store.value(self.sel) != 1 {
+            return Ok(());
+        }
+        let premise = Premise::Eq { var: self.sel, val: 1 };
+        store.set_injected_premise(premise);
+        let result = self.inner.propagate_until(store, should_stop);
         if result.is_err() {
             store.push_conflict_premise(premise);
         }

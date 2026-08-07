@@ -16,7 +16,6 @@ use crate::constraints::graph;
 use crate::constraints::intension;
 use crate::constraints::list as list_constraints;
 use crate::constraints::primitives;
-use crate::engines::ls::lists as ls_lists;
 use crate::expr;
 use crate::ids::{ListId, PropId, VarId};
 use crate::model::list::{
@@ -27,12 +26,12 @@ use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::search::{self, Objective as SearchObjective, SolveStats};
 use crate::store::{Premise, Solver, Store};
 
+use super::{CollectionCompileContext, CompileFailure};
+
 const MAX_INTEGER_ROUTING_NODES: usize = 32;
 
 /// Local-search iteration cap for the exact backend's warm start: enough for a
 /// good incumbent on small models, bounded so it terminates without a stop flag.
-const WARM_START_ITERS: u64 = 2000;
-
 /// Explicit controls for the exact routing lowering. These used to be hidden
 /// process-wide environment switches, which made API and native launcher runs
 /// difficult to reproduce in the same process.
@@ -55,6 +54,7 @@ enum MatrixOrientation {
     Reversed,
 }
 
+#[derive(Clone)]
 struct DirectEdgeMatrix {
     values: Arc<Vec<Vec<i64>>>,
     orientation: MatrixOrientation,
@@ -71,6 +71,7 @@ struct CapacitySpec {
 /// lie in `[min, max]`.
 type ItemSumSpec = (Vec<(i32, i64)>, i64, i64);
 
+#[derive(Clone)]
 struct RoutingSpec {
     depot_count: usize,
     depot: i32,
@@ -122,6 +123,61 @@ pub(crate) struct RoutingIntegerOutcome {
     pub improvements: u64,
 }
 
+/// Routing shape already parsed and ready to lower. Constructing this value is
+/// the capability check, so execution cannot later decline the model.
+#[derive(Clone)]
+pub(crate) struct CompiledRouting {
+    spec: RoutingSpec,
+    options: RoutingOptions,
+}
+
+pub(crate) fn compile(context: &CollectionCompileContext<'_>, stop: &AtomicBool) -> Result<CompiledRouting, CompileFailure> {
+    #[cfg(test)]
+    COMPILE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+    if compilation_stopped(stop) {
+        return Err(CompileFailure::Interrupted { phase: "before routing capability analysis" });
+    }
+    let model = context.physical();
+    let options = RoutingOptions {
+        two_way: context.request().routing.two_way,
+        nearest_neighbor: context.request().routing.nearest_neighbor,
+        // Warm-start execution belongs to the orchestrator, not this compiler.
+        warm_start: false,
+    };
+    debug_assert_eq!(context.semantic().intervals().is_empty(), model.schedule.is_none());
+    let Some(spec) = RoutingSpec::from_model_interruptible(model, stop) else {
+        return if compilation_stopped(stop) {
+            Err(CompileFailure::Interrupted { phase: "during routing capability analysis" })
+        } else {
+            Err(CompileFailure::Unsupported { code: "routing-shape", detail: "semantic model is outside the exact routing shape" })
+        };
+    };
+    Ok(CompiledRouting { spec, options })
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static COMPILE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MATERIALIZATION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_compile_calls_for_test() {
+    COMPILE_CALLS.with(|calls| calls.set(0));
+    MATERIALIZATION_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn compile_calls_for_test() -> usize {
+    COMPILE_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn materialization_calls_for_test() -> usize {
+    MATERIALIZATION_CALLS.with(std::cell::Cell::get)
+}
+
+#[derive(Clone)]
 struct LoweredProblem {
     solver: Solver,
     search_vars: Vec<VarId>,
@@ -145,13 +201,29 @@ impl DirectEdgeMatrix {
         i32::try_from(value).ok()
     }
 
-    fn covers_i32_costs(&self, nodes: &[i32]) -> bool {
-        nodes.iter().all(|&from| nodes.iter().all(|&to| self.cost(from, to).is_some()))
+    fn covers_i32_costs(&self, nodes: &[i32], stop: &AtomicBool) -> bool {
+        for &from in nodes {
+            for &to in nodes {
+                if compilation_stopped(stop) || self.cost(from, to).is_none() {
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 
 impl RoutingSpec {
+    #[cfg(test)]
     fn from_model(model: &CollectionModel) -> Option<Self> {
+        let stop = AtomicBool::new(false);
+        Self::from_model_interruptible(model, &stop)
+    }
+
+    fn from_model_interruptible(model: &CollectionModel, stop: &AtomicBool) -> Option<Self> {
+        if compilation_stopped(stop) {
+            return None;
+        }
         if model.schedule.is_some() || model.lists == 0 || model.objectives.len() != 1 {
             return None;
         }
@@ -169,6 +241,9 @@ impl RoutingSpec {
         let mut edge_terms = Vec::new();
         let mut scan_terms = Vec::new();
         for term in &tier.terms {
+            if compilation_stopped(stop) {
+                return None;
+            }
             match &term.iterable {
                 Iterable::Edges { .. } => edge_terms.push(term),
                 // A reified `Sum` scan, or a per-item `Sum` reward (`cp.sum(x, |i| ...)`)
@@ -186,6 +261,9 @@ impl RoutingSpec {
         let n_lists = model.lists;
         let mut referenced = vec![false; n_lists];
         for term in &tier.terms {
+            if compilation_stopped(stop) {
+                return None;
+            }
             let list = term.iterable.list();
             if list >= n_lists {
                 return None;
@@ -193,6 +271,9 @@ impl RoutingSpec {
             referenced[list] = true;
         }
         for constraint in &model.constraints {
+            if compilation_stopped(stop) {
+                return None;
+            }
             let list = constraint.reduction.iterable.list();
             if list < n_lists {
                 referenced[list] = true;
@@ -211,6 +292,9 @@ impl RoutingSpec {
 
         // Homogeneous closed-edge matrix over the `k` real routes.
         let (depot, edge) = homogeneous_edge_objective(&edge_terms, k)?;
+        if compilation_stopped(stop) {
+            return None;
+        }
         if model.items.contains(&depot) {
             return None;
         }
@@ -223,7 +307,11 @@ impl RoutingSpec {
             if !pool || scan_terms.len() != k {
                 return None;
             }
-            Some(homogeneous_scan_terms(&scan_terms, &model.items)?)
+            let scan = homogeneous_scan_terms(&scan_terms, &model.items)?;
+            if compilation_stopped(stop) {
+                return None;
+            }
+            Some(scan)
         };
 
         // Side constraints. A pool is only lowerable alongside homogeneous scan
@@ -234,10 +322,17 @@ impl RoutingSpec {
                 return None;
             }
             let pool_list = free[0];
-            (None, Vec::new(), None, None, parse_pool_scan_constraints(model, pool_list)?)
+            let scan = parse_pool_scan_constraints(model, pool_list)?;
+            if compilation_stopped(stop) {
+                return None;
+            }
+            (None, Vec::new(), None, None, scan)
         } else {
             let mut same_list = Vec::new();
             for global in &model.globals {
+                if compilation_stopped(stop) {
+                    return None;
+                }
                 match *global {
                     GlobalConstraint::SameList { a, b } => same_list.push((a, b)),
                     _ => return None,
@@ -247,6 +342,9 @@ impl RoutingSpec {
                 return None;
             }
             let sides = parse_route_side_constraints(model)?;
+            if compilation_stopped(stop) {
+                return None;
+            }
             (sides.capacity, same_list, sides.length, sides.item_sum, sides.scan)
         };
 
@@ -254,7 +352,7 @@ impl RoutingSpec {
         let mut nodes = Vec::with_capacity(depot_count + model.items.len());
         nodes.extend((0..depot_count).map(|_| depot));
         nodes.extend_from_slice(&model.items);
-        edge.covers_i32_costs(&nodes).then_some(Self {
+        edge.covers_i32_costs(&nodes, stop).then_some(Self {
             depot_count,
             depot,
             items: model.items.clone(),
@@ -273,7 +371,10 @@ impl RoutingSpec {
         self.pool_list.is_some()
     }
 
-    fn lower(&self, options: RoutingOptions) -> LoweredProblem {
+    fn lower(&self, options: RoutingOptions, stop: &AtomicBool) -> Option<LoweredProblem> {
+        if compilation_stopped(stop) {
+            return None;
+        }
         let mut solver = Solver::new();
         let mut nodes = Vec::with_capacity(self.depot_count + self.items.len());
         nodes.extend((0..self.depot_count).map(|_| self.depot));
@@ -284,16 +385,28 @@ impl RoutingSpec {
         // `circuit` auto-enables cut-set filtering only on sparse graphs; this
         // lowering builds the complete graph, so it stays on the base rules.
         graph::circuit(&mut solver, &succ);
+        if compilation_stopped(stop) {
+            return None;
+        }
 
         // Pool-membership channel. `in_pool[node]` is fixed 1 at the pool depot
         // (the last depot index), 0 at every real depot, and threaded to each
         // customer from its unique predecessor arc. `circuit` gives each customer
         // one predecessor, so the implication pins it exactly at a leaf.
-        let in_pool = self.pool().then(|| self.build_pool_membership(&mut solver, &succ, n));
+        let in_pool = if self.pool() { Some(self.build_pool_membership(&mut solver, &succ, n, stop)?) } else { None };
 
         let mut cost_vars = Vec::with_capacity(n);
         for (from_idx, &from_node) in nodes.iter().enumerate() {
-            let row = nodes.iter().map(|&to_node| self.edge.cost(from_node, to_node).expect("validated edge cost")).collect::<Vec<_>>();
+            if compilation_stopped(stop) {
+                return None;
+            }
+            let mut row = Vec::with_capacity(n);
+            for &to_node in &nodes {
+                if compilation_stopped(stop) {
+                    return None;
+                }
+                row.push(self.edge.cost(from_node, to_node).expect("validated edge cost"));
+            }
             match &in_pool {
                 // Gate the edge: a pooled tail (customer or the pool depot itself)
                 // contributes 0 on every one of its arcs, so the whole pool route
@@ -324,7 +437,7 @@ impl RoutingSpec {
         // only weakly worsen the objective (see `dominated_optionals`), so pooling it
         // preserves the optimum. The residual search is then the served-only routing.
         if let Some(in_pool) = &in_pool {
-            for c in self.dominated_optionals(&nodes) {
+            for c in self.dominated_optionals(&nodes, stop)? {
                 intension::intension(&mut solver, expr::eq(expr::var(in_pool[c]), expr::int(1)));
             }
             // Pool-route symmetry: its order is cost- and feasibility-irrelevant (every
@@ -333,6 +446,9 @@ impl RoutingSpec {
             // lower-indexed customer. This removes the |pool|! equivalent orderings the
             // circuit would otherwise walk once the optionals are pooled.
             for c in self.depot_count..n {
+                if compilation_stopped(stop) {
+                    return None;
+                }
                 for d in self.depot_count..c {
                     let pooled = expr::eq(expr::var(in_pool[c]), expr::int(1));
                     intension::intension(&mut solver, expr::imp(pooled, expr::ne(expr::var(succ[c]), expr::int(d as i64))));
@@ -340,6 +456,9 @@ impl RoutingSpec {
             }
         }
 
+        if compilation_stopped(stop) {
+            return None;
+        }
         if let Some(capacity) = &self.capacity {
             let load = self.post_capacity_loads(&mut solver, &succ, capacity);
             post_route_capacity_check(&mut solver, &succ, self.depot_count, self.node_demands(capacity), capacity.capacity);
@@ -347,7 +466,9 @@ impl RoutingSpec {
         }
 
         for scan in &self.scan {
-            self.post_scan_constraint(&mut solver, &succ, &nodes, scan, in_pool.as_deref());
+            if !self.post_scan_constraint(&mut solver, &succ, &nodes, scan, in_pool.as_deref(), stop) {
+                return None;
+            }
         }
 
         // Reified scan objective: one gated per-customer contribution, summed into
@@ -355,14 +476,20 @@ impl RoutingSpec {
         // summing the ungated real customers equals the real routes' scan totals.
         if let Some(scan) = &self.scan_objective {
             let in_pool = in_pool.as_deref().expect("scan objective is only set for pool models");
-            cost_vars.extend(self.post_scan_objective(&mut solver, &succ, &nodes, scan, in_pool));
+            cost_vars.extend(self.post_scan_objective(&mut solver, &succ, &nodes, scan, in_pool, stop)?);
         }
 
         // Depot symmetry orders only the `k` real depots; the pool depot (last
         // index) keeps its fixed, distinct, unconstrained role and is excluded, so
         // relabelling real depots never touches it. Non-pool orders all depots.
         let real_depots = if self.pool() { self.depot_count - 1 } else { self.depot_count };
+        if compilation_stopped(stop) {
+            return None;
+        }
         post_depot_symmetry(&mut solver, &succ, real_depots, self.depot_count, n);
+        if compilation_stopped(stop) {
+            return None;
+        }
 
         // Membership <-> route-order channel. Built only for same-list requirements
         // over >= 2 routes (one route makes `same_list` trivially true). The list
@@ -373,6 +500,9 @@ impl RoutingSpec {
         if !self.same_list.is_empty() || self.length.is_some() || self.item_sum.is_some() {
             let lists: Vec<ListId> = (0..self.depot_count).map(|_| solver.store.new_list(self.items.clone())).collect();
             for &list in &lists {
+                if compilation_stopped(stop) {
+                    return None;
+                }
                 list_constraints::list_cardinality(&mut solver, list);
             }
             list_constraints::partition(&mut solver, &lists, &self.items);
@@ -382,12 +512,18 @@ impl RoutingSpec {
             // Homogeneous per-route length applies the same bound to every route.
             if let Some((min, max)) = self.length {
                 for &list in &lists {
+                    if compilation_stopped(stop) {
+                        return None;
+                    }
                     list_constraints::list_len(&mut solver, list, min, max);
                 }
             }
             // Homogeneous per-route weighted item sum applies to every route.
             if let Some((weights, min, max)) = &self.item_sum {
                 for &list in &lists {
+                    if compilation_stopped(stop) {
+                        return None;
+                    }
                     list_constraints::list_item_sum(&mut solver, list, weights.clone(), *min, *max);
                 }
             }
@@ -408,6 +544,9 @@ impl RoutingSpec {
         let mut initial_phase = vec![None; solver.store.num_vars()];
         if options.nearest_neighbor {
             for from in 0..n {
+                if compilation_stopped(stop) {
+                    return None;
+                }
                 if let Some(to) =
                     (0..n).filter(|&to| to != from).min_by_key(|&to| self.edge.cost(nodes[from], nodes[to]).expect("validated edge cost"))
                 {
@@ -422,7 +561,14 @@ impl RoutingSpec {
         // in_pool is a derived channel (dominated optionals are fixed above, the rest
         // follow from the fixed predecessor arc), never branched.
         let search_vars = succ;
-        LoweredProblem { solver, search_vars, cost_vars, nodes, depot_count: self.depot_count, initial_phase }
+        (!compilation_stopped(stop)).then_some(LoweredProblem {
+            solver,
+            search_vars,
+            cost_vars,
+            nodes,
+            depot_count: self.depot_count,
+            initial_phase,
+        })
     }
 
     /// Successor values for a local-search incumbent: chain each LS route
@@ -508,7 +654,18 @@ impl RoutingSpec {
     /// capacity `>=` relaxation). The cumulative sum is kept per route -- reset to
     /// `0` at every depot -- because the list-local-search spec applies the scan
     /// bound to each route independently, not to the fleet total.
-    fn post_scan_constraint(&self, solver: &mut Solver, succ: &[VarId], nodes: &[i32], scan: &ScanRoutingSpec, in_pool: Option<&[VarId]>) {
+    fn post_scan_constraint(
+        &self,
+        solver: &mut Solver,
+        succ: &[VarId],
+        nodes: &[i32],
+        scan: &ScanRoutingSpec,
+        in_pool: Option<&[VarId]>,
+        stop: &AtomicBool,
+    ) -> bool {
+        if compilation_stopped(stop) {
+            return false;
+        }
         let n = nodes.len();
         let depot_count = self.depot_count;
         let arena = &scan.arena.exprs;
@@ -519,6 +676,9 @@ impl RoutingSpec {
         let mut acc = vec![None; n];
         let mut route_sum = vec![None; n];
         for (node, slot) in acc.iter_mut().enumerate().take(n).skip(depot_count) {
+            if compilation_stopped(stop) {
+                return false;
+            }
             *slot = Some(solver.new_var_range(scan.acc_dom.0 as i32, scan.acc_dom.1 as i32));
             route_sum[node] = Some(solver.new_var_range(scan.total_dom.0 as i32, scan.total_dom.1 as i32));
         }
@@ -527,6 +687,9 @@ impl RoutingSpec {
         let sum_in = |from: usize| if from < depot_count { expr::int(0) } else { expr::var(route_sum[from].expect("customer route sum")) };
 
         for (from, &from_var) in succ.iter().enumerate() {
+            if compilation_stopped(stop) {
+                return false;
+            }
             for to in depot_count..n {
                 if from == to {
                     continue;
@@ -550,6 +713,9 @@ impl RoutingSpec {
         // route total is `sum_in(from)` -- `0` for an empty route -- and must obey
         // the constraint's op against rhs.
         for (from, &from_var) in succ.iter().enumerate() {
+            if compilation_stopped(stop) {
+                return false;
+            }
             for to in 0..depot_count {
                 if from == to {
                     continue;
@@ -571,6 +737,7 @@ impl RoutingSpec {
                 intension::intension(solver, expr::imp(arc, guarded));
             }
         }
+        !compilation_stopped(stop)
     }
 
     /// Build the pool-membership vars: `1` fixed at the pool depot (last depot
@@ -578,20 +745,25 @@ impl RoutingSpec {
     /// each customer's unique predecessor arc `succ[from] == to => in_pool[to] ==
     /// in_pool[from]`. Pinned exactly at a leaf because `circuit` makes the
     /// predecessor unique; partial states leave a customer's membership free.
-    fn build_pool_membership(&self, solver: &mut Solver, succ: &[VarId], n: usize) -> Vec<VarId> {
+    fn build_pool_membership(&self, solver: &mut Solver, succ: &[VarId], n: usize, stop: &AtomicBool) -> Option<Vec<VarId>> {
         let pool_depot = self.depot_count - 1;
-        let in_pool: Vec<VarId> = (0..n)
-            .map(|node| {
-                if node == pool_depot {
-                    solver.new_var_set(&[1])
-                } else if node < self.depot_count {
-                    solver.new_var_set(&[0])
-                } else {
-                    solver.new_var_range(0, 1)
-                }
-            })
-            .collect();
+        let mut in_pool = Vec::with_capacity(n);
+        for node in 0..n {
+            if compilation_stopped(stop) {
+                return None;
+            }
+            in_pool.push(if node == pool_depot {
+                solver.new_var_set(&[1])
+            } else if node < self.depot_count {
+                solver.new_var_set(&[0])
+            } else {
+                solver.new_var_range(0, 1)
+            });
+        }
         for from in 0..n {
+            if compilation_stopped(stop) {
+                return None;
+            }
             for to in self.depot_count..n {
                 if from == to {
                     continue;
@@ -600,7 +772,7 @@ impl RoutingSpec {
                 intension::intension(solver, expr::imp(arc, expr::eq(expr::var(in_pool[to]), expr::var(in_pool[from]))));
             }
         }
-        in_pool
+        (!compilation_stopped(stop)).then_some(in_pool)
     }
 
     /// Static `[min, max]` of customer `c`'s reified objective contribution
@@ -687,18 +859,24 @@ impl RoutingSpec {
     /// and a per-item reward (so serving `c` does not ripple onto other customers);
     /// on a non-metric matrix `marginal` may be negative and the rule simply does not
     /// fire. Returns the customer node indices to force `in_pool = 1`.
-    fn dominated_optionals(&self, nodes: &[i32]) -> Vec<usize> {
+    fn dominated_optionals(&self, nodes: &[i32], stop: &AtomicBool) -> Option<Vec<usize>> {
         if !self.pool() || !self.scan.is_empty() || !self.scan_objective_is_per_item() {
-            return Vec::new();
+            return Some(Vec::new());
         }
         let n = nodes.len();
         let pool_depot = self.depot_count - 1;
         let servable: Vec<usize> = (0..n).filter(|&i| i != pool_depot).collect();
         let mut pooled = Vec::new();
         for c in self.depot_count..n {
+            if compilation_stopped(stop) {
+                return None;
+            }
             let reward_min = self.scan_objective.as_ref().map_or(0, |scan| self.served_reward_bounds(nodes, scan, c).0);
             let mut marginal = i64::MAX;
             for &p in &servable {
+                if compilation_stopped(stop) {
+                    return None;
+                }
                 if p == c {
                     continue;
                 }
@@ -715,7 +893,7 @@ impl RoutingSpec {
                 pooled.push(c);
             }
         }
-        pooled
+        (!compilation_stopped(stop)).then_some(pooled)
     }
 
     /// Lower a reified `Sum`-scan objective into per-customer contribution vars.
@@ -730,7 +908,11 @@ impl RoutingSpec {
         nodes: &[i32],
         scan: &ScanRoutingSpec,
         in_pool: &[VarId],
-    ) -> Vec<VarId> {
+        stop: &AtomicBool,
+    ) -> Option<Vec<VarId>> {
+        if compilation_stopped(stop) {
+            return None;
+        }
         let n = nodes.len();
         let depot_count = self.depot_count;
         let arena = &scan.arena.exprs;
@@ -738,12 +920,18 @@ impl RoutingSpec {
 
         let mut acc = vec![None; n];
         for slot in acc.iter_mut().take(n).skip(depot_count) {
+            if compilation_stopped(stop) {
+                return None;
+            }
             *slot = Some(solver.new_var_range(scan.acc_dom.0 as i32, scan.acc_dom.1 as i32));
         }
         let a_of =
             |from: usize| if from < depot_count { expr::int(scan.init) } else { expr::var(acc[from].expect("customer accumulator")) };
 
         for (from, &from_var) in succ.iter().enumerate() {
+            if compilation_stopped(stop) {
+                return None;
+            }
             for to in depot_count..n {
                 if from == to {
                     continue;
@@ -759,6 +947,9 @@ impl RoutingSpec {
         // Per-customer `coeff * emit` at the chosen predecessor, gated to 0 when pooled.
         let mut contrib = Vec::with_capacity(n - depot_count);
         for c in depot_count..n {
+            if compilation_stopped(stop) {
+                return None;
+            }
             let cur = i64::from(nodes[c]);
             // Tight per-customer contribution bounds. For an order-independent per-item
             // reward these collapse to a single constant, so the contribution var stays
@@ -790,8 +981,12 @@ impl RoutingSpec {
             intension::intension(solver, expr::eq(expr::var(obj), gated));
             contrib.push(obj);
         }
-        contrib
+        (!compilation_stopped(stop)).then_some(contrib)
     }
+}
+
+fn compilation_stopped(stop: &AtomicBool) -> bool {
+    stop.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Solve a supported collection routing model by lowering it to integer CP.
@@ -813,39 +1008,61 @@ pub(crate) fn solve_collection_with_options(
     report: &mut dyn FnMut(i64),
     options: RoutingOptions,
 ) -> Option<RoutingIntegerOutcome> {
-    let spec = RoutingSpec::from_model(model)?;
-    // Warm start: a quick local-search incumbent seeds the first dive and, after
-    // replay verification, supplies an initial exact objective bound. Pool models are included:
-    // `ls_tour_succ` chains the pool list through the fixed pool depot, and replay
-    // verifies the decode -- an infeasible one degrades gracefully to bound-less.
-    let warm = if options.warm_start {
-        // A bounded local-search pass: enough to find a good incumbent, capped so
-        // it terminates even without a stop flag and leaves the exact search the
-        // bulk of the time.
-        let mut ignore_warm_start_progress = |_| {};
-        Some(ls_lists::solve_collection_capped(model, seed, stop, WARM_START_ITERS, None, &mut ignore_warm_start_progress))
-    } else {
-        None
+    let spec = RoutingSpec::from_model_interruptible(model, stop)?;
+    let compiled = CompiledRouting { spec, options };
+    Some(solve_compiled(&compiled, seed, stop, None, report))
+}
+
+/// Execute a compiled routing plan with an optional orchestrator-supplied warm
+/// candidate. The engine verifies the candidate against its exact lowering
+/// before using it as an objective bound.
+pub(crate) fn solve_compiled(
+    compiled: &CompiledRouting,
+    seed: u64,
+    stop: &AtomicBool,
+    warm: Option<&CollectionSolution>,
+    report: &mut dyn FnMut(i64),
+) -> RoutingIntegerOutcome {
+    let spec = &compiled.spec;
+    if compilation_stopped(stop) {
+        return interrupted_outcome(spec);
+    }
+    #[cfg(test)]
+    MATERIALIZATION_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+    let mut lowered = match spec.lower(compiled.options, stop) {
+        Some(problem) => problem,
+        None if compilation_stopped(stop) => return interrupted_outcome(spec),
+        None => panic!("compiled routing blueprint failed during physical materialization"),
     };
-    // Verify/replay the LS incumbent on a FRESH lowering (so the exact search's
-    // solver is untouched): reconstruct its tour, confirm it is feasible, and read
-    // its exact cost. This yields a verified fallback solution AND an initial
+    // Verify/replay the LS incumbent at a temporary level of the freshly
+    // materialized root, then pop back before exact search. Reconstruct its
+    // tour, confirm it is feasible, and read its exact cost. This yields a
+    // verified fallback solution AND an initial
     // objective bound -- so the exact prunes anything no better than `cost` from
     // the start, and if it proves nothing strictly better, we still return a real
     // (verified) solution at that cost.
-    let warm_certificate = warm.as_ref().and_then(|solution| solution.bound.as_ref()).map(|bound| (bound.dual, bound.method.clone()));
     let verified: Option<(Vec<Vec<i32>>, i64)> = warm.as_ref().filter(|ls| ls.feasible).and_then(|ls| {
+        if compilation_stopped(stop) {
+            return None;
+        }
         let n = spec.depot_count + spec.items.len();
         let tour = spec.ls_tour_succ(n, &ls.lists)?;
-        let mut check = spec.lower(options);
-        let cost = replay_tour(&mut check.solver, &check.search_vars[..n], &check.cost_vars, &tour)?;
+        let cost = replay_tour(&mut lowered.solver, &lowered.search_vars[..n], &lowered.cost_vars, &tour, stop)?;
+        if compilation_stopped(stop) {
+            return None;
+        }
         let tour_i32: Vec<i32> = tour.iter().map(|&node| node as i32).collect();
-        let routes = routes_from_successors(&check.nodes, check.depot_count, &tour_i32)?;
+        let routes = routes_from_successors(&lowered.nodes, lowered.depot_count, &tour_i32)?;
         Some((routes, cost))
     });
+    if compilation_stopped(stop) {
+        return interrupted_outcome(spec);
+    }
     let bound = verified.as_ref().map(|&(_, cost)| AtomicI64::new(cost));
 
-    let lowered = spec.lower(options);
+    if compilation_stopped(stop) {
+        return interrupted_outcome(spec);
+    }
     let LoweredProblem { mut solver, search_vars, cost_vars, nodes, depot_count, initial_phase } = lowered;
 
     let coeffs = vec![1i64; cost_vars.len()];
@@ -889,36 +1106,58 @@ pub(crate) fn solve_collection_with_options(
             None => (vec![Vec::new(); depot_count], None, false),
         },
     };
-    let mut solution = CollectionSolution {
+    let solution = CollectionSolution {
         lists,
         objectives: objective.map(|value| vec![value]).unwrap_or_default(),
         feasible,
         starts: Vec::new(),
         presences: Vec::new(),
         machines: Vec::new(),
+        modes: Vec::new(),
         bound: None,
     };
-    if complete {
-        crate::engines::dual::attach_exact(&mut solution, "exact routing proof");
-    } else if let Some((dual, method)) = warm_certificate {
-        crate::engines::dual::attach_value(model, &mut solution, dual, method);
+    RoutingIntegerOutcome { solution, stats, complete, improvements }
+}
+
+fn interrupted_outcome(spec: &RoutingSpec) -> RoutingIntegerOutcome {
+    RoutingIntegerOutcome {
+        solution: CollectionSolution {
+            lists: vec![Vec::new(); spec.depot_count],
+            objectives: Vec::new(),
+            feasible: false,
+            starts: Vec::new(),
+            presences: Vec::new(),
+            machines: Vec::new(),
+            modes: Vec::new(),
+            bound: None,
+        },
+        stats: SolveStats::default(),
+        complete: false,
+        improvements: 0,
     }
-    Some(RoutingIntegerOutcome { solution, stats, complete, improvements })
 }
 
 /// Replay a successor tour in the solver to verify feasibility and read its exact
 /// objective. Pushes a temporary level, fixes every successor, propagates, then
 /// pops back to the root. Returns the verified cost, or `None` if infeasible.
-fn replay_tour(solver: &mut Solver, succ_vars: &[VarId], cost_vars: &[VarId], tour: &[usize]) -> Option<i64> {
+fn replay_tour(solver: &mut Solver, succ_vars: &[VarId], cost_vars: &[VarId], tour: &[usize], stop: &AtomicBool) -> Option<i64> {
+    if compilation_stopped(stop) {
+        return None;
+    }
     solver.store.push_level();
     let mut feasible = true;
     for (&var, &value) in succ_vars.iter().zip(tour) {
+        if compilation_stopped(stop) {
+            feasible = false;
+            break;
+        }
         if solver.store.fix(var, value as i32).is_err() {
             feasible = false;
             break;
         }
     }
-    let cost = (feasible && solver.propagate().is_ok()).then(|| cost_vars.iter().map(|&c| i64::from(solver.store.value(c))).sum());
+    let cost = (feasible && !compilation_stopped(stop) && solver.propagate().is_ok() && !compilation_stopped(stop))
+        .then(|| cost_vars.iter().map(|&c| i64::from(solver.store.value(c))).sum());
     solver.store.pop_level();
     cost
 }
@@ -1525,8 +1764,8 @@ mod tests {
     use crate::search::{self, SearchControl};
 
     use super::{
-        routes_from_successors, scan_routing_signature, solve_collection, solve_collection_with_options, CapacityCheck, RoutingOptions,
-        RoutingSpec,
+        routes_from_successors, scan_routing_signature, solve_collection, solve_collection_with_options, solve_compiled, CapacityCheck,
+        CompiledRouting, RoutingOptions, RoutingSpec,
     };
 
     #[test]
@@ -1559,6 +1798,47 @@ mod tests {
         // the exact search may prove optimality without itself reporting/finding a
         // new solution; only the outcome (optimum + route) is the contract here.
         let _ = &reports;
+    }
+
+    #[test]
+    fn stopped_routing_construction_returns_a_clean_unknown_outcome() {
+        let dist = vec![vec![0, 10, 15, 20], vec![10, 0, 35, 25], vec![15, 35, 0, 30], vec![20, 25, 30, 0]];
+        let mut arena = ExprArena::default();
+        let i = arena.arg(0);
+        let j = arena.arg(1);
+        let body = arena.matrix(Arc::new(dist), i, j);
+        let model = CollectionModel {
+            items: vec![1, 2, 3],
+            lists: 1,
+            objectives: vec![ObjectiveTier {
+                minimize: true,
+                terms: vec![Reduction {
+                    op: ReduceOp::Sum,
+                    iterable: Iterable::Edges { list: 0, start: 0, end: 0 },
+                    arena,
+                    body,
+                    coeff: 1,
+                }],
+                max_terms: None,
+            }],
+            constraints: Vec::new(),
+            globals: Vec::new(),
+            schedule: None,
+        };
+        // A compiled routing blueprint contains every capability decision but
+        // materializes its mutable solver only when execution starts. A
+        // pre-armed execution stop must return a clean UNKNOWN outcome.
+        let spec = RoutingSpec::from_model(&model).expect("supported route shape");
+        let compiled = CompiledRouting { spec, options: RoutingOptions::default() };
+
+        let stop = AtomicBool::new(true);
+        let outcome = solve_compiled(&compiled, 0, &stop, None, &mut |_| {});
+
+        assert!(!outcome.complete);
+        assert!(!outcome.solution.feasible);
+        assert_eq!(outcome.solution.lists, vec![Vec::<i32>::new()]);
+        assert!(outcome.solution.objectives.is_empty());
+        assert_eq!(outcome.improvements, 0);
     }
 
     #[test]
@@ -2097,7 +2377,8 @@ mod tests {
 
     fn cdcl_successor_set(model: &CollectionModel) -> BTreeSet<Vec<i32>> {
         let spec = RoutingSpec::from_model(model).expect("supported route lowering");
-        let mut lowered = spec.lower(RoutingOptions::default());
+        let stop = AtomicBool::new(false);
+        let mut lowered = spec.lower(RoutingOptions::default(), &stop).expect("route lowering completes");
         let n = lowered.nodes.len();
         let mut out = BTreeSet::new();
         search::solve(&mut lowered.solver, &lowered.search_vars, |solver| {
@@ -2654,12 +2935,10 @@ mod tests {
         assert_eq!(outcome.solution.objectives, vec![brute], "duplicate scans are idempotent");
     }
 
-    // --- dispatch (classifier agrees with the engine) ---------------------------
-
-    use crate::model::classify::{Backend, BackendSelection, ModelClass};
+    // --- compiler capability ----------------------------------------------------
 
     /// A two-route edge-objective model carrying one scan constraint builder per
-    /// route, for classifier dispatch checks.
+    /// route, for routing compiler checks.
     fn scan_dispatch_model(scan: impl Fn(usize) -> Option<Constraint>) -> CollectionModel {
         let dist_arc = Arc::new(line_dist(&[0, 2, 4, 6, 8]));
         let mut constraints = Vec::new();
@@ -2691,33 +2970,31 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_supported_scan_routes_to_integer_exact() {
+    fn compiler_accepts_supported_scan() {
         let model = scan_dispatch_model(|l| Some(tw_scan_constraint(l)));
-        let selection = BackendSelection::for_collection(&model);
-        assert_eq!(selection.class, ModelClass::Routing);
-        assert_eq!(selection.backend, Backend::IntegerExact, "a homogeneous lowerable scan routes to the exact engine");
+        assert!(RoutingSpec::from_model(&model).is_some());
     }
 
     #[test]
-    fn dispatch_multiple_homogeneous_scans_route_to_integer_exact() {
+    fn compiler_accepts_multiple_homogeneous_scans() {
         // Each route carries two identical scans: still homogeneous, still exact.
         let model = scan_dispatch_model(|l| Some(tw_scan_constraint(l)));
         let mut model = model;
         for l in 0..2 {
             model.constraints.push(tw_scan_constraint(l));
         }
-        assert_eq!(BackendSelection::for_collection(&model).backend, Backend::IntegerExact);
+        assert!(RoutingSpec::from_model(&model).is_some());
     }
 
     #[test]
-    fn dispatch_non_homogeneous_scan_falls_back_to_ls() {
+    fn compiler_rejects_non_homogeneous_scan() {
         // Scan on route 0 only: route-specific, so unsafe under depot symmetry.
         let model = scan_dispatch_model(|l| (l == 0).then(|| tw_scan_constraint(l)));
-        assert_eq!(BackendSelection::for_collection(&model).backend, Backend::ListLocalSearch);
+        assert!(RoutingSpec::from_model(&model).is_none());
     }
 
     #[test]
-    fn dispatch_acc_in_divisor_scan_falls_back_to_ls() {
+    fn compiler_rejects_accumulator_in_divisor() {
         let divisor_scan = |l: usize| {
             let mut arena = ExprArena::default();
             let cur = arena.arg(0);
@@ -2736,11 +3013,11 @@ mod tests {
                 rhs: 0,
             })
         };
-        assert_eq!(BackendSelection::for_collection(&scan_dispatch_model(divisor_scan)).backend, Backend::ListLocalSearch);
+        assert!(RoutingSpec::from_model(&scan_dispatch_model(divisor_scan)).is_none());
     }
 
     #[test]
-    fn dispatch_zero_capable_divisor_scan_falls_back_to_ls() {
+    fn compiler_rejects_zero_capable_divisor_scan() {
         // `emit = cur / rate[cur]` with `rate[1] == 0`: LS reads the zero divisor
         // as the value 0, but the kernel `Div` makes that stop infeasible, so the
         // two engines would disagree. The scan must fall back to LS, not lower.
@@ -2764,11 +3041,11 @@ mod tests {
                 rhs: 100,
             })
         };
-        assert_eq!(BackendSelection::for_collection(&scan_dispatch_model(zero_div)).backend, Backend::ListLocalSearch);
+        assert!(RoutingSpec::from_model(&scan_dispatch_model(zero_div)).is_none());
     }
 
     #[test]
-    fn dispatch_nonzero_const_divisor_scan_stays_exact() {
+    fn compiler_accepts_nonzero_const_divisor_scan() {
         // The div guard must not over-reject: dividing by a nonzero constant lowers
         // cleanly (div-by-const with the accumulator in the numerator is supported).
         let const_div = |l: usize| {
@@ -2791,11 +3068,11 @@ mod tests {
                 rhs: 100,
             })
         };
-        assert_eq!(BackendSelection::for_collection(&scan_dispatch_model(const_div)).backend, Backend::IntegerExact);
+        assert!(RoutingSpec::from_model(&scan_dispatch_model(const_div)).is_some());
     }
 
     #[test]
-    fn dispatch_oversized_table_scan_falls_back_to_ls() {
+    fn compiler_rejects_oversized_table_scan() {
         // A table value beyond the i32-safe band could overflow the kernel's plain
         // i64 `Expr::eval` on an intermediate (LS saturates), so the scan falls back.
         let big_table = |l: usize| {
@@ -2817,7 +3094,7 @@ mod tests {
                 rhs: 100,
             })
         };
-        assert_eq!(BackendSelection::for_collection(&scan_dispatch_model(big_table)).backend, Backend::ListLocalSearch);
+        assert!(RoutingSpec::from_model(&scan_dispatch_model(big_table)).is_none());
     }
 
     #[test]
@@ -2849,7 +3126,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_select_kth_scan_falls_back_to_ls() {
+    fn compiler_rejects_select_kth_scan() {
         let kth_scan = |l: usize| {
             let mut arena = ExprArena::default();
             let cur = arena.arg(0);
@@ -2868,11 +3145,11 @@ mod tests {
                 rhs: 0,
             })
         };
-        assert_eq!(BackendSelection::for_collection(&scan_dispatch_model(kth_scan)).backend, Backend::ListLocalSearch);
+        assert!(RoutingSpec::from_model(&scan_dispatch_model(kth_scan)).is_none());
     }
 
     #[test]
-    fn dispatch_out_of_i32_range_scan_falls_back_to_ls() {
+    fn compiler_rejects_out_of_i32_range_scan() {
         // acc multiplies by 100000 each step, leaving the i32-safe band immediately.
         let huge_scan = |l: usize| {
             let mut arena = ExprArena::default();
@@ -2892,7 +3169,7 @@ mod tests {
                 rhs: 0,
             })
         };
-        assert_eq!(BackendSelection::for_collection(&scan_dispatch_model(huge_scan)).backend, Backend::ListLocalSearch);
+        assert!(RoutingSpec::from_model(&scan_dispatch_model(huge_scan)).is_none());
     }
 
     // --- optional-list pool oracles (G9) ----------------------------------------
@@ -3167,18 +3444,20 @@ mod tests {
     #[test]
     fn pool_scale_proves_optimal_where_enumeration_times_out() {
         // 12 customers + a pool, every served edge strictly positive. Enumeration
-        // cannot exhaust the ordered partitions within a short budget (SATISFIABLE,
-        // best-found still positive); the integer path proves the optimum is 0 (pool
-        // everything) from the non-negative edge bound. This is the scale win: an
-        // instance enumeration cannot close but the integer path proves OPTIMAL.
+        // cannot exhaust the ordered partitions within a short budget and returns
+        // UNKNOWN; the integer path proves the optimum is 0 (pool everything) from
+        // the non-negative edge bound. This is the scale win: an instance
+        // enumeration cannot close but the integer path proves OPTIMAL.
         let count = 12usize;
         let positions: Vec<i64> = (0..=count as i64).collect();
         let dist = line_dist(&positions);
         let items: Vec<i32> = (1..=count as i32).collect();
         let model = pool_edge_model(items, &Arc::new(dist), 1);
 
-        // Enumeration under a short wall-clock budget: it finds a plan but cannot
-        // prove optimality (10! ordered partitions).
+        // Enumeration under a short wall-clock budget cannot finish the exact
+        // search (10! ordered partitions). The interruption contract discards
+        // an in-flight enumeration result, so it returns UNKNOWN rather than a
+        // partially replayed incumbent.
         let tiers = crate::model::list_objective_tiers(&model.objectives, &model.items).expect("objective parses");
         let enum_stop = Arc::new(AtomicBool::new(false));
         {
@@ -3191,7 +3470,8 @@ mod tests {
         let enum_start = std::time::Instant::now();
         let enum_out = crate::engines::list_exact::solve(&model, &tiers, &enum_stop, |_| {}).expect("runs").expect("supported");
         let enum_elapsed = enum_start.elapsed();
-        assert_eq!(enum_out.status, crate::engines::list_exact::Status::Satisfiable, "enumeration cannot prove optimality in the budget");
+        assert_eq!(enum_out.status, crate::engines::list_exact::Status::Unknown, "interrupted enumeration cannot prove optimality");
+        assert!(enum_out.solution.is_none(), "an interrupted exact enumeration does not publish a partial assignment");
 
         // Integer path: proves OPTIMAL. A safety timeout turns a hang into a clear
         // failure rather than blocking CI.
@@ -3208,22 +3488,14 @@ mod tests {
         let int_elapsed = int_start.elapsed();
         assert!(outcome.complete, "the integer path proves optimality");
         assert_eq!(outcome.solution.objectives[0], 0, "pooling every customer is optimal");
-        assert!(
-            outcome.solution.objectives[0] <= enum_out.objectives[0],
-            "the proven optimum is no worse than enumeration's un-proven incumbent"
-        );
         eprintln!(
-            "SCALE pool: enumeration SATISFIABLE in {:?}, integer OPTIMAL ({}) in {:?}",
+            "SCALE pool: enumeration UNKNOWN in {:?}, integer OPTIMAL ({}) in {:?}",
             enum_elapsed, outcome.solution.objectives[0], int_elapsed
         );
     }
 
     #[test]
-    fn pool_classify_and_from_model_agree() {
-        // Lockstep: classify-IntegerExact <=> RoutingSpec::from_model.is_some(), over
-        // a battery covering the pool shapes and the must-enumerate exclusions. The
-        // shared parse plus this test plus the enumeration fall-through mean a gap
-        // can never yield a wrong optimum -- only the exact enumeration optimum.
+    fn pool_compiler_accepts_only_supported_shapes() {
         let dist4 = Arc::new(vec![vec![0, 7, 9, 8], vec![7, 0, 5, 6], vec![9, 5, 0, 4], vec![8, 6, 4, 0]]);
         let dist_line = Arc::new(line_dist(&[0, 2, 4, 6, 8]));
         let demand = Arc::new(vec![0i64, 1, 1, 1, 1]);
@@ -3251,14 +3523,12 @@ mod tests {
             closed_tsp_model(vec![1, 2, 3], 0, &dist4),                                   // non-pool TSP
         ];
 
-        for model in &battery {
-            let classify_integer = BackendSelection::for_collection(model).backend == Backend::IntegerExact;
-            let engine_lowers = RoutingSpec::from_model(model).is_some();
-            assert_eq!(classify_integer, engine_lowers, "classifier and engine must agree on lowerability");
+        let expected = [true, true, true, true, true, false, false, true];
+        for (model, expected) in battery.iter().zip(expected) {
+            assert_eq!(RoutingSpec::from_model(model).is_some(), expected);
         }
-        // The two exclusions really are excluded, and really do route to enumeration.
+        // The two exclusions are handled by another already-compiled candidate.
         assert!(RoutingSpec::from_model(&battery[5]).is_none(), "pool + capacity is not integer-lowerable");
-        assert_eq!(BackendSelection::for_collection(&battery[5]).backend, Backend::DomainExact, "pool + capacity routes to enumeration");
         assert!(RoutingSpec::from_model(&battery[6]).is_none(), "route-specific scan is not integer-lowerable");
     }
 

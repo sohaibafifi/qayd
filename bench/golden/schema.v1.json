@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qayd.invalid/schemas/golden-manifest-v1.json",
+  "title": "qayd architecture golden manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "corpus_version", "description", "prepare", "cases"],
+  "properties": {
+    "schema": {"const": "qayd.golden.manifest/v1"},
+    "corpus_version": {"type": "string", "minLength": 1},
+    "description": {"type": "string"},
+    "prepare": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/command"}
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/case"}
+    }
+  },
+  "$defs": {
+    "command": {
+      "type": "object",
+      "required": ["id", "argv"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string"}
+        },
+        "timeout_seconds": {"type": "integer", "minimum": 1},
+        "allowed_exit_codes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "integer"}
+        }
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "surface", "tags", "instance", "request", "parser", "oracle", "expected"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
+        "surface": {"type": "string", "minLength": 1},
+        "equivalence_group": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
+        "tags": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "instance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "sha256"],
+          "properties": {
+            "path": {"type": "string", "minLength": 1},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        "request": {"$ref": "#/$defs/request"},
+        "parser": {
+          "enum": ["structured-json", "xcsp", "flatzinc", "sat", "pb"]
+        },
+        "oracle": {
+          "type": "object",
+          "required": ["kind"],
+          "properties": {
+            "kind": {"enum": ["finite-domain", "cnf", "python-spec"]},
+            "model": {"type": "object"}
+          }
+        },
+        "expected": {"$ref": "#/$defs/semanticRecord"}
+      }
+    },
+    "request": {
+      "type": "object",
+      "required": ["argv", "threads", "budget", "objective_senses", "execution_timeout_seconds", "allowed_exit_codes"],
+      "properties": {
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string"}
+        },
+        "seed": {"type": ["integer", "null"], "minimum": 0},
+        "threads": {"type": "integer", "minimum": 1},
+        "engine": {"enum": ["auto", "exact", "ls"]},
+        "budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "wall_time_seconds", "max_iterations"],
+          "properties": {
+            "kind": {"const": "complete"},
+            "wall_time_seconds": {"type": "null"},
+            "max_iterations": {"type": "null"}
+          }
+        },
+        "objective_senses": {
+          "type": "array",
+          "items": {"enum": ["minimize", "maximize"]}
+        },
+        "execution_timeout_seconds": {"type": "integer", "minimum": 1},
+        "allowed_exit_codes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "integer"}
+        }
+      }
+    },
+    "semanticRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "senses", "objectives", "solution", "validity", "bound", "gap", "proof"],
+      "properties": {
+        "status": {
+          "enum": ["SATISFIABLE", "UNSATISFIABLE", "OPTIMAL", "UNKNOWN", "UNSUPPORTED"]
+        },
+        "senses": {
+          "type": "array",
+          "items": {"enum": ["minimize", "maximize"]}
+        },
+        "objectives": {
+          "type": "array",
+          "items": {"type": "integer"}
+        },
+        "solution": {"type": ["object", "null"]},
+        "validity": {"type": "boolean"},
+        "bound": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["values", "source"],
+              "properties": {
+                "values": {
+                  "type": "array",
+                  "items": {"type": "integer"}
+                },
+                "source": {"type": "string", "minLength": 1}
+              }
+            }
+          ]
+        },
+        "gap": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["absolute", "relative"],
+              "properties": {
+                "absolute": {"type": "integer", "minimum": 0},
+                "relative": {"type": "number", "minimum": 0}
+              }
+            }
+          ]
+        },
+        "proof": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "required": ["claim", "kind", "verified"],
+              "properties": {
+                "claim": {"enum": ["optimality", "unsatisfiability"]},
+                "kind": {"type": "string", "minLength": 1},
+                "verified": {"const": true},
+                "artifact_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

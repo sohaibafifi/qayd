@@ -1,38 +1,29 @@
 //! `qayd-sat`: a minimal DIMACS CNF front-end for `qayd`.
 
-use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use qayd_sat::proof::{ProofFormat, ProofWriter};
-use qayd_sat::{
-    assignment_satisfies, parse_dimacs, solve_cnf_native_seeded_with_proof_options, solve_cnf_with_backend_seeded_options,
-    PreprocessOptions, SatBackend, SatResult, Status,
+use qayd::model::{BoolLiteral, Constraint, Model, ModelObject, ModelPackage};
+use qayd::orchestrator::{
+    IgnoreEvents, SatBackendMode, SatControls, SatPreprocess, SolveError, SolveLimits, SolveMode, SolveRequest, SolveResult, SolveStatus,
 };
+use qayd_sat::{assignment_satisfies, parse_dimacs};
 
 struct Options {
     verbose: bool,
     time_limit: Option<Duration>,
     memory_limit_mb: Option<u64>,
     competition: bool,
-    backend: SatBackend,
+    backend: SatBackendMode,
     seed: u64,
-    preprocess: PreprocessOptions,
+    preprocess: SatPreprocess,
     proof: Option<String>,
 }
 
 fn main() {
     let (opts, path) = parse_args();
-    if let Some(limit) = opts.memory_limit_mb {
-        set_memory_limit(limit).unwrap_or_else(|e| {
-            eprintln!("error: cannot apply memory limit: {e}");
-            std::process::exit(1);
-        });
-    }
-
     let input = match path {
         Some(path) => std::fs::read_to_string(&path).unwrap_or_else(|e| {
             eprintln!("error: cannot read {path}: {e}");
@@ -55,45 +46,57 @@ fn main() {
 
     let stop = Arc::new(AtomicBool::new(false));
     install_signal_handler(&stop, opts.verbose);
-    if let Some(limit) = opts.time_limit {
-        let flag = Arc::clone(&stop);
-        thread::spawn(move || {
-            thread::sleep(limit);
-            flag.store(true, Ordering::Relaxed);
-        });
-    }
-
-    let start = Instant::now();
-    let result = solve_with_options(&cnf, &stop, &opts);
-    print_result(&cnf, &result);
+    let request = SolveRequest {
+        mode: SolveMode::Exact,
+        seed: opts.seed,
+        limits: SolveLimits {
+            time: opts.time_limit,
+            memory_bytes: opts.memory_limit_mb.map(|mb| mb.saturating_mul(1024).saturating_mul(1024)),
+            ..SolveLimits::default()
+        },
+        sat: SatControls { backend: Some(opts.backend), preprocess: opts.preprocess, proof_path: opts.proof.clone() },
+        ..SolveRequest::default()
+    };
+    let package = semantic_package(&cnf);
+    let mut events = IgnoreEvents;
+    let result = qayd::solve_with_stop(&package, &request, Arc::clone(&stop), &mut events).unwrap_or_else(|error| {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    });
+    print_result(&cnf, &result).unwrap_or_else(|error| {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    });
     if opts.verbose {
+        let report = result.reports().first();
+        let stats = result.aggregate_search_stats();
         eprintln!(
             "c time={:.3}s nodes={} failures={} solutions={} learned_lits={} binary_visits={} watched_visits={} watched_scans={} binary_props={} pre_rounds={} pre_in={} pre_out={} pre_dup_lits={} pre_taut={} pre_units={} pre_pure={} pre_subsumed={} pre_ssr_lits={} pre_bve_vars={} pre_bve_resolvents={} pre_blocked={}",
-            start.elapsed().as_secs_f64(),
-            result.stats.nodes,
-            result.stats.failures,
-            result.stats.solutions,
-            result.stats.learned_lits,
-            result.stats.binary_clause_visits,
-            result.stats.watched_clause_visits,
-            result.stats.watched_literal_scans,
-            result.stats.binary_implications,
-            result.preprocess.rounds,
-            result.preprocess.input_clauses,
-            result.preprocess.output_clauses,
-            result.preprocess.duplicate_literals,
-            result.preprocess.tautological_clauses,
-            result.preprocess.unit_assignments,
-            result.preprocess.pure_assignments,
-            result.preprocess.subsumed_clauses,
-            result.preprocess.self_subsumed_literals,
-            result.preprocess.bve_variables,
-            result.preprocess.bve_resolvents,
-            result.preprocess.blocked_clauses,
+            result.elapsed().as_secs_f64(),
+            stats.nodes,
+            stats.failures,
+            stats.solutions,
+            stats.learned_lits,
+            stats.binary_clause_visits,
+            stats.watched_clause_visits,
+            stats.watched_literal_scans,
+            stats.binary_implications,
+            metadata_counter(report, "pre_rounds"),
+            metadata_counter(report, "pre_in"),
+            metadata_counter(report, "pre_out"),
+            metadata_counter(report, "pre_dup_lits"),
+            metadata_counter(report, "pre_taut"),
+            metadata_counter(report, "pre_units"),
+            metadata_counter(report, "pre_pure"),
+            metadata_counter(report, "pre_subsumed"),
+            metadata_counter(report, "pre_ssr_lits"),
+            metadata_counter(report, "pre_bve_vars"),
+            metadata_counter(report, "pre_bve_resolvents"),
+            metadata_counter(report, "pre_blocked"),
         );
     }
     if opts.competition {
-        std::process::exit(competition_exit_code(result.status));
+        std::process::exit(competition_exit_code(result.status()));
     }
 }
 
@@ -103,9 +106,9 @@ fn parse_args() -> (Options, Option<String>) {
         time_limit: None,
         memory_limit_mb: None,
         competition: false,
-        backend: SatBackend::Native,
+        backend: SatBackendMode::Native,
         seed: 0,
-        preprocess: PreprocessOptions::default(),
+        preprocess: SatPreprocess::Basic,
         proof: None,
     };
     let mut path = None;
@@ -114,9 +117,9 @@ fn parse_args() -> (Options, Option<String>) {
         match arg.as_str() {
             "-v" | "--verbose" => opts.verbose = true,
             "--competition" => opts.competition = true,
-            "--native" => opts.backend = SatBackend::Native,
-            "--linear" => opts.backend = SatBackend::Linear,
-            "--no-preprocess" => opts.preprocess = PreprocessOptions::off(),
+            "--native" => opts.backend = SatBackendMode::Native,
+            "--linear" => opts.backend = SatBackendMode::Linear,
+            "--no-preprocess" => opts.preprocess = SatPreprocess::Off,
             "--preprocess" => {
                 let level = args.next().unwrap_or_else(|| {
                     eprintln!("error: --preprocess expects off, basic, or full");
@@ -198,7 +201,7 @@ fn print_usage() {
 fn install_signal_handler(stop: &Arc<AtomicBool>, verbose: bool) {
     let flag = Arc::clone(stop);
     if let Err(err) = ctrlc::set_handler(move || {
-        flag.store(true, Ordering::Relaxed);
+        flag.store(true, Ordering::Release);
     }) {
         if verbose {
             eprintln!("c signal_handler=unavailable reason={err}");
@@ -206,80 +209,86 @@ fn install_signal_handler(stop: &Arc<AtomicBool>, verbose: bool) {
     }
 }
 
-fn competition_exit_code(status: Status) -> i32 {
+fn competition_exit_code(status: SolveStatus) -> i32 {
     match status {
-        Status::Satisfiable => 10,
-        Status::Unsatisfiable => 20,
-        Status::Unknown => 0,
+        SolveStatus::Satisfiable => 10,
+        SolveStatus::Unsatisfiable => 20,
+        SolveStatus::Optimal | SolveStatus::Unknown | SolveStatus::Unsupported => 0,
     }
 }
 
-#[cfg(target_os = "linux")]
-fn set_memory_limit(memory_limit_mb: u64) -> io::Result<()> {
-    let bytes = memory_limit_mb.saturating_mul(1024).saturating_mul(1024);
-    let mut current = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-    let get_rc = unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut current) };
-    if get_rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let requested = bytes as libc::rlim_t;
-    if current.rlim_max != libc::RLIM_INFINITY && requested > current.rlim_max {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("requested limit exceeds hard limit {}", current.rlim_max)));
-    }
-    let limit = libc::rlimit { rlim_cur: requested, rlim_max: current.rlim_max };
-    let rc = unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn set_memory_limit(_memory_limit_mb: u64) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "--memory-mb is only supported on Linux"))
-}
-
-fn parse_preprocess_level(level: &str) -> Option<PreprocessOptions> {
+fn parse_preprocess_level(level: &str) -> Option<SatPreprocess> {
     match level {
-        "off" => Some(PreprocessOptions::off()),
-        "basic" => Some(PreprocessOptions::basic()),
-        "full" => Some(PreprocessOptions::full()),
+        "off" => Some(SatPreprocess::Off),
+        "basic" => Some(SatPreprocess::Basic),
+        "full" => Some(SatPreprocess::Full),
         _ => None,
     }
 }
 
-fn solve_with_options(cnf: &qayd_sat::Cnf, stop: &AtomicBool, opts: &Options) -> SatResult {
-    let Some(path) = opts.proof.as_deref() else {
-        return solve_cnf_with_backend_seeded_options(cnf, stop, opts.backend, opts.seed, opts.preprocess);
-    };
-    if opts.backend != SatBackend::Native {
-        eprintln!("error: --proof requires --native");
-        std::process::exit(1);
+fn semantic_package(cnf: &qayd_sat::Cnf) -> ModelPackage {
+    let mut model = Model::new();
+    let variables = (0..cnf.vars).map(|_| model.bool_var()).collect::<Vec<_>>();
+    for clause in &cnf.clauses {
+        model.add_constraint(Constraint::Clause(
+            clause
+                .iter()
+                .map(|literal| BoolLiteral { variable: variables[literal.unsigned_abs() as usize - 1], positive: *literal > 0 })
+                .collect(),
+        ));
     }
-
-    let file = File::create(path).unwrap_or_else(|e| {
-        eprintln!("error: cannot create proof file {path}: {e}");
-        std::process::exit(1);
-    });
-    let mut proof = ProofWriter::new(BufWriter::new(file), ProofFormat::Drat);
-    solve_cnf_native_seeded_with_proof_options(cnf, stop, opts.seed, opts.preprocess, &mut proof).unwrap_or_else(|e| {
-        eprintln!("error: cannot write proof file {path}: {e}");
-        std::process::exit(1);
-    })
+    let mut package = ModelPackage::new(model);
+    for (index, variable) in variables.into_iter().enumerate() {
+        let object = ModelObject::IntVar(variable);
+        let name = (index + 1).to_string();
+        package.metadata.names.insert(object, name.clone());
+        package.metadata.frontend_ids.insert(("dimacs".to_string(), name), object);
+        package.metadata.outputs.push(object);
+    }
+    package
 }
 
-fn print_result(cnf: &qayd_sat::Cnf, result: &SatResult) {
-    match result.status {
-        Status::Satisfiable => {
-            let assignment = result.assignment.as_deref().expect("SAT result has an assignment");
-            debug_assert!(assignment_satisfies(cnf, assignment));
+fn print_result(cnf: &qayd_sat::Cnf, result: &SolveResult) -> Result<(), SolveError> {
+    match result.status() {
+        SolveStatus::Satisfiable => {
+            let candidate =
+                result.primal().ok_or_else(|| SolveError::InvalidResult("SAT result has no verified assignment".to_string()))?;
+            if candidate.assignment().integers.len() != cnf.vars {
+                return Err(SolveError::InvalidResult(format!(
+                    "verified SAT assignment has {} variables, expected {}",
+                    candidate.assignment().integers.len(),
+                    cnf.vars
+                )));
+            }
+            let assignment = candidate
+                .assignment()
+                .integers
+                .iter()
+                .map(|value| match value {
+                    Some(0) => Ok(false),
+                    Some(1) => Ok(true),
+                    Some(value) => Err(SolveError::InvalidResult(format!("verified SAT variable has non-Boolean value {value}"))),
+                    None => Err(SolveError::InvalidResult("verified SAT assignment contains an unassigned variable".to_string())),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            debug_assert!(assignment_satisfies(cnf, &assignment));
             println!("s SATISFIABLE");
-            print_assignment(assignment);
+            print_assignment(&assignment);
         }
-        Status::Unsatisfiable => println!("s UNSATISFIABLE"),
-        Status::Unknown => println!("s UNKNOWN"),
+        SolveStatus::Unsatisfiable => println!("s UNSATISFIABLE"),
+        SolveStatus::Unknown => println!("s UNKNOWN"),
+        SolveStatus::Unsupported => println!("s UNSUPPORTED"),
+        SolveStatus::Optimal => {
+            return Err(SolveError::InvalidResult("SAT decision frontend received an optimization result".to_string()));
+        }
     }
+    Ok(())
+}
+
+fn metadata_counter(report: Option<&qayd::orchestrator::EngineReport>, key: &str) -> u64 {
+    report
+        .and_then(|report| report.metadata.iter().find_map(|(name, value)| if name == key { value.parse().ok() } else { None }))
+        .unwrap_or(0)
 }
 
 fn print_assignment(assignment: &[bool]) {

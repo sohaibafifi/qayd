@@ -19,11 +19,31 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Test
-        run: cargo test
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test Rust workspace
+        run: cargo test --workspace
+
+      - name: Build Python extension
+        run: uv run maturin develop --profile pyext
+
+      - name: Test Python API
+        run: uv run python -m pytest tests/python
+
+      - name: Test golden harness
+        run: python3 -m unittest discover -s bench/golden -p 'test_*.py'
+
+      - name: Test parallel regression harness
+        run: python3 -m unittest discover -s tests/python -p 'test_parallel_regression.py'
+
+      - name: Run architecture goldens
+        run: uv run python bench/golden/run.py
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Clippy Python extension
-        run: cargo clippy --all-targets --features python -- -D warnings
+        run: cargo clippy --workspace --all-targets --features python -- -D warnings

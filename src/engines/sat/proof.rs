@@ -1,7 +1,7 @@
 //! SAT proof output helpers.
 //!
 //! This module owns only proof-file syntax. Solver integration and preprocessing
-//! proof steps live in the SAT front-end and the LCG trail.
+//! proof steps live in the core SAT engine and the LCG trail.
 
 use std::io::{self, Write};
 

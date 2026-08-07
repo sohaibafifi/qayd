@@ -293,13 +293,7 @@ pub fn first_solution_assuming(solver: &mut Solver, vars: &[VarId], assumptions:
     decide_sat_assuming_seeded(solver, vars, assumptions, &NEVER_STOP, 0, None, None, Vec::new(), Vec::new())
 }
 
-/// Find one solution over `vars`, or prove UNSAT, with CDCL learning and restarts.
-/// This is not an enumeration driver: it does not count or block all solutions.
-pub(crate) fn decide_sat_seeded(solver: &mut Solver, vars: &[VarId], stop: &AtomicBool, seed: u64) -> (Option<Vec<i32>>, SolveStats, bool) {
-    decide_sat_shared_seeded(solver, vars, stop, seed, None, false)
-}
-
-/// Like [`decide_sat_seeded`], cooperating in a CSP portfolio: learned clauses
+/// Find one solution cooperatively in a CSP portfolio. Learned clauses
 /// (sound model consequences, never solution-blocking) are exchanged through
 /// `clause_sharing`. `fast` picks the shorter restart schedule to diversify
 /// workers. Find-one/UNSAT only - never used for enumeration.

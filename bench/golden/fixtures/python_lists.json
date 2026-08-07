@@ -1,0 +1,15 @@
+{
+  "schema": "qayd.python-golden/v1",
+  "kind": "lists",
+  "items": [1, 2, 3],
+  "list_count": 1,
+  "optional": false,
+  "depot": 0,
+  "travel": [
+    [0, 1, 9, 9],
+    [9, 0, 1, 9],
+    [9, 9, 0, 1],
+    [1, 9, 9, 0]
+  ],
+  "objective": {"kind": "total_distance", "sense": "minimize"}
+}

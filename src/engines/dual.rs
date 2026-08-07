@@ -16,6 +16,8 @@ const COLUMN_DUAL_SCALE: i128 = 1 << 12;
 const MAX_EXACT_PACKING_ITEMS: usize = 35;
 const PACKING_NODE_LIMIT: u64 = 20_000;
 const MAX_ENERGY_INTERVAL_PAIRS: usize = 50_000;
+const MAX_VRPTW_METRIC_NODES: usize = 128;
+const MAX_ROUTING_RELAXATION_NODES: usize = 2_048;
 const INF: i64 = i64::MAX;
 
 /// A certified bound before a primal solution is known.
@@ -37,7 +39,7 @@ pub fn compute(model: &CollectionModel, stop: &AtomicBool) -> Option<DualBound> 
     let mut best = used_list_bound(model, stop).or_else(|| additive_assignment_bound(model, stop));
     if tier.minimize {
         if let Some(routing) = RoutingRelaxation::from_model(model, stop) {
-            best = stronger(best, routing.assignment_bound(), true);
+            best = stronger(best, routing.assignment_bound(stop), true);
             if routing.routes == 1 && routing.symmetric {
                 best = stronger(best, routing.held_karp_bound(stop), true);
             }
@@ -108,7 +110,13 @@ fn additive_assignment_bound(model: &CollectionModel, stop: &AtomicBool) -> Opti
     if tier.max_terms.as_ref().is_some_and(|terms| !terms.is_empty()) || model.lists == 0 {
         return None;
     }
-    let mut contributions = vec![vec![0i128; model.items.len()]; model.lists];
+    let mut contributions = Vec::with_capacity(model.lists);
+    for _ in 0..model.lists {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        contributions.push(vec![0i128; model.items.len()]);
+    }
     let mut magnitude = 0i128;
     for reduction in &tier.terms {
         if stop.load(Ordering::Relaxed)
@@ -122,6 +130,9 @@ fn additive_assignment_bound(model: &CollectionModel, stop: &AtomicBool) -> Opti
             return None;
         }
         for (item_index, &item) in model.items.iter().enumerate() {
+            if item_index.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+                return None;
+            }
             let raw = i128::from(eval_expr(&reduction.arena.exprs, reduction.body, &[i64::from(item)]));
             let value = raw.checked_mul(i128::from(reduction.coeff))?;
             contributions[list][item_index] = contributions[list][item_index].checked_add(value)?;
@@ -165,7 +176,7 @@ fn used_list_bound(model: &CollectionModel, stop: &AtomicBool) -> Option<DualBou
     } else {
         let mut bound = capacity.as_ref().map_or(1, |capacity| capacity.min_routes.max(1));
         let mut method = capacity.as_ref().map_or("used-list relaxation", |capacity| capacity.method);
-        let conflicts = list_conflicts(model, capacity.as_ref());
+        let conflicts = list_conflicts(model, capacity.as_ref(), stop)?;
         if let Some(capacity) = &capacity {
             let candidate = conflict_packing_bound(&capacity.demands, capacity.capacity, &conflicts, stop);
             if candidate > bound {
@@ -173,7 +184,7 @@ fn used_list_bound(model: &CollectionModel, stop: &AtomicBool) -> Option<DualBou
                 method = "conflict-aware bin-packing relaxation";
             }
         }
-        if let Some(vrptw) = VrptwRelaxation::from_model(model, capacity.as_ref()) {
+        if let Some(vrptw) = VrptwRelaxation::from_model(model, capacity.as_ref(), stop) {
             if let Some(candidate) = vrptw.fleet_bound(stop) {
                 if candidate.value >= bound {
                     bound = candidate.value;
@@ -232,7 +243,10 @@ fn capacity_relaxation(model: &CollectionModel, stop: &AtomicBool) -> Option<Cap
         let mut demands = Vec::with_capacity(model.items.len());
         let mut raw_total = 0i128;
         let mut demand_total = 0i128;
-        for &item in &model.items {
+        for (item_index, &item) in model.items.iter().enumerate() {
+            if item_index.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+                return None;
+            }
             let raw = eval_expr(&constraint.reduction.arena.exprs, constraint.reduction.body, &[i64::from(item)]);
             if raw < 0 {
                 demands.clear();
@@ -384,11 +398,20 @@ fn pack_plain(sizes: &[i64], capacity: i64, item: usize, loads: &mut [i64], node
 }
 
 #[allow(clippy::needless_range_loop)]
-fn list_conflicts(model: &CollectionModel, capacity: Option<&CapacityRelaxation>) -> Vec<Vec<bool>> {
+fn list_conflicts(model: &CollectionModel, capacity: Option<&CapacityRelaxation>, stop: &AtomicBool) -> Option<Vec<Vec<bool>>> {
     let count = model.items.len();
-    let mut conflicts = vec![vec![false; count]; count];
+    let mut conflicts = Vec::with_capacity(count);
+    for _ in 0..count {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        conflicts.push(vec![false; count]);
+    }
     if let Some(capacity) = capacity {
         for left in 0..count {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
             for right in left + 1..count {
                 if capacity.demands[left].checked_add(capacity.demands[right]).is_none_or(|sum| sum > capacity.capacity) {
                     conflicts[left][right] = true;
@@ -405,10 +428,16 @@ fn list_conflicts(model: &CollectionModel, capacity: Option<&CapacityRelaxation>
         }
     };
     for constraint in &model.globals {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
         match constraint {
             GlobalConstraint::DifferentList { a, b } | GlobalConstraint::ListDistance { a, b, min: 1.., .. } => mark(*a, *b),
             GlobalConstraint::AllDifferentLists { items } => {
                 for left in 0..items.len() {
+                    if stop.load(Ordering::Relaxed) {
+                        return None;
+                    }
                     for right in left + 1..items.len() {
                         mark(items[left], items[right]);
                     }
@@ -420,35 +449,46 @@ fn list_conflicts(model: &CollectionModel, capacity: Option<&CapacityRelaxation>
             | GlobalConstraint::ListDistance { .. } => {}
         }
     }
-    conflicts
+    Some(conflicts)
 }
 
-fn greedy_clique_bound(conflicts: &[Vec<bool>], active: &[bool]) -> usize {
+fn greedy_clique_bound(conflicts: &[Vec<bool>], active: &[bool], stop: &AtomicBool) -> Option<usize> {
     let mut best = usize::from(active.iter().any(|&enabled| enabled));
     for start in 0..conflicts.len() {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
         if !active[start] {
             continue;
         }
         let mut candidates = (0..conflicts.len()).filter(|&node| active[node] && conflicts[start][node]).collect::<Vec<_>>();
         let mut size = 1usize;
         while !candidates.is_empty() {
-            let (position, &picked) = candidates
-                .iter()
-                .enumerate()
-                .max_by_key(|&(_, &node)| candidates.iter().filter(|&&other| conflicts[node][other]).count())
-                .expect("non-empty candidate set");
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            let mut selected = None;
+            for (position, &node) in candidates.iter().enumerate() {
+                let degree = candidates.iter().filter(|&&other| conflicts[node][other]).count();
+                if selected.is_none_or(|(_, best_degree)| degree > best_degree) {
+                    selected = Some((position, degree));
+                }
+            }
+            let (position, _) = selected.expect("non-empty candidate set");
+            let picked = candidates[position];
             let _ = candidates.swap_remove(position);
             size += 1;
             candidates.retain(|&node| conflicts[picked][node]);
         }
         best = best.max(size);
     }
-    best
+    Some(best)
 }
 
 fn conflict_packing_bound(sizes: &[i64], capacity: i64, conflicts: &[Vec<bool>], stop: &AtomicBool) -> usize {
     let active = sizes.iter().map(|&size| size > 0).collect::<Vec<_>>();
-    let bound = packing_seed_bound(sizes, capacity).max(greedy_clique_bound(conflicts, &active));
+    let seed = packing_seed_bound(sizes, capacity);
+    let bound = seed.max(greedy_clique_bound(conflicts, &active, stop).unwrap_or(seed));
     let mut order = (0..sizes.len()).filter(|&item| active[item]).collect::<Vec<_>>();
     if capacity <= 0 || order.is_empty() || order.len() > MAX_EXACT_PACKING_ITEMS || bound > order.len() {
         return bound;
@@ -627,13 +667,16 @@ fn parse_vrptw_constraint(constraint: &crate::model::list::Constraint) -> Option
 }
 
 impl VrptwRelaxation {
-    fn from_model(model: &CollectionModel, capacity: Option<&CapacityRelaxation>) -> Option<Self> {
+    fn from_model(model: &CollectionModel, capacity: Option<&CapacityRelaxation>, stop: &AtomicBool) -> Option<Self> {
         let capacity = capacity?.clone();
-        if capacity.capacity <= 0 || model.lists == 0 || model.items.is_empty() {
+        if stop.load(Ordering::Relaxed) || capacity.capacity <= 0 || model.lists == 0 || model.items.is_empty() {
             return None;
         }
         let mut by_list = vec![None; model.lists];
         for constraint in &model.constraints {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
             let Some((list, data)) = parse_vrptw_constraint(constraint) else { continue };
             let slot = by_list.get_mut(list)?;
             if slot.as_ref().is_some_and(|known| known != &data) {
@@ -646,7 +689,13 @@ impl VrptwRelaxation {
             return None;
         }
         let depot = usize::try_from(data.depot).ok()?;
-        let node_indices = model.items.iter().map(|&item| usize::try_from(item).ok()).collect::<Option<Vec<_>>>()?;
+        let mut node_indices = Vec::with_capacity(model.items.len());
+        for &item in &model.items {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            node_indices.push(usize::try_from(item).ok()?);
+        }
         let max_node = node_indices.iter().copied().chain(std::iter::once(depot)).max()?;
         if data.earliest.len() <= max_node
             || data.latest.len() <= max_node
@@ -659,6 +708,9 @@ impl VrptwRelaxation {
         }
         let nodes = std::iter::once(depot).chain(node_indices.iter().copied()).collect::<Vec<_>>();
         for &node in &nodes {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
             if data.earliest[node] > data.latest[node] || data.service[node] < 0 || data.travel[node][node] != 0 {
                 return None;
             }
@@ -668,8 +720,14 @@ impl VrptwRelaxation {
                 }
             }
         }
+        if nodes.len() > MAX_VRPTW_METRIC_NODES {
+            return None;
+        }
         for &from in &nodes {
             for &via in &nodes {
+                if stop.load(Ordering::Relaxed) {
+                    return None;
+                }
                 for &to in &nodes {
                     if i128::from(data.travel[from][to]) > i128::from(data.travel[from][via]) + i128::from(data.travel[via][to]) {
                         return None;
@@ -683,8 +741,17 @@ impl VrptwRelaxation {
     #[allow(clippy::needless_range_loop)]
     fn fleet_bound(&self, stop: &AtomicBool) -> Option<FleetBound> {
         let mut best = FleetBound { value: self.capacity.min_routes.max(1), method: self.capacity.method };
-        let mut conflicts = vec![vec![false; self.items.len()]; self.items.len()];
+        let mut conflicts = Vec::with_capacity(self.items.len());
+        for _ in 0..self.items.len() {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            conflicts.push(vec![false; self.items.len()]);
+        }
         for left in 0..self.items.len() {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
             for right in left + 1..self.items.len() {
                 let incompatible =
                     self.capacity.demands[left].checked_add(self.capacity.demands[right]).is_none_or(|sum| sum > self.capacity.capacity)
@@ -741,6 +808,9 @@ impl VrptwRelaxation {
         let states = 1usize.checked_shl(u32::try_from(customers).ok()?)?;
         let mut loads = vec![0i64; states];
         for mask in 1..states {
+            if mask.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+                return None;
+            }
             let bit = mask.trailing_zeros() as usize;
             loads[mask] = loads[mask & (mask - 1)].checked_add(self.capacity.demands[bit])?;
         }
@@ -792,6 +862,9 @@ impl VrptwRelaxation {
         }
         let mut feasible = vec![false; states];
         for mask in 1..states {
+            if mask.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+                return None;
+            }
             if loads[mask] > self.capacity.capacity {
                 continue;
             }
@@ -814,9 +887,18 @@ impl VrptwRelaxation {
         let depot = usize::try_from(self.data.depot).ok()?;
         let count = self.items.len();
         let nodes = (0..count).map(|customer| self.node(customer)).collect::<Option<Vec<_>>>()?;
-        let mut dprime = vec![vec![None; count]; count];
+        let mut dprime = Vec::with_capacity(count);
+        for _ in 0..count {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            dprime.push(vec![None; count]);
+        }
         let mut outgoing = vec![0i128; count];
         for left in 0..count {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
             let from = nodes[left];
             let mut best = i128::from(self.data.travel[from][depot]);
             for right in 0..count {
@@ -840,6 +922,9 @@ impl VrptwRelaxation {
         let mut lst = vec![0i128; count];
         let mut duration = vec![0i128; count];
         for right in 0..count {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
             let node = nodes[right];
             let mut incoming = i128::from(self.data.travel[depot][node]);
             for left in 0..count {
@@ -862,6 +947,9 @@ impl VrptwRelaxation {
         let mut starts = vec![i128::from(self.data.initial_time)];
         let mut ends = vec![i128::from(self.data.latest[depot])];
         for customer in 0..count {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
             starts.extend([est[customer], lst[customer], est[customer] + duration[customer]]);
             ends.extend([lst[customer], est[customer] + duration[customer], lst[customer] + duration[customer]]);
         }
@@ -906,7 +994,8 @@ impl VrptwRelaxation {
                     (i64::try_from(width), work.iter().map(|&value| i64::try_from(value).ok()).collect::<Option<Vec<_>>>())
                 {
                     let active = work.iter().map(|&value| value > 0).collect::<Vec<_>>();
-                    let packing = packing_seed_bound(&work, width).max(greedy_clique_bound(conflicts, &active));
+                    let seed = packing_seed_bound(&work, width);
+                    let packing = seed.max(greedy_clique_bound(conflicts, &active, stop).unwrap_or(seed));
                     if packing > best.value {
                         best.value = packing;
                         best.method = "VRPTW interval-energy/BPPC relaxation";
@@ -937,19 +1026,38 @@ fn covering_dual_bound(feasible: &[bool], customers: usize, stop: &AtomicBool) -
         }
         let mut proposal = dual.clone();
         for offset in 0..customers {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
             let customer = (offset + iteration) % customers;
-            let slack = (1..states)
-                .filter(|&mask| active[mask] && mask & (1usize << customer) != 0)
-                .map(|mask| COLUMN_DUAL_SCALE - subset_sum(mask, &proposal))
-                .min()?;
+            let mut slack = None;
+            for (mask, &is_active) in active.iter().enumerate().take(states).skip(1) {
+                if mask.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+                    return None;
+                }
+                if is_active && mask & (1usize << customer) != 0 {
+                    let value = COLUMN_DUAL_SCALE - subset_sum(mask, &proposal);
+                    slack = Some(slack.map_or(value, |known: i128| known.min(value)));
+                }
+            }
+            let slack = slack?;
             if slack > 0 {
                 proposal[customer] += if iteration % 4 == 3 { slack } else { 3 * slack / 4 };
             }
         }
-        let (priced_mask, reduced_cost) = (1..states)
-            .filter(|&mask| feasible[mask])
-            .map(|mask| (mask, COLUMN_DUAL_SCALE - subset_sum(mask, &proposal)))
-            .min_by_key(|&(_, reduced_cost)| reduced_cost)?;
+        let mut priced = None;
+        for (mask, &is_feasible) in feasible.iter().enumerate().take(states).skip(1) {
+            if mask.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            if is_feasible {
+                let reduced_cost = COLUMN_DUAL_SCALE - subset_sum(mask, &proposal);
+                if priced.is_none_or(|(_, known)| reduced_cost < known) {
+                    priced = Some((mask, reduced_cost));
+                }
+            }
+        }
+        let (priced_mask, reduced_cost) = priced?;
         let shift = reduced_cost.min(0);
         let corrected = proposal.iter().map(|&value| value + shift).collect::<Vec<_>>();
         let corrected_value = corrected.iter().sum::<i128>();
@@ -1007,18 +1115,30 @@ impl RoutingRelaxation {
         let mut nodes = Vec::with_capacity(model.items.len() + 1);
         nodes.push(depot);
         nodes.extend_from_slice(&model.items);
-        let mut reference = None;
+        if nodes.len() > MAX_ROUTING_RELAXATION_NODES {
+            return None;
+        }
+        let mut reference: Option<Vec<Vec<i64>>> = None;
         for reductions in by_list {
             if reductions.iter().any(|reduction| reduction.coeff < 0) {
                 return None;
             }
             let mut max_raw = vec![0i128; reductions.len()];
-            let mut matrix = vec![vec![0i64; nodes.len()]; nodes.len()];
+            let mut matrix = Vec::with_capacity(nodes.len());
+            for _ in 0..nodes.len() {
+                if stop.load(Ordering::Relaxed) {
+                    return None;
+                }
+                matrix.push(vec![0i64; nodes.len()]);
+            }
             for (from_index, &from) in nodes.iter().enumerate() {
                 if stop.load(Ordering::Relaxed) {
                     return None;
                 }
                 for (to_index, &to) in nodes.iter().enumerate() {
+                    if to_index.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+                        return None;
+                    }
                     let mut cost = 0i128;
                     for (reduction_index, reduction) in reductions.iter().enumerate() {
                         let raw = eval_expr(&reduction.arena.exprs, reduction.body, &[i64::from(from), i64::from(to)]);
@@ -1042,8 +1162,13 @@ impl RoutingRelaxation {
                 return None;
             }
             if let Some(reference) = &reference {
-                if reference != &matrix {
-                    return None;
+                for (row_index, (left, right)) in reference.iter().zip(&matrix).enumerate() {
+                    if row_index.is_multiple_of(64) && stop.load(Ordering::Relaxed) {
+                        return None;
+                    }
+                    if left != right {
+                        return None;
+                    }
                 }
             } else {
                 reference = Some(matrix);
@@ -1053,7 +1178,18 @@ impl RoutingRelaxation {
         let max_edges = i128::try_from(model.items.len().saturating_add(model.lists)).ok()?;
         let max_cost = i128::from(costs.iter().flatten().copied().max().unwrap_or(0));
         i64::try_from(max_cost.checked_mul(max_edges)?).ok()?;
-        let symmetric = (0..costs.len()).all(|i| (0..costs.len()).all(|j| costs[i][j] == costs[j][i]));
+        let mut symmetric = true;
+        'symmetry: for (i, row) in costs.iter().enumerate() {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            for (&forward, reverse_row) in row.iter().skip(i + 1).zip(costs.iter().skip(i + 1)) {
+                if forward != reverse_row[i] {
+                    symmetric = false;
+                    break 'symmetry;
+                }
+            }
+        }
         Some(Self { costs, routes: model.lists, symmetric, capacity: capacity_relaxation(model, stop) })
     }
 
@@ -1061,7 +1197,7 @@ impl RoutingRelaxation {
         self.capacity.as_ref().map_or(1, |capacity| capacity.min_routes.max(1))
     }
 
-    fn assignment_bound(&self) -> Option<DualBound> {
+    fn assignment_bound(&self, stop: &AtomicBool) -> Option<DualBound> {
         let customers = self.costs.len().checked_sub(1)?;
         let routes = self.min_routes();
         if routes > customers || routes > self.routes {
@@ -1070,6 +1206,9 @@ impl RoutingRelaxation {
         let mut outgoing = 0i128;
         let mut incoming = 0i128;
         for customer in 1..=customers {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
             outgoing =
                 outgoing.checked_add(i128::from((0..=customers).filter(|&to| to != customer).map(|to| self.costs[customer][to]).min()?))?;
             incoming = incoming
@@ -1094,7 +1233,7 @@ impl RoutingRelaxation {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            let (modified, degrees) = minimum_one_tree(&self.costs, &penalties)?;
+            let (modified, degrees) = minimum_one_tree(&self.costs, &penalties, stop)?;
             let bound = modified.checked_sub(2 * penalties.iter().sum::<i128>())?;
             best = best.max(bound);
             if degrees.iter().all(|&degree| degree == 2) {
@@ -1140,19 +1279,38 @@ impl RoutingRelaxation {
             }
             let mut proposal = dual.clone();
             for offset in 0..customers {
+                if stop.load(Ordering::Relaxed) {
+                    return None;
+                }
                 let customer = (offset + iteration) % customers;
-                let slack = (1..states)
-                    .filter(|&mask| active[mask] && mask & (1usize << customer) != 0)
-                    .map(|mask| i128::from(route_cost[mask]) * COLUMN_DUAL_SCALE - subset_sum(mask, &proposal))
-                    .min()?;
+                let mut slack = None;
+                for mask in 1..states {
+                    if mask.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+                        return None;
+                    }
+                    if active[mask] && mask & (1usize << customer) != 0 {
+                        let value = i128::from(route_cost[mask]) * COLUMN_DUAL_SCALE - subset_sum(mask, &proposal);
+                        slack = Some(slack.map_or(value, |known: i128| known.min(value)));
+                    }
+                }
+                let slack = slack?;
                 if slack > 0 {
                     proposal[customer] += if iteration % 4 == 3 { slack } else { 3 * slack / 4 };
                 }
             }
-            let (priced_mask, reduced_cost) = (1..states)
-                .filter(|&mask| route_cost[mask] != INF)
-                .map(|mask| (mask, i128::from(route_cost[mask]) * COLUMN_DUAL_SCALE - subset_sum(mask, &proposal)))
-                .min_by_key(|&(_, reduced_cost)| reduced_cost)?;
+            let mut priced = None;
+            for (mask, &cost) in route_cost.iter().enumerate().take(states).skip(1) {
+                if mask.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+                    return None;
+                }
+                if cost != INF {
+                    let reduced_cost = i128::from(cost) * COLUMN_DUAL_SCALE - subset_sum(mask, &proposal);
+                    if priced.is_none_or(|(_, known)| reduced_cost < known) {
+                        priced = Some((mask, reduced_cost));
+                    }
+                }
+            }
+            let (priced_mask, reduced_cost) = priced?;
             let shift = reduced_cost.min(0);
             let feasible = proposal.iter().map(|&value| value + shift).collect::<Vec<_>>();
             let feasible_value = feasible.iter().sum::<i128>();
@@ -1169,7 +1327,7 @@ impl RoutingRelaxation {
     }
 }
 
-fn minimum_one_tree(costs: &[Vec<i64>], penalties: &[i128]) -> Option<(i128, Vec<i32>)> {
+fn minimum_one_tree(costs: &[Vec<i64>], penalties: &[i128], stop: &AtomicBool) -> Option<(i128, Vec<i32>)> {
     let customers = costs.len().checked_sub(1)?;
     if customers == 0 {
         return Some((0, vec![0]));
@@ -1183,6 +1341,9 @@ fn minimum_one_tree(costs: &[Vec<i64>], penalties: &[i128]) -> Option<(i128, Vec
         let mut parent = vec![0usize; costs.len()];
         key[1] = 0;
         for _ in 0..customers {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
             let node = (1..costs.len()).filter(|&node| !included[node]).min_by_key(|&node| key[node])?;
             included[node] = true;
             if node != 1 {
@@ -1221,6 +1382,9 @@ fn route_columns(costs: &[Vec<i64>], demands: &[i64], capacity: i64, stop: &Atom
     let states = 1usize.checked_shl(u32::try_from(customers).ok()?)?;
     let mut loads = vec![0i64; states];
     for mask in 1..states {
+        if mask.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+            return None;
+        }
         let bit = mask.trailing_zeros() as usize;
         loads[mask] = loads[mask & (mask - 1)].checked_add(demands[bit])?;
     }
@@ -1258,6 +1422,9 @@ fn route_columns(costs: &[Vec<i64>], demands: &[i64], capacity: i64, stop: &Atom
     }
     let mut route_cost = vec![INF; states];
     for mask in 1..states {
+        if mask.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+            return None;
+        }
         if loads[mask] > capacity {
             continue;
         }
@@ -1281,29 +1448,53 @@ fn schedule_bound(schedule: &crate::model::list::Schedule, stop: &AtomicBool) ->
     if !schedule.minimize_makespan || schedule.intervals.is_empty() {
         return None;
     }
-    let durations = schedule
-        .intervals
-        .iter()
-        .map(|interval| {
-            if interval.optional {
-                0
-            } else if interval.modes.is_empty() {
-                interval.duration
-            } else {
-                interval.modes.iter().map(|mode| mode.duration).min().unwrap_or(0)
+    let mut durations = Vec::with_capacity(schedule.intervals.len());
+    for interval in &schedule.intervals {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        durations.push(if interval.optional {
+            0
+        } else if interval.modes.is_empty() {
+            interval.duration
+        } else {
+            let mut shortest = i64::MAX;
+            for (mode_index, mode) in interval.modes.iter().enumerate() {
+                if mode_index.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+                    return None;
+                }
+                shortest = shortest.min(mode.duration);
             }
-        })
-        .collect::<Vec<_>>();
-    let mut outgoing = vec![Vec::new(); durations.len()];
+            shortest
+        });
+    }
+    let mut outgoing = Vec::with_capacity(durations.len());
+    for _ in 0..durations.len() {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        outgoing.push(Vec::new());
+    }
     let mut indegree = vec![0usize; durations.len()];
-    for &(before, after) in &schedule.precedences {
+    for (edge, &(before, after)) in schedule.precedences.iter().enumerate() {
+        if edge.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+            return None;
+        }
         if schedule.intervals.get(before)?.optional || schedule.intervals.get(after)?.optional {
             continue;
         }
         outgoing[before].push(after);
         indegree[after] += 1;
     }
-    let mut queue = (0..durations.len()).filter(|&interval| indegree[interval] == 0).collect::<Vec<_>>();
+    let mut queue = Vec::new();
+    for (interval, &degree) in indegree.iter().enumerate().take(durations.len()) {
+        if interval.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        if degree == 0 {
+            queue.push(interval);
+        }
+    }
     let mut earliest = vec![0i64; durations.len()];
     let mut visited = 0usize;
     while let Some(interval) = queue.pop() {
@@ -1323,13 +1514,25 @@ fn schedule_bound(schedule: &crate::model::list::Schedule, stop: &AtomicBool) ->
     if visited != durations.len() {
         return None;
     }
-    let mut bound = earliest.iter().zip(&durations).map(|(&start, &duration)| start.saturating_add(duration)).max().unwrap_or(0);
+    let mut bound = 0i64;
+    for (index, (&start, &duration)) in earliest.iter().zip(&durations).enumerate() {
+        if index.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        bound = bound.max(start.saturating_add(duration));
+    }
     for resource in &schedule.resources {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
         let resource_bound = match resource {
             Resource::NoOverlap(intervals) => {
                 let mut seen = vec![false; durations.len()];
                 let mut total = 0i64;
-                for &interval in intervals {
+                for (index, &interval) in intervals.iter().enumerate() {
+                    if index.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+                        return None;
+                    }
                     if interval >= durations.len() {
                         return None;
                     }
@@ -1341,12 +1544,15 @@ fn schedule_bound(schedule: &crate::model::list::Schedule, stop: &AtomicBool) ->
                 total
             }
             Resource::Cumulative { demands, capacity } if *capacity > 0 => {
-                let energy = demands
-                    .iter()
-                    .filter(|&&(interval, _)| schedule.intervals.get(interval).is_some_and(|spec| !spec.optional))
-                    .try_fold(0i128, |sum, &(interval, demand)| {
-                    sum.checked_add(i128::from(durations[interval]).checked_mul(i128::from(demand))?)
-                })?;
+                let mut energy = 0i128;
+                for (index, &(interval, demand)) in demands.iter().enumerate() {
+                    if index.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+                        return None;
+                    }
+                    if schedule.intervals.get(interval).is_some_and(|spec| !spec.optional) {
+                        energy = energy.checked_add(i128::from(durations[interval]).checked_mul(i128::from(demand))?)?;
+                    }
+                }
                 i64::try_from((energy + i128::from(*capacity) - 1) / i128::from(*capacity)).ok()?
             }
             Resource::Cumulative { .. } | Resource::MachineNoOverlap => 0,

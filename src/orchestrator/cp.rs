@@ -1,0 +1,634 @@
+//! Orchestration adapter for compiled integer and set models.
+
+use std::time::Instant;
+
+use crate::engines::cp::portfolio::{self, RunOptions, SearchGuidance};
+use crate::model::{CompiledCp, Constraint, Model, Relation};
+use crate::problem::Problem;
+use crate::search::SolveStats;
+
+use super::{
+    merge_search_stats, Assignment, Bound, CandidateSolution, EngineKind, EngineReport, EventControl, EventSink, ProofClaim,
+    ProvenConclusion, SolveBudget, SolveError, SolveEvent, SolveMode, SolveRequest, SolveResult, SolveStatus, TerminationReason,
+    VerificationLevel,
+};
+
+#[cfg(test)]
+std::thread_local! {
+    static ROOT_PROBLEM_CLONES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn clone_problem(problem: &Problem) -> Problem {
+    #[cfg(test)]
+    ROOT_PROBLEM_CLONES.set(ROOT_PROBLEM_CLONES.get().saturating_add(1));
+    problem.clone()
+}
+
+#[cfg(test)]
+pub(crate) fn audit_cp_root_problem_clones() -> u64 {
+    ROOT_PROBLEM_CLONES.get()
+}
+
+#[derive(Clone)]
+pub(crate) struct CpSolvePlan {
+    compiled: CompiledCp,
+    local_search: Option<super::integer_ls::IntegerLocalSearchPlan>,
+    mode: SolveMode,
+    guidance: SearchGuidance,
+    assumptions: Vec<super::SemanticAssumption>,
+    hints: Vec<(usize, i32)>,
+    branch_order: Vec<usize>,
+}
+
+impl CpSolvePlan {
+    pub(crate) fn estimated_backend_bytes(&self) -> u64 {
+        self.compiled.estimated_bytes()
+    }
+
+    pub(crate) fn engine(&self) -> EngineKind {
+        if self.mode == SolveMode::LocalSearch {
+            EngineKind::IntegerLocalSearch
+        } else {
+            EngineKind::IntegerExact
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn compile_cp_plan(model: &Model, request: &SolveRequest, budget: &SolveBudget) -> Result<CpSolvePlan, SolveError> {
+    request.validate()?;
+    compile_cp_plan_inner(model, request, budget, false)
+}
+
+/// Compile after the orchestrator has validated both the request and the
+/// enclosing `ModelPackage`. Assumption constraints are constructed below from
+/// checked integer references, so they preserve the validated model invariants.
+pub(crate) fn compile_cp_plan_validated(model: &Model, request: &SolveRequest, budget: &SolveBudget) -> Result<CpSolvePlan, SolveError> {
+    compile_cp_plan_inner(model, request, budget, true)
+}
+
+fn compile_cp_plan_inner(
+    model: &Model,
+    request: &SolveRequest,
+    budget: &SolveBudget,
+    model_is_validated: bool,
+) -> Result<CpSolvePlan, SolveError> {
+    if budget.expired() {
+        return Err(SolveError::Interrupted("solve budget expired before CP compilation".to_string()));
+    }
+    if request.list_hint.is_some() {
+        return Err(SolveError::InvalidRequest("list_hint is only supported for list_vars models".to_string()));
+    }
+    if request.schedule_cdcl {
+        return Err(SolveError::InvalidRequest("schedule_cdcl is only valid for a semantic schedule model".to_string()));
+    }
+    if request.routing != super::RoutingControls::default() {
+        return Err(SolveError::InvalidRequest("routing controls are only valid for a semantic routing model".to_string()));
+    }
+    if request.sat != super::SatControls::default() {
+        return Err(SolveError::InvalidRequest("SAT controls require the specialized SAT plan".to_string()));
+    }
+    if request.mode != SolveMode::LocalSearch && request.limits.iterations.is_some() {
+        return Err(SolveError::InvalidRequest("max_iterations requires engine='ls' for integer models".to_string()));
+    }
+    if request.mode == SolveMode::LocalSearch {
+        if !request.hints.is_empty() || !request.branch_order.is_empty() {
+            return Err(SolveError::InvalidRequest("integer local search does not yet accept value hints or branch order".to_string()));
+        }
+        if request.limits.conflicts.is_some() {
+            return Err(SolveError::InvalidRequest("conflict limits require integer exact mode".to_string()));
+        }
+        if request.cp != super::CpControls::default() {
+            return Err(SolveError::InvalidRequest("CP portfolio controls require integer exact mode".to_string()));
+        }
+    }
+    for assumption in &request.assumptions {
+        if assumption.variable >= model.int_vars().len() {
+            return Err(SolveError::InvalidRequest(format!("assumption references unknown integer variable {}", assumption.variable)));
+        }
+    }
+    let estimated_backend_bytes = CompiledCp::estimate_semantic_bytes_interruptible(model, budget.stop())
+        .ok_or_else(|| SolveError::Interrupted("solve budget expired during CP memory preflight".to_string()))?
+        .saturating_add(u64::try_from(request.assumptions.len()).unwrap_or(u64::MAX).saturating_mul(2048));
+    let estimated_concurrent_bytes = estimated_backend_bytes.saturating_mul(u64::try_from(request.threads).unwrap_or(u64::MAX));
+    if request.limits.memory_bytes.is_some_and(|memory| estimated_concurrent_bytes > memory) {
+        return Err(SolveError::Compile(format!(
+            "estimated CP backend requires {estimated_concurrent_bytes} bytes across concurrent workers, above the memory limit"
+        )));
+    }
+    if budget.expired() {
+        return Err(SolveError::Interrupted("solve budget expired after CP memory preflight".to_string()));
+    }
+    let mut effective = (!request.assumptions.is_empty()).then(|| model.clone());
+    if let Some(effective) = &mut effective {
+        for assumption in &request.assumptions {
+            let relation = match assumption.operation {
+                super::SemanticAssumptionOp::Eq => Relation::Eq,
+                super::SemanticAssumptionOp::Ne => Relation::Ne,
+                super::SemanticAssumptionOp::Le => Relation::Le,
+                super::SemanticAssumptionOp::Lt => Relation::Lt,
+                super::SemanticAssumptionOp::Ge => Relation::Ge,
+                super::SemanticAssumptionOp::Gt => Relation::Gt,
+            };
+            effective.add_constraint(Constraint::Linear {
+                terms: vec![(1, crate::model::IntVarRef(assumption.variable))],
+                relation,
+                rhs: i64::from(assumption.value),
+            });
+        }
+    }
+    let effective = effective.as_ref().unwrap_or(model);
+    let compiled = if model_is_validated {
+        CompiledCp::compile_validated_with_estimate_interruptible(effective, estimated_backend_bytes, budget.stop())
+    } else {
+        CompiledCp::compile_with_estimate_interruptible(effective, estimated_backend_bytes, budget.stop())
+    }
+    .map_err(|error| SolveError::Compile(error.reason))?
+    .ok_or_else(|| SolveError::Interrupted("solve budget expired during CP compilation".to_string()))?;
+    validate_cp_controls(&compiled, request)?;
+    let local_search = if request.mode == SolveMode::LocalSearch { Some(super::integer_ls::compile(effective, &compiled)?) } else { None };
+    let (initial_phase, branch_order) = compiled
+        .search_guidance_interruptible(&request.hints, &request.branch_order, budget.stop())
+        .map_err(|error| SolveError::InvalidRequest(error.reason))?
+        .ok_or_else(|| SolveError::Interrupted("solve budget expired during CP search-guidance compilation".to_string()))?;
+    Ok(CpSolvePlan {
+        compiled,
+        local_search,
+        mode: request.mode,
+        guidance: SearchGuidance { initial_phase, branch_order },
+        assumptions: request.assumptions.clone(),
+        hints: request.hints.clone(),
+        branch_order: request.branch_order.clone(),
+    })
+}
+
+fn validate_cp_controls(compiled: &CompiledCp, request: &SolveRequest) -> Result<(), SolveError> {
+    let controls = request.cp;
+    let cooperative_roles = controls.split || controls.probes > 0 || controls.lns > 0;
+    if request.limits.conflicts.is_some() && cooperative_roles {
+        return Err(SolveError::InvalidRequest("a total conflict limit cannot be combined with split, probe, or LNS workers".to_string()));
+    }
+    let objectives = compiled.objectives();
+    if objectives.is_empty() {
+        if cooperative_roles {
+            return Err(SolveError::InvalidRequest("split, probes, and LNS require an optimization objective".to_string()));
+        }
+        return Ok(());
+    }
+    if controls.no_learn_csp {
+        return Err(SolveError::InvalidRequest("no_learn_csp applies only to satisfaction models without an objective".to_string()));
+    }
+    if cooperative_roles && request.threads == 1 {
+        return Err(SolveError::InvalidRequest("split, probes, and LNS require threads greater than one".to_string()));
+    }
+    if (controls.split || controls.probes > 0) && objectives.iter().any(|objective| objective.var().is_none()) {
+        return Err(SolveError::InvalidRequest(
+            "split and probe workers require every objective tier to be a materialized variable".to_string(),
+        ));
+    }
+    let auxiliary_workers = controls.probes.saturating_add(controls.lns);
+    if auxiliary_workers >= request.threads && auxiliary_workers > 0 {
+        return Err(SolveError::InvalidRequest(format!(
+            "{} probe and LNS workers leave no complete worker in a {}-thread portfolio",
+            auxiliary_workers, request.threads
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn solve_cp_plan(
+    model: &Model,
+    plan: &CpSolvePlan,
+    request: &SolveRequest,
+    budget: &SolveBudget,
+    sink: &mut dyn EventSink,
+) -> Result<SolveResult, SolveError> {
+    request.validate()?;
+    solve_cp_plan_inner(model, plan, request, budget, sink, true)
+}
+
+/// Execute a CP plan against the same semantic model and request that the
+/// orchestrator validated before compilation.
+pub(crate) fn solve_cp_plan_validated(
+    model: &Model,
+    plan: &CpSolvePlan,
+    request: &SolveRequest,
+    budget: &SolveBudget,
+    sink: &mut dyn EventSink,
+) -> Result<SolveResult, SolveError> {
+    solve_cp_plan_inner(model, plan, request, budget, sink, false)
+}
+
+fn solve_cp_plan_inner(
+    model: &Model,
+    plan: &CpSolvePlan,
+    request: &SolveRequest,
+    budget: &SolveBudget,
+    sink: &mut dyn EventSink,
+    validate_model: bool,
+) -> Result<SolveResult, SolveError> {
+    if request.assumptions != plan.assumptions || request.hints != plan.hints || request.branch_order != plan.branch_order {
+        return Err(SolveError::InvalidRequest(
+            "assumptions, hints, and branch_order must match the request used to compile the CP plan".to_string(),
+        ));
+    }
+    if request.mode != plan.mode {
+        return Err(SolveError::InvalidRequest("solve mode must match the request used to compile the CP plan".to_string()));
+    }
+    if budget.expired() {
+        return Ok(SolveResult::unknown());
+    }
+    if validate_model {
+        match model.validate_interruptible(budget.stop()) {
+            Ok(true) => {}
+            Ok(false) => return Ok(SolveResult::unknown()),
+            Err(errors) => return Err(SolveError::Compile(errors.join("; "))),
+        }
+    }
+    let search_stop = budget.search_stop();
+    let engine_stop = search_stop.flag();
+    let started = Instant::now();
+    let mut result = if let Some(local_search) = &plan.local_search {
+        super::integer_ls::solve(model, &plan.compiled, local_search, request, budget, engine_stop, sink)?
+    } else if !plan.compiled.objectives().is_empty() {
+        solve_lexicographic(LexicographicSolve { model, plan, request, budget, engine_stop, sink, started })?
+    } else {
+        let options = portfolio::normalize_options(false, false, cp_options(request, request.seed, request.limits.conflicts));
+        let problem = clone_problem(plan.compiled.problem());
+        let outcome = portfolio::solve_csp(problem, engine_stop, options, plan.guidance.clone());
+        let conflict_limit_reached =
+            request.limits.conflicts.is_some_and(|limit| outcome.stats.failures >= limit) && !outcome.decided && !budget.expired();
+        let primal = outcome
+            .solution
+            .as_ref()
+            .map(|values| candidate_if_running(model, &plan.compiled, values, budget, VerificationLevel::Final))
+            .transpose()?
+            .flatten();
+        let status = if primal.is_some() {
+            SolveStatus::Satisfiable
+        } else if outcome.solution.is_some() {
+            SolveStatus::Unknown
+        } else if outcome.decided {
+            SolveStatus::Unsatisfiable
+        } else {
+            SolveStatus::Unknown
+        };
+        SolveResult {
+            status,
+            primal,
+            bounds: Vec::new(),
+            proof: completion_proof(status, 0, outcome.decided && outcome.solution.is_none()),
+            reports: vec![EngineReport {
+                engine: Some(EngineKind::IntegerExact),
+                search: outcome.stats,
+                elapsed: started.elapsed(),
+                improvements: u64::from(outcome.solution.is_some()),
+                metadata: cp_metadata(outcome.shared_clauses, outcome.imported_clauses, None, None, None),
+            }],
+            message: conflict_limit_reached.then(|| "search stopped: ConflictLimit".to_string()),
+        }
+    };
+
+    if let Some(candidate) = &result.primal {
+        verify_assumptions(candidate, &plan.assumptions)?;
+    }
+    if budget.expired() && result.status == SolveStatus::Unknown {
+        result.message.get_or_insert_with(|| format!("search stopped: {:?}", budget.termination_reason()));
+    }
+    result.validate_contract()?;
+    Ok(result)
+}
+
+struct LexicographicSolve<'a> {
+    model: &'a Model,
+    plan: &'a CpSolvePlan,
+    request: &'a SolveRequest,
+    budget: &'a SolveBudget,
+    engine_stop: &'a std::sync::atomic::AtomicBool,
+    sink: &'a mut dyn EventSink,
+    started: Instant,
+}
+
+fn solve_lexicographic(context: LexicographicSolve<'_>) -> Result<SolveResult, SolveError> {
+    let LexicographicSolve { model, plan, request, budget, engine_stop, sink, started } = context;
+    let objective_count = plan.compiled.objectives().len();
+    let mut problem = None;
+    let mut output = Vec::new();
+    let mut total_stats = SolveStats::default();
+    let mut shared_clauses = 0usize;
+    let mut imported_clauses = 0u64;
+    let mut split_jobs = None;
+    let mut probe_stats = None;
+    let mut lns_stats = None;
+    let mut remaining_conflicts = request.limits.conflicts;
+    let mut proven_prefix = Vec::with_capacity(objective_count);
+    let mut bounds = Vec::with_capacity(objective_count);
+    let mut primal = None;
+    let mut complete = false;
+    let mut unsatisfiable = false;
+    let mut stopped_tier = None;
+    let mut conflict_limit_reached = false;
+
+    for (tier, objective) in plan.compiled.objectives().iter().enumerate() {
+        if engine_stop.load(std::sync::atomic::Ordering::Acquire) || remaining_conflicts == Some(0) {
+            conflict_limit_reached = remaining_conflicts == Some(0) && !budget.expired();
+            stopped_tier = Some(tier);
+            break;
+        }
+
+        let final_tier = tier + 1 == objective_count;
+        let problem_root = problem.get_or_insert_with(|| clone_problem(plan.compiled.problem()));
+        problem_root.objective = Some(objective.clone());
+        let options = portfolio::normalize_options(
+            true,
+            problem_root.var_objective().is_some(),
+            cp_options(request, request.seed.wrapping_add(tier as u64), remaining_conflicts),
+        );
+        // Earlier tiers retain a pristine root so their proved value can be
+        // posted for the next tier. The final tier consumes that root directly.
+        let tier_problem = if final_tier {
+            problem.take().expect("the active lexicographic tier has a CP problem")
+        } else {
+            clone_problem(problem.as_ref().expect("the active lexicographic tier has a CP problem"))
+        };
+        let progress_prefix = proven_prefix.clone();
+        let mut event_error = None;
+        let outcome = {
+            let mut progress = |objective, assignment: Option<&[i32]>| {
+                if event_error.is_some() {
+                    return;
+                }
+                let mut objectives = progress_prefix.clone();
+                objectives.push(objective);
+                if let Some(values) = assignment {
+                    let candidate =
+                        candidate_if_running(model, &plan.compiled, values, budget, VerificationLevel::Transfer).and_then(|candidate| {
+                            if let Some(candidate) = &candidate {
+                                verify_assumptions(candidate, &plan.assumptions)?;
+                            }
+                            Ok(candidate)
+                        });
+                    match candidate {
+                        Ok(Some(candidate)) => match sink.emit(SolveEvent::Candidate(candidate)) {
+                            Ok(EventControl::Continue) => {}
+                            Ok(EventControl::Stop) => {
+                                budget.cancel_with(TerminationReason::EventSink);
+                                return;
+                            }
+                            Err(error) => {
+                                event_error = Some(error);
+                                budget.cancel_with(TerminationReason::EventSink);
+                                return;
+                            }
+                        },
+                        Ok(None) => return,
+                        Err(error) => {
+                            event_error = Some(error);
+                            budget.cancel_with(TerminationReason::EventSink);
+                            return;
+                        }
+                    }
+                }
+                match sink.emit(SolveEvent::Progress { engine: EngineKind::IntegerExact, objectives, elapsed: budget.elapsed() }) {
+                    Ok(EventControl::Continue) => {}
+                    Ok(EventControl::Stop) => budget.cancel_with(TerminationReason::EventSink),
+                    Err(error) => {
+                        event_error = Some(error);
+                        budget.cancel_with(TerminationReason::EventSink);
+                    }
+                }
+            };
+            portfolio::solve_cop_with_progress(
+                tier_problem,
+                false,
+                engine_stop,
+                &mut output,
+                options,
+                plan.guidance.clone(),
+                request.publish_incumbent_assignments,
+                &mut progress,
+            )
+            .map_err(SolveError::Engine)?
+        };
+        if let Some(error) = event_error {
+            return Err(error);
+        }
+
+        merge_search_stats(&mut total_stats, outcome.stats);
+        shared_clauses = shared_clauses.saturating_add(outcome.shared_clauses);
+        imported_clauses = imported_clauses.saturating_add(outcome.imported_clauses);
+        add_optional_pair(&mut split_jobs, outcome.split_jobs);
+        add_optional_pair(&mut probe_stats, outcome.probe_stats);
+        add_optional_pair(&mut lns_stats, outcome.lns_stats);
+        if let Some(remaining) = &mut remaining_conflicts {
+            *remaining = remaining.saturating_sub(outcome.stats.failures);
+        }
+
+        let tier_candidate = outcome
+            .best
+            .as_ref()
+            .map(|(values, _)| candidate_if_running(model, &plan.compiled, values, budget, VerificationLevel::Final))
+            .transpose()?
+            .flatten();
+        if let (Some(candidate), Some((_, physical_value))) = (&tier_candidate, &outcome.best) {
+            if candidate.objectives().get(tier) != Some(physical_value) {
+                return Err(SolveError::InvalidResult(format!(
+                    "CP tier {tier} reported objective {physical_value}, canonical replay produced {:?}",
+                    candidate.objectives().get(tier)
+                )));
+            }
+            primal = Some(candidate.clone());
+        }
+
+        match (&outcome.best, outcome.proved) {
+            (None, true) if tier == 0 => {
+                unsatisfiable = true;
+                complete = true;
+                break;
+            }
+            (None, true) => {
+                return Err(SolveError::InvalidResult(format!("CP proved the fixed lexicographic subproblem infeasible at tier {tier}")));
+            }
+            (Some((_, value)), true) if tier_candidate.is_some() => {
+                proven_prefix.push(*value);
+                bounds.push(Bound { tier, value: *value, method: format!("complete CP search for lexicographic tier {tier}") });
+                if final_tier {
+                    complete = true;
+                    break;
+                }
+                plan.compiled
+                    .fix_objective(problem.as_mut().expect("a non-final lexicographic tier retains its CP problem"), tier, *value)
+                    .map_err(|error| SolveError::Engine(error.reason))?;
+                if remaining_conflicts == Some(0) {
+                    conflict_limit_reached = !budget.expired();
+                    stopped_tier = Some(tier + 1);
+                    break;
+                }
+            }
+            _ => {
+                stopped_tier = Some(tier);
+                conflict_limit_reached = remaining_conflicts == Some(0) && !budget.expired();
+                break;
+            }
+        }
+    }
+
+    let status = if unsatisfiable {
+        SolveStatus::Unsatisfiable
+    } else if complete {
+        SolveStatus::Optimal
+    } else if primal.is_some() {
+        SolveStatus::Satisfiable
+    } else {
+        SolveStatus::Unknown
+    };
+    let proof = completion_proof(status, objective_count, complete);
+    let message = stopped_tier.map(|tier| {
+        let reason = if conflict_limit_reached { TerminationReason::ConflictLimit } else { budget.termination_reason() };
+        format!("CP lexicographic search stopped before proving tier {tier}: {reason:?}")
+    });
+
+    Ok(SolveResult {
+        status,
+        primal,
+        bounds,
+        proof,
+        reports: vec![EngineReport {
+            engine: Some(EngineKind::IntegerExact),
+            search: total_stats,
+            elapsed: started.elapsed(),
+            improvements: total_stats.solutions,
+            metadata: cp_metadata(shared_clauses, imported_clauses, split_jobs, probe_stats, lns_stats),
+        }],
+        message,
+    })
+}
+
+fn cp_options(request: &SolveRequest, seed: u64, conflict_limit: Option<u64>) -> RunOptions {
+    RunOptions {
+        seed,
+        workers: request.threads,
+        split: request.cp.split,
+        probes: request.cp.probes,
+        lns: request.cp.lns,
+        no_learn_csp: request.cp.no_learn_csp,
+        force_scope_reasons: request.cp.force_scope_reasons,
+        shared_pool_capacity: request.cp.shared_pool_capacity,
+        conflict_limit,
+    }
+}
+
+fn add_optional_pair(total: &mut Option<(u64, u64)>, part: Option<(u64, u64)>) {
+    let Some((left, right)) = part else {
+        return;
+    };
+    let (total_left, total_right) = total.get_or_insert((0, 0));
+    *total_left = total_left.saturating_add(left);
+    *total_right = total_right.saturating_add(right);
+}
+
+pub(super) fn verify_assumptions(candidate: &CandidateSolution, assumptions: &[super::SemanticAssumption]) -> Result<(), SolveError> {
+    for assumption in assumptions {
+        let value = candidate
+            .assignment()
+            .integers
+            .get(assumption.variable)
+            .copied()
+            .flatten()
+            .ok_or_else(|| SolveError::InvalidResult(format!("assumed integer variable {} is unassigned", assumption.variable)))?;
+        let expected = i64::from(assumption.value);
+        let holds = match assumption.operation {
+            super::SemanticAssumptionOp::Eq => value == expected,
+            super::SemanticAssumptionOp::Ne => value != expected,
+            super::SemanticAssumptionOp::Le => value <= expected,
+            super::SemanticAssumptionOp::Lt => value < expected,
+            super::SemanticAssumptionOp::Ge => value >= expected,
+            super::SemanticAssumptionOp::Gt => value > expected,
+        };
+        if !holds {
+            return Err(SolveError::InvalidResult(format!("candidate violates assumption on integer variable {}", assumption.variable)));
+        }
+    }
+    Ok(())
+}
+
+fn candidate(
+    model: &Model,
+    compiled: &CompiledCp,
+    values: &[i32],
+    stop: &std::sync::atomic::AtomicBool,
+    verification: VerificationLevel,
+) -> Result<CandidateSolution, SolveError> {
+    let decoded = compiled.decode(values).map_err(SolveError::InvalidResult)?;
+    let assignment = Assignment { integers: decoded.integers, sets: decoded.sets, lists: Vec::new(), intervals: Vec::new() };
+    let objectives = model
+        .objectives()
+        .iter()
+        .map(|objective| match objective {
+            crate::model::Objective::IntExpr { expr, .. } => expr
+                .evaluate(&|variable| assignment.integers.get(variable.0).copied().flatten())
+                .ok_or_else(|| SolveError::InvalidResult("integer objective is undefined or overflows".to_string())),
+            crate::model::Objective::ListTerms { .. } | crate::model::Objective::Makespan { .. } => {
+                Err(SolveError::InvalidResult("CP candidate contains a non-integer objective".to_string()))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Err(error) = super::verify_semantic_assignment_validated_interruptible(model, &assignment, &objectives, stop) {
+        let prefix = assignment.integers.iter().take(16).copied().collect::<Vec<_>>();
+        let reason = match error {
+            SolveError::InvalidResult(reason) => reason,
+            other => return Err(other),
+        };
+        return Err(SolveError::InvalidResult(format!("{reason}; CP assignment prefix {prefix:?}")));
+    }
+    Ok(CandidateSolution::verified(assignment, objectives, EngineKind::IntegerExact, verification))
+}
+
+pub(super) fn candidate_if_running(
+    model: &Model,
+    compiled: &CompiledCp,
+    values: &[i32],
+    budget: &SolveBudget,
+    verification: VerificationLevel,
+) -> Result<Option<CandidateSolution>, SolveError> {
+    match candidate(model, compiled, values, budget.stop(), verification) {
+        Ok(candidate) => Ok(Some(candidate)),
+        Err(SolveError::Interrupted(_)) if budget.expired() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn completion_proof(status: SolveStatus, objective_tiers: usize, complete: bool) -> Option<ProofClaim> {
+    if !complete {
+        return None;
+    }
+    let conclusion = match status {
+        SolveStatus::Optimal => ProvenConclusion::Optimal,
+        SolveStatus::Unsatisfiable => ProvenConclusion::Unsatisfiable,
+        SolveStatus::Satisfiable | SolveStatus::Unknown | SolveStatus::Unsupported => return None,
+    };
+    Some(ProofClaim::complete_search(EngineKind::IntegerExact, conclusion, objective_tiers))
+}
+
+fn cp_metadata(
+    shared_clauses: usize,
+    imported_clauses: u64,
+    split_jobs: Option<(u64, u64)>,
+    probe_stats: Option<(u64, u64)>,
+    lns_stats: Option<(u64, u64)>,
+) -> Vec<(String, String)> {
+    let mut metadata =
+        vec![("shared_clauses".to_string(), shared_clauses.to_string()), ("imported_clauses".to_string(), imported_clauses.to_string())];
+    if let Some((split, completed)) = split_jobs {
+        metadata.extend([("split_jobs".to_string(), split.to_string()), ("completed_jobs".to_string(), completed.to_string())]);
+    }
+    if let Some((attempts, unsatisfiable)) = probe_stats {
+        metadata.extend([("probe_attempts".to_string(), attempts.to_string()), ("probe_unsat".to_string(), unsatisfiable.to_string())]);
+    }
+    if let Some((attempts, improved)) = lns_stats {
+        metadata.extend([("lns_attempts".to_string(), attempts.to_string()), ("lns_improved".to_string(), improved.to_string())]);
+    }
+    metadata
+}

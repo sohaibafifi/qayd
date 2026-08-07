@@ -1,0 +1,5 @@
+var 0..3: x :: output_var;
+var 0..3: y :: output_var;
+constraint int_lin_eq([1, 1], [x, y], 3);
+constraint int_le(y, 2);
+solve minimize x;

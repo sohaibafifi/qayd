@@ -1,0 +1,420 @@
+{
+  "schema": "qayd.golden.manifest/v1",
+  "corpus_version": "2026-08-06.5",
+  "description": "Blocking deterministic architecture goldens. Performance campaigns are intentionally separate.",
+  "prepare": [
+    {
+      "id": "rust-binaries",
+      "argv": ["cargo", "build", "--quiet", "--workspace", "--bins"],
+      "timeout_seconds": 900,
+      "allowed_exit_codes": [0]
+    },
+    {
+      "id": "python-extension",
+      "argv": ["uv", "run", "maturin", "develop", "--profile", "pyext", "--quiet"],
+      "timeout_seconds": 1800,
+      "allowed_exit_codes": [0]
+    }
+  ],
+  "cases": [
+    {
+      "id": "rust-native-minimize",
+      "surface": "rust-native",
+      "equivalence_group": "integer-minimize",
+      "tags": ["rust", "integer", "optimization"],
+      "instance": {
+        "path": "bench/golden/fixtures/rust_native.case",
+        "sha256": "9259ab9f137c9a6be981c77a7b529b8cbf253934bfc85a4ddd2d6d05324b4460"
+      },
+      "request": {
+        "argv": ["cargo", "test", "--quiet", "--test", "architecture_golden_native", "emits_native_golden_record", "--", "--nocapture"],
+        "seed": 0,
+        "threads": 1,
+        "engine": "exact",
+        "budget": {"kind": "complete", "wall_time_seconds": null, "max_iterations": null},
+        "objective_senses": ["minimize"],
+        "execution_timeout_seconds": 120,
+        "allowed_exit_codes": [0]
+      },
+      "parser": "structured-json",
+      "oracle": {
+        "kind": "finite-domain",
+        "model": {
+          "variables": [
+            {"name": "x", "domain": {"min": 0, "max": 3}},
+            {"name": "y", "domain": {"min": 0, "max": 3}}
+          ],
+          "constraints": [
+            {"terms": {"x": 1, "y": 1}, "relation": "eq", "rhs": 3},
+            {"terms": {"y": 1}, "relation": "le", "rhs": 2}
+          ],
+          "objectives": [{"sense": "minimize", "terms": {"x": 1}}]
+        }
+      },
+      "expected": {
+        "status": "OPTIMAL",
+        "senses": ["minimize"],
+        "objectives": [1],
+        "solution": {"assignments": {"x": 1, "y": 2}},
+        "validity": true,
+        "bound": {"values": [1], "source": "complete-search"},
+        "gap": {"absolute": 0, "relative": 0.0},
+        "proof": {"claim": "optimality", "kind": "complete-search", "verified": true}
+      }
+    },
+    {
+      "id": "python-integer-minimize",
+      "surface": "python",
+      "equivalence_group": "integer-minimize",
+      "tags": ["python", "integer", "optimization"],
+      "instance": {
+        "path": "bench/golden/fixtures/python_minimize.json",
+        "sha256": "0975b882153a861b65cda3b6a974b3c84a6a2ce0756d24e0515154293a7bb43f"
+      },
+      "request": {
+        "argv": ["uv", "run", "python", "bench/golden/python_probe.py", "{instance}", "--seed", "0", "--threads", "1", "--engine", "exact"],
+        "seed": 0,
+        "threads": 1,
+        "engine": "exact",
+        "budget": {"kind": "complete", "wall_time_seconds": null, "max_iterations": null},
+        "objective_senses": ["minimize"],
+        "execution_timeout_seconds": 120,
+        "allowed_exit_codes": [0]
+      },
+      "parser": "structured-json",
+      "oracle": {"kind": "python-spec"},
+      "expected": {
+        "status": "OPTIMAL",
+        "senses": ["minimize"],
+        "objectives": [1],
+        "solution": {"assignments": {"x": 1, "y": 2}},
+        "validity": true,
+        "bound": {"values": [1], "source": "solver"},
+        "gap": {"absolute": 0, "relative": 0.0},
+        "proof": {"claim": "optimality", "kind": "solver-status", "verified": true}
+      }
+    },
+    {
+      "id": "python-integer-lexicographic",
+      "surface": "python",
+      "tags": ["python", "integer", "lexicographic"],
+      "instance": {
+        "path": "bench/golden/fixtures/python_integer.json",
+        "sha256": "a6e067c43e398f99bcdb90028dbe83492a3b7cf33f199332e6946703ffed7399"
+      },
+      "request": {
+        "argv": ["uv", "run", "python", "bench/golden/python_probe.py", "{instance}", "--seed", "0", "--threads", "1", "--engine", "exact"],
+        "seed": 0,
+        "threads": 1,
+        "engine": "exact",
+        "budget": {"kind": "complete", "wall_time_seconds": null, "max_iterations": null},
+        "objective_senses": ["minimize", "maximize"],
+        "execution_timeout_seconds": 120,
+        "allowed_exit_codes": [0]
+      },
+      "parser": "structured-json",
+      "oracle": {"kind": "python-spec"},
+      "expected": {
+        "status": "OPTIMAL",
+        "senses": ["minimize", "maximize"],
+        "objectives": [0, 1],
+        "solution": {"assignments": {"x": 0, "y": 1}},
+        "validity": true,
+        "bound": {"values": [0], "source": "solver"},
+        "gap": {"absolute": 0, "relative": 0.0},
+        "proof": {"claim": "optimality", "kind": "solver-status", "verified": true}
+      }
+    },
+    {
+      "id": "python-list-exact",
+      "surface": "lists",
+      "tags": ["python", "lists", "optimization"],
+      "instance": {
+        "path": "bench/golden/fixtures/python_lists.json",
+        "sha256": "dc58644a6273bf9f4538a99f5ef135aa635185e27b9532933310ed9a2e3bb292"
+      },
+      "request": {
+        "argv": ["uv", "run", "python", "bench/golden/python_probe.py", "{instance}", "--seed", "0", "--threads", "1", "--engine", "exact"],
+        "seed": 0,
+        "threads": 1,
+        "engine": "exact",
+        "budget": {"kind": "complete", "wall_time_seconds": null, "max_iterations": null},
+        "objective_senses": ["minimize"],
+        "execution_timeout_seconds": 120,
+        "allowed_exit_codes": [0]
+      },
+      "parser": "structured-json",
+      "oracle": {"kind": "python-spec"},
+      "expected": {
+        "status": "OPTIMAL",
+        "senses": ["minimize"],
+        "objectives": [4],
+        "solution": {"lists": [[1, 2, 3]]},
+        "validity": true,
+        "bound": {"values": [4], "source": "solver"},
+        "gap": {"absolute": 0, "relative": 0.0},
+        "proof": {"claim": "optimality", "kind": "solver-status", "verified": true}
+      }
+    },
+    {
+      "id": "python-routing-exact",
+      "surface": "routing",
+      "tags": ["python", "routing", "optimization"],
+      "instance": {
+        "path": "bench/golden/fixtures/python_routing.json",
+        "sha256": "01fea6a33f7173c28ecb9202c0ebecd4d7bf32d4114e2f01ee370bbef815bb26"
+      },
+      "request": {
+        "argv": ["uv", "run", "python", "bench/golden/python_probe.py", "{instance}", "--seed", "0", "--threads", "1", "--engine", "exact"],
+        "seed": 0,
+        "threads": 1,
+        "engine": "exact",
+        "budget": {"kind": "complete", "wall_time_seconds": null, "max_iterations": null},
+        "objective_senses": ["minimize"],
+        "execution_timeout_seconds": 120,
+        "allowed_exit_codes": [0]
+      },
+      "parser": "structured-json",
+      "oracle": {"kind": "python-spec"},
+      "expected": {
+        "status": "OPTIMAL",
+        "senses": ["minimize"],
+        "objectives": [4],
+        "solution": {"routes": [[1, 2, 3]]},
+        "validity": true,
+        "bound": {"values": [4], "source": "solver"},
+        "gap": {"absolute": 0, "relative": 0.0},
+        "proof": {"claim": "optimality", "kind": "solver-status", "verified": true}
+      }
+    },
+    {
+      "id": "python-scheduling-exact",
+      "surface": "scheduling",
+      "tags": ["python", "scheduling", "resource", "optimization"],
+      "instance": {
+        "path": "bench/golden/fixtures/python_scheduling.json",
+        "sha256": "33f20c5da07a0a8f9d276c39a8a97f4bd8b6443aa775a9b7d32b514647ad452f"
+      },
+      "request": {
+        "argv": ["uv", "run", "python", "bench/golden/python_probe.py", "{instance}", "--seed", "0", "--threads", "1", "--engine", "exact"],
+        "seed": 0,
+        "threads": 1,
+        "engine": "exact",
+        "budget": {"kind": "complete", "wall_time_seconds": null, "max_iterations": null},
+        "objective_senses": ["minimize"],
+        "execution_timeout_seconds": 120,
+        "allowed_exit_codes": [0]
+      },
+      "parser": "structured-json",
+      "oracle": {"kind": "python-spec"},
+      "expected": {
+        "status": "OPTIMAL",
+        "senses": ["minimize"],
+        "objectives": [5],
+        "solution": {"starts": {"0": 0, "1": 3}},
+        "validity": true,
+        "bound": {"values": [5], "source": "solver"},
+        "gap": {"absolute": 0, "relative": 0.0},
+        "proof": {"claim": "optimality", "kind": "solver-status", "verified": true}
+      }
+    },
+    {
+      "id": "xcsp-minimize",
+      "surface": "xcsp",
+      "equivalence_group": "integer-minimize",
+      "tags": ["xcsp", "integer", "optimization"],
+      "instance": {
+        "path": "bench/golden/fixtures/xcsp_minimize.xml",
+        "sha256": "b2fbcdb59c7c9af1e75ead165e869b6c304b8fa54114a7b7f9affc264608426c"
+      },
+      "request": {
+        "argv": ["{repo}/target/debug/qayd", "--seed", "0", "--threads", "1", "{instance}"],
+        "seed": 0,
+        "threads": 1,
+        "budget": {"kind": "complete", "wall_time_seconds": null, "max_iterations": null},
+        "objective_senses": ["minimize"],
+        "execution_timeout_seconds": 120,
+        "allowed_exit_codes": [0]
+      },
+      "parser": "xcsp",
+      "oracle": {
+        "kind": "finite-domain",
+        "model": {
+          "variables": [
+            {"name": "x", "domain": {"min": 0, "max": 3}},
+            {"name": "y", "domain": {"min": 0, "max": 3}}
+          ],
+          "constraints": [
+            {"terms": {"x": 1, "y": 1}, "relation": "eq", "rhs": 3},
+            {"terms": {"y": 1}, "relation": "le", "rhs": 2}
+          ],
+          "objectives": [{"sense": "minimize", "terms": {"x": 1}}]
+        }
+      },
+      "expected": {
+        "status": "OPTIMAL",
+        "senses": ["minimize"],
+        "objectives": [1],
+        "solution": {"assignments": {"x": 1, "y": 2}},
+        "validity": true,
+        "bound": {"values": [1], "source": "terminal-status"},
+        "gap": {"absolute": 0, "relative": 0.0},
+        "proof": {"claim": "optimality", "kind": "terminal-status", "verified": true}
+      }
+    },
+    {
+      "id": "flatzinc-minimize",
+      "surface": "flatzinc",
+      "equivalence_group": "integer-minimize",
+      "tags": ["flatzinc", "integer", "optimization"],
+      "instance": {
+        "path": "bench/golden/fixtures/flatzinc_minimize.fzn",
+        "sha256": "8cc3204830ba30978d8c570212937f1ab04a2fe711e630cb3a60f8cc8a4c1b0c"
+      },
+      "request": {
+        "argv": ["{repo}/target/debug/qayd-fzn", "{instance}"],
+        "seed": 0,
+        "threads": 1,
+        "engine": "exact",
+        "budget": {"kind": "complete", "wall_time_seconds": null, "max_iterations": null},
+        "objective_senses": ["minimize"],
+        "execution_timeout_seconds": 120,
+        "allowed_exit_codes": [0]
+      },
+      "parser": "flatzinc",
+      "oracle": {
+        "kind": "finite-domain",
+        "model": {
+          "variables": [
+            {"name": "x", "domain": {"min": 0, "max": 3}},
+            {"name": "y", "domain": {"min": 0, "max": 3}}
+          ],
+          "constraints": [
+            {"terms": {"x": 1, "y": 1}, "relation": "eq", "rhs": 3},
+            {"terms": {"y": 1}, "relation": "le", "rhs": 2}
+          ],
+          "objectives": [{"sense": "minimize", "terms": {"x": 1}}]
+        }
+      },
+      "expected": {
+        "status": "OPTIMAL",
+        "senses": ["minimize"],
+        "objectives": [1],
+        "solution": {"assignments": {"x": 1, "y": 2}},
+        "validity": true,
+        "bound": {"values": [1], "source": "completion-marker"},
+        "gap": {"absolute": 0, "relative": 0.0},
+        "proof": {"claim": "optimality", "kind": "completion-marker", "verified": true}
+      }
+    },
+    {
+      "id": "sat-unique-model",
+      "surface": "sat",
+      "tags": ["sat", "satisfaction", "validity"],
+      "instance": {
+        "path": "bench/golden/fixtures/sat_unique.cnf",
+        "sha256": "51b38232f5ff17c148e4255bca6eb63a817da004b3b5bd2f1aa3f9e2501c9418"
+      },
+      "request": {
+        "argv": ["{repo}/target/debug/qayd-sat", "--seed", "0", "--no-preprocess", "{instance}"],
+        "seed": 0,
+        "threads": 1,
+        "budget": {"kind": "complete", "wall_time_seconds": null, "max_iterations": null},
+        "objective_senses": [],
+        "execution_timeout_seconds": 120,
+        "allowed_exit_codes": [0]
+      },
+      "parser": "sat",
+      "oracle": {"kind": "cnf"},
+      "expected": {
+        "status": "SATISFIABLE",
+        "senses": [],
+        "objectives": [],
+        "solution": {"assignments": {"x1": true, "x2": false}},
+        "validity": true,
+        "bound": null,
+        "gap": null,
+        "proof": null
+      }
+    },
+    {
+      "id": "sat-unsat-rup-proof",
+      "surface": "sat",
+      "tags": ["sat", "unsat", "proof", "rup", "drat"],
+      "instance": {
+        "path": "bench/golden/fixtures/sat_unsat.cnf",
+        "sha256": "2e6111dc8010dd18c488fc0ca77b963d81b913d067e42c08081612ae8abca130"
+      },
+      "request": {
+        "argv": ["{repo}/target/debug/qayd-sat", "--seed", "0", "--no-preprocess", "--proof", "{proof}", "{instance}"],
+        "seed": 0,
+        "threads": 1,
+        "budget": {"kind": "complete", "wall_time_seconds": null, "max_iterations": null},
+        "objective_senses": [],
+        "execution_timeout_seconds": 120,
+        "allowed_exit_codes": [0]
+      },
+      "parser": "sat",
+      "oracle": {"kind": "cnf"},
+      "expected": {
+        "status": "UNSATISFIABLE",
+        "senses": [],
+        "objectives": [],
+        "solution": null,
+        "validity": true,
+        "bound": null,
+        "gap": null,
+        "proof": {
+          "claim": "unsatisfiability",
+          "kind": "drat-rup",
+          "verified": true,
+          "artifact_sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+        }
+      }
+    },
+    {
+      "id": "pb-minimize",
+      "surface": "pb",
+      "tags": ["pb", "optimization", "validity"],
+      "instance": {
+        "path": "bench/golden/fixtures/pb_minimize.opb",
+        "sha256": "0e02fc9093e8f279457a7f326e2e639293e548c7d55497bddc6c516daf854567"
+      },
+      "request": {
+        "argv": ["{repo}/target/debug/qayd-pb", "{instance}"],
+        "seed": null,
+        "threads": 1,
+        "budget": {"kind": "complete", "wall_time_seconds": null, "max_iterations": null},
+        "objective_senses": ["minimize"],
+        "execution_timeout_seconds": 120,
+        "allowed_exit_codes": [30]
+      },
+      "parser": "pb",
+      "oracle": {
+        "kind": "finite-domain",
+        "model": {
+          "variables": [
+            {"name": "x1", "domain": [0, 1]},
+            {"name": "x2", "domain": [0, 1]}
+          ],
+          "constraints": [
+            {"terms": {"x1": 1, "x2": 1}, "relation": "ge", "rhs": 1}
+          ],
+          "objectives": [
+            {"sense": "minimize", "terms": {"x1": 1, "x2": 2}}
+          ]
+        }
+      },
+      "expected": {
+        "status": "OPTIMAL",
+        "senses": ["minimize"],
+        "objectives": [1],
+        "solution": {"assignments": {"x1": true, "x2": false}},
+        "validity": true,
+        "bound": {"values": [1], "source": "terminal-status"},
+        "gap": {"absolute": 0, "relative": 0.0},
+        "proof": {"claim": "optimality", "kind": "terminal-status", "verified": true}
+      }
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+<instance format="XCSP3" type="COP">
+  <variables>
+    <array id="x" note="ruler marks" size="[8]"> 0..40 </array>
+    <array id="d" note="positive pairwise distances" size="[28]"> 1..40 </array>
+  </variables>
+  <constraints>
+    <sum>
+      <list> x[0] </list>
+      <condition> (eq,0) </condition>
+    </sum>
+    <ordered>
+      <list> x[] </list>
+      <operator> lt </operator>
+    </ordered>
+    <group note="d is the distance between each pair of marks">
+      <sum>
+        <list> %0 %1 %2 </list>
+        <coeffs> -1 1 -1 </coeffs>
+        <condition> (eq,0) </condition>
+      </sum>
+      <args> x[0] x[1] d[0] </args>
+      <args> x[0] x[2] d[1] </args>
+      <args> x[0] x[3] d[2] </args>
+      <args> x[0] x[4] d[3] </args>
+      <args> x[0] x[5] d[4] </args>
+      <args> x[0] x[6] d[5] </args>
+      <args> x[0] x[7] d[6] </args>
+      <args> x[1] x[2] d[7] </args>
+      <args> x[1] x[3] d[8] </args>
+      <args> x[1] x[4] d[9] </args>
+      <args> x[1] x[5] d[10] </args>
+      <args> x[1] x[6] d[11] </args>
+      <args> x[1] x[7] d[12] </args>
+      <args> x[2] x[3] d[13] </args>
+      <args> x[2] x[4] d[14] </args>
+      <args> x[2] x[5] d[15] </args>
+      <args> x[2] x[6] d[16] </args>
+      <args> x[2] x[7] d[17] </args>
+      <args> x[3] x[4] d[18] </args>
+      <args> x[3] x[5] d[19] </args>
+      <args> x[3] x[6] d[20] </args>
+      <args> x[3] x[7] d[21] </args>
+      <args> x[4] x[5] d[22] </args>
+      <args> x[4] x[6] d[23] </args>
+      <args> x[4] x[7] d[24] </args>
+      <args> x[5] x[6] d[25] </args>
+      <args> x[5] x[7] d[26] </args>
+      <args> x[6] x[7] d[27] </args>
+    </group>
+    <allDifferent>
+      <list> d[] </list>
+    </allDifferent>
+  </constraints>
+  <objectives>
+    <minimize> x[7] </minimize>
+  </objectives>
+</instance>

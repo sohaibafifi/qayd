@@ -1,0 +1,4 @@
+c unique satisfying assignment: x1=true, x2=false
+p cnf 2 2
+1 0
+-2 0

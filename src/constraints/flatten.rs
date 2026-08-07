@@ -1,7 +1,9 @@
 //! Small decompositions used by front-ends for higher-level constraints.
 
-use crate::constraints::intension::intension;
-use crate::constraints::linear::{linear, Relation};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::constraints::intension::{self as intension_constraint, intension};
+use crate::constraints::linear::{self as linear_constraint, linear, Relation};
 use crate::expr::{self, Expr};
 use crate::ids::VarId;
 use crate::store::Solver;
@@ -29,10 +31,6 @@ fn in_values_expr(var: VarId, values: &[i32]) -> Expr {
     }
 }
 
-fn any_eq_expr(vars: &[VarId], value: i32) -> Expr {
-    expr::or(vars.iter().map(|&var| expr::eq(expr::var(var), expr::int(value as i64))).collect())
-}
-
 pub fn post_tuple_not_equal(solver: &mut Solver, left: &[VarId], right: &[VarId]) -> Result<(), String> {
     if left.len() != right.len() {
         return Err("allDifferent-list: ragged tuples".to_string());
@@ -50,6 +48,28 @@ pub fn post_all_different_except(solver: &mut Solver, vars: &[VarId], except: &[
             intension(solver, expr::or(terms));
         }
     }
+}
+
+pub(crate) fn post_all_different_except_interruptible(solver: &mut Solver, vars: &[VarId], except: &[i32], stop: &AtomicBool) -> bool {
+    for i in 0..vars.len() {
+        for j in (i + 1)..vars.len() {
+            if stop.load(Ordering::Acquire) {
+                return false;
+            }
+            let mut terms = Vec::with_capacity(except.len().saturating_add(1));
+            terms.push(expr::ne(expr::var(vars[i]), expr::var(vars[j])));
+            for &value in except {
+                if stop.load(Ordering::Acquire) {
+                    return false;
+                }
+                terms.push(expr::eq(expr::var(vars[i]), expr::int(i64::from(value))));
+            }
+            if !intension_constraint::intension_interruptible(solver, expr::or(terms), stop) {
+                return false;
+            }
+        }
+    }
+    !stop.load(Ordering::Acquire)
 }
 
 pub fn post_channel_onehot_index(solver: &mut Solver, xs: &[VarId], value: VarId, start_index: i32) {
@@ -88,6 +108,53 @@ pub fn post_bin_loads(solver: &mut Solver, items: &[VarId], sizes: &[i64], loads
     }
 }
 
+pub(crate) fn post_bin_loads_interruptible(
+    solver: &mut Solver,
+    items: &[VarId],
+    sizes: &[i64],
+    loads: &[VarId],
+    stop: &AtomicBool,
+) -> bool {
+    assert!(loads.len() <= i32::MAX as usize, "binPacking: too many bins");
+    if stop.load(Ordering::Acquire) {
+        return false;
+    }
+    if loads.is_empty() {
+        return items.is_empty() || linear_constraint::linear_interruptible(solver, Vec::new(), Vec::new(), Relation::Eq, 1, stop);
+    }
+
+    let last_bin = loads.len() as i64 - 1;
+    for &item in items {
+        if stop.load(Ordering::Acquire)
+            || !linear_constraint::linear_interruptible(solver, vec![1], vec![item], Relation::Ge, 0, stop)
+            || !linear_constraint::linear_interruptible(solver, vec![1], vec![item], Relation::Le, last_bin, stop)
+        {
+            return false;
+        }
+    }
+
+    for (bin, &load) in loads.iter().enumerate() {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut coefficients = Vec::with_capacity(items.len().saturating_add(1));
+        let mut variables = Vec::with_capacity(items.len().saturating_add(1));
+        for (index, &item) in items.iter().enumerate() {
+            if stop.load(Ordering::Acquire) {
+                return false;
+            }
+            coefficients.push(sizes[index]);
+            variables.push(eq_const_indicator(solver, item, bin as i32));
+        }
+        coefficients.push(-1);
+        variables.push(load);
+        if !linear_constraint::linear_interruptible(solver, coefficients, variables, Relation::Eq, 0, stop) {
+            return false;
+        }
+    }
+    !stop.load(Ordering::Acquire)
+}
+
 pub fn post_diffn(solver: &mut Solver, origins: &[Vec<VarId>], lengths: &[Vec<Expr>], zero_ignored: bool) -> Result<(), String> {
     if origins.len() != lengths.len() {
         return Err("noOverlap: origins/lengths length mismatch".to_string());
@@ -111,26 +178,6 @@ pub fn post_diffn(solver: &mut Solver, origins: &[Vec<VarId>], lengths: &[Vec<Ex
         }
     }
     Ok(())
-}
-
-pub(crate) fn nvalues_var(solver: &mut Solver, vars: &[VarId]) -> VarId {
-    let mut vals = Vec::new();
-    for &v in vars {
-        vals.extend(solver.store.values(v));
-    }
-    vals.sort_unstable();
-    vals.dedup();
-    let mut present = Vec::with_capacity(vals.len() + 1);
-    for val in vals {
-        present.push(aux_for_expr(solver, any_eq_expr(vars, val)));
-    }
-    let n = present.len();
-    let aux = solver.new_var_range(if vars.is_empty() { 0 } else { 1 }, n as i32);
-    let mut coeffs = vec![1i64; n];
-    coeffs.push(-1);
-    present.push(aux);
-    linear(solver, &coeffs, &present, Relation::Eq, 0);
-    aux
 }
 
 pub fn count_values_to_var(solver: &mut Solver, vars: &[VarId], values: &[i32], rel: Relation, target: VarId) {

@@ -220,6 +220,7 @@ name = "qayd"
 version = "0.9.1"
 dependencies = [
  "ctrlc",
+ "libc",
  "lzma-rs",
  "pyo3",
  "smallvec",
@@ -238,7 +239,6 @@ name = "qayd-pb"
 version = "0.9.1"
 dependencies = [
  "ctrlc",
- "libc",
  "qayd",
 ]
 
@@ -247,7 +247,6 @@ name = "qayd-sat"
 version = "0.9.1"
 dependencies = [
  "ctrlc",
- "libc",
  "qayd",
 ]
 

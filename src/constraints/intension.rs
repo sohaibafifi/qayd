@@ -2,6 +2,8 @@
 //! Filtering: disentailment by bounds, probing each unfixed value, then an exact
 //! check once all vars are fixed (the correctness safety net for weak bounds).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::expr::Expr;
 use crate::ids::{PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Propagator};
@@ -20,6 +22,16 @@ impl Propagator for Intension {
         for &v in &self.vars {
             store.subscribe(v, me, Event::DomainChange);
         }
+    }
+
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        for &variable in &self.vars {
+            if should_stop() {
+                return false;
+            }
+            store.subscribe(variable, me, Event::DomainChange);
+        }
+        !should_stop()
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
@@ -71,9 +83,71 @@ impl Propagator for Intension {
 
 /// Post the constraint "`expr` holds" (evaluates non-zero/true).
 pub fn intension(solver: &mut Solver, expr: Expr) {
+    let stop = AtomicBool::new(false);
+    assert!(intension_interruptible(solver, expr, &stop));
+}
+
+/// Post an intension expression while polling during variable collection and
+/// propagator registration. A `false` result requires discarding `solver`.
+pub(crate) fn intension_interruptible(solver: &mut Solver, expr: Expr, stop: &AtomicBool) -> bool {
+    if stop.load(Ordering::Acquire) {
+        return false;
+    }
     let mut vars = Vec::new();
-    expr.collect_vars(&mut vars);
+    if !collect_vars_interruptible(&expr, &mut vars, stop) {
+        return false;
+    }
     vars.sort_unstable();
+    if stop.load(Ordering::Acquire) {
+        return false;
+    }
     vars.dedup();
-    solver.post(Box::new(Intension { expr, vars, scratch: Vec::new() }));
+    let should_stop = || stop.load(Ordering::Acquire);
+    solver.post_until(Box::new(Intension { expr, vars, scratch: Vec::new() }), &should_stop).is_some()
+}
+
+fn collect_vars_interruptible(expr: &Expr, output: &mut Vec<VarId>, stop: &AtomicBool) -> bool {
+    if stop.load(Ordering::Acquire) {
+        return false;
+    }
+    match expr {
+        Expr::Const(_) => {}
+        Expr::Var(variable) => output.push(*variable),
+        Expr::Neg(value) | Expr::Abs(value) | Expr::Not(value) => {
+            if !collect_vars_interruptible(value, output, stop) {
+                return false;
+            }
+        }
+        Expr::Add(values) | Expr::Mul(values) | Expr::Min(values) | Expr::Max(values) | Expr::And(values) | Expr::Or(values) => {
+            for value in values {
+                if !collect_vars_interruptible(value, output, stop) {
+                    return false;
+                }
+            }
+        }
+        Expr::Sub(left, right)
+        | Expr::Div(left, right)
+        | Expr::Mod(left, right)
+        | Expr::Eq(left, right)
+        | Expr::Ne(left, right)
+        | Expr::Lt(left, right)
+        | Expr::Le(left, right)
+        | Expr::Gt(left, right)
+        | Expr::Ge(left, right)
+        | Expr::Imp(left, right)
+        | Expr::Iff(left, right) => {
+            if !collect_vars_interruptible(left, output, stop) || !collect_vars_interruptible(right, output, stop) {
+                return false;
+            }
+        }
+        Expr::IfThenElse(condition, then_value, else_value) => {
+            if !collect_vars_interruptible(condition, output, stop)
+                || !collect_vars_interruptible(then_value, output, stop)
+                || !collect_vars_interruptible(else_value, output, stop)
+            {
+                return false;
+            }
+        }
+    }
+    true
 }

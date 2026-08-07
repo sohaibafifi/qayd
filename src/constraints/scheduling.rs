@@ -1,6 +1,8 @@
 //! Scheduling constraints: `noOverlap`, `cumulative` (time-tabling),
 //! `binPacking` (Shaw load pruning), `knapsack` (two linear constraints).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::constraints::linear::{clamp_i32, linear, Relation};
 use crate::ids::{PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Priority, Propagator};
@@ -29,6 +31,27 @@ macro_rules! local_fixpoint {
     };
 }
 
+fn copy_slice_interruptible<T: Copy>(values: &[T], stop: &AtomicBool) -> Option<Vec<T>> {
+    let mut copied = Vec::with_capacity(values.len());
+    for &value in values {
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        copied.push(value);
+    }
+    Some(copied)
+}
+
+fn register_variables_until(store: &mut Store, me: PropId, variables: &[VarId], event: Event, should_stop: &dyn Fn() -> bool) -> bool {
+    for &variable in variables {
+        if should_stop() {
+            return false;
+        }
+        store.subscribe(variable, me, event);
+    }
+    !should_stop()
+}
+
 // ===========================================================================
 // noOverlap (disjunctive, pairwise)
 // ===========================================================================
@@ -49,6 +72,10 @@ impl Propagator for NoOverlap {
         for &s in &self.starts {
             store.subscribe(s, me, Event::BoundChange);
         }
+    }
+
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        register_variables_until(store, me, &self.starts, Event::BoundChange, should_stop)
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
@@ -117,6 +144,18 @@ pub fn no_overlap(solver: &mut Solver, starts: &[VarId], durations: &[i64]) {
     solver.post(Box::new(NoOverlap { starts: starts.to_vec(), durations: durations.to_vec() }));
 }
 
+pub(crate) fn no_overlap_interruptible(solver: &mut Solver, starts: &[VarId], durations: &[i64], stop: &AtomicBool) -> bool {
+    assert_eq!(starts.len(), durations.len(), "noOverlap: starts/durations mismatch");
+    let Some(starts) = copy_slice_interruptible(starts, stop) else {
+        return false;
+    };
+    let Some(durations) = copy_slice_interruptible(durations, stop) else {
+        return false;
+    };
+    let should_stop = || stop.load(Ordering::Acquire);
+    solver.post_until(Box::new(NoOverlap { starts, durations }), &should_stop).is_some()
+}
+
 // ===========================================================================
 // cumulative (time-tabling)
 // ===========================================================================
@@ -183,6 +222,10 @@ impl Propagator for Cumulative {
         for &s in &self.starts {
             store.subscribe(s, me, Event::BoundChange);
         }
+    }
+
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        register_variables_until(store, me, &self.starts, Event::BoundChange, should_stop)
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
@@ -338,6 +381,47 @@ pub fn cumulative(solver: &mut Solver, starts: &[VarId], durations: &[i64], heig
     }));
 }
 
+pub(crate) fn cumulative_interruptible(
+    solver: &mut Solver,
+    starts: &[VarId],
+    durations: &[i64],
+    heights: &[i64],
+    capacity: i64,
+    stop: &AtomicBool,
+) -> bool {
+    assert_eq!(starts.len(), durations.len(), "cumulative: length mismatch");
+    assert_eq!(starts.len(), heights.len(), "cumulative: length mismatch");
+    let Some(starts) = copy_slice_interruptible(starts, stop) else {
+        return false;
+    };
+    let Some(dur) = copy_slice_interruptible(durations, stop) else {
+        return false;
+    };
+    let Some(height) = copy_slice_interruptible(heights, stop) else {
+        return false;
+    };
+    let n = starts.len();
+    if stop.load(Ordering::Acquire) {
+        return false;
+    }
+    let propagator = Cumulative {
+        starts,
+        dur,
+        height,
+        capacity,
+        profile: Vec::new(),
+        buf: Vec::new(),
+        est: vec![0; n],
+        lct: vec![0; n],
+        energy: vec![0; n],
+        by_est: (0..n).collect(),
+        by_lct: (0..n).collect(),
+        lb: vec![0; n],
+    };
+    let should_stop = || stop.load(Ordering::Acquire);
+    solver.post_until(Box::new(propagator), &should_stop).is_some()
+}
+
 // cumulative with variable durations, heights, and/or capacity.
 // Time-tabling: profile sums min heights over mandatory parts
 // [latest_start, earliest_start + min_dur); pruning uses cap.max and min_dur,
@@ -381,6 +465,20 @@ impl Propagator for CumulativeVar {
             store.subscribe(h, me, Event::BoundChange);
         }
         store.subscribe(self.capacity, me, Event::BoundChange);
+    }
+
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        register_variables_until(store, me, &self.starts, Event::BoundChange, should_stop)
+            && register_variables_until(store, me, &self.dur, Event::BoundChange, should_stop)
+            && register_variables_until(store, me, &self.height, Event::BoundChange, should_stop)
+            && {
+                if should_stop() {
+                    false
+                } else {
+                    store.subscribe(self.capacity, me, Event::BoundChange);
+                    !should_stop()
+                }
+            }
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
@@ -482,6 +580,31 @@ pub fn cumulative_var(solver: &mut Solver, starts: &[VarId], durations: &[VarId]
     }));
 }
 
+pub(crate) fn cumulative_var_interruptible(
+    solver: &mut Solver,
+    starts: &[VarId],
+    durations: &[VarId],
+    heights: &[VarId],
+    capacity: VarId,
+    stop: &AtomicBool,
+) -> bool {
+    assert_eq!(starts.len(), durations.len(), "cumulative: length mismatch");
+    assert_eq!(starts.len(), heights.len(), "cumulative: length mismatch");
+    let Some(starts) = copy_slice_interruptible(starts, stop) else {
+        return false;
+    };
+    let Some(dur) = copy_slice_interruptible(durations, stop) else {
+        return false;
+    };
+    let Some(height) = copy_slice_interruptible(heights, stop) else {
+        return false;
+    };
+    let should_stop = || stop.load(Ordering::Acquire);
+    solver
+        .post_until(Box::new(CumulativeVar { starts, dur, height, capacity, profile: Vec::new(), buf: Vec::new() }), &should_stop)
+        .is_some()
+}
+
 // ===========================================================================
 // binPacking (Shaw, load-based)
 // ===========================================================================
@@ -505,6 +628,10 @@ impl Propagator for BinPacking {
         for &it in &self.items {
             store.subscribe(it, me, Event::DomainChange);
         }
+    }
+
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        register_variables_until(store, me, &self.items, Event::DomainChange, should_stop)
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
@@ -560,6 +687,27 @@ pub fn bin_packing(solver: &mut Solver, items: &[VarId], sizes: &[i64], capaciti
     }));
 }
 
+pub(crate) fn bin_packing_interruptible(
+    solver: &mut Solver,
+    items: &[VarId],
+    sizes: &[i64],
+    capacities: &[i64],
+    stop: &AtomicBool,
+) -> bool {
+    assert_eq!(items.len(), sizes.len(), "binPacking: items/sizes mismatch");
+    let Some(items) = copy_slice_interruptible(items, stop) else {
+        return false;
+    };
+    let Some(sizes) = copy_slice_interruptible(sizes, stop) else {
+        return false;
+    };
+    let Some(capacities) = copy_slice_interruptible(capacities, stop) else {
+        return false;
+    };
+    let should_stop = || stop.load(Ordering::Acquire);
+    solver.post_until(Box::new(BinPacking { items, sizes, capacities, load: Vec::new(), buf: Vec::new() }), &should_stop).is_some()
+}
+
 // ===========================================================================
 // knapsack (two linear constraints)
 // ===========================================================================
@@ -581,4 +729,40 @@ pub fn knapsack(
     assert_eq!(vars.len(), profits.len(), "knapsack: vars/profits mismatch");
     linear(solver, weights, vars, weight_rel, weight_limit);
     linear(solver, profits, vars, profit_rel, profit_limit);
+}
+
+pub(crate) struct KnapsackInput<'a> {
+    pub(crate) variables: &'a [VarId],
+    pub(crate) weights: &'a [i64],
+    pub(crate) profits: &'a [i64],
+    pub(crate) weight_relation: Relation,
+    pub(crate) weight_limit: i64,
+    pub(crate) profit_relation: Relation,
+    pub(crate) profit_limit: i64,
+}
+
+pub(crate) fn knapsack_interruptible(solver: &mut Solver, input: KnapsackInput<'_>, stop: &AtomicBool) -> bool {
+    assert_eq!(input.variables.len(), input.weights.len(), "knapsack: vars/weights mismatch");
+    assert_eq!(input.variables.len(), input.profits.len(), "knapsack: vars/profits mismatch");
+    let Some(weight_variables) = copy_slice_interruptible(input.variables, stop) else {
+        return false;
+    };
+    let Some(profit_variables) = copy_slice_interruptible(input.variables, stop) else {
+        return false;
+    };
+    let Some(weights) = copy_slice_interruptible(input.weights, stop) else {
+        return false;
+    };
+    let Some(profits) = copy_slice_interruptible(input.profits, stop) else {
+        return false;
+    };
+    crate::constraints::linear::linear_interruptible(solver, weights, weight_variables, input.weight_relation, input.weight_limit, stop)
+        && crate::constraints::linear::linear_interruptible(
+            solver,
+            profits,
+            profit_variables,
+            input.profit_relation,
+            input.profit_limit,
+            stop,
+        )
 }

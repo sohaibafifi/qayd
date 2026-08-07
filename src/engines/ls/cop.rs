@@ -28,6 +28,10 @@ const MIN_CONFLICTS_SAMPLES: usize = 8;
 
 #[derive(Clone)]
 pub(crate) enum LocalConstraint {
+    Selected {
+        selector: VarId,
+        constraint: Box<LocalConstraint>,
+    },
     Expr(Expr),
     Linear {
         coeffs: Vec<i64>,
@@ -90,8 +94,8 @@ pub(crate) enum LocalConstraint {
     },
     Cumulative {
         starts: Vec<VarId>,
-        durations: Vec<VarId>,
-        heights: Vec<VarId>,
+        durations: Vec<LocalRhs>,
+        heights: Vec<LocalRhs>,
         cap: LocalRhs,
     },
     ChannelInverse {
@@ -151,7 +155,11 @@ pub struct LocalSearchSpec {
     constraints: Vec<LocalConstraint>,
     functionals: Vec<Functional>,
     derived: Vec<bool>,
+    /// Variables owned by the semantic model, as opposed to physical helper
+    /// variables introduced while posting constraints.
+    decisions: Vec<bool>,
     unsupported: usize,
+    suppress_functionals: bool,
 }
 
 /// Behaviour toggles for the local-search engine selected by `--ls`.
@@ -172,11 +180,17 @@ pub struct LsConfig {
 
 pub struct LocalSearchOutcome {
     pub(crate) best: Option<(Vec<i32>, i64)>,
+    #[allow(dead_code, reason = "retained for the structured LS report migration")]
     pub(crate) iterations: u64,
+    #[allow(dead_code, reason = "retained for the structured LS report migration")]
     pub(crate) moves: u64,
+    #[allow(dead_code, reason = "retained for the structured LS report migration")]
     pub(crate) restarts: u64,
+    #[allow(dead_code, reason = "retained for the structured LS report migration")]
     pub(crate) constraints: usize,
+    #[allow(dead_code, reason = "retained for the structured LS report migration")]
     pub(crate) functionals: usize,
+    #[allow(dead_code, reason = "retained for the structured LS report migration")]
     pub(crate) unsupported: usize,
 }
 
@@ -524,6 +538,10 @@ fn min_conflict_candidates(
 /// Append every variable whose value a constraint's violation reads.
 fn constraint_vars(constraint: &LocalConstraint, out: &mut Vec<VarId>) {
     match constraint {
+        LocalConstraint::Selected { selector, constraint } => {
+            out.push(*selector);
+            constraint_vars(constraint, out);
+        }
         LocalConstraint::Expr(expr) => expr.collect_vars(out),
         LocalConstraint::Linear { vars, .. }
         | LocalConstraint::AllDifferent(vars)
@@ -553,8 +571,14 @@ fn constraint_vars(constraint: &LocalConstraint, out: &mut Vec<VarId>) {
         }
         LocalConstraint::Cumulative { starts, durations, heights, cap } => {
             out.extend(starts.iter().copied());
-            out.extend(durations.iter().copied());
-            out.extend(heights.iter().copied());
+            out.extend(durations.iter().filter_map(|value| match value {
+                LocalRhs::Var(variable) => Some(*variable),
+                LocalRhs::Const(_) => None,
+            }));
+            out.extend(heights.iter().filter_map(|value| match value {
+                LocalRhs::Var(variable) => Some(*variable),
+                LocalRhs::Const(_) => None,
+            }));
             if let LocalRhs::Var(v) = cap {
                 out.push(*v);
             }
@@ -685,20 +709,46 @@ impl LocalRhs {
 }
 
 impl LocalSearchSpec {
+    pub(crate) fn begin_guarded_constraints(&mut self) -> usize {
+        self.suppress_functionals = true;
+        self.constraints.len()
+    }
+
+    pub(crate) fn finish_guarded_constraints(&mut self, start: usize, selector: VarId) {
+        self.suppress_functionals = false;
+        for constraint in &mut self.constraints[start..] {
+            let inner = constraint.clone();
+            *constraint = LocalConstraint::Selected { selector, constraint: Box::new(inner) };
+        }
+    }
+
+    pub(crate) fn is_derived(&self, variable: VarId) -> bool {
+        self.derived.get(variable.index()).copied().unwrap_or(false)
+    }
+
+    pub(crate) fn is_decision(&self, variable: VarId) -> bool {
+        self.decisions.get(variable.index()).copied().unwrap_or(false)
+    }
+
     pub fn add_var(&mut self, var: VarId) {
         self.ensure(var);
+        self.decisions[var.index()] = true;
     }
 
     pub fn add_expr(&mut self, expr: Expr) {
-        if let Some(functional) = functional_from_expr(&expr, &self.derived) {
-            self.mark_functional(functional);
+        if !self.suppress_functionals {
+            if let Some(functional) = functional_from_expr(&expr, &self.derived) {
+                self.mark_functional(functional);
+            }
         }
         self.constraints.push(LocalConstraint::Expr(expr));
     }
 
     pub fn add_linear(&mut self, coeffs: Vec<i64>, vars: Vec<VarId>, rel: Relation, rhs: i64) {
-        if let Some(functional) = functional_from_linear(&coeffs, &vars, rel, rhs, &self.derived) {
-            self.mark_functional(functional);
+        if !self.suppress_functionals {
+            if let Some(functional) = functional_from_linear(&coeffs, &vars, rel, rhs, &self.derived) {
+                self.mark_functional(functional);
+            }
         }
         self.constraints.push(LocalConstraint::Linear { coeffs, vars, rel, rhs });
     }
@@ -721,8 +771,10 @@ impl LocalSearchSpec {
 
     pub fn add_extension(&mut self, vars: Vec<VarId>, tuples: Vec<Vec<i32>>, positive: bool) {
         if positive {
-            if let Some(functional) = functional_from_extension(&vars, &tuples) {
-                self.mark_functional(functional);
+            if !self.suppress_functionals {
+                if let Some(functional) = functional_from_extension(&vars, &tuples) {
+                    self.mark_functional(functional);
+                }
             }
             self.constraints.push(LocalConstraint::Extension { vars, tuples });
         } else {
@@ -759,10 +811,23 @@ impl LocalSearchSpec {
     }
 
     pub fn add_element(&mut self, array: Vec<VarId>, index: VarId, target: VarId, start_index: i32) {
-        self.mark_functional(Functional::Element { target, array, index, start_index });
+        if self.suppress_functionals {
+            self.mark_unsupported();
+        } else {
+            self.mark_functional(Functional::Element { target, array, index, start_index });
+        }
     }
 
     pub fn add_cumulative(&mut self, starts: Vec<VarId>, durations: Vec<VarId>, heights: Vec<VarId>, cap: LocalRhs) {
+        self.add_cumulative_rhs(
+            starts,
+            durations.into_iter().map(LocalRhs::Var).collect(),
+            heights.into_iter().map(LocalRhs::Var).collect(),
+            cap,
+        );
+    }
+
+    pub fn add_cumulative_rhs(&mut self, starts: Vec<VarId>, durations: Vec<LocalRhs>, heights: Vec<LocalRhs>, cap: LocalRhs) {
         self.constraints.push(LocalConstraint::Cumulative { starts, durations, heights, cap });
     }
 
@@ -814,6 +879,9 @@ impl LocalSearchSpec {
     fn ensure(&mut self, var: VarId) {
         if self.derived.len() <= var.index() {
             self.derived.resize(var.index() + 1, false);
+        }
+        if self.decisions.len() <= var.index() {
+            self.decisions.resize(var.index() + 1, false);
         }
     }
 
@@ -1128,6 +1196,12 @@ impl LocalModel {
     fn lex_constraints_ok(&self, assignment: &[i32]) -> bool {
         self.constraints.iter().all(|constraint| match constraint {
             LocalConstraint::Lex { rows, strict } => lex_chain_violation(rows, *strict, assignment) == 0,
+            LocalConstraint::Selected { selector, constraint }
+                if assignment[selector.index()] == 1 && matches!(constraint.as_ref(), LocalConstraint::Lex { .. }) =>
+            {
+                let LocalConstraint::Lex { rows, strict } = constraint.as_ref() else { unreachable!() };
+                lex_chain_violation(rows, *strict, assignment) == 0
+            }
             _ => true,
         })
     }
@@ -1288,6 +1362,13 @@ impl LocalModel {
 
     fn violation(&self, constraint: &LocalConstraint, assignment: &[i32]) -> i64 {
         match constraint {
+            LocalConstraint::Selected { selector, constraint } => {
+                if assignment[selector.index()] == 1 {
+                    self.violation(constraint, assignment)
+                } else {
+                    0
+                }
+            }
             LocalConstraint::Expr(expr) => match expr.eval(&|v| assignment[v.index()] as i64) {
                 Some(v) if v != 0 => 0,
                 Some(_) => 1,
@@ -1448,13 +1529,13 @@ fn element_member_violation(array: &[VarId], value: i32, assignment: &[i32]) -> 
     }
 }
 
-fn cumulative_violation(starts: &[VarId], durations: &[VarId], heights: &[VarId], cap: i64, assignment: &[i32]) -> i64 {
+fn cumulative_violation(starts: &[VarId], durations: &[LocalRhs], heights: &[LocalRhs], cap: i64, assignment: &[i32]) -> i64 {
     let mut tasks = Vec::new();
     let mut points = Vec::new();
     for ((&start, &duration), &height) in starts.iter().zip(durations).zip(heights) {
         let s = assignment[start.index()] as i64;
-        let d = assignment[duration.index()] as i64;
-        let h = assignment[height.index()] as i64;
+        let d = duration.value(assignment);
+        let h = height.value(assignment);
         if d <= 0 || h <= 0 {
             continue;
         }
@@ -1941,6 +2022,21 @@ pub fn solve_ls<F>(
     stop: &AtomicBool,
     seed: u64,
     config: LsConfig,
+    on_improve: F,
+) -> LocalSearchOutcome
+where
+    F: FnMut(i64, &[i32], &'static str),
+{
+    solve_ls_capped(problem, spec, stop, seed, config, u64::MAX, on_improve)
+}
+
+pub(crate) fn solve_ls_capped<F>(
+    problem: Problem,
+    spec: LocalSearchSpec,
+    stop: &AtomicBool,
+    seed: u64,
+    config: LsConfig,
+    max_iterations: u64,
     mut on_improve: F,
 ) -> LocalSearchOutcome
 where
@@ -2005,7 +2101,7 @@ where
     let mut stagnant = 0;
     let mut kick_bandit = KickBandit::new();
 
-    while !stop.load(Ordering::Relaxed) {
+    while iterations < max_iterations && !stop.load(Ordering::Relaxed) {
         iterations += 1;
         if complete_now && current.violation == 0 {
             if let Some(value) = model.objective_value(&assignment) {

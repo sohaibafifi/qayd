@@ -1,0 +1,9 @@
+<instance format="XCSP3" type="CSP">
+  <variables>
+    <array id="x" size="[3]"> 0..2 </array>
+  </variables>
+  <constraints>
+    <allDifferent><list>x[]</list></allDifferent>
+    <ordered><list>x[]</list><operator>lt</operator></ordered>
+  </constraints>
+</instance>

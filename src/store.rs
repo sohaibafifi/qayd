@@ -2,7 +2,7 @@
 //! propagation queue; [`Solver`] holds the propagator objects and drives the
 //! event-driven fixpoint.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::domains::int::Domain;
@@ -321,6 +321,40 @@ impl Store {
         id
     }
 
+    /// Create a validated list domain while honoring a physical-build
+    /// cancellation flag. A partially built store is intentionally discarded
+    /// by the caller when this returns `None`.
+    pub(crate) fn new_list_interruptible(&mut self, universe: Vec<i32>, should_stop: &dyn Fn() -> bool) -> Option<ListId> {
+        assert!(i32::try_from(universe.len()).is_ok(), "list universe is too large");
+        if should_stop() {
+            return None;
+        }
+        let mut seen = HashSet::with_capacity(universe.len());
+        for &item in &universe {
+            if should_stop() {
+                return None;
+            }
+            assert!(seen.insert(item), "list universe contains duplicate items");
+        }
+        if should_stop() {
+            return None;
+        }
+        let mut members = Vec::with_capacity(universe.len());
+        for _ in &universe {
+            if should_stop() {
+                return None;
+            }
+            members.push(self.new_var_range(0, 1));
+        }
+        if should_stop() {
+            return None;
+        }
+        let length = self.new_var_range(0, universe.len() as i32);
+        let id = ListId(self.list_domains.len() as u32);
+        self.list_domains.push(ListDomain { universe, members, length });
+        Some(id)
+    }
+
     /// Create a mandatory fixed-duration interval.
     pub fn new_interval(&mut self, start_min: i32, start_max: i32, duration: i32) -> IntervalId {
         self.new_interval_with_presence(start_min, start_max, duration, IntervalPresence::Present)
@@ -346,6 +380,18 @@ impl Store {
                 Some(var)
             }
         };
+        let id = IntervalId(self.interval_domains.len() as u32);
+        self.interval_domains.push(IntervalDomain { start, duration, presence });
+        id
+    }
+
+    /// Register an interval domain backed by integer variables that are
+    /// already owned by this store. Semantic compilation uses this to attach
+    /// native interval propagators without duplicating frontend variables.
+    pub(crate) fn register_interval(&mut self, start: VarId, duration: i32, presence: Option<VarId>) -> IntervalId {
+        assert!(start.index() < self.domains.len(), "interval start variable is unknown");
+        assert!(presence.is_none_or(|variable| variable.index() < self.domains.len()), "interval presence variable is unknown");
+        assert!(duration >= 0, "interval duration must be non-negative");
         let id = IntervalId(self.interval_domains.len() as u32);
         self.interval_domains.push(IntervalDomain { start, duration, presence });
         id
@@ -1267,19 +1313,32 @@ impl Solver {
     /// it for an initial propagation. Under [`set_selector`](Solver::set_selector)
     /// the propagator is first wrapped in a [`Selected`] guard.
     pub fn post(&mut self, prop: Box<dyn Propagator>) -> PropId {
+        self.post_until(prop, &|| false).expect("non-interruptible propagator registration must complete")
+    }
+
+    /// Post a propagator while polling `should_stop` during registration.
+    /// `None` means registration was interrupted. Some subscriptions or
+    /// auxiliary variables may already exist, so callers must discard this
+    /// solver instead of attempting propagation or posting more constraints.
+    pub(crate) fn post_until(&mut self, prop: Box<dyn Propagator>, should_stop: &dyn Fn() -> bool) -> Option<PropId> {
+        if should_stop() {
+            return None;
+        }
         let mut prop: Box<dyn Propagator> = match self.current_selector {
             Some(sel) => Box::new(Selected::new(sel, prop)),
             None => prop,
         };
         let id = self.store.alloc_prop();
         debug_assert_eq!(id.index(), self.propagators.len());
-        prop.register(&mut self.store, id);
+        if !prop.register_until(&mut self.store, id, should_stop) {
+            return None;
+        }
         self.store.set_priority(id, prop.priority());
         self.store.finalize_scope(id);
         self.propagators.push(Some(prop));
         self.weights.push(1);
         self.store.enqueue(id);
-        id
+        Some(id)
     }
 
     /// Route subsequently [`post`](Solver::post)ed propagators through a
@@ -1318,7 +1377,10 @@ impl Solver {
     /// Run the propagation fixpoint until the queue empties (consistent) or a
     /// propagator reports `Inconsistency`.
     pub fn propagate(&mut self) -> Result<(), Inconsistency> {
-        self.propagate_until(|| false)
+        while let Some(id) = self.store.dequeue() {
+            self.run_prop(id)?;
+        }
+        Ok(())
     }
 
     /// Run the propagation fixpoint, polling `should_stop`. On stop, clears the
@@ -1326,12 +1388,15 @@ impl Solver {
     /// this as a consistent fixpoint.
     pub fn propagate_until<F: Fn() -> bool>(&mut self, should_stop: F) -> Result<(), Inconsistency> {
         while let Some(id) = self.store.dequeue() {
-            // Poll every dequeue: one propagator call can be slow on huge instances.
             if should_stop() {
                 self.store.clear_queue();
                 return Ok(());
             }
-            self.run_prop(id)?;
+            self.run_prop_until(id, &should_stop)?;
+            if should_stop() {
+                self.store.clear_queue();
+                return Ok(());
+            }
         }
         Ok(())
     }
@@ -1358,6 +1423,26 @@ impl Solver {
         self.store.clear_pending();
         self.store.current = Some(id);
         let result = prop.propagate(&mut self.store);
+        self.store.current = None;
+        self.propagators[id.index()] = Some(prop);
+        if let Err(error) = result {
+            self.weights[id.index()] += 1;
+            self.store.bump_var_weight(id);
+            self.store.clear_queue();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn run_prop_until(&mut self, id: PropId, should_stop: &dyn Fn() -> bool) -> Result<(), Inconsistency> {
+        PROP_CALLS.with(|c| c.set(c.get() + 1));
+        if self.store.prio[id.index()] == Priority::Expensive {
+            EXPENSIVE_CALLS.with(|c| c.set(c.get() + 1));
+        }
+        let mut prop = self.propagators[id.index()].take().expect("running a propagator that is not present");
+        self.store.clear_pending();
+        self.store.current = Some(id);
+        let result = prop.propagate_until(&mut self.store, should_stop);
         self.store.current = None;
         self.propagators[id.index()] = Some(prop);
         if let Err(e) = result {

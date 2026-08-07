@@ -1,135 +1,145 @@
-//! Search driver: dispatch CSP / COP, stream progress, honour a time limit.
-//! Output follows the MiniZinc FlatZinc solver protocol: `name = value;` items
-//! for annotated output variables, `----------` after a solution, `==========`
-//! after a completeness proof, `=====UNSATISFIABLE=====` / `=====UNKNOWN=====`
-//! otherwise. Verbose extras are emitted as `%` comment lines.
+//! Search adapter and MiniZinc FlatZinc protocol renderer.
+//!
+//! Parsing builds a canonical `ModelPackage`; this module submits it to the
+//! frontend-neutral orchestrator, projects the verified result back onto
+//! annotated FlatZinc outputs, and renders the protocol markers.
 
-use std::collections::HashMap;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use qayd::{optimize_with, solve_interruptible, SearchControl, SolveStats, VarId};
+use qayd::model::IntVarRef;
+use qayd::orchestrator::{EventControl, EventSink, SolveError, SolveEvent, SolveLimits, SolveMode, SolveRequest, SolveResult, SolveStatus};
 
 use crate::model::{Model, Output};
 
 /// Run-time options from the command line.
 pub(crate) struct Options {
-    /// Stream improving bounds and print end-of-search statistics (as `%` comments).
+    /// Stream improving objectives and print end-of-search statistics (as `%` comments).
     pub(crate) verbose: bool,
-    /// Wall-clock limit; search is interrupted once it elapses.
+    /// Wall-clock limit shared by every orchestrated solve phase.
     pub(crate) time_limit: Option<Duration>,
 }
 
-/// Solve `model` and print the result in the MiniZinc solver protocol.
-pub(crate) fn solve(mut model: Model, opts: &Options) {
-    let start = Instant::now();
-    let stop = Arc::new(AtomicBool::new(false));
-    if let Some(limit) = opts.time_limit {
-        let flag = Arc::clone(&stop);
-        thread::spawn(move || {
-            thread::sleep(limit);
-            flag.store(true, Ordering::Relaxed);
-        });
-    }
-    let stop_ref: &AtomicBool = &stop;
-    match model.objective {
-        Some((minimizing, obj)) => solve_opt(&mut model, minimizing, obj, stop_ref, opts, start),
-        None => solve_sat(&mut model, stop_ref, opts, start),
+/// FlatZinc-specific output structure retained beside the canonical package.
+struct OutputProjection {
+    outputs: Vec<Output>,
+}
+
+impl OutputProjection {
+    /// Print annotated output items from a verified assignment.
+    fn print_solution(&self, result: &SolveResult) -> Result<(), SolveError> {
+        let candidate =
+            result.primal().ok_or_else(|| SolveError::InvalidResult("FlatZinc solution status has no primal assignment".to_string()))?;
+        let value = |variable: IntVarRef| {
+            let value = candidate
+                .assignment()
+                .integers
+                .get(variable.0)
+                .copied()
+                .flatten()
+                .ok_or_else(|| SolveError::InvalidResult(format!("FlatZinc output variable {} is undefined", variable.0)))?;
+            i32::try_from(value).map_err(|_| SolveError::InvalidResult("FlatZinc output value does not fit in an i32".to_string()))
+        };
+        let format_value = |variable: IntVarRef, is_bool: bool| -> Result<String, SolveError> {
+            let value = value(variable)?;
+            if is_bool {
+                if value != 0 {
+                    Ok("true".to_string())
+                } else {
+                    Ok("false".to_string())
+                }
+            } else {
+                Ok(value.to_string())
+            }
+        };
+
+        for output in &self.outputs {
+            match output {
+                Output::Var { name, var, is_bool } => println!("{name} = {};", format_value(*var, *is_bool)?),
+                Output::Array { name, dims, vars, is_bool } => {
+                    let ranges = dims.iter().map(|(lo, hi)| format!("{lo}..{hi}")).collect::<Vec<_>>().join(", ");
+                    let values = vars.iter().map(|&var| format_value(var, *is_bool)).collect::<Result<Vec<_>, _>>()?.join(", ");
+                    println!("{name} = array{}d({ranges}, [{values}]);", dims.len());
+                }
+            }
+        }
+        Ok(())
     }
 }
 
-/// Branch-and-bound optimisation, streaming each improving bound when verbose.
-fn solve_opt(model: &mut Model, minimizing: bool, obj: VarId, stop: &AtomicBool, opts: &Options, start: Instant) {
-    let verbose = opts.verbose;
-    let (best, stats) = optimize_with(&mut model.solver, &model.search, obj, minimizing, stop, |value| {
-        if verbose {
-            println!("% o {value}");
+/// FlatZinc event rendering. The compatibility adapter currently publishes its
+/// final candidate, while future progress events can be rendered without
+/// putting an optimization loop back into this frontend.
+struct FlatZincEvents {
+    verbose: bool,
+    last_objective: Option<i64>,
+}
+
+impl FlatZincEvents {
+    fn publish_objective(&mut self, objectives: &[i64]) {
+        let Some(&objective) = objectives.first() else {
+            return;
+        };
+        if self.verbose && self.last_objective != Some(objective) {
+            println!("% o {objective}");
             let _ = io::stdout().flush();
         }
-    });
-    let interrupted = stop.load(Ordering::Relaxed);
-    match best {
-        Some((solution, _)) => {
-            print_solution(model, &solution);
-            println!("----------");
-            // `==========` is the completeness proof; an interrupted incumbent
-            // is feasible but not proven optimal.
-            if !interrupted {
-                println!("==========");
-            }
-        }
-        None => println!("{}", if interrupted { "=====UNKNOWN=====" } else { "=====UNSATISFIABLE=====" }),
-    }
-    if verbose {
-        print_stats(&stats, start);
+        self.last_objective = Some(objective);
     }
 }
 
-/// Satisfaction search: report the first solution, or UNSAT / UNKNOWN.
-fn solve_sat(model: &mut Model, stop: &AtomicBool, opts: &Options, start: Instant) {
-    let mut solution = None;
-    let stats = solve_interruptible(
-        &mut model.solver,
-        &model.search,
-        |s| {
-            solution = Some(model.search.iter().map(|&v| s.store.value(v)).collect::<Vec<i32>>());
-            SearchControl::Stop
-        },
-        stop,
-    );
-    match solution {
-        Some(values) => {
-            print_solution(model, &values);
-            println!("----------");
+impl EventSink for FlatZincEvents {
+    fn emit(&mut self, event: SolveEvent) -> Result<EventControl, SolveError> {
+        match event {
+            SolveEvent::Candidate(candidate) => self.publish_objective(candidate.objectives()),
+            SolveEvent::Progress { objectives, .. } => self.publish_objective(&objectives),
+            SolveEvent::Bound(_) | SolveEvent::Proof(_) | SolveEvent::Finished(_) => {}
         }
-        None => println!("{}", if stop.load(Ordering::Relaxed) { "=====UNKNOWN=====" } else { "=====UNSATISFIABLE=====" }),
-    }
-    if opts.verbose {
-        print_stats(&stats, start);
+        Ok(EventControl::Continue)
     }
 }
 
-/// Print the annotated output items in MiniZinc's FlatZinc solution format:
-/// `name = value;` and `name = arrayNd(1..a, ..., [values]);`.
-fn print_solution(model: &Model, assignment: &[i32]) {
-    let by_search: HashMap<VarId, i32> = model.search.iter().copied().zip(assignment.iter().copied()).collect();
-    // Constants and root-fixed variables keep their value in the store.
-    let value = |v: VarId| by_search.get(&v).copied().unwrap_or_else(|| model.solver.store.value(v));
-    let fmt = |v: VarId, is_bool: bool| {
-        let x = value(v);
-        if is_bool {
-            if x != 0 {
-                "true".to_string()
-            } else {
-                "false".to_string()
-            }
-        } else {
-            x.to_string()
-        }
+/// Solve `model` through the shared orchestrator and print MiniZinc protocol output.
+pub(crate) fn solve(model: Model, opts: &Options) -> Result<(), SolveError> {
+    let request = SolveRequest {
+        mode: SolveMode::Exact,
+        limits: SolveLimits { time: opts.time_limit, ..SolveLimits::default() },
+        ..SolveRequest::default()
     };
-    for out in &model.outputs {
-        match out {
-            Output::Var { name, var, is_bool } => println!("{name} = {};", fmt(*var, *is_bool)),
-            Output::Array { name, dims, vars, is_bool } => {
-                let ranges = dims.iter().map(|(lo, hi)| format!("{lo}..{hi}")).collect::<Vec<_>>().join(", ");
-                let values = vars.iter().map(|&v| fmt(v, *is_bool)).collect::<Vec<_>>().join(", ");
-                println!("{name} = array{}d({ranges}, [{values}]);", dims.len());
-            }
-        }
+    let (package, outputs) = model.into_package();
+    let projection = OutputProjection { outputs };
+    let mut events = FlatZincEvents { verbose: opts.verbose, last_objective: None };
+    let result = qayd::solve(&package, &request, &mut events)?;
+
+    render_result(&projection, &result)?;
+    if opts.verbose {
+        print_stats(&result);
     }
+    Ok(())
 }
 
-/// Print a `%` statistics comment line.
-fn print_stats(stats: &SolveStats, start: Instant) {
-    println!(
-        "% time={:.3}s nodes={} failures={} solutions={} learned_lits={}",
-        start.elapsed().as_secs_f64(),
-        stats.nodes,
-        stats.failures,
-        stats.solutions,
-        stats.learned_lits,
-    );
+/// Render an orchestrator-owned final status using MiniZinc protocol markers.
+fn render_result(projection: &OutputProjection, result: &SolveResult) -> Result<(), SolveError> {
+    if result.primal().is_some() {
+        projection.print_solution(result)?;
+        println!("----------");
+        if result.status() == SolveStatus::Optimal {
+            println!("==========");
+        }
+    } else {
+        let marker = if result.status() == SolveStatus::Unsatisfiable { "=====UNSATISFIABLE=====" } else { "=====UNKNOWN=====" };
+        println!("{marker}");
+    }
+    Ok(())
+}
+
+/// Print a `%` statistics comment line aggregated from all engine reports.
+fn print_stats(result: &SolveResult) {
+    let elapsed = result.elapsed();
+    let stats = result.aggregate_search_stats();
+    let nodes = stats.nodes;
+    let failures = stats.failures;
+    let solutions = stats.solutions;
+    let learned_lits = stats.learned_lits;
+    println!("% time={:.3}s nodes={nodes} failures={failures} solutions={solutions} learned_lits={learned_lits}", elapsed.as_secs_f64(),);
 }

@@ -1,0 +1,15 @@
+{
+  "schema": "qayd.python-golden/v1",
+  "kind": "integer",
+  "variables": [
+    {"name": "x", "domain": [0, 1, 2, 3]},
+    {"name": "y", "domain": [0, 1, 2, 3]}
+  ],
+  "constraints": [
+    {"terms": {"x": 1, "y": 1}, "relation": "eq", "rhs": 3},
+    {"terms": {"y": 1}, "relation": "le", "rhs": 2}
+  ],
+  "objectives": [
+    {"sense": "minimize", "terms": {"x": 1}}
+  ]
+}

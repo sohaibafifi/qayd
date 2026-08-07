@@ -337,8 +337,13 @@ impl ObjectiveTier {
 /// flexible op has several modes; the search picks one.
 #[derive(Clone, Copy)]
 pub struct Mode {
+    /// Stable index in the semantic interval-mode arena. Legacy physical
+    /// schedules may omit it until they are lifted through [`crate::model::Model`].
+    pub reference: Option<usize>,
     pub machine: usize,
     pub duration: i64,
+    /// Inclusive start bounds for this execution mode.
+    pub start_window: (i64, i64),
 }
 
 /// An interval decision variable: a task whose start is decided in
@@ -425,6 +430,9 @@ pub struct CollectionSolution {
     /// Chosen machine of each interval (`-1` if it has no modes), for a moded
     /// [`Schedule`] model (empty otherwise).
     pub machines: Vec<i64>,
+    /// Stable semantic mode index for each interval, or `None` for fixed,
+    /// absent, or legacy modes without a semantic identity.
+    pub modes: Vec<Option<usize>>,
     /// Certified dual bound and gap for the primary objective, when a supported
     /// relaxation was available.
     pub bound: Option<BoundReport>,

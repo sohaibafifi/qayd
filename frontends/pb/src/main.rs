@@ -9,21 +9,21 @@
 //! o <objective value>      (each incumbent, flushed immediately)
 //! ```
 //!
-//! Current scope: linear PBS/PBO without certificates. Non-linear (product)
-//! terms and objectives whose value range exceeds `i32` are reported
-//! `s UNSUPPORTED`.
+//! Current scope: linear PBS/PBO without certificates. Non-linear product
+//! terms are reported `s UNSUPPORTED`.
 
 mod opb;
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use opb::{Objective, Op, Opb};
-use qayd::constraints::linear::{linear, Relation};
-use qayd::{first_solution, optimize_with, Solver, VarId};
+use qayd::model::{Constraint, IntExpr, IntVarRef, Model, ModelObject, ModelPackage, Objective as SemanticObjective, Relation};
+use qayd::orchestrator::{
+    solve_model_with_stop, EventControl, EventSink, SolveError, SolveEvent, SolveLimits, SolveMode, SolveRequest, SolveResult, SolveStatus,
+};
 
 struct Options {
     verbose: bool,
@@ -31,25 +31,8 @@ struct Options {
     memory_limit_mb: Option<u64>,
 }
 
-/// Final answer status, used for the exit code.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Status {
-    Satisfiable,
-    Optimum,
-    Unsatisfiable,
-    Unknown,
-    Unsupported,
-}
-
 fn main() {
     let (opts, path) = parse_args();
-    if let Some(limit) = opts.memory_limit_mb {
-        set_memory_limit(limit).unwrap_or_else(|e| {
-            eprintln!("error: cannot apply memory limit: {e}");
-            std::process::exit(1);
-        });
-    }
-
     let input = read_input(path.as_deref());
 
     let instance = opb::parse(&input).unwrap_or_else(|e| {
@@ -59,35 +42,72 @@ fn main() {
 
     let stop = Arc::new(AtomicBool::new(false));
     install_signal_handler(&stop, opts.verbose);
-    if let Some(limit) = opts.time_limit {
-        let flag = Arc::clone(&stop);
-        thread::spawn(move || {
-            thread::sleep(limit);
-            flag.store(true, Ordering::Relaxed);
-        });
-    }
 
-    let start = Instant::now();
-    let status = run(&instance, &stop);
-    if opts.verbose {
-        eprintln!("c time={:.3}s vars={} constraints={}", start.elapsed().as_secs_f64(), instance.n_vars, instance.constraints.len());
-    }
+    let status = match run(&instance, Arc::clone(&stop), &opts) {
+        Ok(status) => status,
+        Err(FrontendError::Unsupported) => {
+            println!("s UNSUPPORTED");
+            std::process::exit(0);
+        }
+        Err(FrontendError::Solve(error)) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+    };
     std::process::exit(competition_exit_code(status));
 }
 
-/// Build the model and solve. Prints the competition output; returns the status.
-fn run(instance: &Opb, stop: &AtomicBool) -> Status {
+enum FrontendError {
+    Unsupported,
+    Solve(SolveError),
+}
+
+impl From<SolveError> for FrontendError {
+    fn from(error: SolveError) -> Self {
+        Self::Solve(error)
+    }
+}
+
+struct LoweredPackage {
+    package: ModelPackage,
+}
+
+/// Build the semantic model, delegate execution, and render the competition
+/// protocol. Status and proof semantics come exclusively from the orchestrator.
+fn run(instance: &Opb, stop: Arc<AtomicBool>, options: &Options) -> Result<SolveStatus, FrontendError> {
     if instance.nonlinear {
-        println!("s UNSUPPORTED");
-        return Status::Unsupported;
+        return Err(FrontendError::Unsupported);
     }
 
-    let mut solver = Solver::new();
+    let Some(lowered) = lower_problem(instance) else {
+        return Err(FrontendError::Unsupported);
+    };
+    let request = SolveRequest {
+        mode: SolveMode::Exact,
+        limits: SolveLimits {
+            time: options.time_limit,
+            memory_bytes: options.memory_limit_mb.map(|mb| mb.saturating_mul(1024).saturating_mul(1024)),
+            ..SolveLimits::default()
+        },
+        ..SolveRequest::default()
+    };
+    let mut sink = CompetitionSink::new();
+    let result = solve_model_with_stop(&lowered.package, &request, stop, &mut sink)?;
+    if options.verbose {
+        let elapsed = result.elapsed();
+        eprintln!("c time={:.3}s vars={} constraints={}", elapsed.as_secs_f64(), instance.n_vars, instance.constraints.len());
+    }
+    render_result(&result, instance.n_vars, &mut sink)?;
+    Ok(result.status())
+}
+
+fn lower_problem(instance: &Opb) -> Option<LoweredPackage> {
+    let mut model = Model::new();
     // 0/1 variable for each OPB index; `vars[i]` is OPB variable `x(i+1)`.
-    let vars: Vec<VarId> = (0..instance.n_vars).map(|_| solver.new_var_range(0, 1)).collect();
+    let vars: Vec<IntVarRef> = (0..instance.n_vars).map(|_| model.bool_var()).collect();
 
     for c in &instance.constraints {
-        let (coeffs, cvars, rhs) = normalize(&c.terms, c.rhs, &vars);
+        let (terms, rhs) = normalize(&c.terms, c.rhs, &vars);
         let rel = match c.op {
             Op::Ge => Relation::Ge,
             Op::Le => Relation::Le,
@@ -95,14 +115,25 @@ fn run(instance: &Opb, stop: &AtomicBool) -> Status {
             Op::Gt => Relation::Gt,
             Op::Lt => Relation::Lt,
         };
-        linear(&mut solver, &coeffs, &cvars, rel, rhs);
+        model.add_constraint(Constraint::Linear { terms, relation: rel, rhs });
     }
 
-    match &instance.objective {
-        None => solve_satisfaction(&mut solver, &vars),
-        Some(obj) if obj.terms.is_empty() => solve_satisfaction(&mut solver, &vars),
-        Some(obj) => solve_optimization(&mut solver, &vars, obj, stop),
+    let objective = match &instance.objective {
+        None => None,
+        Some(objective) => Some(lower_objective(&vars, objective)?),
+    };
+    if let Some(objective) = objective {
+        model.add_objective(objective);
     }
+    let mut package = ModelPackage::new(model);
+    for (index, variable) in vars.into_iter().enumerate() {
+        let object = ModelObject::IntVar(variable);
+        let name = format!("x{}", index + 1);
+        package.metadata.names.insert(object, name.clone());
+        package.metadata.frontend_ids.insert(("opb".to_string(), name), object);
+        package.metadata.outputs.push(object);
+    }
+    Some(LoweredPackage { package })
 }
 
 /// Collapse terms to one coefficient per variable and fold `~x` literals and the
@@ -110,7 +141,7 @@ fn run(instance: &Opb, stop: &AtomicBool) -> Status {
 ///
 /// `c·~x = c·(1 - x) = c - c·x`, so a negated term contributes `-c` to `x` and
 /// `c` to the LHS constant, which moves to the rhs as `-c`.
-fn normalize(terms: &[opb::Term], rhs: i64, vars: &[VarId]) -> (Vec<i64>, Vec<VarId>, i64) {
+fn normalize(terms: &[opb::Term], rhs: i64, vars: &[IntVarRef]) -> (Vec<(i64, IntVarRef)>, i64) {
     let mut coeff_by_var = vec![0i64; vars.len()];
     let mut constant = 0i64; // LHS constant to move to the rhs
     for t in terms {
@@ -122,95 +153,112 @@ fn normalize(terms: &[opb::Term], rhs: i64, vars: &[VarId]) -> (Vec<i64>, Vec<Va
             coeff_by_var[idx] += t.coeff;
         }
     }
-    let mut coeffs = Vec::new();
-    let mut cvars = Vec::new();
+    let mut normalized = Vec::new();
     for (idx, &c) in coeff_by_var.iter().enumerate() {
         if c != 0 {
-            coeffs.push(c);
-            cvars.push(vars[idx]);
+            normalized.push((c, vars[idx]));
         }
     }
-    (coeffs, cvars, rhs - constant)
+    (normalized, rhs - constant)
 }
 
-fn solve_satisfaction(solver: &mut Solver, vars: &[VarId]) -> Status {
-    match first_solution(solver, vars) {
-        Some(model) => {
-            println!("s SATISFIABLE");
-            print_model(&model);
-            Status::Satisfiable
-        }
-        None => {
-            println!("s UNSATISFIABLE");
-            Status::Unsatisfiable
-        }
-    }
-}
-
-fn solve_optimization(solver: &mut Solver, vars: &[VarId], obj: &Objective, stop: &AtomicBool) -> Status {
+fn lower_objective(vars: &[IntVarRef], obj: &Objective) -> Option<SemanticObjective> {
     // Objective in x-form (coefficients on `x`). `normalize` folds the `~x`
     // constant into its third return as `0 - folded`, so the additive constant
     // of the true objective is its negation.
-    let (ocoeffs, ovars, neg_constant) = normalize(&obj.terms, 0, vars);
-    let constant = -neg_constant;
+    let (terms, neg_constant) = normalize(&obj.terms, 0, vars);
+    let constant = neg_constant.checked_neg()?;
 
-    // Bounds of the x-form sum; the materialised objective variable needs an
-    // i32 domain, so bail out if the range does not fit.
-    let (mut lo, mut hi) = (0i64, 0i64);
-    for &c in &ocoeffs {
-        if c < 0 {
-            lo += c;
-        } else {
-            hi += c;
+    let mut expressions = terms
+        .into_iter()
+        .map(|(coefficient, variable)| IntExpr::Mul(vec![IntExpr::Constant(coefficient), IntExpr::Variable(variable)]))
+        .collect::<Vec<_>>();
+    if constant != 0 {
+        expressions.push(IntExpr::Constant(constant));
+    }
+    let expr = if expressions.is_empty() { IntExpr::Constant(0) } else { IntExpr::Add(expressions) };
+    Some(SemanticObjective::IntExpr { minimize: !obj.maximize, expr })
+}
+
+struct CompetitionSink {
+    last_objective: Option<i64>,
+}
+
+impl CompetitionSink {
+    fn new() -> Self {
+        Self { last_objective: None }
+    }
+
+    fn publish_objective(&mut self, value: i64) -> Result<(), SolveError> {
+        if self.last_objective != Some(value) {
+            println!("o {value}");
+            io::stdout().flush().map_err(|error| SolveError::Engine(error.to_string()))?;
+            self.last_objective = Some(value);
         }
+        Ok(())
     }
-    if lo < i32::MIN as i64 || hi > i32::MAX as i64 {
-        println!("s UNSUPPORTED");
-        return Status::Unsupported;
-    }
+}
 
-    let obj_var = solver.new_var_range(lo as i32, hi as i32);
-    // obj_var = sum(ocoeffs · ovars):  sum - obj_var = 0.
-    let mut eq_coeffs = ocoeffs.clone();
-    let mut eq_vars = ovars.clone();
-    eq_coeffs.push(-1);
-    eq_vars.push(obj_var);
-    linear(solver, &eq_coeffs, &eq_vars, Relation::Eq, 0);
-
-    // Reported objective value = x-form value + the folded `~x` constant, sign
-    // handled by the maximise flag.
-    let minimizing = !obj.maximize;
-    let report = |x_value: i32| -> i64 { x_value as i64 + constant };
-
-    let (best, _stats) = optimize_with(solver, vars, obj_var, minimizing, stop, |x_value| {
-        println!("o {}", report(x_value));
-        let _ = io::stdout().flush();
-    });
-
-    let interrupted = stop.load(Ordering::Relaxed);
-    match best {
-        Some((model, x_value)) => {
-            if interrupted {
-                println!("o {}", report(x_value));
-                println!("s SATISFIABLE");
-                print_model(&model);
-                Status::Satisfiable
-            } else {
-                println!("o {}", report(x_value));
-                println!("s OPTIMUM FOUND");
-                print_model(&model);
-                Status::Optimum
+impl EventSink for CompetitionSink {
+    fn emit(&mut self, event: SolveEvent) -> Result<EventControl, SolveError> {
+        match event {
+            SolveEvent::Candidate(candidate) => {
+                if let Some(&objective) = candidate.objectives().first() {
+                    self.publish_objective(objective)?;
+                }
             }
+            SolveEvent::Progress { objectives, .. } => {
+                if let Some(&objective) = objectives.first() {
+                    self.publish_objective(objective)?;
+                }
+            }
+            SolveEvent::Bound(_) | SolveEvent::Proof(_) | SolveEvent::Finished(_) => {}
         }
-        None if interrupted => {
-            println!("s UNKNOWN");
-            Status::Unknown
-        }
-        None => {
-            println!("s UNSATISFIABLE");
-            Status::Unsatisfiable
-        }
+        Ok(EventControl::Continue)
     }
+}
+
+fn render_result(result: &SolveResult, n_vars: usize, sink: &mut CompetitionSink) -> Result<(), SolveError> {
+    if let Some(raw) = result.primal().and_then(|candidate| candidate.objectives().first()).copied() {
+        sink.publish_objective(raw)?;
+    }
+    match result.status() {
+        SolveStatus::Optimal => {
+            println!("s OPTIMUM FOUND");
+            print_result_model(result, n_vars)?;
+        }
+        SolveStatus::Satisfiable => {
+            println!("s SATISFIABLE");
+            print_result_model(result, n_vars)?;
+        }
+        SolveStatus::Unsatisfiable => println!("s UNSATISFIABLE"),
+        SolveStatus::Unknown => println!("s UNKNOWN"),
+        SolveStatus::Unsupported => println!("s UNSUPPORTED"),
+    }
+    Ok(())
+}
+
+fn print_result_model(result: &SolveResult, n_vars: usize) -> Result<(), SolveError> {
+    let candidate = result.primal().ok_or_else(|| SolveError::InvalidResult("SAT/OPTIMUM result has no verified PB model".to_string()))?;
+    if candidate.assignment().integers.len() != n_vars {
+        return Err(SolveError::InvalidResult(format!(
+            "verified PB model has {} variables, expected {n_vars}",
+            candidate.assignment().integers.len()
+        )));
+    }
+    let model = candidate
+        .assignment()
+        .integers
+        .iter()
+        .map(|value| match value {
+            Some(0) => Ok(0),
+            Some(1) => Ok(1),
+            Some(value) => Err(SolveError::InvalidResult(format!("verified PB variable has non-Boolean value {value}"))),
+            None => Err(SolveError::InvalidResult("verified PB model contains an unassigned variable".to_string())),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    print_model(&model);
+    Ok(())
 }
 
 /// Print the `v` line: `x<i>` when true, `-x<i>` when false (1-based).
@@ -305,7 +353,7 @@ fn print_usage() {
 fn install_signal_handler(stop: &Arc<AtomicBool>, verbose: bool) {
     let flag = Arc::clone(stop);
     if let Err(err) = ctrlc::set_handler(move || {
-        flag.store(true, Ordering::Relaxed);
+        flag.store(true, Ordering::Release);
     }) {
         if verbose {
             eprintln!("c signal_handler=unavailable reason={err}");
@@ -313,39 +361,13 @@ fn install_signal_handler(stop: &Arc<AtomicBool>, verbose: bool) {
     }
 }
 
-fn competition_exit_code(status: Status) -> i32 {
+fn competition_exit_code(status: SolveStatus) -> i32 {
     // Mirrors the PB Competition convention: 10 SAT, 20 UNSAT, 30 OPTIMUM,
     // 0 otherwise.
     match status {
-        Status::Satisfiable => 10,
-        Status::Unsatisfiable => 20,
-        Status::Optimum => 30,
-        Status::Unknown | Status::Unsupported => 0,
+        SolveStatus::Satisfiable => 10,
+        SolveStatus::Unsatisfiable => 20,
+        SolveStatus::Optimal => 30,
+        SolveStatus::Unknown | SolveStatus::Unsupported => 0,
     }
-}
-
-#[cfg(target_os = "linux")]
-fn set_memory_limit(memory_limit_mb: u64) -> io::Result<()> {
-    let bytes = memory_limit_mb.saturating_mul(1024).saturating_mul(1024);
-    let mut current = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-    let get_rc = unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut current) };
-    if get_rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let requested = bytes as libc::rlim_t;
-    if current.rlim_max != libc::RLIM_INFINITY && requested > current.rlim_max {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("requested limit exceeds hard limit {}", current.rlim_max)));
-    }
-    let limit = libc::rlimit { rlim_cur: requested, rlim_max: current.rlim_max };
-    let rc = unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn set_memory_limit(_memory_limit_mb: u64) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "--memory-mb is only supported on Linux"))
 }

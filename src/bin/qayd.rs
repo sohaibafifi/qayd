@@ -134,31 +134,6 @@ fn main() {
         let s = stop.clone();
         let _ = ctrlc::set_handler(move || s.store(true, Ordering::SeqCst));
     }
-    if let Some(secs) = time_limit {
-        let s = stop.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(secs));
-            s.store(true, Ordering::SeqCst);
-        });
-    }
-    if let Some(mb) = mem_limit {
-        qayd::mem::set_limit_mb(mb);
-        let s = stop.clone();
-        std::thread::spawn(move || {
-            // Same clean-stop path as the time limit: set the flag, keep the
-            // incumbent, report SATISFIABLE/UNKNOWN (never OPTIMUM/UNSAT).
-            while !s.load(Ordering::Relaxed) {
-                if qayd::mem::over_hard() {
-                    if verbose {
-                        eprintln!("c mem hard limit reached at {} MB; stopping search", qayd::mem::live() / (1024 * 1024));
-                    }
-                    s.store(true, Ordering::SeqCst);
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        });
-    }
 
     let mode = if ls { qayd::frontends::xcsp::Mode::Ls } else { qayd::frontends::xcsp::Mode::Default };
     run_instance(
@@ -175,6 +150,7 @@ fn main() {
             no_learn_csp,
             force_scope_reasons,
             shared_pool_capacity,
+            time_limit: time_limit.map(Duration::from_secs),
             mem_limit,
         },
     );

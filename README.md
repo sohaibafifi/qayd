@@ -85,9 +85,34 @@ Priority order: correct, simple, fast.
 - `qayd-fzn`: beta FlatZinc driver for MiniZinc.
 - `qayd-sat`: beta DIMACS CNF frontend.
 - `qayd-pb`: beta OPB frontend.
-- Rust crate: direct finite-domain modeling and solver internals.
+- Rust crate: canonical semantic modeling through `Model`, `ModelPackage`, and
+  `SolveRequest`, plus lower-level solver internals.
 - Python module: modeling experiments, especially list, lambda, and routing
   examples.
+
+Every frontend builds the same semantic package. The orchestrator validates it,
+compiles an executable backend plan, owns budgets and cancellation, then replays
+the final assignment before publication. A minimal Rust solve is:
+
+```rust
+use qayd::model::{Constraint, Model, ModelPackage, Relation};
+use qayd::orchestrator::{IgnoreEvents, SolveRequest};
+
+let mut model = Model::new();
+let value = model.int_range(0, 9);
+model.add_constraint(Constraint::Linear {
+    terms: vec![(1, value)],
+    relation: Relation::Ge,
+    rhs: 4,
+});
+
+let result = qayd::solve(
+    &ModelPackage::new(model),
+    &SolveRequest::default(),
+    &mut IgnoreEvents,
+)?;
+# Ok::<(), qayd::orchestrator::SolveError>(())
+```
 
 ## Build And Test
 

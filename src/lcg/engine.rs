@@ -490,10 +490,11 @@ impl Cdcl<'_> {
         }
         let mut stats = SolveStats::default();
         let mut best: Option<(Vec<i32>, i64)> = None;
+        self.set_conflict_budget(conflict_budget);
         if !self.init() {
             stats.failures = self.conflicts;
             self.copy_inprocessing_stats(&mut stats);
-            return (best, stats, true);
+            return (best, stats, !self.conflict_budget_exhausted());
         }
         if cube.is_empty() && conflict_budget.is_none() && !self.root_probe(vars) {
             stats.failures = self.conflicts;
@@ -503,7 +504,7 @@ impl Cdcl<'_> {
         if !self.assume_cube(cube) {
             stats.failures = self.conflicts;
             self.copy_inprocessing_stats(&mut stats);
-            return (best, stats, true);
+            return (best, stats, !self.conflict_budget_exhausted());
         }
         // Seed the saved-phase array with the caller's value-ordering hint (e.g.
         // nearest-neighbour successors) when supplied, else start blank.
@@ -516,15 +517,14 @@ impl Cdcl<'_> {
         let mut enforced = None;
         let mut obj_bound = ObjBoundCell::default();
         let mut complete = true;
-        let conflict_limit = conflict_budget.map(|n| self.conflicts.saturating_add(n));
         if !self.sync_shared_clauses() {
             stats.failures = self.conflicts;
             self.copy_inprocessing_stats(&mut stats);
-            return (best, stats, true);
+            return (best, stats, !self.conflict_budget_exhausted());
         }
 
         loop {
-            if stop.load(Ordering::Relaxed) || conflict_limit.is_some_and(|limit| self.conflicts >= limit) {
+            if stop.load(Ordering::Relaxed) || self.conflict_budget_reached() {
                 complete = false;
                 break;
             }
@@ -535,12 +535,18 @@ impl Cdcl<'_> {
                     if stronger {
                         enforced = Some(value);
                         if !self.tighten_objective(objective, minimizing, value, &mut obj_bound) {
+                            if self.conflict_budget_exhausted() {
+                                complete = false;
+                            }
                             break;
                         }
                     }
                 }
             }
             if !self.maybe_restart() {
+                if self.conflict_budget_exhausted() {
+                    complete = false;
+                }
                 break;
             }
             match self.select_var(vars, objective_impact.as_ref()) {
@@ -557,6 +563,9 @@ impl Cdcl<'_> {
                         on_improve,
                     );
                     if !keep_searching {
+                        if self.conflict_budget_exhausted() {
+                            complete = false;
+                        }
                         break; // optimal
                     }
                 }
@@ -565,6 +574,9 @@ impl Cdcl<'_> {
                     let lit = self.decision_lit(v, &phase);
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
+                        if self.conflict_budget_exhausted() {
+                            complete = false;
+                        }
                         break; // tree exhausted under the bound: optimal
                     }
                 }
@@ -627,22 +639,23 @@ impl Cdcl<'_> {
         stop: &AtomicBool,
     ) -> (Option<Vec<i32>>, SolveStats, bool) {
         let mut stats = SolveStats::default();
+        self.set_conflict_budget(conflict_budget);
         if !self.init() || !self.assume_cube(cube) || !self.sync_shared_clauses() {
             stats.failures = self.conflicts;
             self.copy_inprocessing_stats(&mut stats);
-            return (None, stats, true);
+            return (None, stats, !self.conflict_budget_exhausted());
         }
         if self.initial_phase.len() == self.solver.store.num_vars() {
             self.saved_phase = self.initial_phase.clone();
         }
-        let conflict_limit = conflict_budget.map(|n| self.conflicts.saturating_add(n));
         let mut complete = true;
         let solution = loop {
-            if stop.load(Ordering::Relaxed) || conflict_limit.is_some_and(|limit| self.conflicts >= limit) {
+            if stop.load(Ordering::Relaxed) || self.conflict_budget_reached() {
                 complete = false;
                 break None;
             }
             if !self.maybe_restart() {
+                complete = !self.conflict_budget_exhausted();
                 break None;
             }
             match self.select_var(vars, None) {
@@ -655,6 +668,7 @@ impl Cdcl<'_> {
                     let lit = self.decision_lit(v, &self.saved_phase);
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
+                        complete = !self.conflict_budget_exhausted();
                         break None;
                     }
                 }

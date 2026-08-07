@@ -2,14 +2,10 @@
 
 use std::collections::HashMap;
 
-use qayd::constraints::intension::intension;
-use qayd::constraints::linear::{linear, Relation};
-use qayd::constraints::primitives::{all_different, all_equal, precedence};
-use qayd::expr;
-use qayd::VarId;
+use qayd::model::{IntVarRef, Relation, SourceRange};
 
-use crate::model::{FznDomain, Model, Output, Reif, UNBOUNDED_HI, UNBOUNDED_LO};
-use crate::text::{clean_name, require, split_args, strip_annotations, strip_leading_solve_annotations};
+use crate::model::{expr, FznDomain, Model, Output, Reif, UNBOUNDED_HI, UNBOUNDED_LO};
+use crate::text::{clean_name, require, split_args, strip_leading_solve_annotations};
 
 const MAX_EXPLICIT_DOMAIN_VALUES: usize = 100_000;
 
@@ -17,25 +13,233 @@ const MAX_EXPLICIT_DOMAIN_VALUES: usize = 100_000;
 /// statement to a declaration, constraint, or solve handler.
 pub(crate) fn parse(input: &str) -> Result<Model, String> {
     let mut model = Model::new();
-    let mut text = String::new();
-    for line in input.lines() {
-        text.push_str(line.split('%').next().unwrap_or(""));
-        text.push('\n');
-    }
-    for raw in text.split(';') {
+    let text = strip_comments_preserving_offsets(input);
+    let mut item_start = 0;
+    let mut item = 0;
+    for item_end in statement_ends(&text).into_iter().chain(std::iter::once(text.len())) {
+        let raw = &text[item_start..item_end.saturating_sub(usize::from(item_end > item_start && text.as_bytes()[item_end - 1] == b';'))];
+        let leading = raw.len() - raw.trim_start().len();
+        let trailing = raw.trim_end().len();
         let stmt = raw.trim();
-        if stmt.is_empty() || stmt.starts_with("predicate ") || stmt.starts_with("output ") {
+        let source = SourceRange {
+            source: "flatzinc".to_string(),
+            start: item_start + leading,
+            end: item_start + trailing + usize::from(item_end > item_start && text.as_bytes()[item_end - 1] == b';'),
+        };
+        item_start = item_end;
+        if stmt.is_empty() {
             continue;
         }
-        if stmt.starts_with("constraint ") {
-            parse_constraint(&mut model, stmt)?;
+        let mark = model.metadata_mark();
+        let annotations = if stmt.starts_with("constraint ") {
+            let (body, parsed_annotations) = split_trailing_annotations(stmt)?;
+            parse_constraint(&mut model, &body)?;
+            parsed_annotations
         } else if stmt.starts_with("solve ") {
-            parse_solve(&mut model, stmt)?;
+            parse_solve(&mut model, stmt, item, source.clone())?
+        } else if stmt.starts_with("predicate ") || stmt.starts_with("output ") {
+            let (_, parsed_annotations) = split_trailing_annotations(stmt)?;
+            parsed_annotations
         } else {
-            parse_decl(&mut model, stmt)?;
-        }
+            let (body, parsed_annotations) = split_declaration_annotations(stmt)?;
+            parse_decl(&mut model, &body, &parsed_annotations)?;
+            parsed_annotations
+        };
+        model.record_item_metadata(item, mark, &annotations, source);
+        item += 1;
     }
     Ok(model)
+}
+
+fn statement_ends(text: &str) -> Vec<usize> {
+    let mut ends = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, byte) in text.bytes().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else if byte == b'"' {
+            in_string = true;
+        } else if byte == b';' {
+            ends.push(index + 1);
+        }
+    }
+    ends
+}
+
+/// Replace comments with spaces so statement byte offsets still refer to the
+/// original FlatZinc source. A percent sign inside a string is not a comment.
+fn strip_comments_preserving_offsets(input: &str) -> String {
+    let mut bytes = input.as_bytes().to_vec();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut in_comment = false;
+    for byte in &mut bytes {
+        if in_comment {
+            if *byte == b'\n' {
+                in_comment = false;
+            } else {
+                *byte = b' ';
+            }
+            continue;
+        }
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+        } else if *byte == b'"' {
+            in_string = true;
+        } else if *byte == b'%' {
+            in_comment = true;
+            *byte = b' ';
+        }
+    }
+    String::from_utf8(bytes).expect("replacing comment bytes with ASCII preserves UTF-8")
+}
+
+/// Split top-level `:: annotation` tails while retaining each annotation as
+/// deterministic opaque FlatZinc text.
+fn split_trailing_annotations(stmt: &str) -> Result<(String, Vec<String>), String> {
+    let mut separators = Vec::new();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let bytes = stmt.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b':' if depth == 0 && bytes.get(index + 1) == Some(&b':') => {
+                separators.push(index);
+                index += 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    if separators.is_empty() {
+        return Ok((stmt.trim().to_string(), Vec::new()));
+    }
+    let body = stmt[..separators[0]].trim().to_string();
+    let mut annotations = Vec::new();
+    for (position, start) in separators.iter().copied().enumerate() {
+        let end = separators.get(position + 1).copied().unwrap_or(stmt.len());
+        let annotation = stmt[start + 2..end].trim();
+        validate_annotation(annotation)?;
+        annotations.push(annotation.to_string());
+    }
+    Ok((body, annotations))
+}
+
+/// Declaration annotations may precede an initializer (`x :: ann = value`) or
+/// follow it (`x = value :: ann`). Restore the initializer to the annotation-
+/// free declaration while retaining the annotation term itself.
+fn split_declaration_annotations(stmt: &str) -> Result<(String, Vec<String>), String> {
+    let (mut body, raw_annotations) = split_trailing_annotations(stmt)?;
+    let mut annotations = Vec::with_capacity(raw_annotations.len());
+    let mut initializer = None;
+    for raw in raw_annotations {
+        if let Some(equals) = top_level_equals(&raw) {
+            if initializer.is_some() {
+                return Err(format!("Unsupported malformed FlatZinc annotation `{raw}`"));
+            }
+            let annotation = raw[..equals].trim();
+            validate_annotation(annotation)?;
+            annotations.push(annotation.to_string());
+            initializer = Some(raw[equals + 1..].trim().to_string());
+        } else {
+            annotations.push(raw);
+        }
+    }
+    if let Some(initializer) = initializer {
+        body.push_str(" = ");
+        body.push_str(&initializer);
+    }
+    Ok((body, annotations))
+}
+
+fn top_level_equals(text: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, character) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            '=' if depth == 0 => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn validate_annotation(annotation: &str) -> Result<(), String> {
+    if annotation.is_empty() {
+        return Err("Unsupported empty FlatZinc annotation".to_string());
+    }
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for character in annotation.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '(' | '[' | '{' => stack.push(character),
+            ')' if stack.pop() != Some('(') => return Err(format!("Unsupported malformed FlatZinc annotation `{annotation}`")),
+            ']' if stack.pop() != Some('[') => return Err(format!("Unsupported malformed FlatZinc annotation `{annotation}`")),
+            '}' if stack.pop() != Some('{') => return Err(format!("Unsupported malformed FlatZinc annotation `{annotation}`")),
+            _ => {}
+        }
+    }
+    if in_string || !stack.is_empty() {
+        Err(format!("Unsupported malformed FlatZinc annotation `{annotation}`"))
+    } else {
+        Ok(())
+    }
 }
 
 /// Enumerate the members of a FlatZinc set literal (`lo..hi` or `{...}`).
@@ -62,7 +266,7 @@ pub(crate) fn parse_int_set(model: &Model, s: &str) -> Result<Vec<i32>, String> 
 fn parse_domain(model: &Model, s: &str) -> Result<FznDomain, String> {
     let s = s.trim();
     if s == "bool" {
-        return Ok(FznDomain::Range(0, 1));
+        return Ok(FznDomain::Bool);
     }
     if s == "int" {
         return Ok(FznDomain::Range(UNBOUNDED_LO, UNBOUNDED_HI));
@@ -109,10 +313,15 @@ fn array_len(model: &Model, left: &str) -> Result<usize, String> {
 }
 
 /// Dimension ranges of an `:: output_array([1..a, 1..b, ...])` annotation, if present.
-fn output_array_dims(model: &Model, right: &str) -> Result<Option<Vec<(i32, i32)>>, String> {
-    let Some(pos) = right.find("output_array") else { return Ok(None) };
-    let rest = &right[pos..];
-    let inner = rest.split_once('[').and_then(|(_, r)| r.split_once(']')).map(|(x, _)| x).ok_or("malformed output_array annotation")?;
+fn output_array_dims(model: &Model, annotations: &[String]) -> Result<Option<Vec<(i32, i32)>>, String> {
+    let Some(annotation) = annotations.iter().find(|annotation| annotation_name(annotation) == "output_array") else {
+        return Ok(None);
+    };
+    let inner = annotation
+        .split_once('[')
+        .and_then(|(_, rest)| rest.rsplit_once(']'))
+        .map(|(inner, _)| inner)
+        .ok_or("Unsupported malformed output_array annotation")?;
     let mut dims = Vec::new();
     for item in split_args(inner) {
         let (lo, hi) = item.split_once("..").ok_or("output_array dimension must be an interval")?;
@@ -121,21 +330,25 @@ fn output_array_dims(model: &Model, right: &str) -> Result<Option<Vec<(i32, i32)
     Ok(Some(dims))
 }
 
-fn parse_decl(model: &mut Model, stmt: &str) -> Result<(), String> {
+fn annotation_name(annotation: &str) -> &str {
+    annotation.split_once('(').map_or(annotation, |(name, _)| name).trim()
+}
+
+fn parse_decl(model: &mut Model, stmt: &str, annotations: &[String]) -> Result<(), String> {
     if stmt.starts_with("array ") {
         let (left, right) = stmt.split_once(':').ok_or("bad array declaration")?;
         let name = clean_name(right);
         let is_bool = left.contains(" of bool") || left.contains(" of var bool");
-        let dims = output_array_dims(model, right)?;
+        let dims = output_array_dims(model, annotations)?;
         if let Some((_, value)) = right.split_once('=') {
             if left.contains(" of var ") {
-                let vars = model.var_list(strip_annotations(value))?;
+                let vars = model.var_list(value)?;
                 if let Some(dims) = dims {
-                    model.outputs.push(Output::Array { name: name.clone(), dims, vars: vars.clone(), is_bool });
+                    model.add_output(Output::Array { name: name.clone(), dims, vars: vars.clone(), is_bool });
                 }
                 model.arrays.insert(name, vars);
             } else {
-                let values = model.int_list(strip_annotations(value))?;
+                let values = model.int_list(value)?;
                 model.int_arrays.insert(name, values);
             }
             return Ok(());
@@ -143,9 +356,9 @@ fn parse_decl(model: &mut Model, stmt: &str) -> Result<(), String> {
         let n = array_len(model, left)?;
         let domain = left.rsplit_once(" of var ").map(|(_, d)| d).ok_or("only var arrays without assignment are supported")?;
         let domain = parse_domain(model, domain)?;
-        let vars: Vec<VarId> = (1..=n).map(|i| model.new_var(format!("{name}[{i}]"), &domain)).collect();
+        let vars: Vec<IntVarRef> = (1..=n).map(|i| model.new_var(format!("{name}[{i}]"), &domain)).collect();
         if let Some(dims) = dims {
-            model.outputs.push(Output::Array { name: name.clone(), dims, vars: vars.clone(), is_bool });
+            model.add_output(Output::Array { name: name.clone(), dims, vars: vars.clone(), is_bool });
         }
         model.arrays.insert(name, vars);
         return Ok(());
@@ -153,7 +366,7 @@ fn parse_decl(model: &mut Model, stmt: &str) -> Result<(), String> {
     let (left, right) = stmt.split_once(':').ok_or("bad declaration")?;
     if left.trim() == "int" || left.trim() == "bool" {
         let (name, value) = right.split_once('=').ok_or("constant declaration without value")?;
-        model.ints.insert(clean_name(name), model.int_atom(strip_annotations(value))?);
+        model.ints.insert(clean_name(name), model.int_atom(value)?);
         return Ok(());
     }
     let domain = left.trim().strip_prefix("var ").ok_or("unsupported declaration")?;
@@ -162,19 +375,19 @@ fn parse_decl(model: &mut Model, stmt: &str) -> Result<(), String> {
     if let Some(set_dom) = domain.strip_prefix("set of ") {
         let values = parse_int_set(model, set_dom)?;
         require(!values.is_empty(), "set variable with empty universe")?;
-        let members: HashMap<i32, VarId> = values.iter().map(|&v| (v, model.solver.new_var_range(0, 1))).collect();
+        let members: HashMap<i32, IntVarRef> = values.iter().map(|&v| (v, model.new_aux_bool())).collect();
         model.set_vars.insert(name, members);
         return Ok(());
     }
     let is_bool = domain.trim() == "bool";
     let domain = parse_domain(model, domain)?;
     let var = model.new_var(name.clone(), &domain);
-    if right.contains("output_var") {
-        model.outputs.push(Output::Var { name, var, is_bool });
+    if annotations.iter().any(|annotation| annotation_name(annotation) == "output_var") {
+        model.add_output(Output::Var { name, var, is_bool });
     }
     if let Some((_, value)) = right.split_once('=') {
-        let fixed = model.var_atom(strip_annotations(value))?;
-        linear(&mut model.solver, &[1, -1], &[var, fixed], Relation::Eq, 0);
+        let fixed = model.var_atom(value)?;
+        model.post_raw_linear(&[1, -1], &[var, fixed], Relation::Eq, 0);
     }
     Ok(())
 }
@@ -186,7 +399,7 @@ fn arg<'a>(name: &str, args: &'a [String], i: usize) -> Result<&'a str, String> 
 }
 
 fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
-    let body = strip_annotations(stmt.strip_prefix("constraint").unwrap()).trim();
+    let body = stmt.strip_prefix("constraint").unwrap().trim();
     let open = body.find('(').ok_or("constraint without arguments")?;
     let name = body[..open].trim();
     let args = split_args(body[open + 1..].trim_end_matches(')'));
@@ -205,7 +418,7 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
         "int_lin_gt" => model.post_linear(&args, Relation::Gt),
         "all_different_int" | "fzn_all_different_int" => {
             let vars = model.var_list(&args[0])?;
-            all_different(&mut model.solver, &vars);
+            model.post_all_different(&vars);
             Ok(())
         }
         "array_int_element" | "array_bool_element" => model.post_element(&args, false),
@@ -257,7 +470,7 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
         "bool_not" => {
             let x = model.var_atom(arg(name, &args, 0)?)?;
             let y = model.var_atom(arg(name, &args, 1)?)?;
-            linear(&mut model.solver, &[1, 1], &[x, y], Relation::Eq, 1);
+            model.post_raw_linear(&[1, 1], &[x, y], Relation::Eq, 1);
             Ok(())
         }
         "bool_and" => {
@@ -273,7 +486,7 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
             if args.len() >= 3 {
                 model.post_reif(expr::ne(a, b), &args[2], Reif::Iff)
             } else {
-                intension(&mut model.solver, expr::ne(a, b));
+                model.post_expr(expr::ne(a, b));
                 Ok(())
             }
         }
@@ -335,7 +548,7 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
         "bool_lin_eq" => model.post_linear(&args, Relation::Eq),
         "bool_lin_le" => model.post_linear(&args, Relation::Le),
 
-        // Globals mapped onto existing propagators / decompositions.
+        // Globals mapped onto normalized semantic constraints or decompositions.
         "gecode_table_int" | "chuffed_table_int" | "fzn_table_int" | "table_int" | "qayd_table_int" => model.post_table(&args),
         "gecode_bool_element" => model.post_gecode_element(&args),
         "gecode_regular" | "chuffed_regular" | "fzn_regular" | "qayd_regular" => model.post_regular(&args),
@@ -359,7 +572,7 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
             let list = model.var_list(arg(name, &args, 0)?)?;
             let s = model.int_atom(arg(name, &args, 1)?)?;
             let t = model.int_atom(arg(name, &args, 2)?)?;
-            precedence(&mut model.solver, &list, &[s, t]);
+            model.post_precedence(&list, &[s, t]);
             Ok(())
         }
         "chuffed_value_precede" | "fzn_value_precede_int" => {
@@ -367,7 +580,7 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
             let s = model.int_atom(arg(name, &args, 0)?)?;
             let t = model.int_atom(arg(name, &args, 1)?)?;
             let list = model.var_list(arg(name, &args, 2)?)?;
-            precedence(&mut model.solver, &list, &[s, t]);
+            model.post_precedence(&list, &[s, t]);
             Ok(())
         }
         "chuffed_connected" | "fzn_connected" => model.post_connected(&args),
@@ -375,7 +588,7 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
         "fzn_all_equal_int" => {
             let vars = model.var_list(&args[0])?;
             if vars.len() > 1 {
-                all_equal(&mut model.solver, &vars);
+                model.post_all_equal(&vars);
             }
             Ok(())
         }
@@ -390,18 +603,67 @@ fn parse_constraint(model: &mut Model, stmt: &str) -> Result<(), String> {
     }
 }
 
-fn parse_solve(model: &mut Model, stmt: &str) -> Result<(), String> {
-    let stmt = strip_annotations(strip_leading_solve_annotations(stmt.strip_prefix("solve").unwrap())).trim();
-    if stmt == "satisfy" {
-        return Ok(());
+fn parse_solve(model: &mut Model, stmt: &str, item: usize, source: SourceRange) -> Result<Vec<String>, String> {
+    let solve_body = stmt.strip_prefix("solve").unwrap();
+    let (leading_annotations, goal) = leading_solve_annotations(solve_body)?;
+    debug_assert_eq!(strip_leading_solve_annotations(solve_body).trim(), goal);
+    let (goal, trailing_annotations) = split_trailing_annotations(goal)?;
+    let annotations = leading_annotations.into_iter().chain(trailing_annotations).collect::<Vec<_>>();
+    if goal == "satisfy" {
+        return Ok(annotations);
     }
-    if let Some(obj) = stmt.strip_prefix("minimize ") {
-        model.objective = Some((true, model.var_atom(obj)?));
-        return Ok(());
+    if let Some(obj) = goal.strip_prefix("minimize ") {
+        let variable = model.var_atom(obj)?;
+        model.set_objective(true, variable, item, annotations.clone(), source);
+        return Ok(annotations);
     }
-    if let Some(obj) = stmt.strip_prefix("maximize ") {
-        model.objective = Some((false, model.var_atom(obj)?));
-        return Ok(());
+    if let Some(obj) = goal.strip_prefix("maximize ") {
+        let variable = model.var_atom(obj)?;
+        model.set_objective(false, variable, item, annotations.clone(), source);
+        return Ok(annotations);
     }
-    Err(format!("unsupported solve item `{stmt}`"))
+    Err(format!("unsupported solve item `{goal}`"))
+}
+
+/// Parse the annotation terms between `solve` and its goal. Unlike a trailing
+/// annotation, each leading term ends at top-level whitespace.
+fn leading_solve_annotations(mut text: &str) -> Result<(Vec<String>, &str), String> {
+    let mut annotations = Vec::new();
+    loop {
+        text = text.trim_start();
+        let Some(rest) = text.strip_prefix("::") else {
+            return Ok((annotations, text.trim()));
+        };
+        let annotation = rest.trim_start();
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut end = annotation.len();
+        for (index, character) in annotation.char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match character {
+                '"' => in_string = true,
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                _ if character.is_whitespace() && depth == 0 => {
+                    end = index;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let value = annotation[..end].trim();
+        validate_annotation(value)?;
+        annotations.push(value.to_string());
+        text = &annotation[end..];
+    }
 }

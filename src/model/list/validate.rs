@@ -1,5 +1,6 @@
 use super::external::call_external_function;
 use super::ir::{CollectionModel, Expr, ExprId, GlobalConstraint, Iterable, Reduction, Resource};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const VALIDATION_STOPPED: &str = "qayd validation stopped by solve budget";
@@ -401,6 +402,7 @@ impl CollectionModel {
         // A schedule model is a disjoint mode: validate the intervals only.
         if let Some(sched) = &self.schedule {
             let n = sched.intervals.len();
+            let mut mode_references = HashSet::new();
             if n == 0 {
                 return Err("a schedule needs at least one interval".to_string());
             }
@@ -415,8 +417,19 @@ impl CollectionModel {
                         return Err("a moded operation cannot also be optional; make its mode intervals optional instead".to_string());
                     }
                     for mode in &iv.modes {
-                        if mode.duration < 0 || mode.duration > iv.horizon {
-                            return Err("interval mode duration must be in 0..=horizon".to_string());
+                        if mode.duration < 0 {
+                            return Err("interval mode duration must be non-negative".to_string());
+                        }
+                        let (start_min, start_max) = mode.start_window;
+                        if start_min > start_max {
+                            return Err("interval mode start window is empty".to_string());
+                        }
+                        let end_max = start_max.checked_add(mode.duration).ok_or("interval mode end overflows i64")?;
+                        if end_max > iv.horizon {
+                            return Err("interval mode start window extends beyond the interval horizon".to_string());
+                        }
+                        if mode.reference.is_some_and(|reference| !mode_references.insert(reference)) {
+                            return Err("interval mode semantic references must be unique".to_string());
                         }
                     }
                 }

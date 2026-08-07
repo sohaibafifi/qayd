@@ -1,6 +1,8 @@
 //! Primitive constraints: disequality, ordering, instantiation, allEqual,
 //! min/max, element, allDifferent, precedence.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::constraints::intension::intension;
 use crate::constraints::linear::Relation;
 use crate::expr::{eq, imp, int, or, var};
@@ -882,4 +884,50 @@ pub fn precedence_with_covered(solver: &mut Solver, list: &[VarId], values: &[i3
             intension(solver, or(occurs));
         }
     }
+}
+
+pub(crate) fn precedence_with_covered_interruptible(
+    solver: &mut Solver,
+    list: &[VarId],
+    values: &[i32],
+    covered: bool,
+    stop: &AtomicBool,
+) -> bool {
+    for pair in values.windows(2) {
+        let (first, second) = (pair[0], pair[1]);
+        for index in 0..list.len() {
+            if stop.load(Ordering::Acquire) {
+                return false;
+            }
+            let mut earlier = Vec::with_capacity(index);
+            for &variable in &list[..index] {
+                if stop.load(Ordering::Acquire) {
+                    return false;
+                }
+                earlier.push(eq(var(variable), int(i64::from(first))));
+            }
+            let expression = imp(eq(var(list[index]), int(i64::from(second))), or(earlier));
+            if !crate::constraints::intension::intension_interruptible(solver, expression, stop) {
+                return false;
+            }
+        }
+    }
+    if covered {
+        for &value in values {
+            if stop.load(Ordering::Acquire) {
+                return false;
+            }
+            let mut occurs = Vec::with_capacity(list.len());
+            for &variable in list {
+                if stop.load(Ordering::Acquire) {
+                    return false;
+                }
+                occurs.push(eq(var(variable), int(i64::from(value))));
+            }
+            if !crate::constraints::intension::intension_interruptible(solver, or(occurs), stop) {
+                return false;
+            }
+        }
+    }
+    !stop.load(Ordering::Acquire)
 }

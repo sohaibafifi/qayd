@@ -5,6 +5,7 @@
 //! domain shrank since the last wake; `regular`/`mdd` recompute per call.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::ids::{PropId, VarId};
@@ -162,54 +163,133 @@ struct Extension {
 
 impl Extension {
     fn new(store: &mut Store, vars: &[VarId], template: Arc<ExtensionTemplate>, positive: bool) -> Self {
+        let stop = AtomicBool::new(false);
+        Self::new_interruptible(store, vars, template, positive, &stop).expect("an uninterrupted extension build must complete")
+    }
+
+    fn new_interruptible(
+        store: &mut Store,
+        vars: &[VarId],
+        template: Arc<ExtensionTemplate>,
+        positive: bool,
+        stop: &AtomicBool,
+    ) -> Option<Self> {
         assert_eq!(template.arity, vars.len(), "extension: arity mismatch");
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
         let nwords = template.full.len();
-        let residues =
-            if positive { vars.iter().map(|&var| store.values(var).map(|value| (value, 0)).collect()).collect() } else { Vec::new() };
+        let mut residues = Vec::new();
+        if positive {
+            residues.reserve(vars.len());
+            for &variable in vars {
+                if stop.load(Ordering::Acquire) {
+                    return None;
+                }
+                let mut values = HashMap::new();
+                for value in store.values(variable) {
+                    if stop.load(Ordering::Acquire) {
+                        return None;
+                    }
+                    values.insert(value, 0);
+                }
+                residues.push(values);
+            }
+        }
         // Positive tables keep currTable reversible, seeded to `full`; a `-1`
         // last-seen size forces every column dirty on the first propagate so the
         // initial domains (and any pre-propagate removals) are folded in once.
         let (curr_words, col_size) = if positive {
-            let words = template
-                .full
-                .iter()
-                .flat_map(|&fw| [store.new_rev_int(fw as u32 as i32), store.new_rev_int((fw >> 32) as u32 as i32)])
-                .collect();
-            let sizes = vars.iter().map(|_| store.new_rev_int(-1)).collect();
+            let mut words = Vec::with_capacity(template.full.len().saturating_mul(2));
+            for &full_word in &template.full {
+                if stop.load(Ordering::Acquire) {
+                    return None;
+                }
+                words.push(store.new_rev_int(full_word as u32 as i32));
+                words.push(store.new_rev_int((full_word >> 32) as u32 as i32));
+            }
+            let mut sizes = Vec::with_capacity(vars.len());
+            for _ in vars {
+                if stop.load(Ordering::Acquire) {
+                    return None;
+                }
+                sizes.push(store.new_rev_int(-1));
+            }
             (words, sizes)
         } else {
             (Vec::new(), Vec::new())
         };
-        Self {
-            vars: vars.to_vec(),
+        let mut physical_vars = Vec::with_capacity(vars.len());
+        let mut search = Vec::with_capacity(vars.len().saturating_add(1));
+        let mut cover = Vec::with_capacity(vars.len().saturating_add(1));
+        let mut killer_seen = Vec::with_capacity(vars.len());
+        for &variable in vars {
+            if stop.load(Ordering::Acquire) {
+                return None;
+            }
+            physical_vars.push(variable);
+            search.push(vec![0u64; nwords]);
+            cover.push(vec![0u64; nwords]);
+            killer_seen.push(HashMap::new());
+        }
+        search.push(vec![0u64; nwords]);
+        cover.push(vec![0u64; nwords]);
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(Self {
+            vars: physical_vars,
             positive,
             current: template.full.clone(),
             union: vec![0u64; nwords],
             curr_words,
             col_size,
             residues,
-            search: vec![vec![0u64; nwords]; vars.len() + 1],
-            cover: vec![vec![0u64; nwords]; vars.len() + 1],
+            search,
+            cover,
             template,
             buf: Vec::new(),
-            killer_seen: vec![HashMap::new(); vars.len()],
+            killer_seen,
             explain_gen: 0,
             last_kill_col: 0,
             removals: Vec::new(),
             why: Vec::new(),
-        }
+        })
     }
 }
 
 impl ExtensionTemplate {
     fn new(arity: usize, tuples: &[Vec<i32>]) -> Self {
-        assert!(tuples.iter().all(|t| t.len() == arity), "extension: tuple arity mismatch");
+        let stop = AtomicBool::new(false);
+        Self::new_interruptible(arity, tuples, &stop).expect("an uninterrupted extension template build must complete")
+    }
+
+    fn new_interruptible(arity: usize, tuples: &[Vec<i32>], stop: &AtomicBool) -> Option<Self> {
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        for tuple in tuples {
+            if stop.load(Ordering::Acquire) {
+                return None;
+            }
+            assert_eq!(tuple.len(), arity, "extension: tuple arity mismatch");
+        }
         let ntuples = tuples.len();
         let nwords = ntuples.div_ceil(64);
-        let mut supports: Vec<HashMap<i32, Vec<u64>>> = vec![HashMap::new(); arity];
-        let mut star: Vec<Vec<u64>> = vec![vec![0u64; nwords]; arity];
+        let mut supports: Vec<HashMap<i32, Vec<u64>>> = Vec::with_capacity(arity);
+        let mut star: Vec<Vec<u64>> = Vec::with_capacity(arity);
+        for _ in 0..arity {
+            if stop.load(Ordering::Acquire) {
+                return None;
+            }
+            supports.push(HashMap::new());
+            star.push(vec![0u64; nwords]);
+        }
         for (t, tuple) in tuples.iter().enumerate() {
             for (c, &val) in tuple.iter().enumerate() {
+                if stop.load(Ordering::Acquire) {
+                    return None;
+                }
                 if val == STAR {
                     star[c][t / 64] |= 1u64 << (t % 64);
                 } else {
@@ -220,10 +300,21 @@ impl ExtensionTemplate {
         }
         let mut full = vec![0u64; nwords];
         for t in 0..ntuples {
+            if stop.load(Ordering::Acquire) {
+                return None;
+            }
             full[t / 64] |= 1u64 << (t % 64);
         }
-        let tuples: Arc<[i32]> = tuples.iter().flatten().copied().collect();
-        Self { arity, supports, star, full, tuples }
+        let mut body = Vec::with_capacity(ntuples.saturating_mul(arity));
+        for tuple in tuples {
+            for &value in tuple {
+                if stop.load(Ordering::Acquire) {
+                    return None;
+                }
+                body.push(value);
+            }
+        }
+        Some(Self { arity, supports, star, full, tuples: Arc::from(body) })
     }
 }
 
@@ -304,6 +395,16 @@ impl Propagator for Extension {
         for &v in &self.vars {
             store.subscribe(v, me, Event::DomainChange);
         }
+    }
+
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        for &variable in &self.vars {
+            if should_stop() {
+                return false;
+            }
+            store.subscribe(variable, me, Event::DomainChange);
+        }
+        !should_stop()
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
@@ -457,6 +558,19 @@ pub fn extension(solver: &mut Solver, vars: &[VarId], tuples: &[Vec<i32>], posit
     extension_from_template(solver, vars, extension_template(vars.len(), tuples), positive);
 }
 
+/// Interruptible extension lowering. A `false` result requires discarding the
+/// partially built solver.
+pub(crate) fn extension_interruptible(solver: &mut Solver, vars: &[VarId], tuples: &[Vec<i32>], positive: bool, stop: &AtomicBool) -> bool {
+    let Some(template) = ExtensionTemplate::new_interruptible(vars.len(), tuples, stop).map(Arc::new) else {
+        return false;
+    };
+    let Some(propagator) = Extension::new_interruptible(&mut solver.store, vars, template, positive, stop) else {
+        return false;
+    };
+    let should_stop = || stop.load(Ordering::Acquire);
+    solver.post_until(Box::new(propagator), &should_stop).is_some()
+}
+
 /// Compile an extension table's immutable tuple bitsets.
 pub fn extension_template(arity: usize, tuples: &[Vec<i32>]) -> Arc<ExtensionTemplate> {
     Arc::new(ExtensionTemplate::new(arity, tuples))
@@ -499,21 +613,49 @@ struct Regular {
 
 impl Regular {
     fn new(vars: &[VarId], dfa: Dfa) -> Self {
-        let mut delta = vec![HashMap::new(); dfa.n_states];
+        let stop = AtomicBool::new(false);
+        Self::new_interruptible(vars, dfa, &stop).expect("an uninterrupted regular build must complete")
+    }
+
+    fn new_interruptible(vars: &[VarId], dfa: Dfa, stop: &AtomicBool) -> Option<Self> {
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut delta = Vec::with_capacity(dfa.n_states);
+        for _ in 0..dfa.n_states {
+            if stop.load(Ordering::Acquire) {
+                return None;
+            }
+            delta.push(HashMap::new());
+        }
         for (s, val, d) in dfa.transitions {
+            if stop.load(Ordering::Acquire) {
+                return None;
+            }
             delta[s].insert(val, d);
         }
         let layers = vars.len() + 1;
-        Self {
-            vars: vars.to_vec(),
+        let cells = layers.checked_mul(dfa.n_states)?;
+        let mut physical_vars = Vec::with_capacity(vars.len());
+        for &variable in vars {
+            if stop.load(Ordering::Acquire) {
+                return None;
+            }
+            physical_vars.push(variable);
+        }
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(Self {
+            vars: physical_vars,
             n_states: dfa.n_states,
             start: dfa.start,
             accept: dfa.accept,
             delta,
-            fwd: vec![false; layers * dfa.n_states],
-            bwd: vec![false; layers * dfa.n_states],
+            fwd: vec![false; cells],
+            bwd: vec![false; cells],
             buf: Vec::new(),
-        }
+        })
     }
 }
 
@@ -522,6 +664,16 @@ impl Propagator for Regular {
         for &v in &self.vars {
             store.subscribe(v, me, Event::DomainChange);
         }
+    }
+
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        for &variable in &self.vars {
+            if should_stop() {
+                return false;
+            }
+            store.subscribe(variable, me, Event::DomainChange);
+        }
+        !should_stop()
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
@@ -583,6 +735,15 @@ pub fn regular(solver: &mut Solver, vars: &[VarId], dfa: Dfa) {
     solver.post(Box::new(Regular::new(vars, dfa)));
 }
 
+pub(crate) fn regular_interruptible(solver: &mut Solver, vars: &[VarId], dfa: Dfa, stop: &AtomicBool) -> bool {
+    assert!(dfa.start < dfa.n_states, "regular: start state out of range");
+    let Some(propagator) = Regular::new_interruptible(vars, dfa, stop) else {
+        return false;
+    };
+    let should_stop = || stop.load(Ordering::Acquire);
+    solver.post_until(Box::new(propagator), &should_stop).is_some()
+}
+
 // ===========================================================================
 // mdd (layered DAG)
 // ===========================================================================
@@ -620,13 +781,34 @@ struct MddProp {
 
 impl MddProp {
     fn new(vars: &[VarId], mdd: Mdd) -> Self {
-        let mut offsets = vec![0usize; mdd.nodes_per_layer.len()];
-        let mut acc = 0;
-        for (i, &c) in mdd.nodes_per_layer.iter().enumerate() {
-            offsets[i] = acc;
-            acc += c;
+        let stop = AtomicBool::new(false);
+        Self::new_interruptible(vars, mdd, &stop).expect("an uninterrupted MDD build must complete")
+    }
+
+    fn new_interruptible(vars: &[VarId], mdd: Mdd, stop: &AtomicBool) -> Option<Self> {
+        if stop.load(Ordering::Acquire) {
+            return None;
         }
-        Self { vars: vars.to_vec(), layers: mdd.layers, offsets, fwd: vec![false; acc], bwd: vec![false; acc], buf: Vec::new() }
+        let mut offsets = Vec::with_capacity(mdd.nodes_per_layer.len());
+        let mut acc = 0usize;
+        for &count in &mdd.nodes_per_layer {
+            if stop.load(Ordering::Acquire) {
+                return None;
+            }
+            offsets.push(acc);
+            acc = acc.checked_add(count)?;
+        }
+        let mut physical_vars = Vec::with_capacity(vars.len());
+        for &variable in vars {
+            if stop.load(Ordering::Acquire) {
+                return None;
+            }
+            physical_vars.push(variable);
+        }
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(Self { vars: physical_vars, layers: mdd.layers, offsets, fwd: vec![false; acc], bwd: vec![false; acc], buf: Vec::new() })
     }
 }
 
@@ -635,6 +817,16 @@ impl Propagator for MddProp {
         for &v in &self.vars {
             store.subscribe(v, me, Event::DomainChange);
         }
+    }
+
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        for &variable in &self.vars {
+            if should_stop() {
+                return false;
+            }
+            store.subscribe(variable, me, Event::DomainChange);
+        }
+        !should_stop()
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
@@ -683,4 +875,14 @@ pub fn mdd(solver: &mut Solver, vars: &[VarId], mdd: Mdd) {
     assert_eq!(mdd.layers.len(), vars.len(), "mdd: one arc layer per variable");
     assert_eq!(mdd.nodes_per_layer.len(), vars.len() + 1, "mdd: nodes_per_layer must have n+1 entries");
     solver.post(Box::new(MddProp::new(vars, mdd)));
+}
+
+pub(crate) fn mdd_interruptible(solver: &mut Solver, vars: &[VarId], mdd: Mdd, stop: &AtomicBool) -> bool {
+    assert_eq!(mdd.layers.len(), vars.len(), "mdd: one arc layer per variable");
+    assert_eq!(mdd.nodes_per_layer.len(), vars.len() + 1, "mdd: nodes_per_layer must have n+1 entries");
+    let Some(propagator) = MddProp::new_interruptible(vars, mdd, stop) else {
+        return false;
+    };
+    let should_stop = || stop.load(Ordering::Acquire);
+    solver.post_until(Box::new(propagator), &should_stop).is_some()
 }

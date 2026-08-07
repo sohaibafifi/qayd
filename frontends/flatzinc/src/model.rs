@@ -1,24 +1,213 @@
 //! The in-memory model: symbol tables plus the `post_*` helpers that translate
-//! FlatZinc predicates into `qayd` propagators.
+//! FlatZinc predicates into the canonical semantic model.
 
 use std::collections::HashMap;
 
-use qayd::constraints::count::{cardinality, count};
-use qayd::constraints::graph::circuit;
-use qayd::constraints::intension::intension;
-use qayd::constraints::lex::lex;
-use qayd::constraints::linear::{linear, Relation};
-use qayd::constraints::primitives::{element, maximum, minimum, ordered};
-use qayd::constraints::scheduling::{cumulative_var, no_overlap};
-use qayd::constraints::table::{extension, regular, Dfa};
-use qayd::expr::{self, Expr};
-use qayd::{Solver, VarId};
+use qayd::model::{
+    Automaton, Constraint, ConstraintRef, IntExpr, IntGlobalConstraint, IntVarRef, Model as SemanticModel, ModelObject, ModelPackage,
+    Objective as SemanticObjective, ObjectiveRef, Relation, SourceRange,
+};
 
 use crate::parse::parse_int_set;
 use crate::text::{bracket_items, require, split_args};
 
 pub(crate) const UNBOUNDED_LO: i32 = -1_000_000;
 pub(crate) const UNBOUNDED_HI: i32 = 1_000_000;
+
+type Expr = IntExpr;
+
+/// Small constructor facade that keeps the predicate lowering readable while
+/// producing only semantic expressions.
+pub(crate) mod expr {
+    use super::{Expr, IntExpr, IntVarRef};
+
+    pub(crate) fn int(value: i64) -> Expr {
+        IntExpr::Constant(value)
+    }
+
+    pub(crate) fn var(variable: IntVarRef) -> Expr {
+        IntExpr::Variable(variable)
+    }
+
+    pub(crate) fn add(values: Vec<Expr>) -> Expr {
+        IntExpr::Add(values)
+    }
+
+    pub(crate) fn sub(left: Expr, right: Expr) -> Expr {
+        IntExpr::Sub(Box::new(left), Box::new(right))
+    }
+
+    pub(crate) fn mul(values: Vec<Expr>) -> Expr {
+        IntExpr::Mul(values)
+    }
+
+    pub(crate) fn div(left: Expr, right: Expr) -> Expr {
+        IntExpr::Div(Box::new(left), Box::new(right))
+    }
+
+    pub(crate) fn rem(left: Expr, right: Expr) -> Expr {
+        IntExpr::Mod(Box::new(left), Box::new(right))
+    }
+
+    pub(crate) fn min_of(values: Vec<Expr>) -> Expr {
+        IntExpr::Min(values)
+    }
+
+    pub(crate) fn max_of(values: Vec<Expr>) -> Expr {
+        IntExpr::Max(values)
+    }
+
+    pub(crate) fn abs(value: Expr) -> Expr {
+        IntExpr::Abs(Box::new(value))
+    }
+
+    pub(crate) fn eq(left: Expr, right: Expr) -> Expr {
+        IntExpr::Eq(Box::new(left), Box::new(right))
+    }
+
+    pub(crate) fn ne(left: Expr, right: Expr) -> Expr {
+        IntExpr::Ne(Box::new(left), Box::new(right))
+    }
+
+    pub(crate) fn le(left: Expr, right: Expr) -> Expr {
+        IntExpr::Le(Box::new(left), Box::new(right))
+    }
+
+    pub(crate) fn lt(left: Expr, right: Expr) -> Expr {
+        IntExpr::Lt(Box::new(left), Box::new(right))
+    }
+
+    pub(crate) fn ge(left: Expr, right: Expr) -> Expr {
+        IntExpr::Ge(Box::new(left), Box::new(right))
+    }
+
+    pub(crate) fn gt(left: Expr, right: Expr) -> Expr {
+        IntExpr::Gt(Box::new(left), Box::new(right))
+    }
+
+    pub(crate) fn and(values: Vec<Expr>) -> Expr {
+        IntExpr::And(values)
+    }
+
+    pub(crate) fn or(values: Vec<Expr>) -> Expr {
+        IntExpr::Or(values)
+    }
+
+    pub(crate) fn not(value: Expr) -> Expr {
+        IntExpr::Not(Box::new(value))
+    }
+
+    pub(crate) fn imp(left: Expr, right: Expr) -> Expr {
+        IntExpr::Imp(Box::new(left), Box::new(right))
+    }
+
+    pub(crate) fn iff(left: Expr, right: Expr) -> Expr {
+        IntExpr::Iff(Box::new(left), Box::new(right))
+    }
+}
+
+#[derive(Clone)]
+struct Dfa {
+    n_states: usize,
+    start: usize,
+    accept: Vec<usize>,
+    transitions: Vec<(usize, i32, usize)>,
+}
+
+fn intension(model: &mut SemanticModel, expression: Expr) {
+    model.add_constraint(Constraint::Intension(expression));
+}
+
+fn linear(model: &mut SemanticModel, coefficients: &[i64], variables: &[IntVarRef], relation: Relation, rhs: i64) {
+    debug_assert_eq!(coefficients.len(), variables.len());
+    model.add_constraint(Constraint::Linear {
+        terms: coefficients.iter().copied().zip(variables.iter().copied()).collect(),
+        relation,
+        rhs,
+    });
+}
+
+fn global(model: &mut SemanticModel, constraint: IntGlobalConstraint) {
+    model.add_constraint(Constraint::IntegerGlobal(constraint));
+}
+
+fn count(model: &mut SemanticModel, variables: &[IntVarRef], value: i32, relation: Relation, count: i64) {
+    global(model, IntGlobalConstraint::Count { variables: variables.to_vec(), value, relation, count });
+}
+
+fn cardinality(model: &mut SemanticModel, variables: &[IntVarRef], values: &[i32], lower: &[i64], upper: &[i64], closed: bool) {
+    global(
+        model,
+        IntGlobalConstraint::Cardinality {
+            variables: variables.to_vec(),
+            values: values.to_vec(),
+            lower: lower.to_vec(),
+            upper: upper.to_vec(),
+            closed,
+        },
+    );
+}
+
+fn all_different(model: &mut SemanticModel, variables: &[IntVarRef]) {
+    global(model, IntGlobalConstraint::AllDifferent { variables: variables.to_vec(), except: Vec::new() });
+}
+
+fn all_equal(model: &mut SemanticModel, variables: &[IntVarRef]) {
+    global(model, IntGlobalConstraint::AllEqual(variables.to_vec()));
+}
+
+fn precedence(model: &mut SemanticModel, variables: &[IntVarRef], values: &[i32]) {
+    global(model, IntGlobalConstraint::ValuePrecedence { variables: variables.to_vec(), values: values.to_vec(), covered: false });
+}
+
+fn circuit(model: &mut SemanticModel, successors: &[IntVarRef]) {
+    global(model, IntGlobalConstraint::Circuit { successors: successors.to_vec(), cutset: false });
+}
+
+fn element(model: &mut SemanticModel, array: &[IntVarRef], index: IntVarRef, value: IntVarRef) {
+    global(model, IntGlobalConstraint::Element { array: array.to_vec(), index, value });
+}
+
+fn minimum(model: &mut SemanticModel, target: IntVarRef, variables: &[IntVarRef]) {
+    global(model, IntGlobalConstraint::Minimum { target, variables: variables.to_vec() });
+}
+
+fn maximum(model: &mut SemanticModel, target: IntVarRef, variables: &[IntVarRef]) {
+    global(model, IntGlobalConstraint::Maximum { target, variables: variables.to_vec() });
+}
+
+fn ordered(model: &mut SemanticModel, variables: &[IntVarRef], relation: Relation) {
+    global(model, IntGlobalConstraint::Ordered { variables: variables.to_vec(), relation });
+}
+
+fn cumulative_var(model: &mut SemanticModel, starts: &[IntVarRef], durations: &[IntVarRef], demands: &[IntVarRef], capacity: IntVarRef) {
+    global(
+        model,
+        IntGlobalConstraint::CumulativeVar { starts: starts.to_vec(), durations: durations.to_vec(), demands: demands.to_vec(), capacity },
+    );
+}
+
+fn no_overlap(model: &mut SemanticModel, starts: &[IntVarRef], durations: &[i64]) {
+    global(model, IntGlobalConstraint::NoOverlap { starts: starts.to_vec(), durations: durations.to_vec() });
+}
+
+fn extension(model: &mut SemanticModel, variables: &[IntVarRef], tuples: &[Vec<i32>], positive: bool) {
+    global(model, IntGlobalConstraint::Table { variables: variables.to_vec(), tuples: tuples.to_vec(), positive });
+}
+
+fn regular(model: &mut SemanticModel, variables: &[IntVarRef], dfa: Dfa) {
+    global(
+        model,
+        IntGlobalConstraint::Regular {
+            variables: variables.to_vec(),
+            automaton: Automaton { states: dfa.n_states, start: dfa.start, accepting: dfa.accept, transitions: dfa.transitions },
+        },
+    );
+}
+
+fn lex(model: &mut SemanticModel, left: &[IntVarRef], right: &[IntVarRef], strict: bool) {
+    global(model, IntGlobalConstraint::Lex { left: left.to_vec(), right: right.to_vec(), strict });
+}
 
 /// How a Boolean reifies a base constraint.
 #[derive(Clone, Copy)]
@@ -31,6 +220,7 @@ pub(crate) enum Reif {
 
 /// A parsed variable domain.
 pub(crate) enum FznDomain {
+    Bool,
     Range(i32, i32),
     Set(Vec<i32>),
 }
@@ -39,58 +229,196 @@ pub(crate) enum FznDomain {
 /// Used by the MiniZinc output protocol.
 pub(crate) enum Output {
     /// `name = <value>;`
-    Var { name: String, var: VarId, is_bool: bool },
+    Var { name: String, var: IntVarRef, is_bool: bool },
     /// `name = arrayNd(<dims>, [<values>]);`
-    Array { name: String, dims: Vec<(i32, i32)>, vars: Vec<VarId>, is_bool: bool },
+    Array { name: String, dims: Vec<(i32, i32)>, vars: Vec<IntVarRef>, is_bool: bool },
 }
 
-/// Symbol tables and the solver under construction.
+/// Symbol tables and the canonical package under construction.
 pub(crate) struct Model {
-    pub(crate) solver: Solver,
-    pub(crate) vars: HashMap<String, VarId>,
-    pub(crate) arrays: HashMap<String, Vec<VarId>>,
+    package: ModelPackage,
+    pub(crate) vars: HashMap<String, IntVarRef>,
+    pub(crate) arrays: HashMap<String, Vec<IntVarRef>>,
     pub(crate) ints: HashMap<String, i32>,
     pub(crate) int_arrays: HashMap<String, Vec<i32>>,
     /// Set variables, represented by their characteristic vector: a `0/1`
     /// membership variable for each value in the set's universe.
-    pub(crate) set_vars: HashMap<String, HashMap<i32, VarId>>,
-    pub(crate) search: Vec<VarId>,
-    pub(crate) names: Vec<(String, VarId)>,
+    pub(crate) set_vars: HashMap<String, HashMap<i32, IntVarRef>>,
+    constants: HashMap<i32, IntVarRef>,
     /// Items annotated for output, in declaration order.
-    pub(crate) outputs: Vec<Output>,
-    /// `(minimizing, objective var)`.
-    pub(crate) objective: Option<(bool, VarId)>,
+    outputs: Vec<Output>,
+    /// Objective plus its frontend-owned metadata, materialized at package handoff.
+    objective: Option<PendingObjective>,
+}
+
+struct PendingObjective {
+    minimize: bool,
+    variable: IntVarRef,
+    item: usize,
+    annotations: Vec<String>,
+    source: SourceRange,
+}
+
+/// Semantic object counts at the start of one FlatZinc item.
+pub(crate) struct MetadataMark {
+    int_vars: usize,
+    constraints: usize,
+    objectives: usize,
+    outputs: usize,
 }
 
 impl Model {
     pub(crate) fn new() -> Self {
         Self {
-            solver: Solver::new(),
+            package: ModelPackage::new(SemanticModel::new()),
             vars: HashMap::new(),
             arrays: HashMap::new(),
             ints: HashMap::new(),
             int_arrays: HashMap::new(),
             set_vars: HashMap::new(),
-            search: Vec::new(),
-            names: Vec::new(),
+            constants: HashMap::new(),
             outputs: Vec::new(),
             objective: None,
         }
     }
 
-    pub(crate) fn new_var(&mut self, name: String, domain: &FznDomain) -> VarId {
+    pub(crate) fn new_var(&mut self, name: String, domain: &FznDomain) -> IntVarRef {
         let var = match domain {
-            FznDomain::Range(lo, hi) => self.solver.new_var_range(*lo, *hi),
-            FznDomain::Set(values) => self.solver.new_var_set(values),
+            FznDomain::Bool => self.package.model.bool_var(),
+            FznDomain::Range(lo, hi) => self.package.model.int_range(*lo, *hi),
+            FznDomain::Set(values) => self.package.model.int_set(values.clone()),
         };
         self.vars.insert(name.clone(), var);
-        self.search.push(var);
-        self.names.push((name, var));
+        let object = ModelObject::IntVar(var);
+        self.package.metadata.names.insert(object, name.clone());
+        self.package.metadata.frontend_ids.insert(("flatzinc".to_string(), name), object);
         var
     }
 
-    pub(crate) fn constant(&mut self, value: i32) -> VarId {
-        self.solver.new_var_set(&[value])
+    pub(crate) fn constant(&mut self, value: i32) -> IntVarRef {
+        if let Some(&variable) = self.constants.get(&value) {
+            return variable;
+        }
+        let variable = self.package.model.int_set(vec![value]);
+        self.constants.insert(value, variable);
+        variable
+    }
+
+    pub(crate) fn new_aux_bool(&mut self) -> IntVarRef {
+        self.package.model.bool_var()
+    }
+
+    pub(crate) fn add_output(&mut self, output: Output) {
+        let variables: &[IntVarRef] = match &output {
+            Output::Var { var, .. } => std::slice::from_ref(var),
+            Output::Array { vars, .. } => vars,
+        };
+        for &variable in variables {
+            let object = ModelObject::IntVar(variable);
+            if !self.package.metadata.outputs.contains(&object) {
+                self.package.metadata.outputs.push(object);
+            }
+        }
+        self.outputs.push(output);
+    }
+
+    pub(crate) fn post_expr(&mut self, expression: Expr) {
+        intension(&mut self.package.model, expression);
+    }
+
+    pub(crate) fn post_raw_linear(&mut self, coefficients: &[i64], variables: &[IntVarRef], relation: Relation, rhs: i64) {
+        linear(&mut self.package.model, coefficients, variables, relation, rhs);
+    }
+
+    pub(crate) fn post_all_different(&mut self, variables: &[IntVarRef]) {
+        all_different(&mut self.package.model, variables);
+    }
+
+    pub(crate) fn post_all_equal(&mut self, variables: &[IntVarRef]) {
+        all_equal(&mut self.package.model, variables);
+    }
+
+    pub(crate) fn post_precedence(&mut self, variables: &[IntVarRef], values: &[i32]) {
+        precedence(&mut self.package.model, variables, values);
+    }
+
+    pub(crate) fn set_objective(
+        &mut self,
+        minimize: bool,
+        variable: IntVarRef,
+        item: usize,
+        annotations: Vec<String>,
+        source: SourceRange,
+    ) {
+        self.objective = Some(PendingObjective { minimize, variable, item, annotations, source });
+    }
+
+    pub(crate) fn into_package(mut self) -> (ModelPackage, Vec<Output>) {
+        if let Some(objective) = self.objective {
+            let reference = self
+                .package
+                .model
+                .add_objective(SemanticObjective::IntExpr { minimize: objective.minimize, expr: IntExpr::Variable(objective.variable) });
+            let object = ModelObject::Objective(reference);
+            self.package.metadata.sources.entry(object).or_default().push(objective.source);
+            Self::insert_object_annotations(&mut self.package, object, objective.item, &objective.annotations);
+        }
+        (self.package, self.outputs)
+    }
+
+    /// Snapshot semantic object counts before parsing one source item.
+    pub(crate) fn metadata_mark(&self) -> MetadataMark {
+        MetadataMark {
+            int_vars: self.package.model.int_vars().len(),
+            constraints: self.package.model.constraints().len(),
+            objectives: self.package.model.objectives().len(),
+            outputs: self.outputs.len(),
+        }
+    }
+
+    /// Retain an item's opaque FlatZinc annotations and attach its source range
+    /// to every semantic object introduced while lowering that item.
+    pub(crate) fn record_item_metadata(&mut self, item: usize, mark: MetadataMark, annotations: &[String], source: SourceRange) {
+        for (index, annotation) in annotations.iter().enumerate() {
+            self.package.metadata.annotations.insert(format!("flatzinc.item.{item}.annotation.{index}"), annotation.clone());
+        }
+
+        let mut objects = (mark.int_vars..self.package.model.int_vars().len())
+            .map(|index| ModelObject::IntVar(IntVarRef(index)))
+            .chain((mark.constraints..self.package.model.constraints().len()).map(|index| ModelObject::Constraint(ConstraintRef(index))))
+            .chain((mark.objectives..self.package.model.objectives().len()).map(|index| ModelObject::Objective(ObjectiveRef(index))))
+            .collect::<Vec<_>>();
+        for output in &self.outputs[mark.outputs..] {
+            let variables: &[IntVarRef] = match output {
+                Output::Var { var, .. } => std::slice::from_ref(var),
+                Output::Array { vars, .. } => vars,
+            };
+            for &variable in variables {
+                let object = ModelObject::IntVar(variable);
+                if !objects.contains(&object) {
+                    objects.push(object);
+                }
+            }
+        }
+
+        if objects.is_empty() {
+            self.package
+                .metadata
+                .annotations
+                .insert(format!("flatzinc.item.{item}.source"), format!("{}:{}..{}", source.source, source.start, source.end));
+            return;
+        }
+        for object in objects {
+            self.package.metadata.sources.entry(object).or_default().push(source.clone());
+            Self::insert_object_annotations(&mut self.package, object, item, annotations);
+        }
+    }
+
+    fn insert_object_annotations(package: &mut ModelPackage, object: ModelObject, item: usize, annotations: &[String]) {
+        let object_annotations = package.metadata.object_annotations.entry(object).or_default();
+        for (index, annotation) in annotations.iter().enumerate() {
+            object_annotations.insert(format!("flatzinc.item.{item}.annotation.{index}"), annotation.clone());
+        }
     }
 
     pub(crate) fn int_atom(&self, s: &str) -> Result<i32, String> {
@@ -102,7 +430,7 @@ impl Model {
         }
     }
 
-    pub(crate) fn var_atom(&mut self, s: &str) -> Result<VarId, String> {
+    pub(crate) fn var_atom(&mut self, s: &str) -> Result<IntVarRef, String> {
         let s = s.trim();
         if let Ok(value) = self.int_atom(s) {
             return Ok(self.constant(value));
@@ -118,7 +446,7 @@ impl Model {
         self.int_arrays.get(s).cloned().ok_or_else(|| format!("unknown integer array `{s}`"))
     }
 
-    pub(crate) fn var_list(&mut self, s: &str) -> Result<Vec<VarId>, String> {
+    pub(crate) fn var_list(&mut self, s: &str) -> Result<Vec<IntVarRef>, String> {
         let s = s.trim();
         if let Some(items) = bracket_items(s) {
             return items.iter().map(|x| self.var_atom(x)).collect();
@@ -137,7 +465,7 @@ impl Model {
     pub(crate) fn post_cmp(&mut self, a: &str, b: &str, rel: Relation) -> Result<(), String> {
         let x = self.var_atom(a)?;
         let y = self.var_atom(b)?;
-        linear(&mut self.solver, &[1, -1], &[x, y], rel, 0);
+        linear(&mut self.package.model, &[1, -1], &[x, y], rel, 0);
         Ok(())
     }
 
@@ -156,7 +484,7 @@ impl Model {
         if coeffs.len() + 1 == vars.len() {
             coeffs.push(-1);
         }
-        linear(&mut self.solver, &coeffs, &vars, rel, rhs);
+        linear(&mut self.package.model, &coeffs, &vars, rel, rhs);
         Ok(())
     }
 
@@ -166,9 +494,9 @@ impl Model {
         let array =
             if var_array { self.var_list(&args[1])? } else { self.int_list(&args[1])?.into_iter().map(|v| self.constant(v)).collect() };
         let value = self.var_atom(&args[2])?;
-        let zero = self.solver.new_var_range(0, array.len() as i32 - 1);
-        linear(&mut self.solver, &[1, -1], &[index, zero], Relation::Eq, 1);
-        element(&mut self.solver, &array, zero, value);
+        let zero = self.package.model.int_range(0, array.len() as i32 - 1);
+        linear(&mut self.package.model, &[1, -1], &[index, zero], Relation::Eq, 1);
+        element(&mut self.package.model, &array, zero, value);
         Ok(())
     }
 
@@ -178,18 +506,18 @@ impl Model {
         let offset = self.int_atom(&args[1])?;
         let array = self.var_list(&args[2])?;
         let value = self.var_atom(&args[3])?;
-        let zero = self.solver.new_var_range(0, array.len() as i32 - 1);
-        linear(&mut self.solver, &[1, -1], &[index, zero], Relation::Eq, offset as i64);
-        element(&mut self.solver, &array, zero, value);
+        let zero = self.package.model.int_range(0, array.len() as i32 - 1);
+        linear(&mut self.package.model, &[1, -1], &[index, zero], Relation::Eq, offset as i64);
+        element(&mut self.package.model, &array, zero, value);
         Ok(())
     }
 
     pub(crate) fn post_count(&mut self, args: &[String], rel: Relation) -> Result<(), String> {
         require(args.len() == 3, "count predicate expects 3 arguments")?;
         let vars = self.var_list(&args[0])?;
-        // Fast path: a constant value and target use the dedicated propagator.
+        // Fast path: a constant value and target use the normalized count global.
         if let (Ok(value), Ok(target)) = (self.int_atom(&args[1]), self.int_atom(&args[2])) {
-            count(&mut self.solver, &vars, value, rel, target as i64);
+            count(&mut self.package.model, &vars, value, rel, target as i64);
             return Ok(());
         }
         // General form `#{ i : vars[i] == value } <rel> target` with a variable
@@ -197,7 +525,7 @@ impl Model {
         let value = self.atom_expr(&args[1])?;
         let target = self.atom_expr(&args[2])?;
         let occ: Vec<Expr> = vars.iter().map(|&v| expr::eq(expr::var(v), value.clone())).collect();
-        intension(&mut self.solver, cmp_expr(rel, expr::add(occ), target));
+        intension(&mut self.package.model, cmp_expr(rel, expr::add(occ), target));
         Ok(())
     }
 
@@ -206,9 +534,9 @@ impl Model {
         let target = self.var_atom(&args[0])?;
         let vars = self.var_list(&args[1])?;
         if is_min {
-            minimum(&mut self.solver, target, &vars);
+            minimum(&mut self.package.model, target, &vars);
         } else {
-            maximum(&mut self.solver, target, &vars);
+            maximum(&mut self.package.model, target, &vars);
         }
         Ok(())
     }
@@ -222,7 +550,7 @@ impl Model {
         for var in self.var_list(&args[1])? {
             terms.push(expr::eq(expr::var(var), expr::int(0)));
         }
-        intension(&mut self.solver, expr::or(terms));
+        intension(&mut self.package.model, expr::or(terms));
         Ok(())
     }
 
@@ -261,14 +589,14 @@ impl Model {
             Reif::Iff => expr::iff(r, base),
             Reif::Imp => expr::imp(r, base),
         };
-        intension(&mut self.solver, formula);
+        intension(&mut self.package.model, formula);
         Ok(())
     }
 
     /// Post `target = value`.
     pub(crate) fn post_def(&mut self, target_s: &str, value: Expr) -> Result<(), String> {
         let t = self.atom_expr(target_s)?;
-        intension(&mut self.solver, expr::eq(t, value));
+        intension(&mut self.package.model, expr::eq(t, value));
         Ok(())
     }
 
@@ -326,7 +654,7 @@ impl Model {
         let member = self.set_member_expr(x, set_s)?;
         match mode {
             None => {
-                intension(&mut self.solver, member);
+                intension(&mut self.package.model, member);
                 Ok(())
             }
             Some(m) => {
@@ -339,14 +667,14 @@ impl Model {
     /// Membership of a constant element in a set variable. `mem` is its `0/1`
     /// membership variable, or `None` when the element is outside the universe
     /// (membership is then constantly false).
-    pub(crate) fn post_set_var_in(&mut self, mem: Option<VarId>, r: Option<&str>, mode: Option<Reif>) -> Result<(), String> {
+    pub(crate) fn post_set_var_in(&mut self, mem: Option<IntVarRef>, r: Option<&str>, mode: Option<Reif>) -> Result<(), String> {
         let base = match mem {
             Some(v) => expr::var(v),
             None => expr::int(0),
         };
         match mode {
             None => {
-                intension(&mut self.solver, base);
+                intension(&mut self.package.model, base);
                 Ok(())
             }
             Some(m) => {
@@ -375,7 +703,7 @@ impl Model {
         let arity = vars.len();
         require(flat.len() % arity == 0, "table tuple length not a multiple of arity")?;
         let tuples: Vec<Vec<i32>> = flat.chunks(arity).map(<[i32]>::to_vec).collect();
-        extension(&mut self.solver, &vars, &tuples, true);
+        extension(&mut self.package.model, &vars, &tuples, true);
         Ok(())
     }
 
@@ -401,7 +729,7 @@ impl Model {
             }
         }
         let dfa = Dfa { n_states: q, start: q0 - 1, accept: accept.iter().map(|&f| f as usize - 1).collect(), transitions };
-        regular(&mut self.solver, &vars, dfa);
+        regular(&mut self.package.model, &vars, dfa);
         Ok(())
     }
 
@@ -411,14 +739,14 @@ impl Model {
         let offset = self.int_atom(&args[0])?;
         let succ = self.var_list(&args[1])?;
         if offset == 0 {
-            circuit(&mut self.solver, &succ);
+            circuit(&mut self.package.model, &succ);
         } else {
             let n = succ.len();
-            let shifted: Vec<VarId> = (0..n).map(|_| self.solver.new_var_range(0, n as i32 - 1)).collect();
+            let shifted: Vec<IntVarRef> = (0..n).map(|_| self.package.model.int_range(0, n as i32 - 1)).collect();
             for k in 0..n {
-                linear(&mut self.solver, &[1, -1], &[succ[k], shifted[k]], Relation::Eq, offset as i64);
+                linear(&mut self.package.model, &[1, -1], &[succ[k], shifted[k]], Relation::Eq, offset as i64);
             }
-            circuit(&mut self.solver, &shifted);
+            circuit(&mut self.package.model, &shifted);
         }
         Ok(())
     }
@@ -430,7 +758,7 @@ impl Model {
         let durations = self.var_list(&args[1])?;
         let heights = self.var_list(&args[2])?;
         let capacity = self.var_atom(&args[3])?;
-        cumulative_var(&mut self.solver, &starts, &durations, &heights, capacity);
+        cumulative_var(&mut self.package.model, &starts, &durations, &heights, capacity);
         Ok(())
     }
 
@@ -438,11 +766,11 @@ impl Model {
     pub(crate) fn post_schedule_unary(&mut self, args: &[String]) -> Result<(), String> {
         require(args.len() == 2, "schedule_unary expects 2 arguments")?;
         let starts = self.var_list(&args[0])?;
-        // Constant durations use the dedicated sweep propagator.
+        // Constant durations use the normalized no-overlap global.
         if let Ok(durations) = self.int_list(&args[1]) {
             let durations: Vec<i64> = durations.into_iter().map(i64::from).collect();
             require(starts.len() == durations.len(), "schedule_unary length mismatch")?;
-            no_overlap(&mut self.solver, &starts, &durations);
+            no_overlap(&mut self.package.model, &starts, &durations);
             return Ok(());
         }
         // Variable durations: pairwise ordering decomposition,
@@ -453,7 +781,7 @@ impl Model {
             for j in i + 1..starts.len() {
                 let i_first = expr::le(expr::add(vec![expr::var(starts[i]), expr::var(durations[i])]), expr::var(starts[j]));
                 let j_first = expr::le(expr::add(vec![expr::var(starts[j]), expr::var(durations[j])]), expr::var(starts[i]));
-                intension(&mut self.solver, expr::or(vec![i_first, j_first]));
+                intension(&mut self.package.model, expr::or(vec![i_first, j_first]));
             }
         }
         Ok(())
@@ -468,13 +796,13 @@ impl Model {
         require(cover.len() == counts.len(), "global_cardinality cover/counts mismatch")?;
         for (j, &val) in cover.iter().enumerate() {
             let terms: Vec<Expr> = vars.iter().map(|&v| expr::eq(expr::var(v), expr::int(val as i64))).collect();
-            intension(&mut self.solver, expr::eq(expr::add(terms), expr::var(counts[j])));
+            intension(&mut self.package.model, expr::eq(expr::add(terms), expr::var(counts[j])));
         }
         if closed {
             // Closed form: every variable must take a value from `cover`.
             for &v in &vars {
                 let member = cover.iter().map(|&c| expr::eq(expr::var(v), expr::int(c as i64))).collect();
-                intension(&mut self.solver, expr::or(member));
+                intension(&mut self.package.model, expr::or(member));
             }
         }
         Ok(())
@@ -487,7 +815,7 @@ impl Model {
         let cover = self.int_list(&args[1])?;
         let low: Vec<i64> = self.int_list(&args[2])?.into_iter().map(i64::from).collect();
         let up: Vec<i64> = self.int_list(&args[3])?.into_iter().map(i64::from).collect();
-        cardinality(&mut self.solver, &vars, &cover, &low, &up, closed);
+        cardinality(&mut self.package.model, &vars, &cover, &low, &up, closed);
         Ok(())
     }
 
@@ -508,7 +836,7 @@ impl Model {
                 .zip(&weight)
                 .map(|(&b, &w)| expr::mul(vec![expr::int(w as i64), expr::eq(expr::var(b), expr::int(target as i64))]))
                 .collect();
-            intension(&mut self.solver, expr::eq(expr::add(terms), expr::var(l)));
+            intension(&mut self.package.model, expr::eq(expr::add(terms), expr::var(l)));
         }
         Ok(())
     }
@@ -523,14 +851,17 @@ impl Model {
         let idx = self.var_atom(&args[2])?;
         let n = xs.len();
         // m = max(xs); pos = idx - offset is a 0-based index with xs[pos] = m.
-        let m = self.solver.new_var_range(UNBOUNDED_LO, UNBOUNDED_HI);
-        maximum(&mut self.solver, m, &xs);
-        let pos = self.solver.new_var_range(0, n as i32 - 1);
-        linear(&mut self.solver, &[1, -1], &[idx, pos], Relation::Eq, offset as i64);
-        element(&mut self.solver, &xs, pos, m);
+        let m = self.package.model.int_range(UNBOUNDED_LO, UNBOUNDED_HI);
+        maximum(&mut self.package.model, m, &xs);
+        let pos = self.package.model.int_range(0, n as i32 - 1);
+        linear(&mut self.package.model, &[1, -1], &[idx, pos], Relation::Eq, offset as i64);
+        element(&mut self.package.model, &xs, pos, m);
         // First maximum: any earlier element must be strictly smaller.
         for (j, &xj) in xs.iter().enumerate() {
-            intension(&mut self.solver, expr::imp(expr::gt(expr::var(pos), expr::int(j as i64)), expr::ne(expr::var(xj), expr::var(m))));
+            intension(
+                &mut self.package.model,
+                expr::imp(expr::gt(expr::var(pos), expr::int(j as i64)), expr::ne(expr::var(xj), expr::var(m))),
+            );
         }
         Ok(())
     }
@@ -541,7 +872,7 @@ impl Model {
         let x = self.var_list(&args[0])?;
         let y = self.var_list(&args[1])?;
         require(x.len() == y.len(), "array lex length mismatch")?;
-        lex(&mut self.solver, &x, &y, strict);
+        lex(&mut self.package.model, &x, &y, strict);
         Ok(())
     }
 
@@ -550,7 +881,7 @@ impl Model {
         require(args.len() == 1, "increasing/decreasing expects 1 argument")?;
         let vars = self.var_list(&args[0])?;
         if vars.len() > 1 {
-            ordered(&mut self.solver, &vars, rel);
+            ordered(&mut self.package.model, &vars, rel);
         }
         Ok(())
     }
@@ -562,7 +893,7 @@ impl Model {
         require(!xs.is_empty(), "member over empty array")?;
         let y = self.atom_expr(&args[1])?;
         let terms = xs.iter().map(|&x| expr::eq(expr::var(x), y.clone())).collect();
-        intension(&mut self.solver, expr::or(terms));
+        intension(&mut self.package.model, expr::or(terms));
         Ok(())
     }
 
@@ -578,7 +909,7 @@ impl Model {
             coeffs.push(-1);
             0
         };
-        linear(&mut self.solver, &coeffs, &vars, rel, rhs);
+        linear(&mut self.package.model, &coeffs, &vars, rel, rhs);
         Ok(())
     }
 
@@ -606,31 +937,26 @@ impl Model {
         // A selected edge selects both its endpoints.
         for (e, &sel) in es.iter().enumerate() {
             let (u, v) = (node(from[e])?, node(to[e])?);
-            intension(&mut self.solver, expr::imp(expr::var(sel), expr::var(ns[u])));
-            intension(&mut self.solver, expr::imp(expr::var(sel), expr::var(ns[v])));
+            intension(&mut self.package.model, expr::imp(expr::var(sel), expr::var(ns[u])));
+            intension(&mut self.package.model, expr::imp(expr::var(sel), expr::var(ns[v])));
         }
         if n == 0 {
             return Ok(());
         }
-        // Levels, root indicators, and "any node selected". These are search
-        // variables: `intension`'s exact final check only fires once every
-        // variable in scope is fixed, so leaving them out of the search would
-        // let spurious (disconnected) solutions through.
-        let level: Vec<VarId> = (0..n).map(|_| self.solver.new_var_range(0, n as i32 - 1)).collect();
-        let root: Vec<VarId> = (0..n).map(|_| self.solver.new_var_range(0, 1)).collect();
-        let any = self.solver.new_var_range(0, 1);
-        self.search.extend(level.iter().copied());
-        self.search.extend(root.iter().copied());
-        self.search.push(any);
-        intension(&mut self.solver, expr::iff(expr::var(any), expr::or(ns.iter().map(|&v| expr::var(v)).collect())));
+        // Levels, root indicators, and "any node selected". The semantic CP
+        // compiler includes every declared integer variable in its search.
+        let level: Vec<IntVarRef> = (0..n).map(|_| self.package.model.int_range(0, n as i32 - 1)).collect();
+        let root: Vec<IntVarRef> = (0..n).map(|_| self.package.model.int_range(0, 1)).collect();
+        let any = self.package.model.int_range(0, 1);
+        intension(&mut self.package.model, expr::iff(expr::var(any), expr::or(ns.iter().map(|&v| expr::var(v)).collect())));
         // Exactly one root when any node is selected, none otherwise.
         let mut coeffs = vec![1i64; n];
         let mut vars = root.clone();
         coeffs.push(-1);
         vars.push(any);
-        linear(&mut self.solver, &coeffs, &vars, Relation::Eq, 0);
+        linear(&mut self.package.model, &coeffs, &vars, Relation::Eq, 0);
         // Incident (edge, neighbour) pairs per node.
-        let mut incident: Vec<Vec<(VarId, usize)>> = vec![Vec::new(); n];
+        let mut incident: Vec<Vec<(IntVarRef, usize)>> = vec![Vec::new(); n];
         for (e, &sel) in es.iter().enumerate() {
             let (u, v) = (node(from[e])?, node(to[e])?);
             incident[u].push((sel, v));
@@ -639,7 +965,7 @@ impl Model {
         for v in 0..n {
             // A root is a selected node at level 0.
             intension(
-                &mut self.solver,
+                &mut self.package.model,
                 expr::imp(expr::var(root[v]), expr::and(vec![expr::var(ns[v]), expr::eq(expr::var(level[v]), expr::int(0))])),
             );
             // A selected non-root node has a selected edge to a parent one level below.
@@ -647,7 +973,10 @@ impl Model {
                 .iter()
                 .map(|&(e, u)| expr::and(vec![expr::var(e), expr::eq(expr::var(level[u]), expr::sub(expr::var(level[v]), expr::int(1)))]))
                 .collect();
-            intension(&mut self.solver, expr::imp(expr::and(vec![expr::var(ns[v]), expr::not(expr::var(root[v]))]), expr::or(parents)));
+            intension(
+                &mut self.package.model,
+                expr::imp(expr::and(vec![expr::var(ns[v]), expr::not(expr::var(root[v]))]), expr::or(parents)),
+            );
         }
         Ok(())
     }

@@ -3,5 +3,7 @@
 //! `cop` is the min-conflicts search over integer variables (the `--ls` COP path); `lists` is the move-based search over list models.
 
 #[doc(hidden)]
-pub mod cop;
-pub mod lists;
+#[allow(dead_code)]
+pub(crate) mod cop;
+#[allow(dead_code)]
+pub(crate) mod lists;

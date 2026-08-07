@@ -19,7 +19,6 @@ use super::incremental::{EvalScratch, InsertView, ListView, ReductionCache};
 use super::metrics::{ListSearchMetrics, MetricsRecorder};
 use super::moves::{apply_move, best_improving_move, better, shuffle, snapshot, trial_list_score_view, SearchMemory};
 use super::portfolio::WorkerCoordination;
-use super::schedule_ls::solve_schedule;
 use crate::engines::dual;
 use crate::mix64;
 use crate::model::list::{
@@ -376,7 +375,7 @@ fn lists_are_interchangeable(
     })
 }
 
-fn routing_gls(objective: &[Vec<Vec<Reduction>>], senses: &[bool]) -> Option<RoutingGls> {
+fn routing_gls(objective: &[Vec<Vec<Reduction>>], senses: &[bool], stop: &AtomicBool) -> Option<RoutingGls> {
     if objective.is_empty() || senses.first().copied() != Some(true) {
         return None;
     }
@@ -385,23 +384,47 @@ fn routing_gls(objective: &[Vec<Vec<Reduction>>], senses: &[bool]) -> Option<Rou
     if !matches!(first.op, ReduceOp::Sum) || first.coeff <= 0 || matrix.is_empty() || matrix.iter().any(|row| row.len() != matrix.len()) {
         return None;
     }
-    let same_feature = objective.iter().all(|list| {
-        list.first().is_some_and(|tier| {
-            tier.len() == 1
-                && matches!(tier[0].iterable, Iterable::Edges { .. })
-                && matches!(tier[0].op, ReduceOp::Sum)
-                && tier[0].coeff == first.coeff
-                && direct_edge_matrix(&tier[0]).is_some_and(|other| other.as_ref() == matrix.as_ref())
-        })
-    });
-    let symmetric = (0..matrix.len()).all(|row| (0..row).all(|col| matrix[row][col] == matrix[col][row]));
-    same_feature.then(|| RoutingGls {
-        penalties: RefCell::new(vec![vec![0; matrix.len()]; matrix.len()]),
-        matrix,
-        lambda: Cell::new(1),
-        coeff: first.coeff,
-        symmetric,
-    })
+    for list in objective {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        let tier = list.first()?;
+        if tier.len() != 1
+            || !matches!(tier[0].iterable, Iterable::Edges { .. })
+            || !matches!(tier[0].op, ReduceOp::Sum)
+            || tier[0].coeff != first.coeff
+        {
+            return None;
+        }
+        let other = direct_edge_matrix(&tier[0])?;
+        if !Arc::ptr_eq(&other, &matrix) {
+            for (left, right) in other.iter().zip(matrix.iter()) {
+                if stop.load(Ordering::Relaxed) || left != right {
+                    return None;
+                }
+            }
+        }
+    }
+    let mut symmetric = true;
+    for row in 0..matrix.len() {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        for col in 0..row {
+            if matrix[row][col] != matrix[col][row] {
+                symmetric = false;
+                break;
+            }
+        }
+    }
+    let mut penalties = Vec::with_capacity(matrix.len());
+    for _ in 0..matrix.len() {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        penalties.push(vec![0; matrix.len()]);
+    }
+    Some(RoutingGls { penalties: RefCell::new(penalties), matrix, lambda: Cell::new(1), coeff: first.coeff, symmetric })
 }
 
 /// Active representatives of interchangeable routes. Every nonempty route is
@@ -499,7 +522,7 @@ impl PerList {
         };
         let interchangeable_lists =
             (enable_routing_gls || diversify_descent) && lists_are_interchangeable(model, &objective, &constraints, &max_objective);
-        let routing_gls = enable_routing_gls.then(|| routing_gls(&objective, &senses)).flatten();
+        let routing_gls = enable_routing_gls.then(|| routing_gls(&objective, &senses, stop)).flatten();
         let routing = has_edges.then(|| routing_signature(model, &route_bounds, candidate_matrix.clone())).flatten();
         let construction_limit = ((model.items.len() as f64).sqrt().ceil() as usize).clamp(8, 64);
         Self {
@@ -1739,7 +1762,6 @@ pub fn solve_collection_hinted(
 /// Frontend entry point after the model has already passed budget-aware
 /// validation. Avoids validating the same large model again inside the search
 /// worker while preserving validation on every public engine entry point.
-#[cfg(feature = "python")]
 pub(crate) fn solve_collection_validated(
     model: &CollectionModel,
     seed: u64,
@@ -1749,7 +1771,7 @@ pub(crate) fn solve_collection_validated(
     report: &mut dyn FnMut(i64),
     profile: bool,
 ) -> (CollectionSolution, ListSearchMetrics) {
-    solve_collection_capped_internal(model, seed, stop, max_iters, hint, report, profile, false)
+    solve_collection_capped_worker(model, seed, stop, max_iters, hint, report, profile, false, SearchProfile::Sequential, None)
 }
 
 /// Complete a warm-start hint into a full `k`-list partition for [`State::from_lists`]:
@@ -1859,6 +1881,7 @@ pub(super) fn solve_collection_capped_worker(
             starts: Vec::new(),
             presences: Vec::new(),
             machines: Vec::new(),
+            modes: Vec::new(),
             bound: None,
         };
         let metrics = MetricsRecorder::new(metrics_enabled).snapshot(started.map(|instant| instant.elapsed()).unwrap_or_default());
@@ -1881,19 +1904,10 @@ pub(super) fn solve_collection_capped_worker(
             }
         }
     }
-    if let Some(sched) = &model.schedule {
-        let recorder = MetricsRecorder::new(metrics_enabled);
-        let (solution, construction) = solve_schedule(sched, seed, stop, report);
-        recorder.record_construction(
-            "serial-sgs",
-            construction.elapsed,
-            construction.first_feasible,
-            construction.candidates,
-            None,
-            solution.objectives.first().copied(),
-        );
-        let metrics = recorder.snapshot(started.map(|instant| instant.elapsed()).unwrap_or_default());
-        return (solution, metrics);
+    // Scheduling has its own physical engine and is dispatched directly by the
+    // orchestrator. A list-search worker never launches that engine.
+    if model.schedule.is_some() {
+        return no_solution();
     }
     let per = PerList::build_profiled(
         model,
@@ -2084,6 +2098,7 @@ pub(super) fn solve_collection_capped_worker(
         starts: Vec::new(),
         presences: Vec::new(),
         machines: Vec::new(),
+        modes: Vec::new(),
         bound: None,
     };
     per.metrics.record_alns(alns.metrics());

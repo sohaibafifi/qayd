@@ -4,9 +4,10 @@
 //! no incumbent injection. Extra workers diversify the ALNS parameters and may
 //! adopt a strictly better shared sequence at a local optimum.
 
+use std::convert::Infallible;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::alns::SearchProfile;
 use super::local_search::{solve_collection_capped_worker, Score};
@@ -15,6 +16,7 @@ use super::moves::better;
 use crate::engines::dual;
 use crate::mix64;
 use crate::model::list::{CollectionModel, CollectionSolution, ObjectiveTier};
+use crate::orchestrator::{execute_workers, EventControl};
 
 const WORKER_SEED_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
 
@@ -137,9 +139,18 @@ impl fmt::Display for ListPortfolioMetrics {
     }
 }
 
-enum PortfolioMessage {
-    Progress(i64),
-    Finished { worker: usize, seed: u64, profile: SearchProfile, solution: CollectionSolution, search: Box<ListSearchMetrics> },
+struct PortfolioWorkerInput<'a> {
+    seed: u64,
+    profile: SearchProfile,
+    hint: Option<&'a [Vec<i32>]>,
+    max_iterations: u64,
+}
+
+struct PortfolioWorkerResult {
+    seed: u64,
+    profile: SearchProfile,
+    solution: CollectionSolution,
+    search: ListSearchMetrics,
 }
 
 /// Solve with `workers` independent list-search trajectories and a shared
@@ -152,12 +163,11 @@ pub fn solve_collection_parallel(
     hint: Option<&[Vec<i32>]>,
     report: &mut dyn FnMut(i64),
 ) -> CollectionSolution {
-    solve_collection_parallel_internal(model, seed, stop, workers, u64::MAX, hint, report, false, true).0
+    solve_collection_parallel_internal(model, seed, stop, workers, u64::MAX, hint, report, false, true, true).0
 }
 
 /// Portfolio entry point for a frontend that already validated the collection
 /// model against the shared solve budget.
-#[cfg(feature = "python")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve_collection_parallel_validated(
     model: &CollectionModel,
@@ -169,7 +179,7 @@ pub(crate) fn solve_collection_parallel_validated(
     report: &mut dyn FnMut(i64),
     profile: bool,
 ) -> (CollectionSolution, ListPortfolioMetrics) {
-    solve_collection_parallel_internal(model, seed, stop, workers, max_iters, hint, report, profile, false)
+    solve_collection_parallel_internal(model, seed, stop, workers, max_iters, hint, report, profile, false, false)
 }
 
 /// Deterministic iteration-capped, profiled portfolio entry point.
@@ -182,7 +192,7 @@ pub fn solve_collection_parallel_capped_profiled(
     hint: Option<&[Vec<i32>]>,
     report: &mut dyn FnMut(i64),
 ) -> (CollectionSolution, ListPortfolioMetrics) {
-    solve_collection_parallel_internal(model, seed, stop, workers, max_iters, hint, report, true, true)
+    solve_collection_parallel_internal(model, seed, stop, workers, max_iters, hint, report, true, true, true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -196,6 +206,7 @@ fn solve_collection_parallel_internal(
     report: &mut dyn FnMut(i64),
     metrics_enabled: bool,
     validate_model: bool,
+    attach_bound: bool,
 ) -> (CollectionSolution, ListPortfolioMetrics) {
     let workers = workers.max(1);
     if workers == 1 {
@@ -211,8 +222,10 @@ fn solve_collection_parallel_internal(
             SearchProfile::Sequential,
             None,
         );
-        let dual_bound = if !stop.load(Ordering::Relaxed) { dual::compute(model, stop) } else { None };
-        dual::attach(model, &mut solution, dual_bound);
+        if attach_bound {
+            let dual_bound = if !stop.load(Ordering::Relaxed) { dual::compute(model, stop) } else { None };
+            dual::attach(model, &mut solution, dual_bound);
+        }
         let worker_metrics = ListPortfolioWorkerMetrics {
             worker: 0,
             seed,
@@ -228,55 +241,66 @@ fn solve_collection_parallel_internal(
     }
 
     let shared = SharedListIncumbent::new();
-    let (sender, receiver) = mpsc::channel();
-    let mut completed = Vec::with_capacity(workers);
-    std::thread::scope(|scope| {
-        for worker in 0..workers {
-            let sender = sender.clone();
-            let profile = worker_profile(worker);
-            let worker_seed = portfolio_seed(seed, worker);
-            let worker_hint = (worker == 0).then_some(hint).flatten();
-            let coordination = Some(WorkerCoordination::new(&shared, worker, profile, model.items.len()));
-            scope.spawn(move || {
-                let mut progress = |objective| {
-                    let _ = sender.send(PortfolioMessage::Progress(objective));
-                };
-                let (solution, search) = solve_collection_capped_worker(
-                    model,
-                    worker_seed,
-                    stop,
-                    max_iters,
-                    worker_hint,
-                    &mut progress,
-                    metrics_enabled,
-                    validate_model,
-                    profile,
-                    coordination,
-                );
-                let _ = sender.send(PortfolioMessage::Finished { worker, seed: worker_seed, profile, solution, search: Box::new(search) });
-            });
-        }
-        drop(sender);
-
-        let minimize_primary = model.objectives.first().is_none_or(|tier| tier.minimize);
-        let mut reported: Option<i64> = None;
-        for message in receiver {
-            match message {
-                PortfolioMessage::Progress(objective) => {
-                    let improved = reported.is_none_or(|current| if minimize_primary { objective < current } else { objective > current });
-                    if improved {
-                        reported = Some(objective);
-                        report(objective);
-                    }
-                }
-                PortfolioMessage::Finished { worker, seed, profile, solution, search } => {
-                    completed.push((worker, seed, profile, solution, *search));
-                }
+    // Keep the portfolio's mixed seed schedule stable. The generic executor's
+    // context seed is intentionally not substituted for these public metrics.
+    let inputs = (0..workers)
+        .map(|worker| PortfolioWorkerInput {
+            seed: portfolio_seed(seed, worker),
+            profile: worker_profile(worker),
+            hint: if worker == 0 { hint } else { None },
+            max_iterations: worker_iteration_quota(max_iters, worker, workers),
+        })
+        .collect();
+    let minimize_primary = model.objectives.first().is_none_or(|tier| tier.minimize);
+    let mut reported: Option<i64> = None;
+    let execution = execute_workers(
+        inputs,
+        stop,
+        Arc::new(AtomicBool::new(false)),
+        seed,
+        |context, input| {
+            let worker = context.worker();
+            let coordination = Some(WorkerCoordination::new(&shared, worker, input.profile, model.items.len()));
+            let mut progress = |objective| {
+                let _ = context.publish_latest(objective);
+            };
+            let (solution, search) = solve_collection_capped_worker(
+                model,
+                input.seed,
+                context.stop(),
+                input.max_iterations,
+                input.hint,
+                &mut progress,
+                metrics_enabled,
+                validate_model,
+                input.profile,
+                coordination,
+            );
+            PortfolioWorkerResult { seed: input.seed, profile: input.profile, solution, search }
+        },
+        |event| {
+            let objective = event.payload;
+            let improved = reported.is_none_or(|current| if minimize_primary { objective < current } else { objective > current });
+            if improved {
+                reported = Some(objective);
+                report(objective);
             }
-        }
-    });
+            Ok::<_, Infallible>(EventControl::Continue)
+        },
+    );
+    let execution = match execution {
+        Ok(execution) => execution,
+        Err(never) => match never {},
+    };
+    let completed = execution
+        .reports
+        .into_iter()
+        .map(|report| {
+            let result = report.result;
+            (report.worker, result.seed, result.profile, result.solution, result.search)
+        })
+        .collect::<Vec<_>>();
 
-    completed.sort_by_key(|entry| entry.0);
     let best_idx = completed
         .iter()
         .enumerate()
@@ -286,8 +310,10 @@ fn solve_collection_parallel_internal(
         })
         .expect("a non-empty portfolio must complete at least one worker");
     let mut solution = completed[best_idx].3.clone();
-    let dual_bound = if !stop.load(Ordering::Relaxed) { dual::compute(model, stop) } else { None };
-    dual::attach(model, &mut solution, dual_bound);
+    if attach_bound {
+        let dual_bound = if !stop.load(Ordering::Relaxed) { dual::compute(model, stop) } else { None };
+        dual::attach(model, &mut solution, dual_bound);
+    }
     let best_worker = completed[best_idx].0;
     let worker_metrics = completed
         .into_iter()
@@ -308,6 +334,15 @@ fn solve_collection_parallel_internal(
         worker_metrics,
     };
     (solution, metrics)
+}
+
+fn worker_iteration_quota(total: u64, worker: usize, workers: usize) -> u64 {
+    if total == u64::MAX {
+        return u64::MAX;
+    }
+    let workers = u64::try_from(workers).unwrap_or(u64::MAX).max(1);
+    let worker = u64::try_from(worker).unwrap_or(u64::MAX);
+    total / workers + u64::from(worker < total % workers)
 }
 
 fn solution_better(candidate: &CollectionSolution, incumbent: &CollectionSolution, model: &CollectionModel) -> bool {
@@ -399,6 +434,7 @@ pub fn audit_portfolio_merge() -> bool {
         starts: Vec::new(),
         presences: Vec::new(),
         machines: Vec::new(),
+        modes: Vec::new(),
         bound: None,
     };
     let incumbent = solution(true, vec![5, 10]);

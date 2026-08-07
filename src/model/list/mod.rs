@@ -4,9 +4,16 @@ pub(crate) mod external;
 mod ir;
 pub(crate) mod scan;
 mod validate;
+mod verify;
 
 pub use external::{external_function_registered, register_external_function};
-pub use ir::*;
+pub(crate) use ir::{BoundReport, CollectionModel, CollectionSolution, IntervalVar, Mode, Schedule};
+pub use ir::{
+    Constraint, Expr, ExprArena, ExprId, FixedPoint, GlobalConstraint, Iterable, MaxTerm, ObjectiveTier, Op, ReduceOp, Reduction, Resource,
+};
+#[cfg(test)]
+pub(crate) use verify::{audit_verification_calls, verify_collection_solution};
+pub(crate) use verify::{verify_collection_solution_interruptible, VERIFICATION_INTERRUPTED};
 
 /// Reference to a list declaration inside [`Model`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -17,6 +24,25 @@ pub struct ListVarRef(pub usize);
 pub struct ListDecl {
     /// Immutable item universe for this list.
     pub universe: Vec<i32>,
+    /// Ordered sequences and unordered assignment sets share the same physical
+    /// collection engine but keep distinct semantic identities.
+    pub ordering: ListOrdering,
+    /// Hidden remainder lists are explicit model objects, never inferred from
+    /// a missing objective reference.
+    pub role: ListRole,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ListOrdering {
+    Ordered,
+    Unordered,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ListRole {
+    Decision,
+    HiddenRemainder,
+    Derived,
 }
 
 /// Current list reduction representation during the migration.
@@ -67,7 +93,7 @@ pub struct ListObjectiveTier {
 }
 
 /// Parse list objective tiers that domain exact search can evaluate.
-pub fn list_objective_tiers(tiers: &[ObjectiveTier], items: &[i32]) -> Option<Vec<ListObjectiveTier>> {
+pub(crate) fn list_objective_tiers(tiers: &[ObjectiveTier], items: &[i32]) -> Option<Vec<ListObjectiveTier>> {
     let mut parsed = Vec::with_capacity(tiers.len());
     for tier in tiers {
         let mut terms = Vec::with_capacity(tier.terms.len());
@@ -100,7 +126,7 @@ pub fn list_objective_tiers(tiers: &[ObjectiveTier], items: &[i32]) -> Option<Ve
 }
 
 /// Evaluate parsed list objective tiers on concrete list contents.
-pub fn evaluate_list_objectives(tiers: &[ListObjectiveTier], lists: &[Vec<i32>]) -> Vec<i64> {
+pub(crate) fn evaluate_list_objectives(tiers: &[ListObjectiveTier], lists: &[Vec<i32>]) -> Vec<i64> {
     tiers
         .iter()
         .map(|tier| {
@@ -118,7 +144,7 @@ pub fn evaluate_list_objectives(tiers: &[ListObjectiveTier], lists: &[Vec<i32>])
 }
 
 /// Lexicographic comparison of list objective vectors.
-pub fn list_objectives_better(candidate: &[i64], incumbent: &[i64], tiers: &[ListObjectiveTier]) -> bool {
+pub(crate) fn list_objectives_better(candidate: &[i64], incumbent: &[i64], tiers: &[ListObjectiveTier]) -> bool {
     for ((candidate, incumbent), tier) in candidate.iter().zip(incumbent).zip(tiers) {
         if candidate == incumbent {
             continue;
@@ -377,7 +403,7 @@ fn piecewise(input: i64, points: &[(i64, i64)]) -> i64 {
 fn list_item_values(reduction: &Reduction, items: &[i32]) -> Option<Vec<(i32, i64)>> {
     let mut values = Vec::with_capacity(items.len());
     for &item in items {
-        values.push((item, super::classify::eval_collection_expr_one(&reduction.arena.exprs, reduction.body, i64::from(item))?));
+        values.push((item, eval_expr_checked(&reduction.arena.exprs, reduction.body, &[i64::from(item)])?));
     }
     Some(values)
 }

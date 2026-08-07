@@ -322,6 +322,12 @@ pub struct Cdcl<'s> {
     max_learned: usize,
     /// Conflicts analysed (statistics and restarts).
     pub(crate) conflicts: u64,
+    /// Absolute ceiling on conflicts analysed by the current bounded search.
+    /// `None` keeps the historical unbounded behaviour.
+    conflict_limit: Option<u64>,
+    /// A conflict was detected after the ceiling had been reached and was left
+    /// unresolved so the caller can report an incomplete search.
+    conflict_limit_reached: bool,
     /// Total literals across all learned clauses (numerator of avg learned size).
     pub(crate) learned_lits: u64,
     /// Learned clauses shortened by CP-aware vivification.
@@ -416,6 +422,8 @@ impl<'s> Cdcl<'s> {
             num_learned: 0,
             max_learned: 2000,
             conflicts: 0,
+            conflict_limit: None,
+            conflict_limit_reached: false,
             learned_lits: 0,
             vivified_clauses: 0,
             vivified_lits: 0,
@@ -461,6 +469,28 @@ impl<'s> Cdcl<'s> {
     /// Raise the learned-clause database budget for pure SAT-style searches.
     pub(crate) fn set_learned_clause_budget(&mut self, max_learned: usize) {
         self.max_learned = self.max_learned.max(max_learned);
+    }
+
+    /// Limit conflict analysis for the next search to at most `budget`
+    /// additional conflicts. The limit is enforced inside propagation because
+    /// one decision can expose several conflicts before returning to a search
+    /// driver.
+    pub(crate) fn set_conflict_budget(&mut self, budget: Option<u64>) {
+        self.conflict_limit = budget.map(|budget| self.conflicts.saturating_add(budget));
+        self.conflict_limit_reached = false;
+    }
+
+    /// Whether the configured conflict ceiling prevents further search.
+    #[inline]
+    pub(crate) fn conflict_budget_reached(&self) -> bool {
+        self.conflict_limit.is_some_and(|limit| self.conflicts >= limit)
+    }
+
+    /// Whether propagation stopped on an unresolved conflict because the
+    /// configured conflict ceiling had already been consumed.
+    #[inline]
+    pub(crate) fn conflict_budget_exhausted(&self) -> bool {
+        self.conflict_limit_reached
     }
 
     /// Stream learned clauses to an external proof writer.
@@ -1099,6 +1129,29 @@ impl<'s> Cdcl<'s> {
     /// Propagate; on each conflict, learn a 1-UIP clause, backjump, assert it.
     /// `true` at a clean fixpoint, `false` if a root conflict proves UNSAT.
     pub fn propagate_and_learn(&mut self) -> bool {
+        if self.conflict_limit.is_none() {
+            return self.propagate_and_learn_unbounded();
+        }
+        loop {
+            match self.propagate() {
+                Ok(()) => return true,
+                Err(conflict) => {
+                    if self.conflict_budget_reached() {
+                        self.conflict_limit_reached = true;
+                        return false;
+                    }
+                    if !self.resolve_conflict(conflict) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Preserve the original branch-free conflict loop for the overwhelmingly
+    /// common unbounded search path. Bounded workers retain the strict check in
+    /// `propagate_and_learn` before resolving each conflict.
+    fn propagate_and_learn_unbounded(&mut self) -> bool {
         loop {
             match self.propagate() {
                 Ok(()) => return true,

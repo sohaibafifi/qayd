@@ -1,0 +1,113 @@
+{
+  "schema": "qayd.parallel.manifest/v1",
+  "corpus_version": "2026-08-06.1",
+  "pre_refactor_revision": "6c09b9fddc2738f584e53d464d7a76b98cab4d6c",
+  "description": "Dedicated complete-search corpus for clause sharing, split cubes, objective probes, and CP LNS.",
+  "default_tolerance": 0.1,
+  "fixtures": [
+    {
+      "id": "pigeonhole-9-8",
+      "path": "bench/parallel/fixtures/pigeonhole-9-8.xml",
+      "sha256": "7ab04fe50ed4f0fdbc3e9e4ef04499c757d0ef1ad7397f4c9249bdcba7f70673",
+      "oracle": {
+        "kind": "pigeonhole-unsat",
+        "pigeons": 9,
+        "holes": 8
+      }
+    },
+    {
+      "id": "golomb-8",
+      "path": "bench/parallel/fixtures/golomb-8.xml",
+      "sha256": "80df0393a553e8d35a05eb59b25418948d46eb20912ab10ec015e961644c236d",
+      "oracle": {
+        "kind": "golomb-ruler",
+        "order": 8,
+        "optimum": 34
+      }
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "clause-sharing",
+      "feature": "clause-sharing",
+      "fixture": "pigeonhole-9-8",
+      "request": {
+        "args": ["--verbose", "--seed", "0", "--threads", "4", "--shared-pool-cap", "16384", "{instance}"],
+        "seed": 0,
+        "threads": 4,
+        "shared_pool_capacity": 16384,
+        "budget": {"kind": "complete", "wall_time_seconds": null, "conflict_limit": null},
+        "timeout_seconds": 180
+      },
+      "expected": {
+        "statuses": ["UNSATISFIABLE"],
+        "objective": null
+      },
+      "evidence": [
+        {"metric": "shared_clauses", "minimum": 1},
+        {"metric": "imported_clauses", "minimum": 1}
+      ]
+    },
+    {
+      "id": "split",
+      "feature": "split",
+      "fixture": "golomb-8",
+      "request": {
+        "args": ["--verbose", "--seed", "0", "--threads", "2", "--split", "{instance}"],
+        "seed": 0,
+        "threads": 2,
+        "split": true,
+        "budget": {"kind": "complete", "wall_time_seconds": null, "conflict_limit": null},
+        "timeout_seconds": 180
+      },
+      "expected": {
+        "statuses": ["OPTIMAL"],
+        "objective": 34
+      },
+      "evidence": [
+        {"metric": "split_jobs", "minimum": 1},
+        {"metric": "completed_jobs", "minimum": 1}
+      ]
+    },
+    {
+      "id": "probes",
+      "feature": "probes",
+      "fixture": "golomb-8",
+      "request": {
+        "args": ["--verbose", "--seed", "0", "--threads", "2", "--probe", "1", "{instance}"],
+        "seed": 0,
+        "threads": 2,
+        "probes": 1,
+        "budget": {"kind": "complete", "wall_time_seconds": null, "conflict_limit": null},
+        "timeout_seconds": 180
+      },
+      "expected": {
+        "statuses": ["OPTIMAL"],
+        "objective": 34
+      },
+      "evidence": [
+        {"metric": "probe_attempts", "minimum": 1}
+      ]
+    },
+    {
+      "id": "lns",
+      "feature": "lns",
+      "fixture": "golomb-8",
+      "request": {
+        "args": ["--verbose", "--seed", "0", "--threads", "2", "--lns", "1", "{instance}"],
+        "seed": 0,
+        "threads": 2,
+        "lns": 1,
+        "budget": {"kind": "complete", "wall_time_seconds": null, "conflict_limit": null},
+        "timeout_seconds": 180
+      },
+      "expected": {
+        "statuses": ["OPTIMAL"],
+        "objective": 34
+      },
+      "evidence": [
+        {"metric": "lns_attempts", "minimum": 1}
+      ]
+    }
+  ]
+}

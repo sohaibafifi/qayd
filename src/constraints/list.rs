@@ -27,6 +27,10 @@ impl Propagator for Partition {
         }
     }
 
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        subscribe_memberships_until(store, &self.lists, me, should_stop)
+    }
+
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
         for &item in &self.items {
             let mut required: Vec<ListId> = Vec::new();
@@ -83,6 +87,11 @@ pub fn partition(solver: &mut Solver, lists: &[ListId], items: &[i32]) -> PropId
     solver.post(Box::new(Partition { lists: lists.to_vec(), items: items.to_vec() }))
 }
 
+/// Post a list partition while allowing a physical-model build to stop.
+pub(crate) fn partition_until(solver: &mut Solver, lists: Vec<ListId>, items: Vec<i32>, should_stop: &dyn Fn() -> bool) -> Option<PropId> {
+    solver.post_until(Box::new(Partition { lists, items }), should_stop)
+}
+
 /// Keep two assigned items on the same list.
 #[derive(Clone)]
 pub struct SameList {
@@ -101,6 +110,10 @@ impl Propagator for SameList {
             store.subscribe_list(list, me, ListEvent::PossibleChange);
             store.subscribe_list(list, me, ListEvent::RequiredChange);
         }
+    }
+
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        subscribe_memberships_until(store, &self.lists, me, should_stop)
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
@@ -169,6 +182,11 @@ pub fn same_list(solver: &mut Solver, lists: &[ListId], a: i32, b: i32) -> PropI
     solver.post(Box::new(SameList { lists: lists.to_vec(), a, b }))
 }
 
+/// Post a same-list constraint while allowing a physical-model build to stop.
+pub(crate) fn same_list_until(solver: &mut Solver, lists: Vec<ListId>, a: i32, b: i32, should_stop: &dyn Fn() -> bool) -> Option<PropId> {
+    solver.post_until(Box::new(SameList { lists, a, b }), should_stop)
+}
+
 /// Keep the assigned list index of `before` no greater than that of `after`.
 #[derive(Clone)]
 pub struct ItemPrecedence {
@@ -187,6 +205,10 @@ impl Propagator for ItemPrecedence {
             store.subscribe_list(list, me, ListEvent::PossibleChange);
             store.subscribe_list(list, me, ListEvent::RequiredChange);
         }
+    }
+
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        subscribe_memberships_until(store, &self.lists, me, should_stop)
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
@@ -258,6 +280,17 @@ impl ItemPrecedence {
 /// Post item precedence over assigned list indices.
 pub fn item_precedence(solver: &mut Solver, lists: &[ListId], before: i32, after: i32) -> PropId {
     solver.post(Box::new(ItemPrecedence { lists: lists.to_vec(), before, after }))
+}
+
+/// Post item precedence while allowing a physical-model build to stop.
+pub(crate) fn item_precedence_until(
+    solver: &mut Solver,
+    lists: Vec<ListId>,
+    before: i32,
+    after: i32,
+    should_stop: &dyn Fn() -> bool,
+) -> Option<PropId> {
+    solver.post_until(Box::new(ItemPrecedence { lists, before, after }), should_stop)
 }
 
 /// The coupling `sum(members) == length` for one list: keeps the length
@@ -344,6 +377,15 @@ pub fn list_cardinality(solver: &mut Solver, list: ListId) -> PropId {
     solver.post(Box::new(ListCardinality { list, items, length }))
 }
 
+/// Post list cardinality while allowing a physical-model build to stop.
+pub(crate) fn list_cardinality_until(solver: &mut Solver, list: ListId, items: Vec<i32>, should_stop: &dyn Fn() -> bool) -> Option<PropId> {
+    if should_stop() {
+        return None;
+    }
+    let length = solver.store.list_length_var(list);
+    solver.post_until(Box::new(ListCardinality { list, items, length }), should_stop)
+}
+
 /// `used = (length(list) >= 1)`: the boolean indicator that a list is non-empty,
 /// used to count open bins or used vehicles in an integer-backed objective.
 #[derive(Clone)]
@@ -388,6 +430,15 @@ pub fn list_used(solver: &mut Solver, list: ListId, used: VarId) -> PropId {
     solver.post(Box::new(ListUsed { list, length, used }))
 }
 
+/// Post a list-used channel while allowing a physical-model build to stop.
+pub(crate) fn list_used_until(solver: &mut Solver, list: ListId, used: VarId, should_stop: &dyn Fn() -> bool) -> Option<PropId> {
+    if should_stop() {
+        return None;
+    }
+    let length = solver.store.list_length_var(list);
+    solver.post_until(Box::new(ListUsed { list, length, used }), should_stop)
+}
+
 /// Bounds the number of required items in a list.
 #[derive(Clone)]
 pub struct ListLength {
@@ -420,6 +471,11 @@ impl Propagator for ListLength {
 /// Post list length bounds.
 pub fn list_len(solver: &mut Solver, list: ListId, min: usize, max: usize) -> PropId {
     solver.post(Box::new(ListLength { list, min, max }))
+}
+
+/// Post list length bounds while allowing a physical-model build to stop.
+pub(crate) fn list_len_until(solver: &mut Solver, list: ListId, min: usize, max: usize, should_stop: &dyn Fn() -> bool) -> Option<PropId> {
+    solver.post_until(Box::new(ListLength { list, min, max }), should_stop)
 }
 
 /// Bounds a weighted item sum over one list.
@@ -551,6 +607,29 @@ impl ListItemSum {
 /// Post weighted item-sum bounds.
 pub fn list_item_sum(solver: &mut Solver, list: ListId, weights: Vec<(i32, i64)>, min: i64, max: i64) -> PropId {
     solver.post(Box::new(ListItemSum { list, weights, min, max }))
+}
+
+/// Post weighted item-sum bounds while allowing a physical-model build to stop.
+pub(crate) fn list_item_sum_until(
+    solver: &mut Solver,
+    list: ListId,
+    weights: Vec<(i32, i64)>,
+    min: i64,
+    max: i64,
+    should_stop: &dyn Fn() -> bool,
+) -> Option<PropId> {
+    solver.post_until(Box::new(ListItemSum { list, weights, min, max }), should_stop)
+}
+
+fn subscribe_memberships_until(store: &mut Store, lists: &[ListId], me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+    for &list in lists {
+        if should_stop() {
+            return false;
+        }
+        store.subscribe_list(list, me, ListEvent::PossibleChange);
+        store.subscribe_list(list, me, ListEvent::RequiredChange);
+    }
+    !should_stop()
 }
 
 fn required_owner(store: &Store, lists: &[ListId], item: i32) -> Result<Option<usize>, Inconsistency> {
