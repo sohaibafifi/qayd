@@ -1,5 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use qayd::frontends::xcsp::{run_to_with_options, Mode, RunOptions};
@@ -13,17 +12,17 @@ fn run_turbo_verbose(xml: &str, seed: u64) -> String {
 }
 
 fn run_turbo_with(xml: &str, seed: u64, verbose: bool) -> String {
-    let stop = Arc::new(AtomicBool::new(false));
-    let stopper = Arc::clone(&stop);
-    let handle = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(150));
-        stopper.store(true, Ordering::Relaxed);
-    });
+    let stop = AtomicBool::new(false);
 
     let mut out = Vec::new();
-    run_to_with_options(xml, verbose, &stop, &mut out, RunOptions { seed, workers: 1, mode: Mode::Ls, ..RunOptions::default() }).unwrap();
-    stop.store(true, Ordering::Relaxed);
-    handle.join().unwrap();
+    run_to_with_options(
+        xml,
+        verbose,
+        &stop,
+        &mut out,
+        RunOptions { seed, workers: 1, mode: Mode::Ls, time_limit: Some(Duration::from_millis(150)), ..RunOptions::default() },
+    )
+    .unwrap();
     String::from_utf8(out).unwrap()
 }
 

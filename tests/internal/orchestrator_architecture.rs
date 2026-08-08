@@ -6,12 +6,13 @@ use qayd::model::list::{
     CollectionModel, CollectionSolution, Constraint as ListConstraint, ExprArena, Iterable, ObjectiveTier, Op, ReduceOp, Reduction,
 };
 use qayd::model::{CompiledCollection, Constraint, IntVarRef, ListOrdering, Model, ModelObject, ModelPackage, Objective};
+#[cfg(feature = "python")]
+use qayd::orchestrator::TerminationReason;
 use qayd::orchestrator::{
     audit_interrupt_next_transfer_replay, compile_collection_plan, compile_model_plan, solve_collection_plan, solve_model_silent,
     solve_model_with_budget, EngineKind, EventControl, EventSink, ExecutablePlan, RoutingControls, SolveBudget, SolveError, SolveEvent,
     SolveLimits, SolveMode, SolveRequest, SolveResult, SolveStatus, VerificationLevel,
 };
-
 fn count(list: usize) -> Reduction {
     let mut arena = ExprArena::default();
     let one = arena.constant(1);
@@ -75,6 +76,20 @@ impl EventSink for FailOnProgress {
         if matches!(event, SolveEvent::Progress { .. }) {
             self.budget.cancel();
             Err(SolveError::Engine("progress callback failed".to_string()))
+        } else {
+            Ok(EventControl::Continue)
+        }
+    }
+}
+
+#[cfg(feature = "python")]
+struct FailPhysicalProgress;
+
+#[cfg(feature = "python")]
+impl EventSink for FailPhysicalProgress {
+    fn emit(&mut self, event: SolveEvent) -> Result<EventControl, SolveError> {
+        if matches!(event, SolveEvent::Progress { .. }) {
+            Err(SolveError::InvalidResult("physical progress callback failed".to_string()))
         } else {
             Ok(EventControl::Continue)
         }
@@ -199,6 +214,7 @@ fn final_status_construction_is_sealed_inside_the_orchestrator() {
 #[test]
 fn heuristic_engines_cannot_issue_complete_search_proofs() {
     assert!(!EngineKind::ListLocalSearch.can_prove_complete());
+    assert!(!EngineKind::RoutingLocalSearch.can_prove_complete());
     assert!(!EngineKind::ScheduleLocalSearch.can_prove_complete());
     assert!(EngineKind::IntegerExact.can_prove_complete());
 }
@@ -349,6 +365,40 @@ fn physical_compilers_never_report_a_prearmed_stop_as_unsupported() {
     assert!(matches!(schedule::compile(&schedule_context, &stopped), Err(CompileFailure::Interrupted { .. })));
 }
 
+#[cfg(feature = "python")]
+#[test]
+fn physical_callback_failure_stops_search_without_masking_the_error() {
+    use std::sync::atomic::AtomicBool;
+
+    use crate::model::CompiledCp;
+    use crate::orchestrator::{solve_physical_exact_with_budget, PhysicalObjectiveTier, PhysicalSolveInput};
+
+    let mut model = Model::new();
+    let value = model.int_range(0, 10);
+    model.add_objective(Objective::IntExpr { minimize: true, expr: qayd::model::IntExpr::Variable(value) });
+    let compiling = AtomicBool::new(false);
+    let compiled = CompiledCp::compile_interruptible(&model, &compiling).unwrap().unwrap();
+    let input = PhysicalSolveInput {
+        problem: compiled.problem().clone(),
+        visible_variables: model.int_vars().len(),
+        objectives: compiled.objectives().iter().cloned().map(|objective| PhysicalObjectiveTier { objective }).collect(),
+        assumptions: Vec::new(),
+        hints: Vec::new(),
+        branch_order: Vec::new(),
+        shared_clauses: None,
+        first_worker: 0,
+    };
+    let budget = SolveBudget::new(None);
+
+    let error = match solve_physical_exact_with_budget(input, &SolveRequest::default(), &budget, &mut FailPhysicalProgress) {
+        Ok(_) => panic!("the failing physical callback was ignored"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, SolveError::InvalidResult(message) if message == "physical progress callback failed"));
+    assert_eq!(budget.termination_reason(), TerminationReason::Engine);
+}
+
 #[test]
 fn routing_warm_start_is_verified_and_transferred_before_exact_execution() {
     let matrix = Arc::new(vec![vec![0, 4, 7, 6], vec![4, 0, 2, 5], vec![7, 2, 0, 3], vec![6, 5, 3, 0]]);
@@ -373,7 +423,7 @@ fn routing_warm_start_is_verified_and_transferred_before_exact_execution() {
         panic!("routing warm start must compile to a sequential plan");
     };
     assert_eq!(stages.len(), 2);
-    assert!(matches!(&stages[0], ExecutablePlan::Single(stage) if stage.engine() == EngineKind::ListLocalSearch));
+    assert!(matches!(&stages[0], ExecutablePlan::Single(stage) if stage.engine() == EngineKind::RoutingLocalSearch));
     assert!(matches!(&stages[1], ExecutablePlan::Single(stage) if stage.engine() == EngineKind::RoutingExact));
 
     let mut sink = StopOnTransfer::default();
@@ -381,6 +431,7 @@ fn routing_warm_start_is_verified_and_transferred_before_exact_execution() {
 
     assert_eq!(result.status(), SolveStatus::Satisfiable);
     assert!(result.primal().is_some(), "a verified warm-start incumbent must survive a stop between sequential stages");
+    assert!(matches!(sink.events.first(), Some(SolveEvent::StageStarted { engine: EngineKind::RoutingLocalSearch, warm_start: true })));
     assert!(sink
         .events
         .iter()
@@ -395,6 +446,7 @@ fn routing_warm_start_is_verified_and_transferred_before_exact_execution() {
         .position(|event| matches!(event, SolveEvent::Candidate(candidate) if candidate.verification() == VerificationLevel::Transfer))
         .unwrap();
     assert_eq!(transfer + 1, sink.events.len(), "consumer stop must end the routing sequence immediately");
+    assert!(matches!(sink.events.last(), Some(SolveEvent::Candidate(_))), "a consumer stop on a transfer candidate must be terminal");
     assert!(result.reports().iter().all(|report| report.engine != Some(EngineKind::RoutingExact)));
 }
 
@@ -484,17 +536,31 @@ fn routing_exact_consumes_the_verified_stage_candidate_and_preserves_stage_repor
 
     assert_eq!(result.status(), SolveStatus::Optimal);
     let engines = result.reports().iter().filter_map(|report| report.engine).collect::<Vec<_>>();
-    assert_eq!(engines, [EngineKind::ListLocalSearch, EngineKind::RoutingExact]);
+    assert_eq!(engines, [EngineKind::RoutingLocalSearch, EngineKind::RoutingExact]);
+    assert!(matches!(sink.events.first(), Some(SolveEvent::StageStarted { engine: EngineKind::RoutingLocalSearch, warm_start: true })));
     let transfer = sink
         .events
         .iter()
         .position(|event| matches!(event, SolveEvent::Candidate(candidate) if candidate.verification() == VerificationLevel::Transfer))
         .expect("the LS candidate crosses a transfer boundary");
+    let exact_stage = sink
+        .events
+        .iter()
+        .position(|event| matches!(event, SolveEvent::StageStarted { engine: EngineKind::RoutingExact, warm_start: false }))
+        .expect("the exact routing stage is announced");
+    assert_eq!(transfer + 1, exact_stage, "the exact stage marker must immediately precede exact-engine execution");
     let final_candidate = sink
         .events
         .iter()
         .position(|event| matches!(event, SolveEvent::Candidate(candidate) if candidate.verification() == VerificationLevel::Final))
         .expect("the exact result is finally verified");
+    let exact_finished = sink
+        .events
+        .iter()
+        .position(|event| matches!(event, SolveEvent::Finished(report) if report.engine == Some(EngineKind::RoutingExact)))
+        .expect("the exact routing stage publishes its report");
+    assert!(exact_stage < final_candidate, "the exact stage marker must precede its verified candidate");
+    assert!(exact_stage < exact_finished, "the exact stage marker must precede its engine report");
     assert!(transfer < final_candidate);
 }
 
@@ -721,4 +787,5 @@ fn event_stop_suppresses_the_rest_of_collection_finalization() {
     let candidate =
         sink.events.iter().position(|event| matches!(event, SolveEvent::Candidate(_))).expect("the final candidate is published");
     assert_eq!(candidate + 1, sink.events.len(), "no final event may follow a consumer stop");
+    assert!(matches!(sink.events.last(), Some(SolveEvent::Candidate(_))), "a consumer stop on a candidate must be terminal");
 }

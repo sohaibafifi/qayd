@@ -1,5 +1,8 @@
 //! List variable declarations and list-objective evaluation.
 
+use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 pub(crate) mod external;
 mod ir;
 pub(crate) mod scan;
@@ -11,9 +14,9 @@ pub(crate) use ir::{BoundReport, CollectionModel, CollectionSolution, IntervalVa
 pub use ir::{
     Constraint, Expr, ExprArena, ExprId, FixedPoint, GlobalConstraint, Iterable, MaxTerm, ObjectiveTier, Op, ReduceOp, Reduction, Resource,
 };
+pub(crate) use verify::verify_collection_solution_interruptible;
 #[cfg(test)]
-pub(crate) use verify::{audit_verification_calls, verify_collection_solution};
-pub(crate) use verify::{verify_collection_solution_interruptible, VERIFICATION_INTERRUPTED};
+pub(crate) use verify::{audit_record_final_verification_boundary, audit_verification_calls, verify_collection_solution};
 
 /// Reference to a list declaration inside [`Model`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -93,6 +96,7 @@ pub struct ListObjectiveTier {
 }
 
 /// Parse list objective tiers that domain exact search can evaluate.
+#[cfg(test)]
 pub(crate) fn list_objective_tiers(tiers: &[ObjectiveTier], items: &[i32]) -> Option<Vec<ListObjectiveTier>> {
     let mut parsed = Vec::with_capacity(tiers.len());
     for tier in tiers {
@@ -154,6 +158,7 @@ pub(crate) fn list_objectives_better(candidate: &[i64], incumbent: &[i64], tiers
     false
 }
 
+#[cfg(test)]
 fn list_objective_term(reduction: &Reduction, items: &[i32]) -> Option<ListObjectiveTerm> {
     if let Iterable::Items(list) = &reduction.iterable {
         match reduction.op {
@@ -202,7 +207,29 @@ fn eval_list_objective_term(term: &ListObjectiveTerm, lists: &[Vec<i32>]) -> Opt
 }
 
 pub(crate) fn eval_reduction_on_lists(reduction: &Reduction, lists: &[Vec<i32>]) -> Option<i64> {
-    let contents = lists.get(reduction.iterable.list())?;
+    eval_reduction_on_lists_impl(reduction, lists, None).ok().flatten()
+}
+
+pub(crate) fn eval_reduction_on_lists_interruptible(
+    reduction: &Reduction,
+    lists: &[Vec<i32>],
+    stop: &AtomicBool,
+) -> Result<Option<i64>, ()> {
+    eval_reduction_on_lists_impl(reduction, lists, Some(stop))
+}
+
+fn eval_reduction_on_lists_impl(reduction: &Reduction, lists: &[Vec<i32>], stop: Option<&AtomicBool>) -> Result<Option<i64>, ()> {
+    let check_stop = || {
+        if stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
+            Err(())
+        } else {
+            Ok(())
+        }
+    };
+    check_stop()?;
+    let Some(contents) = lists.get(reduction.iterable.list()) else {
+        return Ok(None);
+    };
     let arena = &reduction.arena.exprs;
     let body = reduction.body;
     let mut sum = 0i64;
@@ -210,8 +237,11 @@ pub(crate) fn eval_reduction_on_lists(reduction: &Reduction, lists: &[Vec<i32>])
     let mut lo = i64::MAX;
     let mut hi = i64::MIN;
     let mut steps = 0u64;
-    let want_values = matches!(reduction.op, ReduceOp::SelectKth(_));
-    let mut values: Vec<i64> = Vec::new();
+    let select_k = match reduction.op {
+        ReduceOp::SelectKth(k) => Some(k),
+        _ => None,
+    };
+    let mut smallest = BinaryHeap::new();
     let mut fold = |v: i64| {
         sum = sum.saturating_add(v);
         if v != 0 {
@@ -224,38 +254,51 @@ pub(crate) fn eval_reduction_on_lists(reduction: &Reduction, lists: &[Vec<i32>])
             hi = v;
         }
         steps += 1;
-        if want_values {
-            values.push(v);
+        if let Some(k) = select_k {
+            smallest.push(v);
+            if smallest.len() > k.saturating_add(1) {
+                smallest.pop();
+            }
         }
+    };
+
+    let eval = |id, args: &[i64]| match stop {
+        Some(stop) => eval_objective_expr_interruptible(arena, id, args, stop),
+        None => Ok(eval_objective_expr(arena, id, args)),
     };
 
     match reduction.iterable {
         Iterable::Items(_) => {
             for &item in contents {
-                fold(eval_objective_expr(arena, body, &[i64::from(item)]));
+                check_stop()?;
+                fold(eval(body, &[i64::from(item)])?);
             }
         }
         Iterable::SetItems(_) => {
-            let mut members = contents.clone();
-            members.sort_unstable();
-            for item in members {
-                fold(eval_objective_expr(arena, body, &[i64::from(item)]));
+            // Every SetItems reduction is permutation invariant. Iterating the
+            // canonical assignment directly avoids a non-interruptible clone
+            // and sort at the final verification boundary.
+            for &item in contents {
+                check_stop()?;
+                fold(eval(body, &[i64::from(item)])?);
             }
         }
         Iterable::Edges { start, end, .. } => {
             let n = contents.len();
             for p in 0..=n {
+                check_stop()?;
                 let from = if p == 0 { start } else { contents[p - 1] };
                 let to = if p == n { end } else { contents[p] };
-                fold(eval_objective_expr(arena, body, &[i64::from(from), i64::from(to)]));
+                fold(eval(body, &[i64::from(from), i64::from(to)])?);
             }
         }
         Iterable::Pairs(_) => {
             let n = contents.len();
             for i in 0..n {
                 for j in 0..n {
+                    check_stop()?;
                     let args = [i64::from(contents[i]), i64::from(contents[j]), i as i64, j as i64];
-                    fold(eval_objective_expr(arena, body, &args));
+                    fold(eval(body, &args)?);
                 }
             }
         }
@@ -263,56 +306,81 @@ pub(crate) fn eval_reduction_on_lists(reduction: &Reduction, lists: &[Vec<i32>])
             let mut acc = init;
             let mut prev = boundary;
             for &cur in contents {
-                let new_acc = eval_objective_expr(arena, step, &[i64::from(cur), acc, i64::from(prev)]);
-                fold(eval_objective_expr(arena, body, &[i64::from(cur), new_acc, i64::from(prev)]));
+                check_stop()?;
+                let new_acc = eval(step, &[i64::from(cur), acc, i64::from(prev)])?;
+                fold(eval(body, &[i64::from(cur), new_acc, i64::from(prev)])?);
                 acc = new_acc;
                 prev = cur;
             }
             // Closing edge to `end`: one more transition, mirroring `Edges`.
             if let Some(end) = end {
-                let new_acc = eval_objective_expr(arena, step, &[i64::from(end), acc, i64::from(prev)]);
-                fold(eval_objective_expr(arena, body, &[i64::from(end), new_acc, i64::from(prev)]));
+                check_stop()?;
+                let new_acc = eval(step, &[i64::from(end), acc, i64::from(prev)])?;
+                fold(eval(body, &[i64::from(end), new_acc, i64::from(prev)])?);
             }
         }
         Iterable::Windows { size, inner, .. } => {
             let n = contents.len();
             if size > 0 && n >= size {
                 for start in 0..=(n - size) {
+                    check_stop()?;
                     let mut total = 0i64;
                     for &cur in &contents[start..start + size] {
-                        total = total.saturating_add(eval_objective_expr(arena, inner, &[i64::from(cur)]));
+                        check_stop()?;
+                        total = total.saturating_add(eval(inner, &[i64::from(cur)])?);
                     }
-                    fold(eval_objective_expr(arena, body, &[0, total]));
+                    fold(eval(body, &[0, total])?);
                 }
             }
         }
     }
 
+    check_stop()?;
     let value = match reduction.op {
         ReduceOp::Sum => Some(sum),
         ReduceOp::Count => Some(count),
         ReduceOp::Used => Some(i64::from(steps > 0)),
         ReduceOp::Min => (steps > 0).then_some(lo),
         ReduceOp::Max => (steps > 0).then_some(hi),
-        ReduceOp::SelectKth(k) => {
-            if k >= values.len() {
-                None
-            } else {
-                values.sort_unstable();
-                Some(values[k])
-            }
-        }
+        ReduceOp::SelectKth(k) => (usize::try_from(steps).unwrap_or(usize::MAX) > k)
+            .then(|| *smallest.peek().expect("a populated order-statistic heap has a root")),
     };
-    value.map(|value| value.saturating_mul(reduction.coeff))
+    check_stop()?;
+    Ok(value.map(|value| value.saturating_mul(reduction.coeff)))
 }
 
 pub(crate) fn eval_expr_checked(arena: &[Expr], id: ExprId, args: &[i64]) -> Option<i64> {
-    let rec = |child| eval_expr_checked(arena, child, args);
-    Some(match arena.get(id.0 as usize)? {
+    eval_expr_impl(arena, id, args, None).ok()
+}
+
+fn eval_expr_checked_interruptible(arena: &[Expr], id: ExprId, args: &[i64], stop: &AtomicBool) -> Result<Option<i64>, ()> {
+    match eval_expr_impl(arena, id, args, Some(stop)) {
+        Ok(value) => Ok(Some(value)),
+        Err(EvalError::Undefined) => Ok(None),
+        Err(EvalError::Interrupted) => Err(()),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EvalError {
+    Undefined,
+    Interrupted,
+}
+
+fn eval_expr_impl(arena: &[Expr], id: ExprId, args: &[i64], stop: Option<&AtomicBool>) -> Result<i64, EvalError> {
+    if stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
+        return Err(EvalError::Interrupted);
+    }
+    let rec = |child| eval_expr_impl(arena, child, args, stop);
+    Ok(match arena.get(id.0 as usize).ok_or(EvalError::Undefined)? {
         Expr::Const(c) => *c,
-        Expr::Arg(k) => *args.get(*k as usize)?,
-        Expr::Array(a, i) => *a.get(usize::try_from(rec(*i)?).ok()?)?,
-        Expr::Matrix(m, i, j) => *m.get(usize::try_from(rec(*i)?).ok()?)?.get(usize::try_from(rec(*j)?).ok()?)?,
+        Expr::Arg(k) => *args.get(*k as usize).ok_or(EvalError::Undefined)?,
+        Expr::Array(a, i) => *a.get(usize::try_from(rec(*i)?).map_err(|_| EvalError::Undefined)?).ok_or(EvalError::Undefined)?,
+        Expr::Matrix(m, i, j) => {
+            let row = usize::try_from(rec(*i)?).map_err(|_| EvalError::Undefined)?;
+            let column = usize::try_from(rec(*j)?).map_err(|_| EvalError::Undefined)?;
+            *m.get(row).and_then(|values| values.get(column)).ok_or(EvalError::Undefined)?
+        }
         Expr::Add(a, b) => rec(*a)?.saturating_add(rec(*b)?),
         Expr::Sub(a, b) => rec(*a)?.saturating_sub(rec(*b)?),
         Expr::Mul(a, b) => rec(*a)?.saturating_mul(rec(*b)?),
@@ -337,14 +405,23 @@ pub(crate) fn eval_expr_checked(arena: &[Expr], id: ExprId, args: &[i64]) -> Opt
         }
         Expr::PiecewiseLinear { input, points } => piecewise(rec(*input)?, points),
         Expr::External { name, args: external_args } => {
-            let values = external_args.iter().map(|id| rec(*id)).collect::<Option<Vec<_>>>()?;
-            external::call_external_function(name, &values).unwrap_or(0)
+            let values = external_args.iter().map(|id| rec(*id)).collect::<Result<Vec<_>, _>>()?;
+            match stop {
+                Some(stop) => {
+                    external::call_external_function_interruptible(name, &values, stop).map_err(|()| EvalError::Interrupted)?.unwrap_or(0)
+                }
+                None => external::call_external_function(name, &values).unwrap_or(0),
+            }
         }
     })
 }
 
 fn eval_objective_expr(arena: &[Expr], id: ExprId, args: &[i64]) -> i64 {
     eval_expr_checked(arena, id, args).unwrap_or(0)
+}
+
+fn eval_objective_expr_interruptible(arena: &[Expr], id: ExprId, args: &[i64], stop: &AtomicBool) -> Result<i64, ()> {
+    Ok(eval_expr_checked_interruptible(arena, id, args, stop)?.unwrap_or(0))
 }
 
 fn saturating_pow(mut base: i64, mut exponent: u32) -> i64 {
@@ -400,6 +477,7 @@ fn piecewise(input: i64, points: &[(i64, i64)]) -> i64 {
     points.last().map_or(first_y, |&(_, y)| y)
 }
 
+#[cfg(test)]
 fn list_item_values(reduction: &Reduction, items: &[i32]) -> Option<Vec<(i32, i64)>> {
     let mut values = Vec::with_capacity(items.len());
     for &item in items {

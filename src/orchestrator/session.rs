@@ -94,7 +94,7 @@ impl SemanticSolveSession {
         let done = AtomicBool::new(false);
         let result = std::thread::scope(|scope| {
             scope.spawn(|| {
-                while !done.load(Ordering::Acquire) && !budget.expired() {
+                while !done.load(Ordering::Acquire) {
                     if external_stop.load(Ordering::Acquire) {
                         budget.cancel_with(TerminationReason::ExternalCancellation);
                         break;
@@ -102,7 +102,15 @@ impl SemanticSolveSession {
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
             });
-            let result = self.solve_with_budget(request, &budget, sink);
+            let (mut result, final_evidence_published) = {
+                let mut monitored_sink = super::ExternalStopEventSink::new(external_stop, &budget, sink);
+                let result = self.solve_with_budget(request, &budget, &mut monitored_sink);
+                (result, monitored_sink.final_evidence_published())
+            };
+            if external_stop.load(Ordering::Acquire) && !final_evidence_published {
+                budget.cancel_with(TerminationReason::ExternalCancellation);
+                result = Err(SolveError::Interrupted("session external cancellation won finalization".to_string()));
+            }
             done.store(true, Ordering::Release);
             result
         });
@@ -445,8 +453,22 @@ fn replay_candidate(
     budget: &SolveBudget,
     candidate: &CandidateSolution,
 ) -> Result<CandidateSolution, SolveError> {
-    let objectives = super::verify_semantic_assignment_interruptible(model, candidate.assignment(), candidate.objectives(), budget.stop())?;
-    Ok(CandidateSolution::verified(candidate.assignment().clone(), objectives, candidate.source(), candidate.verification()))
+    if candidate.verification() == super::VerificationLevel::Final {
+        super::verify_final_with_budget(budget, |stop| replay_candidate_once(model, candidate, stop))
+    } else {
+        replay_candidate_once(model, candidate, budget.stop())
+    }
+}
+
+fn replay_candidate_once(
+    model: &crate::model::Model,
+    candidate: &CandidateSolution,
+    stop: &AtomicBool,
+) -> Result<CandidateSolution, SolveError> {
+    let objectives =
+        super::verify_semantic_assignment_validated_interruptible(model, candidate.assignment(), candidate.objectives(), stop)?;
+    let assignment = super::clone_assignment_interruptible(candidate.assignment(), stop)?;
+    Ok(CandidateSolution::verified(assignment, objectives, candidate.source(), candidate.verification()))
 }
 
 fn session_stopped_result(budget: &SolveBudget) -> SolveResult {

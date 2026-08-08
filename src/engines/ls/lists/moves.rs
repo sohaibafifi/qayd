@@ -733,6 +733,20 @@ fn candidate_cross_exchange(per: &PerList, state: &State, a: (usize, usize, usiz
     }
 }
 
+fn candidate_swap(per: &PerList, state: &State, a: usize, a_pos: usize, b: usize, b_pos: usize) -> bool {
+    let a_item = state.lists[a][a_pos];
+    let b_item = state.lists[b][b_pos];
+    match (route_before_after(per, state, a, a_pos, 1), route_before_after(per, state, b, b_pos, 1)) {
+        (Some((a_before, a_after)), Some((b_before, b_after))) => {
+            candidate_edge(per, a_before, b_item)
+                || candidate_edge(per, b_item, a_after)
+                || candidate_edge(per, b_before, a_item)
+                || candidate_edge(per, a_item, b_after)
+        }
+        _ => true,
+    }
+}
+
 /// First-improvement local move: return the first relocate / swap / or-opt /
 /// 2-opt* / cross-exchange / reversal that strictly lowers the score, or `None`
 /// at a local optimum (or when `stop` fires). The neighbourhood is scanned one
@@ -849,6 +863,15 @@ pub(super) fn best_improving_move(
                         return None;
                     }
                     let (vx, vy) = (state.lists[src][xp], state.lists[y][yp]);
+                    // A swap removes the two items from their current
+                    // neighbourhoods. Its promising edges are therefore the four
+                    // adjacencies it creates, not the edge between the swapped
+                    // items, which does not appear in the resulting routes.
+                    // Candidate pruning is disabled while infeasible so the full
+                    // membership neighbourhood remains available for load repair.
+                    if use_candidates && !candidate_swap(per, state, src, xp, y, yp) {
+                        continue;
+                    }
                     let left_edit = Edit::Replace { pos: xp, item: vy };
                     let right_edit = Edit::Replace { pos: yp, item: vx };
                     let na = trial_list_score(per, state, src, left_edit, &mut scratch_a);

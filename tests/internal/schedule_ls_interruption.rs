@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use qayd::engines::ls::lists::solve_schedule;
-use qayd::model::list::{IntervalVar, Mode, Resource, Schedule};
+use qayd::model::list::{verify_collection_solution, CollectionModel, CollectionSolution, IntervalVar, Mode, Resource, Schedule};
 
 fn assert_unknown(solution: &qayd::model::list::CollectionSolution) {
     assert!(!solution.feasible);
@@ -152,4 +152,42 @@ fn schedule_ls_keeps_a_complete_cumulative_incumbent_when_reporting_stops_search
     assert_eq!(solution.starts, vec![0, 0, 2, 2]);
     assert_eq!(solution.presences, vec![true; 4]);
     assert!(metrics.first_feasible.is_some());
+}
+
+#[test]
+fn cumulative_usage_above_i64_max_never_wraps_to_feasible() {
+    let schedule = Schedule {
+        intervals: (0..2).map(|_| IntervalVar { duration: 1, horizon: 2, modes: Vec::new(), optional: false }).collect(),
+        precedences: Vec::new(),
+        resources: vec![Resource::Cumulative { demands: vec![(0, i64::MAX), (1, i64::MAX)], capacity: i64::MAX }],
+        minimize_makespan: true,
+    };
+    let model = CollectionModel {
+        items: Vec::new(),
+        lists: 0,
+        objectives: Vec::new(),
+        constraints: Vec::new(),
+        globals: Vec::new(),
+        schedule: Some(schedule.clone()),
+    };
+    let overlapping = CollectionSolution {
+        lists: Vec::new(),
+        objectives: vec![1],
+        feasible: true,
+        starts: vec![0, 0],
+        presences: vec![true, true],
+        machines: vec![-1, -1],
+        modes: vec![None, None],
+        bound: None,
+    };
+
+    let error = verify_collection_solution(&model, &overlapping).expect_err("two maximum demands exceed one maximum capacity");
+    assert!(error.contains("18446744073709551614"), "canonical usage must be accumulated exactly: {error}");
+
+    let stop = AtomicBool::new(false);
+    let (solution, _) = solve_schedule(&schedule, 29, &stop, &mut |_| stop.store(true, Ordering::Release));
+    assert!(solution.feasible);
+    assert_eq!(solution.objectives, vec![2]);
+    assert_ne!(solution.starts[0], solution.starts[1]);
+    assert_eq!(verify_collection_solution(&model, &solution).unwrap(), vec![2]);
 }

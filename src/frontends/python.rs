@@ -884,6 +884,18 @@ impl PythonCollectionEventSink {
 
 impl EventSink for PythonCollectionEventSink {
     fn emit(&mut self, event: SolveEvent) -> Result<EventControl, SolveError> {
+        // Announce each resolved stage as it starts, so a multi-stage pipeline
+        // (e.g. warm-start LS -> exact) shows its phases live during the search
+        if let SolveEvent::StageStarted { engine, warm_start } = event {
+            if self.verbose {
+                if warm_start {
+                    println!("c warm-start {}", engine.name());
+                } else {
+                    println!("c {}", engine.name());
+                }
+            }
+            return Ok(EventControl::Continue);
+        }
         let SolveEvent::Progress { engine, objectives, elapsed } = event else {
             return Ok(EventControl::Continue);
         };
@@ -897,7 +909,10 @@ impl EventSink for PythonCollectionEventSink {
                 EngineKind::ListExact | EngineKind::ScheduleExact => {
                     println!("  o {objective}  ({})", self.primary_sense);
                 }
-                EngineKind::RoutingExact | EngineKind::ListLocalSearch | EngineKind::ScheduleLocalSearch => {
+                EngineKind::RoutingExact
+                | EngineKind::ListLocalSearch
+                | EngineKind::RoutingLocalSearch
+                | EngineKind::ScheduleLocalSearch => {
                     println!("  o {objective}  ({}, {:.2}s)", self.primary_sense, elapsed.as_secs_f64());
                 }
                 EngineKind::IntegerExact | EngineKind::IntegerLocalSearch | EngineKind::Linear | EngineKind::Verifier => {}
@@ -1041,7 +1056,7 @@ fn verbose_collection_finish(solution: &PySolution, run: &CollectionRun, profile
             println!("  nodes: {}", solution.stats.nodes);
             println!("  failures: {}", solution.stats.failures);
         }
-        EngineKind::ListLocalSearch | EngineKind::ScheduleLocalSearch => {
+        EngineKind::ListLocalSearch | EngineKind::RoutingLocalSearch | EngineKind::ScheduleLocalSearch => {
             println!("qayd result (collection)");
             println!("  status: {}", solution.status);
             if run.result.primal().is_some() {
@@ -1410,6 +1425,14 @@ struct PythonSolveEventSink {
     collection: PythonCollectionEventSink,
 }
 
+/// Engine an event is attributed to, when it carries one.
+fn engine_of(event: &SolveEvent) -> Option<EngineKind> {
+    match event {
+        SolveEvent::Progress { engine, .. } | SolveEvent::StageStarted { engine, .. } => Some(*engine),
+        _ => None,
+    }
+}
+
 impl PythonSolveEventSink {
     fn new(verbose: bool, callback: Option<Py<PyAny>>, primary_sense: &'static str) -> Self {
         Self { integer: PythonIntegerEventSink::new(verbose, callback), collection: PythonCollectionEventSink::new(primary_sense, verbose) }
@@ -1418,17 +1441,21 @@ impl PythonSolveEventSink {
 
 impl EventSink for PythonSolveEventSink {
     fn emit(&mut self, event: SolveEvent) -> Result<EventControl, SolveError> {
-        if matches!(
-            &event,
-            SolveEvent::Progress {
-                engine: EngineKind::RoutingExact
+        let collection_engine = matches!(
+            engine_of(&event),
+            Some(
+                EngineKind::RoutingExact
                     | EngineKind::ListExact
                     | EngineKind::ScheduleExact
                     | EngineKind::ListLocalSearch
-                    | EngineKind::ScheduleLocalSearch,
-                ..
-            }
-        ) {
+                    | EngineKind::RoutingLocalSearch
+                    | EngineKind::ScheduleLocalSearch
+            )
+        );
+        // Route both progress and stage-start markers of a collection engine to
+        // the collection sink; everything else (and engineless events) goes to
+        // the integer sink.
+        if collection_engine && matches!(&event, SolveEvent::Progress { .. } | SolveEvent::StageStarted { .. }) {
             self.collection.emit(event)
         } else {
             self.integer.emit(event)
@@ -2878,6 +2905,7 @@ impl PyModel {
                 | EngineKind::ListExact
                 | EngineKind::ScheduleExact
                 | EngineKind::ListLocalSearch
+                | EngineKind::RoutingLocalSearch
                 | EngineKind::ScheduleLocalSearch
         );
         if has_collection || collection_engine {
@@ -3419,7 +3447,8 @@ impl PyModel {
         let has_list_objective = self.semantic.primary_list_sense().is_some();
         let primary_minimizing = self.semantic.primary_list_sense().unwrap_or(true);
         let primary_sense = if primary_minimizing { "min" } else { "max" };
-        let local_search = matches!(run.engine, EngineKind::ListLocalSearch | EngineKind::ScheduleLocalSearch);
+        let local_search =
+            matches!(run.engine, EngineKind::ListLocalSearch | EngineKind::RoutingLocalSearch | EngineKind::ScheduleLocalSearch);
         let objectives = primal.map_or_else(Vec::new, |candidate| candidate.objectives().to_vec());
         let objective = objectives.first().copied();
         let objective_sense =
@@ -3472,8 +3501,10 @@ impl PyModel {
         let constructor_cost = expose_search_profile.then(|| parse_report_metadata(report, "constructor_cost")).flatten();
         let backend_build_seconds = parse_report_metadata(orchestration_report, "backend_build_seconds");
         let estimated_backend_bytes = parse_report_metadata(orchestration_report, "estimated_backend_bytes");
-        let records_first_feasible =
-            matches!(run.engine, EngineKind::ScheduleExact | EngineKind::ListLocalSearch | EngineKind::ScheduleLocalSearch);
+        let records_first_feasible = matches!(
+            run.engine,
+            EngineKind::ScheduleExact | EngineKind::ListLocalSearch | EngineKind::RoutingLocalSearch | EngineKind::ScheduleLocalSearch
+        );
         let time_to_first_feasible = (profile && records_first_feasible).then_some(run.events.first_feasible_at).flatten().or_else(|| {
             expose_search_profile
                 .then(|| parse_report_metadata::<f64>(report, "time_to_first_feasible"))

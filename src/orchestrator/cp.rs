@@ -561,29 +561,52 @@ fn candidate(
     stop: &std::sync::atomic::AtomicBool,
     verification: VerificationLevel,
 ) -> Result<CandidateSolution, SolveError> {
+    let (assignment, objectives) = decode_candidate(model, compiled, values, stop)?;
+    let objectives = verify_cp_assignment(model, &assignment, &objectives, stop)?;
+    Ok(CandidateSolution::verified(assignment, objectives, EngineKind::IntegerExact, verification))
+}
+
+fn decode_candidate(
+    model: &Model,
+    compiled: &CompiledCp,
+    values: &[i32],
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<(Assignment, Vec<i64>), SolveError> {
     let decoded = compiled.decode(values).map_err(SolveError::InvalidResult)?;
     let assignment = Assignment { integers: decoded.integers, sets: decoded.sets, lists: Vec::new(), intervals: Vec::new() };
     let objectives = model
         .objectives()
         .iter()
         .map(|objective| match objective {
-            crate::model::Objective::IntExpr { expr, .. } => expr
-                .evaluate(&|variable| assignment.integers.get(variable.0).copied().flatten())
-                .ok_or_else(|| SolveError::InvalidResult("integer objective is undefined or overflows".to_string())),
+            crate::model::Objective::IntExpr { expr, .. } => {
+                super::evaluate_int_expr_interruptible(expr, &|variable| assignment.integers.get(variable.0).copied().flatten(), stop)?
+                    .ok_or_else(|| SolveError::InvalidResult("integer objective is undefined or overflows".to_string()))
+            }
             crate::model::Objective::ListTerms { .. } | crate::model::Objective::Makespan { .. } => {
                 Err(SolveError::InvalidResult("CP candidate contains a non-integer objective".to_string()))
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if let Err(error) = super::verify_semantic_assignment_validated_interruptible(model, &assignment, &objectives, stop) {
-        let prefix = assignment.integers.iter().take(16).copied().collect::<Vec<_>>();
-        let reason = match error {
-            SolveError::InvalidResult(reason) => reason,
-            other => return Err(other),
-        };
-        return Err(SolveError::InvalidResult(format!("{reason}; CP assignment prefix {prefix:?}")));
+    Ok((assignment, objectives))
+}
+
+fn verify_cp_assignment(
+    model: &Model,
+    assignment: &Assignment,
+    objectives: &[i64],
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<i64>, SolveError> {
+    match super::verify_semantic_assignment_validated_interruptible(model, assignment, objectives, stop) {
+        Ok(objectives) => Ok(objectives),
+        Err(error) => {
+            let prefix = assignment.integers.iter().take(16).copied().collect::<Vec<_>>();
+            let reason = match error {
+                SolveError::InvalidResult(reason) => reason,
+                other => return Err(other),
+            };
+            Err(SolveError::InvalidResult(format!("{reason}; CP assignment prefix {prefix:?}")))
+        }
     }
-    Ok(CandidateSolution::verified(assignment, objectives, EngineKind::IntegerExact, verification))
 }
 
 pub(super) fn candidate_if_running(
@@ -593,7 +616,15 @@ pub(super) fn candidate_if_running(
     budget: &SolveBudget,
     verification: VerificationLevel,
 ) -> Result<Option<CandidateSolution>, SolveError> {
-    match candidate(model, compiled, values, budget.stop(), verification) {
+    let replay = if verification == VerificationLevel::Final {
+        // Decode, objective evaluation, and semantic replay all live inside
+        // the same interruptible finalization boundary. The first pass borrows
+        // the compiled state; only the work is repeated during deadline grace.
+        super::verify_final_with_budget(budget, |stop| candidate(model, compiled, values, stop, verification))
+    } else {
+        candidate(model, compiled, values, budget.stop(), verification)
+    };
+    match replay {
         Ok(candidate) => Ok(Some(candidate)),
         Err(SolveError::Interrupted(_)) if budget.expired() => Ok(None),
         Err(error) => Err(error),

@@ -20,6 +20,7 @@ pub enum EngineKind {
     ListExact,
     RoutingExact,
     ListLocalSearch,
+    RoutingLocalSearch,
     ScheduleExact,
     ScheduleLocalSearch,
     Linear,
@@ -55,6 +56,7 @@ impl EngineKind {
             Self::ListExact => "list-exact",
             Self::RoutingExact => "routing-exact",
             Self::ListLocalSearch => "list-ls",
+            Self::RoutingLocalSearch => "routing-ls",
             Self::ScheduleExact => "schedule-exact",
             Self::ScheduleLocalSearch => "schedule-ls",
             Self::Linear => "linear",
@@ -515,6 +517,14 @@ pub enum SolveEvent {
     Candidate(CandidateSolution),
     Bound(Bound),
     Proof(ProofClaim),
+    /// A concrete engine stage is about to run. Emitted before the stage so a
+    /// verbose consumer can announce the phase in real time (e.g. a warm-start
+    /// local search feeding an exact stage). `warm_start` is true when this stage
+    /// only seeds the stage after it.
+    StageStarted {
+        engine: EngineKind,
+        warm_start: bool,
+    },
     Progress {
         engine: EngineKind,
         objectives: Vec<i64>,

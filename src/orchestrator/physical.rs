@@ -106,7 +106,11 @@ fn execute_physical_exact(
         total_stats = stats;
         let primal = assignment
             .as_deref()
-            .map(|values| replay_candidate(&input, values, &active_assumptions, &[], VerificationLevel::Final))
+            .map(|values| {
+                super::verify_final_with_budget(budget, |stop| {
+                    replay_candidate(&input, values, &active_assumptions, &[], VerificationLevel::Final, stop)
+                })
+            })
             .transpose()?;
         let status = if primal.is_some() {
             SolveStatus::Satisfiable
@@ -164,14 +168,14 @@ fn execute_physical_exact(
                 let mut objectives = prior_values.clone();
                 objectives.push(value);
                 if request.publish_incumbent_assignments {
-                    match replay_candidate(&input, assignment, &active_assumptions, &objectives, VerificationLevel::Transfer)
+                    match replay_candidate(&input, assignment, &active_assumptions, &objectives, VerificationLevel::Transfer, budget.stop())
                         .and_then(|candidate| emit_intermediate(sink, budget, SolveEvent::Candidate(candidate)))
                     {
                         Ok(true) => {}
                         Ok(false) => return,
                         Err(error) => {
                             tier_error = Some(error);
-                            budget.cancel_with(TerminationReason::EventSink);
+                            budget.cancel_with(TerminationReason::Engine);
                         }
                     }
                 }
@@ -183,7 +187,10 @@ fn execute_physical_exact(
                     ) {
                         Ok(true) => {}
                         Ok(false) => {}
-                        Err(error) => tier_error = Some(error),
+                        Err(error) => {
+                            tier_error = Some(error);
+                            budget.cancel_with(TerminationReason::Engine);
+                        }
                     }
                 }
             },
@@ -218,7 +225,11 @@ fn execute_physical_exact(
 
     let primal = best_assignment
         .as_deref()
-        .map(|values| replay_candidate(&input, values, &active_assumptions, &objective_values, VerificationLevel::Final))
+        .map(|values| {
+            super::verify_final_with_budget(budget, |stop| {
+                replay_candidate(&input, values, &active_assumptions, &objective_values, VerificationLevel::Final, stop)
+            })
+        })
         .transpose()?;
     let exhausted_without_primal = primal.is_none() && objective_values.is_empty() && all_complete;
     let solved_all_tiers = primal.is_some() && all_complete && objective_values.len() == input.objectives.len();
@@ -321,7 +332,11 @@ fn replay_candidate(
     assumptions: &[Assumption],
     claimed_objectives: &[i64],
     verification: VerificationLevel,
+    stop: &std::sync::atomic::AtomicBool,
 ) -> Result<CandidateSolution, SolveError> {
+    if stop.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(SolveError::Interrupted("physical assignment replay was interrupted".to_string()));
+    }
     if values.len() != input.problem.search.len() {
         return Err(SolveError::InvalidResult(format!(
             "physical assignment has {} values, expected {}",
@@ -331,14 +346,25 @@ fn replay_candidate(
     }
     let mut solver = input.problem.solver.clone();
     solver.enqueue_all();
-    for (&variable, &value) in input.problem.search.iter().zip(values) {
+    for (index, (&variable, &value)) in input.problem.search.iter().zip(values).enumerate() {
+        if index & 0xff == 0 && stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(SolveError::Interrupted("physical assignment replay was interrupted".to_string()));
+        }
         solver
             .store
             .fix(variable, value)
             .map_err(|_| SolveError::InvalidResult("physical assignment violates a variable domain".to_string()))?;
     }
-    solver.propagate().map_err(|_| SolveError::InvalidResult("physical assignment violates a posted constraint".to_string()))?;
-    for assumption in assumptions {
+    solver
+        .propagate_until(|| stop.load(std::sync::atomic::Ordering::Acquire))
+        .map_err(|_| SolveError::InvalidResult("physical assignment violates a posted constraint".to_string()))?;
+    if stop.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(SolveError::Interrupted("physical assignment propagation was interrupted".to_string()));
+    }
+    for (index, assumption) in assumptions.iter().enumerate() {
+        if index & 0xff == 0 && stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(SolveError::Interrupted("physical assumption replay was interrupted".to_string()));
+        }
         let value = solver.store.value(assumption.var);
         if !assumption_holds(value, assumption) {
             return Err(SolveError::InvalidResult(format!(
@@ -347,14 +373,32 @@ fn replay_candidate(
             )));
         }
     }
-    let actual = input.objectives.iter().map(|objective| objective_value(&objective.objective, &solver)).collect::<Result<Vec<_>, _>>()?;
+    let mut actual = Vec::with_capacity(input.objectives.len());
+    for (index, objective) in input.objectives.iter().enumerate() {
+        if index & 0x3f == 0 && stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(SolveError::Interrupted("physical objective replay was interrupted".to_string()));
+        }
+        actual.push(objective_value(&objective.objective, &solver)?);
+    }
     if actual.get(..claimed_objectives.len()) != Some(claimed_objectives) {
         return Err(SolveError::InvalidResult(format!(
             "physical objective mismatch: engine reported {claimed_objectives:?}, replay produced {actual:?}"
         )));
     }
-    let by_variable = input.problem.search.iter().copied().zip(values.iter().copied()).collect::<std::collections::BTreeMap<_, _>>();
-    let integers = (0..input.visible_variables).map(|index| by_variable.get(&VarId(index as u32)).copied().map(i64::from)).collect();
+    let mut by_variable = std::collections::BTreeMap::new();
+    for (index, (&variable, &value)) in input.problem.search.iter().zip(values).enumerate() {
+        if index & 0xff == 0 && stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(SolveError::Interrupted("physical assignment projection was interrupted".to_string()));
+        }
+        by_variable.insert(variable, value);
+    }
+    let mut integers = Vec::with_capacity(input.visible_variables);
+    for index in 0..input.visible_variables {
+        if index & 0xff == 0 && stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(SolveError::Interrupted("physical assignment projection was interrupted".to_string()));
+        }
+        integers.push(by_variable.get(&VarId(index as u32)).copied().map(i64::from));
+    }
     Ok(CandidateSolution::verified(
         Assignment { integers, sets: Vec::new(), lists: Vec::new(), intervals: Vec::new() },
         actual,

@@ -212,7 +212,7 @@ impl EventSink for CompetitionSink {
                     self.publish_objective(objective)?;
                 }
             }
-            SolveEvent::Bound(_) | SolveEvent::Proof(_) | SolveEvent::Finished(_) => {}
+            SolveEvent::Bound(_) | SolveEvent::Proof(_) | SolveEvent::Finished(_) | SolveEvent::StageStarted { .. } => {}
         }
         Ok(EventControl::Continue)
     }

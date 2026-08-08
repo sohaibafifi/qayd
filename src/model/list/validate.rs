@@ -1,4 +1,4 @@
-use super::external::call_external_function;
+use super::external::{call_external_function, call_external_function_interruptible};
 use super::ir::{CollectionModel, Expr, ExprId, GlobalConstraint, Iterable, Reduction, Resource};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,21 +13,22 @@ fn check_stop(stop: Option<&AtomicBool>) -> Result<(), String> {
     }
 }
 
-fn eval_expr_checked(arena: &[Expr], id: ExprId, args: &[i64]) -> Result<i64, String> {
+fn eval_expr_checked(arena: &[Expr], id: ExprId, args: &[i64], stop: Option<&AtomicBool>) -> Result<i64, String> {
+    check_stop(stop)?;
     let node = arena.get(id.0 as usize).ok_or_else(|| format!("expr id {} out of arena range", id.0))?;
     Ok(match node {
         Expr::Const(c) => *c,
         Expr::Arg(k) => *args.get(*k as usize).ok_or_else(|| format!("lambda arg {k} is not bound by this iterable"))?,
         Expr::Array(a, i) => {
-            let idx = eval_expr_checked(arena, *i, args)?;
+            let idx = eval_expr_checked(arena, *i, args, stop)?;
             if idx < 0 || idx as usize >= a.len() {
                 return Err(format!("array index {idx} out of range 0..{}", a.len()));
             }
             a[idx as usize]
         }
         Expr::Matrix(m, i, j) => {
-            let ri = eval_expr_checked(arena, *i, args)?;
-            let ci = eval_expr_checked(arena, *j, args)?;
+            let ri = eval_expr_checked(arena, *i, args, stop)?;
+            let ci = eval_expr_checked(arena, *j, args, stop)?;
             if ri < 0 || ri as usize >= m.len() {
                 return Err(format!("matrix row index {ri} out of range 0..{}", m.len()));
             }
@@ -37,55 +38,58 @@ fn eval_expr_checked(arena: &[Expr], id: ExprId, args: &[i64]) -> Result<i64, St
             }
             row[ci as usize]
         }
-        Expr::Add(a, b) => eval_expr_checked(arena, *a, args)?
-            .checked_add(eval_expr_checked(arena, *b, args)?)
+        Expr::Add(a, b) => eval_expr_checked(arena, *a, args, stop)?
+            .checked_add(eval_expr_checked(arena, *b, args, stop)?)
             .ok_or_else(|| "integer overflow in a lambda body (+)".to_string())?,
-        Expr::Sub(a, b) => eval_expr_checked(arena, *a, args)?
-            .checked_sub(eval_expr_checked(arena, *b, args)?)
+        Expr::Sub(a, b) => eval_expr_checked(arena, *a, args, stop)?
+            .checked_sub(eval_expr_checked(arena, *b, args, stop)?)
             .ok_or_else(|| "integer overflow in a lambda body (-)".to_string())?,
-        Expr::Mul(a, b) => eval_expr_checked(arena, *a, args)?
-            .checked_mul(eval_expr_checked(arena, *b, args)?)
+        Expr::Mul(a, b) => eval_expr_checked(arena, *a, args, stop)?
+            .checked_mul(eval_expr_checked(arena, *b, args, stop)?)
             .ok_or_else(|| "integer overflow in a lambda body (*)".to_string())?,
-        Expr::Mod(a, b) => eval_expr_checked(arena, *a, args)?.checked_rem(eval_expr_checked(arena, *b, args)?).unwrap_or(0),
-        Expr::Pow(base, exponent) => eval_expr_checked(arena, *base, args)?
+        Expr::Mod(a, b) => eval_expr_checked(arena, *a, args, stop)?.checked_rem(eval_expr_checked(arena, *b, args, stop)?).unwrap_or(0),
+        Expr::Pow(base, exponent) => eval_expr_checked(arena, *base, args, stop)?
             .checked_pow(*exponent)
             .ok_or_else(|| "integer overflow in a lambda body (pow)".to_string())?,
         Expr::MulScaled(a, b, scale) => {
-            checked_scaled(eval_expr_checked(arena, *a, args)?, eval_expr_checked(arena, *b, args)?, *scale, false)?
+            checked_scaled(eval_expr_checked(arena, *a, args, stop)?, eval_expr_checked(arena, *b, args, stop)?, *scale, false)?
         }
         Expr::DivScaled(a, b, scale) => {
-            checked_scaled(eval_expr_checked(arena, *a, args)?, eval_expr_checked(arena, *b, args)?, *scale, true)?
+            checked_scaled(eval_expr_checked(arena, *a, args, stop)?, eval_expr_checked(arena, *b, args, stop)?, *scale, true)?
         }
-        Expr::Min(a, b) => eval_expr_checked(arena, *a, args)?.min(eval_expr_checked(arena, *b, args)?),
-        Expr::Max(a, b) => eval_expr_checked(arena, *a, args)?.max(eval_expr_checked(arena, *b, args)?),
+        Expr::Min(a, b) => eval_expr_checked(arena, *a, args, stop)?.min(eval_expr_checked(arena, *b, args, stop)?),
+        Expr::Max(a, b) => eval_expr_checked(arena, *a, args, stop)?.max(eval_expr_checked(arena, *b, args, stop)?),
         Expr::Div(a, b) => {
-            let num = eval_expr_checked(arena, *a, args)?;
-            let den = eval_expr_checked(arena, *b, args)?;
+            let num = eval_expr_checked(arena, *a, args, stop)?;
+            let den = eval_expr_checked(arena, *b, args, stop)?;
             if den == 0 {
                 0
             } else {
                 num.checked_div(den).ok_or_else(|| "integer overflow in a lambda body (/)".to_string())?
             }
         }
-        Expr::Abs(a) => eval_expr_checked(arena, *a, args)?.saturating_abs(),
-        Expr::Lt(a, b) => i64::from(eval_expr_checked(arena, *a, args)? < eval_expr_checked(arena, *b, args)?),
-        Expr::Le(a, b) => i64::from(eval_expr_checked(arena, *a, args)? <= eval_expr_checked(arena, *b, args)?),
-        Expr::Eq(a, b) => i64::from(eval_expr_checked(arena, *a, args)? == eval_expr_checked(arena, *b, args)?),
-        Expr::Ne(a, b) => i64::from(eval_expr_checked(arena, *a, args)? != eval_expr_checked(arena, *b, args)?),
+        Expr::Abs(a) => eval_expr_checked(arena, *a, args, stop)?.saturating_abs(),
+        Expr::Lt(a, b) => i64::from(eval_expr_checked(arena, *a, args, stop)? < eval_expr_checked(arena, *b, args, stop)?),
+        Expr::Le(a, b) => i64::from(eval_expr_checked(arena, *a, args, stop)? <= eval_expr_checked(arena, *b, args, stop)?),
+        Expr::Eq(a, b) => i64::from(eval_expr_checked(arena, *a, args, stop)? == eval_expr_checked(arena, *b, args, stop)?),
+        Expr::Ne(a, b) => i64::from(eval_expr_checked(arena, *a, args, stop)? != eval_expr_checked(arena, *b, args, stop)?),
         Expr::IfThenElse(c, a, b) => {
             // Lazy, matching solve semantics: evaluate only the selected branch,
             // so a guarded out-of-range index in the branch the condition never
             // picks is accepted here exactly as it is at solve time.
-            if eval_expr_checked(arena, *c, args)? != 0 {
-                eval_expr_checked(arena, *a, args)?
+            if eval_expr_checked(arena, *c, args, stop)? != 0 {
+                eval_expr_checked(arena, *a, args, stop)?
             } else {
-                eval_expr_checked(arena, *b, args)?
+                eval_expr_checked(arena, *b, args, stop)?
             }
         }
-        Expr::PiecewiseLinear { input, points } => checked_piecewise(eval_expr_checked(arena, *input, args)?, points)?,
+        Expr::PiecewiseLinear { input, points } => checked_piecewise(eval_expr_checked(arena, *input, args, stop)?, points)?,
         Expr::External { name, args: external_args } => {
-            let values = external_args.iter().map(|id| eval_expr_checked(arena, *id, args)).collect::<Result<Vec<_>, _>>()?;
-            call_external_function(name, &values)?
+            let values = external_args.iter().map(|id| eval_expr_checked(arena, *id, args, stop)).collect::<Result<Vec<_>, _>>()?;
+            match stop {
+                Some(stop) => call_external_function_interruptible(name, &values, stop).map_err(|()| VALIDATION_STOPPED.to_string())??,
+                None => call_external_function(name, &values)?,
+            }
         }
     })
 }
@@ -194,7 +198,7 @@ fn check_index(arena: &[Expr], idx: ExprId, domains: &[&[i64]], hi: usize, what:
     let varying: Vec<usize> = (0..domains.len()).filter(|&s| mask & (1u8 << s) != 0).collect();
     let mut args = vec![0i64; domains.len()];
     for_each_combo(domains, &varying, &mut args, 0, stop, &mut |a| {
-        let v = eval_expr_checked(arena, idx, a)?;
+        let v = eval_expr_checked(arena, idx, a, stop)?;
         if v < 0 || v as usize >= hi {
             return Err(format!("{what} index {v} out of range 0..{hi}"));
         }
@@ -325,7 +329,7 @@ fn validate_reduction(reduction: &Reduction, items: &[i32], lists: usize, stop: 
         let varying: Vec<usize> = (0..domains.len()).filter(|&s| mask & (1u8 << s) != 0).collect();
         let mut args = vec![0i64; domains.len()];
         for_each_combo(&domains, &varying, &mut args, 0, stop, &mut |a| {
-            eval_expr_checked(arena, reduction.body, a)?;
+            eval_expr_checked(arena, reduction.body, a, stop)?;
             Ok(())
         })?;
         return Ok(());
@@ -348,11 +352,11 @@ fn validate_reduction(reduction: &Reduction, items: &[i32], lists: usize, stop: 
                     let varying: Vec<usize> = (0..domains.len()).filter(|&s| mask & (1u8 << s) != 0).collect();
                     let mut args = vec![0i64; domains.len()];
                     for_each_combo(&domains, &varying, &mut args, 0, stop, &mut |a| {
-                        let r = eval_expr_checked(arena, *ri, a)?;
+                        let r = eval_expr_checked(arena, *ri, a, stop)?;
                         if r < 0 || r as usize >= m.len() {
                             return Err(format!("matrix row index {r} out of range 0..{}", m.len()));
                         }
-                        let c = eval_expr_checked(arena, *ci, a)?;
+                        let c = eval_expr_checked(arena, *ci, a, stop)?;
                         let row_len = m[r as usize].len();
                         if c < 0 || c as usize >= row_len {
                             return Err(format!("matrix column index {c} out of range 0..{row_len}"));
@@ -381,6 +385,7 @@ impl CollectionModel {
     /// reduction reads a real list, and every body only indexes its arrays and
     /// matrices within bounds for any placement of items. Returns a
     /// human-readable error otherwise, so the engine never reads a silent zero.
+    #[cfg(test)]
     pub fn validate(&self) -> Result<(), String> {
         self.validate_impl(None)
     }

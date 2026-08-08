@@ -93,7 +93,7 @@ impl EventSink for FlatZincEvents {
         match event {
             SolveEvent::Candidate(candidate) => self.publish_objective(candidate.objectives()),
             SolveEvent::Progress { objectives, .. } => self.publish_objective(&objectives),
-            SolveEvent::Bound(_) | SolveEvent::Proof(_) | SolveEvent::Finished(_) => {}
+            SolveEvent::Bound(_) | SolveEvent::Proof(_) | SolveEvent::Finished(_) | SolveEvent::StageStarted { .. } => {}
         }
         Ok(EventControl::Continue)
     }

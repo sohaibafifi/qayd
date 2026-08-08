@@ -6,8 +6,8 @@ use std::time::Instant;
 
 use crate::engines::sat::proof::{ProofFormat, ProofWriter};
 use crate::engines::sat::{
-    assignment_satisfies, solve_cnf_native_seeded_with_proof_options, solve_cnf_with_backend_seeded_options, Cnf, PreprocessOptions,
-    PreprocessStats, SatBackend, SatResult, Status,
+    solve_cnf_native_seeded_with_proof_options, solve_cnf_with_backend_seeded_options, Cnf, PreprocessOptions, PreprocessStats, SatBackend,
+    SatResult, Status,
 };
 use crate::model::{Constraint, IntDomain, Model};
 
@@ -192,20 +192,11 @@ fn finalize_sat_result(
         SatBackend::Native => EngineKind::IntegerExact,
         SatBackend::Linear => EngineKind::Linear,
     };
-    let complete = raw.status != Status::Unknown;
-    let candidate = match (raw.status, raw.assignment) {
+    let SatResult { status, assignment, stats, preprocess } = raw;
+    let complete = status != Status::Unknown;
+    let candidate = match (status, assignment) {
         (Status::Satisfiable, Some(assignment)) => {
-            if !assignment_satisfies(cnf, &assignment) {
-                return Err(SolveError::InvalidResult("SAT backend returned an invalid assignment".to_string()));
-            }
-            let assignment = Assignment {
-                integers: assignment.into_iter().map(|value| Some(i64::from(value))).collect(),
-                sets: Vec::new(),
-                lists: Vec::new(),
-                intervals: Vec::new(),
-            };
-            let objectives = super::verify_semantic_assignment_interruptible(model, &assignment, &[], budget.stop())?;
-            Some(CandidateSolution::verified(assignment, objectives, engine, VerificationLevel::Final))
+            Some(super::verify_final_with_budget(budget, |stop| verified_sat_candidate(model, cnf, &assignment, engine, stop))?)
         }
         (Status::Satisfiable, None) => {
             return Err(SolveError::InvalidResult("SAT backend omitted its satisfying assignment".to_string()));
@@ -215,7 +206,7 @@ fn finalize_sat_result(
             return Err(SolveError::InvalidResult("non-SAT backend result unexpectedly carries an assignment".to_string()));
         }
     };
-    let mut metadata = preprocessing_metadata(raw.preprocess);
+    let mut metadata = preprocessing_metadata(preprocess);
     metadata.push((
         "sat_backend".to_string(),
         match backend {
@@ -227,8 +218,49 @@ fn finalize_sat_result(
     if drat {
         metadata.push(("proof_format".to_string(), "drat".to_string()));
     }
-    let outcome = DecisionOutcome::exact(engine, candidate, complete, raw.stats, started.elapsed(), metadata)?;
+    let outcome = DecisionOutcome::exact(engine, candidate, complete, stats, started.elapsed(), metadata)?;
     finalize_decision_result(outcome, budget)
+}
+
+fn verified_sat_candidate(
+    model: &Model,
+    cnf: &Cnf,
+    values: &[bool],
+    engine: EngineKind,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<CandidateSolution, SolveError> {
+    if values.len() != cnf.vars {
+        return Err(SolveError::InvalidResult(format!("SAT backend returned {} values for {} variables", values.len(), cnf.vars)));
+    }
+    for (clause_index, clause) in cnf.clauses.iter().enumerate() {
+        if clause_index & 0x3f == 0 && stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(SolveError::Interrupted("SAT assignment replay was interrupted".to_string()));
+        }
+        let mut satisfied = false;
+        for (literal_index, &literal) in clause.iter().enumerate() {
+            if literal_index & 0xff == 0 && stop.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(SolveError::Interrupted("SAT assignment replay was interrupted".to_string()));
+            }
+            let value = values[literal.unsigned_abs() as usize - 1];
+            if if literal > 0 { value } else { !value } {
+                satisfied = true;
+                break;
+            }
+        }
+        if !satisfied {
+            return Err(SolveError::InvalidResult("SAT backend returned an invalid assignment".to_string()));
+        }
+    }
+    let mut integers = Vec::with_capacity(values.len());
+    for (index, &value) in values.iter().enumerate() {
+        if index & 0xff == 0 && stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(SolveError::Interrupted("SAT assignment decoding was interrupted".to_string()));
+        }
+        integers.push(Some(i64::from(value)));
+    }
+    let assignment = Assignment { integers, sets: Vec::new(), lists: Vec::new(), intervals: Vec::new() };
+    let objectives = super::verify_semantic_assignment_validated_interruptible(model, &assignment, &[], stop)?;
+    Ok(CandidateSolution::verified(assignment, objectives, engine, VerificationLevel::Final))
 }
 
 fn preprocessing_metadata(stats: PreprocessStats) -> Vec<(String, String)> {

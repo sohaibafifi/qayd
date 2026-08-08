@@ -267,7 +267,7 @@ fn earliest_resource_start(
                     sort_dedup_interruptible(&mut events, stop)?;
                     for event in events {
                         checkpoint(stop)?;
-                        let mut usage = demand;
+                        let mut usage = i128::from(demand);
                         let mut next_end: Option<i64> = None;
                         for &(other, other_demand) in demands {
                             checkpoint(stop)?;
@@ -277,12 +277,12 @@ fn earliest_resource_start(
                                 && starts[other] <= event
                                 && event < starts[other].saturating_add(durations[other])
                             {
-                                usage = usage.saturating_add(other_demand);
+                                usage += i128::from(other_demand);
                                 let other_end = starts[other].saturating_add(durations[other]);
                                 next_end = Some(next_end.map_or(other_end, |old| old.min(other_end)));
                             }
                         }
-                        if usage > *capacity {
+                        if usage > i128::from(*capacity) {
                             advance = Some(advance.map_or(next_end.unwrap_or(end), |old| old.max(next_end.unwrap_or(end))));
                             break;
                         }
@@ -543,22 +543,23 @@ fn cumulative_overload(
         times.push(starts[i].saturating_add(dur[i]));
     }
     sort_dedup_interruptible(&mut times, stop)?;
-    let mut total = 0i64;
+    let mut total = 0i128;
     for w in times.windows(2) {
         checkpoint(stop)?;
         let (t0, t1) = (w[0], w[1]);
-        let mut usage = 0i64;
+        let mut usage = 0i128;
         for &(i, demand) in demands {
             checkpoint(stop)?;
-            if present[i] && starts[i] <= t0 && t0 < starts[i] + dur[i] {
-                usage += demand;
+            if present[i] && starts[i] <= t0 && t0 < starts[i].saturating_add(dur[i]) {
+                usage += i128::from(demand);
             }
         }
-        let over = (usage - capacity).max(0);
-        total = total.saturating_add(over.saturating_mul(t1 - t0));
+        let over = (usage - i128::from(capacity)).max(0);
+        let width = i128::from(t1) - i128::from(t0);
+        total = total.saturating_add(over.saturating_mul(width)).min(i128::from(i64::MAX));
     }
     checkpoint(stop)?;
-    Ok(total)
+    Ok(i64::try_from(total).expect("non-negative cumulative overload is capped at i64::MAX"))
 }
 
 /// Earliest start of each interval respecting precedence only (a longest-path

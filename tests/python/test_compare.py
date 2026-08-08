@@ -17,13 +17,20 @@ def write_csv(tmp_path, name, rows):
 
 
 def n_contradictions(tmp_path, a_rows, b_rows):
-    a = write_csv(tmp_path, "a.csv", a_rows)
-    b = write_csv(tmp_path, "b.csv", b_rows)
-    out = subprocess.run(
-        [sys.executable, str(SCRIPT), a, b], capture_output=True, text=True, check=True
-    ).stdout
+    out = compare_output(tmp_path, a_rows, b_rows)
     line = next(l for l in out.splitlines() if "CONTRADICTIONS" in l)
     return int(line.rsplit(":", 1)[1])
+
+
+def compare_output(tmp_path, a_rows, b_rows, timeout=10):
+    a = write_csv(tmp_path, "a.csv", a_rows)
+    b = write_csv(tmp_path, "b.csv", b_rows)
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), a, b, "--timeout", str(timeout)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
 
 
 def row(inst, status, obj, d="min"):
@@ -56,3 +63,59 @@ def test_sat_better_max_direction(tmp_path):
 
 def test_sat_better_unknown_direction_not_flagged(tmp_path):
     assert n_contradictions(tmp_path, [row("x", "OPTIMUM", 10, "?")], [row("x", "SAT", 8, "?")]) == 0
+
+
+def test_decision_sat_counts_as_solved(tmp_path):
+    out = compare_output(
+        tmp_path,
+        [row("decision", "SAT", "", "?")],
+        [row("decision", "UNKNOWN", "", "?")],
+    )
+
+    assert "  qayd solved : 1" in out
+    assert "  baseline solved : 0" in out
+    assert "  PAR2 qayd : 1.0" in out
+
+
+def test_optimization_sat_is_only_an_incumbent_and_is_charged_unsolved(tmp_path):
+    out = compare_output(
+        tmp_path,
+        [row("cop", "SAT", 12, "min")],
+        [row("cop", "UNKNOWN", "", "min")],
+    )
+
+    assert "  qayd solved : 0" in out
+    assert "  qayd incumbent found : 1" in out
+    assert "  PAR2 qayd : 20.0" in out
+
+
+def test_optimum_and_unsat_count_as_solved(tmp_path):
+    out = compare_output(
+        tmp_path,
+        [row("optimal", "OPTIMUM", 7), row("infeasible", "UNSAT", "")],
+        [row("optimal", "UNKNOWN", ""), row("infeasible", "UNKNOWN", "")],
+    )
+
+    assert "  qayd solved : 2" in out
+    assert "  baseline solved : 0" in out
+    assert "  PAR2 qayd : 2.0" in out
+
+
+def test_minimization_incumbent_quality_prefers_the_lower_value(tmp_path):
+    out = compare_output(
+        tmp_path,
+        [row("min-cop", "SAT", 8, "min")],
+        [row("min-cop", "SAT", 10, "min")],
+    )
+
+    assert "objective quality (incumbent by both): same 0 | qayd better 1 | qayd worse 0" in out
+
+
+def test_maximization_incumbent_quality_prefers_the_higher_value(tmp_path):
+    out = compare_output(
+        tmp_path,
+        [row("max-cop", "SAT", 12, "max")],
+        [row("max-cop", "SAT", 10, "max")],
+    )
+
+    assert "objective quality (incumbent by both): same 0 | qayd better 1 | qayd worse 0" in out

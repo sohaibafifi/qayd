@@ -101,7 +101,7 @@ fn candidate_assignment(result: &qayd::orchestrator::SolveResult) -> Vec<bool> {
 }
 
 #[test]
-fn native_sat_is_verified_and_emits_candidate_then_finished() {
+fn native_sat_is_verified_and_emits_stage_candidate_then_finished() {
     let cnf = parse_dimacs("p cnf 3 3\n1 2 0\n-1 3 0\n-3 2 0\n").unwrap();
     let mut sink = RecordingSink::default();
 
@@ -115,7 +115,14 @@ fn native_sat_is_verified_and_emits_candidate_then_finished() {
     assert_eq!(candidate.verification(), VerificationLevel::Final);
     assert!(assignment_satisfies(&cnf, &candidate_assignment(&result)));
     assert!(result.proof().is_none());
-    assert!(matches!(sink.events.as_slice(), [SolveEvent::Candidate(_), SolveEvent::Finished(_)]));
+    assert!(matches!(
+        sink.events.as_slice(),
+        [
+            SolveEvent::StageStarted { engine: EngineKind::IntegerExact, warm_start: false },
+            SolveEvent::Candidate(_),
+            SolveEvent::Finished(_)
+        ]
+    ));
 }
 
 #[test]
@@ -151,7 +158,10 @@ fn native_unsat_gets_complete_search_proof_and_ordered_events() {
     let proof = result.proof().expect("UNSAT result has a proof");
     assert_eq!(proof.engine(), Some(EngineKind::IntegerExact));
     assert_eq!(proof.objective_tiers(), Some(0));
-    assert!(matches!(sink.events.as_slice(), [SolveEvent::Proof(_), SolveEvent::Finished(_)]));
+    assert!(matches!(
+        sink.events.as_slice(),
+        [SolveEvent::StageStarted { engine: EngineKind::IntegerExact, warm_start: false }, SolveEvent::Proof(_), SolveEvent::Finished(_)]
+    ));
 }
 
 #[test]
@@ -196,7 +206,11 @@ fn stopping_on_candidate_cancels_budget_and_suppresses_finished_event() {
 
     assert_eq!(result.status(), SolveStatus::Satisfiable);
     assert!(stop.load(Ordering::Acquire));
-    assert!(matches!(sink.events.as_slice(), [SolveEvent::Candidate(_)]));
+    assert!(matches!(
+        sink.events.as_slice(),
+        [SolveEvent::StageStarted { engine: EngineKind::IntegerExact, warm_start: false }, SolveEvent::Candidate(_)]
+    ));
+    assert!(matches!(sink.events.last(), Some(SolveEvent::Candidate(_))), "a consumer stop on a candidate must be terminal");
 }
 
 #[test]
@@ -211,6 +225,7 @@ fn linear_backend_is_finalized_by_the_same_contract() {
     assert_eq!(result.status(), SolveStatus::Satisfiable);
     assert_eq!(result.reports()[0].engine, Some(EngineKind::Linear));
     assert!(assignment_satisfies(&cnf, &candidate_assignment(&result)));
+    assert!(matches!(sink.events.first(), Some(SolveEvent::StageStarted { engine: EngineKind::Linear, warm_start: false })));
 }
 
 #[test]

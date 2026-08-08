@@ -137,7 +137,9 @@ fn estimated_engine_bytes(engine: &PreparedEngine) -> u64 {
 fn collection_node(plan: CollectionSolvePlan, threads: usize) -> PreparedNode {
     if let Some(warm_start) = plan.routing_warm_start_plan() {
         PreparedNode::Sequential(vec![PreparedEngine::Collection(Box::new(warm_start)), PreparedEngine::Collection(Box::new(plan))])
-    } else if threads > 1 && matches!(plan.engine(), EngineKind::ListLocalSearch | EngineKind::ScheduleLocalSearch) {
+    } else if threads > 1
+        && matches!(plan.engine(), EngineKind::ListLocalSearch | EngineKind::RoutingLocalSearch | EngineKind::ScheduleLocalSearch)
+    {
         PreparedNode::Portfolio { workers: threads, engine: Box::new(PreparedEngine::Collection(Box::new(plan))) }
     } else {
         PreparedNode::Single(Box::new(PreparedEngine::Collection(Box::new(plan))))
@@ -189,6 +191,19 @@ fn compile_model_plan_inner(
                 return Err(SolveError::Interrupted("solve budget expired during semantic decomposition".to_string()));
             }
             IndependentDecomposition::Components(components) => {
+                // Many tiny homogeneous components can spend their shared
+                // deadline in sequential setup while the corresponding
+                // monolithic backend finds a complete incumbent immediately.
+                // Prefer that route only after it has actually compiled. Mixed
+                // families and disjoint list universes have no monolithic
+                // representation and must retain their decomposed plan.
+                if should_try_monolithic_deadline_plan(&components, request) {
+                    if let Some(plan) =
+                        try_compile_monolithic_plan(model, request, budget, has_integer, has_collection, collection_families)?
+                    {
+                        return Ok(plan);
+                    }
+                }
                 validate_decomposition_coverage(&components, model)?;
                 validate_decomposition_limits(&components, request)?;
                 validate_decomposition_request_references(model, request)?;
@@ -249,6 +264,41 @@ fn compile_model_plan_inner(
             .and_then(|plan| prepared_plan(collection_node(plan, request.threads), request));
     }
     compile_cp_plan_validated(model, request, budget).and_then(|plan| prepared_plan(cp_node(plan, request.threads), request))
+}
+
+/// Above this size, try a compiled monolithic alternative under a deadline.
+/// This is only a plan preference. Failure to compile that alternative always
+/// preserves the complete decomposed representation.
+const MAX_DEADLINE_DECOMPOSITION_COMPONENTS: usize = 16;
+
+fn should_try_monolithic_deadline_plan(components: &[IndependentComponent], request: &SolveRequest) -> bool {
+    request.limits.time.is_some() && components.len() > MAX_DEADLINE_DECOMPOSITION_COMPONENTS
+}
+
+fn try_compile_monolithic_plan(
+    model: &Model,
+    request: &SolveRequest,
+    budget: &SolveBudget,
+    has_integer: bool,
+    has_collection: bool,
+    collection_families: usize,
+) -> Result<Option<PreparedSolvePlan>, SolveError> {
+    if (has_integer && has_collection) || collection_families > 1 {
+        return Ok(None);
+    }
+    let attempt = if has_collection {
+        compile_collection_plan(model, request, budget).and_then(|plan| prepared_plan(collection_node(plan, request.threads), request))
+    } else {
+        compile_cp_plan_validated(model, request, budget).and_then(|plan| prepared_plan(cp_node(plan, request.threads), request))
+    };
+    match attempt {
+        Ok(plan) => Ok(Some(plan)),
+        Err(error @ SolveError::Interrupted(_)) => Err(error),
+        // Compilation itself is the capability probe. Any semantic, physical,
+        // memory, or request incompatibility leaves the proven decomposition in
+        // place instead of changing a supported model into an error.
+        Err(_) => Ok(None),
+    }
 }
 
 fn validate_decomposition_coverage(components: &[IndependentComponent], model: &Model) -> Result<(), SolveError> {
@@ -518,9 +568,21 @@ pub(crate) fn execute_model_plan(
     }
     let decomposed = matches!(&plan.node, PreparedNode::Decomposed(_));
     let result = match &plan.node {
-        PreparedNode::Single(engine) => execute_engine(&package.model, engine, request, budget, None, sink)?,
+        PreparedNode::Single(engine) => {
+            if emit_stage_started(sink, budget, engine_kind(engine), false)? {
+                execute_engine(&package.model, engine, request, budget, None, sink)?
+            } else {
+                stopped_before_execution_result(budget)?
+            }
+        }
         PreparedNode::Sequential(stages) => execute_sequential(&package.model, stages, request, budget, sink)?,
-        PreparedNode::Portfolio { engine, .. } => execute_engine(&package.model, engine, request, budget, None, sink)?,
+        PreparedNode::Portfolio { engine, .. } => {
+            if emit_stage_started(sink, budget, engine_kind(engine), false)? {
+                execute_engine(&package.model, engine, request, budget, None, sink)?
+            } else {
+                stopped_before_execution_result(budget)?
+            }
+        }
         PreparedNode::Decomposed(components) => execute_decomposed(package, components, request, budget, sink)?,
     };
     if request.proof == ProofRequest::Require && result.proof.is_none() {
@@ -577,7 +639,12 @@ impl EventSink for ComponentEventSink<'_> {
                 self.target.emit(SolveEvent::Progress { engine, objectives, elapsed })
             }
             event @ SolveEvent::Finished(_) => self.target.emit(event),
-            SolveEvent::Candidate(_) | SolveEvent::Bound(_) | SolveEvent::Proof(_) => Ok(EventControl::Continue),
+            // A component's own stage markers are internal to the decomposition
+            // (and would surface one per component); the parent solve is a single
+            // logical run, so drop them here like the other component-local events.
+            SolveEvent::Candidate(_) | SolveEvent::Bound(_) | SolveEvent::Proof(_) | SolveEvent::StageStarted { .. } => {
+                Ok(EventControl::Continue)
+            }
         }
     }
 }
@@ -648,6 +715,9 @@ fn execute_sequential(
             return stopped_sequence_result(budget, prior_reports, last_verified_primal);
         }
         let last = index + 1 == stages.len();
+        if !emit_stage_started(sink, budget, engine_kind(stage), !last)? {
+            return stopped_sequence_result(budget, prior_reports, last_verified_primal);
+        }
         let mut result = match execute_engine(model, stage, request, budget, transferred.as_ref(), sink) {
             Ok(result) => result,
             Err(SolveError::Interrupted(_)) if last_verified_primal.is_some() => {
@@ -762,6 +832,29 @@ fn emit_transfer(sink: &mut dyn EventSink, budget: &SolveBudget, candidate: Cand
             Ok(())
         }
     }
+}
+
+fn emit_stage_started(sink: &mut dyn EventSink, budget: &SolveBudget, engine: EngineKind, warm_start: bool) -> Result<bool, SolveError> {
+    match sink.emit(SolveEvent::StageStarted { engine, warm_start })? {
+        EventControl::Continue => Ok(true),
+        EventControl::Stop => {
+            budget.cancel_with(TerminationReason::EventSink);
+            Ok(false)
+        }
+    }
+}
+
+fn stopped_before_execution_result(budget: &SolveBudget) -> Result<SolveResult, SolveError> {
+    let result = SolveResult {
+        status: SolveStatus::Unknown,
+        primal: None,
+        bounds: Vec::new(),
+        proof: None,
+        reports: Vec::new(),
+        message: Some(format!("solve stopped before engine execution: {:?}", budget.termination_reason())),
+    };
+    result.validate_contract()?;
+    Ok(result)
 }
 
 fn stopped_sequence_result(
@@ -926,7 +1019,9 @@ fn execute_decomposed(
                 value.ok_or_else(|| SolveError::InvalidResult(format!("semantic objective tier {tier} has no decomposition owner")))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let objectives = super::verify_semantic_assignment_interruptible(&package.model, &assignment, &objective_values, budget.stop())?;
+        let objectives = super::verify_final_with_budget(budget, |stop| {
+            super::verify_semantic_assignment_validated_interruptible(&package.model, &assignment, &objective_values, stop)
+        })?;
         let optimal = !objectives.is_empty() && all_objective_components_optimal;
         let proof = if optimal {
             Some(ProofClaim::decomposed(optimality_proofs, ProvenConclusion::Optimal, package.model.objectives().len())?)
@@ -1030,8 +1125,15 @@ pub fn solve_model_with_stop(
     stop: std::sync::Arc<AtomicBool>,
     sink: &mut dyn EventSink,
 ) -> Result<SolveResult, SolveError> {
-    let budget = SolveBudget::with_stop(request.limits.time, stop);
-    solve_model_with_budget(package, request, &budget, sink)
+    let (result, stopped) = solve_with_monitored_external_stop(package, request, stop.as_ref(), sink);
+    // Preserve the historical two-way shared flag contract without letting the
+    // deadline timer write into the external cancellation source while the
+    // solve is running. That separation is what lets a later hard stop override
+    // a soft deadline during final replay.
+    if stopped {
+        stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+    result
 }
 
 /// Canonical solve entry point for callers that expose a borrowed cancellation
@@ -1044,15 +1146,27 @@ pub fn solve_model_with_external_stop(
     external_stop: &AtomicBool,
     sink: &mut dyn EventSink,
 ) -> Result<SolveResult, SolveError> {
-    request.validate()?;
+    solve_with_monitored_external_stop(package, request, external_stop, sink).0
+}
+
+fn solve_with_monitored_external_stop(
+    package: &ModelPackage,
+    request: &SolveRequest,
+    external_stop: &AtomicBool,
+    sink: &mut dyn EventSink,
+) -> (Result<SolveResult, SolveError>, bool) {
+    let validation = request.validate();
+    if let Err(error) = validation {
+        return (Err(error), false);
+    }
     let budget = SolveBudget::new(request.limits.time);
     if external_stop.load(std::sync::atomic::Ordering::Acquire) {
         budget.cancel_with(TerminationReason::ExternalCancellation);
     }
     let monitor_done = AtomicBool::new(false);
-    std::thread::scope(|scope| {
+    let result = std::thread::scope(|scope| {
         scope.spawn(|| {
-            while !monitor_done.load(std::sync::atomic::Ordering::Acquire) && !budget.expired() {
+            while !monitor_done.load(std::sync::atomic::Ordering::Acquire) {
                 if external_stop.load(std::sync::atomic::Ordering::Acquire) {
                     budget.cancel_with(TerminationReason::ExternalCancellation);
                     break;
@@ -1060,10 +1174,24 @@ pub fn solve_model_with_external_stop(
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
         });
-        let result = solve_model_with_budget(package, request, &budget, sink);
+        let (mut result, final_evidence_published) = {
+            let mut monitored_sink = super::ExternalStopEventSink::new(external_stop, &budget, sink);
+            let result = solve_model_with_budget(package, request, &budget, &mut monitored_sink);
+            (result, monitored_sink.final_evidence_published())
+        };
+        // A stop before final evidence wins. Once a verified candidate or proof
+        // has synchronously reached the caller, completion is the linearization
+        // point and cannot be retroactively replaced by UNKNOWN.
+        if external_stop.load(std::sync::atomic::Ordering::Acquire) && !final_evidence_published {
+            budget.cancel_with(TerminationReason::ExternalCancellation);
+            result = Ok(stopped_result(&budget, "external cancellation during finalization"));
+        }
         monitor_done.store(true, std::sync::atomic::Ordering::Release);
         result
-    })
+    });
+    // Read shared state only after the scoped monitor has joined. Reading it in
+    // the scope body can miss the monitor's last cancellation poll.
+    (result, budget.expired())
 }
 
 /// Run a specialized frontend adapter under the same control-plane budget as

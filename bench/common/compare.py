@@ -17,7 +17,26 @@ Usage: python compare.py qayd.csv baseline.csv --timeout 10 \
 import argparse
 import csv
 
-SOLVED = {"SAT", "UNSAT", "OPTIMUM"}
+
+def is_solved(status, d):
+    """Did the solver fully settle this instance?
+
+    For a decision/CSP instance (no objective direction) SATISFIABLE is a full
+    answer. For an optimization (COP) instance it is NOT: SATISFIABLE means an
+    incumbent was found but optimality was not proved -- effectively a timeout on
+    the optimization question. Only OPTIMUM (proved optimal) or UNSAT (proved
+    infeasible) count as solved there.
+    """
+    if status in ("OPTIMUM", "UNSAT"):
+        return True
+    if status == "SAT":
+        return d == "?"
+    return False
+
+
+def found_incumbent(status):
+    """Feasible solution in hand (proved optimal or not)."""
+    return status in ("SAT", "OPTIMUM")
 
 
 def load(path):
@@ -37,7 +56,10 @@ def load(path):
 def par2(rows, timeout):
     s = 0.0
     for r in rows.values():
-        if r["status"] in SOLVED and not r["to"]:
+        # COP-aware: an unproved COP incumbent (SATISFIABLE) is charged as
+        # unsolved, so a solver that gives up early with an incumbent is not
+        # rewarded as if it had proved the optimum.
+        if is_solved(r["status"], r["dir"]) and not r["to"]:
             s += r["time"]
         else:
             s += 2 * timeout
@@ -76,9 +98,15 @@ def main():
         print(f"  !! --timeout {args.timeout} looks wrong: recorded times reach "
               f"{max_t:.0f}s — PAR2 is unreliable; pass the runs' actual timeout")
 
-    solved_a = sum(A[i]["status"] in SOLVED for i in common)
-    solved_b = sum(B[i]["status"] in SOLVED for i in common)
-    vbs = sum((A[i]["status"] in SOLVED) or (B[i]["status"] in SOLVED) for i in common)
+    def cdir(i):
+        return A[i]["dir"] if A[i]["dir"] != "?" else B[i]["dir"]
+
+    is_cop = any(cdir(i) in ("min", "max") for i in common)
+    solved_a = sum(is_solved(A[i]["status"], cdir(i)) for i in common)
+    solved_b = sum(is_solved(B[i]["status"], cdir(i)) for i in common)
+    vbs = sum(is_solved(A[i]["status"], cdir(i)) or is_solved(B[i]["status"], cdir(i)) for i in common)
+    incumbent_a = sum(found_incumbent(A[i]["status"]) for i in common)
+    incumbent_b = sum(found_incumbent(B[i]["status"]) for i in common)
 
     contradictions, obj_tie, a_better, a_worse = [], 0, 0, 0
     a_faster = b_faster = 0
@@ -99,7 +127,7 @@ def main():
             contradictions.append((i, f"OPTIMUM={oaj}", f"SAT={obj}"))
         elif d != "?" and sb == "OPTIMUM" and sa == "SAT" and better(oaj, obj, d) == 1:
             contradictions.append((i, f"SAT={oaj}", f"OPTIMUM={obj}"))
-        oa, ob = A[i]["status"] in SOLVED, B[i]["status"] in SOLVED
+        oa, ob = is_solved(sa, d), is_solved(sb, d)
         both += oa and ob
         only_a += oa and not ob
         only_b += ob and not oa
@@ -114,18 +142,28 @@ def main():
                 a_faster += 1
             elif B[i]["time"] < A[i]["time"]:
                 b_faster += 1
-            c = better(A[i]["obj"], B[i]["obj"], A[i]["dir"])
+        # Objective quality is compared wherever BOTH hold an incumbent -- for a
+        # COP that means SATISFIABLE or OPTIMUM, not just proved-by-both, else
+        # every unproved-but-improved/regressed incumbent is invisible. `d` is the
+        # instance's own min/max direction, so max and min are never mixed.
+        if found_incumbent(sa) and found_incumbent(sb):
+            c = better(A[i]["obj"], B[i]["obj"], d)
             if c == 1:
                 a_better += 1
             elif c == -1:
                 a_worse += 1
-                obj_regressions.append((i, A[i]["obj"], B[i]["obj"]))
+                obj_regressions.append((i, A[i]["obj"], B[i]["obj"], d))
             elif A[i]["obj"] is not None:
                 obj_tie += 1
 
     print(f"instances compared: {len(common)}")
+    if is_cop:
+        print("  (optimization instances present: 'solved' = proved optimum/infeasible; SATISFIABLE is an incumbent, not a solve)")
     print(f"  {na} solved : {solved_a}")
     print(f"  {nb} solved : {solved_b}")
+    if is_cop:
+        print(f"  {na} incumbent found : {incumbent_a}")
+        print(f"  {nb} incumbent found : {incumbent_b}")
     print(f"  VBS solved  : {vbs}   (either solver)")
     print(f"  solved by both        : {both}")
     print(f"  only {na}             : {only_a}")
@@ -135,7 +173,7 @@ def main():
     print(f"  PAR2 {nb} : {par2(B, args.timeout):.1f}")
     print(f"  speed (solved-by-both): {na} faster {a_faster} | {nb} faster {b_faster}")
     if obj_tie or a_better or a_worse:
-        print(f"  optimization objective: equal-optimum {obj_tie} | {na} better {a_better} | {na} worse {a_worse}")
+        print(f"  objective quality (incumbent by both): same {obj_tie} | {na} better {a_better} | {na} worse {a_worse}")
     print(f"  CONTRADICTIONS (soundness bug!) : {len(contradictions)}")
     for i, sa, sb in contradictions:
         print(f"    !! {i}: {na}={sa} {nb}={sb}")
@@ -161,9 +199,9 @@ def main():
             for dt, i, ta, tb in fast:
                 print(f"    {i}: {tb:.1f}s -> {ta:.1f}s  ({dt:.1f}s)")
         if obj_regressions:
-            print(f"  objective regressions for {na} (solved-by-both):")
-            for i, oa_v, ob_v in obj_regressions[:n]:
-                print(f"    {i}: {na}={oa_v} {nb}={ob_v}")
+            print(f"  objective regressions for {na} (incumbent by both):")
+            for i, oa_v, ob_v, dd in obj_regressions[:n]:
+                print(f"    {i} [{dd}]: {na}={oa_v} {nb}={ob_v}")
 
 
 if __name__ == "__main__":

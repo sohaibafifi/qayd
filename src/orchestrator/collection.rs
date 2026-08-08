@@ -29,8 +29,55 @@ enum CollectionBackend {
     ListExact(Box<list_exact::CompiledListExact>),
     ScheduleExact(Box<schedule::CompiledSchedule>),
     ListLocalSearch,
+    RoutingLocalSearch,
     ScheduleLocalSearch,
 }
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum FinalReplayAudit {
+    None,
+    SoftDeadline,
+    SoftDeadlineThenExternal,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FINAL_REPLAY_AUDIT: std::cell::Cell<FinalReplayAudit> = const { std::cell::Cell::new(FinalReplayAudit::None) };
+}
+
+#[cfg(test)]
+pub(crate) fn audit_interrupt_next_collection_final_replay(hard_cancel_after_interrupt: bool) {
+    FINAL_REPLAY_AUDIT.set(if hard_cancel_after_interrupt {
+        FinalReplayAudit::SoftDeadlineThenExternal
+    } else {
+        FinalReplayAudit::SoftDeadline
+    });
+}
+
+#[cfg(test)]
+fn apply_final_replay_audit_before_first_pass(budget: &SolveBudget) {
+    FINAL_REPLAY_AUDIT.with(|audit| {
+        if !matches!(audit.get(), FinalReplayAudit::None) {
+            budget.cancel_with(TerminationReason::Deadline);
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn apply_final_replay_audit_before_first_pass(_budget: &SolveBudget) {}
+
+#[cfg(test)]
+fn apply_final_replay_audit_after_interrupt(budget: &SolveBudget) {
+    FINAL_REPLAY_AUDIT.with(|audit| {
+        if matches!(audit.replace(FinalReplayAudit::None), FinalReplayAudit::SoftDeadlineThenExternal) {
+            budget.cancel_with(TerminationReason::ExternalCancellation);
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn apply_final_replay_audit_after_interrupt(_budget: &SolveBudget) {}
 
 impl CollectionBackend {
     fn engine(&self) -> EngineKind {
@@ -39,6 +86,7 @@ impl CollectionBackend {
             Self::ListExact(_) => EngineKind::ListExact,
             Self::ScheduleExact(_) => EngineKind::ScheduleExact,
             Self::ListLocalSearch => EngineKind::ListLocalSearch,
+            Self::RoutingLocalSearch => EngineKind::RoutingLocalSearch,
             Self::ScheduleLocalSearch => EngineKind::ScheduleLocalSearch,
         }
     }
@@ -98,7 +146,7 @@ impl CollectionSolvePlan {
     pub(crate) fn routing_warm_start_plan(&self) -> Option<Self> {
         self.has_routing_warm_start().then(|| Self {
             model: Arc::clone(&self.model),
-            backend: CollectionBackend::ListLocalSearch,
+            backend: CollectionBackend::RoutingLocalSearch,
             family: self.family,
             reason: "routing warm-start local search".to_string(),
             estimated_backend_bytes: model::estimated_local_search_backend_bytes(self.model.as_model()),
@@ -342,7 +390,10 @@ fn validate_selected_plan_options(plan: &CollectionSolvePlan, request: &SolveReq
     if request.schedule_cdcl && !matches!(plan.backend, CollectionBackend::ScheduleExact(_)) {
         return Err(SolveError::InvalidRequest("schedule_cdcl requires a selected exact scheduling backend".to_string()));
     }
-    if request.list_hint.is_some() && !matches!(plan.backend, CollectionBackend::ListLocalSearch) && !plan.has_routing_warm_start() {
+    if request.list_hint.is_some()
+        && !matches!(plan.backend, CollectionBackend::ListLocalSearch | CollectionBackend::RoutingLocalSearch)
+        && !plan.has_routing_warm_start()
+    {
         return Err(SolveError::InvalidRequest(
             "list_hint requires list local search or a routing exact plan with warm start enabled".to_string(),
         ));
@@ -465,6 +516,10 @@ fn ensure_compilation_running(stop: &AtomicBool, phase: &str) -> Result<(), Solv
 fn local_search_backend(model: &list::CollectionModel) -> CollectionBackend {
     if model.schedule.is_some() {
         CollectionBackend::ScheduleLocalSearch
+    } else if physical_family(model) == ModelFamily::Routing {
+        // Same list engine, but edge-cost objectives activate the routing
+        // construction and neighbourhoods; report it as routing local search.
+        CollectionBackend::RoutingLocalSearch
     } else {
         CollectionBackend::ListLocalSearch
     }
@@ -568,7 +623,7 @@ pub(crate) fn solve_collection_plan(
                     let structural_bound = dual_task.join().map_err(|_| SolveError::Engine("dual-bound worker panicked".to_string()))?;
                     Ok::<_, SolveError>((outcome, structural_bound))
                 })?;
-                result_from_routing(semantic, model, outcome, structural_bound, started.elapsed(), budget.stop())?
+                result_from_routing(semantic, model, outcome, structural_bound, started.elapsed(), budget)?
             }
             CollectionBackend::ListExact(compiled) => {
                 let structural_bound = dual::compute(model, engine_stop);
@@ -577,7 +632,7 @@ pub(crate) fn solve_collection_plan(
                         record_progress(sink, budget, &mut event_error, EngineKind::ListExact, value);
                     }
                 });
-                result_from_list_exact(semantic, model, outcome, structural_bound, started.elapsed(), budget.stop())?
+                result_from_list_exact(semantic, model, outcome, structural_bound, started.elapsed(), budget)?
             }
             CollectionBackend::ScheduleExact(compiled) => {
                 let structural_bound = dual::compute(model, engine_stop);
@@ -588,9 +643,11 @@ pub(crate) fn solve_collection_plan(
                     |value| record_progress(sink, budget, &mut event_error, EngineKind::ScheduleExact, value),
                 )
                 .map_err(SolveError::Engine)?;
-                result_from_schedule(semantic, model, outcome, structural_bound, started.elapsed(), budget.stop())?
+                result_from_schedule(semantic, model, outcome, structural_bound, started.elapsed(), budget)?
             }
-            CollectionBackend::ListLocalSearch => result_from_local_search(
+            // Routing local search is the same list engine specialised on edge
+            // costs; it only reports under a distinct kind so the phase is visible.
+            CollectionBackend::ListLocalSearch | CollectionBackend::RoutingLocalSearch => result_from_local_search(
                 ListLocalSearchRun {
                     semantic,
                     model,
@@ -599,7 +656,7 @@ pub(crate) fn solve_collection_plan(
                     engine_stop,
                     list_hint,
                     max_iterations: plan.local_search_iterations.or(request.limits.iterations).unwrap_or(u64::MAX),
-                    engine: EngineKind::ListLocalSearch,
+                    engine: plan.engine(),
                     started,
                 },
                 &mut |engine, value| record_progress(sink, budget, &mut event_error, engine, value),
@@ -637,7 +694,7 @@ fn result_from_routing(
     mut outcome: routing::RoutingIntegerOutcome,
     structural_bound: Option<dual::DualBound>,
     elapsed: Duration,
-    stop: &std::sync::atomic::AtomicBool,
+    budget: &SolveBudget,
 ) -> Result<SolveResult, SolveError> {
     let status = if outcome.solution.feasible {
         if outcome.complete {
@@ -671,7 +728,7 @@ fn result_from_routing(
                 metadata: Vec::new(),
             },
         },
-        stop,
+        budget,
     )
 }
 
@@ -681,7 +738,7 @@ fn result_from_list_exact(
     outcome: list_exact::Outcome,
     structural_bound: Option<dual::DualBound>,
     elapsed: Duration,
-    stop: &std::sync::atomic::AtomicBool,
+    budget: &SolveBudget,
 ) -> Result<SolveResult, SolveError> {
     let status = match outcome.status {
         list_exact::Status::Optimal => SolveStatus::Optimal,
@@ -721,7 +778,7 @@ fn result_from_list_exact(
                 metadata: Vec::new(),
             },
         },
-        stop,
+        budget,
     )
 }
 
@@ -731,7 +788,7 @@ fn result_from_schedule(
     outcome: schedule::Outcome,
     structural_bound: Option<dual::DualBound>,
     elapsed: Duration,
-    stop: &std::sync::atomic::AtomicBool,
+    budget: &SolveBudget,
 ) -> Result<SolveResult, SolveError> {
     let status = match outcome.status {
         schedule::Status::Optimal => SolveStatus::Optimal,
@@ -771,7 +828,7 @@ fn result_from_schedule(
                 metadata: Vec::new(),
             },
         },
-        stop,
+        budget,
     )
 }
 
@@ -860,7 +917,7 @@ fn result_from_local_search(run: ListLocalSearchRun<'_>, improvement: &mut impl 
                 metadata,
             },
         },
-        budget.stop(),
+        budget,
     )?;
     if request.limits.iterations.is_some_and(|limit| iterations >= limit) && !budget.expired() {
         result.message = Some("list local search reached the shared iteration limit".to_string());
@@ -959,7 +1016,7 @@ fn result_from_schedule_local_search(
                 metadata,
             },
         },
-        budget.stop(),
+        budget,
     )
 }
 
@@ -1035,11 +1092,20 @@ fn finish_collection_result(
     semantic: &Model,
     model: &list::CollectionModel,
     completion: CollectionCompletion,
-    stop: &std::sync::atomic::AtomicBool,
+    budget: &SolveBudget,
 ) -> Result<SolveResult, SolveError> {
     let CollectionCompletion { solution, status, source, proof, report } = completion;
-    let primal =
-        solution.feasible.then(|| verified_candidate(semantic, model, &solution, source, VerificationLevel::Final, stop)).transpose()?;
+    let primal = if solution.feasible {
+        #[cfg(test)]
+        list::audit_record_final_verification_boundary();
+        apply_final_replay_audit_before_first_pass(budget);
+        apply_final_replay_audit_after_interrupt(budget);
+        Some(super::verify_final_with_budget(budget, |stop| {
+            verified_candidate(semantic, model, &solution, source, VerificationLevel::Final, stop)
+        })?)
+    } else {
+        None
+    };
     let bounds =
         solution.bound.as_ref().map_or_else(Vec::new, |bound| vec![Bound { tier: 0, value: bound.dual, method: bound.method.clone() }]);
     Ok(SolveResult { status, primal, bounds, proof, reports: vec![report], message: None })
@@ -1053,36 +1119,38 @@ fn verified_candidate(
     verification: VerificationLevel,
     stop: &std::sync::atomic::AtomicBool,
 ) -> Result<CandidateSolution, SolveError> {
-    let objectives = list::verify_collection_solution_interruptible(model, solution, stop).map_err(|reason| {
-        if reason == list::VERIFICATION_INTERRUPTED {
-            SolveError::Interrupted(reason)
-        } else {
-            SolveError::InvalidResult(reason)
-        }
-    })?;
     let assignment = if model.schedule.is_some() {
-        Assignment {
-            integers: Vec::new(),
-            sets: Vec::new(),
-            lists: Vec::new(),
-            intervals: solution
-                .starts
-                .iter()
-                .zip(&solution.presences)
-                .zip(&solution.machines)
-                .zip(&solution.modes)
-                .map(|(((&start, &present), &machine), &mode)| IntervalValue {
-                    start: present.then_some(start),
-                    present,
-                    machine: usize::try_from(machine).ok(),
-                    mode,
-                })
-                .collect(),
+        let mut intervals = Vec::with_capacity(solution.starts.len());
+        for (index, (((&start, &present), &machine), &mode)) in
+            solution.starts.iter().zip(&solution.presences).zip(&solution.machines).zip(&solution.modes).enumerate()
+        {
+            if index & 0xff == 0 && stop.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(SolveError::Interrupted("schedule assignment decoding was interrupted".to_string()));
+            }
+            intervals.push(IntervalValue { start: present.then_some(start), present, machine: usize::try_from(machine).ok(), mode });
         }
+        Assignment { integers: Vec::new(), sets: Vec::new(), lists: Vec::new(), intervals }
     } else {
-        Assignment { integers: Vec::new(), sets: Vec::new(), lists: solution.lists.clone(), intervals: Vec::new() }
+        let mut lists = Vec::with_capacity(solution.lists.len());
+        for (list_index, source) in solution.lists.iter().enumerate() {
+            if list_index & 0x3f == 0 && stop.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(SolveError::Interrupted("list assignment decoding was interrupted".to_string()));
+            }
+            let mut list = Vec::with_capacity(source.len());
+            for (item_index, &item) in source.iter().enumerate() {
+                if item_index & 0xff == 0 && stop.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(SolveError::Interrupted("list assignment decoding was interrupted".to_string()));
+                }
+                list.push(item);
+            }
+            lists.push(list);
+        }
+        Assignment { integers: Vec::new(), sets: Vec::new(), lists, intervals: Vec::new() }
     };
-    let objectives = super::verify_semantic_assignment_interruptible(semantic, &assignment, &objectives, stop)?;
+    // The semantic replay recompiles and checks the collection representation,
+    // assignment, constraints, and objective vector. A separate physical replay
+    // here would perform the same O(n) to O(n²) work twice at the deadline.
+    let objectives = super::verify_semantic_assignment_validated_interruptible(semantic, &assignment, &solution.objectives, stop)?;
     Ok(CandidateSolution::verified(assignment, objectives, source, verification))
 }
 

@@ -1,11 +1,12 @@
-use std::sync::atomic::AtomicBool;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use qayd::model::list::{ExprArena, Iterable, ReduceOp, Reduction};
+use qayd::model::list::{register_external_function, ExprArena, Iterable, ReduceOp, Reduction};
 use qayd::model::{Constraint, Model, ModelPackage, Objective, Relation};
 use qayd::orchestrator::{
-    verify_semantic_assignment, verify_semantic_assignment_validated_interruptible, Assignment, EventCallback, EventControl, SolveError,
-    SolveEvent, SolveLimits, SolveMode, SolveRequest, SolveStatus,
+    audit_interrupt_next_collection_final_replay, verify_semantic_assignment, verify_semantic_assignment_validated_interruptible,
+    Assignment, EventCallback, EventControl, SolveError, SolveEvent, SolveLimits, SolveMode, SolveRequest, SolveStatus,
 };
 
 fn list_assignment_model(items: usize) -> ModelPackage {
@@ -80,6 +81,41 @@ fn cancellation_before_final_replay_cannot_publish_an_unverified_candidate() {
 }
 
 #[test]
+fn a_soft_deadline_during_final_replay_keeps_the_verified_incumbent() {
+    let package = list_assignment_model(16);
+    let request = SolveRequest {
+        mode: SolveMode::LocalSearch,
+        seed: 3,
+        limits: SolveLimits { iterations: Some(0), ..SolveLimits::default() },
+        ..SolveRequest::default()
+    };
+    audit_interrupt_next_collection_final_replay(false);
+
+    let result = qayd::solve(&package, &request, &mut qayd::orchestrator::IgnoreEvents).unwrap();
+
+    assert_eq!(result.status(), SolveStatus::Satisfiable);
+    assert!(result.primal().is_some());
+}
+
+#[test]
+fn a_hard_cancel_after_soft_deadline_prevents_final_publication() {
+    let package = list_assignment_model(16);
+    let request = SolveRequest {
+        mode: SolveMode::LocalSearch,
+        seed: 3,
+        limits: SolveLimits { iterations: Some(0), ..SolveLimits::default() },
+        ..SolveRequest::default()
+    };
+    audit_interrupt_next_collection_final_replay(true);
+
+    let result = qayd::solve(&package, &request, &mut qayd::orchestrator::IgnoreEvents).unwrap();
+
+    assert_eq!(result.status(), SolveStatus::Unknown);
+    assert!(result.primal().is_none());
+    assert!(result.message().is_some_and(|message| message.contains("ExternalCancellation")));
+}
+
+#[test]
 fn public_verification_boundary_still_validates_the_model() {
     let mut model = Model::new();
     model.int_set(vec![0, 0]);
@@ -103,4 +139,40 @@ fn validated_verification_still_replays_constraints_and_honors_interruption() {
 
     let interrupted = verify_semantic_assignment_validated_interruptible(&model, &assignment, &[], &AtomicBool::new(true)).unwrap_err();
     assert!(matches!(interrupted, SolveError::Interrupted(_)));
+}
+
+#[test]
+fn non_cooperative_external_expression_cannot_hold_canonical_replay() {
+    const NAME: &str = "phase10_5_blocking_canonical_replay";
+    register_external_function(NAME, |_| {
+        std::thread::sleep(Duration::from_millis(600));
+        Ok(1)
+    })
+    .unwrap();
+
+    let mut model = Model::new();
+    let list = model.list(vec![1]);
+    model.add_constraint(Constraint::ListPartition { lists: vec![list], items: vec![1] });
+    let mut arena = ExprArena::default();
+    let item = arena.arg(0);
+    let body = arena.external(NAME, vec![item]);
+    model.add_objective(Objective::ListTerms {
+        minimize: true,
+        terms: vec![Reduction { op: ReduceOp::Sum, iterable: Iterable::Items(list.0), arena, body, coeff: 1 }],
+        max_terms: None,
+    });
+    let assignment = Assignment { lists: vec![vec![1]], ..Assignment::default() };
+    let stop = Arc::new(AtomicBool::new(false));
+    let trigger = Arc::clone(&stop);
+    let stopper = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        trigger.store(true, Ordering::Release);
+    });
+    let started = Instant::now();
+
+    let result = verify_semantic_assignment_validated_interruptible(&model, &assignment, &[1], &stop);
+
+    stopper.join().unwrap();
+    assert!(matches!(result, Err(SolveError::Interrupted(_))));
+    assert!(started.elapsed() < Duration::from_millis(300), "external callback escaped the replay cancellation boundary");
 }

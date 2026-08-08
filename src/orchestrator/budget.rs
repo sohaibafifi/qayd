@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 const MIN_FINALIZATION_RESERVE: Duration = Duration::from_millis(10);
 const MAX_FINALIZATION_RESERVE: Duration = Duration::from_millis(250);
+const FINALIZATION_GRACE: Duration = Duration::from_millis(250);
 const SEARCH_STOP_POLL: Duration = Duration::from_millis(2);
 
 /// One wall-clock and cancellation budget shared by compilation, verification,
@@ -19,8 +20,13 @@ struct BudgetInner {
     started: Instant,
     limit: Option<Duration>,
     stop: Arc<AtomicBool>,
+    hard_stop: Arc<AtomicBool>,
     reason: Arc<AtomicU8>,
     timer: Arc<TimerSignal>,
+    /// Resident memory already owned by an embedding process when live memory
+    /// enforcement begins. The tracking allocator reports solver-live bytes
+    /// directly and therefore keeps a zero baseline.
+    memory_baseline: AtomicUsize,
     memory_limit: AtomicUsize,
     memory_monitor_started: AtomicBool,
 }
@@ -37,6 +43,11 @@ pub(crate) struct SearchStop {
 impl SearchStop {
     pub(crate) fn flag(&self) -> &AtomicBool {
         &self.stop
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flag_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop)
     }
 }
 
@@ -98,6 +109,7 @@ impl SolveBudget {
     pub fn with_stop(limit: Option<Duration>, stop: Arc<AtomicBool>) -> Self {
         let immediately_expired = limit == Some(Duration::ZERO);
         let initially_stopped = stop.load(Ordering::Acquire);
+        let hard_stop = Arc::new(AtomicBool::new(initially_stopped));
         let reason = Arc::new(AtomicU8::new(if immediately_expired {
             TerminationReason::Deadline as u8
         } else if initially_stopped {
@@ -118,8 +130,10 @@ impl SolveBudget {
                 started: Instant::now(),
                 limit,
                 stop,
+                hard_stop,
                 reason,
                 timer,
+                memory_baseline: AtomicUsize::new(0),
                 memory_limit: AtomicUsize::new(0),
                 memory_monitor_started: AtomicBool::new(false),
             }),
@@ -142,9 +156,14 @@ impl SolveBudget {
         if reason == TerminationReason::Running {
             return;
         }
-        let _ = self.inner.reason.compare_exchange(TerminationReason::Running as u8, reason as u8, Ordering::AcqRel, Ordering::Acquire);
+        if reason != TerminationReason::Deadline {
+            self.inner.hard_stop.store(true, Ordering::Release);
+        }
+        record_reason(&self.inner.reason, reason);
         self.inner.stop.store(true, Ordering::Release);
-        self.wake_timer();
+        if reason != TerminationReason::Deadline {
+            self.wake_timer();
+        }
     }
 
     pub fn expired(&self) -> bool {
@@ -166,6 +185,10 @@ impl SolveBudget {
         } else {
             reason
         }
+    }
+
+    pub(crate) fn hard_cancelled(&self) -> bool {
+        self.inner.hard_stop.load(Ordering::Acquire)
     }
 
     /// Derive an engine-search flag from this request budget. With a deadline,
@@ -225,15 +248,49 @@ impl SolveBudget {
         SearchStop { stop, done: Some(done), worker: Some(worker) }
     }
 
+    /// A short, cooperative grace token for one final canonical replay after a
+    /// soft wall-clock deadline. Hard cancellation remains live and takes
+    /// priority over `Deadline`; the grace itself is capped independently of the
+    /// requested search time.
+    pub(crate) fn finalization_grace_stop(&self) -> SearchStop {
+        let stop = Arc::new(AtomicBool::new(self.hard_cancelled()));
+        if stop.load(Ordering::Acquire) {
+            return SearchStop { stop, done: None, worker: None };
+        }
+        let hard_stop = Arc::clone(&self.inner.hard_stop);
+        let child = Arc::clone(&stop);
+        let done = Arc::new(TimerSignal::default());
+        let worker_done = Arc::clone(&done);
+        let worker = std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut finished = worker_done.stopped.lock().unwrap();
+            loop {
+                if *finished {
+                    return;
+                }
+                if hard_stop.load(Ordering::Acquire) || started.elapsed() >= FINALIZATION_GRACE {
+                    child.store(true, Ordering::Release);
+                    return;
+                }
+                let wait = SEARCH_STOP_POLL.min(FINALIZATION_GRACE.saturating_sub(started.elapsed()));
+                let (next, _) = worker_done.wake.wait_timeout(finished, wait).unwrap();
+                finished = next;
+            }
+        });
+        SearchStop { stop, done: Some(done), worker: Some(worker) }
+    }
+
     fn configure_memory_limit(&self, limit: Option<u64>) {
         let bytes = limit.map(|value| usize::try_from(value).unwrap_or(usize::MAX)).unwrap_or(0);
         let previous = self.inner.memory_limit.swap(bytes, Ordering::AcqRel);
         if previous == bytes {
             return;
         }
-        update_process_memory_limit(self.inner.id, bytes);
+        let baseline = if bytes > 0 && crate::mem::live() == 0 { crate::mem::monitored().unwrap_or(0) } else { 0 };
+        self.inner.memory_baseline.store(baseline, Ordering::Release);
+        update_process_memory_limit(self.inner.id, process_memory_limit(baseline, bytes));
         if bytes > 0 {
-            if crate::mem::monitored().is_some_and(|usage| crate::mem::classify(usage, bytes) == crate::mem::Pressure::Hard) {
+            if monitored_solve_bytes(&self.inner).is_some_and(|usage| crate::mem::classify(usage, bytes) == crate::mem::Pressure::Hard) {
                 self.cancel_with(TerminationReason::MemoryLimit);
                 return;
             }
@@ -288,6 +345,20 @@ fn spawn_deadline(duration: Duration, stop: Weak<AtomicBool>, reason: Weak<Atomi
     });
 }
 
+fn record_reason(reason: &AtomicU8, next: TerminationReason) {
+    loop {
+        let current = TerminationReason::from_u8(reason.load(Ordering::Acquire));
+        let replace =
+            current == TerminationReason::Running || (current == TerminationReason::Deadline && next != TerminationReason::Deadline);
+        if !replace {
+            return;
+        }
+        if reason.compare_exchange(current as u8, next as u8, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            return;
+        }
+    }
+}
+
 pub(crate) fn apply_memory_limit(limit: Option<u64>, budget: &SolveBudget) {
     budget.configure_memory_limit(limit);
 }
@@ -306,20 +377,16 @@ fn update_process_memory_limit(id: u64, bytes: usize) {
 fn spawn_memory_monitor(inner: Weak<BudgetInner>) {
     std::thread::spawn(move || loop {
         let Some(inner) = inner.upgrade() else { return };
-        if inner.stop.load(Ordering::Acquire) {
+        if inner.hard_stop.load(Ordering::Acquire) {
             return;
         }
         let limit = inner.memory_limit.load(Ordering::Acquire);
         if limit == 0 {
             return;
         }
-        if crate::mem::classify(crate::mem::monitored().unwrap_or(0), limit) == crate::mem::Pressure::Hard {
-            let _ = inner.reason.compare_exchange(
-                TerminationReason::Running as u8,
-                TerminationReason::MemoryLimit as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+        if crate::mem::classify(monitored_solve_bytes(&inner).unwrap_or(0), limit) == crate::mem::Pressure::Hard {
+            inner.hard_stop.store(true, Ordering::Release);
+            record_reason(&inner.reason, TerminationReason::MemoryLimit);
             inner.stop.store(true, Ordering::Release);
             inner.timer.wake.notify_all();
             return;
@@ -330,4 +397,20 @@ fn spawn_memory_monitor(inner: Weak<BudgetInner>) {
             return;
         }
     });
+}
+
+fn monitored_solve_bytes(inner: &BudgetInner) -> Option<usize> {
+    let baseline = inner.memory_baseline.load(Ordering::Acquire);
+    crate::mem::monitored().map(|usage| usage.saturating_sub(baseline))
+}
+
+/// Translate an incremental embedded-process allowance into the absolute
+/// threshold consumed by the process-wide allocator pressure hooks. The budget
+/// monitor itself still classifies the exact baseline-relative usage.
+fn process_memory_limit(baseline: usize, allowance: usize) -> usize {
+    if allowance == 0 || baseline == 0 {
+        return allowance;
+    }
+    let hard = baseline.saturating_add(allowance / 20 * 19);
+    usize::try_from((hard as u128).saturating_mul(20).div_ceil(19)).unwrap_or(usize::MAX)
 }

@@ -1,4 +1,4 @@
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -77,6 +77,31 @@ fn borrowed_external_stop_reaches_the_canonical_budget() {
     let result = solve_model_with_external_stop(&ModelPackage::new(model), &SolveRequest::default(), &stop, &mut IgnoreEvents).unwrap();
     assert_eq!(result.status(), SolveStatus::Unknown);
     assert!(result.message().is_some_and(|message| message.contains("ExternalCancellation")));
+}
+
+#[test]
+fn external_stop_after_final_candidate_keeps_result_and_stops_later_events() {
+    let mut model = Model::new();
+    model.int_range(0, 1);
+    let package = ModelPackage::new(model);
+    let stop = Arc::new(AtomicBool::new(false));
+    let callback_stop = Arc::clone(&stop);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    let mut sink = EventCallback(move |event| {
+        if matches!(event, SolveEvent::Candidate(_)) {
+            callback_stop.store(true, Ordering::Release);
+        }
+        captured.lock().unwrap().push(event);
+        Ok(EventControl::Continue)
+    });
+
+    let result = solve_model_with_stop(&package, &SolveRequest::default(), Arc::clone(&stop), &mut sink).unwrap();
+
+    assert!(stop.load(Ordering::Acquire));
+    assert_eq!(result.status(), SolveStatus::Satisfiable);
+    assert!(result.primal().is_some());
+    assert!(matches!(events.lock().unwrap().as_slice(), [SolveEvent::StageStarted { .. }, SolveEvent::Candidate(_)]));
 }
 
 #[test]
@@ -463,6 +488,27 @@ fn final_candidate_event_is_verified_before_publication() {
         .unwrap()
         .iter()
         .any(|event| { matches!(event, SolveEvent::Candidate(candidate) if candidate.verification() == VerificationLevel::Final) }));
+}
+
+#[test]
+fn stopping_on_stage_started_prevents_engine_execution() {
+    let mut model = Model::new();
+    model.int_range(0, 1);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    let mut sink = EventCallback(move |event| {
+        let stop = matches!(event, SolveEvent::StageStarted { .. });
+        captured.lock().unwrap().push(event);
+        Ok(if stop { EventControl::Stop } else { EventControl::Continue })
+    });
+
+    let result = solve_model(&ModelPackage::new(model), &SolveRequest::default(), &mut sink).unwrap();
+
+    assert_eq!(result.status(), SolveStatus::Unknown);
+    assert!(result.primal().is_none());
+    assert!(result.reports().is_empty());
+    assert!(result.message().is_some_and(|message| message.contains("EventSink")));
+    assert!(matches!(events.lock().unwrap().as_slice(), [SolveEvent::StageStarted { .. }]));
 }
 
 #[test]

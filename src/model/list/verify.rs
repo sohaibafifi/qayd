@@ -5,10 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) const VERIFICATION_INTERRUPTED: &str = "canonical verification was interrupted";
 
-use super::{
-    eval_reduction_on_lists, evaluate_list_objectives, list_objective_tiers, CollectionModel, CollectionSolution, GlobalConstraint, Op,
-    Resource,
-};
+use super::{eval_reduction_on_lists_interruptible, CollectionModel, CollectionSolution, GlobalConstraint, Op, Reduction, Resource};
 
 /// Replay a collection solution independently of a search engine and return its
 /// canonical lexicographic objective vector.
@@ -28,15 +25,20 @@ pub(crate) fn audit_verification_calls() -> u64 {
     VERIFICATION_CALLS.get()
 }
 
+#[cfg(test)]
+pub(crate) fn audit_record_final_verification_boundary() {
+    VERIFICATION_CALLS.set(VERIFICATION_CALLS.get().saturating_add(1));
+}
+
 pub(crate) fn verify_collection_solution_interruptible(
     model: &CollectionModel,
     solution: &CollectionSolution,
     stop: &AtomicBool,
 ) -> Result<Vec<i64>, String> {
-    #[cfg(test)]
-    VERIFICATION_CALLS.set(VERIFICATION_CALLS.get().saturating_add(1));
     check_stop(stop)?;
-    model.validate()?;
+    if !model.validate_interruptible(stop)? {
+        return Err(VERIFICATION_INTERRUPTED.to_string());
+    }
     check_stop(stop)?;
     let objectives = if let Some(schedule) = &model.schedule {
         verify_schedule(schedule, solution, stop)?
@@ -61,11 +63,16 @@ fn verify_lists(model: &CollectionModel, solution: &CollectionSolution, stop: &A
     if solution.lists.len() != model.lists {
         return Err(format!("solution has {} lists, expected {}", solution.lists.len(), model.lists));
     }
-    let universe = model.items.iter().copied().collect::<HashSet<_>>();
+    let mut universe = HashSet::with_capacity(model.items.len());
+    for &item in &model.items {
+        check_stop(stop)?;
+        universe.insert(item);
+    }
     let mut owner = HashMap::with_capacity(model.items.len());
     for (list_index, contents) in solution.lists.iter().enumerate() {
         check_stop(stop)?;
         for &item in contents {
+            check_stop(stop)?;
             if !universe.contains(&item) {
                 return Err(format!("solution contains item {item} outside the model universe"));
             }
@@ -75,13 +82,22 @@ fn verify_lists(model: &CollectionModel, solution: &CollectionSolution, stop: &A
         }
     }
     if owner.len() != model.items.len() {
-        let missing = model.items.iter().find(|item| !owner.contains_key(item)).copied().unwrap_or_default();
+        let mut missing = None;
+        for &item in &model.items {
+            check_stop(stop)?;
+            if !owner.contains_key(&item) {
+                missing = Some(item);
+                break;
+            }
+        }
+        let missing = missing.unwrap_or_default();
         return Err(format!("solution does not assign item {missing}"));
     }
 
     for constraint in &model.constraints {
         check_stop(stop)?;
-        let value = eval_reduction_on_lists(&constraint.reduction, &solution.lists)
+        let value = eval_reduction_on_lists_interruptible(&constraint.reduction, &solution.lists, stop)
+            .map_err(|()| VERIFICATION_INTERRUPTED.to_string())?
             .ok_or_else(|| "a collection constraint is undefined on the candidate".to_string())?;
         let satisfied = match constraint.op {
             Op::Le => value <= constraint.rhs,
@@ -98,12 +114,12 @@ fn verify_lists(model: &CollectionModel, solution: &CollectionSolution, stop: &A
     }
     for global in &model.globals {
         check_stop(stop)?;
-        verify_global(global, &owner)?;
+        verify_global(global, &owner, stop)?;
     }
 
-    let tiers = list_objective_tiers(&model.objectives, &model.items)
-        .ok_or_else(|| "collection objective cannot be evaluated canonically".to_string())?;
-    Ok(evaluate_list_objectives(&tiers, &solution.lists))
+    let objectives = verify_list_objectives(model, &solution.lists, stop)?;
+    check_stop(stop)?;
+    Ok(objectives)
 }
 
 fn op_name(op: Op) -> &'static str {
@@ -114,7 +130,7 @@ fn op_name(op: Op) -> &'static str {
     }
 }
 
-fn verify_global(global: &GlobalConstraint, owner: &HashMap<i32, usize>) -> Result<(), String> {
+fn verify_global(global: &GlobalConstraint, owner: &HashMap<i32, usize>, stop: &AtomicBool) -> Result<(), String> {
     let list = |item: i32| owner.get(&item).copied().ok_or_else(|| format!("global constraint references unassigned item {item}"));
     let satisfied = match global {
         GlobalConstraint::ListLe { before, after } => list(*before)? <= list(*after)?,
@@ -122,11 +138,27 @@ fn verify_global(global: &GlobalConstraint, owner: &HashMap<i32, usize>) -> Resu
         GlobalConstraint::DifferentList { a, b } => list(*a)? != list(*b)?,
         GlobalConstraint::AllSameList { items } => {
             let first = list(items[0])?;
-            items.iter().skip(1).all(|item| list(*item).is_ok_and(|value| value == first))
+            let mut same = true;
+            for &item in items.iter().skip(1) {
+                check_stop(stop)?;
+                if list(item)? != first {
+                    same = false;
+                    break;
+                }
+            }
+            same
         }
         GlobalConstraint::AllDifferentLists { items } => {
-            let values = items.iter().map(|item| list(*item)).collect::<Result<HashSet<_>, _>>()?;
-            values.len() == items.len()
+            let mut values = HashSet::with_capacity(items.len());
+            let mut different = true;
+            for &item in items.iter() {
+                check_stop(stop)?;
+                if !values.insert(list(item)?) {
+                    different = false;
+                    break;
+                }
+            }
+            different
         }
         GlobalConstraint::ListDistance { a, b, min, max } => {
             let distance = list(*a)?.abs_diff(list(*b)?);
@@ -138,6 +170,40 @@ fn verify_global(global: &GlobalConstraint, owner: &HashMap<i32, usize>) -> Resu
     } else {
         Err("cross-list global constraint is violated".to_string())
     }
+}
+
+fn verify_list_objectives(model: &CollectionModel, lists: &[Vec<i32>], stop: &AtomicBool) -> Result<Vec<i64>, String> {
+    let mut objectives = Vec::with_capacity(model.objectives.len());
+    for tier in &model.objectives {
+        check_stop(stop)?;
+        let mut value = verify_objective_terms(&tier.terms, lists, tier.minimize, stop)?;
+        if let Some(max_terms) = &tier.max_terms {
+            for term in max_terms {
+                check_stop(stop)?;
+                let mut component = None;
+                for group in &term.groups {
+                    let group = verify_objective_terms(group, lists, tier.minimize, stop)?;
+                    component = Some(component.map_or(group, |current: i64| current.max(group)));
+                }
+                value = value.saturating_add(component.unwrap_or(0).saturating_mul(term.coeff));
+            }
+        }
+        objectives.push(value);
+    }
+    Ok(objectives)
+}
+
+fn verify_objective_terms(terms: &[Reduction], lists: &[Vec<i32>], minimize: bool, stop: &AtomicBool) -> Result<i64, String> {
+    let undefined = if minimize { i64::MAX / 4 } else { i64::MIN / 4 };
+    let mut value = 0i64;
+    for term in terms {
+        check_stop(stop)?;
+        let term = eval_reduction_on_lists_interruptible(term, lists, stop)
+            .map_err(|()| VERIFICATION_INTERRUPTED.to_string())?
+            .unwrap_or(undefined);
+        value = value.saturating_add(term);
+    }
+    Ok(value)
 }
 
 fn verify_schedule(schedule: &super::Schedule, solution: &CollectionSolution, stop: &AtomicBool) -> Result<Vec<i64>, String> {
@@ -306,16 +372,17 @@ fn verify_cumulative(
     events.dedup();
     for &time in &events {
         check_stop(stop)?;
-        let usage = demands
-            .iter()
-            .filter(|&&(interval, _)| {
-                solution.presences[interval]
-                    && solution.starts[interval] <= time
-                    && time < solution.starts[interval].saturating_add(durations[interval])
-            })
-            .map(|&(_, demand)| demand)
-            .sum::<i64>();
-        if usage > capacity {
+        let mut usage = 0i128;
+        for &(interval, demand) in demands {
+            check_stop(stop)?;
+            if solution.presences[interval]
+                && solution.starts[interval] <= time
+                && time < solution.starts[interval].saturating_add(durations[interval])
+            {
+                usage += i128::from(demand);
+            }
+        }
+        if usage > i128::from(capacity) {
             return Err(format!("cumulative usage {usage} exceeds capacity {capacity} at time {time}"));
         }
     }

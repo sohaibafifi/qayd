@@ -179,6 +179,50 @@ fn disjoint_list_partitions_are_projected_solved_and_merged_in_tier_order() {
     ));
 }
 
+fn assert_deadline_preserves_decomposed_support(package: &ModelPackage, minimum_components: usize) {
+    let unlimited_request = SolveRequest { mode: SolveMode::Exact, ..SolveRequest::default() };
+    let timed_request = SolveRequest {
+        mode: SolveMode::Exact,
+        limits: SolveLimits { time: Some(Duration::from_secs(5)), ..SolveLimits::default() },
+        ..SolveRequest::default()
+    };
+    for request in [&unlimited_request, &timed_request] {
+        let plan = compile_model_plan(package, request, &SolveBudget::new(request.limits.time)).unwrap();
+        assert!(
+            matches!(plan.description(), ExecutablePlan::Decomposed { components, .. } if components.len() >= minimum_components),
+            "the request deadline changed a supported decomposed model into a monolithic or unsupported plan"
+        );
+    }
+
+    let unlimited = solve_model_silent(package, &unlimited_request).unwrap();
+    let timed = solve_model_silent(package, &timed_request).unwrap();
+    assert_eq!(timed.status(), unlimited.status());
+    assert_eq!(timed.primal().is_some(), unlimited.primal().is_some());
+}
+
+#[test]
+fn deadline_does_not_disable_large_mixed_family_decomposition() {
+    let mut model = Model::new();
+    for _ in 0..17 {
+        model.bool_var();
+    }
+    let list = model.list(vec![101, 102]);
+    model.add_constraint(Constraint::ListPartition { lists: vec![list], items: vec![101, 102] });
+
+    assert_deadline_preserves_decomposed_support(&ModelPackage::new(model), 18);
+}
+
+#[test]
+fn deadline_does_not_disable_disjoint_list_universe_decomposition() {
+    let mut model = Model::new();
+    for item in 1..=17 {
+        let list = model.list(vec![item]);
+        model.add_constraint(Constraint::ListPartition { lists: vec![list], items: vec![item] });
+    }
+
+    assert_deadline_preserves_decomposed_support(&ModelPackage::new(model), 17);
+}
+
 #[test]
 fn list_hint_is_projected_to_each_independent_partition() {
     let mut model = Model::new();
@@ -337,6 +381,26 @@ fn compact_integer_components_pass_an_aggregate_memory_preflight() {
     let plan = compile_model_plan(&ModelPackage::new(model), &request, &SolveBudget::new(None)).unwrap();
 
     assert!(matches!(plan.description(), ExecutablePlan::Decomposed { components, .. } if components.len() == 64));
+}
+
+#[test]
+fn deadline_prefers_a_monolithic_plan_only_after_that_plan_compiles() {
+    let mut model = Model::new();
+    for _ in 0..64 {
+        model.bool_var();
+    }
+    let package = ModelPackage::new(model);
+    let request = SolveRequest {
+        mode: SolveMode::Exact,
+        limits: SolveLimits { time: Some(Duration::from_secs(5)), ..SolveLimits::default() },
+        ..SolveRequest::default()
+    };
+
+    let plan = compile_model_plan(&package, &request, &SolveBudget::new(request.limits.time)).unwrap();
+    assert!(matches!(plan.description(), ExecutablePlan::Single(_)));
+    let result = solve_model_silent(&package, &request).unwrap();
+    assert_eq!(result.status(), SolveStatus::Satisfiable);
+    assert!(result.primal().is_some());
 }
 
 #[test]

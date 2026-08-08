@@ -1,5 +1,6 @@
 //! Finalization of exact decision-engine outcomes.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::search::SolveStats;
@@ -8,6 +9,46 @@ use super::{
     CandidateSolution, EngineKind, EngineReport, EventControl, EventSink, ProofClaim, ProvenConclusion, SolveBudget, SolveError,
     SolveEvent, SolveResult, SolveStatus, TerminationReason, VerificationLevel,
 };
+
+/// Synchronize a borrowed caller cancellation source with event publication.
+/// The asynchronous budget monitor remains responsible for search and replay;
+/// this adapter closes the sub-poll race around synchronous callbacks.
+pub(crate) struct ExternalStopEventSink<'a> {
+    external_stop: &'a AtomicBool,
+    budget: &'a SolveBudget,
+    target: &'a mut dyn EventSink,
+    final_evidence_published: bool,
+}
+
+impl<'a> ExternalStopEventSink<'a> {
+    pub(crate) fn new(external_stop: &'a AtomicBool, budget: &'a SolveBudget, target: &'a mut dyn EventSink) -> Self {
+        Self { external_stop, budget, target, final_evidence_published: false }
+    }
+
+    pub(crate) fn final_evidence_published(&self) -> bool {
+        self.final_evidence_published
+    }
+}
+
+impl EventSink for ExternalStopEventSink<'_> {
+    fn emit(&mut self, event: SolveEvent) -> Result<EventControl, SolveError> {
+        if self.external_stop.load(Ordering::Acquire) {
+            self.budget.cancel_with(TerminationReason::ExternalCancellation);
+            return Ok(EventControl::Stop);
+        }
+        let is_final_evidence = matches!(&event, SolveEvent::Candidate(candidate) if candidate.verification() == VerificationLevel::Final)
+            || matches!(&event, SolveEvent::Proof(_));
+        let control = self.target.emit(event);
+        if control.is_ok() && is_final_evidence {
+            self.final_evidence_published = true;
+        }
+        if self.external_stop.load(Ordering::Acquire) {
+            self.budget.cancel_with(TerminationReason::ExternalCancellation);
+            return control.map(|_| EventControl::Stop);
+        }
+        control
+    }
+}
 
 /// Raw outcome of an exact SAT/UNSAT decision engine.
 ///
@@ -94,7 +135,7 @@ pub(crate) fn finalize_decision_result(outcome: DecisionOutcome, budget: &SolveB
 /// Publish final result events in protocol order. A consumer stop is terminal
 /// for this sequence on every backend.
 pub(crate) fn publish_result_events(result: &SolveResult, budget: &SolveBudget, sink: &mut dyn EventSink) -> Result<(), SolveError> {
-    if budget.termination_reason() == TerminationReason::EventSink {
+    if budget.hard_cancelled() {
         return Ok(());
     }
     if let Some(candidate) = result.primal.clone() {
@@ -121,6 +162,9 @@ pub(crate) fn publish_result_events(result: &SolveResult, budget: &SolveBudget, 
 }
 
 fn emit(sink: &mut dyn EventSink, budget: &SolveBudget, event: SolveEvent) -> Result<bool, SolveError> {
+    if budget.hard_cancelled() {
+        return Ok(false);
+    }
     match sink.emit(event)? {
         EventControl::Continue => Ok(true),
         EventControl::Stop => {
