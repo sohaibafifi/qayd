@@ -5,16 +5,21 @@
 //! every assignment crossing the worker boundary is repaired on the CP root
 //! and replayed against the semantic model before publication.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::constraints::linear::Relation as PhysicalRelation;
-use crate::constraints::table::{Dfa, Mdd, MddArc};
+use crate::constraints::table::{Dfa, Mdd, MddArc, STAR};
 use crate::engines::ls::cop::{solve_ls_capped, LocalRhs, LocalSearchOutcome, LocalSearchSpec, LsConfig};
 use crate::expr::Expr;
 use crate::ids::VarId;
-use crate::model::{BoolLiteral, CompiledCp, Constraint, IntGlobalConstraint, Model, Relation, SetVarRef};
+use crate::model::{
+    BoolLiteral, CompiledCp, Constraint, IntDomain, IntExpr as SemanticIntExpr, IntGlobalConstraint, IntVarRef, Model,
+    Objective as SemanticObjective, Relation, SetVarRef,
+};
+use crate::problem::Objective as PhysicalObjective;
 
 use super::{
     execute_workers, CandidateSolution, EngineKind, EngineReport, EventControl, EventSink, SolveBudget, SolveError, SolveEvent,
@@ -24,6 +29,14 @@ use super::{
 #[derive(Clone)]
 pub(crate) struct IntegerLocalSearchPlan {
     spec: LocalSearchSpec,
+    guarded_warm_start: bool,
+}
+
+pub(crate) struct IntegerWarmStart {
+    pub(crate) candidate: CandidateSolution,
+    pub(crate) physical_solution: Vec<i32>,
+    pub(crate) physical_objective: i64,
+    pub(crate) report: EngineReport,
 }
 
 #[derive(Clone)]
@@ -33,6 +46,13 @@ struct Improvement {
 }
 
 const INTERNAL_REPLAY_INTERVAL: Duration = Duration::from_millis(25);
+const GUARDED_WARM_START_ITERATIONS: u64 = 160;
+
+struct RepairedCandidate {
+    candidate: CandidateSolution,
+    physical_solution: Vec<i32>,
+    physical_objective: Option<i64>,
+}
 
 struct RepairContext<'a> {
     model: &'a Model,
@@ -44,7 +64,17 @@ struct RepairContext<'a> {
 
 impl RepairContext<'_> {
     fn candidate(&self, values: &[i32], seed: u64, verification: VerificationLevel) -> Result<Option<CandidateSolution>, SolveError> {
-        repair_candidate(self, values, seed, verification)
+        Ok(repair_candidate(self, values, seed, verification)?.map(|repaired| repaired.candidate))
+    }
+}
+
+pub(crate) fn may_support_guarded_warm_start(model: &Model) -> bool {
+    semantic_guarded_warm_start(model)
+}
+
+impl IntegerLocalSearchPlan {
+    pub(crate) fn supports_guarded_warm_start(&self) -> bool {
+        self.guarded_warm_start
     }
 }
 
@@ -71,7 +101,479 @@ pub(crate) fn compile(model: &Model, compiled: &CompiledCp) -> Result<IntegerLoc
             spec.unsupported()
         )));
     }
-    Ok(IntegerLocalSearchPlan { spec })
+    let guarded_warm_start = semantic_guarded_warm_start(model) && spec.has_guarded_word_structure(compiled.problem());
+    Ok(IntegerLocalSearchPlan { spec, guarded_warm_start })
+}
+
+pub(crate) fn warm_start(
+    model: &Model,
+    compiled: &CompiledCp,
+    plan: &IntegerLocalSearchPlan,
+    request: &SolveRequest,
+    budget: &SolveBudget,
+    engine_stop: &AtomicBool,
+) -> Result<Option<IntegerWarmStart>, SolveError> {
+    if !plan.supports_guarded_warm_start() || budget.expired() {
+        return Ok(None);
+    }
+
+    let started = Instant::now();
+    let problem = compiled.problem().clone();
+    let outcome = solve_ls_capped(
+        problem,
+        plan.spec.clone(),
+        engine_stop,
+        request.seed,
+        LsConfig { gls: true, min_conflicts: true, kick_bandit: false },
+        GUARDED_WARM_START_ITERATIONS,
+        |_, _, _| {},
+    );
+    let LocalSearchOutcome { best, iterations, moves, restarts, constraints, functionals, unsupported } = outcome;
+    let Some((values, local_objective)) = best else {
+        return Ok(None);
+    };
+
+    let repair = RepairContext { model, compiled, spec: &plan.spec, request, budget };
+    let Some(repaired) = repair_candidate(&repair, &values, request.seed, VerificationLevel::Transfer)? else {
+        return Ok(None);
+    };
+    let physical_objective = repaired
+        .physical_objective
+        .ok_or_else(|| SolveError::InvalidResult("guarded integer warm start has no physical objective".to_string()))?;
+    if physical_objective != local_objective {
+        return Err(SolveError::InvalidResult(format!(
+            "integer warm start scored objective {local_objective}, physical replay produced {}",
+            physical_objective
+        )));
+    }
+    if repaired.candidate.objectives() != [physical_objective] {
+        return Err(SolveError::InvalidResult(format!(
+            "integer warm-start physical objective {} does not match canonical replay {:?}",
+            physical_objective,
+            repaired.candidate.objectives()
+        )));
+    }
+
+    Ok(Some(IntegerWarmStart {
+        candidate: repaired.candidate,
+        physical_solution: repaired.physical_solution,
+        physical_objective,
+        report: EngineReport {
+            engine: Some(EngineKind::IntegerLocalSearch),
+            search: crate::search::SolveStats {
+                solutions: 1,
+                nodes: iterations,
+                failures: restarts,
+                ..crate::search::SolveStats::default()
+            },
+            elapsed: started.elapsed(),
+            improvements: 1,
+            metadata: vec![
+                ("ls_role".to_string(), "guarded_warm_start".to_string()),
+                ("ls_moves".to_string(), moves.to_string()),
+                ("ls_constraints".to_string(), constraints.to_string()),
+                ("ls_functionals".to_string(), functionals.to_string()),
+                ("ls_unsupported".to_string(), unsupported.to_string()),
+            ],
+        },
+    }))
+}
+
+fn semantic_guarded_warm_start(model: &Model) -> bool {
+    let [SemanticObjective::IntExpr { minimize, expr: objective }] = model.objectives() else {
+        return false;
+    };
+    if semantic_direct_guarded_warm_start(model, objective, *minimize) {
+        return true;
+    }
+    if !model.constraints().iter().any(|constraint| {
+        matches!(
+            constraint,
+            Constraint::IntegerGlobal(IntGlobalConstraint::Table { positive: true, .. })
+                | Constraint::IntegerGlobal(IntGlobalConstraint::ElementConst { .. })
+        )
+    }) {
+        return false;
+    }
+
+    model.constraints().iter().any(|constraint| {
+        let Constraint::Intension(expression) = constraint else {
+            return false;
+        };
+        let Some((guard, counter)) = semantic_guarded_mismatch_bound(expression) else {
+            return false;
+        };
+        model.int_vars().get(guard.0).is_some_and(semantic_binary_domain)
+            && semantic_objective_rewards_guard(model, objective, *minimize, guard)
+            && semantic_counter_uses_common_element_array(model, counter)
+    })
+}
+
+fn semantic_direct_guarded_warm_start(model: &Model, objective: &SemanticIntExpr, minimizing: bool) -> bool {
+    let mut requirements: HashMap<IntVarRef, Vec<(IntVarRef, i32)>> = HashMap::new();
+    for constraint in model.constraints() {
+        let guarded_value = match constraint {
+            Constraint::Intension(expression) => semantic_direct_guarded_value(expression),
+            Constraint::IntegerGlobal(IntGlobalConstraint::Table { variables, tuples, positive: true }) => {
+                semantic_direct_guarded_table_value(variables, tuples)
+            }
+            _ => None,
+        };
+        if let Some((guard, target, value)) = guarded_value {
+            requirements.entry(guard).or_default().push((target, value));
+        }
+    }
+
+    requirements.into_iter().any(|(guard, mut values)| {
+        values.sort_unstable();
+        values.dedup();
+        let has_conflicting_value = values.windows(2).any(|pair| pair[0].0 == pair[1].0 && pair[0].1 != pair[1].1);
+        !values.is_empty()
+            && !has_conflicting_value
+            && values.iter().all(|&(target, _)| target != guard)
+            && model.int_vars().get(guard.0).is_some_and(semantic_binary_domain)
+            && semantic_objective_rewards_guard(model, objective, minimizing, guard)
+            && semantic_guarded_elements_have_positive_construction(model, &values)
+    })
+}
+
+fn semantic_binary_domain(domain: &IntDomain) -> bool {
+    match domain {
+        IntDomain::Bool | IntDomain::Range { lo: 0, hi: 1 } => true,
+        IntDomain::Set(values) => values.len() == 2 && values.contains(&0) && values.contains(&1),
+        IntDomain::Range { .. } => false,
+    }
+}
+
+fn semantic_direct_guarded_value(expression: &SemanticIntExpr) -> Option<(IntVarRef, IntVarRef, i32)> {
+    let SemanticIntExpr::Or(parts) = expression else {
+        return None;
+    };
+    let [left, right] = parts.as_slice() else {
+        return None;
+    };
+    semantic_direct_guarded_parts(left, right).or_else(|| semantic_direct_guarded_parts(right, left))
+}
+
+fn semantic_direct_guarded_parts(guard: &SemanticIntExpr, target: &SemanticIntExpr) -> Option<(IntVarRef, IntVarRef, i32)> {
+    let guard = semantic_zero_guard(guard)?;
+    let (target, value) = semantic_eq_variable_constant(target)?;
+    Some((guard, target, value))
+}
+
+fn semantic_eq_variable_constant(expression: &SemanticIntExpr) -> Option<(IntVarRef, i32)> {
+    let SemanticIntExpr::Eq(left, right) = expression else {
+        return None;
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (SemanticIntExpr::Variable(variable), SemanticIntExpr::Constant(value))
+        | (SemanticIntExpr::Constant(value), SemanticIntExpr::Variable(variable)) => Some((*variable, i32::try_from(*value).ok()?)),
+        _ => None,
+    }
+}
+
+fn semantic_direct_guarded_table_value(variables: &[IntVarRef], tuples: &[Vec<i32>]) -> Option<(IntVarRef, IntVarRef, i32)> {
+    let [guard, target] = variables else {
+        return None;
+    };
+    let mut inactive_free = false;
+    let mut active_value = None;
+    for tuple in tuples {
+        let [guard_value, target_value] = tuple.as_slice() else {
+            return None;
+        };
+        match (*guard_value, *target_value) {
+            (0, STAR) => inactive_free = true,
+            (1, value) if value != STAR && active_value.is_none_or(|active| active == value) => active_value = Some(value),
+            _ => return None,
+        }
+    }
+    inactive_free.then_some((*guard, *target, active_value?))
+}
+
+fn semantic_guarded_elements_have_positive_construction(model: &Model, requirements: &[(IntVarRef, i32)]) -> bool {
+    let first_target = requirements[0].0;
+    let mut candidate_arrays: Vec<&[IntVarRef]> = Vec::new();
+    for constraint in model.constraints() {
+        let Constraint::IntegerGlobal(IntGlobalConstraint::Element { array, value, .. }) = constraint else {
+            continue;
+        };
+        if *value == first_target && !candidate_arrays.contains(&array.as_slice()) {
+            candidate_arrays.push(array);
+        }
+    }
+
+    candidate_arrays.into_iter().any(|array| {
+        let mut indexes = Vec::with_capacity(requirements.len());
+        for &(target, _) in requirements {
+            let mut matching_indexes = model
+                .constraints()
+                .iter()
+                .filter_map(|constraint| {
+                    let Constraint::IntegerGlobal(IntGlobalConstraint::Element { array: candidate_array, index, value }) = constraint
+                    else {
+                        return None;
+                    };
+                    (*value == target && candidate_array.as_slice() == array).then_some(*index)
+                })
+                .collect::<Vec<_>>();
+            matching_indexes.sort_unstable();
+            matching_indexes.dedup();
+            let [index] = matching_indexes.as_slice() else {
+                return false;
+            };
+            indexes.push(*index);
+        }
+        let distinct_indexes = indexes.iter().copied().collect::<HashSet<_>>();
+        distinct_indexes.len() == indexes.len() && semantic_positive_tables_connect_indexes(model, &indexes)
+    })
+}
+
+fn semantic_positive_tables_connect_indexes(model: &Model, indexes: &[IntVarRef]) -> bool {
+    if indexes.is_empty() {
+        return false;
+    }
+    let positions = indexes.iter().enumerate().map(|(position, &index)| (index, position)).collect::<HashMap<_, _>>();
+    let mut adjacency = vec![Vec::new(); indexes.len()];
+    let mut covered = vec![false; indexes.len()];
+    for constraint in model.constraints() {
+        let Constraint::IntegerGlobal(IntGlobalConstraint::Table { variables, tuples, positive: true }) = constraint else {
+            continue;
+        };
+        if tuples.is_empty() {
+            continue;
+        }
+        let mut table_positions = variables
+            .iter()
+            .enumerate()
+            .filter_map(|(column, variable)| {
+                positions
+                    .get(variable)
+                    .copied()
+                    .filter(|_| tuples.iter().any(|tuple| tuple.get(column).is_some_and(|&value| value != STAR)))
+            })
+            .collect::<Vec<_>>();
+        table_positions.sort_unstable();
+        table_positions.dedup();
+        for &position in &table_positions {
+            covered[position] = true;
+        }
+        for &left in &table_positions {
+            for &right in &table_positions {
+                if left != right {
+                    adjacency[left].push(right);
+                }
+            }
+        }
+    }
+    if !covered.iter().all(|&value| value) {
+        return false;
+    }
+
+    let mut reached = vec![false; indexes.len()];
+    let mut pending = vec![0usize];
+    reached[0] = true;
+    while let Some(position) = pending.pop() {
+        for &next in &adjacency[position] {
+            if !reached[next] {
+                reached[next] = true;
+                pending.push(next);
+            }
+        }
+    }
+    reached.iter().all(|&value| value)
+}
+
+fn semantic_guarded_mismatch_bound(expression: &SemanticIntExpr) -> Option<(IntVarRef, IntVarRef)> {
+    let SemanticIntExpr::Or(parts) = expression else {
+        return None;
+    };
+    let [left, right] = parts.as_slice() else {
+        return None;
+    };
+    semantic_zero_guard(left)
+        .zip(semantic_nonnegative_bound(right))
+        .or_else(|| semantic_zero_guard(right).zip(semantic_nonnegative_bound(left)))
+}
+
+fn semantic_zero_guard(expression: &SemanticIntExpr) -> Option<IntVarRef> {
+    let SemanticIntExpr::Eq(left, right) = expression else {
+        return None;
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (SemanticIntExpr::Variable(variable), SemanticIntExpr::Constant(0))
+        | (SemanticIntExpr::Constant(0), SemanticIntExpr::Variable(variable)) => Some(*variable),
+        _ => None,
+    }
+}
+
+fn semantic_nonnegative_bound(expression: &SemanticIntExpr) -> Option<IntVarRef> {
+    let SemanticIntExpr::Le(left, right) = expression else {
+        return None;
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (SemanticIntExpr::Variable(variable), SemanticIntExpr::Constant(value)) if *value >= 0 => Some(*variable),
+        _ => None,
+    }
+}
+
+fn semantic_objective_rewards_guard(model: &Model, objective: &SemanticIntExpr, minimizing: bool, guard: IntVarRef) -> bool {
+    let direct = semantic_affine_coefficient(objective, guard).filter(|&coefficient| coefficient != 0);
+    let coefficient = direct.or_else(|| {
+        let SemanticIntExpr::Variable(objective_variable) = objective else {
+            return None;
+        };
+        semantic_materialized_objective_coefficient(model, *objective_variable, guard)
+    });
+    coefficient.is_some_and(|coefficient| if minimizing { coefficient < 0 } else { coefficient > 0 })
+}
+
+fn semantic_materialized_objective_coefficient(model: &Model, objective: IntVarRef, guard: IntVarRef) -> Option<i128> {
+    let mut candidates = model.constraints().iter().filter_map(|constraint| {
+        let Constraint::Linear { terms, relation: Relation::Eq, .. } = constraint else {
+            return None;
+        };
+        let mut objective_coefficient = 0i128;
+        let mut guard_coefficient = 0i128;
+        for &(coefficient, variable) in terms {
+            if variable == objective {
+                objective_coefficient = objective_coefficient.checked_add(i128::from(coefficient))?;
+            }
+            if variable == guard {
+                guard_coefficient = guard_coefficient.checked_add(i128::from(coefficient))?;
+            }
+        }
+        (objective_coefficient.abs() == 1 && guard_coefficient != 0).then(|| -guard_coefficient / objective_coefficient)
+    });
+    let coefficient = candidates.next()?;
+    candidates.all(|candidate| candidate == coefficient).then_some(coefficient)
+}
+
+fn semantic_affine_coefficient(expression: &SemanticIntExpr, target: IntVarRef) -> Option<i128> {
+    match expression {
+        SemanticIntExpr::Constant(_) => Some(0),
+        SemanticIntExpr::Variable(variable) => Some(i128::from(*variable == target)),
+        SemanticIntExpr::Neg(value) => semantic_affine_coefficient(value, target)?.checked_neg(),
+        SemanticIntExpr::Add(values) => {
+            values.iter().try_fold(0i128, |sum, value| sum.checked_add(semantic_affine_coefficient(value, target)?))
+        }
+        SemanticIntExpr::Sub(left, right) => {
+            semantic_affine_coefficient(left, target)?.checked_sub(semantic_affine_coefficient(right, target)?)
+        }
+        SemanticIntExpr::Mul(values) => {
+            let mut scale = 1i128;
+            let mut nonconstant = None;
+            for value in values {
+                if let Some(constant) = semantic_constant_value(value) {
+                    scale = scale.checked_mul(constant)?;
+                } else if nonconstant.replace(value).is_some() {
+                    return None;
+                }
+            }
+            nonconstant.map_or(Some(0), |value| semantic_affine_coefficient(value, target)?.checked_mul(scale))
+        }
+        _ => None,
+    }
+}
+
+fn semantic_constant_value(expression: &SemanticIntExpr) -> Option<i128> {
+    match expression {
+        SemanticIntExpr::Constant(value) => Some(i128::from(*value)),
+        SemanticIntExpr::Neg(value) => semantic_constant_value(value)?.checked_neg(),
+        SemanticIntExpr::Add(values) => values.iter().try_fold(0i128, |sum, value| sum.checked_add(semantic_constant_value(value)?)),
+        SemanticIntExpr::Sub(left, right) => semantic_constant_value(left)?.checked_sub(semantic_constant_value(right)?),
+        SemanticIntExpr::Mul(values) => {
+            values.iter().try_fold(1i128, |product, value| product.checked_mul(semantic_constant_value(value)?))
+        }
+        _ => None,
+    }
+}
+
+fn semantic_counter_uses_common_element_array(model: &Model, counter: IntVarRef) -> bool {
+    model.constraints().iter().any(|constraint| {
+        let Constraint::Linear { terms, relation: Relation::Eq, rhs: 0 } = constraint else {
+            return false;
+        };
+        let mut saw_counter = false;
+        let mut mismatches = Vec::new();
+        for &(coefficient, variable) in terms {
+            if variable == counter {
+                if saw_counter || coefficient != -1 {
+                    return false;
+                }
+                saw_counter = true;
+            } else if coefficient == 1 {
+                mismatches.push(variable);
+            } else if coefficient != 0 {
+                return false;
+            }
+        }
+        saw_counter && !mismatches.is_empty() && semantic_mismatches_share_element_array(model, &mismatches)
+    })
+}
+
+fn semantic_mismatches_share_element_array(model: &Model, mismatches: &[IntVarRef]) -> bool {
+    let mut common_arrays: Option<Vec<Vec<IntVarRef>>> = None;
+    for &mismatch in mismatches {
+        let sources = model
+            .constraints()
+            .iter()
+            .filter_map(|constraint| {
+                let Constraint::Intension(expression) = constraint else {
+                    return None;
+                };
+                semantic_mismatch_source(expression, mismatch)
+            })
+            .collect::<Vec<_>>();
+        if sources.is_empty() {
+            return false;
+        }
+        let mut arrays = model
+            .constraints()
+            .iter()
+            .filter_map(|constraint| {
+                let Constraint::IntegerGlobal(IntGlobalConstraint::Element { array, value, .. }) = constraint else {
+                    return None;
+                };
+                sources.contains(value).then(|| array.clone())
+            })
+            .collect::<Vec<_>>();
+        arrays.sort_unstable();
+        arrays.dedup();
+        if arrays.is_empty() {
+            return false;
+        }
+        match &mut common_arrays {
+            None => common_arrays = Some(arrays),
+            Some(common) => common.retain(|array| arrays.binary_search(array).is_ok()),
+        }
+        if common_arrays.as_ref().is_none_or(Vec::is_empty) {
+            return false;
+        }
+    }
+    common_arrays.is_some_and(|arrays| !arrays.is_empty())
+}
+
+fn semantic_mismatch_source(expression: &SemanticIntExpr, mismatch: IntVarRef) -> Option<IntVarRef> {
+    let SemanticIntExpr::Eq(left, right) = expression else {
+        return None;
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (SemanticIntExpr::Variable(variable), value) if *variable == mismatch => semantic_ne_variable_constant(value),
+        (value, SemanticIntExpr::Variable(variable)) if *variable == mismatch => semantic_ne_variable_constant(value),
+        _ => None,
+    }
+}
+
+fn semantic_ne_variable_constant(expression: &SemanticIntExpr) -> Option<IntVarRef> {
+    let SemanticIntExpr::Ne(left, right) = expression else {
+        return None;
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (SemanticIntExpr::Variable(variable), SemanticIntExpr::Constant(_))
+        | (SemanticIntExpr::Constant(_), SemanticIntExpr::Variable(variable)) => Some(*variable),
+        _ => None,
+    }
 }
 
 pub(crate) fn solve(
@@ -280,7 +782,7 @@ fn repair_candidate(
     values: &[i32],
     seed: u64,
     verification: VerificationLevel,
-) -> Result<Option<CandidateSolution>, SolveError> {
+) -> Result<Option<RepairedCandidate>, SolveError> {
     if context.budget.expired() && verification == VerificationLevel::Transfer {
         return Ok(None);
     }
@@ -308,7 +810,7 @@ fn repair_candidate(
         problem.search.iter().map(|variable| solver.store.value(*variable)).collect()
     } else {
         let conflict_limit = Some(context.request.limits.conflicts.unwrap_or(10_000).min(10_000));
-        let (solution, _, _) = crate::search::decide_sat_assuming_seeded(
+        let (solution, _, complete) = crate::search::decide_sat_assuming_seeded(
             &mut solver,
             &problem.search,
             &[],
@@ -319,11 +821,12 @@ fn repair_candidate(
             Vec::new(),
             Vec::new(),
         );
-        let Some(solution) = solution else {
-            return Err(SolveError::InvalidResult("local-search decisions have no CP completion within the shared budget".to_string()));
+        let Some(solution) = cp_repair_completion(solution, complete)? else {
+            return Ok(None);
         };
         solution
     };
+    let physical_objective = physical_objective_value(problem, &completed)?;
     let candidate =
         super::cp::candidate_if_running(context.model, context.compiled, &completed, context.budget, verification)?.map(|candidate| {
             CandidateSolution::verified(
@@ -336,7 +839,56 @@ fn repair_candidate(
     if let Some(candidate) = &candidate {
         super::cp::verify_assumptions(candidate, &context.request.assumptions)?;
     }
-    Ok(candidate)
+    Ok(candidate.map(|candidate| RepairedCandidate { candidate, physical_solution: completed, physical_objective }))
+}
+
+fn cp_repair_completion(solution: Option<Vec<i32>>, complete: bool) -> Result<Option<Vec<i32>>, SolveError> {
+    match (solution, complete) {
+        (Some(solution), _) => Ok(Some(solution)),
+        (None, false) => Ok(None),
+        (None, true) => Err(SolveError::InvalidResult("local-search decisions have no completion in the canonical CP model".to_string())),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn audit_cp_repair_completion(complete: bool) -> Result<bool, SolveError> {
+    cp_repair_completion(None, complete).map(|solution| solution.is_some())
+}
+
+fn physical_objective_value(problem: &crate::problem::Problem, values: &[i32]) -> Result<Option<i64>, SolveError> {
+    let Some(objective) = problem.objective.as_ref() else {
+        return Ok(None);
+    };
+    let by_variable = problem.search.iter().copied().zip(values.iter().copied()).collect::<HashMap<_, _>>();
+    let value = |variable: VarId| by_variable.get(&variable).copied().map(i64::from);
+    let objective_value = match objective {
+        PhysicalObjective::Var(_, variable) => value(*variable).ok_or_else(|| {
+            SolveError::InvalidResult(format!("physical objective variable {} is absent from the search solution", variable.index()))
+        }),
+        PhysicalObjective::Linear(_, coefficients, variables) => coefficients
+            .iter()
+            .zip(variables)
+            .try_fold(0i64, |sum, (&coefficient, &variable)| {
+                let variable_value = value(variable).ok_or(())?;
+                let term = coefficient.checked_mul(variable_value).ok_or(())?;
+                sum.checked_add(term).ok_or(())
+            })
+            .map_err(|()| SolveError::InvalidResult("physical warm-start objective is incomplete or overflows i64".to_string())),
+        PhysicalObjective::Expr(_, expression) => {
+            let mut variables = Vec::new();
+            expression.collect_vars(&mut variables);
+            if let Some(variable) = variables.into_iter().find(|variable| !by_variable.contains_key(variable)) {
+                return Err(SolveError::InvalidResult(format!(
+                    "physical objective variable {} is absent from the search solution",
+                    variable.index()
+                )));
+            }
+            expression
+                .eval(&|variable| value(variable).expect("objective variables were checked above"))
+                .ok_or_else(|| SolveError::InvalidResult("physical warm-start objective expression is undefined".to_string()))
+        }
+    }?;
+    Ok(Some(objective_value))
 }
 
 fn compile_constraint(spec: &mut LocalSearchSpec, model: &Model, compiled: &CompiledCp, constraint: &Constraint) -> Result<(), SolveError> {

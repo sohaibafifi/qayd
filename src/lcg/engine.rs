@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::expr;
 use crate::expr::Expr;
 use crate::ids::{PropId, VarId};
+use crate::lcg::guarded_sum::GuardedSum;
 use crate::lcg::lit::{Lit, LitOrConst};
 use crate::lcg::trail::{Cdcl, Reason};
 use crate::lcg::view::Tri;
@@ -21,6 +22,24 @@ use crate::store::{Premise, Solver, Store};
 /// and dives with a fresh polarity). The other segments keep saved phases, so
 /// convergence is preserved and diversification stays a minority of the effort.
 const REPHASE_PERIOD: u64 = 4;
+
+/// Upper bound on the obvious work estimate for optional singleton filtering
+/// of a symbolic objective. The root interval check remains enabled above it.
+const MAX_EXPR_SINGLETON_PROBE_WORK: usize = 32_768;
+
+/// Small objectives benefit from directed branching on the first dive. Large
+/// objectives first need a cheap feasible assignment before their decisions
+/// can safely dominate the feasibility heuristic.
+const MAX_EAGER_OBJECTIVE_VARIABLES: usize = 32;
+
+/// Literal evaluations reserved for a one-shot guarded-objective phase hint.
+/// The first incumbent is published before this bounded local search starts.
+const GUARDED_OBJECTIVE_HINT_WORK: usize = 32_000_000;
+
+/// Enumerating up to a pseudo-random rank is acceptable only on compact
+/// domains. Large bounds domains use a direct supported target or an endpoint
+/// so value selection stays bounded at the search-loop level.
+const MAX_ENUMERATED_RANDOM_DOMAIN: usize = 4_096;
 
 use crate::mix64;
 
@@ -52,6 +71,7 @@ impl Objective<'_> {
 struct ObjectiveImpact {
     coeffs: Vec<u64>,
     directions: Vec<i8>,
+    defer_until_incumbent: bool,
 }
 
 fn constant_expr_value(expression: &Expr) -> Option<i128> {
@@ -107,6 +127,7 @@ impl ObjectiveImpact {
     fn new(objective: Objective<'_>, nvars: usize, minimizing: bool) -> Option<Self> {
         let mut impact = vec![0u64; nvars];
         let mut signed = vec![0i128; nvars];
+        let mut nonlinear = false;
         match objective {
             Objective::Var(var) => {
                 // A materialized objective is often an auxiliary constrained by
@@ -116,22 +137,41 @@ impl ObjectiveImpact {
                 signed[var.index()] = if minimizing { 1 } else { -1 };
             }
             Objective::Linear { coeffs, vars } => {
+                let eager_priority = vars.len() <= MAX_EAGER_OBJECTIVE_VARIABLES;
                 for (&coeff, &var) in coeffs.iter().zip(vars) {
-                    impact[var.index()] = impact[var.index()].saturating_add(coeff.unsigned_abs());
+                    if eager_priority {
+                        impact[var.index()] = impact[var.index()].saturating_add(coeff.unsigned_abs());
+                    }
                     let directed = if minimizing { i128::from(coeff) } else { -i128::from(coeff) };
                     signed[var.index()] = signed[var.index()].checked_add(directed)?;
                 }
             }
             Objective::Expr(expression) => {
                 let factor = if minimizing { 1 } else { -1 };
+                // Affine expressions provide a sound value direction. Do not
+                // let coefficient magnitude eclipse dom/wdeg entirely:
+                // feasibility variables still have to be interleaved with
+                // objective decisions on tightly constrained models.
                 if !affine_expr_directions(expression, factor, &mut signed) {
-                    return None;
+                    nonlinear = true;
+                    // A nonlinear objective still contains useful structural
+                    // information. Syntactic occurrence is a conservative
+                    // sensitivity proxy: it prioritizes selectors shared by
+                    // many guarded terms without inventing an improving value
+                    // direction that may be false.
+                    let mut variables = Vec::new();
+                    expression.collect_vars(&mut variables);
+                    for variable in variables {
+                        impact[variable.index()] = impact[variable.index()].saturating_add(1);
+                    }
                 }
             }
         }
-        let has_direction = signed.iter().any(|&coeff| coeff != 0);
-        let directions = signed.into_iter().map(|coeff| coeff.signum() as i8).collect();
-        (impact.iter().any(|&coeff| coeff > 0) || has_direction).then_some(Self { coeffs: impact, directions })
+        let directions: Vec<i8> = signed.into_iter().map(|coeff| coeff.signum() as i8).collect();
+        let active_variables =
+            impact.iter().zip(&directions).filter(|(coefficient, direction)| **coefficient != 0 || **direction != 0).count();
+        let defer_until_incumbent = nonlinear || active_variables > MAX_EAGER_OBJECTIVE_VARIABLES;
+        (active_variables > 0).then_some(Self { coeffs: impact, directions, defer_until_incumbent })
     }
 
     fn score(&self, solver: &Solver, var: VarId) -> u128 {
@@ -225,8 +265,24 @@ impl Cdcl<'_> {
     /// is still in the domain (skipped on a rephasing segment), else a polarity
     /// endpoint chosen by [`rephase_value`](Self::rephase_value).
     fn decision_lit(&self, v: VarId, phase: &[Option<i32>], objective: Option<&ObjectiveImpact>) -> Lit {
+        self.decision_lit_with_policy(v, phase, objective, false)
+    }
+
+    /// Variant used by the one-shot guarded-objective dive. Its locally
+    /// optimized values are intentional phases, so directionless objective
+    /// variables may consume them until a restart abandons that dive.
+    fn decision_lit_with_policy(
+        &self,
+        v: VarId,
+        phase: &[Option<i32>],
+        objective: Option<&ObjectiveImpact>,
+        honor_directionless_phase: bool,
+    ) -> Lit {
+        let nonlinear_objective_variable =
+            objective.is_some_and(|impact| impact.prefers_max(v).is_none() && impact.score(self.solver, v) > 0);
+        let honor_saved_phase = if nonlinear_objective_variable { honor_directionless_phase } else { self.rephase_mode == 0 };
         let val = match phase[v.index()] {
-            Some(p) if self.rephase_mode == 0 && self.solver.store.contains(v, p) => p,
+            Some(p) if honor_saved_phase && self.solver.store.contains(v, p) => p,
             _ => self.rephase_value(v, objective),
         };
         match self.atoms.eq(v, val) {
@@ -238,9 +294,35 @@ impl Cdcl<'_> {
     }
 
     /// The domain endpoint to branch to when no saved phase applies: the
-    /// objective-improving endpoint when available, otherwise the seed-dependent
-    /// endpoint. Both are inverted on a rephasing segment.
+    /// objective-improving endpoint when available, otherwise a diversified
+    /// endpoint. Rephasing only inverts the unguided choice: reversing a known
+    /// objective direction was the source of long COP plateaus.
     fn rephase_value(&self, v: VarId, objective: Option<&ObjectiveImpact>) -> i32 {
+        if objective.is_some_and(|impact| impact.prefers_max(v).is_none() && impact.score(self.solver, v) > 0) {
+            // For a structural, directionless objective hint, both endpoints
+            // are an unnecessarily small neighborhood on non-Boolean domains.
+            // Choose any supported value deterministically and vary the choice
+            // across restart segments.
+            let size = self.solver.store.size(v);
+            let variable_salt = (v.0 as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let restart_salt = self.restarts_done.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            let random = mix64(self.seed ^ variable_salt ^ restart_salt);
+            if size <= MAX_ENUMERATED_RANDOM_DOMAIN {
+                let index = (random % size as u64) as usize;
+                return self.solver.store.values(v).nth(index).expect("branch value index is inside the domain");
+            }
+            let min = self.solver.store.min(v);
+            let max = self.solver.store.max(v);
+            let span = (i64::from(max) - i64::from(min) + 1) as u64;
+            let target = (i64::from(min) + (random % span) as i64) as i32;
+            return if self.solver.store.contains(v, target) {
+                target
+            } else if random & 1 == 0 {
+                min
+            } else {
+                max
+            };
+        }
         // Three seed classes exploit the improving endpoint. The fourth
         // deliberately explores its opposite, so symbolic-objective portfolio
         // workers do not all traverse the same deterministic tree.
@@ -248,8 +330,10 @@ impl Cdcl<'_> {
             objective
                 .and_then(|impact| impact.prefers_max(v))
                 .map(|prefers_max| if self.seed & 3 == 1 { !prefers_max } else { prefers_max });
-        let default_max = objective_preference.unwrap_or_else(|| self.seed != 0 && mix64(self.seed ^ v.0 as u64) & 1 != 0);
-        let want_max = default_max ^ (self.rephase_mode != 0);
+        let want_max = objective_preference.unwrap_or_else(|| {
+            let diversified = objective.is_some() && mix64(self.seed ^ v.0 as u64) & 1 != 0;
+            diversified ^ (self.rephase_mode != 0)
+        });
         if want_max {
             self.solver.store.max(v)
         } else {
@@ -641,6 +725,42 @@ impl Cdcl<'_> {
             vec![None; self.solver.store.num_vars()]
         };
         let objective_impact = ObjectiveImpact::new(objective, self.solver.store.num_vars(), minimizing);
+        // A generated guarded-sum objective admits a much cheaper local
+        // minimization than a generic expression tree. Keep that computation
+        // outside the propagator: its assignment is only a phase hint, while
+        // the regular CP search remains responsible for feasibility and proof.
+        // Explicit caller guidance retains its requested behavior. A bounded
+        // dive may still use this one-shot phase hint: the conflict budget
+        // continues to bound the exact search, while the hint itself never
+        // publishes a candidate or claims feasibility.
+        let mut guarded_hint_pending = minimizing
+            && cube.is_empty()
+            && self.initial_phase.iter().all(Option::is_none)
+            && self.branch_order.is_empty()
+            && matches!(objective, Objective::Expr(_));
+        let mut guarded_hint_restart = None;
+        // A preceding dive or another worker may already have published an
+        // incumbent. In that case the imported strict cutoff can prevent this
+        // worker from accepting the ordinary first solution that used to
+        // trigger the guarded-sum hint. Seed the phase up front when the hint
+        // itself improves the shared bound. This remains only a value-ordering
+        // policy: CP still checks every constraint before publishing anything.
+        if guarded_hint_pending {
+            let shared_incumbent =
+                shared_bound.map(|bound| bound.load(Ordering::Relaxed)).filter(|&value| value != i64::MAX && value != i64::MIN);
+            if let (Some(incumbent), Objective::Expr(expression)) = (shared_incumbent, objective) {
+                if let Some((_, assignment)) = GuardedSum::compile(expression)
+                    .and_then(|guarded| guarded.minimize_hint(&self.solver.store, self.seed, stop, GUARDED_OBJECTIVE_HINT_WORK))
+                    .filter(|(hint_value, _)| *hint_value < incumbent)
+                {
+                    for (variable, value) in assignment {
+                        phase[variable.index()] = Some(value);
+                    }
+                    guarded_hint_pending = false;
+                    guarded_hint_restart = Some(self.restarts_done);
+                }
+            }
+        }
         let mut enforced = None;
         let mut obj_bound = ObjBoundCell::default();
         let mut complete = true;
@@ -676,8 +796,19 @@ impl Cdcl<'_> {
                 }
                 break;
             }
-            match self.select_branch_var(vars, primary_branch_scope, objective_impact.as_ref()) {
+            if guarded_hint_restart.is_some_and(|restart| restart != self.restarts_done) {
+                guarded_hint_restart = None;
+            }
+            // A nonlinear occurrence score has no sound improving polarity.
+            // Activate it only after the regular feasibility heuristic has
+            // supplied an incumbent and therefore a useful objective bound.
+            let active_objective = objective_impact.as_ref().filter(|impact| !impact.defer_until_incumbent || best.is_some());
+            match self.select_branch_var(vars, primary_branch_scope, active_objective) {
                 None => {
+                    // A successful hinted dive consumes the one-shot policy.
+                    // Its accepted incumbent becomes the ordinary saved phase
+                    // and must not replay as another guarded dive.
+                    guarded_hint_restart = None;
                     let keep_searching = self.accept_solution(
                         vars,
                         objective,
@@ -695,10 +826,32 @@ impl Cdcl<'_> {
                         }
                         break; // optimal
                     }
+                    if guarded_hint_pending {
+                        guarded_hint_pending = false;
+                        let incumbent = best.as_ref().expect("the accepted solution is the incumbent").1;
+                        let hint = match objective {
+                            Objective::Expr(expression) => GuardedSum::compile(expression).and_then(|guarded| {
+                                guarded.minimize_hint(&self.solver.store, self.seed, stop, GUARDED_OBJECTIVE_HINT_WORK)
+                            }),
+                            Objective::Var(_) | Objective::Linear { .. } => None,
+                        };
+                        if let Some((hint_value, assignment)) = hint {
+                            // Only displace the incumbent phase when the exact
+                            // guarded objective improved. The hinted assignment
+                            // may violate other constraints, so it is never
+                            // published directly and cannot affect correctness.
+                            if hint_value < incumbent {
+                                for (variable, value) in assignment {
+                                    phase[variable.index()] = Some(value);
+                                }
+                                guarded_hint_restart = Some(self.restarts_done);
+                            }
+                        }
+                    }
                 }
                 Some(v) => {
                     stats.nodes += 1;
-                    let lit = self.decision_lit(v, &phase, objective_impact.as_ref());
+                    let lit = self.decision_lit_with_policy(v, &phase, active_objective, guarded_hint_restart.is_some());
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
                         if self.conflict_budget_exhausted() {
@@ -996,18 +1149,31 @@ impl Propagator for ObjLinearLeq {
 #[derive(Clone)]
 struct ObjExprLeq {
     expr: Expr,
+    guarded_sum: Option<GuardedSum>,
     vars: Vec<VarId>,
     bound: Arc<AtomicI64>,
     scratch: Vec<i32>,
+    probe_cost_per_value: usize,
 }
 
 impl ObjExprLeq {
     fn new(expr: Expr, bound: Arc<AtomicI64>) -> Self {
+        let guarded_sum = GuardedSum::compile(&expr);
         let mut vars = Vec::new();
         expr.collect_vars(&mut vars);
+        let occurrences = vars.len();
         vars.sort_unstable();
         vars.dedup();
-        Self { expr, vars, bound, scratch: Vec::new() }
+        if let Some(guarded) = &guarded_sum {
+            vars = guarded.vars().to_vec();
+        }
+        // Singleton probing recomputes the complete expression for every value
+        // of every unfixed variable. It is useful on compact expressions, but
+        // becomes the dominant cost on generated guarded sums and wide
+        // domains. Keep the sound interval check in all cases; `propagate`
+        // enables this optional filtering only when the current domain-size
+        // estimate also fits the work ceiling.
+        Self { expr, guarded_sum, vars, bound, scratch: Vec::new(), probe_cost_per_value: occurrences.max(1) }
     }
 }
 
@@ -1020,10 +1186,13 @@ impl Propagator for ObjExprLeq {
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
         let c = self.bound.load(Ordering::Relaxed);
-        let (lo, hi) = {
-            let dom = |x: VarId| (store.min(x) as i64, store.max(x) as i64);
-            self.expr.bounds(&dom)
-        };
+        let (lo, hi) = self.guarded_sum.as_ref().map_or_else(
+            || {
+                let dom = |x: VarId| (store.min(x) as i64, store.max(x) as i64);
+                self.expr.bounds(&dom)
+            },
+            |guarded| guarded.bounds(store),
+        );
         if lo > c {
             return Err(Inconsistency); // can never hold
         }
@@ -1031,19 +1200,35 @@ impl Propagator for ObjExprLeq {
             return Ok(()); // entailed
         }
 
-        for &v in &self.vars {
-            if store.is_fixed(v) {
-                continue;
-            }
-            self.scratch.clear();
-            self.scratch.extend(store.values(v));
-            for &val in &self.scratch {
-                let dead = {
-                    let dom = |x: VarId| if x == v { (val as i64, val as i64) } else { (store.min(x) as i64, store.max(x) as i64) };
-                    self.expr.bounds(&dom).0 > c
-                };
-                if dead {
-                    store.remove(v, val)?;
+        let probe_work = self
+            .vars
+            .iter()
+            .try_fold(0usize, |work, &variable| work.checked_add(store.size(variable)))
+            .and_then(|values| values.checked_mul(self.probe_cost_per_value));
+        if probe_work.is_some_and(|work| work <= MAX_EXPR_SINGLETON_PROBE_WORK) {
+            for &v in &self.vars {
+                if store.is_fixed(v) {
+                    continue;
+                }
+                self.scratch.clear();
+                self.scratch.extend(store.values(v));
+                for &val in &self.scratch {
+                    let dead = self.guarded_sum.as_ref().map_or_else(
+                        || {
+                            let dom = |x: VarId| {
+                                if x == v {
+                                    (val as i64, val as i64)
+                                } else {
+                                    (store.min(x) as i64, store.max(x) as i64)
+                                }
+                            };
+                            self.expr.bounds(&dom).0 > c
+                        },
+                        |guarded| guarded.bounds_with_value(store, v, val).0 > c,
+                    );
+                    if dead {
+                        store.remove(v, val)?;
+                    }
                 }
             }
         }

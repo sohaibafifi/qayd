@@ -15,6 +15,7 @@ type CompileStep<T> = Result<Option<T>, CpCompileError>;
 type SearchGuidanceParts = (Vec<Option<i32>>, Vec<VarId>, Option<Vec<VarId>>);
 
 const CP_ESTIMATE_BASE_BYTES: u128 = 64 * 1024;
+const MAX_LINEARIZED_AFFINE_OBJECTIVE_VARIABLES: usize = 32;
 
 #[inline]
 fn interrupted(stop: &AtomicBool) -> bool {
@@ -188,7 +189,16 @@ impl CompiledCp {
                     let Some(expression) = compile_expr(expr, &int_variables, stop)? else {
                         return Ok(None);
                     };
-                    Ok(PhysicalObjective::Expr(*minimize, expression))
+                    let affine = expression.affine_form_interruptible(stop);
+                    if interrupted(stop) {
+                        return Ok(None);
+                    }
+                    Ok(match affine {
+                        Some((0, coefficients, variables)) if variables.len() <= MAX_LINEARIZED_AFFINE_OBJECTIVE_VARIABLES => {
+                            PhysicalObjective::Linear(*minimize, coefficients, variables)
+                        }
+                        Some(_) | None => PhysicalObjective::Expr(*minimize, expression),
+                    })
                 }
                 Objective::ListTerms { .. } | Objective::Makespan { .. } => {
                     Err(CpCompileError::new("CP integer lowering received a non-integer objective"))

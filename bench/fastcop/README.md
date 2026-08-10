@@ -158,3 +158,37 @@ The scorer consumes fresh local JSONL records only. It does not silently mix
 the XCSP website's historical traces with locally measured runs. A future
 official-trace adapter can emit the same result schema, with explicit source
 and trace hashes, without changing the runner or scoring rules.
+
+## Anytime analysis
+
+`anytime.py` reconstructs the best objective known at configurable elapsed-time
+checkpoints from the same JSONL files. It sorts events by their recorded arrival
+time and recomputes the minimum or maximum envelope, so it does not rely on the
+solver emitting monotone objective values. An event at exactly a checkpoint is
+included. An optimality or UNSAT proof becomes visible only at or after its
+`proof_elapsed_seconds`; a proof without that timestamp is never backdated.
+
+For example:
+
+```bash
+python3 bench/fastcop/anytime.py \
+  bench/fastcop/results/final-180s/results.jsonl \
+  --checkpoints 1,5,10,30,60,180 \
+  --mode both \
+  --invalidation family \
+  --output bench/fastcop/results/final-180s/anytime.json
+```
+
+Checkpoint values can also be space-separated. The JSON report contains every
+run's first incumbent, best incumbent, last strict improvement, time to each,
+and final plateau duration. It also contains incumbent and proof counts plus
+the exact FAST COP pool and pairwise scores at every checkpoint. These scores
+reuse `score.py`, including its BB1, BB2 and family-invalidation rules. Use
+`--mode none` when only trajectory metrics are wanted.
+
+The run-level plateau is measured from the last strict improvement to the
+recorded wall-time horizon, extended to the latest event or proof timestamp if
+needed. A checkpoint plateau is measured from the current best's first arrival
+to that checkpoint. JSON is written to stdout unless `--output` is supplied;
+the compact text summary goes to stderr in that case, or to stdout alongside a
+file output. `--quiet` suppresses only the text summary.

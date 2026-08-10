@@ -19,6 +19,15 @@ const RANDOM_WALK_PERIOD: u64 = 17;
 const RESTART_AFTER: u64 = 200;
 const CONSTRUCTIVE_KICK_PERIOD: u64 = 5;
 const WORD_PLACEMENT_NODE_LIMIT: usize = 20_000;
+const WORD_PLACEMENT_EVALUATION_NODE_LIMIT: usize = 1_000;
+const DYNAMIC_WORD_ORDER_LIMIT: usize = 20;
+const LARGE_GRID_DYNAMIC_WORD_CANDIDATES: usize = 8;
+const MAX_GUARDED_GRID_CELLS: usize = u64::BITS as usize;
+const MAX_GUARDED_GRID_PAIR_CELLS: usize = 16;
+const GUARDED_GRID_ANNEAL_STEPS: usize = 50_000;
+const GUARDED_GRID_ANNEAL_CYCLE: usize = 5_000;
+const GUARDED_GRID_HILL_CLIMB_ROUNDS: usize = 2;
+const GUARDED_GRID_PAIR_ROUNDS: usize = 4;
 /// Min-conflicts (#1b): domains with at most this many values are scanned in full
 /// (cheap and optimal); larger ones use the bounded candidate set.
 const MIN_CONFLICTS_FULL: usize = 24;
@@ -311,6 +320,14 @@ impl LocalDomain {
         }
     }
 
+    fn first_value_except(&self, excluded: i32) -> Option<i32> {
+        if self.values.is_empty() {
+            [self.min, self.max].into_iter().find(|&value| value != excluded)
+        } else {
+            self.values.iter().copied().find(|&value| value != excluded)
+        }
+    }
+
     fn is_bool(&self) -> bool {
         self.contains(0) && self.contains(1) && self.min_value() == 0 && self.max_value() == 1
     }
@@ -378,17 +395,226 @@ struct GuardedWord<'a> {
     weight: i64,
     array: &'a [VarId],
     letters: Vec<(VarId, i32)>,
-}
-
-struct WordPlacementState {
-    values: Vec<Option<i32>>,
-    cells: Vec<usize>,
-    nodes: usize,
+    max_mismatches: usize,
 }
 
 type ElementViews<'a> = HashMap<VarId, (&'a [VarId], VarId, i32)>;
 type Placement = (VarId, i32);
-type TrialPlacement = (Vec<i32>, Vec<Placement>);
+
+struct TrialPlacement {
+    assignment: Vec<i32>,
+    placements: Vec<Placement>,
+    new_cells: usize,
+}
+
+#[derive(Clone, Copy)]
+enum WordPlacementPriority {
+    Reuse,
+    Weighted { cell_penalty: i64 },
+}
+
+struct GuardedGridWord {
+    weight: i64,
+    max_mismatches: usize,
+    expected: Vec<i32>,
+    allowed_cells: Vec<u64>,
+    transitions: Vec<Vec<u64>>,
+}
+
+struct GuardedGridEvaluator {
+    values: Vec<i32>,
+    words: Vec<GuardedGridWord>,
+    words_by_letter: HashMap<i32, Vec<usize>>,
+    active: Vec<bool>,
+    score: i64,
+}
+
+impl GuardedGridEvaluator {
+    fn new(model: &LocalModel, assignment: &[i32], words: &[GuardedWord<'_>]) -> Option<Self> {
+        let grid = words.first()?.array;
+        if grid.is_empty()
+            || grid.len() > MAX_GUARDED_GRID_CELLS
+            || words.iter().any(|word| word.array != grid || word.max_mismatches > 1 || word.letters.is_empty())
+        {
+            return None;
+        }
+
+        let values = grid.iter().map(|var| assignment[var.index()]).collect::<Vec<_>>();
+        let mut compiled_words = Vec::with_capacity(words.len());
+        let mut words_by_letter: HashMap<i32, Vec<usize>> = HashMap::new();
+        for (word_index, word) in words.iter().enumerate() {
+            let expected = word.letters.iter().map(|&(_, value)| value).collect::<Vec<_>>();
+            for &value in &expected {
+                words_by_letter.entry(value).or_default().push(word_index);
+            }
+            let allowed_cells = word
+                .letters
+                .iter()
+                .map(|&(index, _)| {
+                    (0..grid.len()).fold(0u64, |mask, cell| {
+                        if model.domains[index.index()].contains(cell as i32) {
+                            mask | (1u64 << cell)
+                        } else {
+                            mask
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut transitions = vec![Vec::new(); word.letters.len()];
+            for (position, transition) in transitions.iter_mut().enumerate().skip(1) {
+                let left = word.letters[position - 1].0;
+                let right = word.letters[position].0;
+                *transition = (0..grid.len())
+                    .map(|from| {
+                        (0..grid.len()).fold(0u64, |mask, to| {
+                            if from != to && model.pair_allowed(left, right, from as i32, to as i32) {
+                                mask | (1u64 << to)
+                            } else {
+                                mask
+                            }
+                        })
+                    })
+                    .collect();
+            }
+            compiled_words.push(GuardedGridWord {
+                weight: word.weight,
+                max_mismatches: word.max_mismatches,
+                expected,
+                allowed_cells,
+                transitions,
+            });
+        }
+        for indices in words_by_letter.values_mut() {
+            indices.sort_unstable();
+            indices.dedup();
+        }
+
+        let mut evaluator = Self { values, words: compiled_words, words_by_letter, active: vec![false; words.len()], score: 0 };
+        evaluator.rebuild();
+        Some(evaluator)
+    }
+
+    fn rebuild(&mut self) {
+        self.score = 0;
+        for word_index in 0..self.words.len() {
+            let present = self.word_present(word_index);
+            self.active[word_index] = present;
+            if present {
+                self.score = self.score.saturating_add(self.words[word_index].weight);
+            }
+        }
+    }
+
+    fn set_values(&mut self, values: &[i32]) {
+        self.values.copy_from_slice(values);
+        self.rebuild();
+    }
+
+    fn score_for_values(&self, values: &[i32]) -> i64 {
+        (0..self.words.len())
+            .filter(|&word_index| self.word_present_in(word_index, values))
+            .fold(0i64, |score, word_index| score.saturating_add(self.words[word_index].weight))
+    }
+
+    fn apply_value(&mut self, cell: usize, value: i32) -> i64 {
+        let old_value = self.values[cell];
+        if old_value == value {
+            return 0;
+        }
+        let mut affected = self.words_by_letter.get(&old_value).cloned().unwrap_or_default();
+        if let Some(indices) = self.words_by_letter.get(&value) {
+            affected.extend(indices.iter().copied());
+        }
+        affected.sort_unstable();
+        affected.dedup();
+
+        self.values[cell] = value;
+        let mut delta = 0i64;
+        for word_index in affected {
+            let present = self.word_present(word_index);
+            if present == self.active[word_index] {
+                continue;
+            }
+            let weight = self.words[word_index].weight;
+            delta = if present { delta.saturating_add(weight) } else { delta.saturating_sub(weight) };
+            self.active[word_index] = present;
+        }
+        self.score = self.score.saturating_add(delta);
+        delta
+    }
+
+    fn word_present(&self, word_index: usize) -> bool {
+        self.word_present_in(word_index, &self.values)
+    }
+
+    fn word_present_in(&self, word_index: usize, values: &[i32]) -> bool {
+        let word = &self.words[word_index];
+        let matching = word.allowed_cells[0]
+            & values
+                .iter()
+                .enumerate()
+                .fold(0u64, |mask, (cell, &value)| if value == word.expected[0] { mask | (1u64 << cell) } else { mask });
+        let mut exact = matching;
+        let mut mismatch = if word.max_mismatches == 1 { word.allowed_cells[0] & !matching } else { 0 };
+        for position in 1..word.expected.len() {
+            let expanded_exact = expand_cells(exact, &word.transitions[position]);
+            let expanded_mismatch = expand_cells(mismatch, &word.transitions[position]);
+            let matching = word.allowed_cells[position]
+                & values.iter().enumerate().fold(
+                    0u64,
+                    |mask, (cell, &value)| {
+                        if value == word.expected[position] {
+                            mask | (1u64 << cell)
+                        } else {
+                            mask
+                        }
+                    },
+                );
+            let mismatching = word.allowed_cells[position] & !matching;
+            mismatch = (expanded_mismatch & matching) | if word.max_mismatches == 1 { expanded_exact & mismatching } else { 0 };
+            exact = expanded_exact & matching;
+            if exact | mismatch == 0 {
+                return false;
+            }
+        }
+        exact | mismatch != 0
+    }
+}
+
+fn expand_cells(mut cells: u64, transitions: &[u64]) -> u64 {
+    let mut expanded = 0u64;
+    while cells != 0 {
+        let from = cells.trailing_zeros() as usize;
+        expanded |= transitions.get(from).copied().unwrap_or(0);
+        cells &= cells - 1;
+    }
+    expanded
+}
+
+struct GuardedLexPlan {
+    grid: Vec<VarId>,
+    deferred_constraints: Vec<usize>,
+    permutations: Vec<Vec<usize>>,
+    guarded_indices: Vec<(VarId, VarId)>,
+}
+
+struct WordPlacementState<'run, 'model> {
+    assignment: &'run [i32],
+    word: &'run GuardedWord<'model>,
+    ignored_constraints: &'run [usize],
+    values: Vec<Option<i32>>,
+    cells: Vec<usize>,
+    nodes: usize,
+    placement_seed: u64,
+    stop: &'run AtomicBool,
+    best: Option<TrialPlacement>,
+}
+
+struct WordTraceState<'a> {
+    cells: Vec<usize>,
+    nodes: usize,
+    stop: &'a AtomicBool,
+}
 
 fn contains_var(expr: &Expr, target: VarId) -> bool {
     let mut vars = Vec::new();
@@ -637,6 +863,33 @@ fn functional_target(functional: &Functional) -> VarId {
     }
 }
 
+fn constraint_has_lex_touching(constraint: &LocalConstraint, variables: &HashSet<VarId>) -> bool {
+    match constraint {
+        LocalConstraint::Lex { rows, .. } => rows.iter().flatten().any(|var| variables.contains(var)),
+        LocalConstraint::Selected { constraint, .. } => constraint_has_lex_touching(constraint, variables),
+        _ => false,
+    }
+}
+
+fn mismatch_letters(functionals: &[Functional], counter: VarId) -> Option<Vec<(VarId, i32)>> {
+    let Functional::Linear { coeff, terms, rhs, .. } = functionals.iter().find(|functional| functional_target(functional) == counter)?
+    else {
+        return None;
+    };
+    if *coeff != -1 || *rhs != 0 || terms.is_empty() || terms.iter().any(|&(coefficient, _)| coefficient != 1) {
+        return None;
+    }
+
+    let mut letters = Vec::with_capacity(terms.len());
+    for &(_, mismatch) in terms {
+        let Functional::Expr { expr, .. } = functionals.iter().find(|functional| functional_target(functional) == mismatch)? else {
+            return None;
+        };
+        letters.push(ne_var_any_const(expr)?);
+    }
+    Some(letters)
+}
+
 /// Build the [`LocalModel::affected`] incidence index. Seed it with each
 /// constraint's direct variable scope, then walk functionals in reverse
 /// topological order (`functionals` is in forward topo order for `complete()`'s
@@ -728,6 +981,22 @@ impl LocalSearchSpec {
 
     pub(crate) fn is_decision(&self, variable: VarId) -> bool {
         self.decisions.get(variable.index()).copied().unwrap_or(false)
+    }
+
+    pub(crate) fn has_guarded_mismatch_structure(&self) -> bool {
+        self.constraints.iter().any(|constraint| {
+            let LocalConstraint::Expr(expr) = constraint else {
+                return false;
+            };
+            guarded_mismatch_bound(expr).is_some_and(|(_, counter, _)| mismatch_letters(&self.functionals, counter).is_some())
+        })
+    }
+
+    pub(crate) fn has_guarded_word_structure(&self, problem: &Problem) -> bool {
+        let Ok(model) = LocalModel::new(problem.clone(), self.clone()) else {
+            return false;
+        };
+        !model.guarded_words(&model.element_views()).is_empty()
     }
 
     pub fn add_var(&mut self, var: VarId) {
@@ -943,11 +1212,17 @@ impl LocalModel {
         self.domains.iter().map(LocalDomain::min_value).collect()
     }
 
-    fn constructive_assignment(&self, seed: u64) -> Vec<i32> {
+    fn constructive_assignment(&self, seed: u64, stop: &AtomicBool) -> Vec<i32> {
         let mut assignment = self.min_assignment();
+        if stop.load(Ordering::Relaxed) {
+            return assignment;
+        }
         self.greedy_exact_cover(&mut assignment);
+        if stop.load(Ordering::Relaxed) {
+            return assignment;
+        }
         let _ = self.complete(&mut assignment);
-        self.place_guarded_elements(assignment, seed)
+        self.place_guarded_elements(assignment, seed, stop)
     }
 
     fn has_extension(&self) -> bool {
@@ -983,7 +1258,9 @@ impl LocalModel {
         match &self.objective {
             Objective::Var(_, var) => self.expanded_var_terms(*var).unwrap_or_else(|| vec![(1, *var)]),
             Objective::Linear(_, coeffs, vars) => coeffs.iter().copied().zip(vars.iter().copied()).collect(),
-            Objective::Expr(_, _) => Vec::new(),
+            Objective::Expr(_, expr) => expr
+                .affine_form_interruptible(&AtomicBool::new(false))
+                .map_or_else(Vec::new, |(_, coeffs, vars)| coeffs.into_iter().zip(vars).collect()),
         }
     }
 
@@ -1069,35 +1346,580 @@ impl LocalModel {
         best.map(|(_, var)| var)
     }
 
-    fn place_guarded_elements(&self, mut assignment: Vec<i32>, seed: u64) -> Vec<i32> {
+    fn place_guarded_elements(&self, assignment: Vec<i32>, seed: u64, stop: &AtomicBool) -> Vec<i32> {
         let elements = self.element_views();
         let mut words = self.guarded_words(&elements);
+        if words.is_empty() {
+            return assignment;
+        }
         if seed == 0 {
             words.sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.guard.cmp(&b.guard)));
         } else {
             words.sort_by(|a, b| {
                 let ak = mix64(seed ^ a.guard.index() as u64);
                 let bk = mix64(seed ^ b.guard.index() as u64);
-                let aw = a.weight * 64 + (ak & 511) as i64;
-                let bw = b.weight * 64 + (bk & 511) as i64;
+                let aw = i128::from(a.weight) * i128::from(512 + (ak & 1023));
+                let bw = i128::from(b.weight) * i128::from(512 + (bk & 1023));
                 bw.cmp(&aw).then_with(|| a.guard.cmp(&b.guard))
             });
         }
-        let mut fixed = vec![None; self.domains.len()];
+        let fallback = assignment.clone();
+        let lex_plan = self.guarded_lex_plan(&words);
+        let deferred_lex = lex_plan.as_ref().map_or(&[][..], |plan| plan.deferred_constraints.as_slice());
+        let mismatch_aware = words.iter().any(|word| word.max_mismatches > 0);
+        let priorities = if mismatch_aware && seed != 0 {
+            let mut unit_weights = words
+                .iter()
+                .filter(|word| word.weight > 0)
+                .map(|word| word.weight / i64::try_from(word.letters.len()).unwrap_or(1).max(1))
+                .collect::<Vec<_>>();
+            unit_weights.sort_unstable();
+            let unit = unit_weights.get(unit_weights.len() / 2).copied().unwrap_or(1).max(1);
+            let multiplier = [1i64, 3, 6][seed as usize % 3];
+            vec![WordPlacementPriority::Weighted { cell_penalty: unit.saturating_mul(multiplier) }]
+        } else {
+            vec![WordPlacementPriority::Reuse]
+        };
 
-        for word in words {
-            let Some((trial, placements)) = self.try_place_word(&assignment, &fixed, &word) else {
+        let mut best: Option<(i64, Vec<i32>, Vec<i32>)> = None;
+        for priority in priorities {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let raw = self.construct_guarded_grid(assignment.clone(), &words, seed, priority, deferred_lex, stop);
+            let Some(finalized) = self.finalize_guarded_candidate(raw.clone(), &words, lex_plan.as_ref(), stop) else {
                 continue;
             };
-            let mut scored = trial;
-            if self.score(&mut scored).violation == 0 {
-                for (var, value) in placements {
-                    fixed[var.index()] = Some(value);
+            let objective = self.objective_value(&finalized).unwrap_or(if self.objective.minimizing() { i64::MAX } else { i64::MIN });
+            if best.as_ref().is_none_or(|(old, _, _)| better_value(self.objective.minimizing(), objective, Some(*old))) {
+                best = Some((objective, raw, finalized));
+            }
+        }
+
+        let Some((_, raw, finalized)) = best else {
+            return fallback;
+        };
+        if stop.load(Ordering::Relaxed) {
+            return finalized;
+        }
+        let improved_raw = self.improve_guarded_grid(raw, &words, seed, mismatch_aware, stop);
+        let Some(improved) = self.finalize_guarded_candidate(improved_raw, &words, lex_plan.as_ref(), stop) else {
+            return finalized;
+        };
+        let old_value = self.objective_value(&finalized);
+        let new_value = self.objective_value(&improved);
+        match (old_value, new_value) {
+            (Some(old), Some(new)) if better_value(self.objective.minimizing(), new, Some(old)) => improved,
+            _ => finalized,
+        }
+    }
+
+    fn construct_guarded_grid(
+        &self,
+        mut assignment: Vec<i32>,
+        words: &[GuardedWord<'_>],
+        seed: u64,
+        priority: WordPlacementPriority,
+        deferred_lex: &[usize],
+        stop: &AtomicBool,
+    ) -> Vec<i32> {
+        let mut fixed = vec![None; self.domains.len()];
+        let mut remaining = (0..words.len()).collect::<Vec<_>>();
+        let dynamic_order = matches!(priority, WordPlacementPriority::Weighted { .. }) || words.len() <= DYNAMIC_WORD_ORDER_LIMIT;
+
+        while !remaining.is_empty() {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let candidate_positions = if dynamic_order {
+                let mut positions = (0..remaining.len()).collect::<Vec<_>>();
+                positions.sort_unstable_by(|&left, &right| {
+                    words[remaining[right]]
+                        .weight
+                        .cmp(&words[remaining[left]].weight)
+                        .then_with(|| words[remaining[left]].guard.cmp(&words[remaining[right]].guard))
+                });
+                if words.first().is_some_and(|word| word.array.len() > MAX_GUARDED_GRID_CELLS) {
+                    positions.truncate(LARGE_GRID_DYNAMIC_WORD_CANDIDATES);
                 }
-                assignment = scored;
+                positions
+            } else {
+                vec![0]
+            };
+            let mut selected: Option<(usize, usize, TrialPlacement)> = None;
+            for &remaining_pos in &candidate_positions {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let word_index = remaining[remaining_pos];
+                let word = &words[word_index];
+                let placement_seed = if seed == 0 { 0 } else { mix64(seed ^ word.guard.index() as u64 ^ remaining.len() as u64) };
+                let Some(candidate) = self.try_place_word(&assignment, &fixed, word, placement_seed, deferred_lex, stop) else {
+                    continue;
+                };
+                let better = selected.as_ref().is_none_or(|(_, best_word_index, best)| {
+                    self.guarded_placement_better(priority, word, &candidate, &words[*best_word_index], best)
+                });
+                if better {
+                    selected = Some((remaining_pos, word_index, candidate));
+                }
+            }
+            let Some((remaining_pos, _, candidate)) = selected else {
+                if dynamic_order {
+                    let failed = candidate_positions.first().copied().unwrap_or(0);
+                    remaining.remove(failed);
+                    continue;
+                }
+                remaining.remove(0);
+                continue;
+            };
+            for (var, value) in candidate.placements {
+                fixed[var.index()] = Some(value);
+            }
+            assignment = candidate.assignment;
+            remaining.remove(remaining_pos);
+        }
+        assignment
+    }
+
+    fn guarded_placement_better(
+        &self,
+        priority: WordPlacementPriority,
+        word: &GuardedWord<'_>,
+        candidate: &TrialPlacement,
+        best_word: &GuardedWord<'_>,
+        best: &TrialPlacement,
+    ) -> bool {
+        let primary = match priority {
+            WordPlacementPriority::Reuse => i128::try_from(usize::MAX - candidate.new_cells).unwrap_or(i128::MAX),
+            WordPlacementPriority::Weighted { cell_penalty } => {
+                i128::from(word.weight) - i128::from(cell_penalty) * candidate.new_cells as i128
+            }
+        };
+        let best_primary = match priority {
+            WordPlacementPriority::Reuse => i128::try_from(usize::MAX - best.new_cells).unwrap_or(i128::MAX),
+            WordPlacementPriority::Weighted { cell_penalty } => {
+                i128::from(best_word.weight) - i128::from(cell_penalty) * best.new_cells as i128
+            }
+        };
+        primary > best_primary
+            || (primary == best_primary
+                && (candidate.new_cells < best.new_cells
+                    || (candidate.new_cells == best.new_cells
+                        && (word.weight > best_word.weight || (word.weight == best_word.weight && word.guard < best_word.guard)))))
+    }
+
+    fn finalize_guarded_candidate(
+        &self,
+        assignment: Vec<i32>,
+        words: &[GuardedWord<'_>],
+        lex_plan: Option<&GuardedLexPlan>,
+        stop: &AtomicBool,
+    ) -> Option<Vec<i32>> {
+        let ignored = lex_plan.map_or(&[][..], |plan| plan.deferred_constraints.as_slice());
+        let materialized = self.materialize_guarded_grid(assignment, words, ignored, stop)?;
+        let mut finalized = match lex_plan {
+            Some(plan) => self.canonicalize_guarded_grid(&materialized, plan, stop)?,
+            None => materialized,
+        };
+        if finalized.len() != self.domains.len()
+            || finalized.iter().zip(&self.domains).any(|(&value, domain)| !domain.contains(value))
+            || self.score(&mut finalized).violation != 0
+        {
+            return None;
+        }
+        Some(finalized)
+    }
+
+    fn guarded_lex_plan(&self, words: &[GuardedWord<'_>]) -> Option<GuardedLexPlan> {
+        let grid = words.first()?.array;
+        if grid.is_empty() || words.iter().any(|word| word.array != grid) || i32::try_from(grid.len() - 1).is_err() {
+            return None;
+        }
+        let positions = grid.iter().copied().enumerate().map(|(index, var)| (var, index)).collect::<HashMap<_, _>>();
+        if positions.len() != grid.len() {
+            return None;
+        }
+        let grid_vars = positions.keys().copied().collect::<HashSet<_>>();
+        let mut deferred_constraints = Vec::new();
+        let mut permutations = vec![(0..grid.len()).collect::<Vec<_>>()];
+        for (constraint_index, constraint) in self.constraints.iter().enumerate() {
+            match constraint {
+                LocalConstraint::Lex { rows, strict } => {
+                    let touches_grid = rows.iter().flatten().any(|var| grid_vars.contains(var));
+                    if !touches_grid {
+                        continue;
+                    }
+                    if *strict || rows.len() != 2 || rows[0].as_slice() != grid || rows[1].len() != grid.len() {
+                        return None;
+                    }
+                    let mut seen = vec![false; grid.len()];
+                    let mut permutation = Vec::with_capacity(grid.len());
+                    for var in &rows[1] {
+                        let &position = positions.get(var)?;
+                        if seen[position] {
+                            return None;
+                        }
+                        seen[position] = true;
+                        permutation.push(position);
+                    }
+                    if !seen.into_iter().all(|present| present) {
+                        return None;
+                    }
+                    deferred_constraints.push(constraint_index);
+                    if !permutations.contains(&permutation) {
+                        permutations.push(permutation);
+                    }
+                }
+                LocalConstraint::Selected { constraint, .. } if constraint_has_lex_touching(constraint, &grid_vars) => return None,
+                _ => {}
+            }
+        }
+        if deferred_constraints.is_empty() {
+            return None;
+        }
+
+        let mut index_guards = HashMap::new();
+        for word in words {
+            for &(index, _) in &word.letters {
+                if index_guards.insert(index, word.guard).is_some_and(|guard| guard != word.guard) {
+                    return None;
+                }
+            }
+        }
+        let mut guarded_indices = Vec::new();
+        for functional in &self.functionals {
+            let Functional::Element { array, index, start_index, .. } = functional else {
+                continue;
+            };
+            if !array.iter().any(|var| grid_vars.contains(var)) {
+                continue;
+            }
+            if array.as_slice() != grid || *start_index != 0 {
+                return None;
+            }
+            guarded_indices.push((*index, *index_guards.get(index)?));
+        }
+        guarded_indices.sort_unstable();
+        guarded_indices.dedup();
+        if guarded_indices.is_empty()
+            || words
+                .iter()
+                .flat_map(|word| word.letters.iter().map(|&(index, _)| index))
+                .any(|index| guarded_indices.binary_search_by_key(&index, |&(candidate, _)| candidate).is_err())
+        {
+            return None;
+        }
+
+        Some(GuardedLexPlan { grid: grid.to_vec(), deferred_constraints, permutations, guarded_indices })
+    }
+
+    fn canonicalize_guarded_grid(&self, assignment: &[i32], plan: &GuardedLexPlan, stop: &AtomicBool) -> Option<Vec<i32>> {
+        let old_grid = plan.grid.iter().map(|var| assignment[var.index()]).collect::<Vec<_>>();
+        let mut best: Option<(Vec<i32>, Vec<i32>)> = None;
+        for permutation in &plan.permutations {
+            if stop.load(Ordering::Relaxed) || permutation.len() != plan.grid.len() {
+                return None;
+            }
+            let mut inverse = vec![usize::MAX; permutation.len()];
+            let mut trial = assignment.to_vec();
+            let mut in_domain = true;
+            for (new_position, &old_position) in permutation.iter().enumerate() {
+                if old_position >= old_grid.len() || inverse[old_position] != usize::MAX {
+                    in_domain = false;
+                    break;
+                }
+                inverse[old_position] = new_position;
+                let variable = plan.grid[new_position];
+                let value = old_grid[old_position];
+                if !self.domains[variable.index()].contains(value) {
+                    in_domain = false;
+                    break;
+                }
+                trial[variable.index()] = value;
+            }
+            if !in_domain || inverse.contains(&usize::MAX) {
+                continue;
+            }
+            for &(index, guard) in &plan.guarded_indices {
+                if assignment[guard.index()] != 1 {
+                    continue;
+                }
+                let Ok(old_position) = usize::try_from(assignment[index.index()]) else {
+                    in_domain = false;
+                    break;
+                };
+                let Some(&new_position) = inverse.get(old_position) else {
+                    in_domain = false;
+                    break;
+                };
+                let Ok(value) = i32::try_from(new_position) else {
+                    in_domain = false;
+                    break;
+                };
+                if !self.domains[index.index()].contains(value) {
+                    in_domain = false;
+                    break;
+                }
+                trial[index.index()] = value;
+            }
+            if !in_domain || self.score(&mut trial).violation != 0 {
+                continue;
+            }
+            let grid_values = plan.grid.iter().map(|var| trial[var.index()]).collect::<Vec<_>>();
+            if best.as_ref().is_none_or(|(best_grid, _)| grid_values < *best_grid) {
+                best = Some((grid_values, trial));
+            }
+        }
+        best.map(|(_, assignment)| assignment)
+    }
+
+    fn improve_guarded_grid(
+        &self,
+        mut assignment: Vec<i32>,
+        words: &[GuardedWord<'_>],
+        seed: u64,
+        mismatch_aware: bool,
+        stop: &AtomicBool,
+    ) -> Vec<i32> {
+        let Some(grid) = words.first().map(|word| word.array) else {
+            return assignment;
+        };
+        if !mismatch_aware
+            || grid.len() > MAX_GUARDED_GRID_CELLS
+            || words.iter().any(|word| word.array != grid)
+            || stop.load(Ordering::Relaxed)
+        {
+            return assignment;
+        }
+
+        let mut alphabet = words.iter().flat_map(|word| word.letters.iter().map(|&(_, value)| value)).collect::<Vec<_>>();
+        alphabet.extend(grid.iter().map(|variable| assignment[variable.index()]));
+        alphabet.sort_unstable();
+        alphabet.dedup();
+        if alphabet.is_empty() {
+            return assignment;
+        }
+
+        let Some(mut evaluator) = GuardedGridEvaluator::new(self, &assignment, words) else {
+            return assignment;
+        };
+        let mut best_values = evaluator.values.clone();
+        let mut best_score = evaluator.score;
+        let mut weights = words.iter().map(|word| word.weight.max(1)).collect::<Vec<_>>();
+        weights.sort_unstable();
+        let temperature_scale = weights.get(weights.len() / 2).copied().unwrap_or(1).max(1);
+
+        // Each cycle starts from the best known grid at a high temperature and
+        // cools deterministically. This makes portfolio seeds meaningfully
+        // different while keeping a seed exactly reproducible.
+        for step in 0..GUARDED_GRID_ANNEAL_STEPS {
+            if step.is_multiple_of(256) && stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let cycle_step = step % GUARDED_GRID_ANNEAL_CYCLE;
+            if cycle_step == 0 {
+                evaluator.set_values(&best_values);
+            }
+            let random = mix64(seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA076_1D64_78BD_642F);
+            let cell = random as usize % grid.len();
+            let value = alphabet[mix64(random ^ 0xE703_7ED1_A0B4_28DB) as usize % alphabet.len()];
+            if value == evaluator.values[cell] || !self.domains[grid[cell].index()].contains(value) {
+                continue;
+            }
+
+            let old_value = evaluator.values[cell];
+            let delta = evaluator.apply_value(cell, value);
+            let accept = if delta >= 0 {
+                true
+            } else {
+                let remaining = GUARDED_GRID_ANNEAL_CYCLE - cycle_step;
+                let temperature = temperature_scale.saturating_mul(i64::try_from(remaining).unwrap_or(i64::MAX))
+                    / i64::try_from(GUARDED_GRID_ANNEAL_CYCLE).unwrap_or(1);
+                let loss = delta.saturating_neg();
+                let range = temperature.saturating_add(loss).max(1) as u64;
+                mix64(random ^ 0x8EBC_6AF0_9C88_C6E3) % range < temperature.max(0) as u64
+            };
+            if !accept {
+                evaluator.apply_value(cell, old_value);
+                continue;
+            }
+            if evaluator.score > best_score {
+                best_score = evaluator.score;
+                best_values.clone_from(&evaluator.values);
+            }
+        }
+
+        evaluator.set_values(&best_values);
+        for _ in 0..GUARDED_GRID_HILL_CLIMB_ROUNDS {
+            let mut changed = false;
+            for (cell, &variable) in grid.iter().enumerate() {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let old_value = evaluator.values[cell];
+                let mut chosen_value = old_value;
+                let mut chosen_score = evaluator.score;
+                for &value in &alphabet {
+                    if value == old_value || !self.domains[variable.index()].contains(value) {
+                        continue;
+                    }
+                    evaluator.apply_value(cell, value);
+                    if evaluator.score > chosen_score {
+                        chosen_score = evaluator.score;
+                        chosen_value = value;
+                    }
+                    evaluator.apply_value(cell, old_value);
+                }
+                if chosen_value != old_value {
+                    evaluator.apply_value(cell, chosen_value);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Single-cell local optima are common on the 3x3 and 4x4 variants.
+        // Exhaustive two-cell moves are still small at this deliberately tight
+        // grid limit and recover improvements that a blind random walk misses.
+        let pair_rounds = if grid.len() <= MAX_GUARDED_GRID_PAIR_CELLS { GUARDED_GRID_PAIR_ROUNDS } else { 0 };
+        for _ in 0..pair_rounds {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let baseline = evaluator.score;
+            let mut best_pair: Option<(i64, usize, i32, usize, i32)> = None;
+            for left in 0..grid.len() {
+                let old_left = evaluator.values[left];
+                for &left_value in &alphabet {
+                    if left_value == old_left || !self.domains[grid[left].index()].contains(left_value) {
+                        continue;
+                    }
+                    evaluator.apply_value(left, left_value);
+                    for (right, &right_variable) in grid.iter().enumerate().skip(left + 1) {
+                        let old_right = evaluator.values[right];
+                        for &right_value in &alphabet {
+                            if right_value == old_right || !self.domains[right_variable.index()].contains(right_value) {
+                                continue;
+                            }
+                            evaluator.apply_value(right, right_value);
+                            if evaluator.score > baseline && best_pair.as_ref().is_none_or(|(score, ..)| evaluator.score > *score) {
+                                best_pair = Some((evaluator.score, left, left_value, right, right_value));
+                            }
+                            evaluator.apply_value(right, old_right);
+                        }
+                    }
+                    evaluator.apply_value(left, old_left);
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+            let Some((_, left, left_value, right, right_value)) = best_pair else {
+                break;
+            };
+            evaluator.apply_value(left, left_value);
+            evaluator.apply_value(right, right_value);
+        }
+
+        if evaluator.score > best_score {
+            best_values.clone_from(&evaluator.values);
+        }
+        for (position, &variable) in grid.iter().enumerate() {
+            let value = best_values[position];
+            if self.domains[variable.index()].contains(value) {
+                assignment[variable.index()] = value;
             }
         }
         assignment
+    }
+
+    fn materialize_guarded_grid(
+        &self,
+        mut assignment: Vec<i32>,
+        words: &[GuardedWord<'_>],
+        ignored_constraints: &[usize],
+        stop: &AtomicBool,
+    ) -> Option<Vec<i32>> {
+        for word in words {
+            if !self.domains[word.guard.index()].contains(0) {
+                return None;
+            }
+            assignment[word.guard.index()] = 0;
+            for &(index, _) in &word.letters {
+                let domain = &self.domains[index.index()];
+                assignment[index.index()] = if domain.contains(0) { 0 } else { domain.min_value() };
+            }
+        }
+        for word in words {
+            let Some(cells) = self.trace_guarded_word(&assignment, word, stop) else {
+                continue;
+            };
+            if !self.domains[word.guard.index()].contains(1) {
+                return None;
+            }
+            assignment[word.guard.index()] = 1;
+            for (&cell, &(index, _)) in cells.iter().zip(&word.letters) {
+                let value = i32::try_from(cell).ok()?;
+                if !self.domains[index.index()].contains(value) {
+                    return None;
+                }
+                assignment[index.index()] = value;
+            }
+        }
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        (self.score_ignoring_constraints(&mut assignment, ignored_constraints).violation == 0).then_some(assignment)
+    }
+
+    fn trace_guarded_word(&self, assignment: &[i32], word: &GuardedWord<'_>, stop: &AtomicBool) -> Option<Vec<usize>> {
+        let mut state = WordTraceState { cells: vec![0; word.letters.len()], nodes: WORD_PLACEMENT_NODE_LIMIT, stop };
+        self.trace_guarded_letters(assignment, word, 0, None, word.max_mismatches, &mut state).then_some(state.cells)
+    }
+
+    fn trace_guarded_letters(
+        &self,
+        assignment: &[i32],
+        word: &GuardedWord<'_>,
+        pos: usize,
+        previous: Option<usize>,
+        mismatches_left: usize,
+        state: &mut WordTraceState<'_>,
+    ) -> bool {
+        if state.nodes == 0 || state.stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        state.nodes -= 1;
+        if pos == word.letters.len() {
+            return true;
+        }
+        let (index, value) = word.letters[pos];
+        for cell in (0..word.array.len()).rev() {
+            if previous == Some(cell) || !self.domains[index.index()].contains(cell as i32) {
+                continue;
+            }
+            if let Some(previous) = previous {
+                let previous_index = word.letters[pos - 1].0;
+                if !self.pair_allowed(previous_index, index, previous as i32, cell as i32) {
+                    continue;
+                }
+            }
+            let mismatch = usize::from(assignment[word.array[cell].index()] != value);
+            if mismatch > mismatches_left {
+                continue;
+            }
+            state.cells[pos] = cell;
+            if self.trace_guarded_letters(assignment, word, pos + 1, Some(cell), mismatches_left - mismatch, state) {
+                return true;
+            }
+        }
+        false
     }
 
     fn element_views(&self) -> ElementViews<'_> {
@@ -1112,6 +1934,7 @@ impl LocalModel {
 
     fn guarded_words<'a>(&self, elements: &ElementViews<'a>) -> Vec<GuardedWord<'a>> {
         let mut requirements: BTreeMap<VarId, Vec<(VarId, i32)>> = BTreeMap::new();
+        let mut max_mismatches = BTreeMap::new();
         for constraint in &self.constraints {
             match constraint {
                 LocalConstraint::Extension { vars, tuples } => {
@@ -1126,6 +1949,22 @@ impl LocalModel {
                 }
                 _ => {}
             }
+        }
+        for constraint in &self.constraints {
+            let LocalConstraint::Expr(expr) = constraint else {
+                continue;
+            };
+            let Some((guard, counter, allowed)) = guarded_mismatch_bound(expr) else {
+                continue;
+            };
+            if requirements.contains_key(&guard) {
+                continue;
+            }
+            let Some(letters) = mismatch_letters(&self.functionals, counter) else {
+                continue;
+            };
+            requirements.insert(guard, letters);
+            max_mismatches.insert(guard, allowed);
         }
 
         let mut words = Vec::new();
@@ -1157,40 +1996,74 @@ impl LocalModel {
             if let Some(array) = array {
                 if !letters.is_empty() && self.domains[guard.index()].contains(1) {
                     letters.sort_by_key(|&(index, _)| index.index());
-                    words.push(GuardedWord { guard, weight, array, letters });
+                    let max_mismatches = max_mismatches.get(&guard).copied().unwrap_or(0).min(letters.len());
+                    words.push(GuardedWord { guard, weight, array, letters, max_mismatches });
                 }
             }
         }
         words
     }
 
-    fn try_place_word(&self, assignment: &[i32], fixed: &[Option<i32>], word: &GuardedWord<'_>) -> Option<TrialPlacement> {
+    fn try_place_word(
+        &self,
+        assignment: &[i32],
+        fixed: &[Option<i32>],
+        word: &GuardedWord<'_>,
+        placement_seed: u64,
+        ignored_constraints: &[usize],
+        stop: &AtomicBool,
+    ) -> Option<TrialPlacement> {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
         let mut state = WordPlacementState {
+            assignment,
+            word,
+            ignored_constraints,
             values: vec![None; word.array.len()],
             cells: vec![0; word.letters.len()],
-            nodes: WORD_PLACEMENT_NODE_LIMIT,
+            nodes: WORD_PLACEMENT_EVALUATION_NODE_LIMIT,
+            placement_seed,
+            stop,
+            best: None,
         };
         for (cell, &var) in word.array.iter().enumerate() {
             state.values[cell] = fixed[var.index()];
         }
-        self.place_word_letters(assignment, word, 0, None, &mut state)
+        self.place_word_letters(0, None, word.max_mismatches, 0, &mut state);
+        state.best
     }
 
-    fn word_trial(&self, assignment: &[i32], word: &GuardedWord<'_>, values: &[Option<i32>], cells: &[usize]) -> Option<TrialPlacement> {
+    fn word_trial(
+        &self,
+        assignment: &[i32],
+        word: &GuardedWord<'_>,
+        values: &[Option<i32>],
+        cells: &[usize],
+        new_cells: usize,
+        ignored_constraints: &[usize],
+    ) -> Option<TrialPlacement> {
         let mut trial = assignment.to_vec();
         let mut placements = Vec::new();
         trial[word.guard.index()] = 1;
         for (cell, &value) in values.iter().enumerate() {
             if let Some(value) = value {
                 let x = word.array[cell];
+                if !self.domains[x.index()].contains(value) {
+                    return None;
+                }
                 trial[x.index()] = value;
                 placements.push((x, value));
             }
         }
         for (&cell, &(index, _)) in cells.iter().zip(&word.letters) {
-            trial[index.index()] = cell as i32;
+            trial[index.index()] = i32::try_from(cell).ok()?;
         }
-        self.lex_constraints_ok(&trial).then_some((trial, placements))
+        (self.score_ignoring_constraints(&mut trial, ignored_constraints).violation == 0).then_some(TrialPlacement {
+            assignment: trial,
+            placements,
+            new_cells,
+        })
     }
 
     fn lex_constraints_ok(&self, assignment: &[i32]) -> bool {
@@ -1215,53 +2088,160 @@ impl LocalModel {
 
     fn place_word_letters(
         &self,
-        assignment: &[i32],
-        word: &GuardedWord<'_>,
         pos: usize,
         previous: Option<usize>,
-        state: &mut WordPlacementState,
-    ) -> Option<TrialPlacement> {
-        if state.nodes == 0 {
-            return None;
+        mismatches_left: usize,
+        new_cells: usize,
+        state: &mut WordPlacementState<'_, '_>,
+    ) {
+        if state.nodes == 0
+            || state.stop.load(Ordering::Relaxed)
+            || state.best.as_ref().is_some_and(|candidate| new_cells >= candidate.new_cells)
+        {
+            return;
         }
         state.nodes -= 1;
-        if pos == word.letters.len() {
-            return self.word_trial(assignment, word, &state.values, &state.cells);
+        if pos == state.word.letters.len() {
+            if let Some(candidate) =
+                self.word_trial(state.assignment, state.word, &state.values, &state.cells, new_cells, state.ignored_constraints)
+            {
+                state.best = Some(candidate);
+            }
+            return;
         }
-        let (index, value) = word.letters[pos];
-        for cell in 0..word.array.len() {
-            if previous == Some(cell) || !self.domains[index.index()].contains(cell as i32) {
+        let (index, value) = state.word.letters[pos];
+        let cell_count = state.word.array.len();
+        let offset = if state.placement_seed == 0 {
+            0
+        } else {
+            mix64(state.placement_seed ^ pos as u64 ^ previous.unwrap_or(cell_count) as u64) as usize % cell_count
+        };
+
+        // Reusing an occupied matching cell has zero marginal cost and never
+        // consumes the mismatch allowance. Explore those branches first.
+        for rank in 0..cell_count {
+            let cell = (offset + rank) % cell_count;
+            if state.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            if !self.word_cell_allowed(state.word, pos, previous, index, cell) || state.values[cell] != Some(value) {
                 continue;
             }
-            if let Some(previous) = previous {
-                let previous_index = word.letters[pos - 1].0;
-                if !self.pair_allowed(previous_index, index, previous as i32, cell as i32) {
+            self.descend_word_cell(pos, cell, None, mismatches_left, new_cells, state);
+            if state.best.as_ref().is_some_and(|candidate| candidate.new_cells == new_cells) {
+                return;
+            }
+        }
+
+        // An already occupied mismatching cell also costs nothing, but spends
+        // one unit of an explicitly recognised mismatch budget.
+        if mismatches_left > 0 {
+            for rank in 0..cell_count {
+                let cell = (offset + rank) % cell_count;
+                if state.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let Some(old) = state.values[cell] else {
+                    continue;
+                };
+                if old == value || !self.word_cell_allowed(state.word, pos, previous, index, cell) {
                     continue;
                 }
-            }
-            match state.values[cell] {
-                Some(old) if old != value => continue,
-                Some(_) => {
-                    state.cells[pos] = cell;
-                    if let Some(trial) = self.place_word_letters(assignment, word, pos + 1, Some(cell), state) {
-                        return Some(trial);
-                    }
-                }
-                None => {
-                    let x = word.array[cell];
-                    if !self.domains[x.index()].contains(value) {
-                        continue;
-                    }
-                    state.values[cell] = Some(value);
-                    state.cells[pos] = cell;
-                    if let Some(trial) = self.place_word_letters(assignment, word, pos + 1, Some(cell), state) {
-                        return Some(trial);
-                    }
-                    state.values[cell] = None;
+                self.descend_word_cell(pos, cell, None, mismatches_left - 1, new_cells, state);
+                if state.best.as_ref().is_some_and(|candidate| candidate.new_cells == new_cells) {
+                    return;
                 }
             }
         }
-        None
+
+        // A free cell whose current value is already a permitted mismatch can
+        // be used without claiming it for later words.
+        if mismatches_left > 0 {
+            for rank in 0..cell_count {
+                let cell = (offset + rank) % cell_count;
+                if state.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let x = state.word.array[cell];
+                if state.values[cell].is_some()
+                    || state.assignment[x.index()] == value
+                    || !self.word_cell_allowed(state.word, pos, previous, index, cell)
+                {
+                    continue;
+                }
+                self.descend_word_cell(pos, cell, None, mismatches_left - 1, new_cells, state);
+                if state.best.as_ref().is_some_and(|candidate| candidate.new_cells == new_cells) {
+                    return;
+                }
+            }
+        }
+
+        // Exact placements on free cells add one newly occupied cell. The B&B
+        // keeps searching after the first leaf and retains the cheapest one.
+        for rank in 0..cell_count {
+            let cell = (offset + rank) % cell_count;
+            if state.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let x = state.word.array[cell];
+            if state.values[cell].is_some()
+                || !self.domains[x.index()].contains(value)
+                || !self.word_cell_allowed(state.word, pos, previous, index, cell)
+            {
+                continue;
+            }
+            self.descend_word_cell(pos, cell, Some(value), mismatches_left, new_cells + 1, state);
+        }
+
+        // If the current free-cell value equals the requested letter, create an
+        // explicit alternative only when consuming a mismatch is allowed.
+        if mismatches_left > 0 {
+            for rank in 0..cell_count {
+                let cell = (offset + rank) % cell_count;
+                if state.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let x = state.word.array[cell];
+                if state.values[cell].is_some()
+                    || state.assignment[x.index()] != value
+                    || !self.word_cell_allowed(state.word, pos, previous, index, cell)
+                {
+                    continue;
+                }
+                let Some(other) = self.domains[x.index()].first_value_except(value) else {
+                    continue;
+                };
+                self.descend_word_cell(pos, cell, Some(other), mismatches_left - 1, new_cells + 1, state);
+            }
+        }
+    }
+
+    fn word_cell_allowed(&self, word: &GuardedWord<'_>, pos: usize, previous: Option<usize>, index: VarId, cell: usize) -> bool {
+        if previous == Some(cell) || !self.domains[index.index()].contains(cell as i32) {
+            return false;
+        }
+        previous.is_none_or(|previous| {
+            let previous_index = word.letters[pos - 1].0;
+            self.pair_allowed(previous_index, index, previous as i32, cell as i32)
+        })
+    }
+
+    fn descend_word_cell(
+        &self,
+        pos: usize,
+        cell: usize,
+        set_value: Option<i32>,
+        mismatches_left: usize,
+        new_cells: usize,
+        state: &mut WordPlacementState<'_, '_>,
+    ) {
+        let old = state.values[cell];
+        if let Some(value) = set_value {
+            state.values[cell] = Some(value);
+        }
+        state.cells[pos] = cell;
+        self.place_word_letters(pos + 1, Some(cell), mismatches_left, new_cells, state);
+        state.values[cell] = old;
     }
 
     fn focused_repair_vars(&self, assignment: &[i32], seed: u64, iter: u64) -> Vec<VarId> {
@@ -1336,6 +2316,20 @@ impl LocalModel {
         let mut violation = i64::from(!self.complete(assignment)) * 1_000_000;
         for constraint in &self.constraints {
             violation = violation.saturating_add(self.violation(constraint, assignment));
+        }
+        let objective = self.objective_value(assignment).unwrap_or(i64::MAX / 4);
+        Score { violation, objective: if self.objective.minimizing() { objective } else { -objective } }
+    }
+
+    fn score_ignoring_constraints(&self, assignment: &mut [i32], ignored: &[usize]) -> Score {
+        if ignored.is_empty() {
+            return self.score(assignment);
+        }
+        let mut violation = i64::from(!self.complete(assignment)) * 1_000_000;
+        for (index, constraint) in self.constraints.iter().enumerate() {
+            if ignored.binary_search(&index).is_err() {
+                violation = violation.saturating_add(self.violation(constraint, assignment));
+            }
         }
         let objective = self.objective_value(assignment).unwrap_or(i64::MAX / 4);
         Score { violation, objective: if self.objective.minimizing() { objective } else { -objective } }
@@ -1820,6 +2814,27 @@ fn guarded_expr_parts(guard: &Expr, target: &Expr) -> Option<(VarId, VarId, i32)
     Some((guard, target, value))
 }
 
+fn guarded_mismatch_bound(expr: &Expr) -> Option<(VarId, VarId, usize)> {
+    let Expr::Or(terms) = expr else {
+        return None;
+    };
+    let [left, right] = terms.as_slice() else {
+        return None;
+    };
+    guarded_mismatch_parts(left, right).or_else(|| guarded_mismatch_parts(right, left))
+}
+
+fn guarded_mismatch_parts(guard: &Expr, bound: &Expr) -> Option<(VarId, VarId, usize)> {
+    let guard = eq_var_const(guard, 0)?;
+    let Expr::Le(left, right) = bound else {
+        return None;
+    };
+    let (Expr::Var(counter), Expr::Const(limit)) = (&**left, &**right) else {
+        return None;
+    };
+    Some((guard, *counter, usize::try_from(*limit).ok()?))
+}
+
 fn eq_var_const(expr: &Expr, expected: i64) -> Option<VarId> {
     let Expr::Eq(a, b) = expr else {
         return None;
@@ -1832,6 +2847,16 @@ fn eq_var_const(expr: &Expr, expected: i64) -> Option<VarId> {
 
 fn eq_var_any_const(expr: &Expr) -> Option<(VarId, i32)> {
     let Expr::Eq(a, b) = expr else {
+        return None;
+    };
+    match (&**a, &**b) {
+        (Expr::Var(var), Expr::Const(value)) | (Expr::Const(value), Expr::Var(var)) => to_i32(*value).map(|value| (*var, value)),
+        _ => None,
+    }
+}
+
+fn ne_var_any_const(expr: &Expr) -> Option<(VarId, i32)> {
+    let Expr::Ne(a, b) = expr else {
         return None;
     };
     match (&**a, &**b) {
@@ -2080,7 +3105,7 @@ where
     // Only mutated when `config.gls` is on; they persist across
     // restarts so effort keeps accumulating on the genuinely hard constraints.
     let mut weights: Vec<i64> = vec![1; model.constraints.len()];
-    let mut assignment = if constructive_start { model.constructive_assignment(seed) } else { model.random_assignment(seed) };
+    let mut assignment = if constructive_start { model.constructive_assignment(seed, stop) } else { model.random_assignment(seed) };
     let (mut current, mut con_viol, mut complete_now) = model.score_breakdown(&mut assignment, &weights);
     let mut viol_sum: i128 = weighted_sum(&con_viol, &weights);
     // Reusable scratch for trial moves; never reallocated inside the loop.
@@ -2122,8 +3147,11 @@ where
             if stagnant >= RESTART_AFTER {
                 restarts += 1;
                 let restart_seed = seed ^ mix64(iterations);
-                let mut trial =
-                    if constructive_start { model.constructive_assignment(restart_seed) } else { model.random_assignment(restart_seed) };
+                let mut trial = if constructive_start {
+                    model.constructive_assignment(restart_seed, stop)
+                } else {
+                    model.random_assignment(restart_seed)
+                };
                 let (mut trial_score, mut trial_con_viol, mut trial_complete) = model.score_breakdown(&mut trial, &weights);
                 let mut min_trial = model.min_assignment();
                 let (min_score, min_con_viol, min_complete) = model.score_breakdown(&mut min_trial, &weights);
@@ -2204,7 +3232,7 @@ where
                     }
                 }
                 KickOperator::Constructive => {
-                    let mut trial = model.constructive_assignment(seed ^ mix64(iterations));
+                    let mut trial = model.constructive_assignment(seed ^ mix64(iterations), stop);
                     let (score, trial_con_viol, trial_complete) = model.score_breakdown(&mut trial, &weights);
                     if score < current {
                         assignment = trial;
@@ -2234,7 +3262,7 @@ where
             restarts += 1;
             let restart_seed = seed ^ mix64(iterations);
             assignment =
-                if constructive_start { model.constructive_assignment(restart_seed) } else { model.random_assignment(restart_seed) };
+                if constructive_start { model.constructive_assignment(restart_seed, stop) } else { model.random_assignment(restart_seed) };
             (current, con_viol, complete_now) = model.score_breakdown(&mut assignment, &weights);
             viol_sum = weighted_sum(&con_viol, &weights);
             source = if constructive_start { "constructive" } else { "local-search" };
@@ -2243,7 +3271,7 @@ where
         }
 
         if constructive_start && iterations.is_multiple_of(CONSTRUCTIVE_KICK_PERIOD) {
-            let mut trial = model.constructive_assignment(seed ^ mix64(iterations));
+            let mut trial = model.constructive_assignment(seed ^ mix64(iterations), stop);
             let (score, trial_con_viol, trial_complete) = model.score_breakdown(&mut trial, &weights);
             if score < current {
                 assignment = trial;

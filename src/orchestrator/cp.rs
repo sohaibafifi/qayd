@@ -30,10 +30,16 @@ pub(crate) fn audit_cp_root_problem_clones() -> u64 {
     ROOT_PROBLEM_CLONES.get()
 }
 
+#[cfg(test)]
+pub(crate) fn audit_cp_repair_completion(complete: bool) -> Result<bool, SolveError> {
+    super::integer_ls::audit_cp_repair_completion(complete)
+}
+
 #[derive(Clone)]
 pub(crate) struct CpSolvePlan {
     compiled: CompiledCp,
     local_search: Option<super::integer_ls::IntegerLocalSearchPlan>,
+    guarded_warm_start: bool,
     mode: SolveMode,
     guidance: SearchGuidance,
     assumptions: Vec<super::SemanticAssumption>,
@@ -151,6 +157,15 @@ fn compile_cp_plan_inner(
     .ok_or_else(|| SolveError::Interrupted("solve budget expired during CP compilation".to_string()))?;
     validate_cp_controls(&compiled, request)?;
     let local_search = if request.mode == SolveMode::LocalSearch { Some(super::integer_ls::compile(effective, &compiled)?) } else { None };
+    let guarded_warm_start = request.mode != SolveMode::LocalSearch
+        && request.threads == 1
+        && request.limits.conflicts.is_none()
+        && request.cp == super::CpControls::default()
+        && request.assumptions.is_empty()
+        && request.hints.is_empty()
+        && request.primary_branch_scope.is_none()
+        && request.branch_order.is_empty()
+        && super::integer_ls::may_support_guarded_warm_start(effective);
     let (initial_phase, branch_order, primary_branch_scope) = compiled
         .search_guidance_interruptible(&request.hints, &request.branch_order, request.primary_branch_scope.as_deref(), budget.stop())
         .map_err(|error| SolveError::InvalidRequest(error.reason))?
@@ -158,6 +173,7 @@ fn compile_cp_plan_inner(
     Ok(CpSolvePlan {
         compiled,
         local_search,
+        guarded_warm_start,
         mode: request.mode,
         guidance: SearchGuidance { initial_phase, branch_order, primary_branch_scope },
         assumptions: request.assumptions.clone(),
@@ -261,7 +277,7 @@ fn solve_cp_plan_inner(
     let mut result = if let Some(local_search) = &plan.local_search {
         super::integer_ls::solve(model, &plan.compiled, local_search, request, budget, engine_stop, sink)?
     } else if !plan.compiled.objectives().is_empty() {
-        solve_lexicographic(LexicographicSolve { model, plan, request, budget, engine_stop, sink, started })?
+        solve_lexicographic(LexicographicSolve { model, plan, request, budget, engine_stop, sink })?
     } else {
         let options = portfolio::normalize_options(false, false, cp_options(request, request.seed, request.limits.conflicts));
         let problem = clone_problem(plan.compiled.problem());
@@ -318,12 +334,37 @@ struct LexicographicSolve<'a> {
     budget: &'a SolveBudget,
     engine_stop: &'a std::sync::atomic::AtomicBool,
     sink: &'a mut dyn EventSink,
-    started: Instant,
 }
 
 fn solve_lexicographic(context: LexicographicSolve<'_>) -> Result<SolveResult, SolveError> {
-    let LexicographicSolve { model, plan, request, budget, engine_stop, sink, started } = context;
+    let LexicographicSolve { model, plan, request, budget, engine_stop, sink } = context;
     let objective_count = plan.compiled.objectives().len();
+    let mut reports = Vec::new();
+    let mut initial_incumbent = None;
+    let mut primal = None;
+    if plan.guarded_warm_start && !budget.expired() {
+        if let Ok(warm_plan) = super::integer_ls::compile(model, &plan.compiled) {
+            if let Some(warm) = super::integer_ls::warm_start(model, &plan.compiled, &warm_plan, request, budget, engine_stop)? {
+                let candidate_control = sink.emit(SolveEvent::Candidate(warm.candidate.clone()))?;
+                let progress_control = if candidate_control == EventControl::Continue {
+                    sink.emit(SolveEvent::Progress {
+                        engine: EngineKind::IntegerLocalSearch,
+                        objectives: warm.candidate.objectives().to_vec(),
+                        elapsed: budget.elapsed(),
+                    })?
+                } else {
+                    EventControl::Stop
+                };
+                if progress_control == EventControl::Stop {
+                    budget.cancel_with(TerminationReason::EventSink);
+                }
+                primal = Some(promote_warm_candidate(&warm.candidate));
+                initial_incumbent = Some(portfolio::InitialIncumbent { solution: warm.physical_solution, value: warm.physical_objective });
+                reports.push(warm.report);
+            }
+        }
+    }
+    let exact_started = Instant::now();
     let mut problem = None;
     let mut output = Vec::new();
     let mut total_stats = SolveStats::default();
@@ -335,7 +376,6 @@ fn solve_lexicographic(context: LexicographicSolve<'_>) -> Result<SolveResult, S
     let mut remaining_conflicts = request.limits.conflicts;
     let mut proven_prefix = Vec::with_capacity(objective_count);
     let mut bounds = Vec::with_capacity(objective_count);
-    let mut primal = None;
     let mut complete = false;
     let mut unsatisfiable = false;
     let mut stopped_tier = None;
@@ -417,6 +457,7 @@ fn solve_lexicographic(context: LexicographicSolve<'_>) -> Result<SolveResult, S
                 &mut output,
                 options,
                 plan.guidance.clone(),
+                initial_incumbent.take(),
                 request.publish_incumbent_assignments,
                 &mut progress,
             )
@@ -453,6 +494,11 @@ fn solve_lexicographic(context: LexicographicSolve<'_>) -> Result<SolveResult, S
         }
 
         match (&outcome.best, outcome.proved) {
+            (None, true) if primal.is_some() => {
+                return Err(SolveError::InvalidResult(
+                    "CP root is inconsistent with a canonically verified warm-start incumbent".to_string(),
+                ));
+            }
             (None, true) if tier == 0 => {
                 unsatisfiable = true;
                 complete = true;
@@ -500,20 +546,24 @@ fn solve_lexicographic(context: LexicographicSolve<'_>) -> Result<SolveResult, S
         format!("CP lexicographic search stopped before proving tier {tier}: {reason:?}")
     });
 
-    Ok(SolveResult {
-        status,
-        primal,
-        bounds,
-        proof,
-        reports: vec![EngineReport {
-            engine: Some(EngineKind::IntegerExact),
-            search: total_stats,
-            elapsed: started.elapsed(),
-            improvements: total_stats.solutions,
-            metadata: cp_metadata(shared_clauses, imported_clauses, split_jobs, probe_stats, lns_stats),
-        }],
-        message,
-    })
+    reports.push(EngineReport {
+        engine: Some(EngineKind::IntegerExact),
+        search: total_stats,
+        elapsed: exact_started.elapsed(),
+        improvements: total_stats.solutions,
+        metadata: cp_metadata(shared_clauses, imported_clauses, split_jobs, probe_stats, lns_stats),
+    });
+
+    Ok(SolveResult { status, primal, bounds, proof, reports, message })
+}
+
+fn promote_warm_candidate(candidate: &CandidateSolution) -> CandidateSolution {
+    CandidateSolution::verified(
+        candidate.assignment().clone(),
+        candidate.objectives().to_vec(),
+        candidate.source(),
+        VerificationLevel::Final,
+    )
 }
 
 fn cp_options(request: &SolveRequest, seed: u64, conflict_limit: Option<u64>) -> RunOptions {

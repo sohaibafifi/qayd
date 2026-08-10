@@ -79,3 +79,29 @@ fn linear_objective_many_improvements_reaches_optimum() {
     assert!(out.contains("s OPTIMUM FOUND"), "{out}");
     assert!(out.contains("o 1110000"), "{out}");
 }
+
+#[test]
+fn wide_xcsp_sum_combines_duplicate_variables_without_changing_the_optimum() {
+    // The raw terms have a span far above the materialization threshold, but
+    // duplicate-variable cancellation reduces the objective to x + 2*y.
+    // With x+y >= 2, minimizing chooses x=2 and y=0 for objective value 2.
+    let xml = r#"
+      <instance format="XCSP3" type="COP">
+        <variables>
+          <var id="x"> 0..2 </var>
+          <var id="y"> 0..2 </var>
+        </variables>
+        <constraints>
+          <sum><list>x y</list><condition>(ge,2)</condition></sum>
+        </constraints>
+        <objectives>
+          <minimize type="sum">
+            <list>x x y y</list>
+            <coeffs>1000000 -999999 1000000 -999998</coeffs>
+          </minimize>
+        </objectives>
+      </instance>"#;
+    let out = run(xml).unwrap();
+    assert!(out.contains("s OPTIMUM FOUND"), "{out}");
+    assert!(out.contains("o 2"), "{out}");
+}

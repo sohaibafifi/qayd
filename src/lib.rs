@@ -98,6 +98,9 @@ mod lcg_atom_layout;
 #[path = "../tests/internal/lcg_conflict_budget.rs"]
 mod lcg_conflict_budget;
 #[cfg(test)]
+#[path = "../tests/internal/lcg_guarded_sum.rs"]
+mod lcg_guarded_sum;
+#[cfg(test)]
 #[path = "../tests/internal/lcg_objective_branching.rs"]
 mod lcg_objective_branching;
 #[cfg(test)]

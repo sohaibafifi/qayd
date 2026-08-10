@@ -165,3 +165,92 @@ fn repeated_extreme_linear_terms_keep_their_mathematical_direction() {
     );
     assert_eq!(first, Some((0, vec![0])));
 }
+
+#[test]
+fn nonlinear_objective_guidance_keeps_a_fast_feasibility_dive() {
+    let mut solver = Solver::new();
+    let x = solver.new_var_range(0, 1);
+    let y = solver.new_var_range(0, 1);
+    linear(&mut solver, &[1, 1], &[x, y], Relation::Eq, 1);
+    let search = [x, y];
+    let objective = Expr::And(vec![
+        Expr::Eq(Box::new(Expr::Var(x)), Box::new(Expr::Const(1))),
+        Expr::Eq(Box::new(Expr::Var(y)), Box::new(Expr::Const(0))),
+    ]);
+    let mut incumbents = Vec::new();
+    let _ = optimize_seeded(
+        &mut solver,
+        &search,
+        Objective::Expr(&objective),
+        false,
+        &AtomicBool::new(false),
+        0,
+        None,
+        None,
+        &[],
+        None,
+        Vec::new(),
+        Vec::new(),
+        |value, assignment| incumbents.push((value, assignment.to_vec())),
+    );
+
+    assert_eq!(incumbents.first(), Some(&(0, vec![0, 1])));
+    assert_eq!(incumbents.last(), Some(&(1, vec![1, 0])));
+}
+
+#[test]
+fn all_none_caller_phase_still_allows_the_guarded_objective_dive() {
+    let mut solver = Solver::new();
+    let x = solver.new_var_range(0, 1);
+    let y = solver.new_var_range(0, 1);
+    let search = [x, y];
+    let objective = Expr::Add(vec![Expr::And(vec![Expr::Not(Box::new(Expr::Var(x)))]), Expr::And(vec![Expr::Not(Box::new(Expr::Var(y)))])]);
+    let mut incumbents = Vec::new();
+    let _ = optimize_seeded(
+        &mut solver,
+        &search,
+        Objective::Expr(&objective),
+        true,
+        &AtomicBool::new(false),
+        0,
+        None,
+        None,
+        &[],
+        None,
+        vec![None; 2],
+        Vec::new(),
+        |value, assignment| incumbents.push((value, assignment.to_vec())),
+    );
+
+    assert_eq!(incumbents, vec![(2, vec![0, 0]), (0, vec![1, 1])]);
+}
+
+#[test]
+fn symbolic_objective_bound_does_not_enumerate_a_wide_domain() {
+    let mut solver = Solver::new();
+    let x = solver.new_var_range(0, i32::MAX);
+    let objective = Expr::Eq(Box::new(Expr::Var(x)), Box::new(Expr::Const(i64::from(i32::MAX))));
+    let stop = AtomicBool::new(false);
+    let mut first = None;
+    let (_, _, complete) = optimize_seeded(
+        &mut solver,
+        &[x],
+        Objective::Expr(&objective),
+        false,
+        &stop,
+        0,
+        None,
+        None,
+        &[],
+        None,
+        Vec::new(),
+        Vec::new(),
+        |value, _| {
+            first = Some(value);
+            stop.store(true, std::sync::atomic::Ordering::Release);
+        },
+    );
+
+    assert_eq!(first, Some(0));
+    assert!(!complete);
+}

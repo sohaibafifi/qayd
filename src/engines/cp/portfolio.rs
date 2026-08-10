@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use crate::ids::VarId;
 use crate::lcg::clause::{ClauseSharing, SharedClausePool};
+use crate::lcg::guarded_sum::GuardedSum;
 use crate::lcg::lit::Lit;
 use crate::lns::{fix_neighborhood, LnsState};
 use crate::orchestrator::{execute_workers, execute_workers_silent, merge_search_stats, EventControl, WorkerContext};
@@ -21,6 +22,13 @@ use crate::search::{
     probe_seeded_with_scope, split_cube_seeded_with_scope, Objective as SearchObjective, SolveStats,
 };
 use crate::store::Solver;
+
+const DIVERSIFIED_DIVE_CONFLICTS: u64 = 768;
+const GUARDED_SUM_DIVE_CONFLICTS: u64 = 4_096;
+const STANDARD_DIVE_OFFSETS: &[u64] = &[1];
+const GUARDED_SUM_DIVE_OFFSETS: &[u64] = &[1, 2, 4, 8];
+const MIN_DIVERSIFIED_DIVE_VARIABLES: usize = 64;
+const MIN_DIVERSIFIED_DIVE_OBJECTIVE_TERMS: usize = 32;
 
 /// Solver execution settings. Parallel search is opt-in with `workers > 1`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +70,54 @@ impl SearchGuidance {
     }
 }
 
+/// Select symbolic COPs where bounded seeded dives are cheap relative to the
+/// complete search. Compact guarded sums have their own specialized hint and
+/// benefit even below the generic size threshold. Explicitly bounded and
+/// user-directed searches retain their requested trajectory.
+pub(crate) fn uses_diversified_dive(problem: &Problem, options: RunOptions, guidance: &SearchGuidance) -> bool {
+    if options.workers != 1
+        || options.split
+        || options.probes != 0
+        || options.lns != 0
+        || options.conflict_limit.is_some()
+        || !guidance.is_empty()
+    {
+        return false;
+    }
+
+    if matches!(problem.objective.as_ref(), Some(Objective::Expr(true, expression)) if GuardedSum::compile(expression).is_some()) {
+        return true;
+    }
+    if problem.search.len() < MIN_DIVERSIFIED_DIVE_VARIABLES {
+        return false;
+    }
+
+    let objective_terms = match problem.objective.as_ref() {
+        Some(Objective::Linear(_, coefficients, _)) => coefficients.iter().filter(|&&coefficient| coefficient != 0).count(),
+        Some(Objective::Expr(_, expression)) => {
+            let mut variables = Vec::new();
+            expression.collect_vars(&mut variables);
+            variables.len()
+        }
+        Some(Objective::Var(_, _)) | None => 0,
+    };
+    objective_terms >= MIN_DIVERSIFIED_DIVE_OBJECTIVE_TERMS
+}
+
+fn diversified_dive_offsets(problem: &Problem) -> &'static [u64] {
+    match problem.objective.as_ref() {
+        Some(Objective::Expr(true, expression)) if GuardedSum::compile(expression).is_some() => GUARDED_SUM_DIVE_OFFSETS,
+        Some(_) | None => STANDARD_DIVE_OFFSETS,
+    }
+}
+
+fn diversified_dive_conflicts(problem: &Problem) -> u64 {
+    match problem.objective.as_ref() {
+        Some(Objective::Expr(true, expression)) if GuardedSum::compile(expression).is_some() => GUARDED_SUM_DIVE_CONFLICTS,
+        Some(_) | None => DIVERSIFIED_DIVE_CONFLICTS,
+    }
+}
+
 impl Default for RunOptions {
     fn default() -> Self {
         Self {
@@ -87,6 +143,14 @@ pub(crate) struct ParallelOutcome {
     pub(crate) split_jobs: Option<(u64, u64)>,
     pub(crate) probe_stats: Option<(u64, u64)>,
     pub(crate) lns_stats: Option<(u64, u64)>,
+}
+
+/// A feasible solution checked against the canonical model before entering
+/// the exact portfolio.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InitialIncumbent {
+    pub(crate) solution: Vec<i32>,
+    pub(crate) value: i64,
 }
 
 struct CopWorkerResult {
@@ -371,15 +435,19 @@ fn optimize_worker(
     clause_worker: Option<usize>,
     conflict_budget: Option<u64>,
     guidance: &SearchGuidance,
+    import_symbolic_incumbent: bool,
 ) -> (SolveStats, bool, bool) {
     let minimizing = objective.minimizing();
     let materialized = objective.var().is_some();
     let sharing = if materialized { clause_worker.map(|worker| ClauseSharing::new(Arc::clone(&shared.clauses), worker)) } else { None };
-    // Importing an incumbent while a symbolic objective-bound propagator is
-    // already active can invalidate that worker's root state. Symbolic workers
-    // therefore search independently and only merge their verified incumbents;
-    // materialized objectives retain cooperative bound and clause sharing.
-    let shared_bound = materialized.then_some(&shared.best);
+    // Concurrent symbolic workers must keep independent bound propagators. An
+    // exact worker may instead import a stable incumbent supplied before that
+    // worker starts. Use a snapshot so this exception cannot silently become
+    // asynchronous symbolic bound sharing if the caller later grows a worker.
+    // CopShared already reserves i64::MIN and i64::MAX as absence sentinels, so
+    // this path deliberately preserves its inability to import those values.
+    let symbolic_snapshot = (!materialized && import_symbolic_incumbent).then(|| AtomicI64::new(shared.best.load(Ordering::Acquire)));
+    let shared_bound = if materialized { Some(&shared.best) } else { symbolic_snapshot.as_ref() };
     let mut improved = false;
     let (_, stats, complete) = optimize_seeded_with_scope(
         solver,
@@ -656,9 +724,15 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
     w: &mut W,
     options: RunOptions,
     guidance: SearchGuidance,
+    initial_incumbent: Option<InitialIncumbent>,
     publish_incumbents: bool,
     on_improvement: &mut dyn FnMut(i64, Option<&[i32]>),
 ) -> Result<ParallelOutcome, String> {
+    if let Some(initial) = &initial_incumbent {
+        if initial.solution.len() != problem.search.len() {
+            return Err(format!("initial incumbent has {} values for {} search variables", initial.solution.len(), problem.search.len()));
+        }
+    }
     problem.solver.set_force_scope_reasons(options.force_scope_reasons);
     let minimizing = problem.objective_dir().expect("COP lost its objective");
     match prepare_root(&mut problem, stop) {
@@ -677,7 +751,7 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
         }
         RootPreparation::Interrupted => {
             return Ok(ParallelOutcome {
-                best: None,
+                best: initial_incumbent.as_ref().map(|initial| (initial.solution.clone(), initial.value)),
                 stats: SolveStats::default(),
                 proved: false,
                 shared_clauses: 0,
@@ -692,12 +766,15 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
     let (probe_lower, probe_upper) = var_objective
         .map(|(_, obj)| (problem.solver.store.min(obj) as i64, problem.solver.store.max(obj) as i64))
         .unwrap_or((i64::MIN, i64::MAX));
+    let initial_value = initial_incumbent.as_ref().map(|initial| initial.value);
+    let initial_solution = initial_incumbent.map(|initial| (initial.solution, initial.value));
+    let has_initial_incumbent = initial_solution.is_some();
     let cancel = Arc::new(AtomicBool::new(false));
     let shared = Arc::new(CopShared {
         cancel: Arc::clone(&cancel),
         proved: AtomicBool::new(false),
-        best: AtomicI64::new(if minimizing { i64::MAX } else { i64::MIN }),
-        solution: Mutex::new(None),
+        best: AtomicI64::new(initial_value.unwrap_or(if minimizing { i64::MAX } else { i64::MIN })),
+        solution: Mutex::new(initial_solution),
         clauses: Arc::new(SharedClausePool::with_capacity(options.shared_pool_capacity)),
         work: WorkQueue::new(),
         minimizing,
@@ -716,7 +793,9 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
     }
     let regular_workers = options.workers - options.probes - options.lns;
     let lns_end = regular_workers + options.lns;
-    let mut printed = None;
+    // The caller already published the verified warm start. Seed the progress
+    // filter so the portfolio only reports strict improvements over it.
+    let mut printed = initial_value;
 
     let execution = execute_workers(
         models,
@@ -735,9 +814,38 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
                 }
                 let vars = &model.search;
                 if !options.split {
+                    let diversified_dive = !has_initial_incumbent && uses_diversified_dive(&model, options, &guidance);
+                    let mut stats = SolveStats::default();
+                    if diversified_dive {
+                        let dive_conflicts = diversified_dive_conflicts(&model);
+                        for &seed_offset in diversified_dive_offsets(&model) {
+                            if context.is_cancelled() {
+                                break;
+                            }
+                            let mut solver = model.solver.clone();
+                            let source = WorkerSource { kind: "dive", worker: context.worker() };
+                            let (dive_stats, _, _) = optimize_worker_with_seed(
+                                &mut solver,
+                                vars,
+                                model.objective.clone().expect("COP lost its objective"),
+                                context.seed().wrapping_add(seed_offset),
+                                &shared,
+                                &context,
+                                source,
+                                None,
+                                Some(dive_conflicts),
+                                &guidance,
+                            );
+                            merge_search_stats(&mut stats, dive_stats);
+                        }
+                    }
+
+                    // The proof pass always starts from the immutable prepared
+                    // root. Completion of the bounded dive is deliberately
+                    // ignored, so only this unbounded pass can certify optimality.
                     let mut solver = std::mem::take(&mut model.solver);
                     let source = WorkerSource { kind: "portfolio", worker: context.worker() };
-                    let (stats, complete, _) = optimize_worker(
+                    let (exact_stats, complete, _) = optimize_worker(
                         &mut solver,
                         vars,
                         model.objective.clone().expect("COP lost its objective"),
@@ -747,7 +855,9 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
                         Some(context.worker()),
                         worker_conflict_quota(options.conflict_limit, context.worker(), regular_workers),
                         &guidance,
+                        diversified_dive || has_initial_incumbent,
                     );
+                    merge_search_stats(&mut stats, exact_stats);
                     if complete {
                         shared.proved.store(true, Ordering::Release);
                         shared.stop();

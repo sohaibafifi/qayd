@@ -2,6 +2,9 @@
 //! [`Expr::eval`] = exact value (`None` if undefined); [`Expr::bounds`] = sound
 //! interval (never narrower than reality), safe for disentailment.
 
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::ids::VarId;
 
 /// A node in an `intension` expression tree.
@@ -94,6 +97,34 @@ impl Expr {
                 e.collect_vars(out);
             }
         }
+    }
+
+    /// Return this expression's exact affine form when all coefficients and
+    /// the constant fit in `i64`.
+    ///
+    /// Duplicate variables are combined and zero coefficients are omitted.
+    /// Intermediate arithmetic uses checked `i128` operations, so an
+    /// expression that cannot be represented safely is left symbolic by its
+    /// caller instead of wrapping. `None` also reports cancellation through
+    /// `stop`; callers that need to distinguish it from a non-affine
+    /// expression can inspect the flag.
+    pub(crate) fn affine_form_interruptible(&self, stop: &AtomicBool) -> Option<(i64, Vec<i64>, Vec<VarId>)> {
+        let form = AffineForm::from_expr(self, stop)?;
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+
+        let constant = i64::try_from(form.constant).ok()?;
+        let mut coefficients = Vec::with_capacity(form.terms.len());
+        let mut variables = Vec::with_capacity(form.terms.len());
+        for (variable, coefficient) in form.terms {
+            if stop.load(Ordering::Acquire) {
+                return None;
+            }
+            coefficients.push(i64::try_from(coefficient).ok()?);
+            variables.push(variable);
+        }
+        Some((constant, coefficients, variables))
     }
 
     /// Exact evaluation under a total assignment. `None` if undefined.
@@ -348,6 +379,101 @@ impl Expr {
                     (tl.min(el), th.max(eh))
                 }
             },
+        }
+    }
+}
+
+#[derive(Default)]
+struct AffineForm {
+    constant: i128,
+    terms: BTreeMap<VarId, i128>,
+}
+
+impl AffineForm {
+    fn from_expr(expression: &Expr, stop: &AtomicBool) -> Option<Self> {
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        match expression {
+            Expr::Const(value) => Some(Self { constant: i128::from(*value), terms: BTreeMap::new() }),
+            Expr::Var(variable) => Some(Self { constant: 0, terms: BTreeMap::from([(*variable, 1)]) }),
+            Expr::Neg(value) => Self::from_expr(value, stop)?.checked_scale(-1),
+            Expr::Add(values) => {
+                let mut sum = Self::default();
+                for value in values {
+                    if stop.load(Ordering::Acquire) {
+                        return None;
+                    }
+                    sum.checked_add_scaled(Self::from_expr(value, stop)?, 1)?;
+                }
+                Some(sum)
+            }
+            Expr::Sub(left, right) => {
+                let mut difference = Self::from_expr(left, stop)?;
+                difference.checked_add_scaled(Self::from_expr(right, stop)?, -1)?;
+                Some(difference)
+            }
+            Expr::Mul(values) => {
+                let mut product = Self { constant: 1, terms: BTreeMap::new() };
+                for value in values {
+                    if stop.load(Ordering::Acquire) {
+                        return None;
+                    }
+                    product = product.checked_mul(Self::from_expr(value, stop)?)?;
+                }
+                Some(product)
+            }
+            Expr::Abs(_)
+            | Expr::Div(_, _)
+            | Expr::Mod(_, _)
+            | Expr::Min(_)
+            | Expr::Max(_)
+            | Expr::Eq(_, _)
+            | Expr::Ne(_, _)
+            | Expr::Lt(_, _)
+            | Expr::Le(_, _)
+            | Expr::Gt(_, _)
+            | Expr::Ge(_, _)
+            | Expr::Not(_)
+            | Expr::And(_)
+            | Expr::Or(_)
+            | Expr::Imp(_, _)
+            | Expr::Iff(_, _)
+            | Expr::IfThenElse(_, _, _) => None,
+        }
+    }
+
+    fn checked_add_scaled(&mut self, other: Self, scale: i128) -> Option<()> {
+        self.constant = self.constant.checked_add(other.constant.checked_mul(scale)?)?;
+        for (variable, coefficient) in other.terms {
+            let scaled = coefficient.checked_mul(scale)?;
+            let combined = self.terms.get(&variable).copied().unwrap_or(0).checked_add(scaled)?;
+            if combined == 0 {
+                self.terms.remove(&variable);
+            } else {
+                self.terms.insert(variable, combined);
+            }
+        }
+        Some(())
+    }
+
+    fn checked_scale(mut self, scale: i128) -> Option<Self> {
+        self.constant = self.constant.checked_mul(scale)?;
+        if scale == 0 {
+            self.terms.clear();
+            return Some(self);
+        }
+        for coefficient in self.terms.values_mut() {
+            *coefficient = coefficient.checked_mul(scale)?;
+        }
+        Some(self)
+    }
+
+    fn checked_mul(self, other: Self) -> Option<Self> {
+        match (self.terms.is_empty(), other.terms.is_empty()) {
+            (false, false) => None,
+            (_, true) => self.checked_scale(other.constant),
+            (true, false) => other.checked_scale(self.constant),
         }
     }
 }

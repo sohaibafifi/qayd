@@ -8,6 +8,7 @@ use crate::orchestrator::{
     audit_cp_root_problem_clones, compile_cp_plan, solve_cp_plan, IgnoreEvents, SolveBudget, SolveError, SolveLimits, SolveRequest,
     SolveStatus,
 };
+use crate::problem::Objective as PhysicalObjective;
 use crate::Solver;
 
 #[test]
@@ -129,6 +130,59 @@ fn flat_expression_lowering_stops_while_collecting_operands() {
     });
 
     assert!(result.unwrap().is_none());
+}
+
+#[test]
+fn affine_cp_objective_is_normalized_and_duplicate_terms_are_combined() {
+    let mut model = Model::new();
+    let x = model.bool_var();
+    let y = model.bool_var();
+    let expression = IntExpr::Sub(
+        Box::new(IntExpr::Add(vec![
+            IntExpr::Constant(7),
+            IntExpr::Mul(vec![IntExpr::Constant(2), IntExpr::Variable(x)]),
+            IntExpr::Neg(Box::new(IntExpr::Variable(x))),
+            IntExpr::Variable(y),
+            IntExpr::Variable(y),
+        ])),
+        Box::new(IntExpr::Add(vec![
+            IntExpr::Constant(7),
+            IntExpr::Neg(Box::new(IntExpr::Mul(vec![IntExpr::Constant(2), IntExpr::Variable(x)]))),
+            IntExpr::Mul(vec![IntExpr::Constant(2), IntExpr::Constant(3), IntExpr::Variable(y)]),
+        ])),
+    );
+    model.add_objective(Objective::IntExpr { minimize: true, expr: expression });
+
+    let compiled = CompiledCp::compile_interruptible(&model, &AtomicBool::new(false)).unwrap().unwrap();
+
+    let PhysicalObjective::Linear(minimize, coefficients, variables) = &compiled.objectives()[0] else {
+        panic!("zero-constant affine objective was not normalized");
+    };
+    assert!(*minimize);
+    assert_eq!(coefficients, &[3, -4]);
+    assert_eq!(variables, compiled.int_variables());
+}
+
+#[test]
+fn cp_objective_linearization_safely_preserves_unsupported_expressions() {
+    let mut model = Model::new();
+    let x = model.bool_var();
+    let y = model.bool_var();
+    model.add_objective(Objective::IntExpr { minimize: true, expr: IntExpr::Add(vec![IntExpr::Variable(x), IntExpr::Constant(1)]) });
+    model.add_objective(Objective::IntExpr { minimize: true, expr: IntExpr::Mul(vec![IntExpr::Variable(x), IntExpr::Variable(y)]) });
+    model.add_objective(Objective::IntExpr {
+        minimize: true,
+        expr: IntExpr::Add(vec![
+            IntExpr::Mul(vec![IntExpr::Constant(i64::MAX), IntExpr::Variable(x)]),
+            IntExpr::Mul(vec![IntExpr::Constant(2), IntExpr::Variable(x)]),
+        ]),
+    });
+
+    let compiled = CompiledCp::compile_interruptible(&model, &AtomicBool::new(false)).unwrap().unwrap();
+
+    assert!(matches!(compiled.objectives()[0], PhysicalObjective::Expr(true, _)));
+    assert!(matches!(compiled.objectives()[1], PhysicalObjective::Expr(true, _)));
+    assert!(matches!(compiled.objectives()[2], PhysicalObjective::Expr(true, _)));
 }
 
 #[test]
