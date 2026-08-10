@@ -92,8 +92,14 @@ mod collection;
 #[path = "../tests/internal/cp_compile_interruption.rs"]
 mod cp_compile_interruption;
 #[cfg(test)]
+#[path = "../tests/internal/lcg_atom_layout.rs"]
+mod lcg_atom_layout;
+#[cfg(test)]
 #[path = "../tests/internal/lcg_conflict_budget.rs"]
 mod lcg_conflict_budget;
+#[cfg(test)]
+#[path = "../tests/internal/lcg_objective_branching.rs"]
+mod lcg_objective_branching;
 #[cfg(test)]
 #[path = "../tests/internal/list_alns_phase4.rs"]
 mod list_alns_phase4;

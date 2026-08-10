@@ -7,7 +7,6 @@
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
-use crate::constraints::linear::clamp_i32;
 use crate::expr;
 use crate::expr::Expr;
 use crate::ids::{PropId, VarId};
@@ -52,27 +51,87 @@ impl Objective<'_> {
 
 struct ObjectiveImpact {
     coeffs: Vec<u64>,
+    directions: Vec<i8>,
+}
+
+fn constant_expr_value(expression: &Expr) -> Option<i128> {
+    match expression {
+        Expr::Const(value) => Some(i128::from(*value)),
+        Expr::Neg(value) => constant_expr_value(value)?.checked_neg(),
+        Expr::Add(values) => values.iter().try_fold(0i128, |sum, value| sum.checked_add(constant_expr_value(value)?)),
+        Expr::Sub(left, right) => constant_expr_value(left)?.checked_sub(constant_expr_value(right)?),
+        Expr::Mul(values) => values.iter().try_fold(1i128, |product, value| product.checked_mul(constant_expr_value(value)?)),
+        _ => None,
+    }
+}
+
+/// Accumulate exact affine coefficients without allocating a second expression
+/// tree. This is deliberately a value-ordering hint only: nonlinear or
+/// overflowing expressions keep the regular seeded polarity.
+fn affine_expr_directions(expression: &Expr, factor: i128, directions: &mut [i128]) -> bool {
+    match expression {
+        Expr::Const(_) => true,
+        Expr::Var(variable) => {
+            let Some(value) = directions[variable.index()].checked_add(factor) else {
+                return false;
+            };
+            directions[variable.index()] = value;
+            true
+        }
+        Expr::Neg(value) => factor.checked_neg().is_some_and(|factor| affine_expr_directions(value, factor, directions)),
+        Expr::Add(values) => values.iter().all(|value| affine_expr_directions(value, factor, directions)),
+        Expr::Sub(left, right) => {
+            affine_expr_directions(left, factor, directions)
+                && factor.checked_neg().is_some_and(|factor| affine_expr_directions(right, factor, directions))
+        }
+        Expr::Mul(values) => {
+            let mut scaled = factor;
+            let mut nonconstant = None;
+            for value in values {
+                if let Some(constant) = constant_expr_value(value) {
+                    let Some(next) = scaled.checked_mul(constant) else {
+                        return false;
+                    };
+                    scaled = next;
+                } else if nonconstant.replace(value).is_some() {
+                    return false;
+                }
+            }
+            nonconstant.is_none_or(|value| affine_expr_directions(value, scaled, directions))
+        }
+        _ => false,
+    }
 }
 
 impl ObjectiveImpact {
     fn new(objective: Objective<'_>, nvars: usize, minimizing: bool) -> Option<Self> {
         let mut impact = vec![0u64; nvars];
-        let mut signed = vec![0i64; nvars];
+        let mut signed = vec![0i128; nvars];
         match objective {
             Objective::Var(var) => {
+                // A materialized objective is often an auxiliary constrained by
+                // the real decisions. Guide its value when it is selected, but
+                // do not force it ahead of the feasibility heuristic.
                 impact[var.index()] = 0;
                 signed[var.index()] = if minimizing { 1 } else { -1 };
             }
             Objective::Linear { coeffs, vars } => {
                 for (&coeff, &var) in coeffs.iter().zip(vars) {
                     impact[var.index()] = impact[var.index()].saturating_add(coeff.unsigned_abs());
-                    let directed = if minimizing { coeff } else { coeff.saturating_neg() };
-                    signed[var.index()] = signed[var.index()].saturating_add(directed);
+                    let directed = if minimizing { i128::from(coeff) } else { -i128::from(coeff) };
+                    signed[var.index()] = signed[var.index()].checked_add(directed)?;
                 }
             }
-            Objective::Expr(_) => return None,
+            Objective::Expr(expression) => {
+                let factor = if minimizing { 1 } else { -1 };
+                if !affine_expr_directions(expression, factor, &mut signed) {
+                    return None;
+                }
+            }
         }
-        (impact.iter().any(|&coeff| coeff > 0) || signed.iter().any(|&coeff| coeff != 0)).then_some(Self { coeffs: impact })
+        let has_direction = signed.iter().any(|&coeff| coeff != 0);
+        let directions = signed.into_iter().map(|coeff| coeff.signum() as i8).collect();
+        (impact.iter().any(|&coeff| coeff > 0) || has_direction).then_some(Self { coeffs: impact, directions })
     }
 
     fn score(&self, solver: &Solver, var: VarId) -> u128 {
@@ -82,6 +141,18 @@ impl ObjectiveImpact {
         }
         let width = i64::from(solver.store.max(var)) - i64::from(solver.store.min(var));
         coeff.saturating_mul(width.max(0) as u128)
+    }
+
+    /// Preferred endpoint for a variable whose net objective contribution has
+    /// a direction. Positive means that smaller values improve the objective;
+    /// negative means that larger values do. Repeated terms that cancel leave
+    /// value selection to the regular seeded polarity.
+    fn prefers_max(&self, var: VarId) -> Option<bool> {
+        match self.directions[var.index()].cmp(&0) {
+            std::cmp::Ordering::Less => Some(true),
+            std::cmp::Ordering::Greater => Some(false),
+            std::cmp::Ordering::Equal => None,
+        }
     }
 }
 
@@ -132,13 +203,31 @@ impl Cdcl<'_> {
         best_objective.or(best)
     }
 
+    /// Select from the semantic primary scope until it is exhausted, then
+    /// complete the full assignment. Explicit branch order is evaluated only
+    /// inside the active phase, so it cannot pull a completion variable ahead
+    /// of an unfixed primary variable.
+    fn select_branch_var(
+        &self,
+        vars: &[VarId],
+        primary_branch_scope: Option<&[VarId]>,
+        objective: Option<&ObjectiveImpact>,
+    ) -> Option<VarId> {
+        if let Some(primary) = primary_branch_scope {
+            if let Some(variable) = self.select_var(primary, objective) {
+                return Some(variable);
+            }
+        }
+        self.select_var(vars, objective)
+    }
+
     /// The decision literal for `v`: `[v = p]` toward the saved phase `p` when it
     /// is still in the domain (skipped on a rephasing segment), else a polarity
     /// endpoint chosen by [`rephase_value`](Self::rephase_value).
-    fn decision_lit(&self, v: VarId, phase: &[Option<i32>]) -> Lit {
+    fn decision_lit(&self, v: VarId, phase: &[Option<i32>], objective: Option<&ObjectiveImpact>) -> Lit {
         let val = match phase[v.index()] {
             Some(p) if self.rephase_mode == 0 && self.solver.store.contains(v, p) => p,
-            _ => self.rephase_value(v),
+            _ => self.rephase_value(v, objective),
         };
         match self.atoms.eq(v, val) {
             LitOrConst::Lit(l) => l,
@@ -149,9 +238,17 @@ impl Cdcl<'_> {
     }
 
     /// The domain endpoint to branch to when no saved phase applies: the
-    /// seed-dependent endpoint by default, inverted on a rephasing segment.
-    fn rephase_value(&self, v: VarId) -> i32 {
-        let default_max = self.seed != 0 && mix64(self.seed ^ v.0 as u64) & 1 != 0;
+    /// objective-improving endpoint when available, otherwise the seed-dependent
+    /// endpoint. Both are inverted on a rephasing segment.
+    fn rephase_value(&self, v: VarId, objective: Option<&ObjectiveImpact>) -> i32 {
+        // Three seed classes exploit the improving endpoint. The fourth
+        // deliberately explores its opposite, so symbolic-objective portfolio
+        // workers do not all traverse the same deterministic tree.
+        let objective_preference =
+            objective
+                .and_then(|impact| impact.prefers_max(v))
+                .map(|prefers_max| if self.seed & 3 == 1 { !prefers_max } else { prefers_max });
+        let default_max = objective_preference.unwrap_or_else(|| self.seed != 0 && mix64(self.seed ^ v.0 as u64) & 1 != 0);
         let want_max = default_max ^ (self.rephase_mode != 0);
         if want_max {
             self.solver.store.max(v)
@@ -191,12 +288,18 @@ impl Cdcl<'_> {
     /// constraints) can drop sibling solutions when enumerating.
     // TODO(strong): a sound CDCL enumeration (restart-per-solution with blocking
     // clauses kept out of analysis, or dual reasoning) would prune harder.
-    pub fn enumerate<F>(&mut self, vars: &[VarId], mut on_solution: F, stop: &AtomicBool) -> SolveStats
+    pub fn enumerate<F>(
+        &mut self,
+        vars: &[VarId],
+        primary_branch_scope: Option<&[VarId]>,
+        mut on_solution: F,
+        stop: &AtomicBool,
+    ) -> SolveStats
     where
         F: FnMut(&Solver) -> SearchControl,
     {
         let mut stats = SolveStats::default();
-        if !self.init() || !self.root_probe(vars) {
+        if !self.init() || !self.root_probe(primary_branch_scope.unwrap_or(vars)) {
             stats.failures = self.conflicts;
             self.copy_inprocessing_stats(&mut stats);
             return stats; // root unsatisfiable
@@ -207,7 +310,7 @@ impl Cdcl<'_> {
                 break;
             }
             match self.propagate() {
-                Ok(()) => match self.select_var(vars, None) {
+                Ok(()) => match self.select_branch_var(vars, primary_branch_scope, None) {
                     None => {
                         // Full assignment.
                         for &v in vars {
@@ -223,7 +326,7 @@ impl Cdcl<'_> {
                     }
                     Some(v) => {
                         stats.nodes += 1;
-                        let lit = self.decision_lit(v, &phase);
+                        let lit = self.decision_lit(v, &phase, None);
                         self.decide(lit).expect("in-domain decision cannot fail");
                     }
                 },
@@ -314,7 +417,17 @@ impl Cdcl<'_> {
                     }
                     None => {
                         let atom = Arc::new(AtomicI64::new(c));
-                        let coeffs = if minimizing { coeffs.to_vec() } else { coeffs.iter().map(|&a| -a).collect() };
+                        let coeffs = coeffs
+                            .iter()
+                            .map(|&coefficient| {
+                                let coefficient = i128::from(coefficient);
+                                if minimizing {
+                                    coefficient
+                                } else {
+                                    -coefficient
+                                }
+                            })
+                            .collect();
                         let id = self.solver.post(Box::new(ObjLinearLeq::new(coeffs, vars, Arc::clone(&atom))));
                         cell.handle = Some((id, atom));
                     }
@@ -374,18 +487,20 @@ impl Cdcl<'_> {
     }
 
     /// Pick one binary split for a cube, or `None` when it is already terminal.
-    pub(crate) fn split_cube(&mut self, vars: &[VarId], cube: &[Lit]) -> Option<Lit> {
+    pub(crate) fn split_cube(&mut self, vars: &[VarId], primary_branch_scope: Option<&[VarId]>, cube: &[Lit]) -> Option<Lit> {
         if self.stopped() || !self.init() || !self.assume_cube(cube) || self.stopped() {
             return None;
         }
         let phase = vec![None; self.solver.store.num_vars()];
-        self.select_var(vars, None).map(|v| self.decision_lit(v, &phase))
+        let split_scope = primary_branch_scope.unwrap_or(vars);
+        self.select_var(split_scope, None).map(|v| self.decision_lit(v, &phase, None))
     }
 
     /// Find one solution under an optimistic objective bound.
     pub(crate) fn probe(
         &mut self,
         vars: &[VarId],
+        primary_branch_scope: Option<&[VarId]>,
         obj: VarId,
         minimizing: bool,
         target: i32,
@@ -407,7 +522,7 @@ impl Cdcl<'_> {
             if !self.maybe_restart() {
                 break None;
             }
-            match self.select_var(vars, None) {
+            match self.select_branch_var(vars, primary_branch_scope, None) {
                 None => {
                     stats.solutions += 1;
                     let value = self.solver.store.value(obj);
@@ -416,7 +531,7 @@ impl Cdcl<'_> {
                 }
                 Some(v) => {
                     stats.nodes += 1;
-                    let lit = self.decision_lit(v, &phase);
+                    let lit = self.decision_lit(v, &phase, None);
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
                         break None;
@@ -462,6 +577,7 @@ impl Cdcl<'_> {
     pub(crate) fn optimize<F: FnMut(i64, &[i32])>(
         &mut self,
         vars: &[VarId],
+        primary_branch_scope: Option<&[VarId]>,
         objective: Objective<'_>,
         minimizing: bool,
         stop: &AtomicBool,
@@ -470,13 +586,24 @@ impl Cdcl<'_> {
         conflict_budget: Option<u64>,
         mut on_improve: F,
     ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
-        self.optimize_with_mode(vars, objective, minimizing, stop, shared_bound, cube, conflict_budget, &mut on_improve)
+        self.optimize_with_mode(
+            vars,
+            primary_branch_scope,
+            objective,
+            minimizing,
+            stop,
+            shared_bound,
+            cube,
+            conflict_budget,
+            &mut on_improve,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
     fn optimize_with_mode<F: FnMut(i64, &[i32])>(
         &mut self,
         vars: &[VarId],
+        primary_branch_scope: Option<&[VarId]>,
         objective: Objective<'_>,
         minimizing: bool,
         stop: &AtomicBool,
@@ -496,7 +623,7 @@ impl Cdcl<'_> {
             self.copy_inprocessing_stats(&mut stats);
             return (best, stats, !self.conflict_budget_exhausted());
         }
-        if cube.is_empty() && conflict_budget.is_none() && !self.root_probe(vars) {
+        if cube.is_empty() && conflict_budget.is_none() && !self.root_probe(primary_branch_scope.unwrap_or(vars)) {
             stats.failures = self.conflicts;
             self.copy_inprocessing_stats(&mut stats);
             return (best, stats, true);
@@ -549,7 +676,7 @@ impl Cdcl<'_> {
                 }
                 break;
             }
-            match self.select_var(vars, objective_impact.as_ref()) {
+            match self.select_branch_var(vars, primary_branch_scope, objective_impact.as_ref()) {
                 None => {
                     let keep_searching = self.accept_solution(
                         vars,
@@ -571,7 +698,7 @@ impl Cdcl<'_> {
                 }
                 Some(v) => {
                     stats.nodes += 1;
-                    let lit = self.decision_lit(v, &phase);
+                    let lit = self.decision_lit(v, &phase, objective_impact.as_ref());
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
                         if self.conflict_budget_exhausted() {
@@ -590,9 +717,14 @@ impl Cdcl<'_> {
     /// CDCL decision driver for CSP: find one solution or prove UNSAT.
     /// It never posts solution-blocking clauses, so learned clauses remain
     /// consequences of the model. Use enumeration for counting/all-solutions.
-    pub(crate) fn decide_sat(&mut self, vars: &[VarId], stop: &AtomicBool) -> (Option<Vec<i32>>, SolveStats, bool) {
+    pub(crate) fn decide_sat(
+        &mut self,
+        vars: &[VarId],
+        primary_branch_scope: Option<&[VarId]>,
+        stop: &AtomicBool,
+    ) -> (Option<Vec<i32>>, SolveStats, bool) {
         let mut stats = SolveStats::default();
-        if !self.init() || !self.root_probe(vars) || !self.sync_shared_clauses() {
+        if !self.init() || !self.root_probe(primary_branch_scope.unwrap_or(vars)) || !self.sync_shared_clauses() {
             stats.failures = self.conflicts;
             self.copy_inprocessing_stats(&mut stats);
             return (None, stats, true);
@@ -609,14 +741,14 @@ impl Cdcl<'_> {
             if !self.maybe_restart() {
                 break None;
             }
-            match self.select_var(vars, None) {
+            match self.select_branch_var(vars, primary_branch_scope, None) {
                 None => {
                     stats.solutions += 1;
                     break Some(vars.iter().map(|&v| self.solver.store.value(v)).collect());
                 }
                 Some(v) => {
                     stats.nodes += 1;
-                    let lit = self.decision_lit(v, &self.saved_phase);
+                    let lit = self.decision_lit(v, &self.saved_phase, None);
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
                         break None;
@@ -634,6 +766,7 @@ impl Cdcl<'_> {
     pub(crate) fn decide_sat_assuming(
         &mut self,
         vars: &[VarId],
+        primary_branch_scope: Option<&[VarId]>,
         cube: &[Lit],
         conflict_budget: Option<u64>,
         stop: &AtomicBool,
@@ -658,14 +791,14 @@ impl Cdcl<'_> {
                 complete = !self.conflict_budget_exhausted();
                 break None;
             }
-            match self.select_var(vars, None) {
+            match self.select_branch_var(vars, primary_branch_scope, None) {
                 None => {
                     stats.solutions += 1;
                     break Some(vars.iter().map(|&v| self.solver.store.value(v)).collect());
                 }
                 Some(v) => {
                     stats.nodes += 1;
-                    let lit = self.decision_lit(v, &self.saved_phase);
+                    let lit = self.decision_lit(v, &self.saved_phase, None);
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
                         complete = !self.conflict_budget_exhausted();
@@ -738,7 +871,7 @@ impl Cdcl<'_> {
             match self.select_var(vars, None) {
                 None => return AssumptionOutcome::Sat(vars.iter().map(|&v| self.solver.store.value(v)).collect()),
                 Some(v) => {
-                    let lit = self.decision_lit(v, &self.saved_phase);
+                    let lit = self.decision_lit(v, &self.saved_phase, None);
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
                         self.backjump_to(0);
@@ -766,14 +899,14 @@ struct ObjBoundCell {
 /// `LinearLeq`; the only difference is the mutable rhs.
 #[derive(Clone)]
 struct ObjLinearLeq {
-    coeffs: Vec<i64>,
+    coeffs: Vec<i128>,
     vars: Vec<VarId>,
     bound: Arc<AtomicI64>,
-    term_min: Vec<i64>,
+    term_min: Vec<i128>,
 }
 
 impl ObjLinearLeq {
-    fn new(coeffs: Vec<i64>, vars: &[VarId], bound: Arc<AtomicI64>) -> Self {
+    fn new(coeffs: Vec<i128>, vars: &[VarId], bound: Arc<AtomicI64>) -> Self {
         let n = vars.len();
         Self { coeffs, vars: vars.to_vec(), bound, term_min: vec![0; n] }
     }
@@ -798,17 +931,23 @@ impl Propagator for ObjLinearLeq {
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
-        let c = self.bound.load(Ordering::Relaxed);
+        let c = i128::from(self.bound.load(Ordering::Relaxed));
         loop {
-            let mut sum_min: i64 = 0;
-            let mut sum_max: i64 = 0;
+            let mut sum_min = 0i128;
+            let mut sum_max = 0i128;
             for (slot, (&a, &v)) in self.term_min.iter_mut().zip(self.coeffs.iter().zip(&self.vars)) {
-                let lo = store.min(v) as i64;
-                let hi = store.max(v) as i64;
+                let lo = i128::from(store.min(v));
+                let hi = i128::from(store.max(v));
                 let (tmin, tmax) = if a >= 0 { (a * lo, a * hi) } else { (a * hi, a * lo) };
                 *slot = tmin;
-                sum_min += tmin;
-                sum_max += tmax;
+                let Some(next_min) = sum_min.checked_add(tmin) else {
+                    return Ok(());
+                };
+                let Some(next_max) = sum_max.checked_add(tmax) else {
+                    return Ok(());
+                };
+                sum_min = next_min;
+                sum_max = next_max;
             }
 
             if sum_min > c {
@@ -823,15 +962,20 @@ impl Propagator for ObjLinearLeq {
                 if a == 0 {
                     continue;
                 }
-                let allowed = c - (sum_min - self.term_min[idx]);
+                let Some(other_min) = sum_min.checked_sub(self.term_min[idx]) else {
+                    return Ok(());
+                };
+                let Some(allowed) = c.checked_sub(other_min) else {
+                    return Ok(());
+                };
                 if a > 0 {
-                    let bound = clamp_i32(floor_div(allowed, a));
+                    let bound = clamp_i128_i32(floor_div(allowed, a));
                     if bound < store.max(v) {
                         store.remove_above_because(v, bound, self.min_side(store, idx))?;
                         changed = true;
                     }
                 } else {
-                    let bound = clamp_i32(ceil_div(allowed, a));
+                    let bound = clamp_i128_i32(ceil_div(allowed, a));
                     if bound > store.min(v) {
                         store.remove_below_because(v, bound, self.min_side(store, idx))?;
                         changed = true;
@@ -914,8 +1058,12 @@ impl Propagator for ObjExprLeq {
     }
 }
 
+fn clamp_i128_i32(value: i128) -> i32 {
+    value.clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32
+}
+
 /// Floor of `a / b` for integers (Rust `/` truncates toward zero).
-fn floor_div(a: i64, b: i64) -> i64 {
+fn floor_div(a: i128, b: i128) -> i128 {
     let q = a / b;
     let r = a % b;
     if r != 0 && ((r < 0) != (b < 0)) {
@@ -926,7 +1074,7 @@ fn floor_div(a: i64, b: i64) -> i64 {
 }
 
 /// Ceiling of `a / b` for integers.
-fn ceil_div(a: i64, b: i64) -> i64 {
+fn ceil_div(a: i128, b: i128) -> i128 {
     let q = a / b;
     let r = a % b;
     if r != 0 && ((r < 0) == (b < 0)) {

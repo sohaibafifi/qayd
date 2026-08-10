@@ -38,6 +38,7 @@ pub(crate) struct CpSolvePlan {
     guidance: SearchGuidance,
     assumptions: Vec<super::SemanticAssumption>,
     hints: Vec<(usize, i32)>,
+    primary_branch_scope: Option<Vec<usize>>,
     branch_order: Vec<usize>,
 }
 
@@ -93,8 +94,10 @@ fn compile_cp_plan_inner(
         return Err(SolveError::InvalidRequest("max_iterations requires engine='ls' for integer models".to_string()));
     }
     if request.mode == SolveMode::LocalSearch {
-        if !request.hints.is_empty() || !request.branch_order.is_empty() {
-            return Err(SolveError::InvalidRequest("integer local search does not yet accept value hints or branch order".to_string()));
+        if !request.hints.is_empty() || request.primary_branch_scope.is_some() || !request.branch_order.is_empty() {
+            return Err(SolveError::InvalidRequest(
+                "integer local search does not yet accept value hints, primary branch scope, or branch order".to_string(),
+            ));
         }
         if request.limits.conflicts.is_some() {
             return Err(SolveError::InvalidRequest("conflict limits require integer exact mode".to_string()));
@@ -148,17 +151,18 @@ fn compile_cp_plan_inner(
     .ok_or_else(|| SolveError::Interrupted("solve budget expired during CP compilation".to_string()))?;
     validate_cp_controls(&compiled, request)?;
     let local_search = if request.mode == SolveMode::LocalSearch { Some(super::integer_ls::compile(effective, &compiled)?) } else { None };
-    let (initial_phase, branch_order) = compiled
-        .search_guidance_interruptible(&request.hints, &request.branch_order, budget.stop())
+    let (initial_phase, branch_order, primary_branch_scope) = compiled
+        .search_guidance_interruptible(&request.hints, &request.branch_order, request.primary_branch_scope.as_deref(), budget.stop())
         .map_err(|error| SolveError::InvalidRequest(error.reason))?
         .ok_or_else(|| SolveError::Interrupted("solve budget expired during CP search-guidance compilation".to_string()))?;
     Ok(CpSolvePlan {
         compiled,
         local_search,
         mode: request.mode,
-        guidance: SearchGuidance { initial_phase, branch_order },
+        guidance: SearchGuidance { initial_phase, branch_order, primary_branch_scope },
         assumptions: request.assumptions.clone(),
         hints: request.hints.clone(),
+        primary_branch_scope: request.primary_branch_scope.clone(),
         branch_order: request.branch_order.clone(),
     })
 }
@@ -229,9 +233,13 @@ fn solve_cp_plan_inner(
     sink: &mut dyn EventSink,
     validate_model: bool,
 ) -> Result<SolveResult, SolveError> {
-    if request.assumptions != plan.assumptions || request.hints != plan.hints || request.branch_order != plan.branch_order {
+    if request.assumptions != plan.assumptions
+        || request.hints != plan.hints
+        || request.primary_branch_scope != plan.primary_branch_scope
+        || request.branch_order != plan.branch_order
+    {
         return Err(SolveError::InvalidRequest(
-            "assumptions, hints, and branch_order must match the request used to compile the CP plan".to_string(),
+            "assumptions, hints, primary_branch_scope, and branch_order must match the request used to compile the CP plan".to_string(),
         ));
     }
     if request.mode != plan.mode {
@@ -275,6 +283,8 @@ fn solve_cp_plan_inner(
         } else {
             SolveStatus::Unknown
         };
+        let mut metadata = cp_metadata(outcome.shared_clauses, outcome.imported_clauses, None, None, None);
+        metadata.push(("csp_search".to_string(), outcome.search_kind.to_string()));
         SolveResult {
             status,
             primal,
@@ -285,7 +295,7 @@ fn solve_cp_plan_inner(
                 search: outcome.stats,
                 elapsed: started.elapsed(),
                 improvements: u64::from(outcome.solution.is_some()),
-                metadata: cp_metadata(outcome.shared_clauses, outcome.imported_clauses, None, None, None),
+                metadata,
             }],
             message: conflict_limit_reached.then(|| "search stopped: ConflictLimit".to_string()),
         }

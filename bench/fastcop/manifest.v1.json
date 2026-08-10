@@ -1,0 +1,2259 @@
+{
+  "competition": "XCSP25",
+  "instance_count": 250,
+  "instances": [
+    {
+      "family": "AlteredStates",
+      "family_group": "AlteredStates",
+      "id": "AlteredStates-02",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/AlteredStates-02_c25.xml.lzma",
+      "sha256": "8bc10fca4612b7eec5df17b7786b3a3c9328bfdd20a0633e7fcb4348ac6eb71f",
+      "size_bytes": 4674
+    },
+    {
+      "family": "AlteredStates",
+      "family_group": "AlteredStates",
+      "id": "AlteredStates-03",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/AlteredStates-03_c25.xml.lzma",
+      "sha256": "65f0cd57c0c9c709a83fff0af7f1df765d1cb29c41ecee3da512516a7fa6f449",
+      "size_bytes": 4728
+    },
+    {
+      "family": "AlteredStates",
+      "family_group": "AlteredStates",
+      "id": "AlteredStates-04",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/AlteredStates-04_c25.xml.lzma",
+      "sha256": "bccaf0b64b74ff87c8b2fb7d238831538e267609032b5b6af8ed0eaf5189bd9a",
+      "size_bytes": 4926
+    },
+    {
+      "family": "AlteredStates",
+      "family_group": "AlteredStates",
+      "id": "AlteredStates-05",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/AlteredStates-05_c25.xml.lzma",
+      "sha256": "0845c0e5176eaaf113161003dd0922ea69b0f7bc8afff57087c78d3c196e266e",
+      "size_bytes": 5279
+    },
+    {
+      "family": "AlteredStates",
+      "family_group": "AlteredStates",
+      "id": "AlteredStates-06",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/AlteredStates-06_c25.xml.lzma",
+      "sha256": "2d20d119994d5c8cfa70950df14f54214a7ec75855171b0c1e809bf4052b1b32",
+      "size_bytes": 5665
+    },
+    {
+      "family": "AlteredStates",
+      "family_group": "AlteredStates",
+      "id": "AlteredStates-08",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/AlteredStates-08_c25.xml.lzma",
+      "sha256": "7193552babf298dd9fba0ef0d394ba7c0ade97d2915a7b6a3e98776bdda0a4ee",
+      "size_bytes": 7351
+    },
+    {
+      "family": "AlteredStates",
+      "family_group": "AlteredStates",
+      "id": "AlteredStates-10",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/AlteredStates-10_c25.xml.lzma",
+      "sha256": "137062e8bc121ffa178875015ee4ab32e43a1d3b08b549862b1b10f5b9df09c7",
+      "size_bytes": 8446
+    },
+    {
+      "family": "AlteredStates",
+      "family_group": "AlteredStates",
+      "id": "AlteredStates-12",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/AlteredStates-12_c25.xml.lzma",
+      "sha256": "be1c5a85673fc04e678d8969af157c8ee996c2a4022212df6fb733d56ae6f7e7",
+      "size_bytes": 13471
+    },
+    {
+      "family": "AlteredStates",
+      "family_group": "AlteredStates",
+      "id": "AlteredStates-15",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/AlteredStates-15_c25.xml.lzma",
+      "sha256": "f8c81ab4ea4aa72e15829bc91edf5f0c0faf85174a2dece7d8da280cfacbc7ca",
+      "size_bytes": 22760
+    },
+    {
+      "family": "AlteredStates-bis",
+      "family_group": "AlteredStates",
+      "id": "AlteredStates-bis-02",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/AlteredStates-bis-02_c25.xml.lzma",
+      "sha256": "a30e11280a5a69f854bb20636038a069dd1747d88e8e5fa8dd2368aef310f9bc",
+      "size_bytes": 5549
+    },
+    {
+      "family": "AlteredStates-bis",
+      "family_group": "AlteredStates",
+      "id": "AlteredStates-bis-03",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/AlteredStates-bis-03_c25.xml.lzma",
+      "sha256": "f311627b8ba790fcbfc2277c53d516cedd3f470b0499d66fb1d1c1d9cf0c0fb7",
+      "size_bytes": 5647
+    },
+    {
+      "family": "AlteredStates-bis",
+      "family_group": "AlteredStates",
+      "id": "AlteredStates-bis-04",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/AlteredStates-bis-04_c25.xml.lzma",
+      "sha256": "6f7bfdac18215952b93e15d812f91cf0843bc5f2d0a97fd10d512e55caa0c4f9",
+      "size_bytes": 5831
+    },
+    {
+      "family": "AlteredStates-bis",
+      "family_group": "AlteredStates",
+      "id": "AlteredStates-bis-05",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/AlteredStates-bis-05_c25.xml.lzma",
+      "sha256": "b3454d62d831e9a57c8ae8a5ce2ae81339b689e9aafe80c06a06918e6c736bb8",
+      "size_bytes": 6106
+    },
+    {
+      "family": "AlteredStates-bis",
+      "family_group": "AlteredStates",
+      "id": "AlteredStates-bis-06",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/AlteredStates-bis-06_c25.xml.lzma",
+      "sha256": "0e19198ea40158ca2d71d08d08f73b0fa5f79a2e437c9d290528a88f12055e05",
+      "size_bytes": 6565
+    },
+    {
+      "family": "AlteredStates-bis",
+      "family_group": "AlteredStates",
+      "id": "AlteredStates-bis-08",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/AlteredStates-bis-08_c25.xml.lzma",
+      "sha256": "27dff78acb86f6ee4c6c64363eead18bcdd1117f5b0822f19d35772f2b01276b",
+      "size_bytes": 7930
+    },
+    {
+      "family": "AlteredStates-bis",
+      "family_group": "AlteredStates",
+      "id": "AlteredStates-bis-10",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/AlteredStates-bis-10_c25.xml.lzma",
+      "sha256": "31175d4bb8783038698b25be4bb93bd418de425ccbba001dbcfe697002b8608e",
+      "size_bytes": 9481
+    },
+    {
+      "family": "AlteredStates-bis",
+      "family_group": "AlteredStates",
+      "id": "AlteredStates-bis-12",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/AlteredStates-bis-12_c25.xml.lzma",
+      "sha256": "fc068eed2efdc2aa21a97e75eb41bb21fe6debd1910ccf5bdba82ac1278b6841",
+      "size_bytes": 14094
+    },
+    {
+      "family": "AlteredStates-bis",
+      "family_group": "AlteredStates",
+      "id": "AlteredStates-bis-15",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/AlteredStates-bis-15_c25.xml.lzma",
+      "sha256": "70330b10392b2f1aa1f8ee23b169914664c8029a197f76811a0d9097bcc8f08c",
+      "size_bytes": 23011
+    },
+    {
+      "family": "BlockModeling",
+      "family_group": "BlockModeling",
+      "id": "BlockModeling-kansas-02",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BlockModeling-kansas-02_c25.xml.lzma",
+      "sha256": "d34b39722158801e951aeb58fd463218e0a291256d5b2b589be86f63103f5c0d",
+      "size_bytes": 2799
+    },
+    {
+      "family": "BlockModeling",
+      "family_group": "BlockModeling",
+      "id": "BlockModeling-kansas-03",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BlockModeling-kansas-03_c25.xml.lzma",
+      "sha256": "67e7188d71402847ef5b77a7493003af796e3437d8db65223a7dd7f34b4bef64",
+      "size_bytes": 5299
+    },
+    {
+      "family": "BlockModeling",
+      "family_group": "BlockModeling",
+      "id": "BlockModeling-kansas-05",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BlockModeling-kansas-05_c25.xml.lzma",
+      "sha256": "d17d2541dfbeab09370686bf65e44e6380e7fa8ed3d6bc29030736c64d068f92",
+      "size_bytes": 13040
+    },
+    {
+      "family": "BlockModeling",
+      "family_group": "BlockModeling",
+      "id": "BlockModeling-kansas-10",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BlockModeling-kansas-10_c25.xml.lzma",
+      "sha256": "2321e9ad569e2f68af3ded1b35ae6b96bfdb9323a16eadc55a201d75de9e3f77",
+      "size_bytes": 48928
+    },
+    {
+      "family": "BlockModeling",
+      "family_group": "BlockModeling",
+      "id": "BlockModeling-karate-02",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BlockModeling-karate-02_c25.xml.lzma",
+      "sha256": "4af50663b0b166792731766f95c89f6c8168b2f0a90c021cff9ce5cd8387263b",
+      "size_bytes": 3997
+    },
+    {
+      "family": "BlockModeling",
+      "family_group": "BlockModeling",
+      "id": "BlockModeling-karate-03",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BlockModeling-karate-03_c25.xml.lzma",
+      "sha256": "21e8499e0a2922edcf9b4630965227537c7abb8f0e80fdf9299ab84391a4c4d7",
+      "size_bytes": 7828
+    },
+    {
+      "family": "BlockModeling",
+      "family_group": "BlockModeling",
+      "id": "BlockModeling-karate-05",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BlockModeling-karate-05_c25.xml.lzma",
+      "sha256": "b8b08d7c46a6b81b6c0bd9c9da4ab9322a2e5f77dbd742be1b6c77e8a4879ebd",
+      "size_bytes": 19931
+    },
+    {
+      "family": "BlockModeling",
+      "family_group": "BlockModeling",
+      "id": "BlockModeling-karate-10",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BlockModeling-karate-10_c25.xml.lzma",
+      "sha256": "7ac705c6e173bc335ecaf738cdce77fd3f7b75789f3db965c568dac6f238502c",
+      "size_bytes": 75837
+    },
+    {
+      "family": "BlockModeling",
+      "family_group": "BlockModeling",
+      "id": "BlockModeling-politicalactor-02",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BlockModeling-politicalactor-02_c25.xml.lzma",
+      "sha256": "c775447e654dedb65b604825b309b3dafb546d637bf5da170a5e3f3c629d7690",
+      "size_bytes": 1715
+    },
+    {
+      "family": "BlockModeling",
+      "family_group": "BlockModeling",
+      "id": "BlockModeling-politicalactor-03",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BlockModeling-politicalactor-03_c25.xml.lzma",
+      "sha256": "5c8615f101fb2022038b84e6622a8a7205aafe605644bc236881297852e14f09",
+      "size_bytes": 2978
+    },
+    {
+      "family": "BlockModeling",
+      "family_group": "BlockModeling",
+      "id": "BlockModeling-politicalactor-05",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BlockModeling-politicalactor-05_c25.xml.lzma",
+      "sha256": "d4a0ca74ad72ce9fd596b39e30753f3cbe155866cdf538f0e7d7739674b045b4",
+      "size_bytes": 6821
+    },
+    {
+      "family": "BlockModeling",
+      "family_group": "BlockModeling",
+      "id": "BlockModeling-politicalactor-10",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BlockModeling-politicalactor-10_c25.xml.lzma",
+      "sha256": "63520b3787c8e9b629044f7234c76fd3ddc28414a348d53dde39188eab9b540e",
+      "size_bytes": 24247
+    },
+    {
+      "family": "BlockModeling",
+      "family_group": "BlockModeling",
+      "id": "BlockModeling-transatlantic-02",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BlockModeling-transatlantic-02_c25.xml.lzma",
+      "sha256": "552ae334a7ce1da85a92ab917a62e943acbd1cd09b802a8f5344c78a4ba4c518",
+      "size_bytes": 1448
+    },
+    {
+      "family": "BlockModeling",
+      "family_group": "BlockModeling",
+      "id": "BlockModeling-transatlantic-03",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BlockModeling-transatlantic-03_c25.xml.lzma",
+      "sha256": "b5ac885eec26e9ae5076bb1097c970242b5efa96568c0a3e66db2ced5232f50d",
+      "size_bytes": 2483
+    },
+    {
+      "family": "BlockModeling",
+      "family_group": "BlockModeling",
+      "id": "BlockModeling-transatlantic-05",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BlockModeling-transatlantic-05_c25.xml.lzma",
+      "sha256": "b45b46dff1eb9005268261b8374947a1aaca47b7636bd3e7cab789cac9a04e75",
+      "size_bytes": 5069
+    },
+    {
+      "family": "BlockModeling",
+      "family_group": "BlockModeling",
+      "id": "BlockModeling-transatlantic-10",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BlockModeling-transatlantic-10_c25.xml.lzma",
+      "sha256": "fd939d53739cfa590654b8589ab2037489ceba767656fcbe10dce0f0193ebf4d",
+      "size_bytes": 15446
+    },
+    {
+      "family": "BusScheduling",
+      "family_group": "BusScheduling",
+      "id": "BusScheduling-c1",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BusScheduling-c1_c25.xml.lzma",
+      "sha256": "887368f261195c770a13e96a44b63a0a0aa32d474a211bc80eea5502c412be7b",
+      "size_bytes": 15323
+    },
+    {
+      "family": "BusScheduling",
+      "family_group": "BusScheduling",
+      "id": "BusScheduling-c1a",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BusScheduling-c1a_c25.xml.lzma",
+      "sha256": "e54b7df0ca2304517d787db7bcb26f315b181f61c36d83f31d6567cd49e27924",
+      "size_bytes": 27728
+    },
+    {
+      "family": "BusScheduling",
+      "family_group": "BusScheduling",
+      "id": "BusScheduling-c2",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BusScheduling-c2_c25.xml.lzma",
+      "sha256": "81b3c658ac411ee495a525bd237d64b71bf6cbeffd8d61c28b3db7aefe838128",
+      "size_bytes": 55365
+    },
+    {
+      "family": "BusScheduling",
+      "family_group": "BusScheduling",
+      "id": "BusScheduling-r1",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BusScheduling-r1_c25.xml.lzma",
+      "sha256": "4f42a68001394c0618014fcb5c43b16594aa9da8a13016f6aa7f5b48255620bc",
+      "size_bytes": 10781
+    },
+    {
+      "family": "BusScheduling",
+      "family_group": "BusScheduling",
+      "id": "BusScheduling-r1a",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BusScheduling-r1a_c25.xml.lzma",
+      "sha256": "71eab397ee28c60ab17325a527007f3b493eb208af9a5bb2af7336b1ff6249f3",
+      "size_bytes": 16976
+    },
+    {
+      "family": "BusScheduling",
+      "family_group": "BusScheduling",
+      "id": "BusScheduling-r2",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BusScheduling-r2_c25.xml.lzma",
+      "sha256": "1be91625cb424530e70ec88ed64db0d5a8086f848a810ef060a22a51e6b2ad8a",
+      "size_bytes": 11729
+    },
+    {
+      "family": "BusScheduling",
+      "family_group": "BusScheduling",
+      "id": "BusScheduling-r3",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BusScheduling-r3_c25.xml.lzma",
+      "sha256": "de0377a5e063d0d65849792bc31cf41d341446ee43eef911258f93d168589bfa",
+      "size_bytes": 85458
+    },
+    {
+      "family": "BusScheduling",
+      "family_group": "BusScheduling",
+      "id": "BusScheduling-r4",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BusScheduling-r4_c25.xml.lzma",
+      "sha256": "8d71a5677bd9f69281dd2faa1b4d3986b4af0bed55fcc65ed8ff32e85a56107f",
+      "size_bytes": 10998
+    },
+    {
+      "family": "BusScheduling",
+      "family_group": "BusScheduling",
+      "id": "BusScheduling-r5",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BusScheduling-r5_c25.xml.lzma",
+      "sha256": "e39e109c68de7efba1e4eb963a6fd2ec234daf97667603cb9b12bf2d4e3030b9",
+      "size_bytes": 11494
+    },
+    {
+      "family": "BusScheduling",
+      "family_group": "BusScheduling",
+      "id": "BusScheduling-r5a",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BusScheduling-r5a_c25.xml.lzma",
+      "sha256": "1acdcab8b155ee82ea499550ba3281519a2229368ce49a12768c6b7b3c9f5700",
+      "size_bytes": 63960
+    },
+    {
+      "family": "BusScheduling",
+      "family_group": "BusScheduling",
+      "id": "BusScheduling-t1",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BusScheduling-t1_c25.xml.lzma",
+      "sha256": "a773601205f6faded6999eacfc7f25d40599be738edc7caeb1d9db93b13f512a",
+      "size_bytes": 691
+    },
+    {
+      "family": "BusScheduling",
+      "family_group": "BusScheduling",
+      "id": "BusScheduling-t2",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/BusScheduling-t2_c25.xml.lzma",
+      "sha256": "cac1a6f20e75396aff611e6885971facba4aac373116c86e6869804bed19cfc2",
+      "size_bytes": 13174
+    },
+    {
+      "family": "ButtonsScissors",
+      "family_group": "ButtonsScissors",
+      "id": "ButtonsScissors-00",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/ButtonsScissors-00_c25.xml.lzma",
+      "sha256": "65c9ebaf2f1c33259deb97ebc871045c195738b1a8614c08b1cf549bd1b074e1",
+      "size_bytes": 1310
+    },
+    {
+      "family": "ButtonsScissors",
+      "family_group": "ButtonsScissors",
+      "id": "ButtonsScissors-01",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/ButtonsScissors-01_c25.xml.lzma",
+      "sha256": "2dac36e59b2daa916b25435d90b87255270af4681aca29327e0097c1e228e0c9",
+      "size_bytes": 1310
+    },
+    {
+      "family": "ButtonsScissors",
+      "family_group": "ButtonsScissors",
+      "id": "ButtonsScissors-02",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/ButtonsScissors-02_c25.xml.lzma",
+      "sha256": "fea77f52a5b0542b57904d6df2fe6b0601479b117fae93acba1e207d987b2536",
+      "size_bytes": 1290
+    },
+    {
+      "family": "ButtonsScissors",
+      "family_group": "ButtonsScissors",
+      "id": "ButtonsScissors-03",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/ButtonsScissors-03_c25.xml.lzma",
+      "sha256": "8f88136dd55204ab9d13e89dd32e057c5cc6c0bc24019ff7badf0567f4316ac4",
+      "size_bytes": 1786
+    },
+    {
+      "family": "ButtonsScissors",
+      "family_group": "ButtonsScissors",
+      "id": "ButtonsScissors-04",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/ButtonsScissors-04_c25.xml.lzma",
+      "sha256": "d9623f0426c67a8ed887d24f3eb5ccc6d2a5c3b01d1bd473cb892b1635d49856",
+      "size_bytes": 1773
+    },
+    {
+      "family": "ButtonsScissors",
+      "family_group": "ButtonsScissors",
+      "id": "ButtonsScissors-05",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/ButtonsScissors-05_c25.xml.lzma",
+      "sha256": "dbc1fc6914f24b8bcb7978960fb3821bfe5ca4230ca33eca6996dbb56eae2987",
+      "size_bytes": 2576
+    },
+    {
+      "family": "ButtonsScissors",
+      "family_group": "ButtonsScissors",
+      "id": "ButtonsScissors-06",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/ButtonsScissors-06_c25.xml.lzma",
+      "sha256": "4a14c1fd960145804ca1937b7381ef1d82acc4a26ca24fa322876a23660a46a5",
+      "size_bytes": 2440
+    },
+    {
+      "family": "ButtonsScissors",
+      "family_group": "ButtonsScissors",
+      "id": "ButtonsScissors-07",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/ButtonsScissors-07_c25.xml.lzma",
+      "sha256": "137a6f4748edfdfee81aef3c2894d7aa12c86273e96f37497d821bccc707ed2c",
+      "size_bytes": 2729
+    },
+    {
+      "family": "ButtonsScissors",
+      "family_group": "ButtonsScissors",
+      "id": "ButtonsScissors-08",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/ButtonsScissors-08_c25.xml.lzma",
+      "sha256": "c781a6d265a4514cdbcbf33ecdda054dd1ceec664691403a84543c989d5b7207",
+      "size_bytes": 2569
+    },
+    {
+      "family": "ButtonsScissors",
+      "family_group": "ButtonsScissors",
+      "id": "ButtonsScissors-09",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/ButtonsScissors-09_c25.xml.lzma",
+      "sha256": "d11ccc1e0129a8dd3e695fbe7d7e56984d45bc6173e088e8899e0242e563565e",
+      "size_bytes": 2273
+    },
+    {
+      "family": "ButtonsScissors",
+      "family_group": "ButtonsScissors",
+      "id": "ButtonsScissors-10",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/ButtonsScissors-10_c25.xml.lzma",
+      "sha256": "71d84f1971db3c958c22ee5ea7d62907cf2bf088e2e088bad904ea74a726ede6",
+      "size_bytes": 2544
+    },
+    {
+      "family": "ChampionsLeague",
+      "family_group": "ChampionsLeague",
+      "id": "ChampionsLeague-2024-09",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/ChampionsLeague-2024-09_c25.xml.lzma",
+      "sha256": "46afcc02adb64659d09391b5eed0b40462b639d43ede3c93105e3ccde05c7805",
+      "size_bytes": 1721
+    },
+    {
+      "family": "ChampionsLeague",
+      "family_group": "ChampionsLeague",
+      "id": "ChampionsLeague-2024-15",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/ChampionsLeague-2024-15_c25.xml.lzma",
+      "sha256": "f40fe31746d31b81f55adbe59d0b084efa6c5e0b865bd0eeb484078ff2e877c8",
+      "size_bytes": 1720
+    },
+    {
+      "family": "ChampionsLeague",
+      "family_group": "ChampionsLeague",
+      "id": "ChampionsLeague-2024-18",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/ChampionsLeague-2024-18_c25.xml.lzma",
+      "sha256": "0bf8c61e82d4f1e08bba76520b87844a1c1ea7273f8d7a717de4dd455b91b41e",
+      "size_bytes": 1720
+    },
+    {
+      "family": "ChampionsLeague",
+      "family_group": "ChampionsLeague",
+      "id": "ChampionsLeague-2024-20",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/ChampionsLeague-2024-20_c25.xml.lzma",
+      "sha256": "c8698c934025b1e3e7ab63fb56432416e6edb870bd367431cf5c274e47852c22",
+      "size_bytes": 1720
+    },
+    {
+      "family": "ChampionsLeague",
+      "family_group": "ChampionsLeague",
+      "id": "ChampionsLeague-2024-25",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/ChampionsLeague-2024-25_c25.xml.lzma",
+      "sha256": "151ab6dbf7649eb8b96d3d798978d4375b1236b887ee93b4d2d598014af992d1",
+      "size_bytes": 1720
+    },
+    {
+      "family": "ChampionsLeague",
+      "family_group": "ChampionsLeague",
+      "id": "ChampionsLeague-2024-30",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/ChampionsLeague-2024-30_c25.xml.lzma",
+      "sha256": "9b33efb12b7977aa0cb4c5dd078d1231048a4a8b02cc9f6382aa88481c83d20d",
+      "size_bytes": 1720
+    },
+    {
+      "family": "ChampionsLeague",
+      "family_group": "ChampionsLeague",
+      "id": "ChampionsLeague-2024-35",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/ChampionsLeague-2024-35_c25.xml.lzma",
+      "sha256": "2117511b100f72302385039791f76e6afb83982651a833268b307427bfda5835",
+      "size_bytes": 1720
+    },
+    {
+      "family": "ChampionsLeague-strict",
+      "family_group": "ChampionsLeague",
+      "id": "ChampionsLeague-strict-2024-09",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/ChampionsLeague-strict-2024-09_c25.xml.lzma",
+      "sha256": "c83048d53db0e6e593210c05e1246ae7112e15baf0f0ff359e695cf6f6c40259",
+      "size_bytes": 1714
+    },
+    {
+      "family": "ChampionsLeague-strict",
+      "family_group": "ChampionsLeague",
+      "id": "ChampionsLeague-strict-2024-15",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/ChampionsLeague-strict-2024-15_c25.xml.lzma",
+      "sha256": "5311803ad6cd7464f6b557d29e9aaa2560ad4cd4657e0155c12fdcca5c6c837c",
+      "size_bytes": 1715
+    },
+    {
+      "family": "ChampionsLeague-strict",
+      "family_group": "ChampionsLeague",
+      "id": "ChampionsLeague-strict-2024-18",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/ChampionsLeague-strict-2024-18_c25.xml.lzma",
+      "sha256": "64c19c4d0bb21bc94ebda57300584f4f89063eec133276d1f42cafd55cf81f25",
+      "size_bytes": 1715
+    },
+    {
+      "family": "ChampionsLeague-strict",
+      "family_group": "ChampionsLeague",
+      "id": "ChampionsLeague-strict-2024-20",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/ChampionsLeague-strict-2024-20_c25.xml.lzma",
+      "sha256": "21746c56107e44f757f4d5b976dbd647a7917baa7114234903beb64891e8ab21",
+      "size_bytes": 1716
+    },
+    {
+      "family": "ChampionsLeague-strict",
+      "family_group": "ChampionsLeague",
+      "id": "ChampionsLeague-strict-2024-25",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/ChampionsLeague-strict-2024-25_c25.xml.lzma",
+      "sha256": "f621a9c0ca3edf5e5e96925f814c7ff2c6c8ee4b5983bf21bbaf669e2c43ae11",
+      "size_bytes": 1715
+    },
+    {
+      "family": "ChampionsLeague-strict",
+      "family_group": "ChampionsLeague",
+      "id": "ChampionsLeague-strict-2024-30",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/ChampionsLeague-strict-2024-30_c25.xml.lzma",
+      "sha256": "2817b2f32c78d494d6979df16ac14cb26c393fa9c20f91959c31762d3e03b0e1",
+      "size_bytes": 1716
+    },
+    {
+      "family": "ChampionsLeague-strict",
+      "family_group": "ChampionsLeague",
+      "id": "ChampionsLeague-strict-2024-35",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/ChampionsLeague-strict-2024-35_c25.xml.lzma",
+      "sha256": "ca057bd006b04ab5bb5a34d050d65ade0151250bed4f30885497f42f84785a5e",
+      "size_bytes": 1715
+    },
+    {
+      "family": "Coprime",
+      "family_group": "Coprime",
+      "id": "Coprime-08",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Coprime-08_c25.xml.lzma",
+      "sha256": "deea654b61fe5bdd83c8d1bae9e28a591a425293af49de967239b1b56ed216e2",
+      "size_bytes": 1120
+    },
+    {
+      "family": "Coprime",
+      "family_group": "Coprime",
+      "id": "Coprime-10",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Coprime-10_c25.xml.lzma",
+      "sha256": "e58068ce1505871755114ce6907459a410a1383a05b371905f27dfc03c2c6035",
+      "size_bytes": 2924
+    },
+    {
+      "family": "Coprime",
+      "family_group": "Coprime",
+      "id": "Coprime-12",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Coprime-12_c25.xml.lzma",
+      "sha256": "ea1e93642ee3cf715f16a44f069b149daa9bb22b843862e580066a3f3882e0b3",
+      "size_bytes": 5259
+    },
+    {
+      "family": "Coprime",
+      "family_group": "Coprime",
+      "id": "Coprime-14",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Coprime-14_c25.xml.lzma",
+      "sha256": "2b5f62cea872c8351af8de7ce9c4964b79decf3cbfff7c9f7ace438ea8c4f09c",
+      "size_bytes": 6558
+    },
+    {
+      "family": "Coprime",
+      "family_group": "Coprime",
+      "id": "Coprime-16",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Coprime-16_c25.xml.lzma",
+      "sha256": "3b255e2c2425faf0da766d5d1c3b3d0ce7f7b2b83a761c89906656c0ff0bdabf",
+      "size_bytes": 11488
+    },
+    {
+      "family": "Coprime",
+      "family_group": "Coprime",
+      "id": "Coprime-17",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Coprime-17_c25.xml.lzma",
+      "sha256": "89bcaf74dab2f45c6f0c2d7cf866ee4c728140ec7c4b1f14a240e577c1a1d9b9",
+      "size_bytes": 14577
+    },
+    {
+      "family": "Coprime",
+      "family_group": "Coprime",
+      "id": "Coprime-18",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Coprime-18_c25.xml.lzma",
+      "sha256": "2fe0ca679d7bdbf7d28180564a3c99cc60ec710eacaf473e25a3470d919ff815",
+      "size_bytes": 17030
+    },
+    {
+      "family": "Coprime",
+      "family_group": "Coprime",
+      "id": "Coprime-19",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Coprime-19_c25.xml.lzma",
+      "sha256": "32ad14cd2595dd13ef3e87e9444cb6a5a31a4d5b9ac6d78b2c346ad23f48c893",
+      "size_bytes": 16218
+    },
+    {
+      "family": "Coprime",
+      "family_group": "Coprime",
+      "id": "Coprime-20",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Coprime-20_c25.xml.lzma",
+      "sha256": "3a2d95db7d152b12fe59103b9763fe9cf60fbd3f69299173739ea42832494792",
+      "size_bytes": 19611
+    },
+    {
+      "family": "Coprime",
+      "family_group": "Coprime",
+      "id": "Coprime-21",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Coprime-21_c25.xml.lzma",
+      "sha256": "f24451b0c58d7a49e17952b785440a704134e6d9af9dd854763119a1833b278a",
+      "size_bytes": 23294
+    },
+    {
+      "family": "Coprime",
+      "family_group": "Coprime",
+      "id": "Coprime-22",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Coprime-22_c25.xml.lzma",
+      "sha256": "7977afef85dd32975d3ff67a5f3988e46ab961684cd9f305ccfce8b42b477c37",
+      "size_bytes": 26303
+    },
+    {
+      "family": "Coprime",
+      "family_group": "Coprime",
+      "id": "Coprime-23",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Coprime-23_c25.xml.lzma",
+      "sha256": "1a94c0cb6cb13202c3b9daaa85d2dd5fb3718be3610af832e719469db84b48d4",
+      "size_bytes": 33172
+    },
+    {
+      "family": "Coprime",
+      "family_group": "Coprime",
+      "id": "Coprime-24",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Coprime-24_c25.xml.lzma",
+      "sha256": "4828768832925c8366ae58b4edee02941372427f1aee9bdda9bf8a80061f0045",
+      "size_bytes": 37731
+    },
+    {
+      "family": "Coprime",
+      "family_group": "Coprime",
+      "id": "Coprime-25",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Coprime-25_c25.xml.lzma",
+      "sha256": "cafae9ff325dc1917caca03f736f72c9edbca950ed2e173664c4669011a19e64",
+      "size_bytes": 43967
+    },
+    {
+      "family": "Coprime",
+      "family_group": "Coprime",
+      "id": "Coprime-30",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Coprime-30_c25.xml.lzma",
+      "sha256": "0040a5f9af26a4a49ea4770416d2ce4801c27a07ae07885587efe3201e784782",
+      "size_bytes": 108047
+    },
+    {
+      "family": "Coprime",
+      "family_group": "Coprime",
+      "id": "Coprime-40",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Coprime-40_c25.xml.lzma",
+      "sha256": "c7e70799f123eee0949b9705f789e1f70eef13edf538cf2a8029213e3484aa3c",
+      "size_bytes": 415649
+    },
+    {
+      "family": "Cutstock",
+      "family_group": "Cutstock",
+      "id": "Cutstock-00-0",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Cutstock-00-0_c25.xml.lzma",
+      "sha256": "d7be02e16a675d9f800ae07cc0a18459c1e3fb3fa24dd9352355e561b135040f",
+      "size_bytes": 684
+    },
+    {
+      "family": "Cutstock",
+      "family_group": "Cutstock",
+      "id": "Cutstock-01-0",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Cutstock-01-0_c25.xml.lzma",
+      "sha256": "12cd19d3ff45bd8c9b30ea9e31e9767c6d808c4aca6e8add153155034efc815c",
+      "size_bytes": 1011
+    },
+    {
+      "family": "Cutstock",
+      "family_group": "Cutstock",
+      "id": "Cutstock-02-0",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Cutstock-02-0_c25.xml.lzma",
+      "sha256": "c992253d97ae75749ba34bea1ec8ab26fb2c186a689fa5858ae6af4dc974ac75",
+      "size_bytes": 2396
+    },
+    {
+      "family": "Cutstock",
+      "family_group": "Cutstock",
+      "id": "Cutstock-03-0",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Cutstock-03-0_c25.xml.lzma",
+      "sha256": "8415c77d54c692e6c3deb1896601137cf4edbc818845efce3e71000d926fbeae",
+      "size_bytes": 1600
+    },
+    {
+      "family": "Cutstock",
+      "family_group": "Cutstock",
+      "id": "Cutstock-04-0",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Cutstock-04-0_c25.xml.lzma",
+      "sha256": "13bfc6ed1b303e6c3f5b76f6b5bf57dd6dd9923dfe2e3744b0a744ef1b023154",
+      "size_bytes": 4199
+    },
+    {
+      "family": "Cutstock",
+      "family_group": "Cutstock",
+      "id": "Cutstock-07-0",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Cutstock-07-0_c25.xml.lzma",
+      "sha256": "49e779cbf393f28e76aa684ccb928191763d3d50e71e4391c832c271412117cd",
+      "size_bytes": 1638
+    },
+    {
+      "family": "Cutstock",
+      "family_group": "Cutstock",
+      "id": "Cutstock-08-0",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Cutstock-08-0_c25.xml.lzma",
+      "sha256": "e845219108e0fbd0e1a4175bb48e5a89a3120abb77c1bffe423ba7e1bba5a63b",
+      "size_bytes": 5127
+    },
+    {
+      "family": "Cutstock",
+      "family_group": "Cutstock",
+      "id": "Cutstock-09-0",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Cutstock-09-0_c25.xml.lzma",
+      "sha256": "4e8c2b2661192346daa68969faddf4b88347120c21333bfb72c0f7e9f8785ce2",
+      "size_bytes": 3389
+    },
+    {
+      "family": "Cutstock",
+      "family_group": "Cutstock",
+      "id": "Cutstock-10-0",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Cutstock-10-0_c25.xml.lzma",
+      "sha256": "3a02276b9cfae14afadda8d89e24dcc4e42f01b10b693b1e35b9175f360605e1",
+      "size_bytes": 13487
+    },
+    {
+      "family": "Cutstock",
+      "family_group": "Cutstock",
+      "id": "Cutstock-13-0",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Cutstock-13-0_c25.xml.lzma",
+      "sha256": "9866d9d81a3d46f2a413425372970af0ad093322ef8f64a545ab7d6a8f33ac85",
+      "size_bytes": 1722
+    },
+    {
+      "family": "Cutstock",
+      "family_group": "Cutstock",
+      "id": "Cutstock-14-0",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Cutstock-14-0_c25.xml.lzma",
+      "sha256": "ad83cdc2d56dd3f0cc0de52cc27360bd778da5dd7560da7c553039d360b6cf87",
+      "size_bytes": 7004
+    },
+    {
+      "family": "Cutstock",
+      "family_group": "Cutstock",
+      "id": "Cutstock-15-0",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Cutstock-15-0_c25.xml.lzma",
+      "sha256": "7274a2e4c6c3cdef3054cb8bf09e17c518987a61f4e6b0f0f2b4fd7cbd57de00",
+      "size_bytes": 3887
+    },
+    {
+      "family": "Cutstock",
+      "family_group": "Cutstock",
+      "id": "Cutstock-16-0",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Cutstock-16-0_c25.xml.lzma",
+      "sha256": "39a916cfd437815e541f39968f85773f164aae373291fa56d88f7167b6b56ca9",
+      "size_bytes": 15567
+    },
+    {
+      "family": "Cutstock",
+      "family_group": "Cutstock",
+      "id": "Cutstock-16-1",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Cutstock-16-1_c25.xml.lzma",
+      "sha256": "56cb7de8c4f729ce7aa40f124237ae35da1aa213da650f1f97ec4da8e379d0ee",
+      "size_bytes": 13952
+    },
+    {
+      "family": "Cutstock",
+      "family_group": "Cutstock",
+      "id": "Cutstock-16-2",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Cutstock-16-2_c25.xml.lzma",
+      "sha256": "7f410dbab772a93ce60d3fdd765386ac2d5297f6b4d66cd08ec03f489938b506",
+      "size_bytes": 23564
+    },
+    {
+      "family": "FAPP",
+      "family_group": "FAPP",
+      "id": "FAPP-aux-01-0200",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FAPP-aux-01-0200_c25.xml.lzma",
+      "sha256": "e0dfacb0c42c491ff8429a8368a474fccb1f8df4c10daf44ad0faa8ef5290e2e",
+      "size_bytes": 172861
+    },
+    {
+      "family": "FAPP",
+      "family_group": "FAPP",
+      "id": "FAPP-aux-02-0250",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FAPP-aux-02-0250_c25.xml.lzma",
+      "sha256": "1167d8df3dc8d153026be9c74fdd35e5b630ec9976b3c432e79e38214b8ccf38",
+      "size_bytes": 271020
+    },
+    {
+      "family": "FAPP",
+      "family_group": "FAPP",
+      "id": "FAPP-aux-03-0300",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FAPP-aux-03-0300_c25.xml.lzma",
+      "sha256": "c6eb2306b5470cf09e599a330cca501f32e6d5a6a3193c0e8abf94d6cf8144d1",
+      "size_bytes": 435401
+    },
+    {
+      "family": "FAPP",
+      "family_group": "FAPP",
+      "id": "FAPP-aux-04-0300",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FAPP-aux-04-0300_c25.xml.lzma",
+      "sha256": "12217a360a82cde583ba63c6f9edc638b8b0e8ea9ff146e9aee78d40047b2904",
+      "size_bytes": 376167
+    },
+    {
+      "family": "FAPP",
+      "family_group": "FAPP",
+      "id": "FAPP-aux-05-0350",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FAPP-aux-05-0350_c25.xml.lzma",
+      "sha256": "ab5df3bef2ca7b8a0dc0daf225dcdd12b444f37eaa3dad15100570f98dbd460d",
+      "size_bytes": 529211
+    },
+    {
+      "family": "FAPP",
+      "family_group": "FAPP",
+      "id": "FAPP-aux-06-0500",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FAPP-aux-06-0500_c25.xml.lzma",
+      "sha256": "af16a1803eb98f267584640732de999b183b8e979eeffc222246faf06657c236",
+      "size_bytes": 745431
+    },
+    {
+      "family": "FAPP",
+      "family_group": "FAPP",
+      "id": "FAPP-aux-07-0600",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FAPP-aux-07-0600_c25.xml.lzma",
+      "sha256": "5daa7822937b92f7babbbaf2243dbe2da8db93f0db026ccbf164945426ebddc9",
+      "size_bytes": 1030710
+    },
+    {
+      "family": "FAPP",
+      "family_group": "FAPP",
+      "id": "FAPP-aux-08-0700",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FAPP-aux-08-0700_c25.xml.lzma",
+      "sha256": "6c0a964f973b7c5133851a778cdc23c0b36daa9f3d64120d00a62862fc749fe5",
+      "size_bytes": 779283
+    },
+    {
+      "family": "FAPP",
+      "family_group": "FAPP",
+      "id": "FAPP-aux-09-0800",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FAPP-aux-09-0800_c25.xml.lzma",
+      "sha256": "340c69983f8ff7a5c6288c6b170812a77b5b04dfb76ba9f062f2e5f2607060df",
+      "size_bytes": 994987
+    },
+    {
+      "family": "FAPP",
+      "family_group": "FAPP",
+      "id": "FAPP-aux-10-0900",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FAPP-aux-10-0900_c25.xml.lzma",
+      "sha256": "20f381d5917313ef7d7bb192d83ebbc309f0d6122a0b5e66a41ede4284b6fbce",
+      "size_bytes": 1524548
+    },
+    {
+      "family": "FAPP",
+      "family_group": "FAPP",
+      "id": "FAPP-aux-17-0300",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FAPP-aux-17-0300_c25.xml.lzma",
+      "sha256": "e5de273a2971b8c8a78ad8c3b4d1f0523dce8d202fd54959153f6b530c2b234c",
+      "size_bytes": 100266
+    },
+    {
+      "family": "FAPP",
+      "family_group": "FAPP",
+      "id": "FAPP-aux-18-0350",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FAPP-aux-18-0350_c25.xml.lzma",
+      "sha256": "b69e5301937ae79944df5320a0f64fce4453449e1745fc933e585368f0b193b4",
+      "size_bytes": 84440
+    },
+    {
+      "family": "FAPP",
+      "family_group": "FAPP",
+      "id": "FAPP-aux-19-0350",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FAPP-aux-19-0350_c25.xml.lzma",
+      "sha256": "6754b5203b5b98271e3223e00d26709834c2c2ce848bc440abf970ecdcfd2740",
+      "size_bytes": 311261
+    },
+    {
+      "family": "FAPP",
+      "family_group": "FAPP",
+      "id": "FAPP-aux-20-0420",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FAPP-aux-20-0420_c25.xml.lzma",
+      "sha256": "9e5e599d72fd643e7c2db061c258636fd32a435da94f86f9cb26e1364c2a2ad6",
+      "size_bytes": 145280
+    },
+    {
+      "family": "FAPP",
+      "family_group": "FAPP",
+      "id": "FAPP-aux-21-0500",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FAPP-aux-21-0500_c25.xml.lzma",
+      "sha256": "ba2688d382d51984f362af01cca34f8628109dbdabde01696cbadb43c5226922",
+      "size_bytes": 73960
+    },
+    {
+      "family": "FAPP",
+      "family_group": "FAPP",
+      "id": "FAPP-aux-ex1",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FAPP-aux-ex1_c25.xml.lzma",
+      "sha256": "878f3b8f716b4e1f28ab1b8bd2d900483e8c445f0709ddf01e3acf6ad599925f",
+      "size_bytes": 3833
+    },
+    {
+      "family": "FAPP",
+      "family_group": "FAPP",
+      "id": "FAPP-aux-test01-0150",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FAPP-aux-test01-0150_c25.xml.lzma",
+      "sha256": "e66f4bbd1c460e9a5cfb98087ff1ac26cf1ec643afae7206dda4e0e097ffac6e",
+      "size_bytes": 198171
+    },
+    {
+      "family": "FAPP",
+      "family_group": "FAPP",
+      "id": "FAPP-aux-test03-0400",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FAPP-aux-test03-0400_c25.xml.lzma",
+      "sha256": "391520941a8803112e397e95e76c5cdd2a4332476c28cce9c9543fd06d0662d6",
+      "size_bytes": 622721
+    },
+    {
+      "family": "FlexibleJobshopScen",
+      "family_group": "FlexibleJobshopScen",
+      "id": "FlexibleJobshopScen-dh-5-16-005",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FlexibleJobshopScen-dh-5-16-005_c25.xml.lzma",
+      "sha256": "72f1cae203cd9f9346c13d6c5deee2db8eb8126ac8083d6346d1fd6f337b3246",
+      "size_bytes": 3219
+    },
+    {
+      "family": "FlexibleJobshopScen",
+      "family_group": "FlexibleJobshopScen",
+      "id": "FlexibleJobshopScen-dh-5-16-020",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FlexibleJobshopScen-dh-5-16-020_c25.xml.lzma",
+      "sha256": "6bb832a67a23c6784b6deb8ccbfe919e2cf347d500e5da724bcc8ed2a555d912",
+      "size_bytes": 9428
+    },
+    {
+      "family": "FlexibleJobshopScen",
+      "family_group": "FlexibleJobshopScen",
+      "id": "FlexibleJobshopScen-dh-5-16-080",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FlexibleJobshopScen-dh-5-16-080_c25.xml.lzma",
+      "sha256": "fc3bac0ce13813ab405003191df9461e9f19a9a942cb5d44a0b86d7f76e07d2c",
+      "size_bytes": 30430
+    },
+    {
+      "family": "FlexibleJobshopScen",
+      "family_group": "FlexibleJobshopScen",
+      "id": "FlexibleJobshopScen-dh-5-16-200",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FlexibleJobshopScen-dh-5-16-200_c25.xml.lzma",
+      "sha256": "af23ed39a273a023261062d407b2aa39ccc7cbfb0f7544f59bd2a24d01f814cb",
+      "size_bytes": 72954
+    },
+    {
+      "family": "FlexibleJobshopScen",
+      "family_group": "FlexibleJobshopScen",
+      "id": "FlexibleJobshopScen-dh-5-16-400",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FlexibleJobshopScen-dh-5-16-400_c25.xml.lzma",
+      "sha256": "a31119b23810b458be1d45bd1be2a96139ce36d784ebf0137074c804e9aa3601",
+      "size_bytes": 139162
+    },
+    {
+      "family": "FlexibleJobshopScen",
+      "family_group": "FlexibleJobshopScen",
+      "id": "FlexibleJobshopScen-dh-5-20-005",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FlexibleJobshopScen-dh-5-20-005_c25.xml.lzma",
+      "sha256": "910c04dee1d94e1b3a8110caecfc00d54d30e79562986a8bce39c92406bfb83c",
+      "size_bytes": 3750
+    },
+    {
+      "family": "FlexibleJobshopScen",
+      "family_group": "FlexibleJobshopScen",
+      "id": "FlexibleJobshopScen-dh-5-20-020",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FlexibleJobshopScen-dh-5-20-020_c25.xml.lzma",
+      "sha256": "b3d0ab1681e60e2bfc83bb6b356056d1c27449ea173a92da3308be716fa9455f",
+      "size_bytes": 11242
+    },
+    {
+      "family": "FlexibleJobshopScen",
+      "family_group": "FlexibleJobshopScen",
+      "id": "FlexibleJobshopScen-dh-5-20-080",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FlexibleJobshopScen-dh-5-20-080_c25.xml.lzma",
+      "sha256": "1b2653082fb9c6384d2c1371d8aa7c396bd2f69397c54c39893ebe7f18c4405d",
+      "size_bytes": 36089
+    },
+    {
+      "family": "FlexibleJobshopScen",
+      "family_group": "FlexibleJobshopScen",
+      "id": "FlexibleJobshopScen-dh-5-20-200",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FlexibleJobshopScen-dh-5-20-200_c25.xml.lzma",
+      "sha256": "cb95a0ec0425b077f1b523457d188f36dea0ecb58c9b21df1176d8717a7fac95",
+      "size_bytes": 86130
+    },
+    {
+      "family": "FlexibleJobshopScen",
+      "family_group": "FlexibleJobshopScen",
+      "id": "FlexibleJobshopScen-dh-5-20-400",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FlexibleJobshopScen-dh-5-20-400_c25.xml.lzma",
+      "sha256": "d07902d9bbb3337c2fcdaf5c80d580f8f79857ce3ab3bb19d840d529db5bd7aa",
+      "size_bytes": 169180
+    },
+    {
+      "family": "FlexibleJobshopScen",
+      "family_group": "FlexibleJobshopScen",
+      "id": "FlexibleJobshopScen-dh-6-18-005",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FlexibleJobshopScen-dh-6-18-005_c25.xml.lzma",
+      "sha256": "25105854a00d0ff6acacd658d4e5fb3fac192118ea0ce07b4bcebe2111e8e8c5",
+      "size_bytes": 3285
+    },
+    {
+      "family": "FlexibleJobshopScen",
+      "family_group": "FlexibleJobshopScen",
+      "id": "FlexibleJobshopScen-dh-6-18-020",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FlexibleJobshopScen-dh-6-18-020_c25.xml.lzma",
+      "sha256": "d30db6f5bc4e083b83d41279d304fdfe29ca857b3a420873238e2f118e7a3268",
+      "size_bytes": 9512
+    },
+    {
+      "family": "FlexibleJobshopScen",
+      "family_group": "FlexibleJobshopScen",
+      "id": "FlexibleJobshopScen-dh-6-18-080",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FlexibleJobshopScen-dh-6-18-080_c25.xml.lzma",
+      "sha256": "6abd9c867724848ac1314a791bd926b3af5eb13082f9fa2ceb7e8256e8f25142",
+      "size_bytes": 30621
+    },
+    {
+      "family": "FlexibleJobshopScen",
+      "family_group": "FlexibleJobshopScen",
+      "id": "FlexibleJobshopScen-dh-6-18-200",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FlexibleJobshopScen-dh-6-18-200_c25.xml.lzma",
+      "sha256": "0cecc0c21509f2bd84fcc50706e2cd494eff5785d48582cfaa2dc550cbe3f26b",
+      "size_bytes": 72852
+    },
+    {
+      "family": "FlexibleJobshopScen",
+      "family_group": "FlexibleJobshopScen",
+      "id": "FlexibleJobshopScen-dh-6-18-400",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/FlexibleJobshopScen-dh-6-18-400_c25.xml.lzma",
+      "sha256": "920c688965534c46eb2f5bb55d04ba5763e9f7e30d071658d35661466c4a3ea2",
+      "size_bytes": 138389
+    },
+    {
+      "family": "Fortress1",
+      "family_group": "Fortress",
+      "id": "Fortress1-03",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Fortress1-03_c25.xml.lzma",
+      "sha256": "18697be5d42866b6b77a259eab183accb6e05d666061efd369cf67975adbed61",
+      "size_bytes": 3062
+    },
+    {
+      "family": "Fortress1",
+      "family_group": "Fortress",
+      "id": "Fortress1-04",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Fortress1-04_c25.xml.lzma",
+      "sha256": "57f2c48ca103c70def7b676bd1d9962d3ec7ffbdc67e2d67596d839c13be3a07",
+      "size_bytes": 3606
+    },
+    {
+      "family": "Fortress1",
+      "family_group": "Fortress",
+      "id": "Fortress1-05",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Fortress1-05_c25.xml.lzma",
+      "sha256": "2de127f2bce456ac015e250f139c3a3da4c5ab7bd6f4d14d0c931742288fa643",
+      "size_bytes": 5930
+    },
+    {
+      "family": "Fortress1",
+      "family_group": "Fortress",
+      "id": "Fortress1-06",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Fortress1-06_c25.xml.lzma",
+      "sha256": "3e731d966f8bd268e4d7b227dfa79e97c675cf5061da53581556fb0b4bd9bec7",
+      "size_bytes": 5190
+    },
+    {
+      "family": "Fortress1",
+      "family_group": "Fortress",
+      "id": "Fortress1-07",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Fortress1-07_c25.xml.lzma",
+      "sha256": "e537af7b1b898d598e702fb2539a284358592272e26f74a39eeedd6625d8aa9e",
+      "size_bytes": 7351
+    },
+    {
+      "family": "Fortress1",
+      "family_group": "Fortress",
+      "id": "Fortress1-08",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Fortress1-08_c25.xml.lzma",
+      "sha256": "eb78412304ca0d9290738901d2870077aaafbbaa771f9219f276c8e105cad3cf",
+      "size_bytes": 6516
+    },
+    {
+      "family": "Fortress1",
+      "family_group": "Fortress",
+      "id": "Fortress1-09",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Fortress1-09_c25.xml.lzma",
+      "sha256": "2a051b01a58f55fd0f15fe5ae1651c713552eeabea5126e25a9f418e957124ce",
+      "size_bytes": 8679
+    },
+    {
+      "family": "Fortress1",
+      "family_group": "Fortress",
+      "id": "Fortress1-10",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Fortress1-10_c25.xml.lzma",
+      "sha256": "6018e41d7520525701f368a7c347753eeb9aa827d3619d87ee3c995f284146cd",
+      "size_bytes": 10163
+    },
+    {
+      "family": "Fortress2",
+      "family_group": "Fortress",
+      "id": "Fortress2-03",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Fortress2-03_c25.xml.lzma",
+      "sha256": "80ac4df4543154d3f411d2e02a904f8939be74c0a7e30eb1736059b4929a22ad",
+      "size_bytes": 2663
+    },
+    {
+      "family": "Fortress2",
+      "family_group": "Fortress",
+      "id": "Fortress2-04",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Fortress2-04_c25.xml.lzma",
+      "sha256": "35a6a8524ced9a82a978b678e9506244348f12c00b7bddd595af91ffa477ad55",
+      "size_bytes": 3924
+    },
+    {
+      "family": "Fortress2",
+      "family_group": "Fortress",
+      "id": "Fortress2-05",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Fortress2-05_c25.xml.lzma",
+      "sha256": "4cce55488d7340a45df8f5b8679cc8cf46784dad4dc8fd54727817bf91be8f1a",
+      "size_bytes": 5970
+    },
+    {
+      "family": "Fortress2",
+      "family_group": "Fortress",
+      "id": "Fortress2-06",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Fortress2-06_c25.xml.lzma",
+      "sha256": "9e3364dacbd03577322b0cf0034d902cca80a65e76e62d91a7db477b06e76ea6",
+      "size_bytes": 6354
+    },
+    {
+      "family": "Fortress2",
+      "family_group": "Fortress",
+      "id": "Fortress2-07",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Fortress2-07_c25.xml.lzma",
+      "sha256": "a5bbb67e133abc3328405fe8fed71160088e63d4a8e1b667d4153350f7a18a98",
+      "size_bytes": 7378
+    },
+    {
+      "family": "Fortress2",
+      "family_group": "Fortress",
+      "id": "Fortress2-08",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Fortress2-08_c25.xml.lzma",
+      "sha256": "b4f5e83e727cc82db859ab23c04c925083cc5257f4463220e4bd5c0afab14af2",
+      "size_bytes": 7494
+    },
+    {
+      "family": "Fortress2",
+      "family_group": "Fortress",
+      "id": "Fortress2-09",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Fortress2-09_c25.xml.lzma",
+      "sha256": "ccf4b45a9619e3b41eb5d2b06ee7eacc8b4e71059118fe480e677b26503f7501",
+      "size_bytes": 9471
+    },
+    {
+      "family": "Fortress2",
+      "family_group": "Fortress",
+      "id": "Fortress2-10",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/Fortress2-10_c25.xml.lzma",
+      "sha256": "20b09e4200ef9a10fee4fc1e60df7b8845c87e27d748274f3a2b282636a0efd4",
+      "size_bytes": 13922
+    },
+    {
+      "family": "IHTC",
+      "family_group": "IHTC",
+      "id": "IHTC-i01",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/IHTC-i01_c25.xml.lzma",
+      "sha256": "97d5fdcf03a190609ad03a499285d548d2bb7c09fb7dd7f5643e902c5dee0a10",
+      "size_bytes": 4724
+    },
+    {
+      "family": "IHTC",
+      "family_group": "IHTC",
+      "id": "IHTC-i02",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/IHTC-i02_c25.xml.lzma",
+      "sha256": "a64637a868ba022203ab15cc65e23d467f174d0407afe136093b8a2bd0740907",
+      "size_bytes": 5493
+    },
+    {
+      "family": "IHTC",
+      "family_group": "IHTC",
+      "id": "IHTC-i03",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/IHTC-i03_c25.xml.lzma",
+      "sha256": "553f3732cab007e6fd7efaebb7f84d963cb80e41bad2c5aa09e9f92596361d59",
+      "size_bytes": 5951
+    },
+    {
+      "family": "IHTC",
+      "family_group": "IHTC",
+      "id": "IHTC-i04",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/IHTC-i04_c25.xml.lzma",
+      "sha256": "5c4fa87d4563907154776df087da90d57324e58bc470d10f6874dc7865e0f5b2",
+      "size_bytes": 8029
+    },
+    {
+      "family": "IHTC",
+      "family_group": "IHTC",
+      "id": "IHTC-i05",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/IHTC-i05_c25.xml.lzma",
+      "sha256": "e083bd80f012747fa386727edfab1c9beb21358aee50cc9b867c20c1014757e4",
+      "size_bytes": 11980
+    },
+    {
+      "family": "IHTC",
+      "family_group": "IHTC",
+      "id": "IHTC-i06",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/IHTC-i06_c25.xml.lzma",
+      "sha256": "0cf8c2ab9f760d8082295a4f7529bc8f62cb681b23c7c45052760d0f55cd7256",
+      "size_bytes": 12112
+    },
+    {
+      "family": "IHTC",
+      "family_group": "IHTC",
+      "id": "IHTC-i07",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/IHTC-i07_c25.xml.lzma",
+      "sha256": "cd07e760be1c2385d70febaeed44528b35a0eedba3d82769e4b17fd551cee3a4",
+      "size_bytes": 11653
+    },
+    {
+      "family": "IHTC",
+      "family_group": "IHTC",
+      "id": "IHTC-i08",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/IHTC-i08_c25.xml.lzma",
+      "sha256": "4fea777e7293a1edd773d26c7326426065357bd824b972632ffccabad45217cc",
+      "size_bytes": 25734
+    },
+    {
+      "family": "IHTC",
+      "family_group": "IHTC",
+      "id": "IHTC-i09",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/IHTC-i09_c25.xml.lzma",
+      "sha256": "80de40f27f9849569e0782c2216b9a42139f2529d4f6af592330fff1a9e31568",
+      "size_bytes": 12930
+    },
+    {
+      "family": "IHTC",
+      "family_group": "IHTC",
+      "id": "IHTC-i10",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/IHTC-i10_c25.xml.lzma",
+      "sha256": "17d92d6ff022c57dae3e2380e2d968c61fe19db9bac265be1c65efbe31dadd62",
+      "size_bytes": 17357
+    },
+    {
+      "family": "IHTC",
+      "family_group": "IHTC",
+      "id": "IHTC-i11",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/IHTC-i11_c25.xml.lzma",
+      "sha256": "dccfc73f2ec9a30ba7d66de8d0965db8604b4e2b895ea73a609f05b3d89876b8",
+      "size_bytes": 16397
+    },
+    {
+      "family": "IHTC",
+      "family_group": "IHTC",
+      "id": "IHTC-i12",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/IHTC-i12_c25.xml.lzma",
+      "sha256": "3ba8c1a28236e31bcc9b1d06f8aacaa182846ff1ae05ab1da420f3616ef97bc8",
+      "size_bytes": 16483
+    },
+    {
+      "family": "IHTC",
+      "family_group": "IHTC",
+      "id": "IHTC-i16",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/IHTC-i16_c25.xml.lzma",
+      "sha256": "08c30adc0f3ce3a568cb04745df0cfd39cdf9a7480d17866896536d60a3ed71f",
+      "size_bytes": 23085
+    },
+    {
+      "family": "IHTC",
+      "family_group": "IHTC",
+      "id": "IHTC-i18",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/IHTC-i18_c25.xml.lzma",
+      "sha256": "ae6c38da2ab0dfc403a62d88a61f127e9717f2abd51e5e1edfdf73950dabfcfb",
+      "size_bytes": 36923
+    },
+    {
+      "family": "IHTC",
+      "family_group": "IHTC",
+      "id": "IHTC-i29",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/IHTC-i29_c25.xml.lzma",
+      "sha256": "2dd0760b8caed76a2dd9849e86ee898fd23c2959128ed7529926fe7ab35b5483",
+      "size_bytes": 47612
+    },
+    {
+      "family": "IHTC",
+      "family_group": "IHTC",
+      "id": "IHTC-i30",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/IHTC-i30_c25.xml.lzma",
+      "sha256": "b0772a7a321e8ae5a9c1ed505748f08604631d050a5194949c0951a65a3bc5db",
+      "size_bytes": 64111
+    },
+    {
+      "family": "LowAutocorrelation",
+      "family_group": "LowAutocorrelation",
+      "id": "LowAutocorrelation-010",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/LowAutocorrelation-010_c25.xml.lzma",
+      "sha256": "b2e54f4b938781911dbec7e7339d3dc605944f9cd64e8325cbc4b4b8253cbe90",
+      "size_bytes": 705
+    },
+    {
+      "family": "LowAutocorrelation",
+      "family_group": "LowAutocorrelation",
+      "id": "LowAutocorrelation-020",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/LowAutocorrelation-020_c25.xml.lzma",
+      "sha256": "2b640101a11dea4f59f7f34eef27da3813176e8db1ac84a3eac9a88d7989ed8b",
+      "size_bytes": 1179
+    },
+    {
+      "family": "LowAutocorrelation",
+      "family_group": "LowAutocorrelation",
+      "id": "LowAutocorrelation-040",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/LowAutocorrelation-040_c25.xml.lzma",
+      "sha256": "b7c2072d697f215ca5a3f85bf82a07b176f5b413330956f97ba0a7b471f58b74",
+      "size_bytes": 2105
+    },
+    {
+      "family": "LowAutocorrelation",
+      "family_group": "LowAutocorrelation",
+      "id": "LowAutocorrelation-060",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/LowAutocorrelation-060_c25.xml.lzma",
+      "sha256": "04f0a8107786b60cf36c7506e9c18804810a8c3dc45088f9f4a857f2493aabea",
+      "size_bytes": 3255
+    },
+    {
+      "family": "LowAutocorrelation",
+      "family_group": "LowAutocorrelation",
+      "id": "LowAutocorrelation-080",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/LowAutocorrelation-080_c25.xml.lzma",
+      "sha256": "e5cf70a857c704eba7cab1af54e534b97d2c1e06f0b051a4a40f84e23f081223",
+      "size_bytes": 4945
+    },
+    {
+      "family": "LowAutocorrelation",
+      "family_group": "LowAutocorrelation",
+      "id": "LowAutocorrelation-100",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/LowAutocorrelation-100_c25.xml.lzma",
+      "sha256": "76ca3e19c04ff9b0b76c6f1d9af324884e64bc72bd7f7a15d711fd892b75f26c",
+      "size_bytes": 6031
+    },
+    {
+      "family": "LowAutocorrelation",
+      "family_group": "LowAutocorrelation",
+      "id": "LowAutocorrelation-120",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/LowAutocorrelation-120_c25.xml.lzma",
+      "sha256": "e9925aa44a3852dd3025a7e4fcd23064a2eb2bf6e6d3fd7f4662ec4580049ad7",
+      "size_bytes": 9876
+    },
+    {
+      "family": "LowAutocorrelation",
+      "family_group": "LowAutocorrelation",
+      "id": "LowAutocorrelation-150",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/LowAutocorrelation-150_c25.xml.lzma",
+      "sha256": "073ecd8e1d9a7cfca33b5a23cefe5042a4a04d1c26469b6776aeebcfc5bb98b9",
+      "size_bytes": 13675
+    },
+    {
+      "family": "LowAutocorrelation",
+      "family_group": "LowAutocorrelation",
+      "id": "LowAutocorrelation-200",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/LowAutocorrelation-200_c25.xml.lzma",
+      "sha256": "df1f6d982c901bd8324f1e6c3deecc806a81e59ea702b36d790a4004b41fa6a8",
+      "size_bytes": 22110
+    },
+    {
+      "family": "LowAutocorrelation",
+      "family_group": "LowAutocorrelation",
+      "id": "LowAutocorrelation-300",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/LowAutocorrelation-300_c25.xml.lzma",
+      "sha256": "a426e5d83d7b71d475112dcaf2a8e8e3aac8985850c3f95dcf885596ef02c85f",
+      "size_bytes": 43642
+    },
+    {
+      "family": "LowAutocorrelation",
+      "family_group": "LowAutocorrelation",
+      "id": "LowAutocorrelation-500",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/LowAutocorrelation-500_c25.xml.lzma",
+      "sha256": "b195a1ef438be6352a35f4c47d43d9dd3e8f2253444ad6c4473cb5bc60abb446",
+      "size_bytes": 108751
+    },
+    {
+      "family": "LowAutocorrelation",
+      "family_group": "LowAutocorrelation",
+      "id": "LowAutocorrelation-800",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/LowAutocorrelation-800_c25.xml.lzma",
+      "sha256": "2df6d797be691ed47a201fbf1edbb99636a4ad60355bce3b1ab3a6d516fa61cd",
+      "size_bytes": 296916
+    },
+    {
+      "family": "MetabolicNetwork",
+      "family_group": "MetabolicNetwork",
+      "id": "MetabolicNetwork-09",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/MetabolicNetwork-09_c25.xml.lzma",
+      "sha256": "8259d2fd5ee781078c6ee2171ecc2abc84f3ab99b3ae4a241e4053b158268c1f",
+      "size_bytes": 683
+    },
+    {
+      "family": "MetabolicNetwork",
+      "family_group": "MetabolicNetwork",
+      "id": "MetabolicNetwork-10",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/MetabolicNetwork-10_c25.xml.lzma",
+      "sha256": "9b8d64f6bcd867c859b182fb5ee81cea2f82e4e2d2b69312166a2d18388f4f6e",
+      "size_bytes": 736
+    },
+    {
+      "family": "MetabolicNetwork",
+      "family_group": "MetabolicNetwork",
+      "id": "MetabolicNetwork-14",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/MetabolicNetwork-14_c25.xml.lzma",
+      "sha256": "9cf714f66438827f7e4c84c9f2c5e252a8b3e56dd6df5ca631428c0ad70501cc",
+      "size_bytes": 11427
+    },
+    {
+      "family": "MetabolicNetwork",
+      "family_group": "MetabolicNetwork",
+      "id": "MetabolicNetwork-16",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/MetabolicNetwork-16_c25.xml.lzma",
+      "sha256": "d11791255e35bc74e184b21e2daab6e365f8e968b9e8a59b528f7fdd9a1a5b17",
+      "size_bytes": 801
+    },
+    {
+      "family": "MetabolicNetwork",
+      "family_group": "MetabolicNetwork",
+      "id": "MetabolicNetwork-17",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/MetabolicNetwork-17_c25.xml.lzma",
+      "sha256": "2584f005e3c8e10bac5f5148e8f9d7598442c395fc38afdb6a8f5131b85e30f6",
+      "size_bytes": 886
+    },
+    {
+      "family": "MetabolicNetwork",
+      "family_group": "MetabolicNetwork",
+      "id": "MetabolicNetwork-36",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/MetabolicNetwork-36_c25.xml.lzma",
+      "sha256": "442d81940bde0bf175453631408d75b1ddba616c8e32a640f0266451cd9658a6",
+      "size_bytes": 21100
+    },
+    {
+      "family": "MetabolicNetwork",
+      "family_group": "MetabolicNetwork",
+      "id": "MetabolicNetwork-37",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/MetabolicNetwork-37_c25.xml.lzma",
+      "sha256": "05e8fb39776a5404ebae7a88973c4e6536147512a3bea776e43dc60286dedec7",
+      "size_bytes": 15064
+    },
+    {
+      "family": "MetabolicNetwork",
+      "family_group": "MetabolicNetwork",
+      "id": "MetabolicNetwork-38",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/MetabolicNetwork-38_c25.xml.lzma",
+      "sha256": "bd3f89046780e02661ff7f1096e6d6bce7331ef10f9885e6ed63c7c87ac37794",
+      "size_bytes": 15859
+    },
+    {
+      "family": "MetabolicNetwork",
+      "family_group": "MetabolicNetwork",
+      "id": "MetabolicNetwork-39",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/MetabolicNetwork-39_c25.xml.lzma",
+      "sha256": "bd37057a1c7c8d3c7cc7accfe95d5a2cecae9c02894c98d209522ceaebe1129d",
+      "size_bytes": 17224
+    },
+    {
+      "family": "MetabolicNetwork",
+      "family_group": "MetabolicNetwork",
+      "id": "MetabolicNetwork-40",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/MetabolicNetwork-40_c25.xml.lzma",
+      "sha256": "60e66a4613eb15daeead91d486907adf7fc845bb1adf9a692079eb9811100522",
+      "size_bytes": 12852
+    },
+    {
+      "family": "MetabolicNetwork",
+      "family_group": "MetabolicNetwork",
+      "id": "MetabolicNetwork-41",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/MetabolicNetwork-41_c25.xml.lzma",
+      "sha256": "8dfb679f9879549bcebc0567b59f1a6adcf94485c3d130938a799f29f87ecb08",
+      "size_bytes": 6262
+    },
+    {
+      "family": "MetabolicNetwork",
+      "family_group": "MetabolicNetwork",
+      "id": "MetabolicNetwork-43",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/MetabolicNetwork-43_c25.xml.lzma",
+      "sha256": "042a58c91b18a85e0190d92a56174704c06a1f6e5bb1b80dc0ae1d109a8a7423",
+      "size_bytes": 15771
+    },
+    {
+      "family": "MetabolicNetwork",
+      "family_group": "MetabolicNetwork",
+      "id": "MetabolicNetwork-45",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/MetabolicNetwork-45_c25.xml.lzma",
+      "sha256": "121cdc7ba153b663d3023de908bd274b5ad3c09a1226edcde83e4b4d13546e33",
+      "size_bytes": 17160
+    },
+    {
+      "family": "MetabolicNetwork",
+      "family_group": "MetabolicNetwork",
+      "id": "MetabolicNetwork-47",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/MetabolicNetwork-47_c25.xml.lzma",
+      "sha256": "bc4e8a549f65258ab125d848206f1da3b43cb0a0417855158839254850c6e147",
+      "size_bytes": 17234
+    },
+    {
+      "family": "MetabolicNetwork",
+      "family_group": "MetabolicNetwork",
+      "id": "MetabolicNetwork-49",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/MetabolicNetwork-49_c25.xml.lzma",
+      "sha256": "dd9c24404695ed62ddf82af2b0a1b1f71aa7be66038bcce83d9cc6d40cfa1178",
+      "size_bytes": 23645
+    },
+    {
+      "family": "RoadefPlaning2",
+      "family_group": "RoadefPlaning2",
+      "id": "RoadefPlaning2-2021-04",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RoadefPlaning2-2021-04_c25.xml.lzma",
+      "sha256": "b598bb43a3b3e5a77b3f2288d104bf6273837316365a517b1dbfcd9dc617a1b2",
+      "size_bytes": 1358
+    },
+    {
+      "family": "RoadefPlaning2",
+      "family_group": "RoadefPlaning2",
+      "id": "RoadefPlaning2-2021-05",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RoadefPlaning2-2021-05_c25.xml.lzma",
+      "sha256": "e0b0de8fb94b6d0d9a61ce8c6b690ce77f455cd32cfb07c69282618e21dc3978",
+      "size_bytes": 1362
+    },
+    {
+      "family": "RoadefPlaning2",
+      "family_group": "RoadefPlaning2",
+      "id": "RoadefPlaning2-2021-06",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RoadefPlaning2-2021-06_c25.xml.lzma",
+      "sha256": "4676b4a4f1e192e78c26e7b2ee9d6d06a7d15dde61a41de5ba1aed7d8fa62ec0",
+      "size_bytes": 1362
+    },
+    {
+      "family": "RoadefPlaning2",
+      "family_group": "RoadefPlaning2",
+      "id": "RoadefPlaning2-2022-10",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RoadefPlaning2-2022-10_c25.xml.lzma",
+      "sha256": "1deaed4f11a8186d1a0022e3e72ba0023b7e913f856e418aaae9f31906c6c1c6",
+      "size_bytes": 2102
+    },
+    {
+      "family": "RoadefPlaning2",
+      "family_group": "RoadefPlaning2",
+      "id": "RoadefPlaning2-2022-11",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RoadefPlaning2-2022-11_c25.xml.lzma",
+      "sha256": "c937d086aa8d2d906b6252b8d490f03d1b85cfe263c05ecfbbe1dc6da6dca268",
+      "size_bytes": 2132
+    },
+    {
+      "family": "RoadefPlaning2",
+      "family_group": "RoadefPlaning2",
+      "id": "RoadefPlaning2-2022-12",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RoadefPlaning2-2022-12_c25.xml.lzma",
+      "sha256": "caf9b9bbb07b22f14b78183eebff91c0e0b251efe8908b3a8ad2068d8a40a9f7",
+      "size_bytes": 2118
+    },
+    {
+      "family": "RoadefPlaning2",
+      "family_group": "RoadefPlaning2",
+      "id": "RoadefPlaning2-2023-11",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RoadefPlaning2-2023-11_c25.xml.lzma",
+      "sha256": "a36b058d3019fe116ff3f514ad6a3ff038ee7849074c1dedc4c82305f7db6d2e",
+      "size_bytes": 2084
+    },
+    {
+      "family": "RoadefPlaning2",
+      "family_group": "RoadefPlaning2",
+      "id": "RoadefPlaning2-2023-12",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RoadefPlaning2-2023-12_c25.xml.lzma",
+      "sha256": "da2e7b57cbba34e42240287c16f5e66dc288d9bff2132b4267979bec0f4bd1b6",
+      "size_bytes": 2088
+    },
+    {
+      "family": "RoadefPlaning2",
+      "family_group": "RoadefPlaning2",
+      "id": "RoadefPlaning2-2023-13",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RoadefPlaning2-2023-13_c25.xml.lzma",
+      "sha256": "c8cb67d9950234b6a7123a790fb3e0fea733ef827df1c939daa16f14a30bd5d5",
+      "size_bytes": 2089
+    },
+    {
+      "family": "RoadefPlaning2",
+      "family_group": "RoadefPlaning2",
+      "id": "RoadefPlaning2-2024-09",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RoadefPlaning2-2024-09_c25.xml.lzma",
+      "sha256": "a1050dfb94f9f0d1743e7570d5227cd025b8f3dde253028193011c9e103f6d34",
+      "size_bytes": 1783
+    },
+    {
+      "family": "RoadefPlaning2",
+      "family_group": "RoadefPlaning2",
+      "id": "RoadefPlaning2-2024-10",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RoadefPlaning2-2024-10_c25.xml.lzma",
+      "sha256": "b78764466bc1cac159300d0ebfe32a893fca6d598880057d9dd5d601f19ec8d5",
+      "size_bytes": 1791
+    },
+    {
+      "family": "RoadefPlaning2",
+      "family_group": "RoadefPlaning2",
+      "id": "RoadefPlaning2-2024-11",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RoadefPlaning2-2024-11_c25.xml.lzma",
+      "sha256": "e27b83b91661a53f2798a6d6d1d2cdc7db53bb441505a46b60d73b4eeb6b4318",
+      "size_bytes": 1787
+    },
+    {
+      "family": "RollerSplat",
+      "family_group": "RollerSplat",
+      "id": "RollerSplat-04-20",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RollerSplat-04-20_c25.xml.lzma",
+      "sha256": "7cbd9a74f7b87e192fe3cdbcc5cc2482c0651798b9af3e596483ff2ba98ff8ac",
+      "size_bytes": 3032
+    },
+    {
+      "family": "RollerSplat",
+      "family_group": "RollerSplat",
+      "id": "RollerSplat-05a-30",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RollerSplat-05a-30_c25.xml.lzma",
+      "sha256": "72b74af37456e914fca260da6493ab95754f5b7ca0b7c1d74e8488a038f47e4e",
+      "size_bytes": 2616
+    },
+    {
+      "family": "RollerSplat",
+      "family_group": "RollerSplat",
+      "id": "RollerSplat-05b-50",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RollerSplat-05b-50_c25.xml.lzma",
+      "sha256": "56005929510cd4c5e16918586383c92947f148b81011c36d3b6bf14f6e05e54e",
+      "size_bytes": 5327
+    },
+    {
+      "family": "RollerSplat",
+      "family_group": "RollerSplat",
+      "id": "RollerSplat-05c-70",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RollerSplat-05c-70_c25.xml.lzma",
+      "sha256": "8ad8882cc59abedd9bc553f5224fdacd7a490576ae30939aef430a0ba5e073b0",
+      "size_bytes": 10213
+    },
+    {
+      "family": "RollerSplat",
+      "family_group": "RollerSplat",
+      "id": "RollerSplat-05d-90",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RollerSplat-05d-90_c25.xml.lzma",
+      "sha256": "c7fc3afbdce78d16453356e53f00623932816f93574c2b7c8377a446b3ebc193",
+      "size_bytes": 23001
+    },
+    {
+      "family": "RollerSplat",
+      "family_group": "RollerSplat",
+      "id": "RollerSplat-06a-30",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RollerSplat-06a-30_c25.xml.lzma",
+      "sha256": "1de1b8d77f62e202b9481e8f81c17d41c38583df9e9c81411640eca2e85bbc42",
+      "size_bytes": 5302
+    },
+    {
+      "family": "RollerSplat",
+      "family_group": "RollerSplat",
+      "id": "RollerSplat-06b-50",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RollerSplat-06b-50_c25.xml.lzma",
+      "sha256": "3809ee71aea5337258dd81e985240e22458e934a98de1b3cd4c14bd76313489c",
+      "size_bytes": 10591
+    },
+    {
+      "family": "RollerSplat",
+      "family_group": "RollerSplat",
+      "id": "RollerSplat-06c-70",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RollerSplat-06c-70_c25.xml.lzma",
+      "sha256": "b348ccdebb0b12b090f85a369d74559bf4fdc4609e06418578b02f53d9fc269a",
+      "size_bytes": 21649
+    },
+    {
+      "family": "RollerSplat",
+      "family_group": "RollerSplat",
+      "id": "RollerSplat-06d-90",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RollerSplat-06d-90_c25.xml.lzma",
+      "sha256": "d5d8d6254edb72b45058388d73e24b213df06b82418c4c636f01f237cb926ac9",
+      "size_bytes": 34908
+    },
+    {
+      "family": "RollerSplat",
+      "family_group": "RollerSplat",
+      "id": "RollerSplat-07a-30",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RollerSplat-07a-30_c25.xml.lzma",
+      "sha256": "166c406cda1c9190bedba58c685d6be1453c2991ae08eeb64a966ad6ef94d3fd",
+      "size_bytes": 5949
+    },
+    {
+      "family": "RollerSplat",
+      "family_group": "RollerSplat",
+      "id": "RollerSplat-07b-50",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RollerSplat-07b-50_c25.xml.lzma",
+      "sha256": "3983adf17b50e85b77c35a56e9e4eeb03f7672f8be058be42e27b767bc56b471",
+      "size_bytes": 13246
+    },
+    {
+      "family": "RollerSplat",
+      "family_group": "RollerSplat",
+      "id": "RollerSplat-07c-70",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/RollerSplat-07c-70_c25.xml.lzma",
+      "sha256": "63b559177afd5da1fded03b7f354ea8e784276a6253cd2b4889f04246c339ad5",
+      "size_bytes": 14985
+    },
+    {
+      "family": "SchedulingOS",
+      "family_group": "SchedulingOS",
+      "id": "SchedulingOS-gp-04-01",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/SchedulingOS-gp-04-01_c25.xml.lzma",
+      "sha256": "dbd20cedb84e983cb5591049350b2a962887f5f41c3a908cb61cbd4d8dc86ac4",
+      "size_bytes": 983
+    },
+    {
+      "family": "SchedulingOS",
+      "family_group": "SchedulingOS",
+      "id": "SchedulingOS-gp-04-05",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/SchedulingOS-gp-04-05_c25.xml.lzma",
+      "sha256": "446a91b797958fb7f7a1e7bce3976999a6575eb13a81282e49e5a475a859e16e",
+      "size_bytes": 986
+    },
+    {
+      "family": "SchedulingOS",
+      "family_group": "SchedulingOS",
+      "id": "SchedulingOS-gp-05-01",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/SchedulingOS-gp-05-01_c25.xml.lzma",
+      "sha256": "d3786ab137065f93275714b664c722e75575592e4832bf2a0908c4016777eaa2",
+      "size_bytes": 1090
+    },
+    {
+      "family": "SchedulingOS",
+      "family_group": "SchedulingOS",
+      "id": "SchedulingOS-gp-05-05",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/SchedulingOS-gp-05-05_c25.xml.lzma",
+      "sha256": "091cce2e33e5f2d48076a91092b60ea0d75745b5797d693b51cf26cc1ab2f1ca",
+      "size_bytes": 1058
+    },
+    {
+      "family": "SchedulingOS",
+      "family_group": "SchedulingOS",
+      "id": "SchedulingOS-gp-06-01",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/SchedulingOS-gp-06-01_c25.xml.lzma",
+      "sha256": "58843976fb0297ea40d2fee845bdcfb255ecd521ebf03b3939a0bd09662d7456",
+      "size_bytes": 1194
+    },
+    {
+      "family": "SchedulingOS",
+      "family_group": "SchedulingOS",
+      "id": "SchedulingOS-gp-06-05",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/SchedulingOS-gp-06-05_c25.xml.lzma",
+      "sha256": "2e62f60fc2c5d76eb641ddf419e371ad0463b85811ba749237f41bc439c4d26a",
+      "size_bytes": 1180
+    },
+    {
+      "family": "SchedulingOS",
+      "family_group": "SchedulingOS",
+      "id": "SchedulingOS-gp-07-01",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/SchedulingOS-gp-07-01_c25.xml.lzma",
+      "sha256": "ced8443a0cd76b569004ecb232da1d46e0dcf943c4509108b0a7e3d63113fdff",
+      "size_bytes": 1312
+    },
+    {
+      "family": "SchedulingOS",
+      "family_group": "SchedulingOS",
+      "id": "SchedulingOS-gp-07-05",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/SchedulingOS-gp-07-05_c25.xml.lzma",
+      "sha256": "f699b8a2af0824d22f8737ef8402b83129128c6fa536d62e219fa7d46a55f16f",
+      "size_bytes": 1289
+    },
+    {
+      "family": "SchedulingOS",
+      "family_group": "SchedulingOS",
+      "id": "SchedulingOS-gp-08-01",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/SchedulingOS-gp-08-01_c25.xml.lzma",
+      "sha256": "03b1813619e226c68e82db5052cfaf01f85c052996b93ab97fb3b9a52fe9e82b",
+      "size_bytes": 1420
+    },
+    {
+      "family": "SchedulingOS",
+      "family_group": "SchedulingOS",
+      "id": "SchedulingOS-gp-08-05",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/SchedulingOS-gp-08-05_c25.xml.lzma",
+      "sha256": "d103498491184c871a8e07a5b033f72878bffaf613613f25c23184e349824c3e",
+      "size_bytes": 1397
+    },
+    {
+      "family": "SchedulingOS",
+      "family_group": "SchedulingOS",
+      "id": "SchedulingOS-gp-09-01",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/SchedulingOS-gp-09-01_c25.xml.lzma",
+      "sha256": "9769b0e9d3cdbcdda6ab17675d26d1d7328fbb36f8adf0c029b4f2cc8afeb919",
+      "size_bytes": 1567
+    },
+    {
+      "family": "SchedulingOS",
+      "family_group": "SchedulingOS",
+      "id": "SchedulingOS-gp-09-05",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/SchedulingOS-gp-09-05_c25.xml.lzma",
+      "sha256": "de17dfa3244c89ae7427cfb7608551955bf8fb79f4599e9a3c555e8346646569",
+      "size_bytes": 1590
+    },
+    {
+      "family": "SchedulingOS",
+      "family_group": "SchedulingOS",
+      "id": "SchedulingOS-gp-10-01",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/SchedulingOS-gp-10-01_c25.xml.lzma",
+      "sha256": "73be355151e96ad79402376a9a99233625530f0601be4f075ddb13b82970c28b",
+      "size_bytes": 1730
+    },
+    {
+      "family": "SchedulingOS",
+      "family_group": "SchedulingOS",
+      "id": "SchedulingOS-gp-10-05",
+      "objective_sense": "min",
+      "path": "data/XCSP25/COP25/SchedulingOS-gp-10-05_c25.xml.lzma",
+      "sha256": "6ff4f8ab50a74719a2f8a32b910fcab7120e96bd9296b6f7681dc5f0e51b3a02",
+      "size_bytes": 1717
+    },
+    {
+      "family": "TankAllocation1",
+      "family_group": "TankAllocation",
+      "id": "TankAllocation1-0000",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/TankAllocation1-0000_c25.xml.lzma",
+      "sha256": "e5362913b6cc76594547fa35a219dc4aff9fc3064ea032c28050e35845e322ba",
+      "size_bytes": 1735
+    },
+    {
+      "family": "TankAllocation1",
+      "family_group": "TankAllocation",
+      "id": "TankAllocation1-0400",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/TankAllocation1-0400_c25.xml.lzma",
+      "sha256": "ac4998da3a4b5c803ec42a92cdd5b0b307fe797b73bfcb1f546a77e58a62f5e7",
+      "size_bytes": 2681
+    },
+    {
+      "family": "TankAllocation1",
+      "family_group": "TankAllocation",
+      "id": "TankAllocation1-0800",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/TankAllocation1-0800_c25.xml.lzma",
+      "sha256": "0c7474354b05bd11832109a19333e20ccc5a86594fc7f35edd0d2317fca9b82b",
+      "size_bytes": 3205
+    },
+    {
+      "family": "TankAllocation1",
+      "family_group": "TankAllocation",
+      "id": "TankAllocation1-1200",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/TankAllocation1-1200_c25.xml.lzma",
+      "sha256": "dce8d76d9c73a639a85dfabd5d8527c36a8a6d9f8bf312f688a9be48c5e00797",
+      "size_bytes": 2644
+    },
+    {
+      "family": "TankAllocation1",
+      "family_group": "TankAllocation",
+      "id": "TankAllocation1-1600",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/TankAllocation1-1600_c25.xml.lzma",
+      "sha256": "b575d1df4a899eeaf56ffe3ff4be14b148deb63829fc025f15f97af69df675c3",
+      "size_bytes": 3485
+    },
+    {
+      "family": "TankAllocation1",
+      "family_group": "TankAllocation",
+      "id": "TankAllocation1-2000",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/TankAllocation1-2000_c25.xml.lzma",
+      "sha256": "f1902cce2c88143e4f864a60baf4ccd5f28c2a2396fcfe7a56cc490664cebb0a",
+      "size_bytes": 3607
+    },
+    {
+      "family": "TankAllocation1",
+      "family_group": "TankAllocation",
+      "id": "TankAllocation1-2400",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/TankAllocation1-2400_c25.xml.lzma",
+      "sha256": "107e6a6f7d4b5635927fe6a296ff475be3c28c22bfba43e8c25b39f2584cea4d",
+      "size_bytes": 3714
+    },
+    {
+      "family": "TankAllocation1",
+      "family_group": "TankAllocation",
+      "id": "TankAllocation1-2591",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/TankAllocation1-2591_c25.xml.lzma",
+      "sha256": "defbb9f6040aa7584b3bb054da2f6b8cd5e7293d6b5c4f987ef49c578ad7cd95",
+      "size_bytes": 4059
+    },
+    {
+      "family": "TankAllocation1",
+      "family_group": "TankAllocation",
+      "id": "TankAllocation1-chemical",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/TankAllocation1-chemical_c25.xml.lzma",
+      "sha256": "e705785c02aac4ffc144c837b9b7cf609c7ae79dbb7d206852354a7fb7c0e9a3",
+      "size_bytes": 1391
+    },
+    {
+      "family": "TankAllocation2",
+      "family_group": "TankAllocation",
+      "id": "TankAllocation2-0000",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/TankAllocation2-0000_c25.xml.lzma",
+      "sha256": "d37993255ee733b6037247190651ced04d5d793a7d844f6aaf80383759a023b9",
+      "size_bytes": 103607
+    },
+    {
+      "family": "TankAllocation2",
+      "family_group": "TankAllocation",
+      "id": "TankAllocation2-0400",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/TankAllocation2-0400_c25.xml.lzma",
+      "sha256": "af5f6e09f1bb09214496ebd2338b2e14b6f49af41fcd761be2d7c916bff75e7a",
+      "size_bytes": 1845523
+    },
+    {
+      "family": "TankAllocation2",
+      "family_group": "TankAllocation",
+      "id": "TankAllocation2-0800",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/TankAllocation2-0800_c25.xml.lzma",
+      "sha256": "2a300c89eed2c68ddece91a432feb28f0ec636b90c23030be25e0744a520b487",
+      "size_bytes": 3061215
+    },
+    {
+      "family": "TankAllocation2",
+      "family_group": "TankAllocation",
+      "id": "TankAllocation2-1200",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/TankAllocation2-1200_c25.xml.lzma",
+      "sha256": "e1f93c8b13ed6c76bcf4beb992ef05d3731636962196ca4631a766894c8c49b6",
+      "size_bytes": 15293
+    },
+    {
+      "family": "TankAllocation2",
+      "family_group": "TankAllocation",
+      "id": "TankAllocation2-1600",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/TankAllocation2-1600_c25.xml.lzma",
+      "sha256": "8ea2db34f95cede44c915d9d00ba29c82b22fc73390297ac82d0e1d7d96f7297",
+      "size_bytes": 60084
+    },
+    {
+      "family": "TankAllocation2",
+      "family_group": "TankAllocation",
+      "id": "TankAllocation2-2000",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/TankAllocation2-2000_c25.xml.lzma",
+      "sha256": "5c8dc49f5124717ee7cc25be8e09faa7ab2c3efdb621b2fb4a0481e3e4011ffc",
+      "size_bytes": 354856
+    },
+    {
+      "family": "TankAllocation2",
+      "family_group": "TankAllocation",
+      "id": "TankAllocation2-2400",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/TankAllocation2-2400_c25.xml.lzma",
+      "sha256": "d482fdea744e3bed26e0180492ebbd99ace4587d575a88271ae81eaa71a350b6",
+      "size_bytes": 92179
+    },
+    {
+      "family": "TankAllocation2",
+      "family_group": "TankAllocation",
+      "id": "TankAllocation2-2591",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/TankAllocation2-2591_c25.xml.lzma",
+      "sha256": "3d26c7d0e4ce4c7acc1c042bfa9917161151f00de2441c0ad15af89e9a145f23",
+      "size_bytes": 53370
+    },
+    {
+      "family": "TankAllocation2",
+      "family_group": "TankAllocation",
+      "id": "TankAllocation2-chemical",
+      "objective_sense": "max",
+      "path": "data/XCSP25/COP25/TankAllocation2-chemical_c25.xml.lzma",
+      "sha256": "38320f7242ccee46cacd7b42471ccc3afd7e07927c0b9c4b25c504fc3db81951",
+      "size_bytes": 40624
+    }
+  ],
+  "schema": "qayd.fastcop.manifest/v1",
+  "source": "https://www.cril.univ-artois.fr/~lecoutre/compets/instancesXCSP25.zip",
+  "track": "FAST COP"
+}

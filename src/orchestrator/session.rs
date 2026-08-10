@@ -152,8 +152,8 @@ impl SemanticSolveSession {
         }
         self.prepare(request, budget)?;
         let compiled = self.compiled.as_ref().expect("successful session preparation installs a compiled plan");
-        let Some((_, branch_order)) = compiled
-            .search_guidance_interruptible(&request.hints, &request.branch_order, budget.stop())
+        let Some((_, branch_order, primary_branch_scope)) = compiled
+            .search_guidance_interruptible(&request.hints, &request.branch_order, request.primary_branch_scope.as_deref(), budget.stop())
             .map_err(|error| SolveError::InvalidRequest(error.reason))?
         else {
             return Err(SolveError::Interrupted("session search guidance construction was interrupted".to_string()));
@@ -204,6 +204,7 @@ impl SemanticSolveSession {
             objectives,
             assumptions,
             hints,
+            primary_branch_scope,
             branch_order,
             shared_clauses: Some(Arc::clone(&self.clauses)),
             first_worker: self.next_worker,

@@ -12,7 +12,7 @@ use crate::Solver;
 use super::{Constraint, IntDomain, IntExpr, IntGlobalConstraint, Model, Objective, Relation, SetVarRef};
 
 type CompileStep<T> = Result<Option<T>, CpCompileError>;
-type SearchGuidanceParts = (Vec<Option<i32>>, Vec<VarId>);
+type SearchGuidanceParts = (Vec<Option<i32>>, Vec<VarId>, Option<Vec<VarId>>);
 
 const CP_ESTIMATE_BASE_BYTES: u128 = 64 * 1024;
 
@@ -288,13 +288,14 @@ impl CompiledCp {
         &self,
         hints: &[(usize, i32)],
         branch_order: &[usize],
+        primary_branch_scope: Option<&[usize]>,
         stop: &AtomicBool,
     ) -> CompileStep<SearchGuidanceParts> {
         if interrupted(stop) {
             return Ok(None);
         }
-        if hints.is_empty() && branch_order.is_empty() {
-            return Ok(Some((Vec::new(), Vec::new())));
+        if hints.is_empty() && branch_order.is_empty() && primary_branch_scope.is_none() {
+            return Ok(Some((Vec::new(), Vec::new(), None)));
         }
         let mut phase = if hints.is_empty() { Vec::new() } else { vec![None; self.problem.solver.store.num_vars()] };
         let mut seen_hints = BTreeSet::new();
@@ -316,6 +317,27 @@ impl CompiledCp {
             phase[variable.index()] = Some(value);
         }
 
+        let mut semantic_scope = BTreeSet::new();
+        let primary_scope =
+            match primary_branch_scope {
+                None => None,
+                Some(scope) => {
+                    let mut physical = Vec::with_capacity(scope.len());
+                    for &index in scope {
+                        if interrupted(stop) {
+                            return Ok(None);
+                        }
+                        if !semantic_scope.insert(index) {
+                            return Err(CpCompileError::new(format!("integer variable {index} appears twice in primary_branch_scope")));
+                        }
+                        physical.push(self.int_variables.get(index).copied().ok_or_else(|| {
+                            CpCompileError::new(format!("primary_branch_scope references unknown integer variable {index}"))
+                        })?);
+                    }
+                    Some(physical)
+                }
+            };
+
         let mut seen_order = BTreeSet::new();
         let mut order = Vec::with_capacity(branch_order.len());
         for &index in branch_order {
@@ -325,6 +347,9 @@ impl CompiledCp {
             if !seen_order.insert(index) {
                 return Err(CpCompileError::new(format!("integer variable {index} appears twice in branch_order")));
             }
+            if primary_branch_scope.is_some() && !semantic_scope.contains(&index) {
+                return Err(CpCompileError::new(format!("branch_order variable {index} is outside primary_branch_scope")));
+            }
             order.push(
                 self.int_variables
                     .get(index)
@@ -332,7 +357,7 @@ impl CompiledCp {
                     .ok_or_else(|| CpCompileError::new(format!("branch_order references unknown integer variable {index}")))?,
             );
         }
-        Ok(Some((phase, order)))
+        Ok(Some((phase, order, primary_scope)))
     }
 
     pub(crate) fn decode(&self, values: &[i32]) -> Result<DecodedCpAssignment, String> {
@@ -558,6 +583,26 @@ fn variable_cumulative_horizon(
     Some(if first { 0 } else { u128::try_from(latest_end.saturating_sub(earliest).max(0)).unwrap_or(u128::MAX) })
 }
 
+fn table_support_count(tuples: &[Vec<i32>], arity: usize, stop: &AtomicBool) -> Option<u128> {
+    let mut total = 0u128;
+    // One set at a time keeps the estimator's peak temporary memory bounded by
+    // a single column instead of duplicating the whole table body.
+    let mut values = BTreeSet::new();
+    for column in 0..arity {
+        values.clear();
+        for tuple in tuples {
+            if interrupted(stop) {
+                return None;
+            }
+            if let Some(&value) = tuple.get(column).filter(|&&value| value != table::STAR) {
+                values.insert(value);
+            }
+        }
+        total = total.saturating_add(wide(values.len()));
+    }
+    Some(total)
+}
+
 fn estimate_global_bytes(model: &Model, global: &IntGlobalConstraint, stop: &AtomicBool) -> Option<u128> {
     if interrupted(stop) {
         return None;
@@ -591,11 +636,18 @@ fn estimate_global_bytes(model: &Model, global: &IntGlobalConstraint, stop: &Ato
             let arity = wide(variables.len());
             let tuple_count = wide(tuples.len());
             let words = tuple_count.saturating_add(63) / 64;
-            let support_bitsets = arity.saturating_mul(tuple_count).saturating_mul(words).saturating_mul(8);
-            let table_body = arity.saturating_mul(tuple_count).saturating_mul(8);
+            let support_values = table_support_count(tuples, variables.len(), stop)?;
+            let support_bitsets = support_values.saturating_mul(words).saturating_mul(8);
+            let support_maps = support_values.saturating_mul(64);
+            let table_body = arity.saturating_mul(tuple_count).saturating_mul(4);
             let layered_scratch = arity.saturating_add(1).saturating_mul(words).saturating_mul(if *positive { 48 } else { 32 });
             let residues = domain_cells(model, variables, stop)?.saturating_mul(if *positive { 160 } else { 32 });
-            8192u128.saturating_add(support_bitsets).saturating_add(table_body).saturating_add(layered_scratch).saturating_add(residues)
+            8192u128
+                .saturating_add(support_bitsets)
+                .saturating_add(support_maps)
+                .saturating_add(table_body)
+                .saturating_add(layered_scratch)
+                .saturating_add(residues)
         }
         IntGlobalConstraint::Regular { variables, automaton } => {
             let layers = wide(variables.len()).saturating_add(1);

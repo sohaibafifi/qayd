@@ -252,18 +252,35 @@ pub(crate) fn solve_interruptible_seeded<F>(solver: &mut Solver, vars: &[VarId],
 where
     F: FnMut(&Solver) -> SearchControl,
 {
+    solve_interruptible_seeded_with_scope(solver, vars, None, on_solution, stop, seed)
+}
+
+/// Like [`solve_interruptible_seeded`], but branches over the explicit primary
+/// scope before completing the full assignment in `vars`.
+pub(crate) fn solve_interruptible_seeded_with_scope<F>(
+    solver: &mut Solver,
+    vars: &[VarId],
+    primary_branch_scope: Option<&[VarId]>,
+    on_solution: F,
+    stop: &AtomicBool,
+    seed: u64,
+) -> SolveStats
+where
+    F: FnMut(&Solver) -> SearchControl,
+{
     let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, None) else {
         return SolveStats::default();
     };
-    cdcl.enumerate(vars, on_solution, stop)
+    cdcl.enumerate(vars, primary_branch_scope, on_solution, stop)
 }
 
 /// Find one solution under temporary assumptions, with optional learned-clause
 /// exchange, value hints, and a conflict budget.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn decide_sat_assuming_seeded(
+pub(crate) fn decide_sat_assuming_seeded_with_scope(
     solver: &mut Solver,
     vars: &[VarId],
+    primary_branch_scope: Option<&[VarId]>,
     assumptions: &[Assumption],
     stop: &AtomicBool,
     seed: u64,
@@ -284,7 +301,33 @@ pub(crate) fn decide_sat_assuming_seeded(
     }
     cdcl.initial_phase = initial_phase;
     cdcl.branch_order = branch_order;
-    cdcl.decide_sat_assuming(vars, &cube, conflict_budget, stop)
+    cdcl.decide_sat_assuming(vars, primary_branch_scope, &cube, conflict_budget, stop)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decide_sat_assuming_seeded(
+    solver: &mut Solver,
+    vars: &[VarId],
+    assumptions: &[Assumption],
+    stop: &AtomicBool,
+    seed: u64,
+    clause_sharing: Option<ClauseSharing>,
+    conflict_budget: Option<u64>,
+    initial_phase: Vec<Option<i32>>,
+    branch_order: Vec<VarId>,
+) -> (Option<Vec<i32>>, SolveStats, bool) {
+    decide_sat_assuming_seeded_with_scope(
+        solver,
+        vars,
+        None,
+        assumptions,
+        stop,
+        seed,
+        clause_sharing,
+        conflict_budget,
+        initial_phase,
+        branch_order,
+    )
 }
 
 /// Find one solution under temporary assumptions, or prove that the assumed
@@ -315,7 +358,7 @@ pub(crate) fn decide_sat_shared_seeded(
     if fast {
         cdcl.use_fast_restarts();
     }
-    cdcl.decide_sat(vars, stop)
+    cdcl.decide_sat(vars, None, stop)
 }
 
 /// Status of [`solve_under_assumptions`].
@@ -413,7 +456,7 @@ pub fn solve_bool_cnf_seeded(
     cdcl.initial_phase = hints.phase;
     cdcl.set_learned_clause_budget(clauses.len().saturating_mul(16).clamp(20_000, 200_000));
     cdcl.use_fast_restarts();
-    Ok(cdcl.decide_sat(vars, stop))
+    Ok(cdcl.decide_sat(vars, None, stop))
 }
 
 /// Like [`solve_bool_cnf_seeded`], streaming learned clauses to `proof`.
@@ -458,7 +501,7 @@ where
     cdcl.initial_phase = hints.phase;
     cdcl.set_learned_clause_budget(clauses.len().saturating_mul(16).clamp(20_000, 200_000));
     cdcl.use_fast_restarts();
-    Ok(cdcl.decide_sat(vars, stop))
+    Ok(cdcl.decide_sat(vars, None, stop))
 }
 
 fn post_native_bool_clauses(cdcl: &mut Cdcl<'_>, vars: &[VarId], clauses: &[Vec<BoolLit>]) -> Result<Option<BoolCnfHints>, BoolCnfError> {
@@ -596,11 +639,20 @@ fn lit_is_logically_positive(cdcl: &Cdcl<'_>, lit: Lit) -> bool {
 /// search was interrupted. Run as a diversified portfolio worker alongside the
 /// learning [`decide_sat_shared_seeded`]: plain DFS wins on instances (e.g.
 /// highly symmetric ones, such as graph colouring) where clause learning thrashes.
-pub(crate) fn find_one_seeded(solver: &mut Solver, vars: &[VarId], stop: &AtomicBool, seed: u64) -> (Option<Vec<i32>>, SolveStats, bool) {
+/// Exhaust `primary_branch_scope`, when present, before the remaining
+/// completion variables while retaining chronological DFS.
+pub(crate) fn find_one_seeded_with_scope(
+    solver: &mut Solver,
+    vars: &[VarId],
+    primary_branch_scope: Option<&[VarId]>,
+    stop: &AtomicBool,
+    seed: u64,
+) -> (Option<Vec<i32>>, SolveStats, bool) {
     let mut found = None;
-    let stats = solve_interruptible_seeded(
+    let stats = solve_interruptible_seeded_with_scope(
         solver,
         vars,
+        primary_branch_scope,
         |s| {
             found = Some(vars.iter().map(|&v| s.store.value(v)).collect::<Vec<_>>());
             SearchControl::Stop
@@ -850,9 +902,10 @@ pub fn optimize_with(
 /// Optimise with a reproducible seed and an optional shared incumbent.
 /// The final Boolean is `true` only when search completed rather than stopping.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn optimize_seeded(
+pub(crate) fn optimize_seeded_with_scope(
     solver: &mut Solver,
     vars: &[VarId],
+    primary_branch_scope: Option<&[VarId]>,
     objective: Objective<'_>,
     minimizing: bool,
     stop: &AtomicBool,
@@ -874,15 +927,50 @@ pub(crate) fn optimize_seeded(
     }
     cdcl.initial_phase = initial_phase;
     cdcl.branch_order = branch_order;
-    cdcl.optimize(vars, objective, minimizing, stop, shared_bound, cube, conflict_budget, on_improve)
+    cdcl.optimize(vars, primary_branch_scope, objective, minimizing, stop, shared_bound, cube, conflict_budget, on_improve)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn optimize_seeded(
+    solver: &mut Solver,
+    vars: &[VarId],
+    objective: Objective<'_>,
+    minimizing: bool,
+    stop: &AtomicBool,
+    seed: u64,
+    shared_bound: Option<&AtomicI64>,
+    clause_sharing: Option<ClauseSharing>,
+    cube: &[Lit],
+    conflict_budget: Option<u64>,
+    initial_phase: Vec<Option<i32>>,
+    branch_order: Vec<VarId>,
+    on_improve: impl FnMut(i64, &[i32]),
+) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
+    optimize_seeded_with_scope(
+        solver,
+        vars,
+        None,
+        objective,
+        minimizing,
+        stop,
+        seed,
+        shared_bound,
+        clause_sharing,
+        cube,
+        conflict_budget,
+        initial_phase,
+        branch_order,
+        on_improve,
+    )
 }
 
 /// Optimise with temporary assumptions. This keeps the public callsite in terms
 /// of integer variables rather than LCG literals.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn optimize_assuming_seeded(
+pub(crate) fn optimize_assuming_seeded_with_scope(
     solver: &mut Solver,
     vars: &[VarId],
+    primary_branch_scope: Option<&[VarId]>,
     assumptions: &[Assumption],
     objective: Objective<'_>,
     minimizing: bool,
@@ -907,7 +995,41 @@ pub(crate) fn optimize_assuming_seeded(
     }
     cdcl.initial_phase = initial_phase;
     cdcl.branch_order = branch_order;
-    cdcl.optimize(vars, objective, minimizing, stop, shared_bound, &cube, conflict_budget, on_improve)
+    cdcl.optimize(vars, primary_branch_scope, objective, minimizing, stop, shared_bound, &cube, conflict_budget, on_improve)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn optimize_assuming_seeded(
+    solver: &mut Solver,
+    vars: &[VarId],
+    assumptions: &[Assumption],
+    objective: Objective<'_>,
+    minimizing: bool,
+    stop: &AtomicBool,
+    seed: u64,
+    shared_bound: Option<&AtomicI64>,
+    clause_sharing: Option<ClauseSharing>,
+    conflict_budget: Option<u64>,
+    initial_phase: Vec<Option<i32>>,
+    branch_order: Vec<VarId>,
+    on_improve: impl FnMut(i64, &[i32]),
+) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
+    optimize_assuming_seeded_with_scope(
+        solver,
+        vars,
+        None,
+        assumptions,
+        objective,
+        minimizing,
+        stop,
+        seed,
+        shared_bound,
+        clause_sharing,
+        conflict_budget,
+        initial_phase,
+        branch_order,
+        on_improve,
+    )
 }
 
 /// Optimise an objective variable under temporary assumptions.
@@ -938,23 +1060,25 @@ pub fn optimize_var_assuming(
 }
 
 /// Pick a binary split for one root cube.
-pub(crate) fn split_cube_seeded(
+pub(crate) fn split_cube_seeded_with_scope(
     solver: &mut Solver,
     vars: &[VarId],
+    primary_branch_scope: Option<&[VarId]>,
     cube: &[Lit],
     stop: &AtomicBool,
     seed: u64,
     lazy_atoms: Option<Arc<LazyAtomRegistry>>,
 ) -> Option<Lit> {
     let mut cdcl = seeded_cdcl(solver, vars, stop, seed, lazy_atoms)?;
-    cdcl.split_cube(vars, cube)
+    cdcl.split_cube(vars, primary_branch_scope, cube)
 }
 
 /// Find one solution under an optimistic objective bound.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn probe_seeded(
+pub(crate) fn probe_seeded_with_scope(
     solver: &mut Solver,
     vars: &[VarId],
+    primary_branch_scope: Option<&[VarId]>,
     obj: VarId,
     minimizing: bool,
     target: i32,
@@ -969,7 +1093,7 @@ pub(crate) fn probe_seeded(
     if let Some(sharing) = clause_sharing {
         cdcl.set_clause_sharing(sharing);
     }
-    cdcl.probe(vars, obj, minimizing, target, stop)
+    cdcl.probe(vars, primary_branch_scope, obj, minimizing, target, stop)
 }
 
 /// Minimise `obj`. Returns the best `(assignment of vars, obj value)`.

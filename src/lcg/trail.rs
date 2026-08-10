@@ -197,29 +197,25 @@ fn build_ds(atoms: &AtomTable, scope: &[ScopeVar]) -> Vec<Lit> {
 /// the inference (constants fold away).
 fn translate_premises(atoms: &AtomTable, premises: &[Premise]) -> Option<Vec<Lit>> {
     let mut lits = Vec::with_capacity(premises.len());
-    let push = |loc: LitOrConst, out: &mut Vec<Lit>| {
+    let push = |loc: Option<LitOrConst>, out: &mut Vec<Lit>| -> Option<()> {
+        let loc = loc?;
         if let LitOrConst::Lit(l) = loc {
             out.push(l);
         }
+        Some(())
     };
     for &p in premises {
-        let var = match p {
-            Premise::Ge { var, .. } | Premise::Le { var, .. } | Premise::Eq { var, .. } | Premise::Ne { var, .. } => var,
-        };
-        if atoms.is_lazy(var) {
-            return None;
-        }
         match p {
-            Premise::Ge { var, bound } => push(atoms.ge(var, bound), &mut lits),
-            Premise::Le { var, bound } => push(neg(atoms.ge_i64(var, i64::from(bound) + 1)), &mut lits),
+            Premise::Ge { var, bound } => push(atoms.ge_i64_existing(var, i64::from(bound)), &mut lits)?,
+            Premise::Le { var, bound } => push(atoms.ge_i64_existing(var, i64::from(bound) + 1).map(neg), &mut lits)?,
             // Express `[x = v]` as order atoms `[x ≥ v] ∧ [x ≤ v]`, never the
             // positive equality atom: the eq atom may carry a deeper level, which
             // would make 1-UIP backjump too far and prune feasible solutions.
             Premise::Eq { var, val } => {
-                push(atoms.ge(var, val), &mut lits);
-                push(neg(atoms.ge_i64(var, i64::from(val) + 1)), &mut lits);
+                push(atoms.ge_i64_existing(var, i64::from(val)), &mut lits)?;
+                push(atoms.ge_i64_existing(var, i64::from(val) + 1).map(neg), &mut lits)?;
             }
-            Premise::Ne { var, val } => push(neg(atoms.eq(var, val)), &mut lits),
+            Premise::Ne { var, val } => push(atoms.eq_existing(var, val).map(neg), &mut lits)?,
         }
     }
     Some(lits)
@@ -395,6 +391,38 @@ impl<'s> Cdcl<'s> {
             |v: VarId| (solver.store.min(v), solver.store.max(v)),
             lazy_atoms,
         );
+
+        // Plain root propagation may have removed interior values before the
+        // LCG engine is constructed. Eager layouts already contain equality
+        // atoms for those holes, but a lazy range would otherwise intern them
+        // only when a later fallback reason is built, after `seed_facts` has
+        // run. Materialize those root-false atoms now so they are recorded as
+        // level-zero facts and remain valid antecedents.
+        let mut root_domain = Vec::new();
+        for (index, &is_active) in active.iter().enumerate() {
+            let var = VarId(index as u32);
+            if !is_active || !atoms.is_lazy(var) {
+                continue;
+            }
+            root_domain.clear();
+            solver.store.domain_premises(var, &mut root_domain);
+            for premise in &root_domain {
+                match *premise {
+                    Premise::Ge { bound, .. } => {
+                        let _ = atoms.ge(var, bound);
+                    }
+                    Premise::Le { bound, .. } => {
+                        let _ = atoms.ge_i64(var, i64::from(bound) + 1);
+                    }
+                    Premise::Eq { val, .. } | Premise::Ne { val, .. } => {
+                        let _ = atoms.eq(var, val);
+                    }
+                }
+            }
+            if solver.store.is_fixed(var) {
+                let _ = atoms.eq(var, solver.store.value(var));
+            }
+        }
         let n = atoms.num_atoms();
         Cdcl {
             solver,
@@ -407,8 +435,11 @@ impl<'s> Cdcl<'s> {
             tval: vec![Tri::Unknown; n],
             seen: vec![false; n],
             clauses: ClauseDb::new(),
-            watches: vec![Vec::new(); n * 2],
-            binary_implications: vec![Vec::new(); n * 2],
+            // Watch tables grow only for literals that clauses actually use.
+            // Preallocating two Vec headers per polarity and per eager atom was
+            // substantially larger than the atom payload itself.
+            watches: Vec::new(),
+            binary_implications: Vec::new(),
             conflict_scope: Vec::new(),
             changed_vars: Vec::new(),
             atom_scratch: Vec::new(),

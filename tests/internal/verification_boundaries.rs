@@ -2,8 +2,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use qayd::constraints::table::STAR;
 use qayd::model::list::{register_external_function, ExprArena, Iterable, ReduceOp, Reduction};
-use qayd::model::{Constraint, Model, ModelPackage, Objective, Relation};
+use qayd::model::{Constraint, IntGlobalConstraint, Model, ModelPackage, Objective, Relation};
 use qayd::orchestrator::{
     audit_interrupt_next_collection_final_replay, verify_semantic_assignment, verify_semantic_assignment_validated_interruptible,
     Assignment, EventCallback, EventControl, SolveError, SolveEvent, SolveLimits, SolveMode, SolveRequest, SolveStatus,
@@ -139,6 +140,56 @@ fn validated_verification_still_replays_constraints_and_honors_interruption() {
 
     let interrupted = verify_semantic_assignment_validated_interruptible(&model, &assignment, &[], &AtomicBool::new(true)).unwrap_err();
     assert!(matches!(interrupted, SolveError::Interrupted(_)));
+}
+
+fn table_model(tuples: Vec<Vec<i32>>, positive: bool) -> Model {
+    let mut model = Model::new();
+    let variables = (0..3).map(|_| model.int_range(i32::MIN, i32::MAX)).collect();
+    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table { variables, tuples, positive }));
+    model
+}
+
+fn integer_assignment(values: [i32; 3]) -> Assignment {
+    Assignment { integers: values.into_iter().map(|value| Some(i64::from(value))).collect(), ..Assignment::default() }
+}
+
+#[test]
+fn canonical_replay_matches_starred_supports_in_every_column() {
+    let model = table_model(vec![vec![STAR, 1, 2], vec![3, STAR, 4], vec![5, 6, STAR]], true);
+
+    for values in [[99, 1, 2], [3, -7, 4], [5, 6, 42]] {
+        verify_semantic_assignment(&model, &integer_assignment(values), &[])
+            .unwrap_or_else(|error| panic!("starred support rejected {values:?}: {error}"));
+    }
+
+    let error = verify_semantic_assignment(&model, &integer_assignment([99, 0, 2]), &[]).unwrap_err();
+    assert!(matches!(error, SolveError::InvalidResult(message) if message.contains("constraint 0")));
+}
+
+#[test]
+fn canonical_replay_matches_starred_conflicts_in_every_column() {
+    let model = table_model(vec![vec![STAR, 1, 2], vec![3, STAR, 4], vec![5, 6, STAR]], false);
+
+    for values in [[99, 1, 2], [3, -7, 4], [5, 6, 42]] {
+        let error = verify_semantic_assignment(&model, &integer_assignment(values), &[]).unwrap_err();
+        assert!(
+            matches!(error, SolveError::InvalidResult(ref message) if message.contains("constraint 0")),
+            "starred conflict accepted {values:?}: {error}"
+        );
+    }
+
+    verify_semantic_assignment(&model, &integer_assignment([99, 0, 2]), &[]).expect("assignment outside every conflict must be accepted");
+}
+
+#[test]
+fn wildcard_semantics_include_the_minimum_integer_domain_value() {
+    let support = table_model(vec![vec![7, STAR, 9]], true);
+    let conflict = table_model(vec![vec![7, STAR, 9]], false);
+    let assignment = integer_assignment([7, i32::MIN, 9]);
+
+    verify_semantic_assignment(&support, &assignment, &[]).expect("wildcard must support an actual i32::MIN assignment");
+    let error = verify_semantic_assignment(&conflict, &assignment, &[]).unwrap_err();
+    assert!(matches!(error, SolveError::InvalidResult(message) if message.contains("constraint 0")));
 }
 
 #[test]

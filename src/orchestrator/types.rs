@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 use std::time::Duration;
 
@@ -180,6 +181,14 @@ pub struct SolveRequest {
     pub hints: Vec<(usize, i32)>,
     /// Optional ordered-list incumbent seed, one sequence per semantic list.
     pub list_hint: Option<Vec<Vec<i32>>>,
+    /// Optional semantic integer-variable scope that must be exhausted before
+    /// exact CP search branches on completion variables. `None` preserves the
+    /// engine's legacy all-variable heuristic; `Some([])` requests an explicit
+    /// completion-only phase.
+    pub primary_branch_scope: Option<Vec<usize>>,
+    /// Exact variable priorities within the active branching phase. When a
+    /// primary scope is explicit, every entry must belong to that scope and no
+    /// entry can promote a completion variable ahead of it.
     pub branch_order: Vec<usize>,
     /// Request verified assignment snapshots for improving incumbents. This is
     /// intentionally opt-in because replaying every improvement is unsuitable
@@ -203,6 +212,7 @@ impl Default for SolveRequest {
             assumptions: Vec::new(),
             hints: Vec::new(),
             list_hint: None,
+            primary_branch_scope: None,
             branch_order: Vec::new(),
             publish_incumbent_assignments: false,
             proof: ProofRequest::None,
@@ -229,6 +239,17 @@ impl SolveRequest {
         }
         if self.proof == ProofRequest::Require && self.mode == SolveMode::LocalSearch {
             return Err(SolveError::InvalidRequest("proof=Require cannot be combined with a local-search-only request".to_string()));
+        }
+        if let Some(scope) = &self.primary_branch_scope {
+            let mut seen = BTreeSet::new();
+            for &variable in scope {
+                if !seen.insert(variable) {
+                    return Err(SolveError::InvalidRequest(format!("integer variable {variable} appears twice in primary_branch_scope")));
+                }
+            }
+            if let Some(&variable) = self.branch_order.iter().find(|variable| !seen.contains(variable)) {
+                return Err(SolveError::InvalidRequest(format!("branch_order variable {variable} is outside primary_branch_scope")));
+            }
         }
         Ok(())
     }

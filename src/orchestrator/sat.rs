@@ -64,12 +64,14 @@ pub(crate) fn compile_sat_plan(model: &Model, request: &SolveRequest, budget: &S
     }
     if !request.assumptions.is_empty()
         || !request.hints.is_empty()
+        || request.primary_branch_scope.is_some()
         || !request.branch_order.is_empty()
         || request.list_hint.is_some()
         || request.publish_incumbent_assignments
     {
         return Err(SolveError::InvalidRequest(
-            "the specialized SAT plan does not accept CP assumptions, hints, branch order, list hints, or incumbent callbacks".to_string(),
+            "the specialized SAT plan does not accept CP assumptions, hints, primary branch scope, branch order, list hints, or incumbent callbacks"
+                .to_string(),
         ));
     }
     if !model.sets().is_empty() || !model.lists().is_empty() || !model.intervals().is_empty() || !model.objectives().is_empty() {

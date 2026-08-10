@@ -86,10 +86,25 @@ fn absent_search_guidance_stays_allocation_free() {
     let stop = AtomicBool::new(false);
     let compiled = CompiledCp::compile_interruptible(&model, &stop).unwrap().unwrap();
 
-    let (phase, branch_order) = compiled.search_guidance_interruptible(&[], &[], &stop).unwrap().unwrap();
+    let (phase, branch_order, primary_branch_scope) = compiled.search_guidance_interruptible(&[], &[], None, &stop).unwrap().unwrap();
 
     assert!(phase.is_empty());
     assert!(branch_order.is_empty());
+    assert!(primary_branch_scope.is_none());
+}
+
+#[test]
+fn table_memory_estimate_counts_distinct_supports_not_tuple_square() {
+    const ARITY: usize = 14;
+    let mut model = Model::new();
+    let variables = (0..ARITY).map(|_| model.bool_var()).collect::<Vec<_>>();
+    let tuples =
+        (0..(1usize << ARITY)).map(|bits| (0..ARITY).map(|column| ((bits >> column) & 1) as i32).collect::<Vec<_>>()).collect::<Vec<_>>();
+    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table { variables, tuples, positive: true }));
+
+    let estimate = CompiledCp::estimate_semantic_bytes_interruptible(&model, &AtomicBool::new(false)).unwrap();
+
+    assert!(estimate < 10 * 1024 * 1024, "repetitive table estimate is still quadratic in tuple count: {estimate}");
 }
 
 #[test]

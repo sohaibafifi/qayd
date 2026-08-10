@@ -1114,6 +1114,12 @@ fn cardinality_holds(
 }
 
 fn table_holds(assigned: &[i64], tuples: &[Vec<i32>], positive: bool, stop: &AtomicBool) -> Result<bool, SolveError> {
+    // XCSP's parser normalizes `*` to `i32::MIN`, the same reserved sentinel
+    // used by the table propagators.  Keep that marker as a pattern here: the
+    // canonical replay must apply exactly the same support/conflict semantics
+    // as the engine whose candidate it verifies.
+    const STAR: i32 = i32::MIN;
+
     let mut progress = 0usize;
     let mut present = false;
     for tuple in tuples {
@@ -1126,7 +1132,7 @@ fn table_holds(assigned: &[i64], tuples: &[Vec<i32>], positive: bool, stop: &Ato
         for (expected, assigned) in tuple.iter().zip(assigned) {
             poll_stop(stop, progress)?;
             progress = progress.wrapping_add(1);
-            if i64::from(*expected) != *assigned {
+            if *expected != STAR && i64::from(*expected) != *assigned {
                 matches = false;
                 break;
             }

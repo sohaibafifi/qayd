@@ -17,7 +17,8 @@ use crate::lns::{fix_neighborhood, LnsState};
 use crate::orchestrator::{execute_workers, execute_workers_silent, merge_search_stats, EventControl, WorkerContext};
 use crate::problem::{Objective, Problem};
 use crate::search::{
-    decide_sat_shared_seeded, find_one_seeded, optimize_seeded, probe_seeded, split_cube_seeded, Objective as SearchObjective, SolveStats,
+    decide_sat_assuming_seeded_with_scope, decide_sat_shared_seeded, find_one_seeded_with_scope, optimize_seeded_with_scope,
+    probe_seeded_with_scope, split_cube_seeded_with_scope, Objective as SearchObjective, SolveStats,
 };
 use crate::store::Solver;
 
@@ -48,10 +49,15 @@ pub struct RunOptions {
 pub(crate) struct SearchGuidance {
     pub initial_phase: Vec<Option<i32>>,
     pub branch_order: Vec<VarId>,
+    pub primary_branch_scope: Option<Vec<VarId>>,
 }
 
 impl SearchGuidance {
     fn is_empty(&self) -> bool {
+        self.initial_phase.iter().all(Option::is_none) && self.branch_order.is_empty() && self.primary_branch_scope.is_none()
+    }
+
+    fn is_chronological_dfs_compatible(&self) -> bool {
         self.initial_phase.iter().all(Option::is_none) && self.branch_order.is_empty()
     }
 }
@@ -313,6 +319,7 @@ fn run_probe_worker(
     minimizing: bool,
     shared: &CopShared,
     context: &WorkerContext<Improvement, CopWorkerResult>,
+    guidance: &SearchGuidance,
 ) -> CopWorkerResult {
     let vars = &model.search;
     let mut stats = SolveStats::default();
@@ -326,9 +333,10 @@ fn run_probe_worker(
         };
         shared.probe_attempts.fetch_add(1, Ordering::Relaxed);
         let mut solver = model.solver.clone();
-        let (found, part, complete) = probe_seeded(
+        let (found, part, complete) = probe_seeded_with_scope(
             &mut solver,
             vars,
+            guidance.primary_branch_scope.as_deref(),
             obj,
             minimizing,
             target,
@@ -373,9 +381,10 @@ fn optimize_worker(
     // materialized objectives retain cooperative bound and clause sharing.
     let shared_bound = materialized.then_some(&shared.best);
     let mut improved = false;
-    let (_, stats, complete) = optimize_seeded(
+    let (_, stats, complete) = optimize_seeded_with_scope(
         solver,
         vars,
+        guidance.primary_branch_scope.as_deref(),
         objective.search(),
         minimizing,
         context.stop(),
@@ -391,14 +400,29 @@ fn optimize_worker(
     (stats, complete, improved)
 }
 
-fn run_lns_worker(model: Problem, shared: &CopShared, context: &WorkerContext<Improvement, CopWorkerResult>) -> CopWorkerResult {
+fn run_lns_worker(
+    model: Problem,
+    shared: &CopShared,
+    context: &WorkerContext<Improvement, CopWorkerResult>,
+    guidance: &SearchGuidance,
+) -> CopWorkerResult {
     let vars = &model.search;
     let objective = model.objective.clone().expect("COP lost its objective");
     let objective_var = model.var_objective().map(|(_, obj)| obj);
+    let primary_members = guidance.primary_branch_scope.as_ref().map(|scope| {
+        let mut members = vec![false; model.solver.store.num_vars()];
+        for &variable in scope {
+            members[variable.index()] = true;
+        }
+        members
+    });
     let candidates = vars
         .iter()
         .enumerate()
-        .filter_map(|(i, &var)| (Some(var) != objective_var && !model.solver.store.is_fixed(var)).then_some(i))
+        .filter_map(|(i, &var)| {
+            let is_primary = primary_members.as_ref().is_none_or(|members| members[var.index()]);
+            (is_primary && Some(var) != objective_var && !model.solver.store.is_fixed(var)).then_some(i)
+        })
         .collect::<Vec<_>>();
     let mut stats = SolveStats::default();
     let mut attempt = 0u64;
@@ -426,6 +450,7 @@ fn run_lns_worker(model: Problem, shared: &CopShared, context: &WorkerContext<Im
             source,
             None,
             Some(lns.budget()),
+            guidance,
         );
         if improved {
             shared.lns_improved.fetch_add(1, Ordering::Relaxed);
@@ -447,15 +472,17 @@ fn optimize_worker_with_seed(
     source: WorkerSource,
     clause_worker: Option<usize>,
     conflict_budget: Option<u64>,
+    guidance: &SearchGuidance,
 ) -> (SolveStats, bool, bool) {
     let minimizing = objective.minimizing();
     let materialized = objective.var().is_some();
     let sharing = if materialized { clause_worker.map(|worker| ClauseSharing::new(Arc::clone(&shared.clauses), worker)) } else { None };
     let shared_bound = materialized.then_some(&shared.best);
     let mut improved = false;
-    let (_, stats, complete) = optimize_seeded(
+    let (_, stats, complete) = optimize_seeded_with_scope(
         solver,
         vars,
+        guidance.primary_branch_scope.as_deref(),
         objective.search(),
         minimizing,
         context.stop(),
@@ -478,6 +505,7 @@ pub(crate) struct CspOutcome {
     pub(crate) decided: bool,
     pub(crate) shared_clauses: usize,
     pub(crate) imported_clauses: u64,
+    pub(crate) search_kind: &'static str,
 }
 
 struct CspWorkerResult {
@@ -516,6 +544,15 @@ fn prepare_root(problem: &mut Problem, stop: &AtomicBool) -> RootPreparation {
 /// Race diversified find-one workers on the same CSP.
 pub(crate) fn solve_csp(mut problem: Problem, stop: &AtomicBool, options: RunOptions, guidance: SearchGuidance) -> CspOutcome {
     problem.solver.set_force_scope_reasons(options.force_scope_reasons);
+    let chronological_compatible = guidance.is_chronological_dfs_compatible() && options.conflict_limit.is_none();
+    let scoped_no_learn = options.no_learn_csp && chronological_compatible;
+    let search_kind = if scoped_no_learn || (options.workers == 1 && chronological_compatible) {
+        "chronological-dfs"
+    } else if chronological_compatible {
+        "hybrid"
+    } else {
+        "cdcl"
+    };
     match prepare_root(&mut problem, stop) {
         RootPreparation::Ready => {}
         RootPreparation::Inconsistent => {
@@ -525,10 +562,18 @@ pub(crate) fn solve_csp(mut problem: Problem, stop: &AtomicBool, options: RunOpt
                 decided: true,
                 shared_clauses: 0,
                 imported_clauses: 0,
+                search_kind,
             };
         }
         RootPreparation::Interrupted => {
-            return CspOutcome { solution: None, stats: SolveStats::default(), decided: false, shared_clauses: 0, imported_clauses: 0 };
+            return CspOutcome {
+                solution: None,
+                stats: SolveStats::default(),
+                decided: false,
+                shared_clauses: 0,
+                imported_clauses: 0,
+                search_kind,
+            };
         }
     }
     let cancel = Arc::new(AtomicBool::new(false));
@@ -551,19 +596,18 @@ pub(crate) fn solve_csp(mut problem: Problem, stop: &AtomicBool, options: RunOpt
         move |context, model| {
             let Problem { mut solver, search, objective: _ } = model;
             let vars = &search;
-            let (solution, stats, complete) = if (context.worker() == 0 || options.no_learn_csp)
-                && guidance.is_empty()
-                && options.conflict_limit.is_none()
-            {
-                find_one_seeded(&mut solver, vars, context.stop(), context.seed())
+            let use_chronological_dfs = scoped_no_learn || (context.worker() == 0 && chronological_compatible);
+            let (solution, stats, complete) = if use_chronological_dfs {
+                find_one_seeded_with_scope(&mut solver, vars, guidance.primary_branch_scope.as_deref(), context.stop(), context.seed())
             } else {
                 let sharing = ClauseSharing::new(Arc::clone(&shared.clauses), context.worker());
                 if guidance.is_empty() && options.conflict_limit.is_none() {
                     decide_sat_shared_seeded(&mut solver, vars, context.stop(), context.seed(), Some(sharing), context.worker() % 2 == 1)
                 } else {
-                    crate::search::decide_sat_assuming_seeded(
+                    decide_sat_assuming_seeded_with_scope(
                         &mut solver,
                         vars,
+                        guidance.primary_branch_scope.as_deref(),
                         &[],
                         context.stop(),
                         context.seed(),
@@ -600,6 +644,7 @@ pub(crate) fn solve_csp(mut problem: Problem, stop: &AtomicBool, options: RunOpt
         decided: shared.decided.load(Ordering::Acquire),
         shared_clauses: shared.clauses.len(),
         imported_clauses: shared.clauses.imported(),
+        search_kind,
     }
 }
 
@@ -683,10 +728,10 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
             move |context: WorkerContext<Improvement, CopWorkerResult>, mut model| {
                 if context.worker() >= lns_end {
                     let (_, obj) = var_objective.expect("symbolic objective cannot use probes");
-                    return run_probe_worker(model, obj, minimizing, &shared, &context);
+                    return run_probe_worker(model, obj, minimizing, &shared, &context, &guidance);
                 }
                 if context.worker() >= regular_workers {
-                    return run_lns_worker(model, &shared, &context);
+                    return run_lns_worker(model, &shared, &context, &guidance);
                 }
                 let vars = &model.search;
                 if !options.split {
@@ -717,9 +762,15 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
                 while let Some(mut cube) = shared.work.take(context.stop()) {
                     while shared.work.needs_split(split_target, split_limit) {
                         let mut probe = model.solver.clone();
-                        let Some(lit) =
-                            split_cube_seeded(&mut probe, vars, &cube, context.stop(), context.seed(), Some(shared.clauses.lazy_atoms()))
-                        else {
+                        let Some(lit) = split_cube_seeded_with_scope(
+                            &mut probe,
+                            vars,
+                            guidance.primary_branch_scope.as_deref(),
+                            &cube,
+                            context.stop(),
+                            context.seed(),
+                            Some(shared.clauses.lazy_atoms()),
+                        ) else {
                             break;
                         };
                         let mut sibling = cube.clone();
@@ -733,9 +784,10 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
                         (SolveStats::default(), false)
                     } else {
                         let mut solver = model.solver.clone();
-                        let (_, job_stats, complete) = optimize_seeded(
+                        let (_, job_stats, complete) = optimize_seeded_with_scope(
                             &mut solver,
                             vars,
+                            guidance.primary_branch_scope.as_deref(),
                             SearchObjective::Var(obj),
                             minimizing,
                             context.stop(),

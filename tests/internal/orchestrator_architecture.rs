@@ -384,6 +384,7 @@ fn physical_callback_failure_stops_search_without_masking_the_error() {
         objectives: compiled.objectives().iter().cloned().map(|objective| PhysicalObjectiveTier { objective }).collect(),
         assumptions: Vec::new(),
         hints: Vec::new(),
+        primary_branch_scope: None,
         branch_order: Vec::new(),
         shared_clauses: None,
         first_worker: 0,

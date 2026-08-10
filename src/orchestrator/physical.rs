@@ -3,6 +3,7 @@
 //! sessions, events, and canonical replay while those parsers migrate to
 //! [`crate::model::ModelPackage`].
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -31,6 +32,7 @@ pub(crate) struct PhysicalSolveInput {
     pub objectives: Vec<PhysicalObjectiveTier>,
     pub assumptions: Vec<Assumption>,
     pub hints: Vec<(VarId, i32)>,
+    pub primary_branch_scope: Option<Vec<VarId>>,
     pub branch_order: Vec<VarId>,
     pub shared_clauses: Option<Arc<SharedClausePool>>,
     pub first_worker: usize,
@@ -89,9 +91,10 @@ fn execute_physical_exact(
     if input.objectives.is_empty() {
         let mut solver = root_solver.clone();
         let sharing = next_sharing(input.shared_clauses.as_ref(), &mut worker);
-        let (assignment, stats, complete) = search::decide_sat_assuming_seeded(
+        let (assignment, stats, complete) = search::decide_sat_assuming_seeded_with_scope(
             &mut solver,
             &input.problem.search,
+            input.primary_branch_scope.as_deref(),
             &active_assumptions,
             engine_stop,
             request.seed,
@@ -148,9 +151,10 @@ fn execute_physical_exact(
         let sharing = next_sharing(input.shared_clauses.as_ref(), &mut worker);
         let prior_values = objective_values.clone();
         let mut tier_error = None;
-        let (best, stats, complete) = search::optimize_assuming_seeded(
+        let (best, stats, complete) = search::optimize_assuming_seeded_with_scope(
             &mut solver,
             &input.problem.search,
+            input.primary_branch_scope.as_deref(),
             &active_assumptions,
             objective.objective.search(),
             objective.objective.minimizing(),
@@ -288,10 +292,35 @@ fn validate_input(input: &PhysicalSolveInput) -> Result<(), SolveError> {
         .iter()
         .chain(input.assumptions.iter().map(|assumption| &assumption.var))
         .chain(input.hints.iter().map(|(variable, _)| variable))
+        .chain(input.primary_branch_scope.iter().flatten())
         .chain(input.branch_order.iter())
     {
         if variable.index() >= variables {
             return Err(SolveError::InvalidRequest(format!("physical request references unknown variable {}", variable.index())));
+        }
+    }
+    if let Some(scope) = &input.primary_branch_scope {
+        let search = input.problem.search.iter().copied().collect::<BTreeSet<_>>();
+        let mut seen = BTreeSet::new();
+        for &variable in scope {
+            if !search.contains(&variable) {
+                return Err(SolveError::InvalidRequest(format!(
+                    "primary physical branch scope references non-search variable {}",
+                    variable.index()
+                )));
+            }
+            if !seen.insert(variable) {
+                return Err(SolveError::InvalidRequest(format!(
+                    "physical variable {} appears twice in primary branch scope",
+                    variable.index()
+                )));
+            }
+        }
+        if let Some(variable) = input.branch_order.iter().find(|variable| !seen.contains(variable)) {
+            return Err(SolveError::InvalidRequest(format!(
+                "physical branch-order variable {} is outside the primary branch scope",
+                variable.index()
+            )));
         }
     }
     for objective in &input.objectives {

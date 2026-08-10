@@ -498,6 +498,37 @@ fn negative_table_cop_finds_optimum() {
     assert!(out.contains("o 1"), "{out}"); // (0,1) or (1,0); diagonal forbidden
 }
 
+#[test]
+fn fortress2_starred_support_pattern_is_canonically_verified() {
+    // Minimal form of Fortress2's repeated five-cell extension: once the
+    // centre and one neighbour are zero, the other neighbours are wildcards.
+    // Fixed domains make the expected candidate deterministic and ensure the
+    // final canonical replay, rather than search alone, exercises the stars.
+    let xml = r#"
+      <instance format="XCSP3" type="COP">
+        <variables>
+          <array id="x" size="[5]">
+            <domain for="x[0] x[1]"> 0 </domain>
+            <domain for="x[2]"> 1 </domain>
+            <domain for="x[3]"> 10000 </domain>
+            <domain for="x[4]"> 1 </domain>
+          </array>
+        </variables>
+        <constraints>
+          <extension>
+            <list> x[] </list>
+            <supports> (0,0,*,*,*)(0,*,0,*,*)(0,*,*,0,*)(0,*,*,*,0)(10000,*,*,*,*) </supports>
+          </extension>
+        </constraints>
+        <objectives><minimize>x[0]</minimize></objectives>
+      </instance>"#;
+
+    let out = run(xml).unwrap();
+    assert!(out.contains("s OPTIMUM FOUND"), "{out}");
+    assert!(out.contains("o 0"), "{out}");
+    assert!(out.contains("v 0 0 1 10000 1"), "{out}");
+}
+
 fn wide_weighted_objective_xml() -> &'static str {
     r#"
       <instance format="XCSP3" type="COP">

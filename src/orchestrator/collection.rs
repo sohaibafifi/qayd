@@ -330,8 +330,14 @@ fn validate_collection_request(semantic: &Model, model: &list::CollectionModel, 
     if request.cp != super::CpControls::default() {
         return Err(SolveError::InvalidRequest("CP portfolio controls require a semantic integer model".to_string()));
     }
-    if !request.assumptions.is_empty() || !request.hints.is_empty() || !request.branch_order.is_empty() {
-        return Err(SolveError::InvalidRequest("collection plans do not accept integer assumptions, hints, or branch order".to_string()));
+    if !request.assumptions.is_empty()
+        || !request.hints.is_empty()
+        || request.primary_branch_scope.is_some()
+        || !request.branch_order.is_empty()
+    {
+        return Err(SolveError::InvalidRequest(
+            "collection plans do not accept integer assumptions, hints, primary branch scope, or branch order".to_string(),
+        ));
     }
     if request.publish_incumbent_assignments {
         return Err(SolveError::InvalidRequest(

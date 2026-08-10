@@ -1,5 +1,6 @@
 //! Canonical frontend-neutral solve entry point.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
@@ -414,6 +415,13 @@ fn validate_decomposition_request_references(model: &Model, request: &SolveReque
             return Err(SolveError::InvalidRequest(format!("branch_order references unknown integer variable {variable}")));
         }
     }
+    if let Some(scope) = &request.primary_branch_scope {
+        for &variable in scope {
+            if variable >= model.int_vars().len() {
+                return Err(SolveError::InvalidRequest(format!("primary_branch_scope references unknown integer variable {variable}")));
+            }
+        }
+    }
     if let Some(hint) = &request.list_hint {
         if model.lists().is_empty() {
             return Err(SolveError::InvalidRequest("list_hint is only supported for list_vars models".to_string()));
@@ -466,6 +474,10 @@ fn project_component_request(
                         .map(|variable| (variable, value))
                 })
                 .collect();
+            projected.primary_branch_scope = request.primary_branch_scope.as_ref().map(|scope| {
+                let local_by_original = component.integers.iter().copied().collect::<BTreeMap<_, _>>();
+                scope.iter().filter_map(|variable| local_by_original.get(variable).copied()).collect()
+            });
             projected.branch_order = request
                 .branch_order
                 .iter()
@@ -480,6 +492,7 @@ fn project_component_request(
         IndependentFamily::Lists => {
             projected.assumptions.clear();
             projected.hints.clear();
+            projected.primary_branch_scope = None;
             projected.branch_order.clear();
             projected.limits.conflicts = None;
             projected.schedule_cdcl = false;
@@ -507,6 +520,7 @@ fn project_component_request(
             projected.assumptions.clear();
             projected.hints.clear();
             projected.list_hint = None;
+            projected.primary_branch_scope = None;
             projected.branch_order.clear();
             projected.limits.conflicts = None;
             projected.routing = super::RoutingControls::default();

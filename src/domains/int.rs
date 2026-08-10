@@ -21,7 +21,12 @@ const DENSE_SET_FACTOR: usize = 4;
 #[derive(Clone)]
 enum ValueMap {
     /// Internal index `i` represents `offset + i`.
-    Dense { offset: i32 },
+    Dense {
+        offset: i32,
+        /// Sorted root support when dense physical storage represents an
+        /// explicit set rather than a contiguous range.
+        root_values: Option<Arc<[i32]>>,
+    },
     /// Internal index `i` represents `values[i]`.
     Sparse { values: Arc<[i32]> },
     /// Wide contiguous range with a reusable prefix of removed interior values.
@@ -64,6 +69,16 @@ impl Domain {
         let lo = vals[0];
         let hi = *vals.last().unwrap();
         let span = span_len(lo, hi);
+        // A contiguous explicit enumeration has exactly the same semantics as
+        // a range. Keeping it tagged as an explicit set would bypass both the
+        // bounds-only domain representation and the lazy LCG atom budget.
+        if span == vals.len() {
+            return if span <= MAX_DENSE_RANGE_VALUES {
+                Self::from_dense_range(lo, hi, span, trail)
+            } else {
+                Self::from_bounds_range(lo, hi, trail)
+            };
+        }
         if span <= MAX_DENSE_SET_SPAN && span <= vals.len().saturating_mul(DENSE_SET_FACTOR) {
             Self::from_dense_set(vals, lo, hi, span, trail)
         } else {
@@ -75,7 +90,7 @@ impl Domain {
         let dense: Vec<u32> = (0..size as u32).collect();
         let sparse = dense.clone();
         Self {
-            values: ValueMap::Dense { offset: lo },
+            values: ValueMap::Dense { offset: lo, root_values: None },
             dense,
             sparse,
             size: trail.new_int(size as i32),
@@ -109,7 +124,7 @@ impl Domain {
         }
 
         Self {
-            values: ValueMap::Dense { offset: lo },
+            values: ValueMap::Dense { offset: lo, root_values: Some(Arc::from(vals)) },
             dense,
             sparse,
             size: trail.new_int(size as i32),
@@ -214,15 +229,25 @@ impl Domain {
             ValueMap::Bounds { holes, holes_len, .. } => {
                 out.extend(holes[..trail.get(*holes_len) as usize].iter().copied().filter(|&v| min < v && v < max))
             }
-            _ => out.extend((0..self.dense.len()).map(|i| self.value_of(i)).filter(|&v| min < v && v < max && !self.contains(v, trail))),
+            ValueMap::Dense { root_values: Some(values), .. } | ValueMap::Sparse { values } => {
+                out.extend(values.iter().copied().filter(|&v| min < v && v < max && !self.contains(v, trail)))
+            }
+            ValueMap::Dense { root_values: None, .. } => {
+                out.extend((0..self.dense.len()).map(|i| self.value_of(i)).filter(|&v| min < v && v < max && !self.contains(v, trail)))
+            }
         }
     }
 
-    /// Root support when this domain uses cardinality-sized storage.
+    /// Sorted root support when this domain was created from an explicit set.
+    ///
+    /// This is independent of the selected physical storage. Compact explicit
+    /// sets can use dense sparse-set arrays while still exposing their gaps to
+    /// atom numbering and explanation code.
     pub(crate) fn sparse_values(&self) -> Option<Arc<[i32]>> {
         match &self.values {
+            ValueMap::Dense { root_values, .. } => root_values.as_ref().map(Arc::clone),
             ValueMap::Sparse { values } => Some(Arc::clone(values)),
-            ValueMap::Dense { .. } | ValueMap::Bounds { .. } => None,
+            ValueMap::Bounds { .. } => None,
         }
     }
 
@@ -238,7 +263,7 @@ impl Domain {
 
     fn index_of(&self, val: i32) -> Option<usize> {
         match &self.values {
-            ValueMap::Dense { offset } => {
+            ValueMap::Dense { offset, .. } => {
                 let shifted = i64::from(val) - i64::from(*offset);
                 (shifted >= 0 && shifted < self.dense.len() as i64).then_some(shifted as usize)
             }
@@ -249,7 +274,7 @@ impl Domain {
 
     fn value_of(&self, index: usize) -> i32 {
         match &self.values {
-            ValueMap::Dense { offset } => (i64::from(*offset) + index as i64) as i32,
+            ValueMap::Dense { offset, .. } => (i64::from(*offset) + index as i64) as i32,
             ValueMap::Sparse { values } => values[index],
             ValueMap::Bounds { .. } => unreachable!("bounds domains have no indexed values"),
         }

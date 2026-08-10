@@ -3,6 +3,7 @@
 
 mod callback;
 
+use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -37,6 +38,10 @@ pub struct RunOptions {
     pub probes: usize,
     pub lns: usize,
     pub no_learn_csp: bool,
+    /// Prefer declared semantic variables before lowering auxiliaries.
+    /// This strict experimental policy is opt-in because its benefit depends
+    /// on the model structure.
+    pub semantic_branching: bool,
     pub force_scope_reasons: bool,
     pub shared_pool_capacity: usize,
     pub time_limit: Option<Duration>,
@@ -59,6 +64,7 @@ impl Default for RunOptions {
             probes: 0,
             lns: 0,
             no_learn_csp: false,
+            semantic_branching: false,
             force_scope_reasons: false,
             shared_pool_capacity: 1 << 14,
             time_limit: None,
@@ -163,7 +169,12 @@ fn parse_problem(path: &Path) -> Result<ParsedXcsp, String> {
         return Err(e);
     }
     let relevant = model.relevant_variables();
-    let search = relevant.iter().enumerate().filter_map(|(index, &used)| used.then_some(index)).collect::<Vec<_>>();
+    let mut seen = BTreeSet::new();
+    let search = model
+        .declared
+        .iter()
+        .filter_map(|(_, variable)| (relevant[variable.0] && seen.insert(variable.0)).then_some(variable.0))
+        .collect::<Vec<_>>();
     let (names, entries) = model
         .declared
         .iter()
@@ -201,6 +212,9 @@ pub fn run_to<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool, w: &mut W) 
 
 /// Like [`run_to`], with explicit seed and portfolio-worker settings.
 pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool, w: &mut W, options: RunOptions) -> Result<(), String> {
+    if options.local_search() && options.semantic_branching {
+        return Err("semantic branching requires exact mode".to_string());
+    }
     let path = stage_xml(xml)?;
     let ParsedXcsp { package, search, output, stats, has_objective } = parse_problem(&path.0)?;
 
@@ -215,19 +229,20 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
         writeln!(w, "c variables {}", stats.variables).map_err(io_err)?;
         writeln!(w, "c sparse domains {}", stats.sparse_domains).map_err(io_err)?;
         writeln!(w, "c bounds domains {}", stats.bounds_domains).map_err(io_err)?;
-        writeln!(w, "c search variables {}", search.len()).map_err(io_err)?;
+        writeln!(w, "c semantic variables {}", search.len()).map_err(io_err)?;
         writeln!(w, "c propagators {}", stats.constraints).map_err(io_err)?;
         writeln!(w, "c seed {}", options.seed).map_err(io_err)?;
         writeln!(w, "c workers {}", options.workers).map_err(io_err)?;
         if !has_objective {
             writeln!(w, "c csp learning {}", !options.no_learn_csp).map_err(io_err)?;
         }
+        writeln!(w, "c semantic branching {}", options.semantic_branching).map_err(io_err)?;
         writeln!(w, "c split {}", options.split).map_err(io_err)?;
     }
 
-    // `search` is the XCSP output projection, not user-supplied branching
-    // guidance. The CP engine keeps ownership of its default variable heuristic.
-    let request = solve_request(options);
+    // The optional semantic scope never changes the output projection or the
+    // requirement that the engine complete every lowering auxiliary.
+    let request = solve_request(options, search);
     let result = {
         let mut events = EventCallback(|event| {
             if let SolveEvent::Progress { engine, objectives, .. } = event {
@@ -259,7 +274,7 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
     Ok(())
 }
 
-fn solve_request(options: RunOptions) -> SolveRequest {
+fn solve_request(options: RunOptions, primary_branch_scope: Vec<usize>) -> SolveRequest {
     let memory_bytes = options.mem_limit.map(|megabytes| u64::try_from(megabytes).unwrap_or(u64::MAX).saturating_mul(1024 * 1024));
     SolveRequest {
         mode: if options.local_search() { SolveMode::LocalSearch } else { SolveMode::Exact },
@@ -274,6 +289,7 @@ fn solve_request(options: RunOptions) -> SolveRequest {
             force_scope_reasons: options.force_scope_reasons,
             shared_pool_capacity: options.shared_pool_capacity,
         },
+        primary_branch_scope: (!options.local_search() && options.semantic_branching).then_some(primary_branch_scope),
         ..SolveRequest::default()
     }
 }
