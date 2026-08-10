@@ -253,6 +253,52 @@ uv run python bench/positioning_report.py \
   --json bench/results/positioning-study.json
 ```
 
+For the large-scale routing-search gate, run the CVRP positioning matrix with
+Qayd and HGS, the paired n=200 behavior probe with Hexaly, then combine both
+artifacts. The gate accepts only the canonical paths, SHA-256 values, BKS,
+single-thread setting, solver versions and exact seeds 0 through 4. It checks
+the Qayd tail and seed dispersion as well as the archived HGS reference range,
+not only median gaps. The behavior report carries the complete 8 by 2 by 5
+pair matrix at one and five seconds with both run IDs, instance hashes, solver
+versions and normalized objectives. Aggregates are recomputed from those 80
+observations. Routing counters, all neighborhoods, macro operators, ALNS
+operators, the elite archive, global scans and path relinking must be exercised.
+Checkpoint timelines must remain causal and no unproductive operator may own
+more than 70 percent of measured CPU.
+
+```sh
+uv run python bench/campaign.py \
+  --suite positioning --family positioning-cvrp \
+  --solver qayd-api --solver hgs \
+  --budget 10 --seed 0,1,2,3,4 --threads 1 \
+  --prepare-qayd \
+  --hgs-binary bench/solvers/HGS-CVRP/build/hgs \
+  --out bench/results/routing-search-cvrp.jsonl --restart
+
+uv run python bench/behavior_probe.py \
+  --workspace bench/results/routing-search-probes \
+  --solver qayd-api --solver hexaly \
+  --customers 200 --budget 1,5 --seed 0,1,2,3,4 --threads 1 \
+  --prepare-qayd \
+  --hexaly-home /opt/hexaly_14_5 --restart
+
+uv run python bench/routing_search_report.py \
+  --campaign bench/results/routing-search-cvrp.jsonl \
+  --behavior-probe bench/results/routing-search-probes/report.json \
+  --markdown bench/results/routing-search-report.md \
+  --json bench/results/routing-search-report.json --require-ready
+```
+
+The 10-second campaign point is the independently measured final result. The
+required internal checkpoints are 0.25, 1, and 5 seconds because the
+orchestrator reserves the tail of a 10-second solve for verification and final
+publication. The internal 10-second checkpoint is emitted on longer runs.
+`--prepare-qayd` rebuilds the Python extension from the current source tree
+before either acceptance campaign. The sidecar pins the commit, the complete
+dirty-tree fingerprint, and the installed extension hash. The runner aborts if
+source or artifact changes while runs are in progress, and the gate requires
+the positioning and behavior campaigns to report the same Qayd build.
+
 ## Data sources
 
 - **SAT** - Global Benchmark Database, <https://benchmark-database.de>, which

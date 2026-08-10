@@ -32,6 +32,7 @@ from common.competitive import (
     machine_provenance,
     run_measured,
     sha256_file,
+    source_tree_sha256,
 )
 
 
@@ -152,13 +153,19 @@ def binary_version(path: Path) -> str:
     return f"sha256:{sha256_file(path)[:16]}"
 
 
-def solver_version(name: str, args: argparse.Namespace, provenance: dict[str, Any]) -> str:
+def solver_version(
+    name: str, args: argparse.Namespace, provenance: dict[str, Any],
+    qayd_artifact: dict[str, str] | None,
+) -> str:
     if name.startswith("qayd-"):
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         workspace = cargo.split("[workspace.package]", 1)[-1]
         match = re.search(r'^version\s*=\s*"([^"]+)"', workspace, re.MULTILINE)
         version = match.group(1) if match else "unknown"
-        return f"qayd {version} ({(provenance.get('commit') or 'unknown')[:12]})"
+        commit = (provenance.get("commit") or "unknown")[:12]
+        source = (provenance.get("source_tree_sha256") or "unknown")[:12]
+        artifact = ((qayd_artifact or {}).get("sha256") or "unknown")[:12]
+        return f"qayd {version} ({commit}, source {source}, artifact {artifact})"
     if name == "ortools-cp-sat":
         try:
             import ortools
@@ -291,6 +298,38 @@ def check_solver_arguments(solvers: list[str], args: argparse.Namespace) -> None
             raise SystemExit(f"{solver} requires {flag}")
 
 
+def prepare_qayd_extension() -> None:
+    try:
+        subprocess.run(
+            ["maturin", "develop", "--features", "python"], cwd=ROOT,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise SystemExit(f"cannot build the qayd Python extension: {error}") from error
+
+
+def qayd_artifact_provenance() -> dict[str, str]:
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", "import qayd._core; print(qayd._core.__file__)"],
+            cwd=ROOT, text=True, capture_output=True, check=True, timeout=30,
+        )
+        location = completed.stdout.strip()
+        if not location:
+            raise OSError("the extension did not report its path")
+        path = Path(location).resolve(strict=True)
+        if not path.is_file():
+            raise OSError(f"the extension path is not a file: {path}")
+    except (OSError, subprocess.SubprocessError) as error:
+        raise SystemExit(f"cannot locate the installed qayd extension: {error}") from error
+    return {"path": str(path), "sha256": sha256_file(path)}
+
+
+def qayd_artifact_unchanged(artifact: dict[str, str]) -> bool:
+    path = Path(artifact.get("path", ""))
+    return path.is_file() and sha256_file(path) == artifact.get("sha256")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", default="smoke", help="suite name or JSON file")
@@ -307,6 +346,10 @@ def main() -> None:
     parser.add_argument(
         "--profile-qayd", action=argparse.BooleanOptionalAction, default=True,
         help="collect candidate throughput for qayd LS runs",
+    )
+    parser.add_argument(
+        "--prepare-qayd", action=argparse.BooleanOptionalAction, default=False,
+        help="build and install the current source tree before running qayd",
     )
     parser.add_argument("--routing-two-way", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--routing-nearest-neighbor", action=argparse.BooleanOptionalAction, default=True)
@@ -330,6 +373,10 @@ def main() -> None:
     seeds = number_list(args.seed or ["0,1,2,3,4"], positive=False)
     solvers = list(dict.fromkeys(args.solver))
     check_solver_arguments(solvers, args)
+    has_qayd = any(solver.startswith("qayd-") for solver in solvers)
+    if has_qayd and args.prepare_qayd:
+        prepare_qayd_extension()
+    qayd_artifact = qayd_artifact_provenance() if has_qayd else None
     suite_path, suite = load_suite(args.suite)
     instances = discover_instances(suite, set(args.family), args.limit_per_family)
     if not instances:
@@ -338,7 +385,7 @@ def main() -> None:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     completed = set() if args.restart else existing_keys(args.out)
     provenance = machine_provenance(ROOT)
-    versions = {solver: solver_version(solver, args, provenance) for solver in solvers}
+    versions = {solver: solver_version(solver, args, provenance, qayd_artifact) for solver in solvers}
     sidecar = args.out.with_suffix(args.out.suffix + ".provenance.json")
     sidecar_payload = {
         "schema_version": 1,
@@ -352,6 +399,8 @@ def main() -> None:
         "qayd_engine": args.qayd_engine,
         "max_iterations": args.max_iterations,
         "profile_qayd": args.profile_qayd,
+        "qayd_prepared": args.prepare_qayd,
+        "qayd_artifact": qayd_artifact,
         "routing_two_way": args.routing_two_way,
         "routing_nearest_neighbor": args.routing_nearest_neighbor,
         "routing_warm_start": args.routing_warm_start,
@@ -360,6 +409,7 @@ def main() -> None:
     compatibility_fields = (
         "suite", "suite_file", "solvers", "budgets", "seeds", "threads",
         "memory_limit_mb", "qayd_engine", "max_iterations", "profile_qayd",
+        "qayd_prepared", "qayd_artifact",
         "routing_two_way", "routing_nearest_neighbor", "routing_warm_start",
     )
     if args.out.exists() and not args.restart:
@@ -370,8 +420,12 @@ def main() -> None:
         if changed:
             fields = ", ".join(changed)
             raise SystemExit(f"campaign configuration changed ({fields}); use a new --out or --restart")
-        if previous.get("host", {}).get("commit") != provenance.get("commit"):
-            raise SystemExit("qayd commit changed; use a new --out or --restart")
+        previous_host = previous.get("host", {})
+        if (
+            previous_host.get("commit") != provenance.get("commit")
+            or previous_host.get("source_tree_sha256") != provenance.get("source_tree_sha256")
+        ):
+            raise SystemExit("qayd source tree changed; use a new --out or --restart")
     sidecar.write_text(json.dumps(sidecar_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     jobs = [
@@ -386,6 +440,14 @@ def main() -> None:
     mode = "w" if args.restart else "a"
     with args.out.open(mode, encoding="utf-8") as output:
         for index, (solver, item, budget, seed) in enumerate(pending, 1):
+            source_changed = (
+                has_qayd
+                and source_tree_sha256(ROOT) != provenance.get("source_tree_sha256")
+            )
+            if source_changed:
+                raise SystemExit("qayd source tree changed during the campaign; restart with a new output")
+            if qayd_artifact is not None and not qayd_artifact_unchanged(qayd_artifact):
+                raise SystemExit("qayd extension changed during the campaign; restart with a new output")
             identifier = run_key(solver, item, budget, seed, args)
             argv = command_for(solver, item, budget, seed, args)
             measured = run_measured(

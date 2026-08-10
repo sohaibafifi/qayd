@@ -3,12 +3,16 @@
 //! Every method in this module is a relaxation. It may return no bound, but it
 //! must never return a heuristic estimate as a certificate.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::engines::ls::lists::eval::eval_expr;
 use crate::model::list::{
-    BoundReport, CollectionModel, CollectionSolution, Expr, ExprArena, ExprId, GlobalConstraint, Iterable, Op, ReduceOp, Resource,
+    BoundReport, CollectionModel, CollectionSolution, Expr, ExprArena, ExprId, GlobalConstraint, Iterable, Op, ReduceOp, Reduction,
+    Resource,
 };
 
 const MAX_COLUMN_GENERATION_CUSTOMERS: usize = 16;
@@ -103,6 +107,48 @@ fn stronger(current: Option<DualBound>, candidate: Option<DualBound>, minimizing
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROUTING_RELAXATION_EDGE_EVALUATIONS: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct DualAuditGuard;
+
+#[cfg(test)]
+impl DualAuditGuard {
+    pub(crate) fn acquire() -> Self {
+        ROUTING_RELAXATION_EDGE_EVALUATIONS.with(|count| count.set(Some(0)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for DualAuditGuard {
+    fn drop(&mut self) {
+        ROUTING_RELAXATION_EDGE_EVALUATIONS.with(|count| count.set(None));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn audit_routing_relaxation_edge_evaluations() -> u64 {
+    ROUTING_RELAXATION_EDGE_EVALUATIONS.with(|count| count.get().unwrap_or(0))
+}
+
+#[cfg(test)]
+pub(crate) fn audit_reset_routing_relaxation_edge_evaluations() {
+    ROUTING_RELAXATION_EDGE_EVALUATIONS.with(|count| {
+        if count.get().is_some() {
+            count.set(Some(0));
+        }
+    });
+}
+
+#[cfg(test)]
+fn audit_note_routing_relaxation_edge_evaluation() {
+    ROUTING_RELAXATION_EDGE_EVALUATIONS.with(|count| count.set(count.get().map(|value| value + 1)));
 }
 
 fn additive_assignment_bound(model: &CollectionModel, stop: &AtomicBool) -> Option<DualBound> {
@@ -602,6 +648,115 @@ fn array_on_arg(arena: &ExprArena, id: ExprId, argument: u8) -> Option<Vec<i64>>
 fn matrix_on_args(arena: &ExprArena, id: ExprId, row_argument: u8, column_argument: u8) -> Option<Vec<Vec<i64>>> {
     let Expr::Matrix(values, row, column) = arena_expr(arena, id)? else { return None };
     (is_arg(arena, *row, row_argument) && is_arg(arena, *column, column_argument)).then(|| values.as_ref().clone())
+}
+
+fn expr_equivalent(left_arena: &ExprArena, left: ExprId, right_arena: &ExprArena, right: ExprId) -> bool {
+    match (arena_expr(left_arena, left), arena_expr(right_arena, right)) {
+        (Some(Expr::Const(a)), Some(Expr::Const(b))) => a == b,
+        (Some(Expr::Arg(a)), Some(Expr::Arg(b))) => a == b,
+        (Some(Expr::Array(left_values, left_index)), Some(Expr::Array(right_values, right_index))) => {
+            (Arc::ptr_eq(left_values, right_values) || left_values.as_ref() == right_values.as_ref())
+                && expr_equivalent(left_arena, *left_index, right_arena, *right_index)
+        }
+        (Some(Expr::Matrix(left_values, left_row, left_col)), Some(Expr::Matrix(right_values, right_row, right_col))) => {
+            (Arc::ptr_eq(left_values, right_values) || left_values.as_ref() == right_values.as_ref())
+                && expr_equivalent(left_arena, *left_row, right_arena, *right_row)
+                && expr_equivalent(left_arena, *left_col, right_arena, *right_col)
+        }
+        (Some(Expr::Add(la, lb)), Some(Expr::Add(ra, rb)))
+        | (Some(Expr::Sub(la, lb)), Some(Expr::Sub(ra, rb)))
+        | (Some(Expr::Mul(la, lb)), Some(Expr::Mul(ra, rb)))
+        | (Some(Expr::Mod(la, lb)), Some(Expr::Mod(ra, rb)))
+        | (Some(Expr::Min(la, lb)), Some(Expr::Min(ra, rb)))
+        | (Some(Expr::Max(la, lb)), Some(Expr::Max(ra, rb)))
+        | (Some(Expr::Div(la, lb)), Some(Expr::Div(ra, rb)))
+        | (Some(Expr::Lt(la, lb)), Some(Expr::Lt(ra, rb)))
+        | (Some(Expr::Le(la, lb)), Some(Expr::Le(ra, rb)))
+        | (Some(Expr::Eq(la, lb)), Some(Expr::Eq(ra, rb)))
+        | (Some(Expr::Ne(la, lb)), Some(Expr::Ne(ra, rb))) => {
+            expr_equivalent(left_arena, *la, right_arena, *ra) && expr_equivalent(left_arena, *lb, right_arena, *rb)
+        }
+        (Some(Expr::Pow(left_base, left_exp)), Some(Expr::Pow(right_base, right_exp))) => {
+            left_exp == right_exp && expr_equivalent(left_arena, *left_base, right_arena, *right_base)
+        }
+        (Some(Expr::MulScaled(la, lb, ls)), Some(Expr::MulScaled(ra, rb, rs)))
+        | (Some(Expr::DivScaled(la, lb, ls)), Some(Expr::DivScaled(ra, rb, rs))) => {
+            ls == rs && expr_equivalent(left_arena, *la, right_arena, *ra) && expr_equivalent(left_arena, *lb, right_arena, *rb)
+        }
+        (Some(Expr::Abs(left_inner)), Some(Expr::Abs(right_inner))) => expr_equivalent(left_arena, *left_inner, right_arena, *right_inner),
+        (Some(Expr::IfThenElse(lc, lt, lo)), Some(Expr::IfThenElse(rc, rt, ro))) => {
+            expr_equivalent(left_arena, *lc, right_arena, *rc)
+                && expr_equivalent(left_arena, *lt, right_arena, *rt)
+                && expr_equivalent(left_arena, *lo, right_arena, *ro)
+        }
+        (
+            Some(Expr::PiecewiseLinear { input: left_input, points: left_points }),
+            Some(Expr::PiecewiseLinear { input: right_input, points: right_points }),
+        ) => {
+            (Arc::ptr_eq(left_points, right_points) || left_points.as_ref() == right_points.as_ref())
+                && expr_equivalent(left_arena, *left_input, right_arena, *right_input)
+        }
+        (Some(Expr::External { name: left_name, args: left_args }), Some(Expr::External { name: right_name, args: right_args })) => {
+            left_name == right_name
+                && left_args.len() == right_args.len()
+                && left_args
+                    .iter()
+                    .zip(right_args.iter())
+                    .all(|(&left_arg, &right_arg)| expr_equivalent(left_arena, left_arg, right_arena, right_arg))
+        }
+        _ => false,
+    }
+}
+
+fn same_routing_reduction_set(left: &[&Reduction], right: &[&Reduction]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right.iter()).all(|(left, right)| {
+            left.coeff == right.coeff
+                && matches!(left.op, ReduceOp::Sum)
+                && matches!(right.op, ReduceOp::Sum)
+                && expr_equivalent(&left.arena, left.body, &right.arena, right.body)
+        })
+}
+
+fn build_routing_cost_matrix(nodes: &[i32], reductions: &[&Reduction], customers: usize, stop: &AtomicBool) -> Option<Vec<Vec<i64>>> {
+    let mut max_raw = vec![0i128; reductions.len()];
+    let mut matrix = Vec::with_capacity(nodes.len());
+    for _ in 0..nodes.len() {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        matrix.push(vec![0i64; nodes.len()]);
+    }
+    for (from_index, &from) in nodes.iter().enumerate() {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        for (to_index, &to) in nodes.iter().enumerate() {
+            if to_index.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            let mut cost = 0i128;
+            for (reduction_index, reduction) in reductions.iter().enumerate() {
+                #[cfg(test)]
+                audit_note_routing_relaxation_edge_evaluation();
+                let raw = eval_expr(&reduction.arena.exprs, reduction.body, &[i64::from(from), i64::from(to)]);
+                if raw < 0 {
+                    return None;
+                }
+                max_raw[reduction_index] = max_raw[reduction_index].max(i128::from(raw));
+                let contribution = i128::from(raw).checked_mul(i128::from(reduction.coeff))?;
+                i64::try_from(contribution).ok()?;
+                cost = cost.checked_add(contribution)?;
+            }
+            matrix[from_index][to_index] = i64::try_from(cost).ok()?;
+        }
+    }
+    let max_route_edges = i128::try_from(customers.saturating_add(1)).ok()?;
+    for (&raw, reduction) in max_raw.iter().zip(reductions) {
+        let worst = raw.checked_mul(max_route_edges)?.checked_mul(i128::from(reduction.coeff))?;
+        i64::try_from(worst).ok()?;
+    }
+    (matrix[0][0] == 0 && matrix.iter().flatten().all(|&cost| cost >= 0)).then_some(matrix)
 }
 
 type ParsedVrptwStep = (Vec<Vec<i64>>, Vec<i64>, Vec<i64>);
@@ -1119,48 +1274,15 @@ impl RoutingRelaxation {
             return None;
         }
         let mut reference: Option<Vec<Vec<i64>>> = None;
-        for reductions in by_list {
+        let mut seen_reduction_sets: Vec<&[&Reduction]> = Vec::new();
+        for reductions in &by_list {
             if reductions.iter().any(|reduction| reduction.coeff < 0) {
                 return None;
             }
-            let mut max_raw = vec![0i128; reductions.len()];
-            let mut matrix = Vec::with_capacity(nodes.len());
-            for _ in 0..nodes.len() {
-                if stop.load(Ordering::Relaxed) {
-                    return None;
-                }
-                matrix.push(vec![0i64; nodes.len()]);
+            if seen_reduction_sets.iter().any(|known| same_routing_reduction_set(known, reductions)) {
+                continue;
             }
-            for (from_index, &from) in nodes.iter().enumerate() {
-                if stop.load(Ordering::Relaxed) {
-                    return None;
-                }
-                for (to_index, &to) in nodes.iter().enumerate() {
-                    if to_index.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
-                        return None;
-                    }
-                    let mut cost = 0i128;
-                    for (reduction_index, reduction) in reductions.iter().enumerate() {
-                        let raw = eval_expr(&reduction.arena.exprs, reduction.body, &[i64::from(from), i64::from(to)]);
-                        if raw < 0 {
-                            return None;
-                        }
-                        max_raw[reduction_index] = max_raw[reduction_index].max(i128::from(raw));
-                        let contribution = i128::from(raw).checked_mul(i128::from(reduction.coeff))?;
-                        i64::try_from(contribution).ok()?;
-                        cost = cost.checked_add(contribution)?;
-                    }
-                    matrix[from_index][to_index] = i64::try_from(cost).ok()?;
-                }
-            }
-            let max_route_edges = i128::try_from(model.items.len().saturating_add(1)).ok()?;
-            for (&raw, reduction) in max_raw.iter().zip(&reductions) {
-                let worst = raw.checked_mul(max_route_edges)?.checked_mul(i128::from(reduction.coeff))?;
-                i64::try_from(worst).ok()?;
-            }
-            if matrix[0][0] != 0 || matrix.iter().flatten().any(|&cost| cost < 0) {
-                return None;
-            }
+            let matrix = build_routing_cost_matrix(&nodes, reductions, model.items.len(), stop)?;
             if let Some(reference) = &reference {
                 for (row_index, (left, right)) in reference.iter().zip(&matrix).enumerate() {
                     if row_index.is_multiple_of(64) && stop.load(Ordering::Relaxed) {
@@ -1171,8 +1293,9 @@ impl RoutingRelaxation {
                     }
                 }
             } else {
-                reference = Some(matrix);
+                reference = Some(matrix.clone());
             }
+            seen_reduction_sets.push(reductions);
         }
         let costs = reference?;
         let max_edges = i128::try_from(model.items.len().saturating_add(model.lists)).ok()?;

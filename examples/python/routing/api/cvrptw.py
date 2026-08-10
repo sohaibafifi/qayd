@@ -141,6 +141,36 @@ construction_record = {
     "constructor": solution.constructor,
     "constructor_fleet": solution.constructor_fleet,
     "constructor_cost": solution.constructor_cost,
+    "anytime_checkpoints": None
+    if solution.anytime_checkpoints is None
+    else [
+        {
+            "target_nanos": target,
+            "observed_nanos": observed,
+            "feasible": feasible,
+            "objectives": objectives,
+            "fleet": fleet,
+            "candidates": candidates,
+        }
+        for target, observed, feasible, objectives, fleet, candidates in solution.anytime_checkpoints
+    ],
+    "neighborhood_profile": None
+    if solution.neighborhood_profile is None
+    else [
+        {
+            "name": name,
+            "uses": uses,
+            "generated": generated,
+            "evaluated": evaluated,
+            "cpu_nanos": cpu_nanos,
+            "improvements": improvements,
+            "global_bests": global_bests,
+            "positive_rewards": positive_rewards,
+            "weight": weight,
+        }
+        for name, uses, generated, evaluated, cpu_nanos, improvements, global_bests, positive_rewards, weight in solution.neighborhood_profile
+    ],
+    "routing_counters": None if solution.routing_counters is None else dict(solution.routing_counters),
 }
 
 if solution.lists is None:

@@ -43,6 +43,44 @@ def git_value(root: Path, *arguments: str) -> Optional[str]:
     return result.stdout.strip() or None
 
 
+def git_bytes(root: Path, *arguments: str) -> Optional[bytes]:
+    try:
+        result = subprocess.run(
+            ["git", *arguments], cwd=root, capture_output=True,
+            check=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout
+
+
+def source_tree_sha256(root: Path) -> Optional[str]:
+    """Fingerprint HEAD plus every tracked and untracked working-tree edit."""
+    commit = git_value(root, "rev-parse", "HEAD")
+    diff = git_bytes(root, "diff", "--binary", "--no-ext-diff", "HEAD", "--")
+    untracked = git_bytes(root, "ls-files", "--others", "--exclude-standard", "-z")
+    if commit is None or diff is None or untracked is None:
+        return None
+    digest = hashlib.sha256()
+
+    def add(payload: bytes) -> None:
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+
+    add(b"qayd-source-tree/v1")
+    add(commit.encode("ascii"))
+    add(diff)
+    for encoded_path in sorted(filter(None, untracked.split(b"\0"))):
+        path = root / os.fsdecode(encoded_path)
+        try:
+            payload = path.read_bytes()
+        except OSError:
+            return None
+        add(encoded_path)
+        add(payload)
+    return digest.hexdigest()
+
+
 def machine_provenance(root: Path) -> dict[str, Any]:
     commit = git_value(root, "rev-parse", "HEAD")
     dirty = bool(git_value(root, "status", "--porcelain"))
@@ -50,6 +88,7 @@ def machine_provenance(root: Path) -> dict[str, Any]:
         "captured_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "commit": commit,
         "dirty": dirty,
+        "source_tree_sha256": source_tree_sha256(root),
         "platform": platform.platform(),
         "python": platform.python_version(),
         "machine": platform.machine(),

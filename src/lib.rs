@@ -64,6 +64,9 @@ pub use search::{
 pub use store::{Solver, Store};
 pub use trail::{ReversibleInt, Trail};
 
+#[cfg(test)]
+pub(crate) use engines::ls::lists::audit_exhausted_neighborhood_learning;
+
 /// SplitMix64 finalizer: scrambles a counter/seed into a well-distributed
 /// `u64`. Shared so every seed-derived stream stays bit-identical across
 /// modules - determinism depends on it.
@@ -139,6 +142,15 @@ mod phase7;
 #[cfg(test)]
 #[path = "../tests/internal/phase9_phase10.rs"]
 mod phase9_phase10;
+#[cfg(test)]
+#[path = "../tests/internal/routing_alns_elite.rs"]
+mod routing_alns_elite;
+#[cfg(test)]
+#[path = "../tests/internal/routing_neighborhoods.rs"]
+mod routing_neighborhoods;
+#[cfg(test)]
+#[path = "../tests/internal/routing_search.rs"]
+mod routing_search;
 #[cfg(test)]
 #[path = "../tests/internal/schedule_compile_contract.rs"]
 mod schedule_compile_contract;

@@ -6,19 +6,28 @@
 //! search it as a fallback or incumbent generator.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use smallvec::SmallVec;
 
-use super::alns::{build_candidate, AcceptanceKind, AlnsController, SearchProfile};
+use super::alns::{
+    build_candidate, build_candidate_bounded, build_macro_candidate_bounded, routing_compound_structural_floor,
+    routing_relink_structural_floor, routing_route_elimination_floor, AcceptanceKind, AlnsBuildStatus, AlnsController, AlnsWorkBudget,
+    MacroOperator, SearchProfile,
+};
+use super::elite::{elite_archive_budget, elite_selection_budget, path_relink_bounded, EliteOperationStatus, ElitePool, PathRelinkStatus};
 use super::eval::{eval_reduction, violation_of, INFEASIBLE};
-use super::incremental::{EvalScratch, InsertView, ListView, ReductionCache};
+use super::incremental::{EvalScratch, EvaluationInterrupted, InsertView, ListView, ReductionCache};
 use super::metrics::{ListSearchMetrics, MetricsRecorder};
-use super::moves::{apply_move, best_improving_move, better, shuffle, snapshot, trial_list_score_view, SearchMemory};
+use super::moves::{
+    apply_move, best_improving_move, better, search_routing_neighborhood, shuffle, snapshot, trial_list_score_view, NeighborhoodKind,
+    RoutingIndexCache, RoutingScanMemory, RoutingScanWorkspace, ScanMode, ScanOutcome, SearchMemory, WorkBudget,
+};
 use super::portfolio::WorkerCoordination;
+use super::routing_search::{RoutingSearchControl, SliceKind};
 use crate::engines::dual;
 use crate::mix64;
 use crate::model::list::{
@@ -66,6 +75,28 @@ impl Globals {
         self.value_to_idx.get(&value).map_or(0, |&i| item_list[i])
     }
 
+    fn list_of_interruptible(
+        &self,
+        item_list: &[usize],
+        value: i32,
+        overrides: &[(i32, usize)],
+        stop: &AtomicBool,
+    ) -> Result<usize, EvaluationInterrupted> {
+        for (index, &(candidate, list)) in overrides.iter().enumerate() {
+            if index.is_multiple_of(64) && stop.load(Ordering::Relaxed) {
+                return Err(EvaluationInterrupted);
+            }
+            if candidate == value {
+                return Ok(list);
+            }
+        }
+        if stop.load(Ordering::Relaxed) {
+            Err(EvaluationInterrupted)
+        } else {
+            Ok(self.value_to_idx.get(&value).map_or(0, |&index| item_list[index]))
+        }
+    }
+
     /// Violation of one global constraint under the current `item_list` plus
     /// overrides. `ListLe` penalises by how many lists out of order; `SameList`
     /// by the list-index distance, so both are smooth for local search.
@@ -101,6 +132,58 @@ impl Globals {
         }
     }
 
+    fn one_interruptible(
+        &self,
+        constraint: &GlobalConstraint,
+        item_list: &[usize],
+        overrides: &[(i32, usize)],
+        stop: &AtomicBool,
+    ) -> Result<i64, EvaluationInterrupted> {
+        let list_of = |value| self.list_of_interruptible(item_list, value, overrides, stop);
+        match constraint {
+            GlobalConstraint::ListLe { before, after } => {
+                let before = list_of(*before)? as i64;
+                let after = list_of(*after)? as i64;
+                Ok((before - after).max(0))
+            }
+            GlobalConstraint::SameList { a, b } => {
+                let left = list_of(*a)? as i64;
+                let right = list_of(*b)? as i64;
+                Ok((left - right).abs())
+            }
+            GlobalConstraint::DifferentList { a, b } => Ok(i64::from(list_of(*a)? == list_of(*b)?)),
+            GlobalConstraint::AllSameList { items } => {
+                let Some(&first) = items.first() else { return Ok(0) };
+                let first = list_of(first)? as i64;
+                let (mut lo, mut hi) = (first, first);
+                for (index, &item) in items.iter().enumerate().skip(1) {
+                    if index.is_multiple_of(64) && stop.load(Ordering::Relaxed) {
+                        return Err(EvaluationInterrupted);
+                    }
+                    let owner = list_of(item)? as i64;
+                    lo = lo.min(owner);
+                    hi = hi.max(owner);
+                }
+                Ok(hi - lo)
+            }
+            GlobalConstraint::AllDifferentLists { items } => {
+                let mut seen = HashSet::with_capacity(items.len());
+                let mut violation = 0i64;
+                for (index, &item) in items.iter().enumerate() {
+                    if index.is_multiple_of(64) && stop.load(Ordering::Relaxed) {
+                        return Err(EvaluationInterrupted);
+                    }
+                    violation = violation.saturating_add(i64::from(!seen.insert(list_of(item)?)));
+                }
+                Ok(violation)
+            }
+            GlobalConstraint::ListDistance { a, b, min, max } => {
+                let distance = list_of(*a)?.abs_diff(list_of(*b)?);
+                Ok(i64::try_from(min.saturating_sub(distance).saturating_add(distance.saturating_sub(*max))).unwrap_or(i64::MAX))
+            }
+        }
+    }
+
     /// Total violation over all global constraints.
     pub(super) fn total(&self, item_list: &[usize]) -> i64 {
         self.cons.iter().fold(0i64, |acc, c| acc.saturating_add(self.one(c, item_list, &[])))
@@ -108,22 +191,55 @@ impl Globals {
 
     /// Change in total global violation if the listed items moved to new lists.
     pub(super) fn delta(&self, item_list: &[usize], overrides: &[(i32, usize)]) -> i64 {
+        let stop = AtomicBool::new(false);
+        self.delta_interruptible(item_list, overrides, &stop).expect("an uninterrupted global delta must complete")
+    }
+
+    pub(super) fn delta_interruptible(
+        &self,
+        item_list: &[usize],
+        overrides: &[(i32, usize)],
+        stop: &AtomicBool,
+    ) -> Result<i64, EvaluationInterrupted> {
+        if stop.load(Ordering::Relaxed) {
+            return Err(EvaluationInterrupted);
+        }
         let mut affected: Vec<usize> = Vec::new();
+        let mut affected_seen = HashSet::new();
+        let mut work = 0usize;
         for &(v, _) in overrides {
+            if work.is_multiple_of(64) && stop.load(Ordering::Relaxed) {
+                return Err(EvaluationInterrupted);
+            }
             if let Some(&i) = self.value_to_idx.get(&v) {
                 for &g in &self.of_idx[i] {
-                    if !affected.contains(&g) {
+                    if work.is_multiple_of(64) && stop.load(Ordering::Relaxed) {
+                        return Err(EvaluationInterrupted);
+                    }
+                    if affected_seen.insert(g) {
                         affected.push(g);
                     }
+                    work = work.saturating_add(1);
                 }
             }
+            work = work.saturating_add(1);
         }
         let mut d = 0i64;
         for &g in &affected {
+            if work.is_multiple_of(64) && stop.load(Ordering::Relaxed) {
+                return Err(EvaluationInterrupted);
+            }
             let c = &self.cons[g];
-            d = d.saturating_add(self.one(c, item_list, overrides).saturating_sub(self.one(c, item_list, &[])));
+            let next = self.one_interruptible(c, item_list, overrides, stop)?;
+            let old = self.one_interruptible(c, item_list, &[], stop)?;
+            d = d.saturating_add(next.saturating_sub(old));
+            work = work.saturating_add(1);
         }
-        d
+        if stop.load(Ordering::Relaxed) {
+            Err(EvaluationInterrupted)
+        } else {
+            Ok(d)
+        }
     }
 }
 
@@ -181,10 +297,17 @@ struct RoutingSignature {
     capacity: Option<i64>,
     has_time_windows: bool,
     has_fleet_objective: bool,
+    reverse_equivalent: bool,
 }
 
 pub(super) struct CandidateNeighbors {
+    /// Directed, cost-ordered k-nearest neighbours used by construction and
+    /// destroy/repair operators.
     map: HashMap<i32, Vec<i32>>,
+    /// Symmetric candidate graph used by routing neighbourhoods.  It contains
+    /// at most two adjacency entries per directed kNN edge, including route
+    /// boundary nodes such as the depot.
+    routing_map: HashMap<i32, Vec<i32>>,
 }
 
 impl CandidateNeighbors {
@@ -213,13 +336,10 @@ impl CandidateNeighbors {
         }
 
         let mut targets = model.items.clone();
-        for &value in &values {
-            if !targets.contains(&value) {
-                targets.push(value);
-            }
-        }
+        targets.extend(values.iter().copied());
         targets.sort_unstable();
         targets.dedup();
+        let keep = limit.min(targets.len().saturating_sub(1));
 
         let mut map = HashMap::with_capacity(values.len());
         for &from in &values {
@@ -227,28 +347,64 @@ impl CandidateNeighbors {
                 return None;
             }
             let from_idx = usize::try_from(from).ok()?;
-            let mut near = targets
-                .iter()
-                .copied()
-                .filter(|&to| to != from)
-                .map(|to| {
-                    let to_idx = usize::try_from(to).ok()?;
-                    Some((matrix[from_idx][to_idx], to))
-                })
-                .collect::<Option<Vec<_>>>()?;
+            // Keep only the best `limit` entries while scanning the row.  A
+            // full sort here used to make candidate construction O(n² log n)
+            // and left one whole row uninterruptible.
+            let mut heap = BinaryHeap::with_capacity(keep);
+            for (target_at, &to) in targets.iter().enumerate() {
+                if target_at.is_multiple_of(256) && stop.load(Ordering::Relaxed) {
+                    return None;
+                }
+                if to == from {
+                    continue;
+                }
+                let to_idx = usize::try_from(to).ok()?;
+                let entry = (matrix[from_idx][to_idx], to);
+                if heap.len() < keep {
+                    heap.push(entry);
+                } else if heap.peek().is_some_and(|worst| entry < *worst) {
+                    heap.pop();
+                    heap.push(entry);
+                }
+            }
+            let mut near = heap.into_vec();
             near.sort_unstable_by_key(|&(cost, to)| (cost, to));
-            near.truncate(limit.min(near.len()));
             map.insert(from, near.into_iter().map(|(_, to)| to).collect());
         }
-        Some(Self { map })
+
+        // Routing treats a candidate edge as undirected.  Build that view in
+        // deterministic source/cost order without allowing mutual directed
+        // arcs to duplicate work in every granular scan.
+        let directed_edges = map.values().map(Vec::len).sum();
+        let mut routing_map: HashMap<i32, Vec<i32>> = HashMap::with_capacity(values.len());
+        let mut seen = HashSet::with_capacity(directed_edges);
+        let mut visited = 0usize;
+        for &from in &values {
+            for &to in map.get(&from).map_or(&[][..], Vec::as_slice) {
+                if visited.is_multiple_of(256) && stop.load(Ordering::Relaxed) {
+                    return None;
+                }
+                visited += 1;
+                let edge = if from < to { (from, to) } else { (to, from) };
+                if seen.insert(edge) {
+                    routing_map.entry(from).or_default().push(to);
+                    routing_map.entry(to).or_default().push(from);
+                }
+            }
+        }
+        Some(Self { map, routing_map })
     }
 
     pub(super) fn contains(&self, a: i32, b: i32) -> bool {
         self.map.get(&a).is_some_and(|near| near.contains(&b)) || self.map.get(&b).is_some_and(|near| near.contains(&a))
     }
 
-    fn neighbors(&self, item: i32) -> &[i32] {
+    pub(super) fn neighbors(&self, item: i32) -> &[i32] {
         self.map.get(&item).map_or(&[], Vec::as_slice)
+    }
+
+    pub(super) fn routing_neighbors(&self, item: i32) -> &[i32] {
+        self.routing_map.get(&item).map_or(&[], Vec::as_slice)
     }
 
     /// The nearest neighbour of `from` (by edge cost) that is currently present and
@@ -286,15 +442,100 @@ fn direct_item_array(reduction: &Reduction) -> Option<Arc<Vec<i64>>> {
     expr_is_arg(&reduction.arena.exprs, *index, 0).then(|| Arc::clone(values))
 }
 
-fn routing_signature(
-    model: &CollectionModel,
-    route_bounds: &[Option<(i32, i32)>],
-    matrix: Option<Arc<Vec<Vec<i64>>>>,
-) -> Option<RoutingSignature> {
+fn same_matrix(left: &Arc<Vec<Vec<i64>>>, right: &Arc<Vec<Vec<i64>>>) -> bool {
+    Arc::ptr_eq(left, right) || left.as_ref() == right.as_ref()
+}
+
+fn symmetric_matrix(matrix: &[Vec<i64>]) -> bool {
+    matrix.iter().enumerate().all(|(row, values)| {
+        values.len() == matrix.len() && values.iter().take(row).enumerate().all(|(column, &value)| matrix[column].get(row) == Some(&value))
+    })
+}
+
+fn reversal_invariant_reduction(reduction: &Reduction) -> bool {
+    match &reduction.iterable {
+        Iterable::Items(_) | Iterable::SetItems(_) => true,
+        Iterable::Edges { start, end, .. } => start == end && direct_edge_matrix(reduction).is_some_and(|matrix| symmetric_matrix(&matrix)),
+        Iterable::Scan { .. } | Iterable::Windows { .. } | Iterable::Pairs(_) => false,
+    }
+}
+
+fn routing_signature(model: &CollectionModel) -> Option<RoutingSignature> {
+    if !homogeneous_minimization_routing(model) {
+        return None;
+    }
+    let mut route_bounds = vec![None; model.lists];
+    let mut matrix = None;
+    let mut inspect = |reduction: &Reduction, objective: bool| -> Option<()> {
+        let Iterable::Edges { list, start, end, .. } = &reduction.iterable else {
+            return Some(());
+        };
+        if *list >= model.lists {
+            return None;
+        }
+        let bounds = (*start, *end);
+        if route_bounds[*list].is_some_and(|existing| existing != bounds) {
+            return None;
+        }
+        route_bounds[*list] = Some(bounds);
+        if objective && matrix.is_none() {
+            matrix = direct_edge_matrix(reduction);
+        }
+        Some(())
+    };
+    for tier in &model.objectives {
+        for reduction in &tier.terms {
+            inspect(reduction, true)?;
+        }
+        for reduction in tier.max_terms.iter().flatten().flat_map(|term| term.groups.iter().flatten()) {
+            inspect(reduction, true)?;
+        }
+    }
+    for constraint in &model.constraints {
+        inspect(&constraint.reduction, false)?;
+    }
+
     let matrix = matrix?;
     let (depot, end) = route_bounds.iter().flatten().next().copied()?;
-    if depot != end || route_bounds.iter().flatten().any(|&(start, finish)| start != depot || finish != depot) {
+    if depot != end
+        || route_bounds.iter().any(Option::is_none)
+        || route_bounds.iter().flatten().any(|&(start, finish)| start != depot || finish != depot)
+    {
         return None;
+    }
+    let mut guided_lists = vec![false; model.lists];
+    let mut inspect_objective_reduction = |reduction: &Reduction| -> Option<()> {
+        let Iterable::Edges { list, start, end, .. } = &reduction.iterable else {
+            return Some(());
+        };
+        if *start != depot || *end != depot || *list >= model.lists {
+            return None;
+        }
+        if matches!(reduction.op, ReduceOp::Sum)
+            && reduction.coeff > 0
+            && direct_edge_matrix(reduction).is_some_and(|other| same_matrix(&other, &matrix))
+        {
+            guided_lists[*list] = true;
+        }
+        Some(())
+    };
+    for tier in &model.objectives {
+        for reduction in &tier.terms {
+            inspect_objective_reduction(reduction)?;
+        }
+        for reduction in tier.max_terms.iter().flatten().flat_map(|term| term.groups.iter().flatten()) {
+            inspect_objective_reduction(reduction)?;
+        }
+    }
+    if guided_lists.iter().any(|guided| !guided) {
+        return None;
+    }
+    for constraint in &model.constraints {
+        if let Iterable::Edges { start, end, .. } = &constraint.reduction.iterable {
+            if *start != depot || *end != depot {
+                return None;
+            }
+        }
     }
     let capacity_constraint = model.constraints.iter().find(|constraint| {
         matches!(constraint.op, crate::model::list::Op::Le)
@@ -307,7 +548,20 @@ fn routing_signature(
     let has_time_windows = model.constraints.iter().any(|constraint| matches!(constraint.reduction.iterable, Iterable::Scan { .. }));
     let has_fleet_objective =
         model.objectives.iter().flat_map(|tier| tier.reductions()).any(|reduction| matches!(reduction.op, ReduceOp::Used));
-    Some(RoutingSignature { depot, matrix, demands, capacity, has_time_windows, has_fleet_objective })
+    let reverse_equivalent = model
+        .objectives
+        .iter()
+        .flat_map(|tier| tier.reductions())
+        .chain(model.constraints.iter().map(|constraint| &constraint.reduction))
+        .all(reversal_invariant_reduction);
+    Some(RoutingSignature { depot, matrix, demands, capacity, has_time_windows, has_fleet_objective, reverse_equivalent })
+}
+
+/// Whether the specialized sliced routing trajectory can consume this physical
+/// list model. The orchestrator and the engine use this single capability test,
+/// so a stage is never labelled routing while executing the generic list loop.
+pub(crate) fn routing_search_supported(model: &CollectionModel) -> bool {
+    routing_signature(model).is_some()
 }
 
 /// How a reduction can be scored incrementally from the old list plus a local
@@ -351,6 +605,45 @@ fn same_reduction_shape(a: &Reduction, b: &Reduction) -> bool {
         _ => false,
     };
     same_op && a.arena == b.arena && a.body == b.body && a.coeff == b.coeff && same_iterable_shape(&a.iterable, &b.iterable)
+}
+
+fn homogeneous_minimization_routing(model: &CollectionModel) -> bool {
+    if model.lists == 0
+        || model.objectives.is_empty()
+        || model.objectives.iter().any(|tier| !tier.minimize || tier.max_terms.as_ref().is_some_and(|terms| !terms.is_empty()))
+    {
+        return false;
+    }
+    for tier in &model.objectives {
+        let mut by_list = vec![Vec::new(); model.lists];
+        for reduction in &tier.terms {
+            let list = reduction.iterable.list();
+            if list >= model.lists {
+                return false;
+            }
+            by_list[list].push(reduction);
+        }
+        if (1..model.lists).any(|list| {
+            by_list[list].len() != by_list[0].len()
+                || by_list[list].iter().zip(&by_list[0]).any(|(left, right)| !same_reduction_shape(left, right))
+        }) {
+            return false;
+        }
+    }
+    let mut constraints = vec![Vec::new(); model.lists];
+    for constraint in &model.constraints {
+        let list = constraint.reduction.iterable.list();
+        if list >= model.lists {
+            return false;
+        }
+        constraints[list].push(constraint);
+    }
+    (1..model.lists).all(|list| {
+        constraints[list].len() == constraints[0].len()
+            && constraints[list].iter().zip(&constraints[0]).all(|(left, right)| {
+                left.op == right.op && left.rhs == right.rhs && same_reduction_shape(&left.reduction, &right.reduction)
+            })
+    })
 }
 
 fn lists_are_interchangeable(
@@ -523,7 +816,7 @@ impl PerList {
         let interchangeable_lists =
             (enable_routing_gls || diversify_descent) && lists_are_interchangeable(model, &objective, &constraints, &max_objective);
         let routing_gls = enable_routing_gls.then(|| routing_gls(&objective, &senses, stop)).flatten();
-        let routing = has_edges.then(|| routing_signature(model, &route_bounds, candidate_matrix.clone())).flatten();
+        let routing = has_edges.then(|| routing_signature(model)).flatten();
         let construction_limit = ((model.items.len() as f64).sqrt().ceil() as usize).clamp(8, 64);
         Self {
             objective,
@@ -548,17 +841,34 @@ impl PerList {
     }
 
     pub(super) fn edge_penalty(&self, list: usize, contents: &(impl ListView + ?Sized)) -> i64 {
-        let Some(gls) = &self.routing_gls else { return 0 };
-        let Some((start, end)) = self.route_bounds[list] else { return 0 };
+        let stop = AtomicBool::new(false);
+        self.edge_penalty_interruptible(list, contents, &stop).expect("an uninterrupted edge-penalty evaluation must complete")
+    }
+
+    pub(super) fn edge_penalty_interruptible(
+        &self,
+        list: usize,
+        contents: &(impl ListView + ?Sized),
+        stop: &AtomicBool,
+    ) -> Result<i64, EvaluationInterrupted> {
+        let Some(gls) = &self.routing_gls else { return Ok(0) };
+        let Some((start, end)) = self.route_bounds[list] else { return Ok(0) };
         let penalties = gls.penalties.borrow();
         let mut penalty = 0i64;
         for pos in 0..=contents.len() {
+            if pos.is_multiple_of(64) && stop.load(Ordering::Relaxed) {
+                return Err(EvaluationInterrupted);
+            }
             let from = if pos == 0 { start } else { contents.at(pos - 1) };
             let to = if pos == contents.len() { end } else { contents.at(pos) };
             let (Ok(from), Ok(to)) = (usize::try_from(from), usize::try_from(to)) else { continue };
             penalty = penalty.saturating_add(penalties.get(from).and_then(|row| row.get(to)).copied().unwrap_or(0));
         }
-        penalty
+        if stop.load(Ordering::Relaxed) {
+            Err(EvaluationInterrupted)
+        } else {
+            Ok(penalty)
+        }
     }
 
     fn bump_routing_gls(&self, state: &State, primary_objective: i64) -> Option<usize> {
@@ -910,14 +1220,16 @@ pub(super) fn base_totals(scores: &[ListScore], tiers: usize) -> (i64, TierValue
     (violation, raw)
 }
 
-fn max_objective_totals<'a>(
+fn max_objective_totals_interruptible<'a>(
     per: &PerList,
     state: &State,
     replacements: &'a [TrialList<'a>],
     scratch: &mut EvalScratch,
-) -> (i64, TierValues) {
+    stop: &AtomicBool,
+) -> Result<(i64, TierValues), EvaluationInterrupted> {
     let mut violation = 0i64;
     let mut raw = tier_values(per.tiers, 0);
+    let mut work = 0usize;
     for (tier, terms) in per.max_objective.iter().enumerate() {
         for (term_idx, term) in terms.iter().enumerate() {
             let mut best = None;
@@ -925,12 +1237,15 @@ fn max_objective_totals<'a>(
                 let mut group_value = 0i64;
                 let mut defined = true;
                 for (reduction_idx, reduction) in group.iter().enumerate() {
+                    if work.is_multiple_of(64) && stop.load(Ordering::Relaxed) {
+                        return Err(EvaluationInterrupted);
+                    }
                     let cache = &state.max_caches[tier][term_idx][group_idx][reduction_idx];
                     let list = reduction.iterable.list();
                     let value = if let Some(replacement) = replacements.iter().find(|replacement| replacement.list == list) {
                         let value = per.metrics.measure_delta(reduction, || {
-                            cache.candidate_value(reduction, &state.lists[list], replacement.contents, scratch)
-                        });
+                            cache.candidate_value_interruptible(reduction, &state.lists[list], replacement.contents, scratch, stop)
+                        })?;
                         if matches!(reduction.iterable, Iterable::Scan { .. }) {
                             per.metrics.record_incremental_scan(scratch.recomputed_scan_steps());
                         }
@@ -945,6 +1260,7 @@ fn max_objective_totals<'a>(
                             violation = violation.saturating_add(INFEASIBLE);
                         }
                     }
+                    work = work.saturating_add(1);
                 }
                 if defined {
                     best = Some(best.map_or(group_value, |value: i64| value.max(group_value)));
@@ -955,7 +1271,11 @@ fn max_objective_totals<'a>(
             }
         }
     }
-    (violation, raw)
+    if stop.load(Ordering::Relaxed) {
+        Err(EvaluationInterrupted)
+    } else {
+        Ok((violation, raw))
+    }
 }
 
 fn score_with_replacements_mode<'a>(
@@ -966,6 +1286,20 @@ fn score_with_replacements_mode<'a>(
     scratch: &mut EvalScratch,
     guided: bool,
 ) -> Score {
+    let stop = AtomicBool::new(false);
+    score_with_replacements_mode_interruptible(per, state, replacements, global_delta, scratch, guided, &stop)
+        .expect("an uninterrupted replacement score must complete")
+}
+
+fn score_with_replacements_mode_interruptible<'a>(
+    per: &PerList,
+    state: &'a State,
+    replacements: &'a [TrialList<'a>],
+    global_delta: i64,
+    scratch: &mut EvalScratch,
+    guided: bool,
+    stop: &AtomicBool,
+) -> Result<Score, EvaluationInterrupted> {
     // Fold in list order, just like a full evaluation. Subtracting an old
     // contribution from a saturated total and adding the replacement is not
     // reversible at i64::MIN/MAX.
@@ -973,14 +1307,21 @@ fn score_with_replacements_mode<'a>(
     let mut raw = tier_values(per.tiers, 0);
     let constraint_weights = guided.then(|| per.penalties.constraints.borrow());
     let objective_weights = guided.then(|| per.penalties.objectives.borrow());
+    let mut work = 0usize;
     for (list, cached) in state.scores.iter().enumerate() {
+        if work.is_multiple_of(64) && stop.load(Ordering::Relaxed) {
+            return Err(EvaluationInterrupted);
+        }
         let score = replacements.iter().find(|replacement| replacement.list == list).map_or(cached, |replacement| replacement.score);
         if let Some(weights) = &constraint_weights {
-            let weighted = score
-                .constraint_violations
-                .iter()
-                .zip(&weights[list])
-                .fold(score.undefined_violation, |sum, (&value, &weight)| sum.saturating_add(value.saturating_mul(weight)));
+            let mut weighted = score.undefined_violation;
+            for (&value, &weight) in score.constraint_violations.iter().zip(&weights[list]) {
+                if work.is_multiple_of(64) && stop.load(Ordering::Relaxed) {
+                    return Err(EvaluationInterrupted);
+                }
+                weighted = weighted.saturating_add(value.saturating_mul(weight));
+                work = work.saturating_add(1);
+            }
             violation = violation.saturating_add(weighted);
         } else {
             violation = violation.saturating_add(score.violation);
@@ -989,9 +1330,13 @@ fn score_with_replacements_mode<'a>(
             *slot = slot.saturating_add(value);
             if let Some(weights) = &objective_weights {
                 for (&reduction_value, &weight) in score.objective_reductions[tier].iter().zip(&weights[list][tier]) {
+                    if work.is_multiple_of(64) && stop.load(Ordering::Relaxed) {
+                        return Err(EvaluationInterrupted);
+                    }
                     if let Some(reduction_value) = reduction_value {
                         *slot = slot.saturating_add(reduction_value.saturating_mul(weight.saturating_sub(1)));
                     }
+                    work = work.saturating_add(1);
                 }
             }
             if tier == 0 && guided {
@@ -999,17 +1344,23 @@ fn score_with_replacements_mode<'a>(
                     *slot = slot.saturating_add(score.edge_penalty.saturating_mul(gls.lambda.get()));
                 }
             }
+            work = work.saturating_add(1);
         }
+        work = work.saturating_add(1);
     }
     violation = violation.saturating_add(state.global_viol).saturating_add(global_delta);
     if per.has_max_objective() {
-        let (max_violation, max_raw) = max_objective_totals(per, state, replacements, scratch);
+        let (max_violation, max_raw) = max_objective_totals_interruptible(per, state, replacements, scratch, stop)?;
         violation = violation.saturating_add(max_violation);
         for (slot, value) in raw.iter_mut().zip(max_raw) {
             *slot = slot.saturating_add(value);
         }
     }
-    signed(per, violation, raw)
+    if stop.load(Ordering::Relaxed) {
+        Err(EvaluationInterrupted)
+    } else {
+        Ok(signed(per, violation, raw))
+    }
 }
 
 pub(super) fn score_with_replacements<'a>(
@@ -1022,9 +1373,48 @@ pub(super) fn score_with_replacements<'a>(
     score_with_replacements_mode(per, state, replacements, global_delta, scratch, true)
 }
 
+pub(super) fn score_with_replacements_interruptible<'a>(
+    per: &PerList,
+    state: &'a State,
+    replacements: &'a [TrialList<'a>],
+    global_delta: i64,
+    scratch: &mut EvalScratch,
+    stop: &AtomicBool,
+) -> Result<Score, EvaluationInterrupted> {
+    score_with_replacements_mode_interruptible(per, state, replacements, global_delta, scratch, true, stop)
+}
+
+/// Exact unpenalized score after replacing an arbitrary set of lists. This is
+/// the speculative counterpart of `full_score_raw`: untouched lists and their
+/// reduction caches are reused, while only the supplied views are rescored.
+pub(super) fn score_with_replacements_raw<'a>(
+    per: &PerList,
+    state: &'a State,
+    replacements: &'a [TrialList<'a>],
+    global_delta: i64,
+    scratch: &mut EvalScratch,
+) -> Score {
+    score_with_replacements_mode(per, state, replacements, global_delta, scratch, false)
+}
+
+pub(super) fn score_with_replacements_raw_interruptible<'a>(
+    per: &PerList,
+    state: &'a State,
+    replacements: &'a [TrialList<'a>],
+    global_delta: i64,
+    scratch: &mut EvalScratch,
+    stop: &AtomicBool,
+) -> Result<Score, EvaluationInterrupted> {
+    score_with_replacements_mode_interruptible(per, state, replacements, global_delta, scratch, false, stop)
+}
+
 /// Full score including the cross-list global violation.
 pub(super) fn full_score(per: &PerList, state: &State) -> Score {
     score_with_replacements(per, state, &[], 0, &mut EvalScratch::default())
+}
+
+pub(super) fn full_score_interruptible(per: &PerList, state: &State, stop: &AtomicBool) -> Result<Score, EvaluationInterrupted> {
+    score_with_replacements_interruptible(per, state, &[], 0, &mut EvalScratch::default(), stop)
 }
 
 /// Exact, unpenalized score used for incumbent tracking and public objectives.
@@ -1227,8 +1617,67 @@ struct InitialConstruction {
     state: State,
     name: &'static str,
     elapsed: std::time::Duration,
-    first_feasible: Option<std::time::Duration>,
+    feasible_history: Vec<InitialFeasible>,
     candidates: u64,
+    reported: bool,
+}
+
+#[derive(Clone)]
+struct InitialFeasible {
+    elapsed: std::time::Duration,
+    score: Score,
+    fleet: usize,
+    candidates: u64,
+}
+
+struct RoutingConstructionWork<'a> {
+    candidates: &'a mut u64,
+    candidate_budget: u64,
+    feasible_history: &'a mut Vec<InitialFeasible>,
+    started: &'a Instant,
+    per: &'a PerList,
+    report: &'a mut dyn FnMut(i64),
+    fallback_lists: &'a mut Option<(Vec<Vec<i32>>, &'static str)>,
+}
+
+impl RoutingConstructionWork<'_> {
+    fn exhausted(&self) -> bool {
+        *self.candidates >= self.candidate_budget
+    }
+
+    fn consume_candidate(&mut self) {
+        *self.candidates = self.candidates.saturating_add(1);
+    }
+
+    fn observe(&mut self, state: &State, score: Score) -> bool {
+        let improved =
+            observe_construction_incumbent(self.feasible_history, state, score.clone(), self.started.elapsed(), *self.candidates);
+        if improved {
+            *self.fallback_lists = Some((state.lists.clone(), "parallel-savings"));
+        }
+        if improved && self.per.tiers > 0 {
+            (self.report)(tier_value(self.per, &score, 0));
+        }
+        improved
+    }
+}
+
+fn initial_feasible(state: &State, score: Score, elapsed: std::time::Duration, candidates: u64) -> InitialFeasible {
+    InitialFeasible { elapsed, score, fleet: state.lists.iter().filter(|route| !route.is_empty()).count(), candidates }
+}
+
+fn observe_construction_incumbent(
+    history: &mut Vec<InitialFeasible>,
+    state: &State,
+    score: Score,
+    elapsed: Duration,
+    candidates: u64,
+) -> bool {
+    if score.violation != 0 || history.last().is_some_and(|incumbent| score >= incumbent.score) {
+        return false;
+    }
+    history.push(initial_feasible(state, score, elapsed, candidates));
+    true
 }
 
 #[derive(Clone)]
@@ -1236,6 +1685,62 @@ struct InsertionPlacement {
     list: usize,
     position: usize,
     score: Score,
+}
+
+/// Lexicographic opportunity loss between a best placement and an alternative.
+/// Earlier score components dominate later ones without flattening arbitrary
+/// i64 objective values into a fixed-width scalar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ScoreRegret {
+    forced: bool,
+    component: usize,
+    delta: u128,
+}
+
+impl ScoreRegret {
+    const fn forced() -> Self {
+        Self { forced: true, component: 0, delta: u128::MAX }
+    }
+}
+
+impl Ord for ScoreRegret {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.forced
+            .cmp(&other.forced)
+            // A difference in violation (component zero), or an earlier
+            // objective tier, is lexicographically more important.
+            .then_with(|| other.component.cmp(&self.component))
+            .then_with(|| self.delta.cmp(&other.delta))
+    }
+}
+
+impl PartialOrd for ScoreRegret {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+pub(super) fn score_regret(alternative: &Score, best: &Score) -> ScoreRegret {
+    let components =
+        std::iter::once((alternative.violation, best.violation)).chain(alternative.tiers.iter().copied().zip(best.tiers.iter().copied()));
+    for (component, (worse, better)) in components.enumerate() {
+        if worse != better {
+            return ScoreRegret { forced: false, component, delta: (i128::from(worse) - i128::from(better)).unsigned_abs() };
+        }
+    }
+    ScoreRegret { forced: false, component: usize::MAX, delta: 0 }
+}
+
+#[cfg(test)]
+pub(crate) fn audit_lexicographic_regret() -> bool {
+    let score = |violation, tiers: &[i64]| Score { violation, tiers: tiers.iter().copied().collect() };
+    let feasible = score(0, &[0, 0]);
+    let infeasible = score(1, &[i64::MIN, i64::MIN]);
+    let primary = score(0, &[1, i64::MIN]);
+    let secondary = score(0, &[0, i64::MAX]);
+    ScoreRegret::forced() > score_regret(&infeasible, &feasible)
+        && score_regret(&infeasible, &feasible) > score_regret(&primary, &feasible)
+        && score_regret(&primary, &feasible) > score_regret(&secondary, &feasible)
 }
 
 fn construction_positions(per: &PerList, route: &[i32], item: i32) -> Vec<usize> {
@@ -1340,14 +1845,13 @@ fn regret_insertion_state(
         if stop.load(Ordering::Relaxed) || *candidates >= candidate_budget {
             return None;
         }
-        let mut selected: Option<(i128, u64, usize, InsertionPlacement)> = None;
+        let mut selected: Option<(ScoreRegret, u64, usize, InsertionPlacement)> = None;
         for (remaining_index, &item) in remaining.iter().enumerate() {
             let placements = insertion_placements(per, &state, item, &mut scratch, candidates, candidate_budget);
             let Some(best) = placements.first().cloned() else {
                 continue;
             };
-            let regret =
-                placements.get(1).map_or(i128::MAX / 4, |second| score_scalar(&second.score).saturating_sub(score_scalar(&best.score)));
+            let regret = placements.get(1).map_or_else(ScoreRegret::forced, |second| score_regret(&second.score, &best.score));
             let tie = mix64(seed ^ mix64(item as u64));
             if selected
                 .as_ref()
@@ -1404,8 +1908,7 @@ fn savings_state(
     mut state: State,
     seed: u64,
     stop: &AtomicBool,
-    candidates: &mut u64,
-    candidate_budget: u64,
+    work: &mut RoutingConstructionWork<'_>,
 ) -> State {
     let Some(routing) = &per.routing else {
         return state;
@@ -1441,7 +1944,7 @@ fn savings_state(
     let may_reverse = true;
     let mut scratch = EvalScratch::default();
     for (_, _, from, to) in savings {
-        if stop.load(Ordering::Relaxed) || *candidates >= candidate_budget {
+        if stop.load(Ordering::Relaxed) || work.exhausted() {
             break;
         }
         let (Some(left), Some(right)) = (route_for_item(per, &state, from), route_for_item(per, &state, to)) else {
@@ -1457,7 +1960,7 @@ fn savings_state(
         };
         left_route.extend_from_slice(&right_route);
         let empty: Vec<i32> = Vec::new();
-        *candidates = candidates.saturating_add(1);
+        work.consume_candidate();
         per.metrics.record_candidate();
         let left_score = trial_list_score_view(per, &state, left, &left_route, None, &mut scratch);
         let right_score = trial_list_score_view(per, &state, right, &empty, None, &mut scratch);
@@ -1489,13 +1992,14 @@ fn savings_state(
             state.set_item_list(per, item, list);
         }
         state.global_viol = per.globals.total(&state.item_list);
+        let score = full_score_raw(per, &state);
+        work.observe(&state, score);
     }
     state
 }
 
 /// Clarke-Wright construction for a model whose route count is smaller than
 /// the customer count. The singleton routes live only in this temporary
-/// representation, so a safe VRPTW start does not require allocating one model
 /// list per customer. Every merge is replayed through the regular per-list
 /// evaluator before it is accepted, which keeps capacity and scan constraints
 /// hard during construction.
@@ -1504,8 +2008,7 @@ fn savings_from_singletons_state(
     per: &PerList,
     seed: u64,
     stop: &AtomicBool,
-    candidates: &mut u64,
-    candidate_budget: u64,
+    work: &mut RoutingConstructionWork<'_>,
 ) -> Option<State> {
     let routing = per.routing.as_ref()?;
     if model.lists == 0 || model.items.is_empty() {
@@ -1542,8 +2045,9 @@ fn savings_from_singletons_state(
     // scoring below is the authority on whether the oriented merge is feasible.
     let may_reverse = true;
     let mut active_routes = routes.len();
+    let mut best_feasible: Option<(State, Score)> = None;
     for (_, _, from, to) in savings {
-        if stop.load(Ordering::Relaxed) || *candidates >= candidate_budget {
+        if stop.load(Ordering::Relaxed) || work.exhausted() {
             break;
         }
         let (Some(&left), Some(&right)) = (owner.get(&from), owner.get(&to)) else {
@@ -1558,7 +2062,7 @@ fn savings_from_singletons_state(
             continue;
         };
         merged.extend_from_slice(&right_route);
-        *candidates = candidates.saturating_add(1);
+        work.consume_candidate();
         per.metrics.record_candidate();
         if list_score_exact(per, 0, &merged).violation != 0 {
             continue;
@@ -1569,13 +2073,21 @@ fn savings_from_singletons_state(
             owner.insert(item, left);
         }
         active_routes -= 1;
+        if active_routes <= model.lists {
+            let mut candidate_lists: Vec<Vec<i32>> = routes.iter().filter(|route| !route.is_empty()).cloned().collect();
+            candidate_lists.resize(model.lists.max(1), Vec::new());
+            let candidate = State::from_lists_interruptible(model, per, candidate_lists, stop)?;
+            let score = full_score_raw(per, &candidate);
+            if score.violation == 0 && best_feasible.as_ref().is_none_or(|(_, incumbent)| score < *incumbent) {
+                work.observe(&candidate, score.clone());
+                best_feasible = Some((candidate, score));
+            }
+        }
     }
     if active_routes > model.lists {
         return None;
     }
-    let mut lists: Vec<Vec<i32>> = routes.into_iter().filter(|route| !route.is_empty()).collect();
-    lists.resize(model.lists.max(1), Vec::new());
-    State::from_lists_interruptible(model, per, lists, stop).filter(|state| full_score_raw(per, state).violation == 0)
+    best_feasible.map(|(state, _)| state)
 }
 
 fn routing_construction(
@@ -1600,23 +2112,66 @@ fn routing_construction(
     let root = ((model.items.len() as f64).sqrt().ceil() as u64).clamp(8, 64);
     let candidate_budget = (model.items.len() as u64).saturating_mul(root).saturating_mul(96).clamp(10_000, 2_000_000);
     let mut candidates = 0u64;
-    let mut first_feasible = None;
+    let mut feasible_history = Vec::new();
     let mut best: Option<(State, &'static str)> = None;
+    let mut fallback_lists = None;
 
     if let Some(singletons) = singleton_state(model, per, stop) {
         let singleton_score = full_score_raw(per, &singletons);
         if singleton_score.violation == 0 {
-            first_feasible = Some(started.elapsed());
-            if per.tiers > 0 {
-                report(tier_value(per, &singleton_score, 0));
+            let improved =
+                observe_construction_incumbent(&mut feasible_history, &singletons, singleton_score.clone(), started.elapsed(), candidates);
+            if improved {
+                fallback_lists = Some((singletons.lists.clone(), "parallel-savings"));
+                if per.tiers > 0 {
+                    report(tier_value(per, &singleton_score, 0));
+                }
             }
-            let saved = savings_state(model, per, singletons, seed, stop, &mut candidates, candidate_budget);
-            best = Some((saved, "parallel-savings"));
+            let saved = savings_state(
+                model,
+                per,
+                singletons,
+                seed,
+                stop,
+                &mut RoutingConstructionWork {
+                    candidates: &mut candidates,
+                    candidate_budget,
+                    feasible_history: &mut feasible_history,
+                    started: &started,
+                    per,
+                    report,
+                    fallback_lists: &mut fallback_lists,
+                },
+            );
+            if stop.load(Ordering::Relaxed) {
+                best = fallback_lists.take().map(|(lists, name)| (State::from_lists(model, per, lists), name));
+            } else {
+                let saved_score = full_score_raw(per, &saved);
+                if observe_construction_incumbent(&mut feasible_history, &saved, saved_score.clone(), started.elapsed(), candidates)
+                    && per.tiers > 0
+                {
+                    report(tier_value(per, &saved_score, 0));
+                }
+                best = Some((saved, "parallel-savings"));
+            }
         }
-    } else if let Some(saved) = savings_from_singletons_state(model, per, seed, stop, &mut candidates, candidate_budget) {
+    } else if let Some(saved) = savings_from_singletons_state(
+        model,
+        per,
+        seed,
+        stop,
+        &mut RoutingConstructionWork {
+            candidates: &mut candidates,
+            candidate_budget,
+            feasible_history: &mut feasible_history,
+            started: &started,
+            per,
+            report,
+            fallback_lists: &mut fallback_lists,
+        },
+    ) {
         let score = full_score_raw(per, &saved);
-        first_feasible = Some(started.elapsed());
-        if per.tiers > 0 {
+        if observe_construction_incumbent(&mut feasible_history, &saved, score.clone(), started.elapsed(), candidates) && per.tiers > 0 {
             report(tier_value(per, &score, 0));
         }
         best = Some((saved, "parallel-savings"));
@@ -1635,8 +2190,10 @@ fn routing_construction(
             if let Some(cheapest) = cheapest_insertion_state(model, per, &attempt, stop, &mut candidates, candidate_budget) {
                 let score = full_score_raw(per, &cheapest);
                 if score.violation == 0 {
-                    if first_feasible.is_none() {
-                        first_feasible = Some(started.elapsed());
+                    let improved =
+                        observe_construction_incumbent(&mut feasible_history, &cheapest, score.clone(), started.elapsed(), candidates);
+                    if improved {
+                        fallback_lists = Some((cheapest.lists.clone(), "cheapest-insertion"));
                         if per.tiers > 0 {
                             report(tier_value(per, &score, 0));
                         }
@@ -1653,8 +2210,9 @@ fn routing_construction(
         if let Some(regret) = regret_insertion_state(model, per, order, seed, stop, &mut candidates, candidate_budget) {
             let score = full_score_raw(per, &regret);
             if score.violation == 0 {
-                if first_feasible.is_none() {
-                    first_feasible = Some(started.elapsed());
+                let improved = observe_construction_incumbent(&mut feasible_history, &regret, score.clone(), started.elapsed(), candidates);
+                if improved {
+                    fallback_lists = Some((regret.lists.clone(), "regret-insertion"));
                     if per.tiers > 0 {
                         report(tier_value(per, &score, 0));
                     }
@@ -1666,8 +2224,12 @@ fn routing_construction(
         }
     }
 
+    if stop.load(Ordering::Relaxed) {
+        best = fallback_lists.take().map(|(lists, name)| (State::from_lists(model, per, lists), name)).or(best);
+    }
     let (state, name) = best?;
-    Some(InitialConstruction { state, name, elapsed: started.elapsed(), first_feasible, candidates })
+    let reported = per.tiers > 0 && !feasible_history.is_empty();
+    Some(InitialConstruction { state, name, elapsed: started.elapsed(), feasible_history, candidates, reported })
 }
 
 /// Raw (unsigned) value of a tier, undoing the maximisation sign flip.
@@ -1718,10 +2280,656 @@ pub(super) fn score_with_replaced_list(
     score_with_replacements(per, state, &[TrialList { list, score: replacement, contents }], global_delta, scratch)
 }
 
-/// Flatten a lexicographic [`Score`] into a single comparable cost for regret
-/// arithmetic. Violation dominates the primary objective tier.
-pub(super) fn score_scalar(score: &Score) -> i128 {
-    (score.violation as i128) * (1i128 << 50) + i128::from(score.tiers.first().copied().unwrap_or(0))
+#[allow(clippy::too_many_arguments)]
+fn run_generic_search(
+    model: &CollectionModel,
+    per: &PerList,
+    state: &mut State,
+    stop: &AtomicBool,
+    max_iters: u64,
+    seed: u64,
+    profile: SearchProfile,
+    memory: &mut SearchMemory,
+    best_lists: &mut Vec<Vec<i32>>,
+    best_score: &mut Score,
+    best_feasible: &mut bool,
+    report: &mut dyn FnMut(i64),
+    alns: &mut AlnsController,
+    coordination: &mut Option<WorkerCoordination<'_>>,
+) -> bool {
+    let mut stagnant = 0u64;
+    let mut iter = 0u64;
+    let mut local_optima = 0u64;
+
+    while !stop.load(Ordering::Relaxed) && iter < max_iters {
+        iter += 1;
+        let scan_seed = if profile.diversify_initial_descent() { seed ^ mix64(iter) } else { 0 };
+        match best_improving_move(per, state, stop, memory, scan_seed) {
+            Some(mv) => {
+                if !apply_move(per, state, mv, stop) {
+                    return false;
+                }
+                memory.reset_touched(mv);
+                if record_state(per, state, best_lists, best_score, best_feasible, report) {
+                    if coordination.as_ref().is_some_and(|shared| shared.publish(best_lists, best_score, *best_feasible)) {
+                        alns.record_shared_publication();
+                    }
+                    stagnant = 0;
+                }
+            }
+            None => {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                local_optima += 1;
+                if record_state(per, state, best_lists, best_score, best_feasible, report) {
+                    if coordination.as_ref().is_some_and(|shared| shared.publish(best_lists, best_score, *best_feasible)) {
+                        alns.record_shared_publication();
+                    }
+                    stagnant = 0;
+                } else {
+                    stagnant = stagnant.saturating_add(1);
+                }
+
+                if let Some(lists) = coordination.as_mut().and_then(|shared| shared.maybe_inject(local_optima, best_score, *best_feasible))
+                {
+                    let Some(injected_state) = State::from_lists_interruptible(model, per, lists, stop) else {
+                        return false;
+                    };
+                    *state = injected_state;
+                    let injected = record_state(per, state, best_lists, best_score, best_feasible, report);
+                    debug_assert!(injected, "a shared incumbent must strictly improve the worker incumbent");
+                    alns.record_shared_injection();
+                    alns.reset_after_injection(best_score);
+                    memory.reset_all();
+                    stagnant = 0;
+                    continue;
+                }
+
+                let elite_period = profile.elite_restart_period();
+                if stagnant > 0 && stagnant.is_multiple_of(elite_period) {
+                    let Some(elite_state) = State::from_lists_interruptible(model, per, best_lists.clone(), stop) else {
+                        return false;
+                    };
+                    *state = elite_state;
+                    memory.reset_all();
+                    alns.reset_after_injection(best_score);
+                }
+
+                let penalties = per.bump_gls(state);
+                state.refresh_edge_penalties(per);
+                alns.record_gls(penalties);
+
+                let operator_seed = seed ^ mix64(iter) ^ mix64(stagnant);
+                let choice = alns.choose(model.items.len(), stagnant, operator_seed, iter);
+                let current_guided = full_score(per, state);
+                let current_raw = full_score_raw(per, state);
+                let Some(candidate) = build_candidate(model, per, state, choice, operator_seed, stop) else {
+                    alns.record_failed(choice.destroy, choice.repair);
+                    continue;
+                };
+                let candidate_guided = full_score(per, &candidate);
+                let candidate_raw = full_score_raw(per, &candidate);
+                let improved_current = candidate_raw < current_raw;
+                let global_best = record_state(per, &candidate, best_lists, best_score, best_feasible, report);
+                if global_best && coordination.as_ref().is_some_and(|shared| shared.publish(best_lists, best_score, *best_feasible)) {
+                    alns.record_shared_publication();
+                }
+                let acceptance = alns.accept(&current_guided, &candidate_guided, &current_raw, &candidate_raw, operator_seed, iter);
+                if !matches!(acceptance, AcceptanceKind::Rejected) {
+                    *state = candidate;
+                    memory.reset_all();
+                }
+                alns.record(choice.destroy, choice.repair, acceptance, improved_current, global_best);
+                if global_best {
+                    stagnant = 0;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn scaled_work(items: usize, multiplier: u64, minimum: u64, maximum: u64) -> u64 {
+    u64::try_from(items).unwrap_or(u64::MAX).saturating_mul(multiplier).clamp(minimum, maximum)
+}
+
+fn routing_move_budget(items: usize) -> WorkBudget {
+    let work = scaled_work(items, 8, 512, 8_192);
+    WorkBudget::new(work, work)
+}
+
+fn routing_global_budget(items: usize) -> WorkBudget {
+    let work = scaled_work(items, 2, 256, 2_048);
+    WorkBudget::new(work, work)
+}
+
+fn routing_alns_budget(items: usize) -> AlnsWorkBudget {
+    let work = scaled_work(items, 32, 2_048, 32_768);
+    AlnsWorkBudget::new(work, work)
+}
+
+fn routing_exploration_budget(model: &CollectionModel) -> AlnsWorkBudget {
+    // Collection states are exact partitions of the model items. Use the
+    // canonical cardinality so budget admission itself stays O(1).
+    let items = model.items.len();
+    let structural_scale = items.saturating_add(model.lists);
+    let generated = scaled_work(structural_scale, 32, 4_096, 65_536);
+    let evaluated = scaled_work(items, 12, 512, 12_288);
+    AlnsWorkBudget::new(generated, evaluated)
+}
+
+fn routing_macro_budget(
+    model: &CollectionModel,
+    per: &PerList,
+    state: &State,
+    operator: MacroOperator,
+    stop: &AtomicBool,
+) -> Option<AlnsWorkBudget> {
+    let exploratory = routing_exploration_budget(model);
+    let required = match operator {
+        MacroOperator::RouteElimination => routing_route_elimination_floor(model, per, state, stop)?,
+        MacroOperator::EjectionChain | MacroOperator::ChainRelocate | MacroOperator::GuidedSegmentExchange => {
+            AlnsWorkBudget::new(routing_compound_structural_floor(model, per, state, stop)?, 1)
+        }
+    };
+    Some(AlnsWorkBudget::new(exploratory.generated.max(required.generated), exploratory.evaluated.max(required.evaluated)))
+}
+
+fn routing_relink_budget(model: &CollectionModel, per: &PerList, state: &State, stop: &AtomicBool) -> Option<AlnsWorkBudget> {
+    let exploratory = routing_exploration_budget(model);
+    Some(AlnsWorkBudget::new(
+        exploratory.generated.max(routing_relink_structural_floor(model, per, state, stop)?),
+        exploratory.evaluated.max(1),
+    ))
+}
+
+/// Regression oracle for models whose cache-aware materialization cost exceeds
+/// the capped exploration allowance. Speculative macros must still score, route
+/// elimination must complete both canonical rebuilds, and relinking must build
+/// one canonical step.
+#[doc(hidden)]
+pub fn audit_size_safe_routing_compound_budget() -> bool {
+    use crate::model::list::{ExprArena, ObjectiveTier};
+
+    const ITEMS: usize = 3_000;
+    const LISTS: usize = 3_000;
+    const TERMS_PER_LIST: usize = 3;
+
+    let mut arena = ExprArena::default();
+    let body = arena.constant(1);
+    let terms = (0..LISTS)
+        .flat_map(|list| {
+            std::iter::repeat_with({
+                let arena = arena.clone();
+                move || Reduction { op: ReduceOp::Count, iterable: Iterable::Items(list), arena: arena.clone(), body, coeff: 1 }
+            })
+            .take(TERMS_PER_LIST)
+        })
+        .collect();
+    let model = CollectionModel {
+        items: (1..=i32::try_from(ITEMS).expect("audit size fits i32")).collect(),
+        lists: LISTS,
+        objectives: vec![ObjectiveTier { minimize: true, terms, max_terms: None }],
+        constraints: Vec::new(),
+        globals: Vec::new(),
+        schedule: None,
+    };
+    let per = PerList::build(&model);
+    let mut lists = vec![Vec::new(); LISTS];
+    for (index, item) in model.items.iter().copied().enumerate() {
+        lists[index / 2].push(item);
+    }
+    let state = State::from_lists(&model, &per, lists);
+    let exploratory = routing_exploration_budget(&model);
+    let stop = AtomicBool::new(false);
+    let compound_floor = routing_compound_structural_floor(&model, &per, &state, &stop).expect("the audit is not interrupted");
+    let operators = [MacroOperator::ChainRelocate, MacroOperator::GuidedSegmentExchange, MacroOperator::EjectionChain];
+    let capped_runs = operators.map(|operator| build_macro_candidate_bounded(&model, &per, &state, operator, 17, exploratory, &stop));
+    let safe_budgets =
+        operators.map(|operator| routing_macro_budget(&model, &per, &state, operator, &stop).expect("the audit is not interrupted"));
+    let safe_runs: [_; 3] =
+        std::array::from_fn(|index| build_macro_candidate_bounded(&model, &per, &state, operators[index], 17, safe_budgets[index], &stop));
+
+    let route_floor = routing_route_elimination_floor(&model, &per, &state, &stop).expect("the audit is not interrupted");
+    let capped_route = build_macro_candidate_bounded(&model, &per, &state, MacroOperator::RouteElimination, 17, exploratory, &stop);
+    let safe_route_budget =
+        routing_macro_budget(&model, &per, &state, MacroOperator::RouteElimination, &stop).expect("the audit is not interrupted");
+    let safe_route = build_macro_candidate_bounded(&model, &per, &state, MacroOperator::RouteElimination, 17, safe_route_budget, &stop);
+
+    let mut target_lists = state.lists.clone();
+    target_lists[0].swap(0, 1);
+    let target_state = State::from_lists(&model, &per, target_lists);
+    let mut elite = ElitePool::new(6, false, false);
+    let target_score = full_score_raw(&per, &target_state);
+    let archive = elite.consider_bounded(&target_state, &target_score, elite_archive_budget(&model), &stop);
+    let inserted = archive.status == EliteOperationStatus::Complete && archive.inserted;
+    let relink_floor = routing_relink_structural_floor(&model, &per, &state, &stop).expect("the audit is not interrupted");
+    let safe_relink_budget = routing_relink_budget(&model, &per, &state, &stop).expect("the audit is not interrupted");
+    let selection = elite.select_target_bounded(&state, 17, elite_selection_budget(&model), &stop);
+    let relink = selection.target.map(|target| path_relink_bounded(&model, &per, &state, target, safe_relink_budget, &stop));
+
+    compound_floor > exploratory.generated
+        && capped_runs.iter().all(|run| run.status == AlnsBuildStatus::BudgetExhausted && run.evaluated == 0 && run.canonical_rebuilds == 0)
+        && safe_runs.iter().all(|run| {
+            run.status == AlnsBuildStatus::BudgetExhausted
+                && run.evaluated > 0
+                && run.canonical_rebuilds == 0
+                && run.generated <= safe_budgets[0].generated
+        })
+        && route_floor.generated > exploratory.generated
+        && capped_route.status == AlnsBuildStatus::BudgetExhausted
+        && capped_route.evaluated == 0
+        && capped_route.canonical_rebuilds < 2
+        && safe_route_budget.generated >= route_floor.generated
+        && safe_route_budget.evaluated >= route_floor.evaluated
+        && safe_route.status == AlnsBuildStatus::Built
+        && safe_route.evaluated > 0
+        && safe_route.canonical_rebuilds == 2
+        && safe_route.candidate.is_some()
+        && inserted
+        && relink_floor > exploratory.generated
+        && safe_relink_budget.generated == relink_floor
+        && relink.is_some_and(|run| {
+            run.evaluated == 1
+                && run.steps == 1
+                && run.structural_work > 0
+                && run.structural_work < run.generated
+                && run.canonical_rebuilds == 1
+        })
+}
+
+fn observe_routing_checkpoint(
+    control: &mut RoutingSearchControl,
+    started: Option<&Instant>,
+    per: &PerList,
+    best_lists: &[Vec<i32>],
+    best_score: &Score,
+    best_feasible: bool,
+) {
+    if !control.checkpoints_enabled() {
+        return;
+    }
+    let Some(started) = started else { return };
+    control.observe_checkpoint(
+        started.elapsed(),
+        best_feasible,
+        &objective_values(per, best_score),
+        best_lists.iter().filter(|route| !route.is_empty()).count(),
+    );
+}
+
+fn reset_routing_scans(memories: &mut [RoutingScanMemory]) {
+    for memory in memories {
+        memory.reset();
+    }
+}
+
+fn invalidate_routing_scans(
+    index_cache: &mut RoutingIndexCache,
+    granular_scans: &mut [RoutingScanMemory],
+    global_scans: &mut [RoutingScanMemory],
+) {
+    index_cache.reset();
+    reset_routing_scans(granular_scans);
+    reset_routing_scans(global_scans);
+}
+
+fn consider_elite_candidate(
+    model: &CollectionModel,
+    elite: &mut ElitePool,
+    control: &mut RoutingSearchControl,
+    state: &State,
+    score: &Score,
+    stop: &AtomicBool,
+) -> EliteOperationStatus {
+    let run = elite.consider_bounded(state, score, elite_archive_budget(model), stop);
+    control.record_elite_archive(run.status, run.inserted, run.work_units, run.cpu_nanos);
+    run.status
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_routing_search(
+    model: &CollectionModel,
+    per: &PerList,
+    state: &mut State,
+    stop: &AtomicBool,
+    max_iters: u64,
+    seed: u64,
+    best_lists: &mut Vec<Vec<i32>>,
+    best_score: &mut Score,
+    best_feasible: &mut bool,
+    report: &mut dyn FnMut(i64),
+    alns: &mut AlnsController,
+    coordination: &mut Option<WorkerCoordination<'_>>,
+    metrics_enabled: bool,
+    started: Option<&Instant>,
+    construction_offset: Duration,
+    construction_elapsed: Duration,
+    construction_history: &[InitialFeasible],
+    construction_candidates: u64,
+) -> bool {
+    let items = model.items.len();
+    let mut control = RoutingSearchControl::new(metrics_enabled, construction_candidates);
+    if control.checkpoints_enabled() {
+        for incumbent in construction_history {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            control.observe_checkpoint_with_candidates(
+                construction_offset.saturating_add(incumbent.elapsed),
+                true,
+                &objective_values(per, &incumbent.score),
+                incumbent.fleet,
+                incumbent.candidates,
+            );
+        }
+        control.observe_checkpoint_with_candidates(
+            construction_offset.saturating_add(construction_elapsed),
+            *best_feasible,
+            &objective_values(per, best_score),
+            best_lists.iter().filter(|route| !route.is_empty()).count(),
+            construction_candidates,
+        );
+    }
+    let mut elite =
+        ElitePool::new(8, !per.interchangeable_lists.get(), per.routing.as_ref().is_some_and(|routing| routing.reverse_equivalent));
+    if *best_feasible {
+        let _ = consider_elite_candidate(model, &mut elite, &mut control, state, best_score, stop);
+    }
+    let mut granular_scans: [RoutingScanMemory; 6] = std::array::from_fn(|_| RoutingScanMemory::new());
+    let mut global_scans: [RoutingScanMemory; 6] = std::array::from_fn(|_| RoutingScanMemory::new());
+    let mut routing_index = RoutingIndexCache::new();
+    let mut stagnant = 0u64;
+    let mut slice = 0u64;
+    let mut state_consistent = true;
+
+    'routing: while !stop.load(Ordering::Relaxed) && slice < max_iters {
+        slice = slice.saturating_add(1);
+        observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+
+        if let Some(lists) = coordination.as_mut().and_then(|shared| shared.maybe_inject(slice, best_score, *best_feasible)) {
+            let Some(injected) = State::from_lists_interruptible(model, per, lists, stop) else {
+                state_consistent = false;
+                break;
+            };
+            *state = injected;
+            observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+            let improved = record_state(per, state, best_lists, best_score, best_feasible, report);
+            debug_assert!(improved, "a shared incumbent must strictly improve the worker incumbent");
+            alns.record_shared_injection();
+            alns.reset_after_injection(best_score);
+            invalidate_routing_scans(&mut routing_index, &mut granular_scans, &mut global_scans);
+            if *best_feasible {
+                let score = full_score_raw(per, state);
+                if consider_elite_candidate(model, &mut elite, &mut control, state, &score, stop) == EliteOperationStatus::Interrupted {
+                    break 'routing;
+                }
+            }
+            observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+            stagnant = 0;
+        }
+
+        let slice_kind = control.next_slice(stagnant, elite.len() > 1);
+        if stagnant > 0 && slice.is_multiple_of(16) {
+            let penalties = per.bump_gls(state);
+            state.refresh_edge_penalties(per);
+            alns.record_gls(penalties);
+            if penalties > 0 {
+                reset_routing_scans(&mut granular_scans);
+                reset_routing_scans(&mut global_scans);
+            }
+        }
+        let operator_seed = seed ^ mix64(slice) ^ mix64(stagnant);
+
+        match slice_kind {
+            SliceKind::Descent | SliceKind::Global => {
+                let current_raw = full_score_raw(per, state);
+                let infeasible = current_raw.violation != 0;
+                let kind = if infeasible {
+                    [NeighborhoodKind::Relocate, NeighborhoodKind::Swap, NeighborhoodKind::OrOpt][(mix64(operator_seed) % 3) as usize]
+                } else {
+                    control.choose_neighborhood(operator_seed)
+                };
+                let (mode, budget, memory) = if matches!(slice_kind, SliceKind::Global) || infeasible {
+                    (ScanMode::Global, routing_global_budget(items), &mut global_scans[kind.index()])
+                } else {
+                    (ScanMode::Granular, routing_move_budget(items), &mut granular_scans[kind.index()])
+                };
+                let run = search_routing_neighborhood(
+                    per,
+                    state,
+                    stop,
+                    RoutingScanWorkspace::new(&mut routing_index, memory),
+                    kind,
+                    mode,
+                    budget,
+                );
+                let mut accepted_move = false;
+                let mut improved_current = false;
+                let mut global_best = false;
+                match run.outcome {
+                    ScanOutcome::Improved(mv) => {
+                        if !apply_move(per, state, mv, stop) {
+                            if matches!(slice_kind, SliceKind::Global) {
+                                control.record_global(kind, run, false, false, false);
+                            } else {
+                                control.record_descent(kind, run, false, false, false);
+                            }
+                            observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+                            state_consistent = false;
+                            break;
+                        }
+                        accepted_move = true;
+                        invalidate_routing_scans(&mut routing_index, &mut granular_scans, &mut global_scans);
+                        let state_score = full_score_raw(per, state);
+                        improved_current = state_score < current_raw;
+                        observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+                        global_best = record_state(per, state, best_lists, best_score, best_feasible, report);
+                        if global_best && coordination.as_ref().is_some_and(|shared| shared.publish(best_lists, best_score, *best_feasible))
+                        {
+                            alns.record_shared_publication();
+                        }
+                        if state_score.violation == 0
+                            && consider_elite_candidate(model, &mut elite, &mut control, state, &state_score, stop)
+                                == EliteOperationStatus::Interrupted
+                        {
+                            if matches!(slice_kind, SliceKind::Global) {
+                                control.record_global(kind, run, improved_current, global_best, accepted_move);
+                            } else {
+                                control.record_descent(kind, run, improved_current, global_best, accepted_move);
+                            }
+                            observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+                            break 'routing;
+                        }
+                    }
+                    ScanOutcome::Interrupted => {
+                        if matches!(slice_kind, SliceKind::Global) {
+                            control.record_global(kind, run, false, false, false);
+                        } else {
+                            control.record_descent(kind, run, false, false, false);
+                        }
+                        observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+                        break;
+                    }
+                    ScanOutcome::Complete | ScanOutcome::BudgetExhausted => {}
+                }
+                if matches!(slice_kind, SliceKind::Global) {
+                    control.record_global(kind, run, improved_current, global_best, accepted_move);
+                } else {
+                    control.record_descent(kind, run, improved_current, global_best, accepted_move);
+                }
+                observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+                stagnant = if global_best { 0 } else { stagnant.saturating_add(1) };
+            }
+            SliceKind::Alns => {
+                let current_guided = full_score(per, state);
+                let current_raw = full_score_raw(per, state);
+                let choice = alns.choose(items, stagnant, operator_seed, slice);
+                let mut run = build_candidate_bounded(model, per, state, choice, operator_seed, routing_alns_budget(items), stop);
+                observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+                control.record_alns(run.evaluated);
+                if run.status == AlnsBuildStatus::Interrupted {
+                    alns.record_failed_bounded(choice, &run);
+                    observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+                    break;
+                }
+                let Some(candidate) = run.candidate.take() else {
+                    alns.record_failed_bounded(choice, &run);
+                    observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+                    stagnant = stagnant.saturating_add(1);
+                    continue;
+                };
+                let candidate_guided = full_score(per, &candidate);
+                let candidate_raw = full_score_raw(per, &candidate);
+                let improved_current = candidate_raw < current_raw;
+                let global_best = record_state(per, &candidate, best_lists, best_score, best_feasible, report);
+                if global_best && coordination.as_ref().is_some_and(|shared| shared.publish(best_lists, best_score, *best_feasible)) {
+                    alns.record_shared_publication();
+                }
+                let acceptance = alns.accept(&current_guided, &candidate_guided, &current_raw, &candidate_raw, operator_seed, slice);
+                let archive_interrupted = candidate_raw.violation == 0
+                    && consider_elite_candidate(model, &mut elite, &mut control, &candidate, &candidate_raw, stop)
+                        == EliteOperationStatus::Interrupted;
+                if !matches!(acceptance, AcceptanceKind::Rejected) {
+                    *state = candidate;
+                    invalidate_routing_scans(&mut routing_index, &mut granular_scans, &mut global_scans);
+                }
+                alns.record_bounded(choice, acceptance, improved_current, global_best, &run);
+                observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+                if archive_interrupted {
+                    break 'routing;
+                }
+                stagnant = if global_best { 0 } else { stagnant.saturating_add(1) };
+            }
+            SliceKind::Macro => {
+                let operator = control.choose_macro(operator_seed);
+                let Some(budget) = routing_macro_budget(model, per, state, operator, stop) else {
+                    observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+                    break;
+                };
+                let run = build_macro_candidate_bounded(model, per, state, operator, operator_seed, budget, stop);
+                observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+                if run.status == AlnsBuildStatus::Interrupted {
+                    control.record_macro(operator, run.status, run.generated, run.evaluated, run.cpu_nanos, false, false, false);
+                    observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+                    break;
+                }
+                let mut improved_current = false;
+                let mut global_best = false;
+                let mut archive_interrupted = false;
+                let accepted = if let Some(candidate) = run.candidate {
+                    let candidate_score = full_score_raw(per, &candidate);
+                    improved_current = candidate_score < full_score_raw(per, state);
+                    global_best = record_state(per, &candidate, best_lists, best_score, best_feasible, report);
+                    if global_best && coordination.as_ref().is_some_and(|shared| shared.publish(best_lists, best_score, *best_feasible)) {
+                        alns.record_shared_publication();
+                    }
+                    if candidate_score.violation == 0 {
+                        archive_interrupted = consider_elite_candidate(model, &mut elite, &mut control, &candidate, &candidate_score, stop)
+                            == EliteOperationStatus::Interrupted;
+                    }
+                    *state = candidate;
+                    invalidate_routing_scans(&mut routing_index, &mut granular_scans, &mut global_scans);
+                    true
+                } else {
+                    false
+                };
+                control.record_macro(
+                    operator,
+                    run.status,
+                    run.generated,
+                    run.evaluated,
+                    run.cpu_nanos,
+                    improved_current,
+                    global_best,
+                    accepted,
+                );
+                observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+                if archive_interrupted {
+                    break 'routing;
+                }
+                stagnant = if global_best { 0 } else { stagnant.saturating_add(1) };
+            }
+            SliceKind::Relink => {
+                let selection = elite.select_target_bounded(state, operator_seed, elite_selection_budget(model), stop);
+                control.record_elite_selection(selection.status, selection.target.is_some(), selection.work_units, selection.cpu_nanos);
+                if selection.status == EliteOperationStatus::Interrupted {
+                    control.record_relink_slice_without_target();
+                    observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+                    break 'routing;
+                }
+                let Some(target) = selection.target else {
+                    control.record_relink_slice_without_target();
+                    observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+                    stagnant = stagnant.saturating_add(1);
+                    continue;
+                };
+                let Some(budget) = routing_relink_budget(model, per, state, stop) else {
+                    control.record_relink_slice_without_target();
+                    observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+                    break;
+                };
+                let run = path_relink_bounded(model, per, state, target, budget, stop);
+                observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+                if run.status == PathRelinkStatus::Interrupted {
+                    control.record_relink(
+                        run.status,
+                        run.steps,
+                        run.work_units,
+                        run.generated,
+                        run.evaluated,
+                        run.cpu_nanos,
+                        false,
+                        false,
+                        false,
+                    );
+                    observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+                    break;
+                }
+                let mut improved_current = false;
+                let mut global_best = false;
+                let mut archive_interrupted = false;
+                let accepted = if let Some(candidate) = run.candidate {
+                    let candidate_score = full_score_raw(per, &candidate);
+                    improved_current = candidate_score < full_score_raw(per, state);
+                    global_best = record_state(per, &candidate, best_lists, best_score, best_feasible, report);
+                    if global_best && coordination.as_ref().is_some_and(|shared| shared.publish(best_lists, best_score, *best_feasible)) {
+                        alns.record_shared_publication();
+                    }
+                    if candidate_score.violation == 0 {
+                        archive_interrupted = consider_elite_candidate(model, &mut elite, &mut control, &candidate, &candidate_score, stop)
+                            == EliteOperationStatus::Interrupted;
+                    }
+                    *state = candidate;
+                    invalidate_routing_scans(&mut routing_index, &mut granular_scans, &mut global_scans);
+                    true
+                } else {
+                    false
+                };
+                control.record_relink(
+                    run.status,
+                    run.steps,
+                    run.work_units,
+                    run.generated,
+                    run.evaluated,
+                    run.cpu_nanos,
+                    improved_current,
+                    global_best,
+                    accepted,
+                );
+                observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+                if archive_interrupted {
+                    break 'routing;
+                }
+                stagnant = if global_best { 0 } else { stagnant.saturating_add(1) };
+            }
+        }
+    }
+
+    observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+    per.metrics.record_routing(control.finish());
+    state_consistent
 }
 
 /// Solve a collection model with constraint-based local search until `stop`.
@@ -1927,34 +3135,34 @@ pub(super) fn solve_collection_capped_worker(
     // partition); otherwise the greedy random construction. Either way the search
     // loop, ALNS controller, and incumbent tracking below are identical.
     let construction_started = Instant::now();
+    let construction_offset = started.as_ref().map_or(Duration::ZERO, Instant::elapsed);
     let construction = match hint {
         Some(h) => State::from_lists_interruptible(model, &per, hint_partition(model, h), stop).map(|state| {
             let score = full_score_raw(&per, &state);
-            InitialConstruction {
-                state,
-                name: "warm-start",
-                elapsed: construction_started.elapsed(),
-                first_feasible: (score.violation == 0).then_some(construction_started.elapsed()),
-                candidates: 0,
-            }
+            let elapsed = construction_started.elapsed();
+            let feasible_history = (score.violation == 0).then(|| initial_feasible(&state, score, elapsed, 0)).into_iter().collect();
+            InitialConstruction { state, name: "warm-start", elapsed, feasible_history, candidates: 0, reported: false }
         }),
         None => routing_construction(model, &per, &order, seed, stop, report).or_else(|| {
             State::greedy(model, &per, &order, seed, profile.diversify_initial_descent(), stop).map(|state| {
                 let score = full_score_raw(&per, &state);
-                InitialConstruction {
-                    state,
-                    name: "generic-greedy",
-                    elapsed: construction_started.elapsed(),
-                    first_feasible: (score.violation == 0).then_some(construction_started.elapsed()),
-                    candidates: 0,
-                }
+                let elapsed = construction_started.elapsed();
+                let feasible_history = (score.violation == 0).then(|| initial_feasible(&state, score, elapsed, 0)).into_iter().collect();
+                InitialConstruction { state, name: "generic-greedy", elapsed, feasible_history, candidates: 0, reported: false }
             })
         }),
     };
-    let Some(construction) = construction.filter(|_| !stop.load(Ordering::Relaxed)) else {
+    let Some(construction) = construction else {
         return no_solution();
     };
-    let mut state = construction.state;
+    let InitialConstruction {
+        mut state,
+        name: constructor_name,
+        elapsed: construction_elapsed,
+        feasible_history,
+        candidates: construction_candidates,
+        reported: construction_reported,
+    } = construction;
     let construction_score = full_score_raw(&per, &state);
     let construction_objectives = objective_values(&per, &construction_score);
     let fleet = Some(state.lists.iter().filter(|route| !route.is_empty()).count());
@@ -1970,115 +3178,65 @@ pub(super) fn solve_collection_capped_worker(
         })
         .or_else(|| construction_objectives.first().copied());
     per.metrics.record_construction(
-        construction.name,
-        construction.elapsed,
-        construction.first_feasible,
-        construction.candidates,
+        constructor_name,
+        construction_elapsed,
+        feasible_history.first().map(|snapshot| snapshot.elapsed),
+        construction_candidates,
         fleet,
         constructor_cost,
     );
-    let mut memory = SearchMemory::new(model.lists.max(1));
-
     let (mut best_lists, mut best_score, mut best_feasible) = snapshot(&per, &state);
-    let mut alns = AlnsController::new_profile(n, &best_score, profile);
+    let mut alns = if per.routing.is_some() {
+        AlnsController::new_routing_profile(n, &best_score, profile)
+    } else {
+        AlnsController::new_profile(n, &best_score, profile)
+    };
     if coordination.as_ref().is_some_and(|shared| shared.publish(&best_lists, &best_score, best_feasible)) {
         alns.record_shared_publication();
     }
-    if best_feasible && per.tiers > 0 {
+    if best_feasible && per.tiers > 0 && !construction_reported {
         report(tier_value(&per, &best_score, 0));
     }
-    let mut stagnant = 0u64;
-    let mut iter = 0u64;
-    let mut state_consistent = true;
-    let mut local_optima = 0u64;
-
-    while !stop.load(Ordering::Relaxed) && iter < max_iters {
-        iter += 1;
-        let scan_seed = if profile.diversify_initial_descent() { seed ^ mix64(iter) } else { 0 };
-        match best_improving_move(&per, &state, stop, &mut memory, scan_seed) {
-            Some(mv) => {
-                if !apply_move(&per, &mut state, mv, stop) {
-                    state_consistent = false;
-                    break;
-                }
-                memory.reset_touched(mv);
-                if record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report) {
-                    if coordination.as_ref().is_some_and(|shared| shared.publish(&best_lists, &best_score, best_feasible)) {
-                        alns.record_shared_publication();
-                    }
-                    stagnant = 0;
-                }
-            }
-            None => {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                local_optima += 1;
-                if record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report) {
-                    if coordination.as_ref().is_some_and(|shared| shared.publish(&best_lists, &best_score, best_feasible)) {
-                        alns.record_shared_publication();
-                    }
-                    stagnant = 0;
-                } else {
-                    stagnant = stagnant.saturating_add(1);
-                }
-
-                if let Some(lists) = coordination.as_mut().and_then(|shared| shared.maybe_inject(local_optima, &best_score, best_feasible))
-                {
-                    let Some(injected_state) = State::from_lists_interruptible(model, &per, lists, stop) else {
-                        break;
-                    };
-                    state = injected_state;
-                    let injected = record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report);
-                    debug_assert!(injected, "a shared incumbent must strictly improve the worker incumbent");
-                    alns.record_shared_injection();
-                    alns.reset_after_injection(&best_score);
-                    memory.reset_all();
-                    stagnant = 0;
-                    continue;
-                }
-
-                let elite_period = profile.elite_restart_period();
-                if stagnant > 0 && stagnant.is_multiple_of(elite_period) {
-                    let Some(elite_state) = State::from_lists_interruptible(model, &per, best_lists.clone(), stop) else {
-                        break;
-                    };
-                    state = elite_state;
-                    memory.reset_all();
-                    alns.reset_after_injection(&best_score);
-                }
-
-                let penalties = per.bump_gls(&state);
-                state.refresh_edge_penalties(&per);
-                alns.record_gls(penalties);
-
-                let operator_seed = seed ^ mix64(iter) ^ mix64(stagnant);
-                let choice = alns.choose(n, stagnant, operator_seed, iter);
-                let current_guided = full_score(&per, &state);
-                let current_raw = full_score_raw(&per, &state);
-                let Some(candidate) = build_candidate(model, &per, &state, choice, operator_seed, stop) else {
-                    alns.record_failed(choice.destroy, choice.repair);
-                    continue;
-                };
-                let candidate_guided = full_score(&per, &candidate);
-                let candidate_raw = full_score_raw(&per, &candidate);
-                let improved_current = candidate_raw < current_raw;
-                let global_best = record_state(&per, &candidate, &mut best_lists, &mut best_score, &mut best_feasible, report);
-                if global_best && coordination.as_ref().is_some_and(|shared| shared.publish(&best_lists, &best_score, best_feasible)) {
-                    alns.record_shared_publication();
-                }
-                let acceptance = alns.accept(&current_guided, &candidate_guided, &current_raw, &candidate_raw, operator_seed, iter);
-                if !matches!(acceptance, AcceptanceKind::Rejected) {
-                    state = candidate;
-                    memory.reset_all();
-                }
-                alns.record(choice.destroy, choice.repair, acceptance, improved_current, global_best);
-                if global_best {
-                    stagnant = 0;
-                }
-            }
-        }
-    }
+    let state_consistent = if per.routing.is_some() {
+        run_routing_search(
+            model,
+            &per,
+            &mut state,
+            stop,
+            max_iters,
+            seed,
+            &mut best_lists,
+            &mut best_score,
+            &mut best_feasible,
+            report,
+            &mut alns,
+            &mut coordination,
+            metrics_enabled,
+            started.as_ref(),
+            construction_offset,
+            construction_elapsed,
+            &feasible_history,
+            construction_candidates,
+        )
+    } else {
+        let mut memory = SearchMemory::new(model.lists.max(1));
+        run_generic_search(
+            model,
+            &per,
+            &mut state,
+            stop,
+            max_iters,
+            seed,
+            profile,
+            &mut memory,
+            &mut best_lists,
+            &mut best_score,
+            &mut best_feasible,
+            report,
+            &mut alns,
+            &mut coordination,
+        )
+    };
 
     if state_consistent
         && record_state(&per, &state, &mut best_lists, &mut best_score, &mut best_feasible, report)

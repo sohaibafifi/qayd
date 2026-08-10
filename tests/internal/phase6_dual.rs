@@ -1,9 +1,16 @@
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use qayd::engines::dual::{attach, compute};
+use qayd::engines::dual::{
+    attach, audit_reset_routing_relaxation_edge_evaluations, audit_routing_relaxation_edge_evaluations, compute, DualAuditGuard,
+};
 use qayd::model::list::{
     CollectionModel, CollectionSolution, Constraint, ExprArena, IntervalVar, Iterable, ObjectiveTier, Op, ReduceOp, Reduction, Schedule,
+};
+use qayd::model::Model;
+use qayd::orchestrator::{
+    audit_watch_local_search_dual, compile_collection_plan, solve_collection_plan, EngineKind, EventCallback, EventControl,
+    LocalSearchDualAudit, SolveBudget, SolveError, SolveEvent, SolveLimits, SolveMode, SolveRequest,
 };
 
 fn edge_term(list: usize, costs: &[Vec<i64>]) -> Reduction {
@@ -65,6 +72,24 @@ fn routing_model(costs: &[Vec<i64>], demands: &[i64], routes: usize, capacity: O
         globals: Vec::new(),
         schedule: None,
     }
+}
+
+fn shared_edge_term(list: usize, costs: &Arc<Vec<Vec<i64>>>) -> Reduction {
+    let mut arena = ExprArena::default();
+    let from = arena.arg(0);
+    let to = arena.arg(1);
+    let body = arena.matrix(Arc::clone(costs), from, to);
+    Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body, coeff: 1 }
+}
+
+fn offset_edge_term(list: usize, costs: &Arc<Vec<Vec<i64>>>) -> Reduction {
+    let mut arena = ExprArena::default();
+    let from = arena.arg(0);
+    let to = arena.arg(1);
+    let zero = arena.constant(0);
+    let base = arena.matrix(Arc::clone(costs), from, to);
+    let body = arena.add(base, zero);
+    Reduction { op: ReduceOp::Sum, iterable: Iterable::Edges { list, start: 0, end: 0 }, arena, body, coeff: 1 }
 }
 
 fn permutations(values: &mut [i32], start: usize, visit: &mut dyn FnMut(&[i32])) {
@@ -389,4 +414,127 @@ fn dual_construction_honors_a_prearmed_cancellation() {
     let model = routing_model(&costs, &demands, 4, Some(32));
 
     assert!(compute(&model, &AtomicBool::new(true)).is_none());
+}
+
+#[test]
+fn routing_local_search_publishes_its_first_incumbent_before_the_dual_starts() {
+    let local_audit = Arc::new(LocalSearchDualAudit::default());
+    let _audit = audit_watch_local_search_dual(Arc::clone(&local_audit));
+
+    let costs = vec![vec![0, 4, 7, 6], vec![4, 0, 2, 5], vec![7, 2, 0, 3], vec![6, 5, 3, 0]];
+    let collection = routing_model(&costs, &[0, 1, 1, 1], 2, Some(3));
+    let semantic = Model::from_collection(&collection);
+    let request = SolveRequest {
+        mode: SolveMode::LocalSearch,
+        threads: 1,
+        limits: SolveLimits { iterations: Some(16), ..SolveLimits::default() },
+        ..SolveRequest::default()
+    };
+    let budget = SolveBudget::new(None);
+    let plan = compile_collection_plan(&semantic, &request, &budget).expect("routing local-search plan");
+
+    let mut saw_progress = false;
+    let mut sink = EventCallback(|event| -> Result<EventControl, SolveError> {
+        if let SolveEvent::Progress { engine: EngineKind::RoutingLocalSearch, .. } = event {
+            if !saw_progress {
+                saw_progress = true;
+                assert!(
+                    !local_audit.dual_started.load(Ordering::Acquire),
+                    "the dual started before the first incumbent publication completed"
+                );
+            }
+        }
+        Ok(EventControl::Continue)
+    });
+
+    let result = solve_collection_plan(&semantic, &plan, &request, &budget, None, None, &mut sink).expect("routing local-search result");
+
+    assert!(saw_progress, "the routing fixture should publish a feasible incumbent");
+    assert!(local_audit.dual_started.load(Ordering::Acquire), "the dual should still run once the first incumbent has been published");
+    assert!(
+        !local_audit.dual_started_during_progress.load(Ordering::Acquire),
+        "the dual crossed the causal publication boundary while the first incumbent callback was still running"
+    );
+    assert_eq!(result.reports()[0].engine, Some(EngineKind::RoutingLocalSearch));
+    assert_eq!(result.bounds().len(), 1, "the certified dual should still be attached when budget permits");
+}
+
+#[test]
+fn homogeneous_routing_lists_build_one_relaxation_matrix() {
+    let _audit = DualAuditGuard::acquire();
+    let costs = Arc::new(vec![
+        vec![0, 10, 10, 10, 10, 10],
+        vec![10, 0, 1, 1, 1, 1],
+        vec![10, 1, 0, 1, 1, 1],
+        vec![10, 1, 1, 0, 1, 1],
+        vec![10, 1, 1, 1, 0, 1],
+        vec![10, 1, 1, 1, 1, 0],
+    ]);
+    let customers = costs.len() - 1;
+    let routes = 48usize;
+    let model = CollectionModel {
+        items: (1..=customers as i32).collect(),
+        lists: routes,
+        objectives: vec![ObjectiveTier {
+            minimize: true,
+            terms: (0..routes).map(|list| shared_edge_term(list, &costs)).collect(),
+            max_terms: None,
+        }],
+        constraints: Vec::new(),
+        globals: Vec::new(),
+        schedule: None,
+    };
+
+    let bound = compute(&model, &AtomicBool::new(false)).expect("routing relaxation");
+
+    assert!(!bound.method.is_empty());
+    assert_eq!(audit_routing_relaxation_edge_evaluations(), ((customers + 1) * (customers + 1)) as u64);
+}
+
+#[test]
+fn distinct_routing_expression_families_fall_back_once_per_family() {
+    let costs = Arc::new(vec![
+        vec![0, 10, 10, 10, 10, 10],
+        vec![10, 0, 1, 1, 1, 1],
+        vec![10, 1, 0, 1, 1, 1],
+        vec![10, 1, 1, 0, 1, 1],
+        vec![10, 1, 1, 1, 0, 1],
+        vec![10, 1, 1, 1, 1, 0],
+    ]);
+    let customers = costs.len() - 1;
+    let routes = 40usize;
+    let baseline = CollectionModel {
+        items: (1..=customers as i32).collect(),
+        lists: routes,
+        objectives: vec![ObjectiveTier {
+            minimize: true,
+            terms: (0..routes).map(|list| shared_edge_term(list, &costs)).collect(),
+            max_terms: None,
+        }],
+        constraints: Vec::new(),
+        globals: Vec::new(),
+        schedule: None,
+    };
+    let baseline_bound = compute(&baseline, &AtomicBool::new(false)).expect("baseline routing relaxation");
+
+    let _audit = DualAuditGuard::acquire();
+    audit_reset_routing_relaxation_edge_evaluations();
+    let mixed = CollectionModel {
+        items: (1..=customers as i32).collect(),
+        lists: routes,
+        objectives: vec![ObjectiveTier {
+            minimize: true,
+            terms: (0..routes)
+                .map(|list| if list % 2 == 0 { shared_edge_term(list, &costs) } else { offset_edge_term(list, &costs) })
+                .collect(),
+            max_terms: None,
+        }],
+        constraints: Vec::new(),
+        globals: Vec::new(),
+        schedule: None,
+    };
+    let mixed_bound = compute(&mixed, &AtomicBool::new(false)).expect("mixed routing relaxation");
+
+    assert_eq!(mixed_bound, baseline_bound);
+    assert_eq!(audit_routing_relaxation_edge_evaluations(), 2 * ((customers + 1) * (customers + 1)) as u64);
 }

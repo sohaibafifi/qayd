@@ -402,6 +402,13 @@ struct PySolution {
     constructor: Option<String>,
     constructor_fleet: Option<usize>,
     constructor_cost: Option<i64>,
+    /// (target_ns, observed_ns, feasible, objectives, fleet, candidates).
+    anytime_checkpoints: Option<Vec<PyAnytimeCheckpoint>>,
+    /// (name, uses, generated, evaluated, cpu_ns, improvements,
+    /// global_bests, positive_rewards, final_weight).
+    neighborhood_profile: Option<Vec<PyNeighborhoodProfile>>,
+    /// Stable name/value routing scheduler and elite counters.
+    routing_counters: Option<Vec<(String, u64)>>,
     /// Integer local-search counters carried by the canonical engine report.
     ls_moves: Option<u64>,
     ls_constraints: Option<usize>,
@@ -829,6 +836,9 @@ fn make_solution(
         constructor: None,
         constructor_fleet: None,
         constructor_cost: None,
+        anytime_checkpoints: None,
+        neighborhood_profile: None,
+        routing_counters: None,
         ls_moves: None,
         ls_constraints: None,
         ls_functionals: None,
@@ -970,6 +980,123 @@ fn report_metadata<'a>(report: Option<&'a EngineReport>, key: &str) -> Option<&'
 
 fn parse_report_metadata<T: std::str::FromStr>(report: Option<&EngineReport>, key: &str) -> Option<T> {
     report_metadata(report, key)?.parse().ok()
+}
+
+type PyAnytimeCheckpoint = (u64, u64, bool, Vec<i64>, Option<usize>, u64);
+type PyNeighborhoodProfile = (String, u64, u64, u64, u64, u64, u64, u64, f64);
+
+fn parse_anytime_checkpoints(report: Option<&EngineReport>) -> Option<Vec<PyAnytimeCheckpoint>> {
+    let encoded = report_metadata(report, "anytime_checkpoints")?;
+    let mut records = encoded.split(';');
+    if records.next()? != "1" {
+        return None;
+    }
+    records
+        .map(|record| {
+            let fields = record.split(',').collect::<Vec<_>>();
+            if fields.len() != 6 {
+                return None;
+            }
+            let objectives = if fields[5].is_empty() {
+                Vec::new()
+            } else {
+                fields[5].split(':').map(str::parse).collect::<Result<Vec<i64>, _>>().ok()?
+            };
+            Some((
+                fields[0].parse().ok()?,
+                fields[1].parse().ok()?,
+                match fields[2] {
+                    "0" => false,
+                    "1" => true,
+                    _ => return None,
+                },
+                objectives,
+                if fields[3].is_empty() { None } else { Some(fields[3].parse().ok()?) },
+                fields[4].parse().ok()?,
+            ))
+        })
+        .collect()
+}
+
+fn parse_neighborhood_profile(report: Option<&EngineReport>) -> Option<Vec<PyNeighborhoodProfile>> {
+    let encoded = report_metadata(report, "neighborhood_profile")?;
+    let mut records = encoded.split(';');
+    if records.next()? != "1" {
+        return None;
+    }
+    records
+        .map(|record| {
+            let fields = record.split(',').collect::<Vec<_>>();
+            if fields.len() != 9 {
+                return None;
+            }
+            let weight_milli = fields[8].parse::<u64>().ok()?;
+            Some((
+                decode_metadata_component(fields[0])?,
+                fields[1].parse().ok()?,
+                fields[2].parse().ok()?,
+                fields[3].parse().ok()?,
+                fields[4].parse().ok()?,
+                fields[5].parse().ok()?,
+                fields[6].parse().ok()?,
+                fields[7].parse().ok()?,
+                weight_milli as f64 / 1_000.0,
+            ))
+        })
+        .collect()
+}
+
+fn decode_metadata_component(encoded: &str) -> Option<String> {
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let high = hex_digit(*bytes.get(index + 1)?)?;
+        let low = hex_digit(*bytes.get(index + 2)?)?;
+        decoded.push((high << 4) | low);
+        index += 3;
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+const ROUTING_COUNTER_KEYS: [&str; 16] = [
+    "routing_slices",
+    "routing_descent_slices",
+    "routing_alns_slices",
+    "routing_relink_slices",
+    "routing_global_scan_slices",
+    "routing_route_elimination_attempts",
+    "routing_ejection_chain_attempts",
+    "routing_chain_relocate_attempts",
+    "routing_guided_segment_exchange_attempts",
+    "routing_macro_candidates_built",
+    "routing_macro_budget_exhaustions",
+    "routing_elite_insertions",
+    "routing_elite_rejections",
+    "routing_path_relink_attempts",
+    "routing_path_relink_steps",
+    "routing_path_relink_budget_exhaustions",
+];
+
+fn parse_routing_counters(report: Option<&EngineReport>) -> Option<Vec<(String, u64)>> {
+    ROUTING_COUNTER_KEYS
+        .iter()
+        .map(|key| Some((key.trim_start_matches("routing_").to_string(), parse_report_metadata(report, key)?)))
+        .collect()
 }
 
 fn attach_result_profile(solution: &mut PySolution, result: &SolveResult, engine: EngineKind) {
@@ -1811,6 +1938,26 @@ impl PySolution {
     #[getter]
     fn constructor_cost(&self) -> Option<i64> {
         self.constructor_cost
+    }
+
+    /// Internal anytime records as `(target_ns, observed_ns, feasible,
+    /// objectives, fleet, candidates)` tuples.
+    #[getter]
+    fn anytime_checkpoints(&self) -> Option<Vec<PyAnytimeCheckpoint>> {
+        self.anytime_checkpoints.clone()
+    }
+
+    /// Per-neighborhood records as `(name, uses, generated, evaluated,
+    /// cpu_ns, improvements, global_bests, positive_rewards, weight)` tuples.
+    #[getter]
+    fn neighborhood_profile(&self) -> Option<Vec<PyNeighborhoodProfile>> {
+        self.neighborhood_profile.clone()
+    }
+
+    /// Routing scheduler and elite counters as stable name/value pairs.
+    #[getter]
+    fn routing_counters(&self) -> Option<Vec<(String, u64)>> {
+        self.routing_counters.clone()
     }
 
     #[getter]
@@ -3499,6 +3646,9 @@ impl PyModel {
         let constructor = expose_search_profile.then(|| report_metadata(report, "constructor").map(str::to_string)).flatten();
         let constructor_fleet = expose_search_profile.then(|| parse_report_metadata(report, "constructor_fleet")).flatten();
         let constructor_cost = expose_search_profile.then(|| parse_report_metadata(report, "constructor_cost")).flatten();
+        let anytime_checkpoints = expose_search_profile.then(|| parse_anytime_checkpoints(report)).flatten();
+        let neighborhood_profile = expose_search_profile.then(|| parse_neighborhood_profile(report)).flatten();
+        let routing_counters = expose_search_profile.then(|| parse_routing_counters(report)).flatten();
         let backend_build_seconds = parse_report_metadata(orchestration_report, "backend_build_seconds");
         let estimated_backend_bytes = parse_report_metadata(orchestration_report, "estimated_backend_bytes");
         let records_first_feasible = matches!(
@@ -3540,6 +3690,9 @@ impl PyModel {
             constructor,
             constructor_fleet,
             constructor_cost,
+            anytime_checkpoints,
+            neighborhood_profile,
+            routing_counters,
             ls_moves: None,
             ls_constraints: None,
             ls_functionals: None,

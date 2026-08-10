@@ -13,11 +13,83 @@ const REDUCTION_KINDS: usize = ITERABLE_KINDS * REDUCE_OP_KINDS;
 pub struct AdaptiveOperatorMetrics {
     pub name: String,
     pub uses: u64,
+    /// Candidates produced before feasibility and granular filters.
+    pub generated: u64,
+    /// Complete candidates whose score was evaluated.
+    pub evaluated: u64,
+    /// Deterministic generated plus evaluated work, retained for audit.
+    pub work_units: u64,
+    /// Observed thread CPU time, exported as telemetry only.
+    pub cpu_nanos: u64,
     pub accepted: u64,
     pub improvements: u64,
     pub global_bests: u64,
+    pub positive_rewards: u64,
     /// Final roulette weight, scaled by 1,000.
     pub weight_milli: u64,
+}
+
+/// One internal anytime checkpoint. Checkpoints describe the incumbent that
+/// existed at `target_nanos`; they are never fed back into search control.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AnytimeCheckpointMetrics {
+    pub target_nanos: u64,
+    pub observed_nanos: u64,
+    pub feasible: bool,
+    pub objectives: Vec<i64>,
+    pub fleet: Option<usize>,
+    pub candidates: u64,
+}
+
+/// Work and reward profile for one bounded routing neighborhood.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NeighborhoodSearchMetrics {
+    pub name: String,
+    pub uses: u64,
+    pub generated: u64,
+    pub evaluated: u64,
+    /// Observed thread CPU time, exported as telemetry only.
+    pub cpu_nanos: u64,
+    pub improvements: u64,
+    pub global_bests: u64,
+    pub positive_rewards: u64,
+    /// Final adaptive weight, scaled by 1,000.
+    pub weight_milli: u64,
+}
+
+/// CPU and deterministic work spent by routing support mechanisms that are
+/// outside an adaptive candidate neighborhood.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RoutingAuxiliaryMetrics {
+    pub name: String,
+    pub uses: u64,
+    pub work_units: u64,
+    pub cpu_nanos: u64,
+    pub productive: u64,
+}
+
+/// Routing scheduler, neighborhood, and elite-search diagnostics.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RoutingSearchMetrics {
+    pub slices: u64,
+    pub descent_slices: u64,
+    pub alns_slices: u64,
+    pub relink_slices: u64,
+    pub global_scan_slices: u64,
+    pub route_elimination_attempts: u64,
+    pub ejection_chain_attempts: u64,
+    pub chain_relocate_attempts: u64,
+    pub guided_segment_exchange_attempts: u64,
+    pub macro_candidates_built: u64,
+    pub macro_budget_exhaustions: u64,
+    pub elite_insertions: u64,
+    pub elite_rejections: u64,
+    pub path_relink_attempts: u64,
+    pub path_relink_steps: u64,
+    pub path_relink_budget_exhaustions: u64,
+    pub checkpoints: Vec<AnytimeCheckpointMetrics>,
+    pub neighborhoods: Vec<NeighborhoodSearchMetrics>,
+    pub auxiliary: Vec<RoutingAuxiliaryMetrics>,
 }
 
 /// Adaptive large-neighborhood-search statistics for one list search.
@@ -166,6 +238,7 @@ pub struct ListSearchMetrics {
     pub scan_recomputations: u64,
     pub scan_recomputed_steps: u64,
     pub alns: AlnsSearchMetrics,
+    pub(crate) routing: RoutingSearchMetrics,
     pub reductions: Vec<ReductionSearchMetrics>,
 }
 
@@ -196,6 +269,85 @@ impl ListSearchMetrics {
 
     pub fn reduction(&self, iterable: ListIterableKind, op: ListReduceOpKind) -> Option<&ReductionSearchMetrics> {
         self.reductions.iter().find(|metrics| metrics.iterable == iterable && metrics.op == op)
+    }
+
+    pub(crate) fn routing(&self) -> &RoutingSearchMetrics {
+        &self.routing
+    }
+
+    pub(crate) fn anytime_checkpoints_metadata(&self) -> String {
+        let mut encoded = String::from("1");
+        for checkpoint in &self.routing.checkpoints {
+            encoded.push(';');
+            encoded.push_str(&checkpoint.target_nanos.to_string());
+            encoded.push(',');
+            encoded.push_str(&checkpoint.observed_nanos.to_string());
+            encoded.push(',');
+            encoded.push(if checkpoint.feasible { '1' } else { '0' });
+            encoded.push(',');
+            if let Some(fleet) = checkpoint.fleet {
+                encoded.push_str(&fleet.to_string());
+            }
+            encoded.push(',');
+            encoded.push_str(&checkpoint.candidates.to_string());
+            encoded.push(',');
+            for (index, objective) in checkpoint.objectives.iter().enumerate() {
+                if index > 0 {
+                    encoded.push(':');
+                }
+                encoded.push_str(&objective.to_string());
+            }
+        }
+        encoded
+    }
+
+    pub(crate) fn neighborhoods_metadata(&self) -> String {
+        let mut encoded = String::from("1");
+        for neighborhood in &self.routing.neighborhoods {
+            append_neighborhood_metadata(
+                &mut encoded,
+                &neighborhood.name,
+                [
+                    neighborhood.uses,
+                    neighborhood.generated,
+                    neighborhood.evaluated,
+                    neighborhood.cpu_nanos,
+                    neighborhood.improvements,
+                    neighborhood.global_bests,
+                    neighborhood.positive_rewards,
+                    neighborhood.weight_milli,
+                ],
+            );
+        }
+        for auxiliary in &self.routing.auxiliary {
+            // Preserve the stable v1 wire format used by the launchers. For
+            // these explicitly named support records, `generated` carries
+            // deterministic work units and `evaluated` remains zero.
+            append_neighborhood_metadata(
+                &mut encoded,
+                &auxiliary.name,
+                [auxiliary.uses, auxiliary.work_units, 0, auxiliary.cpu_nanos, auxiliary.productive, 0, auxiliary.productive, 1_000],
+            );
+        }
+        for (family, operators) in [("alns_destroy", &self.alns.destroy), ("alns_repair", &self.alns.repair)] {
+            for operator in operators {
+                append_neighborhood_metadata(
+                    &mut encoded,
+                    &format!("{family}/{}", operator.name),
+                    [
+                        operator.uses,
+                        operator.generated,
+                        operator.evaluated,
+                        operator.cpu_nanos,
+                        operator.improvements,
+                        operator.global_bests,
+                        operator.positive_rewards,
+                        operator.weight_milli,
+                    ],
+                );
+            }
+        }
+        encoded
     }
 }
 
@@ -250,13 +402,72 @@ impl fmt::Display for ListSearchMetrics {
         for operator in self.alns.destroy.iter().chain(&self.alns.repair) {
             writeln!(
                 f,
-                "  alns-operator={} uses={} accepted={} improvements={} global-bests={} weight={:.3}",
+                "  alns-operator={} uses={} generated={} evaluated={} work-units={} cpu-ns={} accepted={} improvements={} global-bests={} positive-rewards={} weight={:.3}",
                 operator.name,
                 operator.uses,
+                operator.generated,
+                operator.evaluated,
+                operator.work_units,
+                operator.cpu_nanos,
                 operator.accepted,
                 operator.improvements,
                 operator.global_bests,
+                operator.positive_rewards,
                 operator.weight_milli as f64 / 1_000.0
+            )?;
+        }
+        writeln!(
+            f,
+            "  routing-slices={} descent={} alns={} relink={} global={} route-elimination-attempts={} ejection-chain-attempts={} chain-relocate-attempts={} guided-segment-exchange-attempts={} macro-candidates-built={} macro-budget-exhaustions={} elite-insertions={} elite-rejections={} path-relink-attempts={} path-relink-steps={} path-relink-budget-exhaustions={}",
+            self.routing.slices,
+            self.routing.descent_slices,
+            self.routing.alns_slices,
+            self.routing.relink_slices,
+            self.routing.global_scan_slices,
+            self.routing.route_elimination_attempts,
+            self.routing.ejection_chain_attempts,
+            self.routing.chain_relocate_attempts,
+            self.routing.guided_segment_exchange_attempts,
+            self.routing.macro_candidates_built,
+            self.routing.macro_budget_exhaustions,
+            self.routing.elite_insertions,
+            self.routing.elite_rejections,
+            self.routing.path_relink_attempts,
+            self.routing.path_relink_steps,
+            self.routing.path_relink_budget_exhaustions,
+        )?;
+        for checkpoint in &self.routing.checkpoints {
+            writeln!(
+                f,
+                "  checkpoint-target-ns={} observed-ns={} feasible={} objectives={:?} fleet={} candidates={}",
+                checkpoint.target_nanos,
+                checkpoint.observed_nanos,
+                checkpoint.feasible,
+                checkpoint.objectives,
+                checkpoint.fleet.map_or_else(|| "none".to_owned(), |value| value.to_string()),
+                checkpoint.candidates,
+            )?;
+        }
+        for neighborhood in &self.routing.neighborhoods {
+            writeln!(
+                f,
+                "  neighborhood={} uses={} generated={} evaluated={} cpu-ns={} improvements={} global-bests={} positive-rewards={} weight={:.3}",
+                neighborhood.name,
+                neighborhood.uses,
+                neighborhood.generated,
+                neighborhood.evaluated,
+                neighborhood.cpu_nanos,
+                neighborhood.improvements,
+                neighborhood.global_bests,
+                neighborhood.positive_rewards,
+                neighborhood.weight_milli as f64 / 1_000.0,
+            )?;
+        }
+        for auxiliary in &self.routing.auxiliary {
+            writeln!(
+                f,
+                "  routing-auxiliary={} uses={} work-units={} cpu-ns={} productive={}",
+                auxiliary.name, auxiliary.uses, auxiliary.work_units, auxiliary.cpu_nanos, auxiliary.productive,
             )?;
         }
         for reduction in &self.reductions {
@@ -287,6 +498,28 @@ fn ratio(numerator: u64, denominator: u64) -> f64 {
     }
 }
 
+fn encode_metadata_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+fn append_neighborhood_metadata(encoded: &mut String, name: &str, values: [u64; 8]) {
+    encoded.push(';');
+    encoded.push_str(&encode_metadata_component(name));
+    for value in values {
+        encoded.push(',');
+        encoded.push_str(&value.to_string());
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct RawReductionMetrics {
     full_calls: u64,
@@ -309,6 +542,7 @@ struct RawMetrics {
     scan_recomputations: u64,
     scan_recomputed_steps: u64,
     alns: AlnsSearchMetrics,
+    routing: RoutingSearchMetrics,
     reductions: [RawReductionMetrics; REDUCTION_KINDS],
 }
 
@@ -327,6 +561,7 @@ impl Default for RawMetrics {
             scan_recomputations: 0,
             scan_recomputed_steps: 0,
             alns: AlnsSearchMetrics::default(),
+            routing: RoutingSearchMetrics::default(),
             reductions: [RawReductionMetrics::default(); REDUCTION_KINDS],
         }
     }
@@ -428,6 +663,16 @@ impl MetricsRecorder {
         }
     }
 
+    /// Atomically stores the scheduler profile after search. Building this
+    /// aggregate happens outside the recorder, keeping candidate hot paths free
+    /// of `RefCell` traffic. Disabled profiling performs no allocation or clock
+    /// read here.
+    pub(super) fn record_routing(&self, metrics: RoutingSearchMetrics) {
+        if let Some(raw) = &self.raw {
+            raw.borrow_mut().routing = metrics;
+        }
+    }
+
     pub(super) fn snapshot(&self, elapsed: Duration) -> ListSearchMetrics {
         let Some(raw) = &self.raw else {
             return ListSearchMetrics::default();
@@ -466,6 +711,7 @@ impl MetricsRecorder {
             scan_recomputations: raw.scan_recomputations,
             scan_recomputed_steps: raw.scan_recomputed_steps,
             alns: raw.alns.clone(),
+            routing: raw.routing.clone(),
             reductions,
         }
     }

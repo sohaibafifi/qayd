@@ -21,6 +21,9 @@ _Body4 = Callable[["LambdaExpr", "LambdaExpr", "LambdaExpr", "LambdaExpr"], _Lam
 # An assumption item accepted by solve(assumptions=...) / session.solve(...).
 _Assumption = Union["Constraint", "IntVar", Tuple["IntVar", int], Tuple["IntVar", str, int]]
 _Incumbent = Callable[[int, Dict[int, int]], Any]
+_AnytimeCheckpoint = Tuple[int, int, bool, list[int], Optional[int], int]
+_NeighborhoodProfile = Tuple[str, int, int, int, int, int, int, int, float]
+_RoutingCounter = Tuple[str, int]
 
 # A relation string such as "==", "!=", "<=", "<", ">=", ">".
 STAR: int
@@ -585,6 +588,12 @@ class Solution:
     def constructor_fleet(self) -> Optional[int]: ...
     @property
     def constructor_cost(self) -> Optional[int]: ...
+    @property
+    def anytime_checkpoints(self) -> Optional[list[_AnytimeCheckpoint]]: ...
+    @property
+    def neighborhood_profile(self) -> Optional[list[_NeighborhoodProfile]]: ...
+    @property
+    def routing_counters(self) -> Optional[list[_RoutingCounter]]: ...
     @property
     def ls_moves(self) -> Optional[int]: ...
     @property

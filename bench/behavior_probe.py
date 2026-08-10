@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -26,6 +27,14 @@ ROOT = Path(__file__).resolve().parents[1]
 CAMPAIGN = ROOT / "bench" / "campaign.py"
 SOLVERS = ("qayd-api", "qayd-native", "hexaly", "hgs", "lkh")
 FEASIBLE_STATUSES = {"SAT", "SATISFIABLE", "FEASIBLE", "OPTIMAL", "OPTIMUM"}
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def integer_list(values: Iterable[str], *, positive: bool) -> list[int]:
@@ -159,6 +168,7 @@ def generate_probe_suite(
                 comment=f"qayd clean-room behavior probe: {change}",
             )
             relative = path.relative_to(ROOT).as_posix()
+            instance_sha256 = sha256_file(path)
             datasets.append({"family": family, "problem": "cvrp", "glob": relative})
             probes.append({
                 "probe_id": f"{pair_id}-{role}",
@@ -167,6 +177,7 @@ def generate_probe_suite(
                 "size": size,
                 "role": role,
                 "instance_path": relative,
+                "instance_sha256": instance_sha256,
                 "objective_scale": scale,
                 "depot_node_id": 1,
                 "node_map_to_control": node_map,
@@ -274,8 +285,19 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def load_campaign_provenance(results_path: Path) -> dict[str, Any] | None:
+    path = results_path.with_suffix(results_path.suffix + ".provenance.json")
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def finite(value: object) -> float | None:
-    if isinstance(value, (int, float)) and math.isfinite(value):
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
         return float(value)
     return None
 
@@ -432,6 +454,308 @@ def aggregate_pairs(pairs: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
+def normalized_objectives(record: dict[str, Any], scale: float) -> list[float] | None:
+    objectives = record.get("objectives")
+    if not isinstance(objectives, list) or not objectives or scale <= 0:
+        return None
+    normalized = []
+    for objective in objectives:
+        value = finite(objective)
+        if value is None:
+            return None
+        normalized.append(value / scale)
+    return normalized
+
+
+def campaign_axes(
+    manifest: dict[str, Any], records: Sequence[dict[str, Any]],
+    solvers: set[str],
+) -> tuple[list[object], list[int], int | None]:
+    campaign = manifest.get("campaign")
+    declared_budgets = campaign.get("budgets") if isinstance(campaign, dict) else None
+    declared_seeds = campaign.get("seeds") if isinstance(campaign, dict) else None
+    requested_threads = campaign.get("threads") if isinstance(campaign, dict) else None
+    budgets = (
+        sorted(
+            {
+                budget
+                for budget in declared_budgets
+                if finite(budget) is not None and finite(budget) > 0
+            },
+            key=float,
+        )
+        if isinstance(declared_budgets, list)
+        else sorted(
+            {
+                record.get("checkpoint_seconds")
+                for record in records
+                if record.get("solver") in solvers
+                and finite(record.get("checkpoint_seconds")) is not None
+                and finite(record.get("checkpoint_seconds")) > 0
+            },
+            key=float,
+        )
+    )
+    seeds = (
+        sorted(
+            {
+                seed
+                for seed in declared_seeds
+                if isinstance(seed, int) and not isinstance(seed, bool) and seed >= 0
+            }
+        )
+        if isinstance(declared_seeds, list)
+        else sorted(
+            {
+                record.get("seed")
+                for record in records
+                if record.get("solver") in solvers
+                and isinstance(record.get("seed"), int)
+                and not isinstance(record.get("seed"), bool)
+                and record["seed"] >= 0
+            }
+        )
+    )
+    threads = (
+        requested_threads
+        if isinstance(requested_threads, int)
+        and not isinstance(requested_threads, bool)
+        and requested_threads > 0
+        else None
+    )
+    return budgets, seeds, threads
+
+
+def run_evidence(
+    records: Sequence[dict[str, Any]], *, expected_path: str,
+    expected_hash: str | None, expected_threads: int | None, scale: float,
+) -> dict[str, Any]:
+    """Return exact public run evidence and deterministic eligibility errors."""
+    if not records:
+        return {"run_count": 0, "runs": [], "eligibility_errors": ["run_missing"]}
+
+    runs = []
+    for record in records:
+        normalized = normalized_objectives(record, scale)
+        runs.append({
+            "run_id": record.get("run_id"),
+            "solver_version": record.get("solver_version"),
+            "instance_path": record.get("instance_path"),
+            "instance_sha256": record.get("instance_sha256"),
+            "status": record.get("status"),
+            "verified": record.get("verified"),
+            "requested_threads": record.get("requested_threads"),
+            "threads": record.get("threads"),
+            "objectives": record.get("objectives"),
+            "normalized_objectives": normalized,
+        })
+
+    errors = []
+    if len(runs) != 1:
+        errors.append("duplicate_runs")
+    run = runs[-1]
+    if not isinstance(run["run_id"], str) or not run["run_id"].strip():
+        errors.append("run_id_missing")
+    if (
+        not isinstance(run["solver_version"], str)
+        or not run["solver_version"].strip()
+    ):
+        errors.append("solver_version_missing")
+    if run["instance_path"] != expected_path:
+        errors.append("instance_path_mismatch")
+    if expected_hash is None:
+        errors.append("manifest_instance_hash_missing")
+    elif run["instance_sha256"] != expected_hash:
+        errors.append("instance_hash_mismatch")
+    if expected_threads is None:
+        errors.append("campaign_threads_missing")
+    else:
+        if (
+            not isinstance(run["requested_threads"], int)
+            or isinstance(run["requested_threads"], bool)
+            or run["requested_threads"] != expected_threads
+        ):
+            errors.append("requested_threads_mismatch")
+        if (
+            not isinstance(run["threads"], int)
+            or isinstance(run["threads"], bool)
+            or run["threads"] != expected_threads
+        ):
+            errors.append("threads_mismatch")
+    if run["status"] not in FEASIBLE_STATUSES:
+        errors.append("status_not_feasible")
+    if run["verified"] is not True:
+        errors.append("solution_not_verified")
+    if run["normalized_objectives"] is None:
+        errors.append("objective_missing_or_invalid")
+    return {"run_count": len(runs), "runs": runs, "eligibility_errors": errors}
+
+
+def solver_lag_observations(
+    manifest: dict[str, Any], records: Sequence[dict[str, Any]], *,
+    solver: str = "qayd-api", reference: str = "hexaly",
+) -> list[dict[str, Any]]:
+    """Build the exact expected comparison matrix for two public solvers."""
+    probes = {probe["instance_path"]: probe for probe in manifest["probes"]}
+    indexed: dict[tuple[object, ...], list[dict[str, Any]]] = defaultdict(list)
+    compared_solvers = {solver, reference}
+    for record in records:
+        path = record.get("instance_path")
+        if path not in probes or record.get("solver") not in compared_solvers:
+            continue
+        key = (
+            path, record.get("checkpoint_seconds"), record.get("seed"),
+            record.get("solver"),
+        )
+        indexed[key].append(record)
+
+    budgets, seeds, threads = campaign_axes(manifest, records, compared_solvers)
+    matrix = []
+    for path, probe in sorted(probes.items()):
+        size = int(probe["size"])
+        scale = float(probe["objective_scale"])
+        expected_hash = probe.get("instance_sha256")
+        if not isinstance(expected_hash, str) or not expected_hash:
+            expected_hash = None
+        for budget in budgets:
+            for seed in seeds:
+                solver_evidence = run_evidence(
+                    indexed.get((path, budget, seed, solver), []),
+                    expected_path=path, expected_hash=expected_hash,
+                    expected_threads=threads, scale=scale,
+                )
+                reference_evidence = run_evidence(
+                    indexed.get((path, budget, seed, reference), []),
+                    expected_path=path, expected_hash=expected_hash,
+                    expected_threads=threads, scale=scale,
+                )
+                solver_run = (
+                    solver_evidence["runs"][0]
+                    if solver_evidence["run_count"] == 1 else None
+                )
+                reference_run = (
+                    reference_evidence["runs"][0]
+                    if reference_evidence["run_count"] == 1 else None
+                )
+                reasons = [
+                    *(f"solver:{reason}" for reason in solver_evidence["eligibility_errors"]),
+                    *(f"reference:{reason}" for reason in reference_evidence["eligibility_errors"]),
+                ]
+                lag = None
+                if not reasons:
+                    solver_objective = solver_evidence["runs"][0]["normalized_objectives"][0]
+                    reference_objective = reference_evidence["runs"][0]["normalized_objectives"][0]
+                    lag = 100.0 * (solver_objective - reference_objective) / max(
+                        1.0, abs(reference_objective),
+                    )
+                matrix.append({
+                    "solver": solver,
+                    "reference": reference,
+                    "probe_id": probe["probe_id"],
+                    "pair_id": probe["pair_id"],
+                    "factor": probe["factor"],
+                    "role": probe["role"],
+                    "size": size,
+                    "instance_path": path,
+                    "instance_sha256": expected_hash,
+                    "objective_scale": scale,
+                    "checkpoint_seconds": budget,
+                    "seed": seed,
+                    "campaign_threads": threads,
+                    "solver_run_id": solver_run.get("run_id") if solver_run else None,
+                    "solver_version": solver_run.get("solver_version") if solver_run else None,
+                    "solver_instance_path": solver_run.get("instance_path") if solver_run else None,
+                    "solver_instance_sha256": (
+                        solver_run.get("instance_sha256") if solver_run else None
+                    ),
+                    "solver_requested_threads": (
+                        solver_run.get("requested_threads") if solver_run else None
+                    ),
+                    "solver_threads": solver_run.get("threads") if solver_run else None,
+                    "solver_status": solver_run.get("status") if solver_run else None,
+                    "solver_verified": solver_run.get("verified") if solver_run else None,
+                    "solver_normalized_objective": (
+                        solver_run["normalized_objectives"][0]
+                        if solver_run and solver_run["normalized_objectives"] else None
+                    ),
+                    "solver_normalized_objectives": (
+                        solver_run.get("normalized_objectives") if solver_run else None
+                    ),
+                    "reference_run_id": reference_run.get("run_id") if reference_run else None,
+                    "reference_version": (
+                        reference_run.get("solver_version") if reference_run else None
+                    ),
+                    "reference_instance_path": (
+                        reference_run.get("instance_path") if reference_run else None
+                    ),
+                    "reference_instance_sha256": (
+                        reference_run.get("instance_sha256") if reference_run else None
+                    ),
+                    "reference_requested_threads": (
+                        reference_run.get("requested_threads") if reference_run else None
+                    ),
+                    "reference_threads": reference_run.get("threads") if reference_run else None,
+                    "reference_status": reference_run.get("status") if reference_run else None,
+                    "reference_verified": reference_run.get("verified") if reference_run else None,
+                    "reference_normalized_objective": (
+                        reference_run["normalized_objectives"][0]
+                        if reference_run and reference_run["normalized_objectives"] else None
+                    ),
+                    "reference_normalized_objectives": (
+                        reference_run.get("normalized_objectives") if reference_run else None
+                    ),
+                    "solver_evidence": solver_evidence,
+                    "reference_evidence": reference_evidence,
+                    "objective_lag_percent": lag,
+                    "missing_reason": ";".join(reasons) if reasons else None,
+                })
+    return matrix
+
+
+def aggregate_solver_lag(
+    observations: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str, int, object], list[dict[str, Any]]] = defaultdict(list)
+    for observation in observations:
+        grouped[
+            (
+                str(observation["solver"]), str(observation["reference"]),
+                int(observation["size"]), observation["checkpoint_seconds"],
+            )
+        ].append(observation)
+    rows = []
+    for (solver, reference, size, budget), values in sorted(
+        grouped.items(), key=lambda item: (item[0][2], float(item[0][3]), item[0][0], item[0][1]),
+    ):
+        lags = [
+            lag
+            for value in values
+            if value["missing_reason"] is None
+            and (lag := finite(value["objective_lag_percent"])) is not None
+        ]
+        rows.append({
+            "solver": solver,
+            "reference": reference,
+            "size": size,
+            "checkpoint_seconds": budget,
+            "expected_pairs": len(values),
+            "verified_pairs": len(lags),
+            "missing_pairs": len(values) - len(lags),
+            "median_objective_lag_percent": median(lags),
+        })
+    return rows
+
+
+def solver_lag_rows(
+    manifest: dict[str, Any], records: Sequence[dict[str, Any]], *,
+    solver: str = "qayd-api", reference: str = "hexaly",
+) -> list[dict[str, Any]]:
+    """Aggregate the exact expected solver comparison matrix."""
+    return aggregate_solver_lag(
+        solver_lag_observations(manifest, records, solver=solver, reference=reference),
+    )
+
+
 def observations(rows: Sequence[dict[str, Any]]) -> list[str]:
     latest: dict[tuple[str, str, int], dict[str, Any]] = {}
     for row in rows:
@@ -506,9 +830,22 @@ def markdown_report(summary: dict[str, Any]) -> str:
         "L'objectif du traitement est normalisé pour le probe de changement d'échelle. "
         "L'accord ne signifie pas que les routes sont identiques. Jaccard vaut 1 pour les mêmes arêtes après remappage des indices.",
         "",
-        "## Observations prudentes",
-        "",
     ))
+    if summary["solver_lag_rows"]:
+        lines.extend((
+            "## Retard apparié entre solveurs",
+            "",
+            "| Solveur | Référence | n | Budget | Paires vérifiées | Manquantes | Retard objectif médian |",
+            "|---|---|---:|---:|---:|---:|---:|",
+        ))
+        for row in summary["solver_lag_rows"]:
+            lines.append(
+                f"| {row['solver']} | {row['reference']} | {row['size']} | "
+                f"{row['checkpoint_seconds']}s | {row['verified_pairs']}/{row['expected_pairs']} | "
+                f"{row['missing_pairs']} | {display_percent(row['median_objective_lag_percent'])} |"
+            )
+        lines.append("")
+    lines.extend(("## Observations prudentes", ""))
     lines.extend(f"- {note}" for note in summary["observations"])
     lines.extend((
         "",
@@ -524,13 +861,21 @@ def analyze(manifest_path: Path, results_path: Path, markdown_path: Path, json_p
     records = load_jsonl(results_path)
     pairs = paired_runs(manifest, records)
     rows = aggregate_pairs(pairs)
+    lag_observations = solver_lag_observations(manifest, records)
+    lag_rows = aggregate_solver_lag(lag_observations)
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         "method": manifest["method"],
         "boundary": manifest["boundary"],
+        "generator": manifest.get("generator"),
+        "campaign": manifest.get("campaign"),
+        "campaign_provenance": load_campaign_provenance(results_path),
+        "probes": manifest["probes"],
         "record_count": len(records),
         "paired_run_count": len(pairs),
         "rows": rows,
+        "solver_lag_rows": lag_rows,
+        "solver_lag_pairs": lag_observations,
         "observations": observations(rows),
         "paired_runs": pairs,
     }
@@ -558,6 +903,7 @@ def campaign_command(args: argparse.Namespace, suite_path: Path, results_path: P
     command.append("--routing-two-way" if args.routing_two_way else "--no-routing-two-way")
     command.append("--routing-nearest-neighbor" if args.routing_nearest_neighbor else "--no-routing-nearest-neighbor")
     command.append("--routing-warm-start" if args.routing_warm_start else "--no-routing-warm-start")
+    command.append("--prepare-qayd" if args.prepare_qayd else "--no-prepare-qayd")
     for flag, value in (
         ("--hexaly-home", args.hexaly_home),
         ("--hgs-binary", args.hgs_binary),
@@ -588,6 +934,7 @@ def main() -> None:
     parser.add_argument("--routing-two-way", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--routing-nearest-neighbor", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--routing-warm-start", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--prepare-qayd", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--hexaly-home", type=Path)
     parser.add_argument("--hgs-binary", type=Path)
     parser.add_argument("--lkh-binary", type=Path)
@@ -632,6 +979,16 @@ def main() -> None:
         suite_path, manifest_path, manifest = generate_probe_suite(
             workspace, sizes=args.sizes, instance_seed=args.instance_seed,
             distance_scale=args.distance_scale, edge_delta=args.edge_delta,
+        )
+        manifest["campaign"] = {
+            "solvers": args.solver,
+            "budgets": args.budgets,
+            "seeds": args.seeds,
+            "threads": args.threads,
+        }
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
         )
         print(f"generated {len(manifest['probes'])} probe instances under {workspace}", file=sys.stderr)
         if args.generate_only:

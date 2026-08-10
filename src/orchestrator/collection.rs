@@ -1,6 +1,10 @@
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::engines::ls::lists;
@@ -146,7 +150,7 @@ impl CollectionSolvePlan {
     pub(crate) fn routing_warm_start_plan(&self) -> Option<Self> {
         self.has_routing_warm_start().then(|| Self {
             model: Arc::clone(&self.model),
-            backend: CollectionBackend::RoutingLocalSearch,
+            backend: local_search_backend(self.model.as_model()),
             family: self.family,
             reason: "routing warm-start local search".to_string(),
             estimated_backend_bytes: model::estimated_local_search_backend_bytes(self.model.as_model()),
@@ -516,7 +520,7 @@ fn ensure_compilation_running(stop: &AtomicBool, phase: &str) -> Result<(), Solv
 fn local_search_backend(model: &list::CollectionModel) -> CollectionBackend {
     if model.schedule.is_some() {
         CollectionBackend::ScheduleLocalSearch
-    } else if physical_family(model) == ModelFamily::Routing {
+    } else if lists::routing_search_supported(model) {
         // Same list engine, but edge-cost objectives activate the routing
         // construction and neighbourhoods; report it as routing local search.
         CollectionBackend::RoutingLocalSearch
@@ -844,10 +848,176 @@ struct ListLocalSearchRun<'a> {
     started: Instant,
 }
 
+#[derive(Clone, Default)]
+struct DeferredDualStart {
+    state: Arc<(Mutex<DeferredDualState>, Condvar)>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DeferredDualState {
+    released: bool,
+    cancelled: bool,
+}
+
+impl DeferredDualStart {
+    fn release(&self) {
+        let (lock, wake) = &*self.state;
+        let mut state = lock.lock().expect("dual-start state lock poisoned");
+        state.released = true;
+        wake.notify_one();
+    }
+
+    fn cancel(&self) {
+        let (lock, wake) = &*self.state;
+        let mut state = lock.lock().expect("dual-start state lock poisoned");
+        state.cancelled = true;
+        wake.notify_one();
+    }
+
+    fn wait(&self) -> bool {
+        let (lock, wake) = &*self.state;
+        let mut state = lock.lock().expect("dual-start state lock poisoned");
+        while !state.released && !state.cancelled {
+            state = wake.wait(state).expect("dual-start state lock poisoned");
+        }
+        state.released
+    }
+}
+
+struct DeferredDualGate {
+    start: DeferredDualStart,
+    settled: bool,
+}
+
+impl DeferredDualGate {
+    fn new(start: DeferredDualStart) -> Self {
+        Self { start, settled: false }
+    }
+
+    fn release(&mut self) {
+        if !self.settled {
+            self.start.release();
+            self.settled = true;
+        }
+    }
+
+    fn cancel(&mut self) {
+        if !self.settled {
+            self.start.cancel();
+            self.settled = true;
+        }
+    }
+}
+
+impl Drop for DeferredDualGate {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.start.cancel();
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static LOCAL_SEARCH_DUAL_AUDIT: RefCell<Option<Arc<LocalSearchDualAudit>>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct LocalSearchDualAudit {
+    progress_depth: AtomicUsize,
+    pub(crate) dual_started: AtomicBool,
+    pub(crate) dual_started_during_progress: AtomicBool,
+}
+
+#[cfg(test)]
+pub(crate) struct LocalSearchDualAuditGuard;
+
+#[cfg(test)]
+pub(crate) fn audit_watch_local_search_dual(state: Arc<LocalSearchDualAudit>) -> LocalSearchDualAuditGuard {
+    LOCAL_SEARCH_DUAL_AUDIT.with(|slot| {
+        *slot.borrow_mut() = Some(state);
+    });
+    LocalSearchDualAuditGuard
+}
+
+#[cfg(test)]
+impl Drop for LocalSearchDualAuditGuard {
+    fn drop(&mut self) {
+        LOCAL_SEARCH_DUAL_AUDIT.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+    }
+}
+
+#[cfg(test)]
+fn local_search_dual_audit_state() -> Option<Arc<LocalSearchDualAudit>> {
+    LOCAL_SEARCH_DUAL_AUDIT.with(|slot| slot.borrow().clone())
+}
+
+#[cfg(test)]
+struct LocalSearchProgressAudit {
+    state: Option<Arc<LocalSearchDualAudit>>,
+}
+
+#[cfg(test)]
+impl LocalSearchProgressAudit {
+    fn new() -> Self {
+        let state = local_search_dual_audit_state();
+        if let Some(state) = &state {
+            state.progress_depth.fetch_add(1, Ordering::AcqRel);
+        }
+        Self { state }
+    }
+}
+
+#[cfg(test)]
+impl Drop for LocalSearchProgressAudit {
+    fn drop(&mut self) {
+        if let Some(state) = &self.state {
+            state.progress_depth.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+#[cfg(test)]
+fn audit_local_search_dual_started(state: Option<&Arc<LocalSearchDualAudit>>) {
+    if let Some(state) = state {
+        state.dual_started.store(true, Ordering::Release);
+        if state.progress_depth.load(Ordering::Acquire) > 0 {
+            state.dual_started_during_progress.store(true, Ordering::Release);
+        }
+    }
+}
+
 fn result_from_local_search(run: ListLocalSearchRun<'_>, improvement: &mut impl FnMut(EngineKind, i64)) -> Result<SolveResult, SolveError> {
     let ListLocalSearchRun { semantic, model, request, budget, engine_stop, list_hint, max_iterations, engine, started } = run;
     let (mut solution, metadata, structural_bound, iterations) = std::thread::scope(|scope| {
-        let dual_task = scope.spawn(|| dual::compute(model, engine_stop));
+        let dual_start = DeferredDualStart::default();
+        let mut dual_gate = DeferredDualGate::new(dual_start.clone());
+        let dual_task = {
+            let dual_start = dual_start.clone();
+            #[cfg(test)]
+            let dual_audit = local_search_dual_audit_state();
+            scope.spawn(move || {
+                if !dual_start.wait() || engine_stop.load(Ordering::Relaxed) {
+                    return None;
+                }
+                #[cfg(test)]
+                audit_local_search_dual_started(dual_audit.as_ref());
+                dual::compute(model, engine_stop)
+            })
+        };
+        let mut dual_released = false;
+        let mut publish_first_incumbent = |value| {
+            #[cfg(test)]
+            let _progress_audit = LocalSearchProgressAudit::new();
+            improvement(engine, value);
+            if !dual_released {
+                dual_gate.release();
+                dual_released = true;
+            }
+        };
         let (solution, metadata, iterations) = if request.threads > 1 {
             let (solution, metrics) = lists::solve_collection_parallel_validated(
                 model,
@@ -856,11 +1026,11 @@ fn result_from_local_search(run: ListLocalSearchRun<'_>, improvement: &mut impl 
                 request.threads,
                 max_iterations,
                 list_hint,
-                &mut |value| improvement(engine, value),
+                &mut publish_first_incumbent,
                 request.profile,
             );
             let candidates = metrics.worker_metrics.iter().map(|worker| worker.search.candidates).sum::<u64>();
-            let iterations = metrics.worker_metrics.iter().map(|worker| worker.search.alns.iterations).sum::<u64>();
+            let iterations = metrics.worker_metrics.iter().map(|worker| list_search_iterations(&worker.search)).sum::<u64>();
             let elapsed_nanos = metrics.worker_metrics.iter().map(|worker| worker.search.elapsed_nanos).max().unwrap_or(0);
             let trials = metrics.worker_metrics.iter().map(|worker| worker.search.trial_list_evaluations).sum::<u64>();
             let full = metrics.worker_metrics.iter().map(|worker| worker.search.full_recompute_trial_list_evaluations).sum::<u64>();
@@ -888,14 +1058,21 @@ fn result_from_local_search(run: ListLocalSearchRun<'_>, improvement: &mut impl 
                 engine_stop,
                 max_iterations,
                 list_hint,
-                &mut |value| improvement(engine, value),
+                &mut publish_first_incumbent,
                 request.profile,
             );
             let mut metadata = Vec::new();
             append_search_metadata(&mut metadata, &metrics);
-            let iterations = metrics.alns.iterations;
+            let iterations = list_search_iterations(&metrics);
             (solution, metadata, iterations)
         };
+        if solution.feasible && !solution.objectives.is_empty() && !dual_released {
+            dual_gate.release();
+            dual_released = true;
+        }
+        if !dual_released {
+            dual_gate.cancel();
+        }
         let structural_bound = dual_task.join().map_err(|_| SolveError::Engine("dual-bound worker panicked".to_string()))?;
         Ok::<_, SolveError>((solution, metadata, structural_bound, iterations))
     })?;
@@ -1021,6 +1198,7 @@ fn result_from_schedule_local_search(
 }
 
 fn append_search_metadata(metadata: &mut Vec<(String, String)>, metrics: &lists::ListSearchMetrics) {
+    let routing = metrics.routing();
     metadata.extend([
         ("alns_iterations".to_string(), metrics.alns.iterations.to_string()),
         ("candidates_evaluated".to_string(), metrics.candidates.to_string()),
@@ -1028,6 +1206,24 @@ fn append_search_metadata(metadata: &mut Vec<(String, String)>, metrics: &lists:
         ("full_recompute_percentage".to_string(), metrics.full_recompute_percentage().to_string()),
         ("construction_seconds".to_string(), (metrics.construction_nanos as f64 / 1_000_000_000.0).to_string()),
         ("construction_candidates".to_string(), metrics.construction_candidates.to_string()),
+        ("routing_slices".to_string(), routing.slices.to_string()),
+        ("routing_descent_slices".to_string(), routing.descent_slices.to_string()),
+        ("routing_alns_slices".to_string(), routing.alns_slices.to_string()),
+        ("routing_relink_slices".to_string(), routing.relink_slices.to_string()),
+        ("routing_global_scan_slices".to_string(), routing.global_scan_slices.to_string()),
+        ("routing_route_elimination_attempts".to_string(), routing.route_elimination_attempts.to_string()),
+        ("routing_ejection_chain_attempts".to_string(), routing.ejection_chain_attempts.to_string()),
+        ("routing_chain_relocate_attempts".to_string(), routing.chain_relocate_attempts.to_string()),
+        ("routing_guided_segment_exchange_attempts".to_string(), routing.guided_segment_exchange_attempts.to_string()),
+        ("routing_macro_candidates_built".to_string(), routing.macro_candidates_built.to_string()),
+        ("routing_macro_budget_exhaustions".to_string(), routing.macro_budget_exhaustions.to_string()),
+        ("routing_elite_insertions".to_string(), routing.elite_insertions.to_string()),
+        ("routing_elite_rejections".to_string(), routing.elite_rejections.to_string()),
+        ("routing_path_relink_attempts".to_string(), routing.path_relink_attempts.to_string()),
+        ("routing_path_relink_steps".to_string(), routing.path_relink_steps.to_string()),
+        ("routing_path_relink_budget_exhaustions".to_string(), routing.path_relink_budget_exhaustions.to_string()),
+        ("anytime_checkpoints".to_string(), metrics.anytime_checkpoints_metadata()),
+        ("neighborhood_profile".to_string(), metrics.neighborhoods_metadata()),
     ]);
     if let Some(value) = metrics.time_to_first_feasible_nanos {
         metadata.push(("time_to_first_feasible".to_string(), (value as f64 / 1_000_000_000.0).to_string()));
@@ -1040,6 +1236,15 @@ fn append_search_metadata(metadata: &mut Vec<(String, String)>, metrics: &lists:
     }
     if let Some(value) = metrics.constructor_cost {
         metadata.push(("constructor_cost".to_string(), value.to_string()));
+    }
+}
+
+fn list_search_iterations(metrics: &lists::ListSearchMetrics) -> u64 {
+    let slices = metrics.routing().slices;
+    if slices == 0 {
+        metrics.alns.iterations
+    } else {
+        slices
     }
 }
 
