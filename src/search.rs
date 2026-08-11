@@ -21,6 +21,35 @@ use crate::store::{Solver, Store};
 /// A stop flag that is never set; used by the non-interruptible entry points.
 static NEVER_STOP: AtomicBool = AtomicBool::new(false);
 
+/// Optional incumbent shared by concurrent optimization workers.
+///
+/// Presence is stored separately so every `i64` remains a valid objective
+/// value. Writers publish the value before presence; readers that observe
+/// presence therefore also observe an initialized value. Subsequent reads may
+/// briefly see an older incumbent during a concurrent improvement, which is a
+/// valid, weaker cutoff.
+pub(crate) struct SharedObjectiveBound {
+    value: AtomicI64,
+    present: AtomicBool,
+}
+
+impl SharedObjectiveBound {
+    pub(crate) fn new(initial: Option<i64>) -> Self {
+        Self { value: AtomicI64::new(initial.unwrap_or_default()), present: AtomicBool::new(initial.is_some()) }
+    }
+
+    pub(crate) fn load(&self) -> Option<i64> {
+        self.present.load(Ordering::Acquire).then(|| self.value.load(Ordering::Acquire))
+    }
+
+    /// Publish a caller-validated incumbent. Ordering and improvement checks
+    /// remain the responsibility of the portfolio that owns the assignment.
+    pub(crate) fn publish(&self, value: i64) {
+        self.value.store(value, Ordering::Release);
+        self.present.store(true, Ordering::Release);
+    }
+}
+
 /// Whether to keep enumerating after a solution.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SearchControl {
@@ -937,7 +966,7 @@ pub(crate) fn optimize_seeded_with_scope(
     minimizing: bool,
     stop: &AtomicBool,
     seed: u64,
-    shared_bound: Option<&AtomicI64>,
+    shared_bound: Option<&SharedObjectiveBound>,
     clause_sharing: Option<ClauseSharing>,
     cube: &[Lit],
     conflict_budget: Option<u64>,
@@ -965,7 +994,7 @@ pub(crate) fn optimize_seeded(
     minimizing: bool,
     stop: &AtomicBool,
     seed: u64,
-    shared_bound: Option<&AtomicI64>,
+    shared_bound: Option<&SharedObjectiveBound>,
     clause_sharing: Option<ClauseSharing>,
     cube: &[Lit],
     conflict_budget: Option<u64>,
@@ -1003,7 +1032,7 @@ pub(crate) fn optimize_assuming_seeded_with_scope(
     minimizing: bool,
     stop: &AtomicBool,
     seed: u64,
-    shared_bound: Option<&AtomicI64>,
+    shared_bound: Option<&SharedObjectiveBound>,
     clause_sharing: Option<ClauseSharing>,
     conflict_budget: Option<u64>,
     initial_phase: Vec<Option<i32>>,
@@ -1034,7 +1063,7 @@ pub(crate) fn optimize_assuming_seeded(
     minimizing: bool,
     stop: &AtomicBool,
     seed: u64,
-    shared_bound: Option<&AtomicI64>,
+    shared_bound: Option<&SharedObjectiveBound>,
     clause_sharing: Option<ClauseSharing>,
     conflict_budget: Option<u64>,
     initial_phase: Vec<Option<i32>>,

@@ -9,7 +9,7 @@
 
 #![cfg_attr(not(feature = "python"), allow(dead_code))]
 
-use std::sync::atomic::{AtomicBool, AtomicI64};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::constraints::graph;
@@ -23,7 +23,7 @@ use crate::model::list::{
     CollectionModel, CollectionSolution, Constraint, Expr, ExprId, GlobalConstraint, Iterable, Op, ReduceOp, Reduction,
 };
 use crate::propagator::{Event, Inconsistency, Propagator};
-use crate::search::{self, Objective as SearchObjective, SolveStats};
+use crate::search::{self, Objective as SearchObjective, SharedObjectiveBound, SolveStats};
 use crate::store::{Premise, Solver, Store};
 
 use super::{CollectionCompileContext, CompileFailure};
@@ -1058,7 +1058,7 @@ pub(crate) fn solve_compiled(
     if compilation_stopped(stop) {
         return interrupted_outcome(spec);
     }
-    let bound = verified.as_ref().map(|&(_, cost)| AtomicI64::new(cost));
+    let bound = verified.as_ref().map(|&(_, cost)| SharedObjectiveBound::new(Some(cost)));
 
     if compilation_stopped(stop) {
         return interrupted_outcome(spec);

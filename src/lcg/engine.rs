@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
-use crate::expr;
 use crate::expr::Expr;
 use crate::ids::{PropId, VarId};
 use crate::lcg::guarded_sum::GuardedSum;
@@ -16,7 +15,7 @@ use crate::lcg::lit::{Lit, LitOrConst};
 use crate::lcg::trail::{Cdcl, Reason};
 use crate::lcg::view::Tri;
 use crate::propagator::{Event, Inconsistency, Propagator};
-use crate::search::{Objective, SearchControl, SolveStats};
+use crate::search::{Objective, SearchControl, SharedObjectiveBound, SolveStats};
 use crate::store::{Premise, Solver, Store};
 
 /// One in every `REPHASE_PERIOD` restart segments rephases (ignores saved phases
@@ -775,17 +774,14 @@ impl Cdcl<'_> {
                     return false;
                 };
                 self.backjump_to(0);
-                let c = if minimizing { bound } else { -bound };
                 match &cell.handle {
                     Some((id, atom)) => {
-                        atom.store(c, Ordering::Relaxed);
+                        atom.store(bound, Ordering::Relaxed);
                         self.solver.store.enqueue(*id);
                     }
                     None => {
-                        let atom = Arc::new(AtomicI64::new(c));
-                        // Maximizing (expr ≥ bound) as neg(expr) ≤ -bound.
-                        let e = if minimizing { e.clone() } else { expr::neg(e.clone()) };
-                        let id = self.solver.post(Box::new(ObjExprLeq::new(e, Arc::clone(&atom))));
+                        let atom = Arc::new(AtomicI64::new(bound));
+                        let id = self.solver.post(Box::new(ObjExprBound::new(e.clone(), minimizing, Arc::clone(&atom))));
                         cell.handle = Some((id, atom));
                     }
                 }
@@ -917,7 +913,7 @@ impl Cdcl<'_> {
         objective: Objective<'_>,
         minimizing: bool,
         stop: &AtomicBool,
-        shared_bound: Option<&AtomicI64>,
+        shared_bound: Option<&SharedObjectiveBound>,
         cube: &[Lit],
         conflict_budget: Option<u64>,
         mut on_improve: F,
@@ -943,7 +939,7 @@ impl Cdcl<'_> {
         objective: Objective<'_>,
         minimizing: bool,
         stop: &AtomicBool,
-        shared_bound: Option<&AtomicI64>,
+        shared_bound: Option<&SharedObjectiveBound>,
         cube: &[Lit],
         conflict_budget: Option<u64>,
         on_improve: &mut F,
@@ -1012,8 +1008,7 @@ impl Cdcl<'_> {
         // itself improves the shared bound. This remains only a value-ordering
         // policy: CP still checks every constraint before publishing anything.
         if guarded_hint_pending {
-            let shared_incumbent =
-                shared_bound.map(|bound| bound.load(Ordering::Relaxed)).filter(|&value| value != i64::MAX && value != i64::MIN);
+            let shared_incumbent = shared_bound.and_then(SharedObjectiveBound::load);
             let expression = match objective {
                 Objective::Expr(expression) | Objective::BoundedDiveExpr(expression) => Some(expression),
                 Objective::Var(_)
@@ -1052,18 +1047,15 @@ impl Cdcl<'_> {
                 complete = false;
                 break;
             }
-            if let Some(shared) = shared_bound {
-                let value = shared.load(Ordering::Relaxed);
-                if value != i64::MAX && value != i64::MIN {
-                    let stronger = enforced.is_none_or(|old| if minimizing { value < old } else { value > old });
-                    if stronger {
-                        enforced = Some(value);
-                        if !self.tighten_objective(objective, minimizing, value, &mut obj_bound) {
-                            if self.conflict_budget_exhausted() {
-                                complete = false;
-                            }
-                            break;
+            if let Some(value) = shared_bound.and_then(SharedObjectiveBound::load) {
+                let stronger = enforced.is_none_or(|old| if minimizing { value < old } else { value > old });
+                if stronger {
+                    enforced = Some(value);
+                    if !self.tighten_objective(objective, minimizing, value, &mut obj_bound) {
+                        if self.conflict_budget_exhausted() {
+                            complete = false;
                         }
+                        break;
                     }
                 }
             }
@@ -1430,21 +1422,22 @@ impl Propagator for ObjLinearLeq {
     }
 }
 
-/// `expr ≤ bound`, with `bound` from a shared cell. Filtering mirrors
-/// `constraints::intension`'s `Intension` specialized to a `≤ c` root so the rhs
-/// can tighten in place (a maximizing objective is posted as `neg(expr) ≤ -c`).
+/// `expr ≤ bound` when minimizing, or `expr ≥ bound` when maximizing, with the
+/// bound read from a shared cell. Keeping the relation explicit avoids negating
+/// `i64::MIN` while preserving one persistent propagator per optimization run.
 #[derive(Clone)]
-struct ObjExprLeq {
+struct ObjExprBound {
     expr: Expr,
     guarded_sum: Option<GuardedSum>,
     vars: Vec<VarId>,
     bound: Arc<AtomicI64>,
+    minimizing: bool,
     scratch: Vec<i32>,
     probe_cost_per_value: usize,
 }
 
-impl ObjExprLeq {
-    fn new(expr: Expr, bound: Arc<AtomicI64>) -> Self {
+impl ObjExprBound {
+    fn new(expr: Expr, minimizing: bool, bound: Arc<AtomicI64>) -> Self {
         let guarded_sum = GuardedSum::compile(&expr);
         let mut vars = Vec::new();
         expr.collect_vars(&mut vars);
@@ -1460,11 +1453,35 @@ impl ObjExprLeq {
         // domains. Keep the sound interval check in all cases; `propagate`
         // enables this optional filtering only when the current domain-size
         // estimate also fits the work ceiling.
-        Self { expr, guarded_sum, vars, bound, scratch: Vec::new(), probe_cost_per_value: occurrences.max(1) }
+        Self { expr, guarded_sum, vars, bound, minimizing, scratch: Vec::new(), probe_cost_per_value: occurrences.max(1) }
+    }
+
+    fn impossible(&self, lo: i64, hi: i64, bound: i64) -> bool {
+        if self.minimizing {
+            lo > bound
+        } else {
+            hi < bound
+        }
+    }
+
+    fn entailed(&self, lo: i64, hi: i64, bound: i64) -> bool {
+        if self.minimizing {
+            hi <= bound
+        } else {
+            lo >= bound
+        }
+    }
+
+    fn accepts(&self, value: i64, bound: i64) -> bool {
+        if self.minimizing {
+            value <= bound
+        } else {
+            value >= bound
+        }
     }
 }
 
-impl Propagator for ObjExprLeq {
+impl Propagator for ObjExprBound {
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &v in &self.vars {
             store.subscribe(v, me, Event::DomainChange);
@@ -1480,10 +1497,10 @@ impl Propagator for ObjExprLeq {
             },
             |guarded| guarded.bounds(store),
         );
-        if lo > c {
+        if self.impossible(lo, hi, c) {
             return Err(Inconsistency); // can never hold
         }
-        if hi <= c {
+        if self.entailed(lo, hi, c) {
             return Ok(()); // entailed
         }
 
@@ -1509,9 +1526,13 @@ impl Propagator for ObjExprLeq {
                                     (store.min(x) as i64, store.max(x) as i64)
                                 }
                             };
-                            self.expr.bounds(&dom).0 > c
+                            let (lo, hi) = self.expr.bounds(&dom);
+                            self.impossible(lo, hi, c)
                         },
-                        |guarded| guarded.bounds_with_value(store, v, val).0 > c,
+                        |guarded| {
+                            let (lo, hi) = guarded.bounds_with_value(store, v, val);
+                            self.impossible(lo, hi, c)
+                        },
                     );
                     if dead {
                         store.remove(v, val)?;
@@ -1522,7 +1543,7 @@ impl Propagator for ObjExprLeq {
 
         if self.vars.iter().all(|&x| store.is_fixed(x)) {
             match self.expr.eval(&|x| store.value(x) as i64) {
-                Some(n) if n <= c => {}
+                Some(n) if self.accepts(n, c) => {}
                 _ => return Err(Inconsistency),
             }
         }

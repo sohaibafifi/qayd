@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicI64};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::constraints::linear::{linear, Relation};
@@ -6,7 +6,7 @@ use crate::expr::Expr;
 use crate::lcg::clause::{ClauseSharing, SharedClausePool};
 use crate::lcg::engine::audit_affine_expr_directions;
 use crate::problem::Objective as ProblemObjective;
-use crate::search::{optimize_seeded, optimize_seeded_with_scope, Objective};
+use crate::search::{optimize_seeded, optimize_seeded_with_scope, Objective, SharedObjectiveBound};
 use crate::Solver;
 
 fn first_linear_incumbent(coeffs: &[i64], minimizing: bool) -> (i64, Vec<i32>) {
@@ -33,6 +33,17 @@ fn first_linear_incumbent_seeded(coeffs: &[i64], minimizing: bool, seed: u64) ->
         |value, assignment| incumbents.push((value, assignment.to_vec())),
     );
     incumbents.into_iter().next().expect("optimizer must find an incumbent")
+}
+
+#[test]
+fn shared_objective_bound_reserves_no_i64_value() {
+    let empty = SharedObjectiveBound::new(None);
+    assert_eq!(empty.load(), None);
+    empty.publish(i64::MAX);
+    assert_eq!(empty.load(), Some(i64::MAX));
+
+    let minimum = SharedObjectiveBound::new(Some(i64::MIN));
+    assert_eq!(minimum.load(), Some(i64::MIN));
 }
 
 #[test]
@@ -277,7 +288,7 @@ fn materialized_search_views_import_the_shared_cutoff() {
     linear(&mut root, &[1, 1, -1], &[x, y, objective], Relation::Eq, 0);
     let search = [x, y, objective];
     let physical_objective = ProblemObjective::VarWithAffine(true, objective, vec![1, 1], vec![x, y]);
-    let shared_optimum = AtomicI64::new(0);
+    let shared_optimum = SharedObjectiveBound::new(Some(0));
     let run = |mut solver: Solver, search_objective: Objective<'_>| {
         let mut incumbents = Vec::new();
         let _ = optimize_seeded(
@@ -310,7 +321,7 @@ fn materialized_affine_constant_never_changes_the_authoritative_cutoff() {
     linear(&mut root, &[1, -1], &[x, objective], Relation::Eq, -5);
     let search = [x, objective];
     let physical_objective = ProblemObjective::VarWithAffine(true, objective, vec![1], vec![x]);
-    let shared_optimum = AtomicI64::new(5);
+    let shared_optimum = SharedObjectiveBound::new(Some(5));
 
     for search_objective in [physical_objective.search(), physical_objective.bounded_dive_search()] {
         let mut solver = root.clone();

@@ -19,7 +19,7 @@ use crate::orchestrator::{execute_workers, execute_workers_silent, merge_search_
 use crate::problem::{Objective, Problem};
 use crate::search::{
     decide_sat_assuming_seeded_with_scope, decide_sat_shared_seeded, find_one_seeded_with_scope, optimize_seeded_with_scope,
-    probe_seeded_with_scope, split_cube_seeded_with_scope, SolveStats,
+    probe_seeded_with_scope, split_cube_seeded_with_scope, SharedObjectiveBound, SolveStats,
 };
 use crate::store::Solver;
 
@@ -266,7 +266,7 @@ struct Improvement {
 struct CopShared {
     cancel: Arc<AtomicBool>,
     proved: AtomicBool,
-    best: AtomicI64,
+    best: SharedObjectiveBound,
     solution: Mutex<Option<(Vec<i32>, i64)>>,
     clauses: Arc<SharedClausePool>,
     work: WorkQueue,
@@ -293,21 +293,16 @@ impl CopShared {
         solution: &[i32],
         source: WorkerSource,
     ) -> bool {
-        let mut current = self.best.load(Ordering::Relaxed);
-        while if self.minimizing { value < current } else { value > current } {
-            match self.best.compare_exchange_weak(current, value, Ordering::AcqRel, Ordering::Relaxed) {
-                Ok(_) => {
-                    let mut slot = self.solution.lock().unwrap();
-                    if self.best.load(Ordering::Acquire) == value {
-                        *slot = Some((solution.to_vec(), value));
-                    }
-                    context.publish_latest(Improvement { value, source, solution: self.publish_incumbents.then(|| solution.to_vec()) });
-                    return true;
-                }
-                Err(actual) => current = actual,
-            }
+        let mut slot = self.solution.lock().unwrap();
+        let improves = slot.as_ref().is_none_or(|(_, current)| if self.minimizing { value < *current } else { value > *current });
+        if !improves {
+            return false;
         }
-        false
+        self.best.publish(value);
+        *slot = Some((solution.to_vec(), value));
+        drop(slot);
+        context.publish_latest(Improvement { value, source, solution: self.publish_incumbents.then(|| solution.to_vec()) });
+        true
     }
 
     fn incumbent(&self) -> Option<Vec<i32>> {
@@ -315,13 +310,13 @@ impl CopShared {
     }
 
     fn next_probe(&self) -> Option<i32> {
-        let best = self.best.load(Ordering::Acquire);
+        let best = self.best.load();
         let lower = self.probe_lower.load(Ordering::Acquire);
         let upper = self.probe_upper.load(Ordering::Acquire);
-        let (lo, hi) = if self.minimizing {
-            (lower, if best == i64::MAX { upper } else { best - 1 })
-        } else {
-            (if best == i64::MIN { lower } else { best + 1 }, upper)
+        let (lo, hi) = match (self.minimizing, best) {
+            (true, Some(best)) => (lower, upper.min(best.saturating_sub(1))),
+            (false, Some(best)) => (lower.max(best.saturating_add(1)), upper),
+            (true, None) | (false, None) => (lower, upper),
         };
         (lo <= hi).then(|| (lo + (hi - lo) / 2) as i32)
     }
@@ -336,19 +331,13 @@ impl CopShared {
     }
 
     fn finish_if_probed(&self) -> bool {
-        let best = self.best.load(Ordering::Acquire);
+        let best = self.best.load();
         let lower = self.probe_lower.load(Ordering::Acquire);
         let upper = self.probe_upper.load(Ordering::Acquire);
-        let proved = if self.minimizing {
-            if best == i64::MAX {
-                lower > upper
-            } else {
-                lower >= best
-            }
-        } else if best == i64::MIN {
-            upper < lower
-        } else {
-            upper <= best
+        let proved = match (self.minimizing, best) {
+            (true, Some(best)) => lower >= best,
+            (false, Some(best)) => upper <= best,
+            (true, None) | (false, None) => lower > upper,
         };
         if proved {
             self.proved.store(true, Ordering::Release);
@@ -423,9 +412,7 @@ fn optimize_worker(
     // Concurrent symbolic workers must keep independent bound propagators, so
     // each one imports a stable snapshot of the latest verified incumbent.
     // Materialized objectives can safely share the atomic cutoff directly.
-    // CopShared already reserves i64::MIN and i64::MAX as absence sentinels, so
-    // this path deliberately preserves its inability to import those values.
-    let symbolic_snapshot = (!materialized).then(|| AtomicI64::new(shared.best.load(Ordering::Acquire)));
+    let symbolic_snapshot = (!materialized).then(|| SharedObjectiveBound::new(shared.best.load()));
     let shared_bound = if materialized { Some(&shared.best) } else { symbolic_snapshot.as_ref() };
     let mut improved = false;
     let (_, stats, complete) = optimize_seeded_with_scope(
@@ -755,7 +742,7 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
     let shared = Arc::new(CopShared {
         cancel: Arc::clone(&cancel),
         proved: AtomicBool::new(false),
-        best: AtomicI64::new(initial_value.unwrap_or(if minimizing { i64::MAX } else { i64::MIN })),
+        best: SharedObjectiveBound::new(initial_value),
         solution: Mutex::new(initial_solution),
         clauses: Arc::new(SharedClausePool::with_capacity(options.shared_pool_capacity)),
         work: WorkQueue::new(),

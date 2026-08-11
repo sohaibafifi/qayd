@@ -37,6 +37,37 @@ fn canonical_cp_proves_mixed_direction_lexicographic_objectives() {
     result.validate_contract().unwrap();
 }
 
+fn constant_extreme_objective(variable: qayd::model::IntVarRef, value: i64) -> IntExpr {
+    IntExpr::Add(vec![IntExpr::Mul(vec![IntExpr::Variable(variable), IntExpr::Constant(0)]), IntExpr::Constant(value)])
+}
+
+#[test]
+fn exact_cp_preserves_extreme_objective_values_as_real_incumbents() {
+    for threads in [1, 2] {
+        for (minimize, value) in [(true, i64::MAX), (false, i64::MIN)] {
+            let mut model = Model::new();
+            let variable = model.int_range(0, 1);
+            model.add_objective(Objective::IntExpr { minimize, expr: constant_extreme_objective(variable, value) });
+
+            let request = SolveRequest { threads, ..SolveRequest::default() };
+            let result = solve_model(&ModelPackage::new(model), &request, &mut qayd::orchestrator::IgnoreEvents).unwrap();
+
+            assert_eq!(
+                result.status(),
+                SolveStatus::Optimal,
+                "extreme objective {value} with minimize={minimize} and threads={threads} returned {:?}",
+                result.status()
+            );
+            let candidate = result.primal().expect("an extreme objective still has a feasible assignment");
+            assert_eq!(candidate.objectives(), [value]);
+            assert!(candidate.assignment().integers[variable.0].is_some());
+            assert_eq!(result.bounds().iter().map(|bound| bound.value).collect::<Vec<_>>(), [value]);
+            assert_eq!(result.proof().map(|proof| proof.conclusion()), Some(ProvenConclusion::Optimal));
+            result.validate_contract().unwrap();
+        }
+    }
+}
+
 #[test]
 fn requested_cp_incumbents_cross_the_bus_only_after_transfer_replay() {
     let mut model = Model::new();
