@@ -1,6 +1,7 @@
 """Checks for per-instance positioning aggregation and paired comparisons."""
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 
@@ -65,3 +66,19 @@ def test_unknown_on_both_sides_is_unresolved():
 
     paired = report.paired_rows(records)[0]
     assert paired["unresolved"] == 1
+
+
+def test_clean_provenance_does_not_emit_dirty_warning(tmp_path):
+    report = load_report_module()
+    campaign = tmp_path / "campaign.jsonl"
+    campaign.write_text(json.dumps(record("qayd-api", 0, [1])) + "\n", encoding="utf-8")
+    campaign.with_suffix(".jsonl.provenance.json").write_text(
+        json.dumps({"host": {"dirty": False}}) + "\n",
+        encoding="utf-8",
+    )
+
+    rendered = report.markdown(report.build_summary([campaign]))
+
+    assert "Provenance dirty: non." in rendered
+    assert "La provenance est propre" in rendered
+    assert "La provenance dirty interdit" not in rendered

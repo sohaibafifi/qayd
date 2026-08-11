@@ -206,6 +206,16 @@ def provenance(paths: Sequence[Path]) -> dict[str, Any]:
 
 
 def markdown(summary: dict[str, Any]) -> str:
+    if summary["provenance"]["dirty"]:
+        provenance_limit = (
+            "La provenance dirty interdit de présenter ces chiffres comme un résultat de release "
+            "tant que le code mesuré et les outils d'étude ne sont pas figés dans un commit propre."
+        )
+    else:
+        provenance_limit = (
+            "La provenance est propre et permet d'identifier exactement le code mesuré. "
+            "Elle ne compense toutefois pas les limites statistiques du protocole."
+        )
     lines = [
         "# Première étude de positionnement de qayd",
         "",
@@ -283,7 +293,10 @@ def markdown(summary: dict[str, Any]) -> str:
         "",
         "## Limites de l'étude",
         "",
-        "Cette matrice est une première étude locale stratifiée, pas une publication définitive. Cinq seeds permettent d'estimer la médiane et la robustesse, mais restent insuffisants pour une inférence statistique fine. Le budget unique de dix secondes favorise le démarrage rapide et ne décrit pas la convergence longue. La provenance dirty interdit de présenter ces chiffres comme un résultat de release tant que le code mesuré et les outils d'étude ne sont pas figés dans un commit propre.",
+        "Cette matrice est une première étude locale stratifiée, pas une publication définitive. "
+        "Cinq seeds permettent d'estimer la médiane et la robustesse, mais restent insuffisants "
+        "pour une inférence statistique fine. Le budget unique de dix secondes favorise le "
+        f"démarrage rapide et ne décrit pas la convergence longue. {provenance_limit}",
         "",
     ))
     return "\n".join(lines)
