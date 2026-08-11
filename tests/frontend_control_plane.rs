@@ -119,3 +119,17 @@ fn portfolio_allocation_and_schedule_analysis_have_one_owner() {
     assert!(list_eval.contains("eval_reduction_on_contents"));
     assert!(!list_eval.contains("match reduction.iterable"), "list LS reintroduced a second reduction evaluator");
 }
+
+#[test]
+fn integer_local_search_uses_transactional_invariants() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let search = fs::read_to_string(root.join("src/engines/ls/cop.rs")).expect("integer local-search source");
+    let invariants = fs::read_to_string(root.join("src/engines/ls/cop/invariants.rs")).expect("integer invariant graph source");
+
+    assert!(search.contains("InvariantState::new"));
+    assert!(!search.contains("copy_from_slice(assignment)"), "candidate scoring copied the complete assignment");
+    assert!(!search.contains("model.complete(work)"), "candidate scoring recomputed every functional");
+    for operation in ["fn evaluate", "fn commit", "fn rollback"] {
+        assert!(invariants.contains(operation), "integer invariant graph has no `{operation}` operation");
+    }
+}

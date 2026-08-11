@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use qayd::constraints::linear::Relation;
-use qayd::engines::ls::cop::{solve_ls, solve_ls_capped, solve_ls_capped_borrowed, LocalSearchSpec, LsConfig, MAX_DOMAIN_VALUES};
+use qayd::engines::ls::cop::{
+    audit_invariant_transactions, solve_ls, solve_ls_capped, solve_ls_capped_borrowed, LocalSearchSpec, LsConfig, MAX_DOMAIN_VALUES,
+};
 use qayd::expr::Expr;
 use qayd::ids::VarId;
 use qayd::problem::{Objective, Problem};
@@ -14,6 +16,137 @@ struct SignedProductSquareFixture {
     spec: LocalSearchSpec,
     signs: Vec<VarId>,
     aggregates: Vec<VarId>,
+}
+
+#[test]
+fn integer_invariant_graph_deltas_rollback_and_commit_exactly() {
+    let mut solver = Solver::new();
+    let x = solver.new_var_range(0, 5);
+    let y = solver.new_var_range(0, 5);
+    let z = solver.new_var_range(0, 5);
+    let independent = solver.new_var_range(0, 5);
+    let problem =
+        Problem { solver, search: vec![x, y, z, independent], objective: Some(Objective::Linear(true, vec![3, 7], vec![z, independent])) };
+    let mut spec = LocalSearchSpec::default();
+    for variable in [x, y, z, independent] {
+        spec.add_var(variable);
+    }
+    // Deliberately post the chain backwards. Graph compilation must establish
+    // x -> y -> z before any speculative move is scored.
+    spec.add_expr(Expr::Eq(Box::new(Expr::Var(z)), Box::new(Expr::Var(y))));
+    spec.add_expr(Expr::Eq(Box::new(Expr::Var(y)), Box::new(Expr::Var(x))));
+    spec.add_linear(vec![1], vec![z], Relation::Ge, 0);
+    spec.add_linear(vec![1], vec![independent], Relation::Ge, 0);
+
+    let moves = [(x, 4), (independent, 3), (x, 1), (independent, 5)];
+    let audit = audit_invariant_transactions(&problem, spec, vec![0; 4], &moves).expect("invariant transaction drift");
+
+    assert_eq!(audit.trials, moves.len() as u64);
+    assert_eq!(audit.rollbacks, audit.trials);
+    assert_eq!(audit.commits, audit.trials);
+    assert_eq!(audit.full_rebuilds, 1, "speculative moves must not trigger full rebuilds");
+    assert_eq!(audit.functional_evaluations, 8, "only the two x moves should traverse the two-node functional chain");
+    assert_eq!(audit.constraint_evaluations, 16, "each transaction should refresh only its dependent constraints");
+    assert_eq!(audit.objective_evaluations, 8);
+    assert_eq!(audit.objective_full_evaluations, 1, "affine trials must update the objective by delta");
+}
+
+#[test]
+fn integer_invariant_graph_rolls_back_invalid_derived_values() {
+    let mut solver = Solver::new();
+    let x = solver.new_var_range(0, 1);
+    let derived = solver.new_var_range(0, 0);
+    let problem = Problem { solver, search: vec![x, derived], objective: Some(Objective::Var(true, derived)) };
+    let mut spec = LocalSearchSpec::default();
+    spec.add_var(x);
+    spec.add_var(derived);
+    spec.add_expr(Expr::Eq(Box::new(Expr::Var(derived)), Box::new(Expr::Var(x))));
+
+    let moves = [(x, 1), (x, 0)];
+    let audit = audit_invariant_transactions(&problem, spec, vec![0, 0], &moves).expect("invalid functional rollback drift");
+
+    assert_eq!(audit.trials, 2);
+    assert_eq!(audit.rollbacks, 2);
+    assert_eq!(audit.commits, 2);
+    assert_eq!(audit.full_rebuilds, 1);
+}
+
+#[test]
+fn integer_invariant_graph_work_is_proportional_to_the_affected_subgraph() {
+    const CHAINS: usize = 64;
+    let mut solver = Solver::new();
+    let decisions = (0..CHAINS).map(|_| solver.new_var_range(0, 1)).collect::<Vec<_>>();
+    let derived = (0..CHAINS).map(|_| solver.new_var_range(0, 1)).collect::<Vec<_>>();
+    let mut search = decisions.clone();
+    search.extend_from_slice(&derived);
+    let problem = Problem { solver, search, objective: Some(Objective::Linear(true, vec![1; CHAINS], derived.clone())) };
+    let mut spec = LocalSearchSpec::default();
+    for variable in decisions.iter().chain(&derived) {
+        spec.add_var(*variable);
+    }
+    for (&decision, &target) in decisions.iter().zip(&derived) {
+        spec.add_expr(Expr::Eq(Box::new(Expr::Var(target)), Box::new(Expr::Var(decision))));
+    }
+
+    let audit = audit_invariant_transactions(&problem, spec, vec![0; CHAINS * 2], &[(decisions[37], 1)])
+        .expect("independent invariant subgraph drift");
+
+    assert_eq!(audit.functional_evaluations, 2, "trial plus commit should touch one functional, not all 64");
+    assert_eq!(audit.constraint_evaluations, 2, "trial plus commit should touch one defining constraint, not all 64");
+    assert_eq!(audit.objective_evaluations, 2);
+    assert_eq!(audit.objective_full_evaluations, 1, "the 64-term objective should use its compiled delta after initialization");
+}
+
+#[test]
+fn integer_invariant_graph_stores_direct_arcs_and_stops_on_unchanged_outputs() {
+    const CHAIN: usize = 512;
+    let mut solver = Solver::new();
+    let variables = (0..CHAIN).map(|_| solver.new_var_range(0, 1)).collect::<Vec<_>>();
+    let problem = Problem { solver, search: variables.clone(), objective: Some(Objective::Var(true, variables[CHAIN - 1])) };
+    let mut spec = LocalSearchSpec::default();
+    for variable in &variables {
+        spec.add_var(*variable);
+    }
+    spec.add_expr(Expr::Eq(Box::new(Expr::Var(variables[1])), Box::new(Expr::Mul(vec![Expr::Const(0), Expr::Var(variables[0])]))));
+    for pair in variables[1..].windows(2) {
+        spec.add_expr(Expr::Eq(Box::new(Expr::Var(pair[1])), Box::new(Expr::Var(pair[0]))));
+    }
+
+    let audit = audit_invariant_transactions(&problem, spec, vec![0; CHAIN], &[(variables[0], 1)])
+        .expect("unchanged functional output transaction drift");
+
+    assert_eq!(audit.functional_arcs, CHAIN - 1, "a chain must be stored as direct arcs, not as a quadratic transitive closure");
+    assert_eq!(audit.functional_evaluations, 2, "trial plus commit should stop at the first unchanged derived value");
+    assert_eq!(audit.objective_evaluations, 0, "an unchanged objective dependency must not be rescored");
+    assert_eq!(audit.objective_full_evaluations, 1);
+}
+
+#[test]
+fn integer_invariant_objective_uses_affine_deltas_and_safe_fallback() {
+    let mut affine_solver = Solver::new();
+    let affine_var = affine_solver.new_var_range(0, 3);
+    let affine_objective = Expr::Add(vec![Expr::Const(5), Expr::Mul(vec![Expr::Const(3), Expr::Var(affine_var)])]);
+    let affine_problem =
+        Problem { solver: affine_solver, search: vec![affine_var], objective: Some(Objective::Expr(false, affine_objective)) };
+    let mut affine_spec = LocalSearchSpec::default();
+    affine_spec.add_var(affine_var);
+    let moves = [(affine_var, 2), (affine_var, 1)];
+    let affine = audit_invariant_transactions(&affine_problem, affine_spec, vec![0], &moves).expect("max affine objective delta drift");
+    assert_eq!(affine.objective_evaluations, 4);
+    assert_eq!(affine.objective_full_evaluations, 1);
+
+    let mut nonlinear_solver = Solver::new();
+    let nonlinear_var = nonlinear_solver.new_var_range(0, 3);
+    let nonlinear_objective = Expr::Mul(vec![Expr::Var(nonlinear_var), Expr::Var(nonlinear_var)]);
+    let nonlinear_problem =
+        Problem { solver: nonlinear_solver, search: vec![nonlinear_var], objective: Some(Objective::Expr(true, nonlinear_objective)) };
+    let mut nonlinear_spec = LocalSearchSpec::default();
+    nonlinear_spec.add_var(nonlinear_var);
+    let nonlinear_moves = [(nonlinear_var, 2), (nonlinear_var, 1)];
+    let nonlinear = audit_invariant_transactions(&nonlinear_problem, nonlinear_spec, vec![0], &nonlinear_moves)
+        .expect("nonlinear objective fallback drift");
+    assert_eq!(nonlinear.objective_evaluations, 4);
+    assert_eq!(nonlinear.objective_full_evaluations, 5);
 }
 
 fn unit_sum_values(terms: usize) -> Vec<i32> {

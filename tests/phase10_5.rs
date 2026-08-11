@@ -176,6 +176,36 @@ fn semantic_integer_local_search_uses_the_canonical_plan_and_replay() {
 }
 
 #[test]
+fn semantic_integer_local_search_reports_transactional_invariant_work() {
+    let mut model = Model::new();
+    let value = model.int_range(0, 5);
+    model.add_constraint(Constraint::Linear { terms: vec![(1, value)], relation: Relation::Ge, rhs: 1 });
+    model.add_objective(Objective::IntExpr { minimize: true, expr: IntExpr::Variable(value) });
+    let request = SolveRequest {
+        mode: SolveMode::LocalSearch,
+        limits: qayd::orchestrator::SolveLimits { iterations: Some(8), ..Default::default() },
+        ..SolveRequest::default()
+    };
+
+    let result = solve_model_silent(&ModelPackage::new(model), &request).unwrap();
+    let metadata = &result.reports()[0].metadata;
+    let metric = |name: &str| {
+        metadata
+            .iter()
+            .find_map(|(key, value)| (key == name).then(|| value.parse::<u64>().unwrap()))
+            .unwrap_or_else(|| panic!("missing integer LS metric {name}"))
+    };
+
+    let trials = metric("ls_invariant_trials");
+    assert!(trials > 0);
+    assert_eq!(metric("ls_invariant_rollbacks"), trials);
+    assert!(metric("ls_invariant_constraint_evaluations") > 0);
+    let rebuilds = metric("ls_invariant_full_rebuilds");
+    assert!(rebuilds >= 1);
+    assert_eq!(metric("ls_invariant_objective_full_evaluations"), rebuilds);
+}
+
+#[test]
 fn required_proofs_reject_heuristic_plans_and_accept_exact_completion() {
     let mut heuristic_model = Model::new();
     let heuristic_value = heuristic_model.int_range(7, 7);

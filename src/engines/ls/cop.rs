@@ -1,5 +1,7 @@
 //! Incumbent-only local search for the `--ls` COP engine.
 
+mod invariants;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -201,6 +203,14 @@ pub struct LocalSearchOutcome {
     pub(crate) functionals: usize,
     #[allow(dead_code, reason = "retained for the structured LS report migration")]
     pub(crate) unsupported: usize,
+    pub(crate) invariant_trials: u64,
+    pub(crate) invariant_rollbacks: u64,
+    pub(crate) invariant_commits: u64,
+    pub(crate) invariant_functional_evaluations: u64,
+    pub(crate) invariant_constraint_evaluations: u64,
+    pub(crate) invariant_objective_evaluations: u64,
+    pub(crate) invariant_objective_full_evaluations: u64,
+    pub(crate) invariant_full_rebuilds: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -374,12 +384,7 @@ struct LocalModel {
     functionals: Vec<Functional>,
     bool_tables: HashMap<(VarId, VarId), Vec<(i32, i32)>>,
     exact_covers: Vec<Vec<VarId>>,
-    /// Incidence index for incremental move scoring: `affected[v]` is the set of
-    /// constraint indices whose violation depends on variable `v`, directly or
-    /// transitively through functionals (a flipped `v` propagates to functional
-    /// targets via `complete()`, so constraints over those targets are included).
-    /// Built once in [`LocalModel::new`]; reused by the delta-scoring move loop.
-    affected: Vec<Vec<usize>>,
+    invariants: invariants::InvariantGraph,
 }
 
 /// A strictly recognized sum of squared bilinear-product groups over signs.
@@ -709,7 +714,7 @@ fn relation_violation(lhs: i64, rel: Relation, rhs: i64) -> i64 {
 /// violations into a `Score.violation`, clamping at `i64::MAX` to match the
 /// `saturating_add` of [`LocalModel::score_breakdown`].
 fn combine_violation(penalty: i128, sum: i128) -> i64 {
-    let total = penalty + sum;
+    let total = penalty.saturating_add(sum);
     if total > i64::MAX as i128 {
         i64::MAX
     } else {
@@ -719,7 +724,10 @@ fn combine_violation(penalty: i128, sum: i128) -> i64 {
 
 /// GLS-weighted sum of per-constraint violations: `Σ wᵢ·violᵢ`.
 fn weighted_sum(con_viol: &[i64], weights: &[i64]) -> i128 {
-    con_viol.iter().zip(weights).map(|(&v, &w)| i128::from(v) * i128::from(w)).sum()
+    con_viol
+        .iter()
+        .zip(weights)
+        .fold(0i128, |sum, (&violation, &weight)| sum.saturating_add(i128::from(violation).saturating_mul(i128::from(weight))))
 }
 
 /// Min-conflicts (#1b) candidate-value set for `var` on a large domain: the current
@@ -739,7 +747,7 @@ fn min_conflict_candidates(
     out.clear();
     let j = var.index();
     out.push(assignment[j]);
-    for &c in &model.affected[j] {
+    for &c in model.invariants.constraints(var) {
         if let LocalConstraint::Linear { coeffs, vars, rhs, .. } = &model.constraints[c] {
             if let Some(p) = vars.iter().position(|&v| v == var) {
                 let a = coeffs[p];
@@ -903,49 +911,11 @@ fn mismatch_symbols(functionals: &[Functional], counter: VarId) -> Option<Vec<(V
     Some(symbols)
 }
 
-/// Build the [`LocalModel::affected`] incidence index. Seed it with each
-/// constraint's direct variable scope, then walk functionals in reverse
-/// topological order (`functionals` is in forward topo order for `complete()`'s
-/// single pass) pushing each target's dependent-constraint set back onto the
-/// input variables that determine it. The result: `affected[v]` lists every
-/// constraint whose violation can change when `v` is flipped.
-fn build_affected(num_vars: usize, constraints: &[LocalConstraint], functionals: &[Functional]) -> Vec<Vec<usize>> {
-    let mut affected: Vec<Vec<usize>> = vec![Vec::new(); num_vars];
-    let mut scratch = Vec::new();
-    for (ci, constraint) in constraints.iter().enumerate() {
-        scratch.clear();
-        constraint_vars(constraint, &mut scratch);
-        for &v in &scratch {
-            if v.index() < num_vars {
-                affected[v.index()].push(ci);
-            }
-        }
+fn order_functionals(mut functionals: Vec<Functional>) -> Option<Vec<Functional>> {
+    let mut targets = HashSet::with_capacity(functionals.len());
+    if functionals.iter().any(|functional| !targets.insert(functional_target(functional))) {
+        return None;
     }
-    for functional in functionals.iter().rev() {
-        let target = functional_target(functional);
-        if target.index() >= num_vars {
-            continue;
-        }
-        let dependents = affected[target.index()].clone();
-        if dependents.is_empty() {
-            continue;
-        }
-        scratch.clear();
-        functional_inputs(functional, &mut scratch);
-        for &input in &scratch {
-            if input.index() < num_vars {
-                affected[input.index()].extend(dependents.iter().copied());
-            }
-        }
-    }
-    for entry in &mut affected {
-        entry.sort_unstable();
-        entry.dedup();
-    }
-    affected
-}
-
-fn order_functionals(mut functionals: Vec<Functional>) -> Vec<Functional> {
     let mut ordered = Vec::with_capacity(functionals.len());
     while !functionals.is_empty() {
         let remaining_targets = functionals.iter().map(functional_target).collect::<HashSet<_>>();
@@ -954,15 +924,9 @@ fn order_functionals(mut functionals: Vec<Functional>) -> Vec<Functional> {
             functional_inputs(functional, &mut inputs);
             inputs.into_iter().all(|input| !remaining_targets.contains(&input))
         });
-        match ready {
-            Some(index) => ordered.push(functionals.remove(index)),
-            None => {
-                ordered.extend(functionals);
-                break;
-            }
-        }
+        ordered.push(functionals.remove(ready?));
     }
-    ordered
+    Some(ordered)
 }
 
 impl LocalRhs {
@@ -1233,10 +1197,10 @@ impl LocalModel {
             .filter(|&var| domains[var.index()].is_searchable() && !spec.derived.get(var.index()).copied().unwrap_or(false))
             .collect();
         let constraints = spec.constraints;
-        let functionals = order_functionals(spec.functionals);
+        let functionals = order_functionals(spec.functionals).ok_or(1usize)?;
         let bool_tables = bool_tables(&functionals);
         let exact_covers = exact_cover_rows(&constraints, &domains);
-        let affected = build_affected(domains.len(), &constraints, &functionals);
+        let invariants = invariants::InvariantGraph::compile(domains.len(), &constraints, &functionals, &objective).ok_or(1usize)?;
         Ok(Self {
             domains,
             mutable,
@@ -1246,7 +1210,7 @@ impl LocalModel {
             functionals,
             bool_tables,
             exact_covers,
-            affected,
+            invariants,
         })
     }
 
@@ -2380,7 +2344,7 @@ impl LocalModel {
             violation = violation.saturating_add(self.violation(constraint, assignment));
         }
         let objective = self.objective_value(assignment).unwrap_or(i64::MAX / 4);
-        Score { violation, objective: if self.objective.minimizing() { objective } else { -objective } }
+        Score { violation, objective: if self.objective.minimizing() { objective } else { objective.saturating_neg() } }
     }
 
     fn score_ignoring_constraints(&self, assignment: &mut [i32], ignored: &[usize]) -> Score {
@@ -2394,7 +2358,7 @@ impl LocalModel {
             }
         }
         let objective = self.objective_value(assignment).unwrap_or(i64::MAX / 4);
-        Score { violation, objective: if self.objective.minimizing() { objective } else { -objective } }
+        Score { violation, objective: if self.objective.minimizing() { objective } else { objective.saturating_neg() } }
     }
 
     /// Score plus the per-constraint violation vector and completeness flag, used
@@ -2407,12 +2371,12 @@ impl LocalModel {
         let mut weighted: i128 = 0;
         for (i, constraint) in self.constraints.iter().enumerate() {
             let v = self.violation(constraint, assignment);
-            weighted += i128::from(v) * i128::from(weights[i]);
+            weighted = weighted.saturating_add(i128::from(v).saturating_mul(i128::from(weights[i])));
             con_viol.push(v);
         }
         let penalty = i128::from(!complete) * 1_000_000;
         let objective = self.objective_value(assignment).unwrap_or(i64::MAX / 4);
-        let objective = if self.objective.minimizing() { objective } else { -objective };
+        let objective = if self.objective.minimizing() { objective } else { objective.saturating_neg() };
         (Score { violation: combine_violation(penalty, weighted), objective }, con_viol, complete)
     }
 
@@ -3302,30 +3266,23 @@ fn kick_reward(before: Score, after: Score) -> f64 {
     100.0 * signed_log_delta(violation) + signed_log_delta(objective)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn best_single_variable_move(
     model: &LocalModel,
-    assignment: &[i32],
-    work: &mut [i32],
-    weights: &[i64],
-    con_viol: &[i64],
-    viol_sum: i128,
-    minimizing: bool,
+    state: &mut invariants::InvariantState<'_>,
     config: LsConfig,
     value_sets: &[Option<HashSet<i32>>],
     cand_values: &mut Vec<i32>,
     seed: u64,
     iter: u64,
-) -> Option<(Score, usize, i32)> {
-    let focused = model.focused_repair_vars(assignment, seed, iter);
+) -> Option<(Score, VarId, i32)> {
+    let focused = model.focused_repair_vars(state.assignment(), seed, iter);
     let candidates = if focused.is_empty() { candidate_vars(&model.mutable, seed, iter) } else { focused };
-    let mut best_move: Option<(Score, usize, i32)> = None;
+    let mut best_move: Option<(Score, VarId, i32)> = None;
     for var in candidates {
         let j = var.index();
-        let old_val = assignment[j];
-        let affected = &model.affected[j];
+        let old_val = state.assignment()[j];
         let candidate_values: &[i32] = if config.min_conflicts && value_sets.get(j).and_then(Option::as_ref).is_some() {
-            min_conflict_candidates(model, var, assignment, value_sets[j].as_ref().unwrap(), seed, iter, cand_values);
+            min_conflict_candidates(model, var, state.assignment(), value_sets[j].as_ref().unwrap(), seed, iter, cand_values);
             cand_values
         } else if model.domains[j].values.is_empty() {
             model.domains[j].sample_range(seed ^ iter ^ (j as u64), cand_values);
@@ -3337,93 +3294,13 @@ fn best_single_variable_move(
             if value == old_val {
                 continue;
             }
-            work.copy_from_slice(assignment);
-            work[j] = value;
-            let trial_complete = model.complete(work);
-            let mut delta: i128 = 0;
-            for &c in affected {
-                delta += (i128::from(model.violation(&model.constraints[c], work)) - i128::from(con_viol[c])) * i128::from(weights[c]);
-            }
-            let trial_penalty = i128::from(!trial_complete) * 1_000_000;
-            let violation = combine_violation(trial_penalty, viol_sum + delta);
-            let objective = model.objective_value(work).unwrap_or(i64::MAX / 4);
-            let objective = if minimizing { objective } else { -objective };
-            let score = Score { violation, objective };
+            let score = state.evaluate(var, value);
             if best_move.as_ref().is_none_or(|&(best, _, _)| score < best) {
-                best_move = Some((score, j, value));
+                best_move = Some((score, var, value));
             }
         }
     }
     best_move
-}
-
-#[allow(clippy::too_many_arguments)]
-fn apply_single_variable_move(
-    model: &LocalModel,
-    assignment: &mut [i32],
-    con_viol: &mut [i64],
-    viol_sum: &mut i128,
-    complete_now: &mut bool,
-    current: &mut Score,
-    weights: &[i64],
-    score: Score,
-    j: usize,
-    value: i32,
-) {
-    assignment[j] = value;
-    *complete_now = model.complete(assignment);
-    for &c in &model.affected[j] {
-        let updated = model.violation(&model.constraints[c], assignment);
-        *viol_sum += (i128::from(updated) - i128::from(con_viol[c])) * i128::from(weights[c]);
-        con_viol[c] = updated;
-    }
-    *current = score;
-    #[cfg(debug_assertions)]
-    {
-        let mut check = assignment.to_vec();
-        let (full, _, full_complete) = model.score_breakdown(&mut check, weights);
-        debug_assert_eq!(full, *current, "incremental LS score drifted from full recompute");
-        debug_assert_eq!(full_complete, *complete_now, "LS completeness cache drifted");
-        debug_assert_eq!(
-            full.violation,
-            combine_violation(i128::from(!*complete_now) * 1_000_000, *viol_sum),
-            "LS violation-sum cache drifted"
-        );
-    }
-}
-
-fn refresh_score(
-    model: &LocalModel,
-    assignment: &mut [i32],
-    weights: &[i64],
-    current: &mut Score,
-    con_viol: &mut Vec<i64>,
-    complete_now: &mut bool,
-    viol_sum: &mut i128,
-) {
-    let (score, next_con_viol, complete) = model.score_breakdown(assignment, weights);
-    *current = score;
-    *con_viol = next_con_viol;
-    *complete_now = complete;
-    *viol_sum = weighted_sum(con_viol, weights);
-}
-
-fn bump_gls_weights(weights: &mut [i64], con_viol: &[i64], viol_sum: &mut i128, current: &mut Score, complete_now: bool) -> bool {
-    if !complete_now || current.violation <= 0 {
-        return false;
-    }
-    let mut bumped = false;
-    for (c, weight) in weights.iter_mut().enumerate() {
-        if con_viol[c] > 0 {
-            *weight += 1;
-            bumped = true;
-        }
-    }
-    if bumped {
-        *viol_sum = weighted_sum(con_viol, weights);
-        *current = Score { violation: combine_violation(0, *viol_sum), objective: current.objective };
-    }
-    bumped
 }
 
 struct SignedProductSquaresState {
@@ -3702,10 +3579,34 @@ where
             constraints,
             functionals,
             unsupported: unsupported + 1,
+            invariant_trials: 0,
+            invariant_rollbacks: 0,
+            invariant_commits: 0,
+            invariant_functional_evaluations: 0,
+            invariant_constraint_evaluations: 0,
+            invariant_objective_evaluations: 0,
+            invariant_objective_full_evaluations: 0,
+            invariant_full_rebuilds: 0,
         };
     };
     if unsupported > 0 {
-        return LocalSearchOutcome { best: None, iterations: 0, moves: 0, restarts: 0, constraints, functionals, unsupported };
+        return LocalSearchOutcome {
+            best: None,
+            iterations: 0,
+            moves: 0,
+            restarts: 0,
+            constraints,
+            functionals,
+            unsupported,
+            invariant_trials: 0,
+            invariant_rollbacks: 0,
+            invariant_commits: 0,
+            invariant_functional_evaluations: 0,
+            invariant_constraint_evaluations: 0,
+            invariant_objective_evaluations: 0,
+            invariant_objective_full_evaluations: 0,
+            invariant_full_rebuilds: 0,
+        };
     }
     if model.mutable.is_empty() {
         let mut assignment = model.min_assignment();
@@ -3718,26 +3619,51 @@ where
         } else {
             None
         };
-        return LocalSearchOutcome { best, iterations: 0, moves: 0, restarts: 0, constraints, functionals, unsupported };
+        return LocalSearchOutcome {
+            best,
+            iterations: 0,
+            moves: 0,
+            restarts: 0,
+            constraints,
+            functionals,
+            unsupported,
+            invariant_trials: 0,
+            invariant_rollbacks: 0,
+            invariant_commits: 0,
+            invariant_functional_evaluations: 0,
+            invariant_constraint_evaluations: 0,
+            invariant_objective_evaluations: 0,
+            invariant_objective_full_evaluations: 0,
+            invariant_full_rebuilds: 0,
+        };
     }
 
     if let Some(plan) = model.signed_product_squares_plan(Some(stop)) {
         let (best, iterations, moves, restarts) = solve_signed_product_squares(&model, &plan, stop, seed, max_iterations, &mut on_improve);
-        return LocalSearchOutcome { best, iterations, moves, restarts, constraints, functionals, unsupported };
+        return LocalSearchOutcome {
+            best,
+            iterations,
+            moves,
+            restarts,
+            constraints,
+            functionals,
+            unsupported,
+            invariant_trials: 0,
+            invariant_rollbacks: 0,
+            invariant_commits: 0,
+            invariant_functional_evaluations: 0,
+            invariant_constraint_evaluations: 0,
+            invariant_objective_evaluations: 0,
+            invariant_objective_full_evaluations: 0,
+            invariant_full_rebuilds: 0,
+        };
     }
 
     let minimizing = model.objective.minimizing();
     let objective_kicks = model.objective_kicks();
     let constructive_start = model.has_extension();
-    // GLS penalty weights, one per constraint (all 1 = unweighted min-conflicts).
-    // Only mutated when `config.gls` is on; they persist across
-    // restarts so effort keeps accumulating on the genuinely hard constraints.
-    let mut weights: Vec<i64> = vec![1; model.constraints.len()];
-    let mut assignment = if constructive_start { model.constructive_assignment(seed, stop) } else { model.random_assignment(seed) };
-    let (mut current, mut con_viol, mut complete_now) = model.score_breakdown(&mut assignment, &weights);
-    let mut viol_sum: i128 = weighted_sum(&con_viol, &weights);
-    // Reusable scratch for trial moves; never reallocated inside the loop.
-    let mut work = assignment.clone();
+    let assignment = if constructive_start { model.constructive_assignment(seed, stop) } else { model.random_assignment(seed) };
+    let mut state = invariants::InvariantState::new(&model, assignment);
     // Min-conflicts (#1b): O(1) membership set per large domain, built once. Empty
     // when the toggle is off. `cand_values` is the reused candidate buffer.
     let value_sets: Vec<Option<HashSet<i32>>> = if config.min_conflicts {
@@ -3756,10 +3682,10 @@ where
 
     while iterations < max_iterations && !stop.load(Ordering::Relaxed) {
         iterations += 1;
-        if complete_now && current.violation == 0 {
-            if let Some(value) = model.objective_value(&assignment) {
+        if state.complete() && state.score().violation == 0 {
+            if let Some(value) = model.objective_value(state.assignment()) {
                 if better_value(minimizing, value, best_solution.as_ref().map(|(_, v)| *v)) {
-                    let solution = model.search_solution(&assignment);
+                    let solution = model.search_solution(state.assignment());
                     on_improve(value, &solution, source);
                     best_solution = Some((solution, value));
                 }
@@ -3775,25 +3701,18 @@ where
             if stagnant >= RESTART_AFTER {
                 restarts += 1;
                 let restart_seed = seed ^ mix64(iterations);
-                let mut trial = if constructive_start {
+                let trial = if constructive_start {
                     model.constructive_assignment(restart_seed, stop)
                 } else {
                     model.random_assignment(restart_seed)
                 };
-                let (mut trial_score, mut trial_con_viol, mut trial_complete) = model.score_breakdown(&mut trial, &weights);
-                let mut min_trial = model.min_assignment();
-                let (min_score, min_con_viol, min_complete) = model.score_breakdown(&mut min_trial, &weights);
-                if min_score < trial_score {
-                    trial = min_trial;
-                    trial_score = min_score;
-                    trial_con_viol = min_con_viol;
-                    trial_complete = min_complete;
+                state.reset(trial);
+                let restart_score = state.score();
+                let restart_assignment = state.assignment().to_vec();
+                state.reset(model.min_assignment());
+                if restart_score < state.score() {
+                    state.reset(restart_assignment);
                 }
-                assignment = trial;
-                current = trial_score;
-                con_viol = trial_con_viol;
-                complete_now = trial_complete;
-                viol_sum = weighted_sum(&con_viol, &weights);
                 source = if constructive_start { "constructive" } else { "local-search" };
                 stagnant = 0;
                 continue;
@@ -3809,7 +3728,7 @@ where
             }
 
             let op = kick_bandit.select(&available, seed, iterations);
-            let before = current;
+            let before = state.score();
             let mut moved = false;
             match op {
                 KickOperator::Repair => {
@@ -3817,33 +3736,12 @@ where
                     // improves. (Adding random-walk sideways moves here was tested and
                     // both diluted the exploration that helps timetabling and did not
                     // recover the descent-bound regression - net worse on both.)
-                    if let Some((score, j, value)) = best_single_variable_move(
-                        &model,
-                        &assignment,
-                        &mut work,
-                        &weights,
-                        &con_viol,
-                        viol_sum,
-                        minimizing,
-                        config,
-                        &value_sets,
-                        &mut cand_values,
-                        seed,
-                        iterations,
-                    ) {
-                        if score < current {
-                            apply_single_variable_move(
-                                &model,
-                                &mut assignment,
-                                &mut con_viol,
-                                &mut viol_sum,
-                                &mut complete_now,
-                                &mut current,
-                                &weights,
-                                score,
-                                j,
-                                value,
-                            );
+                    if let Some((score, j, value)) =
+                        best_single_variable_move(&model, &mut state, config, &value_sets, &mut cand_values, seed, iterations)
+                    {
+                        if score < state.score() {
+                            let committed = state.commit(j, value);
+                            debug_assert_eq!(committed, score);
                             source = op.source();
                             moves += 1;
                             moved = true;
@@ -3851,36 +3749,33 @@ where
                     }
                 }
                 KickOperator::Objective => {
-                    if let Some(mut trial) = objective_kick_trial(&model, &assignment, &objective_kicks, seed, iterations) {
-                        refresh_score(&model, &mut trial, &weights, &mut current, &mut con_viol, &mut complete_now, &mut viol_sum);
-                        assignment = trial;
+                    if let Some(trial) = objective_kick_trial(&model, state.assignment(), &objective_kicks, seed, iterations) {
+                        state.reset(trial);
                         source = op.source();
                         moves += 1;
                         moved = true;
                     }
                 }
                 KickOperator::Constructive => {
-                    let mut trial = model.constructive_assignment(seed ^ mix64(iterations), stop);
-                    let (score, trial_con_viol, trial_complete) = model.score_breakdown(&mut trial, &weights);
-                    if score < current {
-                        assignment = trial;
-                        con_viol = trial_con_viol;
-                        viol_sum = weighted_sum(&con_viol, &weights);
-                        complete_now = trial_complete;
-                        current = score;
+                    let current = state.score();
+                    let previous = state.assignment().to_vec();
+                    state.reset(model.constructive_assignment(seed ^ mix64(iterations), stop));
+                    if state.score() < current {
                         source = op.source();
                         moves += 1;
                         moved = true;
+                    } else {
+                        state.reset(previous);
                     }
                 }
             }
-            kick_bandit.record(op, kick_reward(before, current));
+            kick_bandit.record(op, kick_reward(before, state.score()));
             if moved {
                 stagnant = 0;
             } else {
                 stagnant += 1;
                 if config.gls {
-                    bump_gls_weights(&mut weights, &con_viol, &mut viol_sum, &mut current, complete_now);
+                    state.bump_gls_weights();
                 }
             }
             continue;
@@ -3889,77 +3784,43 @@ where
         if stagnant >= RESTART_AFTER {
             restarts += 1;
             let restart_seed = seed ^ mix64(iterations);
-            assignment =
+            let assignment =
                 if constructive_start { model.constructive_assignment(restart_seed, stop) } else { model.random_assignment(restart_seed) };
-            (current, con_viol, complete_now) = model.score_breakdown(&mut assignment, &weights);
-            viol_sum = weighted_sum(&con_viol, &weights);
+            state.reset(assignment);
             source = if constructive_start { "constructive" } else { "local-search" };
             stagnant = 0;
             continue;
         }
 
         if constructive_start && iterations.is_multiple_of(CONSTRUCTIVE_KICK_PERIOD) {
-            let mut trial = model.constructive_assignment(seed ^ mix64(iterations), stop);
-            let (score, trial_con_viol, trial_complete) = model.score_breakdown(&mut trial, &weights);
-            if score < current {
-                assignment = trial;
-                con_viol = trial_con_viol;
-                viol_sum = weighted_sum(&con_viol, &weights);
-                complete_now = trial_complete;
-                current = score;
+            let current = state.score();
+            let previous = state.assignment().to_vec();
+            state.reset(model.constructive_assignment(seed ^ mix64(iterations), stop));
+            if state.score() < current {
                 source = "constructive";
                 moves += 1;
                 stagnant = 0;
                 continue;
             }
+            state.reset(previous);
         }
 
-        if let Some(trial) = objective_kick(&model, &assignment, &objective_kicks, seed, iterations) {
-            assignment = trial;
-            (current, con_viol, complete_now) = model.score_breakdown(&mut assignment, &weights);
-            viol_sum = weighted_sum(&con_viol, &weights);
+        if let Some(trial) = objective_kick(&model, state.assignment(), &objective_kicks, seed, iterations) {
+            state.reset(trial);
             source = "local-search";
             moves += 1;
             stagnant = 0;
             continue;
         }
 
-        // Incremental delta scoring: evaluate `x_j := value` by re-running only the
-        // constraints in `affected[j]` against a reused `work` buffer, instead of
-        // cloning the assignment and rescoring every constraint. `complete()` still
-        // runs in full (functional targets are folded into `affected[j]`, so the
-        // delta over those constraints is exact).
-        let best_move = best_single_variable_move(
-            &model,
-            &assignment,
-            &mut work,
-            &weights,
-            &con_viol,
-            viol_sum,
-            minimizing,
-            config,
-            &value_sets,
-            &mut cand_values,
-            seed,
-            iterations,
-        );
+        let best_move = best_single_variable_move(&model, &mut state, config, &value_sets, &mut cand_values, seed, iterations);
 
         let random_walk = iterations.is_multiple_of(RANDOM_WALK_PERIOD);
         let mut moved = false;
         if let Some((score, j, value)) = best_move {
-            if score < current || random_walk {
-                apply_single_variable_move(
-                    &model,
-                    &mut assignment,
-                    &mut con_viol,
-                    &mut viol_sum,
-                    &mut complete_now,
-                    &mut current,
-                    &weights,
-                    score,
-                    j,
-                    value,
-                );
+            if score < state.score() || random_walk {
+                let committed = state.commit(j, value);
+                debug_assert_eq!(committed, score);
                 source = "local-search";
                 moves += 1;
                 moved = true;
@@ -3974,10 +3835,90 @@ where
             // Penalise every currently-violated constraint, reshaping the weighted
             // landscape so the next descent is pushed toward the hard constraints.
             if config.gls {
-                bump_gls_weights(&mut weights, &con_viol, &mut viol_sum, &mut current, complete_now);
+                state.bump_gls_weights();
             }
         }
     }
 
-    LocalSearchOutcome { best: best_solution, iterations, moves, restarts, constraints, functionals, unsupported }
+    let invariant = state.metrics();
+    LocalSearchOutcome {
+        best: best_solution,
+        iterations,
+        moves,
+        restarts,
+        constraints,
+        functionals,
+        unsupported,
+        invariant_trials: invariant.trials,
+        invariant_rollbacks: invariant.rollbacks,
+        invariant_commits: invariant.committed,
+        invariant_functional_evaluations: invariant.functional_evaluations,
+        invariant_constraint_evaluations: invariant.constraint_evaluations,
+        invariant_objective_evaluations: invariant.objective_evaluations,
+        invariant_objective_full_evaluations: invariant.objective_full_evaluations,
+        invariant_full_rebuilds: invariant.full_rebuilds,
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct InvariantAudit {
+    pub(crate) functional_arcs: usize,
+    pub(crate) trials: u64,
+    pub(crate) rollbacks: u64,
+    pub(crate) commits: u64,
+    pub(crate) functional_evaluations: u64,
+    pub(crate) constraint_evaluations: u64,
+    pub(crate) objective_evaluations: u64,
+    pub(crate) objective_full_evaluations: u64,
+    pub(crate) full_rebuilds: u64,
+}
+
+/// Differential transaction oracle used from `tests/`. Every speculative score
+/// is compared with the independent full scorer, rollback must restore the
+/// complete state, and commit must materialize exactly the fully completed
+/// assignment.
+#[cfg(test)]
+pub(crate) fn audit_invariant_transactions(
+    problem: &Problem,
+    spec: LocalSearchSpec,
+    initial: Vec<i32>,
+    moves: &[(VarId, i32)],
+) -> Option<InvariantAudit> {
+    let model = LocalModel::new(problem, spec).ok()?;
+    let mut state = invariants::InvariantState::new(&model, initial);
+    for &(variable, value) in moves {
+        let before_assignment = state.assignment().to_vec();
+        let before_score = state.score();
+        let before_violations = state.violations().to_vec();
+
+        let trial_score = state.evaluate(variable, value);
+        if state.assignment() != before_assignment || state.score() != before_score || state.violations() != before_violations {
+            return None;
+        }
+
+        let mut full_assignment = before_assignment;
+        full_assignment[variable.index()] = value;
+        let weights = vec![1; model.constraints.len()];
+        let (full_score, _, complete) = model.score_breakdown(&mut full_assignment, &weights);
+        if trial_score != full_score {
+            return None;
+        }
+
+        let committed = state.commit(variable, value);
+        if committed != full_score || state.assignment() != full_assignment || state.complete() != complete {
+            return None;
+        }
+    }
+    let metrics = state.metrics();
+    Some(InvariantAudit {
+        functional_arcs: model.invariants.functional_arcs(),
+        trials: metrics.trials,
+        rollbacks: metrics.rollbacks,
+        commits: metrics.committed,
+        functional_evaluations: metrics.functional_evaluations,
+        constraint_evaluations: metrics.constraint_evaluations,
+        objective_evaluations: metrics.objective_evaluations,
+        objective_full_evaluations: metrics.objective_full_evaluations,
+        full_rebuilds: metrics.full_rebuilds,
+    })
 }

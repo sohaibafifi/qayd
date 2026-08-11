@@ -134,7 +134,23 @@ fn local_warm_start(
         max_iterations,
         |_, _, _| {},
     );
-    let LocalSearchOutcome { best, iterations, moves, restarts, constraints, functionals, unsupported } = outcome;
+    let LocalSearchOutcome {
+        best,
+        iterations,
+        moves,
+        restarts,
+        constraints,
+        functionals,
+        unsupported,
+        invariant_trials,
+        invariant_rollbacks,
+        invariant_commits,
+        invariant_functional_evaluations,
+        invariant_constraint_evaluations,
+        invariant_objective_evaluations,
+        invariant_objective_full_evaluations,
+        invariant_full_rebuilds,
+    } = outcome;
     let Some((values, local_objective)) = best else {
         return Ok(None);
     };
@@ -180,6 +196,14 @@ fn local_warm_start(
                 ("ls_constraints".to_string(), constraints.to_string()),
                 ("ls_functionals".to_string(), functionals.to_string()),
                 ("ls_unsupported".to_string(), unsupported.to_string()),
+                ("ls_invariant_trials".to_string(), invariant_trials.to_string()),
+                ("ls_invariant_rollbacks".to_string(), invariant_rollbacks.to_string()),
+                ("ls_invariant_commits".to_string(), invariant_commits.to_string()),
+                ("ls_invariant_functional_evaluations".to_string(), invariant_functional_evaluations.to_string()),
+                ("ls_invariant_constraint_evaluations".to_string(), invariant_constraint_evaluations.to_string()),
+                ("ls_invariant_objective_evaluations".to_string(), invariant_objective_evaluations.to_string()),
+                ("ls_invariant_objective_full_evaluations".to_string(), invariant_objective_full_evaluations.to_string()),
+                ("ls_invariant_full_rebuilds".to_string(), invariant_full_rebuilds.to_string()),
             ],
         },
     }))
@@ -423,6 +447,14 @@ pub(crate) fn solve(run: IntegerSearchRun<'_>) -> Result<SolveResult, SolveError
     let mut constraints = 0usize;
     let mut functionals = 0usize;
     let mut unsupported = 0usize;
+    let mut invariant_trials = 0u64;
+    let mut invariant_rollbacks = 0u64;
+    let mut invariant_commits = 0u64;
+    let mut invariant_functional_evaluations = 0u64;
+    let mut invariant_constraint_evaluations = 0u64;
+    let mut invariant_objective_evaluations = 0u64;
+    let mut invariant_objective_full_evaluations = 0u64;
+    let mut invariant_full_rebuilds = 0u64;
     let mut rejected = 0usize;
     let mut last_rejection = None;
 
@@ -435,6 +467,14 @@ pub(crate) fn solve(run: IntegerSearchRun<'_>) -> Result<SolveResult, SolveError
             constraints: local_constraints,
             functionals: local_functionals,
             unsupported: local_unsupported,
+            invariant_trials: local_invariant_trials,
+            invariant_rollbacks: local_invariant_rollbacks,
+            invariant_commits: local_invariant_commits,
+            invariant_functional_evaluations: local_invariant_functional_evaluations,
+            invariant_constraint_evaluations: local_invariant_constraint_evaluations,
+            invariant_objective_evaluations: local_invariant_objective_evaluations,
+            invariant_objective_full_evaluations: local_invariant_objective_full_evaluations,
+            invariant_full_rebuilds: local_invariant_full_rebuilds,
         } = report.result;
         iterations = iterations.saturating_add(local_iterations);
         moves = moves.saturating_add(local_moves);
@@ -442,6 +482,15 @@ pub(crate) fn solve(run: IntegerSearchRun<'_>) -> Result<SolveResult, SolveError
         constraints = constraints.max(local_constraints);
         functionals = functionals.max(local_functionals);
         unsupported = unsupported.max(local_unsupported);
+        invariant_trials = invariant_trials.saturating_add(local_invariant_trials);
+        invariant_rollbacks = invariant_rollbacks.saturating_add(local_invariant_rollbacks);
+        invariant_commits = invariant_commits.saturating_add(local_invariant_commits);
+        invariant_functional_evaluations = invariant_functional_evaluations.saturating_add(local_invariant_functional_evaluations);
+        invariant_constraint_evaluations = invariant_constraint_evaluations.saturating_add(local_invariant_constraint_evaluations);
+        invariant_objective_evaluations = invariant_objective_evaluations.saturating_add(local_invariant_objective_evaluations);
+        invariant_objective_full_evaluations =
+            invariant_objective_full_evaluations.saturating_add(local_invariant_objective_full_evaluations);
+        invariant_full_rebuilds = invariant_full_rebuilds.saturating_add(local_invariant_full_rebuilds);
         let Some((values, _)) = local_best else {
             continue;
         };
@@ -467,6 +516,14 @@ pub(crate) fn solve(run: IntegerSearchRun<'_>) -> Result<SolveResult, SolveError
         ("ls_unsupported".to_string(), unsupported.to_string()),
         ("ls_rejected_incumbents".to_string(), rejected.to_string()),
         ("ls_checkpoint_replays".to_string(), checkpoint_replays.to_string()),
+        ("ls_invariant_trials".to_string(), invariant_trials.to_string()),
+        ("ls_invariant_rollbacks".to_string(), invariant_rollbacks.to_string()),
+        ("ls_invariant_commits".to_string(), invariant_commits.to_string()),
+        ("ls_invariant_functional_evaluations".to_string(), invariant_functional_evaluations.to_string()),
+        ("ls_invariant_constraint_evaluations".to_string(), invariant_constraint_evaluations.to_string()),
+        ("ls_invariant_objective_evaluations".to_string(), invariant_objective_evaluations.to_string()),
+        ("ls_invariant_objective_full_evaluations".to_string(), invariant_objective_full_evaluations.to_string()),
+        ("ls_invariant_full_rebuilds".to_string(), invariant_full_rebuilds.to_string()),
         ("workers".to_string(), workers.to_string()),
     ];
     if let Some(error) = &last_rejection {
