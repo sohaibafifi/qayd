@@ -7,6 +7,8 @@ const MIN_FINALIZATION_RESERVE: Duration = Duration::from_millis(10);
 const MAX_FINALIZATION_RESERVE: Duration = Duration::from_millis(250);
 const FINALIZATION_GRACE: Duration = Duration::from_millis(250);
 const SEARCH_STOP_POLL: Duration = Duration::from_millis(2);
+const MAX_WARM_START_TIME: Duration = Duration::from_secs(5);
+const WARM_START_BUDGET_DIVISOR: u32 = 10;
 
 /// One wall-clock and cancellation budget shared by compilation, verification,
 /// fallbacks, and every engine in a solve plan.
@@ -38,6 +40,23 @@ pub(crate) struct SearchStop {
     stop: Arc<AtomicBool>,
     done: Option<Arc<TimerSignal>>,
     worker: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Two cooperative boundaries inside one optional warm-start allowance. Search
+/// stops first; canonical transfer verification may use only the reserved tail.
+pub(crate) struct WarmStartStops {
+    search: SearchStop,
+    transfer: SearchStop,
+}
+
+impl WarmStartStops {
+    pub(crate) fn search(&self) -> &AtomicBool {
+        self.search.flag()
+    }
+
+    pub(crate) fn transfer(&self) -> &AtomicBool {
+        self.transfer.flag()
+    }
 }
 
 impl SearchStop {
@@ -248,6 +267,63 @@ impl SolveBudget {
         SearchStop { stop, done: Some(done), worker: Some(worker) }
     }
 
+    /// Derive a bounded, optional phase from this request budget. Expiring the
+    /// child stops only that phase, while cancellation of the parent request
+    /// still propagates immediately. This is intended for heuristic work that
+    /// must never consume the whole exact-search budget.
+    pub(crate) fn optional_phase_stop(&self, duration: Duration) -> SearchStop {
+        let duration = self.remaining().map_or(duration, |remaining| duration.min(remaining));
+        let stop = Arc::new(AtomicBool::new(duration.is_zero() || self.expired()));
+        if stop.load(Ordering::Acquire) {
+            return SearchStop { stop, done: None, worker: None };
+        }
+
+        let parent = self.stop_handle();
+        let child = Arc::clone(&stop);
+        let done = Arc::new(TimerSignal::default());
+        let worker_done = Arc::clone(&done);
+        let worker = std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut finished = worker_done.stopped.lock().unwrap();
+            loop {
+                if *finished {
+                    return;
+                }
+                if parent.load(Ordering::Acquire) || started.elapsed() >= duration {
+                    child.store(true, Ordering::Release);
+                    return;
+                }
+                let wait = SEARCH_STOP_POLL.min(duration.saturating_sub(started.elapsed()));
+                let (next, _) = worker_done.wake.wait_timeout(finished, wait).unwrap();
+                finished = next;
+            }
+        });
+        SearchStop { stop, done: Some(done), worker: Some(worker) }
+    }
+
+    /// Reserve the bulk of the remaining request for the exact stage. Without
+    /// a request deadline, a warm start still has a fixed upper bound.
+    pub(crate) fn warm_start_stop(&self) -> Option<SearchStop> {
+        let duration = self.warm_start_duration();
+        (!duration.is_zero()).then(|| self.optional_phase_stop(duration))
+    }
+
+    /// Bound optional search and reserve a short tail of the same allowance for
+    /// canonical repair and transfer verification.
+    pub(crate) fn warm_start_stops(&self) -> Option<WarmStartStops> {
+        let duration = self.warm_start_duration();
+        if duration.is_zero() {
+            return None;
+        }
+        let transfer_reserve = if duration <= MIN_FINALIZATION_RESERVE {
+            duration
+        } else {
+            (duration / 4).clamp(MIN_FINALIZATION_RESERVE, MAX_FINALIZATION_RESERVE)
+        };
+        let search_duration = duration.saturating_sub(transfer_reserve);
+        Some(WarmStartStops { search: self.optional_phase_stop(search_duration), transfer: self.optional_phase_stop(duration) })
+    }
+
     /// A short, cooperative grace token for one final canonical replay after a
     /// soft wall-clock deadline. Hard cancellation remains live and takes
     /// priority over `Deadline`; the grace itself is capped independently of the
@@ -297,6 +373,13 @@ impl SolveBudget {
             if !self.inner.memory_monitor_started.swap(true, Ordering::AcqRel) && crate::mem::monitored().is_some() {
                 spawn_memory_monitor(Arc::downgrade(&self.inner));
             }
+        }
+    }
+
+    fn warm_start_duration(&self) -> Duration {
+        match self.remaining() {
+            Some(remaining) => (remaining / WARM_START_BUDGET_DIVISOR).min(MAX_WARM_START_TIME),
+            None => MAX_WARM_START_TIME,
         }
     }
 

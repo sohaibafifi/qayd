@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use qayd::model::list::{ExprArena, Iterable, ReduceOp, Reduction};
 use qayd::model::{Constraint, IntExpr, Model, ModelPackage, Objective, Relation};
-#[cfg(feature = "python")]
 use qayd::orchestrator::SemanticSolveSession;
 use qayd::orchestrator::{
     compile_model_plan, solve_model, solve_model_silent, solve_model_with_external_stop, solve_model_with_stop, CpControls, EngineKind,
@@ -210,7 +209,6 @@ fn required_proofs_reject_heuristic_plans_and_accept_exact_completion() {
 }
 
 #[test]
-#[cfg(feature = "python")]
 fn session_specific_validation_and_required_proofs_win_over_cancellation() {
     let mut invalid_session = SemanticSolveSession::new(ModelPackage::new(Model::new())).unwrap();
     let invalid_request = SolveRequest {
@@ -421,8 +419,7 @@ fn cp_portfolio_conflicts_are_one_aggregate_limit() {
 }
 
 #[test]
-#[cfg(feature = "python")]
-fn physical_session_respects_zero_conflicts_for_decision_and_lexicographic_search() {
+fn persistent_session_respects_zero_conflicts_for_decision_and_lexicographic_search() {
     for optimize in [false, true] {
         let mut model = Model::new();
         let value = model.bool_var();

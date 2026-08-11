@@ -72,6 +72,15 @@ fn retired_parallel_module_cannot_reappear() {
 }
 
 #[test]
+fn integer_search_has_one_engine_and_one_control_plane() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(root.join("src/engines/ls/integer.rs").is_file());
+    assert!(root.join("src/orchestrator/integer_search.rs").is_file());
+    assert!(!root.join("src/orchestrator/integer_ls.rs").exists());
+    assert!(!root.join("src/orchestrator/physical.rs").exists());
+}
+
+#[test]
 fn engines_cannot_construct_the_public_solve_protocol() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut sources = Vec::new();

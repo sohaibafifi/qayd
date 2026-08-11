@@ -1156,7 +1156,8 @@ fn replay_tour(solver: &mut Solver, succ_vars: &[VarId], cost_vars: &[VarId], to
             break;
         }
     }
-    let cost = (feasible && !compilation_stopped(stop) && solver.propagate().is_ok() && !compilation_stopped(stop))
+    let propagation = feasible.then(|| solver.propagate_until(|| compilation_stopped(stop)));
+    let cost = (propagation.is_some_and(|result| result.is_ok()) && !compilation_stopped(stop))
         .then(|| cost_vars.iter().map(|&c| i64::from(solver.store.value(c))).sum());
     solver.store.pop_level();
     cost

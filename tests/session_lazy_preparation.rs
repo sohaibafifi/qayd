@@ -1,5 +1,3 @@
-#![cfg(feature = "python")]
-
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 

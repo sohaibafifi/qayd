@@ -2,15 +2,16 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::model::{IndependentComponent, IndependentDecomposition, IndependentFamily, Model, ModelObject, ModelPackage};
 
 use super::{
     compile_collection_plan, compile_cp_plan_validated, compile_sat_plan, preflight_collection_memory, solve_collection_plan,
-    solve_cp_plan_validated, solve_sat_plan, Assignment, Bound, CandidateSolution, CollectionSolvePlan, CpSolvePlan, DecompositionMerge,
-    EngineKind, EnginePlan, EventControl, EventSink, ExecutablePlan, IgnoreEvents, ProofClaim, ProofRequest, ProvenConclusion,
-    SatSolvePlan, SolveBudget, SolveError, SolveEvent, SolveRequest, SolveResult, SolveStatus, TerminationReason, VerificationLevel,
+    solve_collection_plan_with_stop, solve_cp_plan_validated, solve_sat_plan, Assignment, Bound, CandidateSolution, CollectionSolvePlan,
+    CpSolvePlan, DecompositionMerge, EngineKind, EnginePlan, EventControl, EventSink, ExecutablePlan, IgnoreEvents, ProofClaim,
+    ProofRequest, ProvenConclusion, SatSolvePlan, SolveBudget, SolveError, SolveEvent, SolveRequest, SolveResult, SolveStatus,
+    TerminationReason, VerificationLevel,
 };
 
 #[cfg(test)]
@@ -584,7 +585,7 @@ pub(crate) fn execute_model_plan(
     let result = match &plan.node {
         PreparedNode::Single(engine) => {
             if emit_stage_started(sink, budget, engine_kind(engine), false)? {
-                execute_engine(&package.model, engine, request, budget, None, sink)?
+                execute_engine(&package.model, engine, request, budget, None, None, sink)?
             } else {
                 stopped_before_execution_result(budget)?
             }
@@ -592,7 +593,7 @@ pub(crate) fn execute_model_plan(
         PreparedNode::Sequential(stages) => execute_sequential(&package.model, stages, request, budget, sink)?,
         PreparedNode::Portfolio { engine, .. } => {
             if emit_stage_started(sink, budget, engine_kind(engine), false)? {
-                execute_engine(&package.model, engine, request, budget, None, sink)?
+                execute_engine(&package.model, engine, request, budget, None, None, sink)?
             } else {
                 stopped_before_execution_result(budget)?
             }
@@ -684,6 +685,7 @@ fn execute_engine(
     request: &SolveRequest,
     budget: &SolveBudget,
     transferred_incumbent: Option<&CandidateSolution>,
+    warm_stops: Option<&super::WarmStartStops>,
     sink: &mut dyn EventSink,
 ) -> Result<SolveResult, SolveError> {
     match engine {
@@ -692,7 +694,20 @@ fn execute_engine(
             solve_cp_plan_validated(model, plan, request, budget, sink)
         }
         PreparedEngine::Collection(plan) => {
-            solve_collection_plan(model, plan, request, budget, request.list_hint.as_deref(), transferred_incumbent, sink)
+            if let Some(warm_stops) = warm_stops {
+                solve_collection_plan_with_stop(
+                    model,
+                    plan,
+                    request,
+                    budget,
+                    request.list_hint.as_deref(),
+                    transferred_incumbent,
+                    warm_stops,
+                    sink,
+                )
+            } else {
+                solve_collection_plan(model, plan, request, budget, request.list_hint.as_deref(), transferred_incumbent, sink)
+            }
         }
         PreparedEngine::Sat(plan) => {
             reject_transferred_incumbent(transferred_incumbent, EngineKind::IntegerExact)?;
@@ -732,10 +747,18 @@ fn execute_sequential(
         if !emit_stage_started(sink, budget, engine_kind(stage), !last)? {
             return stopped_sequence_result(budget, prior_reports, last_verified_primal);
         }
-        let mut result = match execute_engine(model, stage, request, budget, transferred.as_ref(), sink) {
+        let warm_stops = (!last).then(|| budget.warm_start_stops()).flatten();
+        if !last && warm_stops.is_none() {
+            continue;
+        }
+        let warm_started = Instant::now();
+        let mut result = match execute_engine(model, stage, request, budget, transferred.as_ref(), warm_stops.as_ref(), sink) {
             Ok(result) => result,
             Err(SolveError::Interrupted(_)) if last_verified_primal.is_some() => {
                 return stopped_sequence_result(budget, prior_reports, last_verified_primal);
+            }
+            Err(error) if !last && !budget.hard_cancelled() => {
+                rejected_warm_start_result(engine_kind(stage), warm_started.elapsed(), error)
             }
             Err(error) => return Err(error),
         };
@@ -793,6 +816,26 @@ fn execute_sequential(
         }
     }
     unreachable!("a non-empty sequential plan returns from its final stage")
+}
+
+fn rejected_warm_start_result(engine: EngineKind, elapsed: Duration, error: SolveError) -> SolveResult {
+    SolveResult {
+        status: SolveStatus::Unknown,
+        primal: None,
+        bounds: Vec::new(),
+        proof: None,
+        reports: vec![super::EngineReport {
+            engine: Some(engine),
+            search: Default::default(),
+            elapsed,
+            improvements: 0,
+            metadata: vec![
+                ("warm_start_outcome".to_string(), "rejected".to_string()),
+                ("warm_start_rejection".to_string(), error.to_string()),
+            ],
+        }],
+        message: Some(format!("optional warm start was rejected: {error}")),
+    }
 }
 
 fn candidate_strictly_better(

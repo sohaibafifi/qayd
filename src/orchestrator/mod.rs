@@ -10,12 +10,9 @@ mod cp;
 mod diagnostics;
 mod executor;
 mod finalize;
-mod integer_ls;
-#[cfg(feature = "python")]
-mod physical;
+mod integer_search;
 mod plan;
 mod sat;
-#[cfg(feature = "python")]
 mod session;
 mod solve;
 mod types;
@@ -28,11 +25,8 @@ pub(crate) use cp::*;
 pub use diagnostics::*;
 pub use executor::*;
 pub(crate) use finalize::*;
-#[cfg(feature = "python")]
-pub(crate) use physical::*;
 pub use plan::*;
 pub(crate) use sat::*;
-#[cfg(feature = "python")]
 pub use session::*;
 pub use solve::*;
 pub use types::*;

@@ -3,14 +3,15 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::engines::cp::portfolio::SearchGuidance;
 use crate::lcg::clause::SharedClausePool;
 use crate::lcg::lit::{AtomKind, AtomTable, Lit};
 use crate::model::{CompiledCp, Constraint, IntDomain, IntExpr, Model, ModelPackage, Objective};
 use crate::search::{Assumption, AssumptionOp};
 
 use super::{
-    solve_physical_exact_with_budget, CandidateSolution, EventControl, EventSink, PhysicalObjectiveTier, PhysicalSolveInput, ProofRequest,
-    SemanticAssumptionOp, SolveBudget, SolveError, SolveEvent, SolveMode, SolveRequest, SolveResult, SolveStatus, TerminationReason,
+    solve_cp_session_validated, EventSink, ProofRequest, SemanticAssumptionOp, SolveBudget, SolveError, SolveMode, SolveRequest,
+    SolveResult, SolveStatus, TerminationReason,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,7 +108,7 @@ impl SemanticSolveSession {
                 let result = self.solve_with_budget(request, &budget, &mut monitored_sink);
                 (result, monitored_sink.final_evidence_published())
             };
-            if external_stop.load(Ordering::Acquire) && !final_evidence_published {
+            if result.is_ok() && external_stop.load(Ordering::Acquire) && !final_evidence_published {
                 budget.cancel_with(TerminationReason::ExternalCancellation);
                 result = Err(SolveError::Interrupted("session external cancellation won finalization".to_string()));
             }
@@ -152,7 +153,7 @@ impl SemanticSolveSession {
         }
         self.prepare(request, budget)?;
         let compiled = self.compiled.as_ref().expect("successful session preparation installs a compiled plan");
-        let Some((_, branch_order, primary_branch_scope)) = compiled
+        let Some((initial_phase, branch_order, primary_branch_scope)) = compiled
             .search_guidance_interruptible(&request.hints, &request.branch_order, request.primary_branch_scope.as_deref(), budget.stop())
             .map_err(|error| SolveError::InvalidRequest(error.reason))?
         else {
@@ -179,46 +180,25 @@ impl SemanticSolveSession {
                 value: assumption.value,
             });
         }
-        let mut hints = Vec::with_capacity(request.hints.len());
-        for &(index, value) in &request.hints {
-            if budget.expired() {
-                return Err(SolveError::Interrupted("session hint mapping was interrupted".to_string()));
-            }
-            let variable = compiled
-                .int_variables()
-                .get(index)
-                .copied()
-                .ok_or_else(|| SolveError::InvalidRequest(format!("hint references unknown integer variable {index}")))?;
-            hints.push((variable, value));
-        }
-        let mut objectives = Vec::with_capacity(compiled.objectives().len());
-        for objective in compiled.objectives() {
-            if budget.expired() {
-                return Err(SolveError::Interrupted("session objective mapping was interrupted".to_string()));
-            }
-            objectives.push(PhysicalObjectiveTier { objective: objective.clone() });
-        }
-        let input = PhysicalSolveInput {
-            problem: compiled.problem().clone(),
-            visible_variables: self.package.model.int_vars().len(),
-            objectives,
-            assumptions,
-            hints,
-            primary_branch_scope,
-            branch_order,
-            shared_clauses: Some(Arc::clone(&self.clauses)),
-            first_worker: self.next_worker,
-        };
-        let mut replay = ReplayEvents { model: &self.package.model, budget, target: sink };
-        let output = solve_physical_exact_with_budget(input, request, budget, &mut replay)?;
+        let guidance = SearchGuidance { initial_phase, branch_order, primary_branch_scope };
+        let output = solve_cp_session_validated(
+            &self.package.model,
+            compiled,
+            &assumptions,
+            guidance,
+            Arc::clone(&self.clauses),
+            self.next_worker,
+            request,
+            budget,
+            sink,
+        )?;
         self.next_worker = output.next_worker;
-        let mut result = output.result;
-        result.primal = result.primal.map(|candidate| replay_candidate(&self.package.model, budget, &candidate)).transpose()?;
+        let result = output.result;
         if request.proof == ProofRequest::Require && result.proof.is_none() {
             return Err(SolveError::InvalidResult("a required session proof was not produced".to_string()));
         }
         result.validate_model_contract(&self.package.model)?;
-        super::publish_result_events(&result, budget, replay.target)?;
+        super::publish_result_events(&result, budget, sink)?;
         Ok(result)
     }
 
@@ -431,45 +411,6 @@ fn expression_bounds_interruptible(model: &Model, expression: &IntExpr, stop: &A
         | IntExpr::Imp(_, _)
         | IntExpr::Iff(_, _) => (0, 1),
     })
-}
-
-struct ReplayEvents<'a> {
-    model: &'a crate::model::Model,
-    budget: &'a SolveBudget,
-    target: &'a mut dyn EventSink,
-}
-
-impl EventSink for ReplayEvents<'_> {
-    fn emit(&mut self, event: SolveEvent) -> Result<EventControl, SolveError> {
-        let event = match event {
-            SolveEvent::Candidate(candidate) => SolveEvent::Candidate(replay_candidate(self.model, self.budget, &candidate)?),
-            other => other,
-        };
-        self.target.emit(event)
-    }
-}
-
-fn replay_candidate(
-    model: &crate::model::Model,
-    budget: &SolveBudget,
-    candidate: &CandidateSolution,
-) -> Result<CandidateSolution, SolveError> {
-    if candidate.verification() == super::VerificationLevel::Final {
-        super::verify_final_with_budget(budget, |stop| replay_candidate_once(model, candidate, stop))
-    } else {
-        replay_candidate_once(model, candidate, budget.stop())
-    }
-}
-
-fn replay_candidate_once(
-    model: &crate::model::Model,
-    candidate: &CandidateSolution,
-    stop: &AtomicBool,
-) -> Result<CandidateSolution, SolveError> {
-    let objectives =
-        super::verify_semantic_assignment_validated_interruptible(model, candidate.assignment(), candidate.objectives(), stop)?;
-    let assignment = super::clone_assignment_interruptible(candidate.assignment(), stop)?;
-    Ok(CandidateSolution::verified(assignment, objectives, candidate.source(), candidate.verification()))
 }
 
 fn session_stopped_result(budget: &SolveBudget) -> SolveResult {

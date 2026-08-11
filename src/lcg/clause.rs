@@ -165,7 +165,6 @@ impl SharedClausePool {
 
     /// Snapshot the live shared clauses in chronological order. `limit` keeps
     /// only the newest clauses when non-zero.
-    #[cfg(feature = "python")]
     pub fn snapshot(&self, limit: usize) -> Vec<(u32, Arc<[Lit]>)> {
         let ring = self.ring.lock().unwrap();
         let write = ring.write;

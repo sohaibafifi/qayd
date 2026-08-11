@@ -9,13 +9,11 @@ use qayd::model::{
     CompiledCollection, Constraint, IntExpr, IntGlobalConstraint, IntVarRef, ListOrdering, Model, ModelObject, ModelPackage, Objective,
     Relation,
 };
-#[cfg(feature = "python")]
-use qayd::orchestrator::TerminationReason;
 use qayd::orchestrator::{
-    audit_cp_repair_completion, audit_interrupt_next_transfer_replay, audit_partial_cp_repair_search_rejection, compile_collection_plan,
-    compile_model_plan, solve_collection_plan, solve_model_silent, solve_model_with_budget, EngineKind, EventControl, EventSink,
-    ExecutablePlan, RoutingControls, SolveBudget, SolveError, SolveEvent, SolveLimits, SolveMode, SolveRequest, SolveResult, SolveStatus,
-    VerificationLevel,
+    audit_cp_repair_completion, audit_interrupt_next_transfer_replay, audit_partial_cp_repair_search_rejection,
+    audit_prearmed_cp_repair_interruption, compile_collection_plan, compile_model_plan, solve_collection_plan, solve_model_silent,
+    solve_model_with_budget, EngineKind, EventControl, EventSink, ExecutablePlan, RoutingControls, SolveBudget, SolveError, SolveEvent,
+    SolveLimits, SolveMode, SolveRequest, SolveResult, SolveStatus, VerificationLevel,
 };
 fn count(list: usize) -> Reduction {
     let mut arena = ExprArena::default();
@@ -86,14 +84,12 @@ impl EventSink for FailOnProgress {
     }
 }
 
-#[cfg(feature = "python")]
-struct FailPhysicalProgress;
+struct FailSessionProgress;
 
-#[cfg(feature = "python")]
-impl EventSink for FailPhysicalProgress {
+impl EventSink for FailSessionProgress {
     fn emit(&mut self, event: SolveEvent) -> Result<EventControl, SolveError> {
         if matches!(event, SolveEvent::Progress { .. }) {
-            Err(SolveError::InvalidResult("physical progress callback failed".to_string()))
+            Err(SolveError::InvalidResult("session progress callback failed".to_string()))
         } else {
             Ok(EventControl::Continue)
         }
@@ -502,70 +498,26 @@ fn incomplete_cp_repair_rejects_the_optional_candidate() {
     assert!(matches!(audit_cp_repair_completion(true, true), Err(SolveError::InvalidResult(_))));
     assert!(!audit_cp_repair_completion(true, false).unwrap());
     assert!(audit_partial_cp_repair_search_rejection().unwrap());
+    assert!(audit_prearmed_cp_repair_interruption().unwrap());
 }
 
-#[cfg(feature = "python")]
 #[test]
-fn physical_callback_failure_stops_search_without_masking_the_error() {
+fn session_callback_failure_stops_search_without_masking_the_error() {
     use std::sync::atomic::AtomicBool;
 
-    use crate::model::CompiledCp;
-    use crate::orchestrator::{solve_physical_exact_with_budget, PhysicalObjectiveTier, PhysicalSolveInput};
+    use crate::orchestrator::SemanticSolveSession;
 
     let mut model = Model::new();
     let value = model.int_range(0, 10);
     model.add_objective(Objective::IntExpr { minimize: true, expr: qayd::model::IntExpr::Variable(value) });
-    let compiling = AtomicBool::new(false);
-    let compiled = CompiledCp::compile_interruptible(&model, &compiling).unwrap().unwrap();
-    let input = PhysicalSolveInput {
-        problem: compiled.problem().clone(),
-        visible_variables: model.int_vars().len(),
-        objectives: compiled.objectives().iter().cloned().map(|objective| PhysicalObjectiveTier { objective }).collect(),
-        assumptions: Vec::new(),
-        hints: Vec::new(),
-        primary_branch_scope: None,
-        branch_order: Vec::new(),
-        shared_clauses: None,
-        first_worker: 0,
-    };
-    let budget = SolveBudget::new(None);
+    let mut session = SemanticSolveSession::new(ModelPackage::new(model)).unwrap();
 
-    let error = match solve_physical_exact_with_budget(input, &SolveRequest::default(), &budget, &mut FailPhysicalProgress) {
-        Ok(_) => panic!("the failing physical callback was ignored"),
+    let error = match session.solve_with_external_stop(&SolveRequest::default(), &AtomicBool::new(false), &mut FailSessionProgress) {
+        Ok(_) => panic!("the failing session callback was ignored"),
         Err(error) => error,
     };
 
-    assert!(matches!(error, SolveError::InvalidResult(message) if message == "physical progress callback failed"));
-    assert_eq!(budget.termination_reason(), TerminationReason::Engine);
-}
-
-#[cfg(feature = "python")]
-#[test]
-fn physical_affine_guide_variables_are_validated_before_search() {
-    use crate::orchestrator::{solve_physical_exact_with_budget, IgnoreEvents, PhysicalObjectiveTier, PhysicalSolveInput};
-    use crate::problem::{Objective as ProblemObjective, Problem};
-    use crate::{Solver, VarId};
-
-    let mut solver = Solver::new();
-    let objective = solver.new_var_range(0, 1);
-    let malformed = ProblemObjective::VarWithAffine(true, objective, vec![1], vec![VarId(99)]);
-    let input = PhysicalSolveInput {
-        problem: Problem { solver, search: vec![objective], objective: Some(malformed.clone()) },
-        visible_variables: 1,
-        objectives: vec![PhysicalObjectiveTier { objective: malformed }],
-        assumptions: Vec::new(),
-        hints: Vec::new(),
-        primary_branch_scope: None,
-        branch_order: Vec::new(),
-        shared_clauses: None,
-        first_worker: 0,
-    };
-
-    let error = match solve_physical_exact_with_budget(input, &SolveRequest::default(), &SolveBudget::new(None), &mut IgnoreEvents) {
-        Ok(_) => panic!("an out-of-arena affine guide variable reached search"),
-        Err(error) => error,
-    };
-    assert!(matches!(error, SolveError::InvalidRequest(message) if message.contains("unknown variable 99")));
+    assert!(matches!(error, SolveError::InvalidResult(message) if message == "session progress callback failed"));
 }
 
 #[test]

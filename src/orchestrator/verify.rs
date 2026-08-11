@@ -162,42 +162,6 @@ pub fn verify_semantic_assignment(model: &Model, assignment: &Assignment, claime
     verify_semantic_assignment_interruptible(model, assignment, claimed_objectives, &AtomicBool::new(false))
 }
 
-#[cfg(feature = "python")]
-pub(crate) fn clone_assignment_interruptible(assignment: &Assignment, stop: &AtomicBool) -> Result<Assignment, SolveError> {
-    let mut integers = Vec::with_capacity(assignment.integers.len());
-    for (index, &value) in assignment.integers.iter().enumerate() {
-        poll_stop(stop, index)?;
-        integers.push(value);
-    }
-    let mut sets = Vec::with_capacity(assignment.sets.len());
-    for (set_index, source) in assignment.sets.iter().enumerate() {
-        poll_stop(stop, set_index)?;
-        let mut target = Vec::with_capacity(source.len());
-        for (value_index, &value) in source.iter().enumerate() {
-            poll_stop(stop, value_index)?;
-            target.push(value);
-        }
-        sets.push(target);
-    }
-    let mut lists = Vec::with_capacity(assignment.lists.len());
-    for (list_index, source) in assignment.lists.iter().enumerate() {
-        poll_stop(stop, list_index)?;
-        let mut target = Vec::with_capacity(source.len());
-        for (item_index, &item) in source.iter().enumerate() {
-            poll_stop(stop, item_index)?;
-            target.push(item);
-        }
-        lists.push(target);
-    }
-    let mut intervals = Vec::with_capacity(assignment.intervals.len());
-    for (index, &value) in assignment.intervals.iter().enumerate() {
-        poll_stop(stop, index)?;
-        intervals.push(value);
-    }
-    check_stop(stop)?;
-    Ok(Assignment { integers, sets, lists, intervals })
-}
-
 static VERIFICATION_CALLS: AtomicU64 = AtomicU64::new(0);
 
 #[doc(hidden)]

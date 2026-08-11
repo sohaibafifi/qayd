@@ -556,13 +556,13 @@ struct CspShared {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RootPreparation {
+pub(super) enum RootPreparation {
     Ready,
     Inconsistent,
     Interrupted,
 }
 
-fn prepare_root(problem: &mut Problem, stop: &AtomicBool) -> RootPreparation {
+pub(super) fn prepare_root(problem: &mut Problem, stop: &AtomicBool) -> RootPreparation {
     if stop.load(Ordering::Acquire) {
         return RootPreparation::Interrupted;
     }

@@ -606,6 +606,34 @@ pub(crate) fn solve_collection_plan(
     transferred_incumbent: Option<&CandidateSolution>,
     sink: &mut dyn EventSink,
 ) -> Result<SolveResult, SolveError> {
+    solve_collection_plan_inner(semantic, plan, request, budget, list_hint, transferred_incumbent, None, sink)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn solve_collection_plan_with_stop(
+    semantic: &Model,
+    plan: &CollectionSolvePlan,
+    request: &SolveRequest,
+    budget: &SolveBudget,
+    list_hint: Option<&[Vec<i32>]>,
+    transferred_incumbent: Option<&CandidateSolution>,
+    warm_stops: &super::WarmStartStops,
+    sink: &mut dyn EventSink,
+) -> Result<SolveResult, SolveError> {
+    solve_collection_plan_inner(semantic, plan, request, budget, list_hint, transferred_incumbent, Some(warm_stops), sink)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_collection_plan_inner(
+    semantic: &Model,
+    plan: &CollectionSolvePlan,
+    request: &SolveRequest,
+    budget: &SolveBudget,
+    list_hint: Option<&[Vec<i32>]>,
+    transferred_incumbent: Option<&CandidateSolution>,
+    optional_stops: Option<&super::WarmStartStops>,
+    sink: &mut dyn EventSink,
+) -> Result<SolveResult, SolveError> {
     request.validate()?;
     if matches!(plan.backend, CollectionBackend::RoutingExact(_)) && request.routing != plan.routing_controls {
         return Err(SolveError::InvalidRequest("routing controls must match the request used to compile the routing plan".to_string()));
@@ -617,8 +645,11 @@ pub(crate) fn solve_collection_plan(
         return Err(SolveError::InvalidResult("only an exact routing stage can consume a transferred collection incumbent".to_string()));
     }
     let model = plan.model.as_model();
-    let search_stop = budget.search_stop();
-    let engine_stop = search_stop.flag();
+    let transfer_stop = optional_stops.map(super::WarmStartStops::transfer);
+    let search_stop = optional_stops.is_none().then(|| budget.search_stop());
+    let engine_stop = optional_stops
+        .map(super::WarmStartStops::search)
+        .unwrap_or_else(|| search_stop.as_ref().expect("ordinary collection search owns a stop token").flag());
     let started = Instant::now();
     let mut event_error = None;
     let outcome = (|| -> Result<SolveResult, SolveError> {
@@ -664,6 +695,7 @@ pub(crate) fn solve_collection_plan(
                     request,
                     budget,
                     engine_stop,
+                    transfer_stop,
                     list_hint,
                     max_iterations: plan.local_search_iterations.or(request.limits.iterations).unwrap_or(u64::MAX),
                     engine: plan.engine(),
@@ -671,11 +703,10 @@ pub(crate) fn solve_collection_plan(
                 },
                 &mut |engine, value| record_progress(sink, budget, &mut event_error, engine, value),
             )?,
-            CollectionBackend::ScheduleLocalSearch => {
-                result_from_schedule_local_search(semantic, model, request, budget, engine_stop, started, &mut |engine, value| {
-                    record_progress(sink, budget, &mut event_error, engine, value)
-                })?
-            }
+            CollectionBackend::ScheduleLocalSearch => result_from_schedule_local_search(
+                ScheduleLocalSearchRun { semantic, model, request, budget, engine_stop, transfer_stop, started },
+                &mut |engine, value| record_progress(sink, budget, &mut event_error, engine, value),
+            )?,
         })
     })();
     let mut result = match outcome {
@@ -739,6 +770,7 @@ fn result_from_routing(
             },
         },
         budget,
+        None,
     )
 }
 
@@ -789,6 +821,7 @@ fn result_from_list_exact(
             },
         },
         budget,
+        None,
     )
 }
 
@@ -839,6 +872,7 @@ fn result_from_schedule(
             },
         },
         budget,
+        None,
     )
 }
 
@@ -848,6 +882,7 @@ struct ListLocalSearchRun<'a> {
     request: &'a SolveRequest,
     budget: &'a SolveBudget,
     engine_stop: &'a AtomicBool,
+    transfer_stop: Option<&'a AtomicBool>,
     list_hint: Option<&'a [Vec<i32>]>,
     max_iterations: u64,
     engine: EngineKind,
@@ -997,7 +1032,8 @@ fn audit_local_search_dual_started(state: Option<&Arc<LocalSearchDualAudit>>) {
 }
 
 fn result_from_local_search(run: ListLocalSearchRun<'_>, improvement: &mut impl FnMut(EngineKind, i64)) -> Result<SolveResult, SolveError> {
-    let ListLocalSearchRun { semantic, model, request, budget, engine_stop, list_hint, max_iterations, engine, started } = run;
+    let ListLocalSearchRun { semantic, model, request, budget, engine_stop, transfer_stop, list_hint, max_iterations, engine, started } =
+        run;
     let (mut solution, metadata, structural_bound, iterations) = std::thread::scope(|scope| {
         let dual_start = DeferredDualStart::default();
         let mut dual_gate = DeferredDualGate::new(dual_start.clone());
@@ -1101,6 +1137,7 @@ fn result_from_local_search(run: ListLocalSearchRun<'_>, improvement: &mut impl 
             },
         },
         budget,
+        transfer_stop,
     )?;
     if request.limits.iterations.is_some_and(|limit| iterations >= limit) && !budget.expired() {
         result.message = Some("list local search reached the shared iteration limit".to_string());
@@ -1108,15 +1145,21 @@ fn result_from_local_search(run: ListLocalSearchRun<'_>, improvement: &mut impl 
     Ok(result)
 }
 
-fn result_from_schedule_local_search(
-    semantic: &Model,
-    model: &list::CollectionModel,
-    request: &SolveRequest,
-    budget: &SolveBudget,
-    engine_stop: &AtomicBool,
+struct ScheduleLocalSearchRun<'a> {
+    semantic: &'a Model,
+    model: &'a list::CollectionModel,
+    request: &'a SolveRequest,
+    budget: &'a SolveBudget,
+    engine_stop: &'a AtomicBool,
+    transfer_stop: Option<&'a AtomicBool>,
     started: Instant,
+}
+
+fn result_from_schedule_local_search(
+    run: ScheduleLocalSearchRun<'_>,
     improvement: &mut impl FnMut(EngineKind, i64),
 ) -> Result<SolveResult, SolveError> {
+    let ScheduleLocalSearchRun { semantic, model, request, budget, engine_stop, transfer_stop, started } = run;
     let schedule = model
         .schedule
         .as_ref()
@@ -1200,6 +1243,7 @@ fn result_from_schedule_local_search(
             },
         },
         budget,
+        transfer_stop,
     )
 }
 
@@ -1304,6 +1348,7 @@ fn finish_collection_result(
     model: &list::CollectionModel,
     completion: CollectionCompletion,
     budget: &SolveBudget,
+    transfer_stop: Option<&AtomicBool>,
 ) -> Result<SolveResult, SolveError> {
     let CollectionCompletion { solution, status, source, proof, report } = completion;
     let primal = if solution.feasible {
@@ -1311,9 +1356,13 @@ fn finish_collection_result(
         list::audit_record_final_verification_boundary();
         apply_final_replay_audit_before_first_pass(budget);
         apply_final_replay_audit_after_interrupt(budget);
-        Some(super::verify_final_with_budget(budget, |stop| {
-            verified_candidate(semantic, model, &solution, source, VerificationLevel::Final, stop)
-        })?)
+        Some(if let Some(stop) = transfer_stop {
+            verified_candidate(semantic, model, &solution, source, VerificationLevel::Final, stop)?
+        } else {
+            super::verify_final_with_budget(budget, |stop| {
+                verified_candidate(semantic, model, &solution, source, VerificationLevel::Final, stop)
+            })?
+        })
     } else {
         None
     };

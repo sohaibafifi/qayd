@@ -51,6 +51,28 @@ fn hard_cancellation_overrides_a_soft_finalization_deadline() {
 }
 
 #[test]
+fn optional_phase_expiration_does_not_cancel_the_request() {
+    let budget = SolveBudget::new(None);
+    let phase = budget.optional_phase_stop(Duration::from_millis(5));
+    let guard = Instant::now();
+    while !phase.flag().load(Ordering::Acquire) && guard.elapsed() < Duration::from_millis(100) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    assert!(phase.flag().load(Ordering::Acquire));
+    assert!(!budget.expired());
+    assert_eq!(budget.termination_reason(), TerminationReason::Running);
+
+    let phase = budget.optional_phase_stop(Duration::from_secs(1));
+    budget.cancel();
+    let guard = Instant::now();
+    while !phase.flag().load(Ordering::Acquire) && guard.elapsed() < Duration::from_millis(100) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(phase.flag().load(Ordering::Acquire));
+}
+
+#[test]
 fn final_replay_grace_is_bounded_and_observes_hard_cancellation() {
     let budget = SolveBudget::new(Some(Duration::from_millis(8)));
     let _search_stop = budget.search_stop();
