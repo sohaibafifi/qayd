@@ -126,7 +126,16 @@ fn interruption_keeps_only_the_proved_lexicographic_prefix() {
         result.aggregate_search_stats()
     );
     assert!(result.primal().is_some());
-    assert_eq!(result.bounds().iter().map(|bound| (bound.tier, bound.value)).collect::<Vec<_>>(), vec![(0, 0)]);
+    let bounds = result.bounds().iter().map(|bound| (bound.tier, bound.value)).collect::<Vec<_>>();
+    #[cfg(not(feature = "lp-relaxation"))]
+    assert_eq!(bounds, vec![(0, 0)]);
+    #[cfg(feature = "lp-relaxation")]
+    {
+        // Complete search proved tier 0. The interrupted tier may additionally
+        // retain its independently certified LP bound.
+        assert_eq!(bounds, vec![(0, 0), (1, 100)]);
+        assert!(result.bounds()[1].method.contains("exact rational recertification"));
+    }
     assert!(result.proof().is_none());
     assert!(result.message().is_some_and(|message| message.contains("tier 1")));
     result.validate_contract().unwrap();

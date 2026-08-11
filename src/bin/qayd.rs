@@ -48,7 +48,7 @@ fn is_instance(arg: &str) -> bool {
 }
 
 const USAGE: &str =
-    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--mem-limit MB] [--ls] [--split] [--probe N] [--lns N] [--no-learn-csp] [--semantic-branching] [--force-scope-reasons] [--shared-pool-cap N] <instance.xml[.lzma|.xz]>";
+    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--mem-limit MB] [--ls] [--split] [--probe N] [--lns N] [--no-learn-csp] [--semantic-branching] [--force-scope-reasons] [--shared-pool-cap N] [--linear-backend auto|native|amthal] [--lp-root-ms N] [--lp-max-vars N] [--lp-max-rows N] [--lp-max-nonzeros N] [--lp-min-coverage N] [--lp-phase-max-vars N] <instance.xml[.lzma|.xz]>";
 
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
@@ -65,6 +65,15 @@ fn positive(value: Option<&str>, message: &str) -> usize {
         fail(message);
     }
     value
+}
+
+fn linear_backend(value: Option<&str>) -> qayd::orchestrator::LinearBackendMode {
+    match value {
+        Some("auto") => qayd::orchestrator::LinearBackendMode::Auto,
+        Some("native") => qayd::orchestrator::LinearBackendMode::Native,
+        Some("amthal") => qayd::orchestrator::LinearBackendMode::Amthal,
+        _ => fail("--linear-backend must be auto, native, or amthal"),
+    }
 }
 
 fn usage() -> ! {
@@ -91,6 +100,7 @@ fn main() {
     let mut force_scope_reasons = false;
     let mut shared_pool_capacity = 1 << 14;
     let mut mem_limit: Option<usize> = None;
+    let mut linear = qayd::orchestrator::LinearControls::default();
     let mut path: Option<String> = None;
 
     let mut it = args.iter();
@@ -112,6 +122,21 @@ fn main() {
                 shared_pool_capacity = positive(it.next().map(String::as_str), "--shared-pool-cap needs a positive integer")
             }
             "--mem-limit" => mem_limit = Some(positive(it.next().map(String::as_str), "--mem-limit needs a positive integer (megabytes)")),
+            "--linear-backend" => linear.backend = linear_backend(it.next().map(String::as_str)),
+            "--lp-root-ms" => {
+                linear.root_time = Duration::from_millis(parse(it.next().map(String::as_str), "--lp-root-ms needs milliseconds"))
+            }
+            "--lp-max-vars" => linear.max_variables = positive(it.next().map(String::as_str), "--lp-max-vars needs a positive integer"),
+            "--lp-max-rows" => linear.max_rows = positive(it.next().map(String::as_str), "--lp-max-rows needs a positive integer"),
+            "--lp-max-nonzeros" => {
+                linear.max_nonzeros = positive(it.next().map(String::as_str), "--lp-max-nonzeros needs a positive integer")
+            }
+            "--lp-min-coverage" => {
+                linear.min_coverage_percent = parse(it.next().map(String::as_str), "--lp-min-coverage needs a percentage")
+            }
+            "--lp-phase-max-vars" => {
+                linear.phase_max_variables = positive(it.next().map(String::as_str), "--lp-phase-max-vars needs a positive integer")
+            }
             other if other.starts_with('-') => {
                 eprintln!("unknown option {other}");
                 usage();
@@ -155,6 +180,7 @@ fn main() {
             shared_pool_capacity,
             time_limit: time_limit.map(Duration::from_secs),
             mem_limit,
+            linear,
         },
     );
 }

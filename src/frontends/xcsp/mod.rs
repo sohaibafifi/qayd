@@ -14,8 +14,8 @@ use xcsp3_rust_parser::xcsp_runner::XcspRunner;
 
 use crate::model::ModelPackage;
 use crate::orchestrator::{
-    solve_model_with_external_stop, CpControls, EventCallback, EventControl, SolveError, SolveEvent, SolveLimits, SolveMode, SolveRequest,
-    SolveResult, SolveStatus,
+    solve_model_with_external_stop, CpControls, EventCallback, EventControl, LinearControls, SolveError, SolveEvent, SolveLimits,
+    SolveMode, SolveRequest, SolveResult, SolveStatus,
 };
 
 /// Search strategy selected by the XCSP command line.
@@ -46,6 +46,7 @@ pub struct RunOptions {
     pub shared_pool_capacity: usize,
     pub time_limit: Option<Duration>,
     pub mem_limit: Option<usize>,
+    pub linear: LinearControls,
 }
 
 impl RunOptions {
@@ -69,6 +70,7 @@ impl Default for RunOptions {
             shared_pool_capacity: 1 << 14,
             time_limit: None,
             mem_limit: None,
+            linear: LinearControls::default(),
         }
     }
 }
@@ -281,6 +283,7 @@ fn solve_request(options: RunOptions, primary_branch_scope: Vec<usize>) -> Solve
         seed: options.seed,
         threads: options.workers,
         limits: SolveLimits { time: options.time_limit, memory_bytes, ..SolveLimits::default() },
+        linear: options.linear,
         cp: CpControls {
             split: options.split,
             probes: options.probes,
@@ -339,6 +342,19 @@ fn write_report<W: Write>(w: &mut W, result: &SolveResult) -> std::io::Result<()
     writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures)?;
     if stats.vivified_clauses > 0 {
         writeln!(w, "c inprocessing vivified {} removed {}", stats.vivified_clauses, stats.vivified_lits)?;
+    }
+    if stats.lp_rows > 0 {
+        writeln!(
+            w,
+            "c lp rows {} root_bound {} solves {} certified {} timeouts {} refactorizations {} time_ms {:.3}",
+            stats.lp_rows,
+            stats.lp_root_bound.map_or_else(|| "?".to_string(), |bound| bound.to_string()),
+            stats.lp_solves,
+            stats.lp_certified,
+            stats.lp_timeouts,
+            stats.lp_refactorizations,
+            stats.lp_micros as f64 / 1000.0,
+        )?;
     }
 
     let value =

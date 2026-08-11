@@ -90,6 +90,46 @@ pub struct RoutingControls {
     pub warm_start: bool,
 }
 
+/// Optional continuous relaxation used by exact integer CP search.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LinearBackendMode {
+    /// Use the best linked advisory backend, if any.
+    #[default]
+    Auto,
+    /// Keep the native CP bounds only.
+    Native,
+    /// Use the lightweight Amthal simplex backend.
+    Amthal,
+}
+
+/// Resource and model-size limits for the advisory linear relaxation.
+/// All controls are ordinary request data, so API and CLI executions are
+/// reproducible without process-wide environment variables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinearControls {
+    pub backend: LinearBackendMode,
+    pub root_time: Duration,
+    pub max_variables: usize,
+    pub max_rows: usize,
+    pub max_nonzeros: usize,
+    pub min_coverage_percent: usize,
+    pub phase_max_variables: usize,
+}
+
+impl Default for LinearControls {
+    fn default() -> Self {
+        Self {
+            backend: LinearBackendMode::Auto,
+            root_time: Duration::from_millis(50),
+            max_variables: 2_000,
+            max_rows: 1_000,
+            max_nonzeros: 100_000,
+            min_coverage_percent: 1,
+            phase_max_variables: 1_000,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CpControls {
     pub split: bool,
@@ -175,6 +215,7 @@ pub struct SolveRequest {
     pub profile: bool,
     pub schedule_cdcl: bool,
     pub routing: RoutingControls,
+    pub linear: LinearControls,
     pub cp: CpControls,
     pub sat: SatControls,
     pub assumptions: Vec<SemanticAssumption>,
@@ -207,6 +248,7 @@ impl Default for SolveRequest {
             profile: false,
             schedule_cdcl: false,
             routing: RoutingControls::default(),
+            linear: LinearControls::default(),
             cp: CpControls::default(),
             sat: SatControls::default(),
             assumptions: Vec::new(),
@@ -230,6 +272,15 @@ impl SolveRequest {
         }
         if self.cp.shared_pool_capacity == 0 {
             return Err(SolveError::InvalidRequest("shared clause capacity must be positive".to_string()));
+        }
+        if self.linear.max_variables == 0 || self.linear.max_rows == 0 || self.linear.max_nonzeros == 0 {
+            return Err(SolveError::InvalidRequest("linear relaxation size limits must be positive".to_string()));
+        }
+        if self.linear.min_coverage_percent > 100 {
+            return Err(SolveError::InvalidRequest("linear relaxation minimum coverage must be between 0 and 100 percent".to_string()));
+        }
+        if self.linear.backend == LinearBackendMode::Amthal && !cfg!(feature = "lp-relaxation") {
+            return Err(SolveError::InvalidRequest("linear backend 'amthal' requires the lp-relaxation Cargo feature".to_string()));
         }
         if self.sat.proof_path.is_some() && self.sat.backend != Some(SatBackendMode::Native) {
             return Err(SolveError::InvalidRequest("SAT proof output requires the native SAT backend".to_string()));

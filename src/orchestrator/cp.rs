@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use crate::engines::cp::incremental::IncrementalSearch;
 use crate::engines::cp::portfolio::{self, RunOptions, SearchGuidance};
+use crate::engines::linear;
 use crate::engines::ls::integer;
 use crate::lcg::clause::SharedClausePool;
 use crate::model::{CompiledCp, Constraint, Model, Relation};
@@ -142,6 +143,11 @@ fn compile_cp_plan_inner(
         if request.cp != super::CpControls::default() {
             return Err(SolveError::InvalidRequest("CP portfolio controls require integer exact mode".to_string()));
         }
+        if request.linear != super::LinearControls::default() {
+            return Err(SolveError::InvalidRequest("linear relaxation controls require integer exact mode".to_string()));
+        }
+    } else if model.objectives().is_empty() && request.linear != super::LinearControls::default() {
+        return Err(SolveError::InvalidRequest("linear relaxation controls require an integer optimization objective".to_string()));
     }
     for assumption in &request.assumptions {
         if assumption.variable >= model.int_vars().len() {
@@ -595,6 +601,7 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
     let mut unsatisfiable = false;
     let mut stopped_tier = None;
     let mut conflict_limit_reached = false;
+    let mut linear_backends = std::collections::BTreeSet::new();
 
     for (tier, objective) in compiled.objectives().iter().enumerate() {
         if engine_stop.load(std::sync::atomic::Ordering::Acquire) || remaining_conflicts == Some(0) {
@@ -614,6 +621,42 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
         } else {
             clone_problem(problem.as_ref().expect("the active lexicographic tier has a CP problem"))
         };
+        let mut linear_controls = request.linear;
+        if let Some(remaining) = budget.remaining() {
+            linear_controls.root_time = linear_controls.root_time.min(remaining.saturating_sub(Duration::from_millis(10)));
+        }
+        let relaxation = linear::solve_root(
+            &tier_problem.solver,
+            &tier_problem.search,
+            objective.search(),
+            objective.minimizing(),
+            linear_controls,
+            engine_stop,
+        );
+        if let Some(backend) = relaxation.backend {
+            linear_backends.insert(backend);
+        }
+        let mut tier_guidance = guidance.clone();
+        if tier_guidance.initial_phase.len() != tier_problem.solver.store.num_vars() {
+            tier_guidance.initial_phase.resize(tier_problem.solver.store.num_vars(), None);
+        }
+        if relaxation.phase.len() == tier_guidance.initial_phase.len() {
+            for (current, &proposed) in tier_guidance.initial_phase.iter_mut().zip(&relaxation.phase) {
+                if current.is_none() {
+                    *current = proposed;
+                }
+            }
+        }
+        if let Some(value) = relaxation.bound {
+            upsert_bound(
+                &mut bounds,
+                Bound {
+                    tier,
+                    value,
+                    method: format!("{} LP relaxation with exact rational recertification", relaxation.backend.unwrap_or("linear")),
+                },
+            );
+        }
         let progress_prefix = proven_prefix.clone();
         let mut event_error = None;
         let outcome = {
@@ -667,6 +710,7 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
                     engine_stop,
                     request.seed.wrapping_add(tier as u64),
                     remaining_conflicts,
+                    &relaxation.phase,
                     request.publish_incumbent_assignments,
                     &mut progress,
                 )
@@ -682,7 +726,7 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
                     engine_stop,
                     &mut output,
                     options,
-                    guidance.clone(),
+                    tier_guidance,
                     initial_incumbent.take(),
                     request.publish_incumbent_assignments,
                     &mut progress,
@@ -694,6 +738,7 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
             return Err(error);
         }
 
+        merge_search_stats(&mut total_stats, relaxation.stats);
         merge_search_stats(&mut total_stats, outcome.stats);
         shared_clauses = shared_clauses.saturating_add(outcome.shared_clauses);
         imported_clauses = imported_clauses.saturating_add(outcome.imported_clauses);
@@ -729,6 +774,7 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
             (None, true) if tier == 0 => {
                 unsatisfiable = true;
                 complete = true;
+                bounds.clear();
                 break;
             }
             (None, true) => {
@@ -736,7 +782,10 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
             }
             (Some((_, value)), true) if tier_candidate.is_some() => {
                 proven_prefix.push(*value);
-                bounds.push(Bound { tier, value: *value, method: format!("complete CP search for lexicographic tier {tier}") });
+                upsert_bound(
+                    &mut bounds,
+                    Bound { tier, value: *value, method: format!("complete CP search for lexicographic tier {tier}") },
+                );
                 if final_tier {
                     complete = true;
                     break;
@@ -774,6 +823,9 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
     });
 
     let mut metadata = cp_metadata(shared_clauses, imported_clauses, split_jobs, probe_stats, lns_stats);
+    if !linear_backends.is_empty() {
+        metadata.push(("linear_backends".to_string(), linear_backends.into_iter().collect::<Vec<_>>().join(",")));
+    }
     if let (Some(first_worker), Some(search)) = (first_incremental_worker, incremental.as_ref()) {
         metadata.push(("clause_session_workers".to_string(), search.next_worker().saturating_sub(first_worker).to_string()));
     }
@@ -786,6 +838,14 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
     });
 
     Ok(SolveResult { status, primal, bounds, proof, reports, message })
+}
+
+fn upsert_bound(bounds: &mut Vec<Bound>, replacement: Bound) {
+    if let Some(bound) = bounds.iter_mut().find(|bound| bound.tier == replacement.tier) {
+        *bound = replacement;
+    } else {
+        bounds.push(replacement);
+    }
 }
 
 fn optional_warm_start_report(elapsed: Duration, rejection: &str) -> EngineReport {

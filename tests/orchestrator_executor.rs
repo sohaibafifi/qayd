@@ -88,6 +88,13 @@ fn merge_search_stats_covers_every_counter() {
         watched_clause_visits: 8,
         watched_literal_scans: 9,
         binary_implications: 10,
+        lp_rows: 11,
+        lp_solves: 12,
+        lp_certified: 13,
+        lp_timeouts: 14,
+        lp_refactorizations: 15,
+        lp_micros: 16,
+        lp_root_bound: Some(17),
     };
     let part = SolveStats {
         solutions: 10,
@@ -100,6 +107,13 @@ fn merge_search_stats_covers_every_counter() {
         watched_clause_visits: 80,
         watched_literal_scans: 90,
         binary_implications: 100,
+        lp_rows: 110,
+        lp_solves: 120,
+        lp_certified: 130,
+        lp_timeouts: 140,
+        lp_refactorizations: 150,
+        lp_micros: 160,
+        lp_root_bound: Some(170),
     };
 
     merge_search_stats(&mut total, part);
@@ -117,6 +131,13 @@ fn merge_search_stats_covers_every_counter() {
             watched_clause_visits: 88,
             watched_literal_scans: 99,
             binary_implications: 110,
+            lp_rows: 121,
+            lp_solves: 132,
+            lp_certified: 143,
+            lp_timeouts: 154,
+            lp_refactorizations: 165,
+            lp_micros: 176,
+            lp_root_bound: Some(17),
         }
     );
 }

@@ -50,6 +50,8 @@ pub(crate) mod schedule;
 
 pub(crate) mod cp;
 
+pub(crate) mod linear;
+
 #[allow(dead_code)]
 pub(crate) mod dual;
 

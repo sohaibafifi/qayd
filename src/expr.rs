@@ -7,6 +7,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ids::VarId;
 
+#[cfg(feature = "lp-relaxation")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LinearRelation {
+    pub(crate) coefficients: Vec<i64>,
+    pub(crate) variables: Vec<VarId>,
+    pub(crate) lower: Option<i64>,
+    pub(crate) upper: Option<i64>,
+}
+
 /// A node in an `intension` expression tree.
 #[derive(Clone)]
 pub enum Expr {
@@ -66,6 +75,69 @@ pub enum Expr {
 }
 
 impl Expr {
+    /// Return a top-level affine comparison as an exact ranged row.
+    /// Disequalities have no unconditional convex relaxation and are omitted.
+    #[cfg(feature = "lp-relaxation")]
+    pub(crate) fn linear_relation_interruptible(&self, stop: &AtomicBool) -> Option<LinearRelation> {
+        let (left, right, relation) = match self {
+            Expr::Le(left, right) => (left.as_ref(), right.as_ref(), 0u8),
+            Expr::Lt(left, right) => (left.as_ref(), right.as_ref(), 1u8),
+            Expr::Ge(left, right) => (left.as_ref(), right.as_ref(), 2u8),
+            Expr::Gt(left, right) => (left.as_ref(), right.as_ref(), 3u8),
+            Expr::Eq(left, right) => (left.as_ref(), right.as_ref(), 4u8),
+            Expr::Const(_)
+            | Expr::Var(_)
+            | Expr::Neg(_)
+            | Expr::Abs(_)
+            | Expr::Add(_)
+            | Expr::Sub(_, _)
+            | Expr::Mul(_)
+            | Expr::Div(_, _)
+            | Expr::Mod(_, _)
+            | Expr::Min(_)
+            | Expr::Max(_)
+            | Expr::Ne(_, _)
+            | Expr::Not(_)
+            | Expr::And(_)
+            | Expr::Or(_)
+            | Expr::Imp(_, _)
+            | Expr::Iff(_, _)
+            | Expr::IfThenElse(_, _, _) => return None,
+        };
+        let (left_constant, left_coefficients, left_variables) = left.affine_form_interruptible(stop)?;
+        let (right_constant, right_coefficients, right_variables) = right.affine_form_interruptible(stop)?;
+        let rhs = right_constant.checked_sub(left_constant)?;
+        let mut combined = BTreeMap::<VarId, i64>::new();
+        for (coefficient, variable) in left_coefficients.into_iter().zip(left_variables) {
+            let updated = combined.get(&variable).copied().unwrap_or(0).checked_add(coefficient)?;
+            if updated == 0 {
+                combined.remove(&variable);
+            } else {
+                combined.insert(variable, updated);
+            }
+        }
+        for (coefficient, variable) in right_coefficients.into_iter().zip(right_variables) {
+            let updated = combined.get(&variable).copied().unwrap_or(0).checked_sub(coefficient)?;
+            if updated == 0 {
+                combined.remove(&variable);
+            } else {
+                combined.insert(variable, updated);
+            }
+        }
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        let (lower, upper) = match relation {
+            0 => (None, Some(rhs)),
+            1 => (None, Some(rhs.checked_sub(1)?)),
+            2 => (Some(rhs), None),
+            3 => (Some(rhs.checked_add(1)?), None),
+            _ => (Some(rhs), Some(rhs)),
+        };
+        let (variables, coefficients): (Vec<_>, Vec<_>) = combined.into_iter().unzip();
+        Some(LinearRelation { coefficients, variables, lower, upper })
+    }
+
     /// Collect every variable referenced in the tree (with duplicates).
     pub fn collect_vars(&self, out: &mut Vec<VarId>) {
         match self {

@@ -353,4 +353,13 @@ pub fn merge_search_stats(total: &mut SolveStats, part: SolveStats) {
     total.watched_clause_visits = total.watched_clause_visits.saturating_add(part.watched_clause_visits);
     total.watched_literal_scans = total.watched_literal_scans.saturating_add(part.watched_literal_scans);
     total.binary_implications = total.binary_implications.saturating_add(part.binary_implications);
+    total.lp_rows = total.lp_rows.saturating_add(part.lp_rows);
+    total.lp_solves = total.lp_solves.saturating_add(part.lp_solves);
+    total.lp_certified = total.lp_certified.saturating_add(part.lp_certified);
+    total.lp_timeouts = total.lp_timeouts.saturating_add(part.lp_timeouts);
+    total.lp_refactorizations = total.lp_refactorizations.saturating_add(part.lp_refactorizations);
+    total.lp_micros = total.lp_micros.saturating_add(part.lp_micros);
+    if total.lp_root_bound.is_none() {
+        total.lp_root_bound = part.lp_root_bound;
+    }
 }

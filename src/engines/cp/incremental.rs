@@ -85,12 +85,14 @@ impl<'a> IncrementalSearch<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn solve_cop(
         &mut self,
         mut problem: Problem,
         stop: &AtomicBool,
         seed: u64,
         conflict_limit: Option<u64>,
+        advisory_phase: &[Option<i32>],
         publish_incumbents: bool,
         on_improvement: &mut dyn FnMut(i64, Option<&[i32]>),
     ) -> ParallelOutcome {
@@ -105,6 +107,17 @@ impl<'a> IncrementalSearch<'a> {
         }
 
         let objective = problem.objective.as_ref().expect("incremental COP lost its objective");
+        let mut initial_phase = self.guidance.initial_phase.clone();
+        if initial_phase.len() != problem.solver.store.num_vars() {
+            initial_phase.resize(problem.solver.store.num_vars(), None);
+        }
+        if advisory_phase.len() == initial_phase.len() {
+            for (current, &proposed) in initial_phase.iter_mut().zip(advisory_phase) {
+                if current.is_none() {
+                    *current = proposed;
+                }
+            }
+        }
         let worker = self.take_worker();
         let (best, stats, proved) = search::optimize_assuming_seeded_with_scope(
             &mut problem.solver,
@@ -118,7 +131,7 @@ impl<'a> IncrementalSearch<'a> {
             None,
             Some(ClauseSharing::new(Arc::clone(&self.clauses), worker)),
             conflict_limit,
-            self.guidance.initial_phase.clone(),
+            initial_phase,
             self.guidance.branch_order.clone(),
             |value, assignment| on_improvement(value, publish_incumbents.then_some(assignment)),
         );

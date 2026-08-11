@@ -50,6 +50,10 @@ panic = "unwind"
 ctrlc = "3.5.2"
 libc = "0.2"
 lzma-rs = "0.3.0"
+amthal = { path = "../amthal", optional = true }
+num-bigint = { version = "0.4", optional = true }
+num-rational = { version = "0.4", optional = true }
+num-traits = { version = "0.2", optional = true }
 pyo3 = { version = "0.29.0", features = ["extension-module", "abi3-py38"], optional = true }
 smallvec = "1.15.1"
 # Patched fork: cardinality mixed occurs, %N group injection, notin, stray stdout
@@ -62,6 +66,9 @@ default = []
 # Build the PyO3 Python extension module (`qayd._core`). Off by default so the
 # normal solver build and tests don't pull in pyo3.
 python = ["dep:pyo3"]
+# Advisory LP relaxation with exact dual recertification. The backend remains
+# optional so ordinary CP, SAT, list, and scheduling builds do not link it.
+lp-relaxation = ["dep:amthal", "dep:num-bigint", "dep:num-rational", "dep:num-traits"]
 
 
 # Cold parse/decompress stack: runs once per instance, never in the solve loop.

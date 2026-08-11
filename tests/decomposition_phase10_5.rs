@@ -5,9 +5,9 @@ use qayd::model::{
     BoolLiteral, Constraint, IntExpr, IntGlobalConstraint, IntVarRef, Model, ModelObject, ModelPackage, Objective, Relation, SourceRange,
 };
 use qayd::orchestrator::{
-    compile_model_plan, solve_model, solve_model_silent, CpControls, EngineKind, EventCallback, EventControl, ExecutablePlan, ProofKind,
-    SemanticAssumption, SemanticAssumptionOp, SolveBudget, SolveError, SolveEvent, SolveLimits, SolveMode, SolveRequest, SolveStatus,
-    VerificationLevel,
+    compile_model_plan, solve_model, solve_model_silent, CpControls, EngineKind, EventCallback, EventControl, ExecutablePlan,
+    LinearControls, ProofKind, SemanticAssumption, SemanticAssumptionOp, SolveBudget, SolveError, SolveEvent, SolveLimits, SolveMode,
+    SolveRequest, SolveStatus, VerificationLevel,
 };
 
 fn list_count(list: usize) -> Reduction {
@@ -93,7 +93,7 @@ fn independent_lexicographic_objectives_are_optimized_and_merged_in_semantic_ord
 }
 
 #[test]
-fn objective_only_cp_controls_are_not_forwarded_to_satisfaction_components() {
+fn objective_only_controls_are_not_forwarded_to_satisfaction_components() {
     let mut model = Model::new();
     let optimized = model.int_range(0, 3);
     let satisfaction_only = model.int_range(0, 1);
@@ -105,6 +105,7 @@ fn objective_only_cp_controls_are_not_forwarded_to_satisfaction_components() {
         mode: SolveMode::Exact,
         threads: 2,
         cp: CpControls { split: true, ..CpControls::default() },
+        linear: LinearControls { root_time: Duration::from_millis(7), ..LinearControls::default() },
         ..SolveRequest::default()
     };
 

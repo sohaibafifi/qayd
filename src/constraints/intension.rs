@@ -93,6 +93,10 @@ pub(crate) fn intension_interruptible(solver: &mut Solver, expr: Expr, stop: &At
     if stop.load(Ordering::Acquire) {
         return false;
     }
+    #[cfg(feature = "lp-relaxation")]
+    if let Some(row) = expr.linear_relation_interruptible(stop) {
+        solver.record_linear_relaxation(&row.coefficients, &row.variables, row.lower, row.upper);
+    }
     let mut vars = Vec::new();
     if !collect_vars_interruptible(&expr, &mut vars, stop) {
         return false;

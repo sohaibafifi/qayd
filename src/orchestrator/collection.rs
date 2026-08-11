@@ -324,6 +324,9 @@ pub(crate) fn preflight_collection_memory(semantic: &Model, request: &SolveReque
 }
 
 fn validate_collection_request(semantic: &Model, model: &list::CollectionModel, request: &SolveRequest) -> Result<(), SolveError> {
+    if request.linear != super::LinearControls::default() {
+        return Err(SolveError::InvalidRequest("linear relaxation controls require an exact integer CP objective".to_string()));
+    }
     if request.sat != super::SatControls::default() {
         return Err(SolveError::InvalidRequest("SAT controls require a semantic Boolean clause model".to_string()));
     }

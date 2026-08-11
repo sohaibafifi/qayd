@@ -82,6 +82,20 @@ pub struct SolveStats {
     pub watched_literal_scans: u64,
     /// Literals implied by the binary-clause fast path.
     pub binary_implications: u64,
+    /// Convex rows retained by the optional root LP relaxation.
+    pub lp_rows: u64,
+    /// LP solves attempted.
+    pub lp_solves: u64,
+    /// Floating-point dual candidates recertified exactly by qayd.
+    pub lp_certified: u64,
+    /// LP solves stopped by their local wall-clock allowance.
+    pub lp_timeouts: u64,
+    /// Complete basis refactorizations reported by the backend.
+    pub lp_refactorizations: u64,
+    /// Wall-clock time spent inside LP solves.
+    pub lp_micros: u64,
+    /// Certified root bound in the user's objective direction.
+    pub lp_root_bound: Option<i64>,
 }
 
 /// A Boolean literal over an integer variable encoded as `{0, 1}` or `{-1, 1}`.

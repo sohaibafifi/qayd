@@ -16,9 +16,9 @@ use crate::model::{Constraint, IntDomain, IntExpr as Expr, IntGlobalConstraint, 
 use crate::orchestrator::{
     count_model_solutions_with_external_stop, enumerate_model_mus_with_external_stop, explain_model_mus_with_external_stop,
     extract_model_mus_with_external_stop, solve_model_with_external_stop, EngineKind, EngineReport, EventControl, EventSink,
-    ModelMusEnumeration, ModelMusResult, MusAtomRelation, RoutingControls, SearchStats, SemanticAssumption, SemanticAssumptionOp,
-    SemanticNogoodRelation, SemanticSolveSession, SolveError, SolveEvent, SolveLimits, SolveMode, SolveRequest, SolveResult, SolveStatus,
-    VerificationLevel,
+    LinearBackendMode, LinearControls, ModelMusEnumeration, ModelMusResult, MusAtomRelation, RoutingControls, SearchStats,
+    SemanticAssumption, SemanticAssumptionOp, SemanticNogoodRelation, SemanticSolveSession, SolveError, SolveEvent, SolveLimits, SolveMode,
+    SolveRequest, SolveResult, SolveStatus, VerificationLevel,
 };
 
 mod expr {
@@ -342,6 +342,20 @@ struct PySolveStats {
     vivified_clauses: u64,
     #[pyo3(get)]
     vivified_lits: u64,
+    #[pyo3(get)]
+    lp_rows: u64,
+    #[pyo3(get)]
+    lp_solves: u64,
+    #[pyo3(get)]
+    lp_certified: u64,
+    #[pyo3(get)]
+    lp_timeouts: u64,
+    #[pyo3(get)]
+    lp_refactorizations: u64,
+    #[pyo3(get)]
+    lp_micros: u64,
+    #[pyo3(get)]
+    lp_root_bound: Option<i64>,
 }
 
 /// Result of [`enumerate_mus`](PyModel::enumerate_mus): the minimal unsatisfiable
@@ -654,6 +668,13 @@ impl From<SearchStats> for PySolveStats {
             learned_lits: stats.learned_lits,
             vivified_clauses: stats.vivified_clauses,
             vivified_lits: stats.vivified_lits,
+            lp_rows: stats.lp_rows,
+            lp_solves: stats.lp_solves,
+            lp_certified: stats.lp_certified,
+            lp_timeouts: stats.lp_timeouts,
+            lp_refactorizations: stats.lp_refactorizations,
+            lp_micros: stats.lp_micros,
+            lp_root_bound: stats.lp_root_bound,
         }
     }
 }
@@ -872,6 +893,35 @@ fn parse_engine(engine: &str) -> PyResult<PythonEngine> {
         "ls" => Ok(PythonEngine::Ls),
         _ => Err(PyValueError::new_err("engine must be 'auto', 'exact', or 'ls'")),
     }
+}
+
+fn parse_linear_backend(backend: &str) -> PyResult<LinearBackendMode> {
+    match backend {
+        "auto" => Ok(LinearBackendMode::Auto),
+        "native" => Ok(LinearBackendMode::Native),
+        "amthal" => Ok(LinearBackendMode::Amthal),
+        _ => Err(PyValueError::new_err("linear_backend must be 'auto', 'native', or 'amthal'")),
+    }
+}
+
+fn linear_controls(
+    backend: &str,
+    root_millis: u64,
+    max_variables: usize,
+    max_rows: usize,
+    max_nonzeros: usize,
+    min_coverage_percent: usize,
+    phase_max_variables: usize,
+) -> PyResult<LinearControls> {
+    Ok(LinearControls {
+        backend: parse_linear_backend(backend)?,
+        root_time: Duration::from_millis(root_millis),
+        max_variables,
+        max_rows,
+        max_nonzeros,
+        min_coverage_percent,
+        phase_max_variables,
+    })
 }
 
 #[derive(Default)]
@@ -1144,6 +1194,13 @@ fn verbose_finish(solution: &PySolution) {
     println!("  nodes: {}", solution.stats.nodes);
     println!("  failures: {}", solution.stats.failures);
     println!("  learned_lits: {}", solution.stats.learned_lits);
+    if solution.stats.lp_rows > 0 {
+        println!("  lp_rows: {}", solution.stats.lp_rows);
+        println!("  lp_root_bound: {}", solution.stats.lp_root_bound.map_or_else(|| "?".to_string(), |bound| bound.to_string()));
+        println!("  lp_solves: {}", solution.stats.lp_solves);
+        println!("  lp_certified: {}", solution.stats.lp_certified);
+        println!("  lp_time_ms: {:.3}", solution.stats.lp_micros as f64 / 1000.0);
+    }
 }
 
 fn verbose_collection_finish(solution: &PySolution, run: &CollectionRun, profile: bool) {
@@ -2110,7 +2167,7 @@ impl PySolveSession {
             .collect())
     }
 
-    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, conflict_budget=None))]
+    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, conflict_budget=None, linear_backend="auto", lp_root_ms=50, lp_max_variables=2000, lp_max_rows=1000, lp_max_nonzeros=100000, lp_min_coverage_percent=1, lp_phase_max_variables=1000))]
     #[allow(clippy::too_many_arguments)]
     fn solve(
         &mut self,
@@ -2124,6 +2181,13 @@ impl PySolveSession {
         time_limit: Option<u64>,
         seed: u64,
         conflict_budget: Option<u64>,
+        linear_backend: &str,
+        lp_root_ms: u64,
+        lp_max_variables: usize,
+        lp_max_rows: usize,
+        lp_max_nonzeros: usize,
+        lp_min_coverage_percent: usize,
+        lp_phase_max_variables: usize,
     ) -> PyResult<PySolution> {
         if let Some(callback) = on_incumbent {
             if !callback.is_callable() {
@@ -2155,6 +2219,15 @@ impl PySolveSession {
             hints,
             branch_order: guidance,
             publish_incumbent_assignments: on_incumbent.is_some(),
+            linear: linear_controls(
+                linear_backend,
+                lp_root_ms,
+                lp_max_variables,
+                lp_max_rows,
+                lp_max_nonzeros,
+                lp_min_coverage_percent,
+                lp_phase_max_variables,
+            )?,
             ..SolveRequest::default()
         };
         let on_incumbent = on_incumbent.map(|cb| cb.clone().unbind());
@@ -2942,7 +3015,7 @@ impl PyModel {
         Ok(())
     }
 
-    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, threads=1, engine="auto", conflict_budget=None, list_hint=None, max_iterations=None, profile=false, memory_limit_mb=None, schedule_cdcl=false, routing_two_way=true, routing_nearest_neighbor=true, routing_warm_start=true))]
+    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, threads=1, engine="auto", conflict_budget=None, list_hint=None, max_iterations=None, profile=false, memory_limit_mb=None, schedule_cdcl=false, routing_two_way=true, routing_nearest_neighbor=true, routing_warm_start=true, linear_backend="auto", lp_root_ms=50, lp_max_variables=2000, lp_max_rows=1000, lp_max_nonzeros=100000, lp_min_coverage_percent=1, lp_phase_max_variables=1000))]
     #[allow(clippy::too_many_arguments)]
     fn solve(
         &self,
@@ -2966,6 +3039,13 @@ impl PyModel {
         routing_two_way: bool,
         routing_nearest_neighbor: bool,
         routing_warm_start: bool,
+        linear_backend: &str,
+        lp_root_ms: u64,
+        lp_max_variables: usize,
+        lp_max_rows: usize,
+        lp_max_nonzeros: usize,
+        lp_min_coverage_percent: usize,
+        lp_phase_max_variables: usize,
     ) -> PyResult<PySolution> {
         if threads == 0 {
             return Err(PyValueError::new_err("threads must be a positive integer"));
@@ -3025,6 +3105,15 @@ impl PyModel {
                 nearest_neighbor: routing_nearest_neighbor,
                 warm_start: routing_warm_start,
             },
+            linear: linear_controls(
+                linear_backend,
+                lp_root_ms,
+                lp_max_variables,
+                lp_max_rows,
+                lp_max_nonzeros,
+                lp_min_coverage_percent,
+                lp_phase_max_variables,
+            )?,
             ..SolveRequest::default()
         };
         if verbose && has_collection {

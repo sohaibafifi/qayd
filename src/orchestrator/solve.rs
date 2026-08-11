@@ -518,6 +518,7 @@ fn project_component_request(
                 projected.cp.split = false;
                 projected.cp.probes = 0;
                 projected.cp.lns = 0;
+                projected.linear = super::LinearControls::default();
             }
         }
         IndependentFamily::Lists => {
@@ -528,6 +529,7 @@ fn project_component_request(
             projected.limits.conflicts = None;
             projected.schedule_cdcl = false;
             projected.cp = super::CpControls::default();
+            projected.linear = super::LinearControls::default();
             projected.list_hint = match &request.list_hint {
                 Some(hint) => {
                     let mut local = vec![Vec::new(); component.model.lists().len()];
@@ -556,6 +558,7 @@ fn project_component_request(
             projected.limits.conflicts = None;
             projected.routing = super::RoutingControls::default();
             projected.cp = super::CpControls::default();
+            projected.linear = super::LinearControls::default();
         }
     }
     Ok(projected)

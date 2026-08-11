@@ -57,9 +57,13 @@ pub(crate) fn compile_sat_plan(model: &Model, request: &SolveRequest, budget: &S
     if request.limits.conflicts.is_some() || request.limits.iterations.is_some() {
         return Err(SolveError::InvalidRequest("the specialized SAT plan does not support conflict or iteration limits".to_string()));
     }
-    if request.schedule_cdcl || request.routing != super::RoutingControls::default() || request.cp != super::CpControls::default() {
+    if request.schedule_cdcl
+        || request.routing != super::RoutingControls::default()
+        || request.cp != super::CpControls::default()
+        || request.linear != super::LinearControls::default()
+    {
         return Err(SolveError::InvalidRequest(
-            "the specialized SAT plan does not accept scheduling, routing, or CP portfolio controls".to_string(),
+            "the specialized SAT plan does not accept scheduling, routing, CP portfolio, or linear relaxation controls".to_string(),
         ));
     }
     if !request.assumptions.is_empty()

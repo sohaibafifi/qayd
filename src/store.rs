@@ -98,6 +98,18 @@ pub struct ScopeVar {
     pub holes: Vec<i32>,
 }
 
+/// Convex linear row retained for an optional relaxation backend.
+/// `None` denotes an infinite side. Selected constraints and disequalities are
+/// excluded because this representation is unconditional.
+#[cfg(feature = "lp-relaxation")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LinearRelaxationRow {
+    pub(crate) coefficients: Vec<i64>,
+    pub(crate) variables: Vec<VarId>,
+    pub(crate) lower: Option<i64>,
+    pub(crate) upper: Option<i64>,
+}
+
 /// Why a domain change happened: the raw material for its LCG explanation.
 #[derive(Clone, Debug)]
 pub enum Cause {
@@ -1321,6 +1333,8 @@ pub struct Solver {
     /// [`Selected`] guard on this selector, used to build constraint-level
     /// unsat cores. `None` in normal solving (no wrapping, no overhead).
     current_selector: Option<VarId>,
+    #[cfg(feature = "lp-relaxation")]
+    linear_relaxation: Vec<LinearRelaxationRow>,
 }
 
 const _: fn() = || {
@@ -1390,6 +1404,23 @@ impl Solver {
     /// [`crate::mus`].
     pub fn set_selector(&mut self, sel: Option<VarId>) {
         self.current_selector = sel;
+    }
+
+    #[cfg(feature = "lp-relaxation")]
+    pub(crate) fn record_linear_relaxation(&mut self, coefficients: &[i64], variables: &[VarId], lower: Option<i64>, upper: Option<i64>) {
+        if self.current_selector.is_none() {
+            self.linear_relaxation.push(LinearRelaxationRow {
+                coefficients: coefficients.to_vec(),
+                variables: variables.to_vec(),
+                lower,
+                upper,
+            });
+        }
+    }
+
+    #[cfg(feature = "lp-relaxation")]
+    pub(crate) fn linear_relaxation(&self) -> &[LinearRelaxationRow] {
+        &self.linear_relaxation
     }
 
     /// Collapse scheduling into a single FIFO band (the pre-banding order), for

@@ -348,6 +348,7 @@ fn post_leq(solver: &mut Solver, coeffs: &[i64], vars: &[VarId], c: i64) {
 /// Post \( \sum_i \texttt{coeffs}[i] \cdot \texttt{vars}[i] \;\texttt{rel}\; \texttt{rhs} \).
 pub fn linear(solver: &mut Solver, coeffs: &[i64], vars: &[VarId], rel: Relation, rhs: i64) {
     assert_eq!(coeffs.len(), vars.len(), "linear: coeffs/vars length mismatch");
+    record_relaxation(solver, coeffs, vars, rel, rhs);
     match rel {
         Relation::Le => post_leq(solver, coeffs, vars, rhs),
         Relation::Lt => post_leq(solver, coeffs, vars, rhs - 1),
@@ -376,6 +377,7 @@ pub(crate) fn linear_interruptible(
     if stop.load(Ordering::Acquire) {
         return false;
     }
+    record_relaxation(solver, &coeffs, &vars, rel, rhs);
     let should_stop = || stop.load(Ordering::Acquire);
     let propagator: Box<dyn Propagator> = match rel {
         Relation::Le => Box::new(LinearLeq { term_min: vec![0; vars.len()], coeffs, vars, c: rhs }),
@@ -398,6 +400,30 @@ pub(crate) fn linear_interruptible(
     }
     solver.post_until(propagator, &should_stop).is_some()
 }
+
+#[cfg(feature = "lp-relaxation")]
+fn record_relaxation(solver: &mut Solver, coefficients: &[i64], variables: &[VarId], relation: Relation, rhs: i64) {
+    match relation {
+        Relation::Le => solver.record_linear_relaxation(coefficients, variables, None, Some(rhs)),
+        Relation::Lt => {
+            if let Some(upper) = rhs.checked_sub(1) {
+                solver.record_linear_relaxation(coefficients, variables, None, Some(upper));
+            }
+        }
+        Relation::Ge => solver.record_linear_relaxation(coefficients, variables, Some(rhs), None),
+        Relation::Gt => {
+            if let Some(lower) = rhs.checked_add(1) {
+                solver.record_linear_relaxation(coefficients, variables, Some(lower), None);
+            }
+        }
+        Relation::Eq => solver.record_linear_relaxation(coefficients, variables, Some(rhs), Some(rhs)),
+        Relation::Ne => {}
+    }
+}
+
+#[cfg(not(feature = "lp-relaxation"))]
+#[inline]
+fn record_relaxation(_solver: &mut Solver, _coefficients: &[i64], _variables: &[VarId], _relation: Relation, _rhs: i64) {}
 
 /// Post \( \sum_i \texttt{vars}[i] \;\texttt{rel}\; \texttt{rhs} \) (all coefficients 1).
 pub fn sum(solver: &mut Solver, vars: &[VarId], rel: Relation, rhs: i64) {

@@ -64,6 +64,12 @@ Priority order: correct, simple, fast.
   dedicates materialized-objective workers to optimistic probes. `--lns`
   dedicates workers to bounded incumbent-driven [Large Neighborhood
   Search](https://doi.org/10.1007/978-3-319-91086-4_4).
+- **Optional certified LP relaxation.** Exact integer COPs can retain convex
+  linear rows and solve a root relaxation through the lightweight Amthal
+  backend. Floating primal values are used only as phase guidance. A dual bound
+  is published only after qayd reconstructs it with exact rational arithmetic.
+  The feature is opt-in and all limits are explicit `SolveRequest`, CLI, or
+  Python arguments.
 - **Local-search COP engine.** `--ls` searches for feasible COP incumbents and
   objective improvements without proving optimality. It uses local scoring for
   common constraints, constructive starts for guarded table/element patterns,
@@ -122,6 +128,13 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
+Optional LP backend checks:
+
+```bash
+cargo test --features lp-relaxation --test lp_relaxation
+cargo clippy --all-targets --features lp-relaxation -- -D warnings
+```
+
 Python extension checks:
 
 ```bash
@@ -142,6 +155,14 @@ Common options:
 - `-p`, `--threads N`: set worker count.
 - `--ls`: search for good COP incumbents without proving optimality.
 - `--split`, `--probe N`, `--lns N`: optional parallel COP strategies.
+- `--linear-backend auto|native|amthal`: select the advisory root LP backend.
+- `--lp-root-ms N`: cap the root relaxation wall-clock time.
+- `--lp-max-vars`, `--lp-max-rows`, `--lp-max-nonzeros`: cap retained model size.
+- `--lp-min-coverage`, `--lp-phase-max-vars`: control eligibility and phase guidance.
+
+The Amthal backend is linked from the private sibling crate `../amthal` only by
+`--features lp-relaxation`. Without that feature, `auto` preserves the native
+path and an explicit `amthal` request returns a clear configuration error.
 
 ## Python Examples
 
