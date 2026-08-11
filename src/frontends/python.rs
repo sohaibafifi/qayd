@@ -60,6 +60,10 @@ mod expr {
         Expr::And(values)
     }
 
+    pub(super) fn or(values: Vec<Expr>) -> Expr {
+        Expr::Or(values)
+    }
+
     pub(super) fn imp(left: Expr, right: Expr) -> Expr {
         Expr::Imp(Box::new(left), Box::new(right))
     }
@@ -282,6 +286,57 @@ impl AlternativeInterval {
             .zip(&self.durations)
             .map(|(&presence, &duration)| expr::mul(vec![expr::var(presence), expr::int(duration)]))
             .collect()
+    }
+}
+
+/// An ordered view over native intervals with sequence-dependent setup times.
+/// The order is derived from the solved start times, which is canonical because
+/// the posted disjunctions keep every pair of present members separated.
+#[pyclass(name = "SequenceVar", module = "qayd", from_py_object)]
+#[derive(Clone)]
+struct PySequenceVar {
+    model_id: u64,
+    index: u32,
+    intervals: Vec<PyIntervalVar>,
+    realizations: Vec<Vec<NativeIntervalSpec>>,
+}
+
+#[pymethods]
+impl PySequenceVar {
+    #[getter]
+    fn index(&self) -> usize {
+        self.index as usize
+    }
+
+    #[getter]
+    fn intervals(&self) -> Vec<PyIntervalVar> {
+        self.intervals.clone()
+    }
+
+    fn order(&self, solution: &PySolution) -> PyResult<Vec<PyIntervalVar>> {
+        let solved = |variable: IntVarRef| solution.values.get(variable.0).copied().flatten();
+        let mut present = Vec::new();
+        for (logical, (interval, realizations)) in self.intervals.iter().zip(&self.realizations).enumerate() {
+            if interval.model_id != self.model_id {
+                return Err(PyRuntimeError::new_err("sequence contains an interval from another model"));
+            }
+            if interval.presence.is_some_and(|presence| solved(presence) == Some(0)) {
+                continue;
+            }
+            let realization = realizations
+                .iter()
+                .find(|realization| realization.presence.is_none_or(|presence| solved(presence) == Some(1)))
+                .ok_or_else(|| PyRuntimeError::new_err("present sequence member has no selected realization"))?;
+            let start = solved(realization.start)
+                .ok_or_else(|| PyRuntimeError::new_err("no start value is available for a present sequence member"))?;
+            present.push((start, logical, interval.clone()));
+        }
+        present.sort_unstable_by_key(|(start, logical, _)| (*start, *logical));
+        Ok(present.into_iter().map(|(_, _, interval)| interval).collect())
+    }
+
+    fn __repr__(&self) -> String {
+        format!("SequenceVar({})", self.index)
     }
 }
 
@@ -560,6 +615,7 @@ struct PyModel {
     objective: Option<ObjectiveSpec>,
     then_objectives: Vec<ObjectiveSpec>,
     native_intervals: Vec<NativeIntervalSpec>,
+    native_sequences: usize,
     /// Canonical semantic construction for integer, list, and compact schedule
     /// models.
     /// Generations and reified-value slots only protect Python handles; all
@@ -1400,6 +1456,13 @@ fn parse_relation(relation: &str) -> PyResult<Relation> {
 
 fn checked_i32(value: i64, name: &str) -> PyResult<i32> {
     i32::try_from(value).map_err(|_| PyValueError::new_err(format!("{name} is outside the i32 domain range")))
+}
+
+fn checked_nonnegative_i32(value: i64, name: &str) -> PyResult<i32> {
+    if value < 0 {
+        return Err(PyValueError::new_err(format!("{name} must be non-negative")));
+    }
+    checked_i32(value, name)
 }
 
 fn relation_to_assumption_op(relation: &str) -> PyResult<SemanticAssumptionOp> {
@@ -2268,6 +2331,7 @@ impl PyModel {
             objective: None,
             then_objectives: Vec::new(),
             native_intervals: Vec::new(),
+            native_sequences: 0,
             semantic: SemanticConstruction::default(),
             mus_selectors: Vec::new(),
             active_soft_selector: None,
@@ -2575,7 +2639,11 @@ impl PyModel {
 
         let intervals = interval_list_from_py(items)?;
         if intervals.iter().all(|iv| iv.kind == PyIntervalKind::Native) {
-            let specs = self.native_interval_specs(&intervals)?;
+            let (specs, _) = self.flatten_native_intervals(&intervals)?;
+            let mut distinct = HashSet::with_capacity(specs.len());
+            if specs.iter().any(|spec| !distinct.insert(spec.interval)) {
+                return Err(PyValueError::new_err("no_overlap intervals must be distinct"));
+            }
             self.post_optional_no_overlap(&specs);
         } else if intervals.iter().all(|iv| iv.kind == PyIntervalKind::Schedule) {
             for iv in &intervals {
@@ -2587,6 +2655,53 @@ impl PyModel {
             return Err(PyValueError::new_err("cannot mix native intervals and schedule intervals in one no_overlap"));
         }
         Ok(())
+    }
+
+    /// Create a total order over native intervals. `transitions[i][j]` is the
+    /// non-negative setup time required when logical member `i` precedes `j`.
+    fn sequence(&mut self, items: &Bound<'_, PyAny>, transitions: Vec<Vec<i64>>) -> PyResult<PySequenceVar> {
+        let intervals = interval_list_from_py(items)?;
+        if intervals.is_empty() {
+            return Err(PyValueError::new_err("sequence needs at least one interval"));
+        }
+        if transitions.len() != intervals.len() || transitions.iter().any(|row| row.len() != intervals.len()) {
+            return Err(PyValueError::new_err("sequence transition matrix must be square and match the interval count"));
+        }
+        let transitions = transitions
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|value| {
+                        if value < 0 {
+                            return Err(PyValueError::new_err("sequence transition times must be non-negative"));
+                        }
+                        checked_i32(value, "sequence transition time")
+                    })
+                    .collect::<PyResult<Vec<_>>>()
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let realizations = intervals.iter().map(|interval| self.native_interval_realizations(interval)).collect::<PyResult<Vec<_>>>()?;
+        let (specs, owners) = self.flatten_native_intervals(&intervals)?;
+        let mut distinct = HashSet::with_capacity(specs.len());
+        if specs.iter().any(|spec| !distinct.insert(spec.interval)) {
+            return Err(PyValueError::new_err("sequence intervals must be distinct"));
+        }
+        for left in 0..specs.len() {
+            for right in (left + 1)..specs.len() {
+                if owners[left] == owners[right] {
+                    continue;
+                }
+                self.post_native_pair_order(
+                    &specs[left],
+                    &specs[right],
+                    transitions[owners[left]][owners[right]],
+                    transitions[owners[right]][owners[left]],
+                );
+            }
+        }
+        let index = self.native_sequences;
+        self.native_sequences += 1;
+        Ok(PySequenceVar { model_id: self.id, index: index as u32, intervals, realizations })
     }
 
     fn cumulative(&mut self, starts: &Bound<'_, PyAny>, durations: Vec<i64>, heights: Vec<i64>, capacity: i64) -> PyResult<()> {
@@ -2702,19 +2817,13 @@ impl PyModel {
                 return Err(PyValueError::new_err("cannot mix native intervals and schedule intervals in one precedence"));
             }
             if a.kind == PyIntervalKind::Native {
-                let before = self.native_interval_spec(&a)?;
-                let after = self.native_interval_spec(&b)?;
-                let precedence =
-                    expr::le(expr::add(vec![expr::var(before.start), expr::int(i64::from(before.duration))]), expr::var(after.start));
-                let mut active = Vec::new();
-                if let Some(presence) = before.presence {
-                    active.push(expr::eq(expr::var(presence), expr::int(1)));
+                let before = self.native_interval_realizations(&a)?;
+                let after = self.native_interval_realizations(&b)?;
+                for first in &before {
+                    for second in &after {
+                        self.post_native_precedence(first, second, 0);
+                    }
                 }
-                if let Some(presence) = after.presence {
-                    active.push(expr::eq(expr::var(presence), expr::int(1)));
-                }
-                let constraint = if active.is_empty() { precedence } else { expr::imp(expr::and(active), precedence) };
-                self.add_integer_constraint(Constraint::Intension(constraint));
             } else {
                 self.check_interval_scope(&a)?;
                 self.check_interval_scope(&b)?;
@@ -2790,13 +2899,11 @@ impl PyModel {
     }
 
     /// The `alternative` constraint over optional intervals the caller created:
-    /// exactly one member executes, and the returned master synchronises with
-    /// it (`.start` is the shared start, `.end`/`.realized_duration` follow the
-    /// chosen member). A dedicated bounds channel confines the master's start
-    /// to the union of the still-capable members' windows and rules out members
-    /// whose window it can no longer reach.
-    #[pyo3(signature = (members, *, name=None))]
-    fn alternative(&mut self, members: &Bound<'_, PyAny>, name: Option<String>) -> PyResult<PyIntervalVar> {
+    /// exactly one member executes while the master is present, and the
+    /// returned master synchronises with it. An optional master may be absent,
+    /// in which case every member is absent too.
+    #[pyo3(signature = (members, *, optional=false, name=None))]
+    fn alternative(&mut self, members: &Bound<'_, PyAny>, optional: bool, name: Option<String>) -> PyResult<PyIntervalVar> {
         let members = interval_list_from_py(members)?;
         if members.is_empty() {
             return Err(PyValueError::new_err("alternative needs at least one member interval"));
@@ -2824,12 +2931,26 @@ impl PyModel {
 
         let shared_start = self.semantic.model_mut().int_range(start_lo, start_hi);
         self.register_native_backing_var(shared_start, name.as_ref().map(|name| format!("{name}.start")));
-        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::AlternativeChannel {
-            shared_start,
-            starts,
-            durations: durations.clone(),
-            presences: presences.clone(),
-        }));
+        let master_presence = optional.then(|| self.semantic.model_mut().bool_var());
+        if let Some(presence) = master_presence {
+            self.register_native_backing_var(presence, name.as_ref().map(|name| format!("{name}.presence")));
+            let mut terms = presences.iter().map(|&member| (1, member)).collect::<Vec<_>>();
+            terms.push((-1, presence));
+            self.add_integer_constraint(Constraint::Linear { terms, relation: Relation::Eq, rhs: 0 });
+            for (&start, &member_presence) in starts.iter().zip(&presences) {
+                self.add_integer_constraint(Constraint::Intension(expr::imp(
+                    expr::eq(expr::var(member_presence), expr::int(1)),
+                    expr::eq(expr::var(shared_start), expr::var(start)),
+                )));
+            }
+        } else {
+            self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::AlternativeChannel {
+                shared_start,
+                starts,
+                durations: durations.clone(),
+                presences: presences.clone(),
+            }));
+        }
 
         let name = name.unwrap_or_else(|| format!("alternative{}", shared_start.0));
         Ok(PyIntervalVar {
@@ -2839,7 +2960,7 @@ impl PyModel {
             kind: PyIntervalKind::Native,
             interval: None,
             start: Some(shared_start),
-            presence: None,
+            presence: master_presence,
             duration: None,
             alternative: Some(AlternativeInterval { name, members, presences, durations }),
         })
@@ -2955,7 +3076,7 @@ impl PyModel {
         {
             let selected = if let Some(intervals) = intervals {
                 let intervals = interval_list_from_py(intervals)?;
-                self.native_interval_specs(&intervals)?
+                self.flatten_native_intervals(&intervals)?.0
             } else {
                 self.native_intervals.clone()
             };
@@ -2980,27 +3101,13 @@ impl PyModel {
     /// pairs whose total over any instant may not exceed the capacity.
     fn resource(&mut self, demands: Vec<(PyIntervalVar, i64)>, capacity: i64) -> PyResult<()> {
         if demands.iter().all(|(iv, _)| iv.kind == PyIntervalKind::Native) {
-            let mut starts = Vec::with_capacity(demands.len());
-            let mut durations = Vec::with_capacity(demands.len());
-            let mut heights = Vec::with_capacity(demands.len());
+            let capacity = checked_nonnegative_i32(capacity, "cumulative capacity")?;
+            let mut expanded = Vec::new();
             for (iv, amount) in &demands {
-                let spec = self.native_interval_spec(iv)?;
-                starts.push(spec.start);
-                durations.push(self.const_var(spec.duration));
-                let demand = checked_i32(*amount, "cumulative demand")?;
-                heights.push(if let Some(presence) = spec.presence {
-                    self.aux_for(expr::mul(vec![expr::var(presence), expr::int(i64::from(demand))]))
-                } else {
-                    self.const_var(demand)
-                });
+                let amount = checked_nonnegative_i32(*amount, "cumulative demand")?;
+                expanded.extend(self.native_interval_realizations(iv)?.into_iter().map(|interval| (interval, amount)));
             }
-            let capacity = self.const_var(checked_i32(capacity, "cumulative capacity")?);
-            self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::CumulativeVar {
-                starts,
-                durations,
-                demands: heights,
-                capacity,
-            }));
+            self.post_native_cumulative(expanded, capacity, &[]);
         } else if demands.iter().all(|(iv, _)| iv.kind == PyIntervalKind::Schedule) {
             for (iv, _) in &demands {
                 self.check_interval_scope(iv)?;
@@ -3011,6 +3118,118 @@ impl PyModel {
                 .add_constraint(shared_model::Constraint::IntervalResource(list::Resource::Cumulative { demands, capacity }));
         } else {
             return Err(PyValueError::new_err("cannot mix native intervals and schedule intervals in one resource"));
+        }
+        Ok(())
+    }
+
+    /// Renewable resource with piecewise-constant capacity overrides on
+    /// half-open `[start, end)` calendar segments.
+    fn resource_calendar(
+        &mut self,
+        demands: Vec<(PyIntervalVar, i64)>,
+        default_capacity: i64,
+        calendar: Vec<(i64, i64, i64)>,
+    ) -> PyResult<()> {
+        let default_capacity = checked_nonnegative_i32(default_capacity, "default cumulative capacity")?;
+        let mut calendar = calendar
+            .into_iter()
+            .map(|(start, end, capacity)| {
+                let start = checked_i32(start, "calendar segment start")?;
+                let end = checked_i32(end, "calendar segment end")?;
+                if start >= end {
+                    return Err(PyValueError::new_err("calendar segments need start < end"));
+                }
+                Ok((start, end, checked_nonnegative_i32(capacity, "calendar capacity")?))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        calendar.sort_unstable_by_key(|&(start, end, _)| (start, end));
+        if calendar.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            return Err(PyValueError::new_err("calendar segments must not overlap"));
+        }
+
+        let mut expanded = Vec::new();
+        for (interval, demand) in &demands {
+            let demand = checked_nonnegative_i32(*demand, "cumulative demand")?;
+            expanded.extend(self.native_interval_realizations(interval)?.into_iter().map(|interval| (interval, demand)));
+        }
+        let horizon = expanded
+            .iter()
+            .map(|(interval, _)| self.domain_max(interval.start).saturating_add(interval.duration))
+            .max()
+            .unwrap_or(0)
+            .max(0);
+        let capacity = calendar.iter().map(|segment| segment.2).fold(default_capacity, i32::max);
+        let mut points = vec![0, horizon];
+        for &(start, end, _) in &calendar {
+            let start = start.clamp(0, horizon);
+            let end = end.clamp(0, horizon);
+            if start < end {
+                points.extend([start, end]);
+            }
+        }
+        points.sort_unstable();
+        points.dedup();
+        let mut blockers = Vec::new();
+        for window in points.windows(2) {
+            let (start, end) = (window[0], window[1]);
+            let available = calendar
+                .iter()
+                .find_map(|&(segment_start, segment_end, value)| (segment_start <= start && start < segment_end).then_some(value))
+                .unwrap_or(default_capacity);
+            if available < capacity {
+                blockers.push((start, end - start, capacity - available));
+            }
+        }
+        self.post_native_cumulative(expanded, capacity, &blockers);
+        Ok(())
+    }
+
+    /// State/resource function. Equal-state intervals may overlap. Intervals
+    /// requiring different states are ordered with transition-dependent setup.
+    fn state_function(&mut self, states: Vec<(PyIntervalVar, usize)>, transitions: Vec<Vec<i64>>) -> PyResult<()> {
+        let state_count = transitions.len();
+        if state_count == 0 || transitions.iter().any(|row| row.len() != state_count) {
+            return Err(PyValueError::new_err("state transition matrix must be non-empty and square"));
+        }
+        let transitions = transitions
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|value| {
+                        if value < 0 {
+                            return Err(PyValueError::new_err("state transition times must be non-negative"));
+                        }
+                        checked_i32(value, "state transition time")
+                    })
+                    .collect::<PyResult<Vec<_>>>()
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let mut expanded = Vec::new();
+        let mut distinct = HashSet::new();
+        for (interval, state) in states {
+            if state >= state_count {
+                return Err(PyValueError::new_err("state function references an unknown state"));
+            }
+            for realization in self.native_interval_realizations(&interval)? {
+                if !distinct.insert(realization.interval) {
+                    return Err(PyValueError::new_err("state function intervals must be distinct"));
+                }
+                expanded.push((realization, state));
+            }
+        }
+        for left in 0..expanded.len() {
+            for right in (left + 1)..expanded.len() {
+                let (first, first_state) = &expanded[left];
+                let (second, second_state) = &expanded[right];
+                if first_state != second_state {
+                    self.post_native_pair_order(
+                        first,
+                        second,
+                        transitions[*first_state][*second_state],
+                        transitions[*second_state][*first_state],
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -3553,6 +3772,93 @@ impl PyModel {
 
     fn native_interval_specs(&self, intervals: &[PyIntervalVar]) -> PyResult<Vec<NativeIntervalSpec>> {
         intervals.iter().map(|iv| self.native_interval_spec(iv)).collect()
+    }
+
+    /// Expand a public interval to the concrete fixed-duration realizations
+    /// consumed by integer scheduling globals. Plain intervals expand to one
+    /// item, while an alternative expands to its optional members.
+    fn native_interval_realizations(&self, interval: &PyIntervalVar) -> PyResult<Vec<NativeIntervalSpec>> {
+        if interval.model_id != self.id {
+            return Err(PyValueError::new_err("this interval belongs to a different model"));
+        }
+        if interval.kind != PyIntervalKind::Native {
+            return Err(PyValueError::new_err("expected a native interval"));
+        }
+        if let Some(alternative) = &interval.alternative {
+            return self.native_interval_specs(&alternative.members);
+        }
+        Ok(vec![self.native_interval_spec(interval)?])
+    }
+
+    fn flatten_native_intervals(&self, intervals: &[PyIntervalVar]) -> PyResult<(Vec<NativeIntervalSpec>, Vec<usize>)> {
+        let mut realizations = Vec::new();
+        let mut owners = Vec::new();
+        for (owner, interval) in intervals.iter().enumerate() {
+            let expanded = self.native_interval_realizations(interval)?;
+            owners.extend(std::iter::repeat_n(owner, expanded.len()));
+            realizations.extend(expanded);
+        }
+        Ok((realizations, owners))
+    }
+
+    fn post_native_precedence(&mut self, before: &NativeIntervalSpec, after: &NativeIntervalSpec, setup: i32) {
+        let precedence = expr::le(
+            expr::add(vec![expr::var(before.start), expr::int(i64::from(before.duration) + i64::from(setup))]),
+            expr::var(after.start),
+        );
+        let mut active = Vec::new();
+        if let Some(presence) = before.presence {
+            active.push(expr::eq(expr::var(presence), expr::int(1)));
+        }
+        if let Some(presence) = after.presence {
+            active.push(expr::eq(expr::var(presence), expr::int(1)));
+        }
+        let constraint = if active.is_empty() { precedence } else { expr::imp(expr::and(active), precedence) };
+        self.add_integer_constraint(Constraint::Intension(constraint));
+    }
+
+    fn post_native_pair_order(&mut self, left: &NativeIntervalSpec, right: &NativeIntervalSpec, left_setup: i32, right_setup: i32) {
+        let left_before = expr::le(
+            expr::add(vec![expr::var(left.start), expr::int(i64::from(left.duration) + i64::from(left_setup))]),
+            expr::var(right.start),
+        );
+        let right_before = expr::le(
+            expr::add(vec![expr::var(right.start), expr::int(i64::from(right.duration) + i64::from(right_setup))]),
+            expr::var(left.start),
+        );
+        let order = expr::or(vec![left_before, right_before]);
+        let active = [left.presence, right.presence]
+            .into_iter()
+            .flatten()
+            .map(|presence| expr::eq(expr::var(presence), expr::int(1)))
+            .collect::<Vec<_>>();
+        let constraint = if active.is_empty() { order } else { expr::imp(expr::and(active), order) };
+        self.add_integer_constraint(Constraint::Intension(constraint));
+    }
+
+    fn post_native_cumulative(&mut self, intervals: Vec<(NativeIntervalSpec, i32)>, capacity: i32, blockers: &[(i32, i32, i32)]) {
+        if intervals.is_empty() && blockers.is_empty() {
+            return;
+        }
+        let mut starts = Vec::with_capacity(intervals.len() + blockers.len());
+        let mut durations = Vec::with_capacity(intervals.len() + blockers.len());
+        let mut demands = Vec::with_capacity(intervals.len() + blockers.len());
+        for (interval, demand) in intervals {
+            starts.push(interval.start);
+            durations.push(self.const_var(interval.duration));
+            demands.push(if let Some(presence) = interval.presence {
+                self.aux_for(expr::mul(vec![expr::var(presence), expr::int(i64::from(demand))]))
+            } else {
+                self.const_var(demand)
+            });
+        }
+        for &(start, duration, demand) in blockers {
+            starts.push(self.const_var(start));
+            durations.push(self.const_var(duration));
+            demands.push(self.const_var(demand));
+        }
+        let capacity = self.const_var(capacity);
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::CumulativeVar { starts, durations, demands, capacity }));
     }
 
     fn set_native_makespan_objective(&mut self, intervals: &[NativeIntervalSpec]) -> PyResult<()> {
@@ -4752,6 +5058,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyIntVar>()?;
     m.add_class::<PyListVar>()?;
     m.add_class::<PyIntervalVar>()?;
+    m.add_class::<PySequenceVar>()?;
     m.add_class::<PyTerm>()?;
     m.add_class::<PyListConstraint>()?;
     m.add_class::<ListValue>()?;

@@ -12,10 +12,10 @@ use std::time::Duration;
 
 use xcsp3_rust_parser::xcsp_runner::XcspRunner;
 
-use crate::model::ModelPackage;
+use crate::model::{Constraint, ModelPackage};
 use crate::orchestrator::{
-    solve_model_with_external_stop, CpControls, EventCallback, EventControl, LinearControls, SolveError, SolveEvent, SolveLimits,
-    SolveMode, SolveRequest, SolveResult, SolveStatus,
+    extract_model_mus_with_external_stop, solve_model_with_external_stop, CpControls, EventCallback, EventControl, LinearControls,
+    ModelMusResult, SolveError, SolveEvent, SolveLimits, SolveMode, SolveRequest, SolveResult, SolveStatus,
 };
 
 /// Search strategy selected by the XCSP command line.
@@ -47,6 +47,8 @@ pub struct RunOptions {
     pub time_limit: Option<Duration>,
     pub mem_limit: Option<usize>,
     pub linear: LinearControls,
+    /// Extract an exact minimal source-constraint core after an UNSAT result.
+    pub core: bool,
 }
 
 impl RunOptions {
@@ -71,6 +73,7 @@ impl Default for RunOptions {
             time_limit: None,
             mem_limit: None,
             linear: LinearControls::default(),
+            core: false,
         }
     }
 }
@@ -152,6 +155,7 @@ struct ParsedXcsp {
     output: SolutionOutput,
     stats: ModelStats,
     has_objective: bool,
+    groups: Vec<callback::ConstraintGroup>,
 }
 
 #[derive(Clone, Copy)]
@@ -193,8 +197,74 @@ fn parse_problem(path: &Path) -> Result<ParsedXcsp, String> {
         constraints: model.num_constraints(),
     };
     let has_objective = model.has_objective();
+    let groups = model.groups.clone();
     let package = model.into_package();
-    Ok(ParsedXcsp { package, search, output, stats, has_objective })
+    Ok(ParsedXcsp { package, search, output, stats, has_objective, groups })
+}
+
+#[derive(Clone)]
+struct CoreGroup {
+    source: usize,
+    label: String,
+    selector: usize,
+}
+
+struct CoreContext {
+    package: ModelPackage,
+    variables: Vec<usize>,
+    groups: Vec<CoreGroup>,
+}
+
+impl CoreContext {
+    fn instrument(package: &ModelPackage, source_groups: &[callback::ConstraintGroup]) -> Result<Self, String> {
+        let mut package = package.clone();
+        package.model.objectives.clear();
+        let variables = (0..package.model.int_vars.len()).collect::<Vec<_>>();
+        let original = std::mem::take(&mut package.model.constraints);
+        let mut owners = vec![None; original.len()];
+        let mut groups = Vec::new();
+
+        for (source, group) in source_groups.iter().enumerate() {
+            if group.start >= group.end || group.end > original.len() {
+                return Err(format!(
+                    "invalid XCSP source-constraint range {}..{} for {} semantic constraints",
+                    group.start,
+                    group.end,
+                    original.len()
+                ));
+            }
+            let group_index = groups.len();
+            for owner in &mut owners[group.start..group.end] {
+                if owner.replace(group_index).is_some() {
+                    return Err("overlapping XCSP source-constraint ranges".to_string());
+                }
+            }
+            groups.push((source, group.label.clone()));
+        }
+
+        // A frontend-generated semantic constraint outside a parser callback
+        // remains diagnosable instead of becoming an invisible hard background.
+        for (index, owner) in owners.iter_mut().enumerate() {
+            if owner.is_none() {
+                *owner = Some(groups.len());
+                groups.push((source_groups.len() + index, "generated constraint".to_string()));
+            }
+        }
+
+        let mut core_groups = Vec::with_capacity(groups.len());
+        for (source, label) in groups {
+            let selector = package.model.bool_var().0;
+            core_groups.push(CoreGroup { source, label, selector });
+        }
+        for (index, constraint) in original.into_iter().enumerate() {
+            let group = owners[index].expect("every semantic constraint has a diagnostic group");
+            package.model.constraints.push(Constraint::Selected {
+                selector: crate::model::IntVarRef(core_groups[group].selector),
+                constraint: Box::new(constraint),
+            });
+        }
+        Ok(Self { package, variables, groups: core_groups })
+    }
 }
 
 /// Parse, build, and solve an XCSP3 instance, returning competition-style
@@ -218,7 +288,8 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
         return Err("semantic branching requires exact mode".to_string());
     }
     let path = stage_xml(xml)?;
-    let ParsedXcsp { package, search, output, stats, has_objective } = parse_problem(&path.0)?;
+    let ParsedXcsp { package, search, output, stats, has_objective, groups } = parse_problem(&path.0)?;
+    let core = options.core.then(|| CoreContext::instrument(&package, &groups)).transpose()?;
 
     if verbose {
         let kind = if has_objective { "COP" } else { "CSP" };
@@ -261,6 +332,9 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
     };
     let elapsed = result.elapsed();
     write_result(w, &output, &result, verbose)?;
+    if result.status() == SolveStatus::Unsatisfiable {
+        write_core(w, core.as_ref(), options, elapsed, stop)?;
+    }
 
     if verbose {
         if stop.load(Ordering::Relaxed) {
@@ -273,6 +347,50 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
         }
     }
     w.flush().map_err(io_err)?;
+    Ok(())
+}
+
+fn write_core<W: Write>(
+    w: &mut W,
+    context: Option<&CoreContext>,
+    options: RunOptions,
+    solve_elapsed: Duration,
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    let Some(context) = context else { return Ok(()) };
+    let remaining = options.time_limit.map(|limit| limit.saturating_sub(solve_elapsed));
+    if remaining == Some(Duration::ZERO) {
+        writeln!(w, "c core unavailable (time limit exhausted)").map_err(io_err)?;
+        return Ok(());
+    }
+    let memory_bytes = options.mem_limit.map(|megabytes| u64::try_from(megabytes).unwrap_or(u64::MAX).saturating_mul(1024 * 1024));
+    let request = SolveRequest {
+        mode: SolveMode::Exact,
+        seed: options.seed,
+        threads: 1,
+        limits: SolveLimits { time: remaining, memory_bytes, ..SolveLimits::default() },
+        ..SolveRequest::default()
+    };
+    let selectors = context.groups.iter().map(|group| group.selector).collect::<Vec<_>>();
+    match extract_model_mus_with_external_stop(&context.package, &context.variables, &selectors, &request, stop) {
+        Ok(ModelMusResult::Mus(selectors)) => {
+            let selected = selectors.into_iter().collect::<BTreeSet<_>>();
+            let core = context.groups.iter().filter(|group| selected.contains(&group.selector)).collect::<Vec<_>>();
+            writeln!(w, "c core {} constraint(s)", core.len()).map_err(io_err)?;
+            for group in core {
+                writeln!(w, "c core-constraint #{} {}", group.source, group.label).map_err(io_err)?;
+            }
+        }
+        Ok(ModelMusResult::Sat(_)) => {
+            writeln!(w, "c core unavailable (instrumented model is satisfiable)").map_err(io_err)?;
+        }
+        Ok(ModelMusResult::Interrupted) => {
+            writeln!(w, "c core unavailable (interrupted)").map_err(io_err)?;
+        }
+        Err(error) => {
+            writeln!(w, "c core unavailable ({error})").map_err(io_err)?;
+        }
+    }
     Ok(())
 }
 

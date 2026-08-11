@@ -1,4 +1,4 @@
-//! `qayd` CLI: `qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--ls] [--split] [--probe N] [--lns N] [--no-learn-csp] [--semantic-branching] <instance.xml[.lzma|.xz]>`.
+//! `qayd` CLI for XCSP3 instances.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -48,7 +48,7 @@ fn is_instance(arg: &str) -> bool {
 }
 
 const USAGE: &str =
-    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--mem-limit MB] [--ls] [--split] [--probe N] [--lns N] [--no-learn-csp] [--semantic-branching] [--force-scope-reasons] [--shared-pool-cap N] [--linear-backend auto|native|amthal] [--lp-root-ms N] [--lp-max-vars N] [--lp-max-rows N] [--lp-max-nonzeros N] [--lp-min-coverage N] [--lp-phase-max-vars N] <instance.xml[.lzma|.xz]>";
+    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--mem-limit MB] [--ls] [--split] [--probe N] [--lns N] [--no-learn-csp] [--semantic-branching] [--force-scope-reasons] [--shared-pool-cap N] [--core] [--linear-backend auto|native|amthal] [--lp-root-ms N] [--lp-max-vars N] [--lp-max-rows N] [--lp-max-nonzeros N] [--lp-min-coverage N] [--lp-phase-max-vars N] <instance.xml[.lzma|.xz]>";
 
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
@@ -96,6 +96,7 @@ fn main() {
     let mut probes = 0;
     let mut lns = 0;
     let mut no_learn_csp = false;
+    let mut core = false;
     let mut semantic_branching = false;
     let mut force_scope_reasons = false;
     let mut shared_pool_capacity = 1 << 14;
@@ -116,6 +117,7 @@ fn main() {
             "--probe" => probes = positive(it.next().map(String::as_str), "--probe needs a positive integer"),
             "--lns" => lns = positive(it.next().map(String::as_str), "--lns needs a positive integer"),
             "--no-learn-csp" => no_learn_csp = true,
+            "--core" => core = true,
             "--semantic-branching" => semantic_branching = true,
             "--force-scope-reasons" => force_scope_reasons = true,
             "--shared-pool-cap" => {
@@ -181,6 +183,7 @@ fn main() {
             time_limit: time_limit.map(Duration::from_secs),
             mem_limit,
             linear,
+            core,
         },
     );
 }

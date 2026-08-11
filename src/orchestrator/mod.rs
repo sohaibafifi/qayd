@@ -6,7 +6,6 @@
 mod budget;
 mod collection;
 mod cp;
-#[cfg(feature = "python")]
 mod diagnostics;
 mod executor;
 mod finalize;
@@ -21,7 +20,6 @@ mod verify;
 pub use budget::*;
 pub(crate) use collection::*;
 pub(crate) use cp::*;
-#[cfg(feature = "python")]
 pub use diagnostics::*;
 pub use executor::*;
 pub(crate) use finalize::*;

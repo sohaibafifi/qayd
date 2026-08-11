@@ -270,7 +270,6 @@ impl CompiledCp {
         estimate_semantic_bytes(model, stop)
     }
 
-    #[cfg(any(feature = "python", test))]
     pub(crate) fn compile_interruptible(model: &Model, stop: &AtomicBool) -> CompileStep<Self> {
         let Some(estimated_bytes) = Self::estimate_semantic_bytes_interruptible(model, stop) else {
             return Ok(None);

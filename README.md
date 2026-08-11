@@ -25,6 +25,11 @@ Priority order: correct, simple, fast.
   domains, explicit support storage for sparse domains, and reversible bounds
   with trailed holes for wide contiguous ranges.
 - **Lists, intervals, and lambdas.**
+- **Scheduling primitives.** Native Python intervals support optional
+  alternatives, precedence, unary and cumulative resources, asymmetric setup
+  sequences, piecewise-constant capacity calendars, state functions, and
+  makespan minimization. Alternative masters compose directly with the other
+  scheduling primitives.
 - **XCSP3-core front-end.** Reads CSP and mono-objective COP instances from XML,
   `.lzma`, and `.xz` files and emits XCSP3 competition output. Supported
   families include `intension`, `extension`, `regular`, `mdd`, `allDifferent`,
@@ -32,6 +37,8 @@ Priority order: correct, simple, fast.
   `cardinality`, `minimum`, `maximum`, `element`, `channel`, `noOverlap`,
   `cumulative`, `binPacking`, `knapsack`, `instantiation`, `circuit`, and
   `slide`. See the [XCSP3 format paper](https://arxiv.org/abs/1611.03398).
+  `--core` computes an exact minimal unsatisfiable subset of XCSP source
+  constraints after an UNSAT result.
 - **Global filtering.** Positive extension tables use
   [Compact-Table](https://arxiv.org/abs/1604.06641)-style bitsets and residues.
   `regular` follows [Pesant's layered automaton
@@ -155,6 +162,7 @@ Common options:
 - `-p`, `--threads N`: set worker count.
 - `--ls`: search for good COP incumbents without proving optimality.
 - `--split`, `--probe N`, `--lns N`: optional parallel COP strategies.
+- `--core`: after an UNSAT result, print an exact source-constraint MUS.
 - `--linear-backend auto|native|amthal`: select the advisory root LP backend.
 - `--lp-root-ms N`: cap the root relaxation wall-clock time.
 - `--lp-max-vars`, `--lp-max-rows`, `--lp-max-nonzeros`: cap retained model size.

@@ -136,6 +136,66 @@ fn csp_learning_proves_unsat() {
 }
 
 #[test]
+fn unsat_core_is_minimal_over_xcsp_source_constraints() {
+    let xml = r#"
+      <instance format="XCSP3" type="CSP">
+        <variables>
+          <var id="x"> 0..1 </var>
+          <var id="y"> 0..1 </var>
+        </variables>
+        <constraints>
+          <intension> eq(x,0) </intension>
+          <intension> eq(x,1) </intension>
+          <intension> eq(y,0) </intension>
+        </constraints>
+      </instance>"#;
+    let mut out = Vec::new();
+    run_to_with_options(xml, false, &AtomicBool::new(false), &mut out, RunOptions { core: true, ..RunOptions::default() }).unwrap();
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("s UNSATISFIABLE"), "{out}");
+    assert!(out.contains("c core 2 constraint(s)"), "{out}");
+    assert!(out.contains("c core-constraint #0 constraint"), "{out}");
+    assert!(out.contains("c core-constraint #1 constraint"), "{out}");
+    assert!(!out.contains("c core-constraint #2 constraint"), "{out}");
+}
+
+#[test]
+fn core_option_does_not_emit_a_core_for_sat() {
+    let xml = r#"
+      <instance format="XCSP3" type="CSP">
+        <variables><var id="x"> 0..1 </var></variables>
+        <constraints><intension> eq(x,0) </intension></constraints>
+      </instance>"#;
+    let mut out = Vec::new();
+    run_to_with_options(xml, false, &AtomicBool::new(false), &mut out, RunOptions { core: true, ..RunOptions::default() }).unwrap();
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("s SATISFIABLE"), "{out}");
+    assert!(!out.contains("c core"), "{out}");
+}
+
+#[test]
+fn unsat_core_handles_a_refutation_that_requires_search() {
+    let xml = r#"
+      <instance format="XCSP3" type="CSP">
+        <variables>
+          <var id="a"> 0..1 </var>
+          <var id="b"> 0..1 </var>
+        </variables>
+        <constraints>
+          <intension> or(eq(a,1),eq(b,1)) </intension>
+          <intension> or(eq(a,1),eq(b,0)) </intension>
+          <intension> or(eq(a,0),eq(b,1)) </intension>
+          <intension> or(eq(a,0),eq(b,0)) </intension>
+        </constraints>
+      </instance>"#;
+    let mut out = Vec::new();
+    run_to_with_options(xml, false, &AtomicBool::new(false), &mut out, RunOptions { core: true, ..RunOptions::default() }).unwrap();
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("s UNSATISFIABLE"), "{out}");
+    assert!(out.contains("c core 4 constraint(s)"), "{out}");
+}
+
+#[test]
 fn csp_no_learning_matches_learning_route() {
     // A unique-solution CSP: the default learning route and the `--no-learn-csp`
     // chronological-DFS route must agree on the solution.

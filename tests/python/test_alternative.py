@@ -102,8 +102,7 @@ def test_alternative_getters_and_errors():
     assert task.index is None
     assert len(task.members) == 2
     assert "t.end" in repr(task.end)
-    with pytest.raises(ValueError, match="schedule its members"):
-        model.no_overlap([task])
+    model.no_overlap([task])
     with pytest.raises(ValueError, match="must be optional"):
         model.alternative([model.interval(2, 10)])
     with pytest.raises(ValueError, match="distinct"):

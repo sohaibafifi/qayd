@@ -314,12 +314,23 @@ struct ArrayDecl {
     cells: HashMap<Vec<usize>, IntVarRef>,
 }
 
+/// Half-open range of semantic constraints emitted by one XCSP source
+/// constraint. The range is captured before decomposition so diagnostics stay
+/// stable when propagator implementations change.
+#[derive(Clone, Debug)]
+pub(super) struct ConstraintGroup {
+    pub(super) label: String,
+    pub(super) start: usize,
+    pub(super) end: usize,
+}
+
 /// Accumulates the model as the parser walks the instance.
 pub struct Model {
     pub(super) package: ModelPackage,
     pub declared: Vec<(String, IntVarRef)>,
     pub(super) objective: Option<SemanticObjective>,
     pub error: Option<String>,
+    pub(super) groups: Vec<ConstraintGroup>,
     /// Scalar variables by name. Array cells use compact row-major storage.
     ids: HashMap<String, IntVarRef>,
     arrays: HashMap<String, ArrayDecl>,
@@ -349,6 +360,7 @@ impl Model {
             declared: Vec::new(),
             objective: None,
             error: None,
+            groups: Vec::new(),
             ids: HashMap::new(),
             arrays: HashMap::new(),
             constants: HashMap::new(),
@@ -434,6 +446,13 @@ impl Model {
     fn fail(&mut self, msg: impl Into<String>) {
         if self.error.is_none() {
             self.error = Some(msg.into());
+        }
+    }
+
+    fn record_group(&mut self, label: &str, start: usize) {
+        let end = self.package.model.constraints().len();
+        if start < end {
+            self.groups.push(ConstraintGroup { label: label.to_string(), start, end });
         }
     }
 
@@ -988,17 +1007,23 @@ fn build_op(op: &EOp, args: Vec<Expr>) -> Result<Expr, String> {
     })
 }
 
-/// Run a fallible mapping, recording the first error.
+/// Run a fallible mapping, recording the first error and the semantic
+/// constraints emitted by this XCSP source constraint.
 macro_rules! guard {
-    ($self:ident, $body:block) => {{
+    ($self:ident, $label:expr, $body:block) => {{
         if $self.error.is_some() {
             return;
         }
+        let __group_start = $self.package.model.constraints().len();
         #[allow(clippy::redundant_closure_call)]
         let r: Result<(), String> = (|| $body)();
-        if let Err(e) = r {
-            $self.fail(e);
+        match r {
+            Ok(()) => $self.record_group($label, __group_start),
+            Err(e) => $self.fail(e),
         }
+    }};
+    ($self:ident, $body:block) => {{
+        guard!($self, "constraint", $body)
     }};
 }
 
