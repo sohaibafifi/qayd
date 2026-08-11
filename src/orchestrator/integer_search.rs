@@ -329,15 +329,19 @@ fn disjunctive_schedule_warm_start(
     }))
 }
 
-pub(crate) fn solve(
-    model: &Model,
-    compiled: &CompiledCp,
-    plan: &IntegerLocalSearchPlan,
-    request: &SolveRequest,
-    budget: &SolveBudget,
-    engine_stop: &AtomicBool,
-    sink: &mut dyn EventSink,
-) -> Result<SolveResult, SolveError> {
+pub(crate) struct IntegerSearchRun<'a> {
+    pub(crate) model: &'a Model,
+    pub(crate) compiled: &'a CompiledCp,
+    pub(crate) plan: &'a IntegerLocalSearchPlan,
+    pub(crate) allocation: super::WorkerAllocation,
+    pub(crate) request: &'a SolveRequest,
+    pub(crate) budget: &'a SolveBudget,
+    pub(crate) engine_stop: &'a AtomicBool,
+    pub(crate) sink: &'a mut dyn EventSink,
+}
+
+pub(crate) fn solve(run: IntegerSearchRun<'_>) -> Result<SolveResult, SolveError> {
+    let IntegerSearchRun { model, compiled, plan, allocation, request, budget, engine_stop, sink } = run;
     let started = Instant::now();
     let config = LsConfig { gls: true, min_conflicts: true, kick_bandit: false };
     let mut problem = compiled.problem().clone();
@@ -345,9 +349,9 @@ pub(crate) fn solve(
         problem.objective = Some(crate::problem::Objective::Expr(true, Expr::Const(0)));
     }
     let max_iterations = request.limits.iterations.unwrap_or(u64::MAX);
-    let inputs = (0..request.threads)
-        .map(|worker| (problem.clone(), plan.spec.clone(), worker_iteration_quota(max_iterations, worker, request.threads)))
-        .collect();
+    let workers = allocation.workers();
+    let inputs =
+        (0..workers).map(|worker| (problem.clone(), plan.spec.clone(), worker_iteration_quota(max_iterations, worker, workers))).collect();
     let publish_assignments = request.publish_incumbent_assignments;
     let repair = RepairContext { model, compiled, spec: &plan.spec, request, budget, stop: engine_stop };
     let minimizing = model.objectives().first().is_none_or(crate::model::Objective::is_minimize);
@@ -463,7 +467,7 @@ pub(crate) fn solve(
         ("ls_unsupported".to_string(), unsupported.to_string()),
         ("ls_rejected_incumbents".to_string(), rejected.to_string()),
         ("ls_checkpoint_replays".to_string(), checkpoint_replays.to_string()),
-        ("workers".to_string(), request.threads.to_string()),
+        ("workers".to_string(), workers.to_string()),
     ];
     if let Some(error) = &last_rejection {
         metadata.push(("ls_last_rejection".to_string(), error.clone()));

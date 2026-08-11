@@ -7,11 +7,11 @@ use std::time::{Duration, Instant};
 use crate::model::{IndependentComponent, IndependentDecomposition, IndependentFamily, Model, ModelObject, ModelPackage};
 
 use super::{
-    compile_collection_plan, compile_cp_plan_validated, compile_sat_plan, preflight_collection_memory, solve_collection_plan,
-    solve_collection_plan_with_stop, solve_cp_plan_validated, solve_sat_plan, Assignment, Bound, CandidateSolution, CollectionSolvePlan,
-    CpSolvePlan, DecompositionMerge, EngineKind, EnginePlan, EventControl, EventSink, ExecutablePlan, IgnoreEvents, ProofClaim,
-    ProofRequest, ProvenConclusion, SatSolvePlan, SolveBudget, SolveError, SolveEvent, SolveRequest, SolveResult, SolveStatus,
-    TerminationReason, VerificationLevel,
+    compile_collection_plan, compile_cp_plan_validated, compile_sat_plan, preflight_collection_memory, solve_collection_plan_with_stop,
+    solve_cp_plan_validated, solve_sat_plan, Assignment, Bound, CandidateSolution, CollectionSolvePlan, CpSolvePlan, DecompositionMerge,
+    EngineKind, EnginePlan, EventControl, EventSink, ExecutablePlan, IgnoreEvents, ProofClaim, ProofRequest, ProvenConclusion,
+    SatSolvePlan, SolveBudget, SolveError, SolveEvent, SolveRequest, SolveResult, SolveStatus, TerminationReason, VerificationLevel,
+    WorkerAllocation,
 };
 
 #[cfg(test)]
@@ -56,13 +56,42 @@ struct PreparedComponent {
 }
 
 #[derive(Clone)]
+struct PreparedStage {
+    engine: PreparedEngine,
+    allocation: WorkerAllocation,
+}
+
+impl PreparedStage {
+    fn single(engine: PreparedEngine) -> Self {
+        Self { engine, allocation: WorkerAllocation::single() }
+    }
+
+    fn allocated(engine: PreparedEngine, workers: usize) -> Self {
+        Self { engine, allocation: WorkerAllocation::portfolio(workers) }
+    }
+
+    fn estimated_backend_bytes(&self) -> u64 {
+        estimated_engine_bytes(&self.engine).saturating_mul(u64::try_from(self.allocation.workers()).unwrap_or(u64::MAX))
+    }
+
+    fn description(&self) -> ExecutablePlan {
+        let engine = EnginePlan::new(engine_kind(&self.engine));
+        if self.allocation.workers() == 1 {
+            ExecutablePlan::Single(engine)
+        } else {
+            ExecutablePlan::Portfolio((0..self.allocation.workers()).map(|_| ExecutablePlan::Single(engine)).collect())
+        }
+    }
+}
+
+#[derive(Clone)]
 enum PreparedNode {
     Single(Box<PreparedEngine>),
     /// Concrete engine stages executed in order by the orchestrator. Routing's
     /// first stage is LS and its second stage is the exact routing backend.
-    Sequential(Vec<PreparedEngine>),
-    /// One physical engine owns a portfolio of compatible worker trajectories.
-    /// High-frequency cooperation remains private to that engine.
+    Sequential(Vec<PreparedStage>),
+    /// The prepared node owns the allocation. The physical engine receives it
+    /// explicitly and only owns its algorithm-specific cooperation state.
     Portfolio {
         workers: usize,
         engine: Box<PreparedEngine>,
@@ -85,7 +114,7 @@ impl PreparedSolvePlan {
             // Every compiled stage remains resident while the sequence runs.
             // Summing is conservative and, unlike `max`, includes the exact
             // backend retained during a warm-start stage.
-            PreparedNode::Sequential(stages) => stages.iter().map(estimated_engine_bytes).fold(0, u64::saturating_add),
+            PreparedNode::Sequential(stages) => stages.iter().map(PreparedStage::estimated_backend_bytes).fold(0, u64::saturating_add),
             PreparedNode::Portfolio { workers, engine } => {
                 estimated_engine_bytes(engine).saturating_mul(u64::try_from(*workers).unwrap_or(u64::MAX))
             }
@@ -98,9 +127,7 @@ impl PreparedSolvePlan {
     pub fn description(&self) -> ExecutablePlan {
         match &self.node {
             PreparedNode::Single(engine) => ExecutablePlan::Single(EnginePlan::new(engine_kind(engine))),
-            PreparedNode::Sequential(stages) => {
-                ExecutablePlan::Sequential(stages.iter().map(|stage| ExecutablePlan::Single(EnginePlan::new(engine_kind(stage)))).collect())
-            }
+            PreparedNode::Sequential(stages) => ExecutablePlan::Sequential(stages.iter().map(PreparedStage::description).collect()),
             PreparedNode::Portfolio { workers, engine } => {
                 ExecutablePlan::Portfolio((0..*workers).map(|_| ExecutablePlan::Single(EnginePlan::new(engine_kind(engine)))).collect())
             }
@@ -138,7 +165,10 @@ fn estimated_engine_bytes(engine: &PreparedEngine) -> u64 {
 
 fn collection_node(plan: CollectionSolvePlan, threads: usize) -> PreparedNode {
     if let Some(warm_start) = plan.routing_warm_start_plan() {
-        PreparedNode::Sequential(vec![PreparedEngine::Collection(Box::new(warm_start)), PreparedEngine::Collection(Box::new(plan))])
+        PreparedNode::Sequential(vec![
+            PreparedStage::allocated(PreparedEngine::Collection(Box::new(warm_start)), threads),
+            PreparedStage::single(PreparedEngine::Collection(Box::new(plan))),
+        ])
     } else if threads > 1
         && matches!(plan.engine(), EngineKind::ListLocalSearch | EngineKind::RoutingLocalSearch | EngineKind::ScheduleLocalSearch)
     {
@@ -564,7 +594,7 @@ fn prepared_plan(node: PreparedNode, request: &SolveRequest) -> Result<PreparedS
 fn prepared_node_can_prove_complete(node: &PreparedNode) -> bool {
     match node {
         PreparedNode::Single(engine) | PreparedNode::Portfolio { engine, .. } => engine_kind(engine).can_prove_complete(),
-        PreparedNode::Sequential(stages) => stages.last().is_some_and(|engine| engine_kind(engine).can_prove_complete()),
+        PreparedNode::Sequential(stages) => stages.last().is_some_and(|stage| engine_kind(&stage.engine).can_prove_complete()),
         PreparedNode::Decomposed(components) => {
             !components.is_empty() && components.iter().all(|component| prepared_node_can_prove_complete(&component.plan.node))
         }
@@ -585,15 +615,37 @@ pub(crate) fn execute_model_plan(
     let result = match &plan.node {
         PreparedNode::Single(engine) => {
             if emit_stage_started(sink, budget, engine_kind(engine), false)? {
-                execute_engine(&package.model, engine, request, budget, None, None, sink)?
+                execute_engine(
+                    EngineExecution {
+                        model: &package.model,
+                        engine,
+                        allocation: WorkerAllocation::single(),
+                        request,
+                        budget,
+                        transferred_incumbent: None,
+                        warm_stops: None,
+                    },
+                    sink,
+                )?
             } else {
                 stopped_before_execution_result(budget)?
             }
         }
         PreparedNode::Sequential(stages) => execute_sequential(&package.model, stages, request, budget, sink)?,
-        PreparedNode::Portfolio { engine, .. } => {
+        PreparedNode::Portfolio { workers, engine } => {
             if emit_stage_started(sink, budget, engine_kind(engine), false)? {
-                execute_engine(&package.model, engine, request, budget, None, None, sink)?
+                execute_engine(
+                    EngineExecution {
+                        model: &package.model,
+                        engine,
+                        allocation: WorkerAllocation::portfolio(*workers),
+                        request,
+                        budget,
+                        transferred_incumbent: None,
+                        warm_stops: None,
+                    },
+                    sink,
+                )?
             } else {
                 stopped_before_execution_result(budget)?
             }
@@ -670,6 +722,16 @@ struct AggregateEventSink<'a> {
     target: &'a mut dyn EventSink,
 }
 
+struct EngineExecution<'a> {
+    model: &'a crate::model::Model,
+    engine: &'a PreparedEngine,
+    allocation: WorkerAllocation,
+    request: &'a SolveRequest,
+    budget: &'a SolveBudget,
+    transferred_incumbent: Option<&'a CandidateSolution>,
+    warm_stops: Option<&'a super::WarmStartStops>,
+}
+
 impl EventSink for AggregateEventSink<'_> {
     fn emit(&mut self, event: SolveEvent) -> Result<EventControl, SolveError> {
         match event {
@@ -679,19 +741,12 @@ impl EventSink for AggregateEventSink<'_> {
     }
 }
 
-fn execute_engine(
-    model: &crate::model::Model,
-    engine: &PreparedEngine,
-    request: &SolveRequest,
-    budget: &SolveBudget,
-    transferred_incumbent: Option<&CandidateSolution>,
-    warm_stops: Option<&super::WarmStartStops>,
-    sink: &mut dyn EventSink,
-) -> Result<SolveResult, SolveError> {
+fn execute_engine(run: EngineExecution<'_>, sink: &mut dyn EventSink) -> Result<SolveResult, SolveError> {
+    let EngineExecution { model, engine, allocation, request, budget, transferred_incumbent, warm_stops } = run;
     match engine {
         PreparedEngine::Cp(plan) => {
             reject_transferred_incumbent(transferred_incumbent, EngineKind::IntegerExact)?;
-            solve_cp_plan_validated(model, plan, request, budget, sink)
+            solve_cp_plan_validated(model, plan, allocation, request, budget, sink)
         }
         PreparedEngine::Collection(plan) => {
             if let Some(warm_stops) = warm_stops {
@@ -703,10 +758,20 @@ fn execute_engine(
                     request.list_hint.as_deref(),
                     transferred_incumbent,
                     warm_stops,
+                    allocation,
                     sink,
                 )
             } else {
-                solve_collection_plan(model, plan, request, budget, request.list_hint.as_deref(), transferred_incumbent, sink)
+                super::solve_collection_plan_allocated(
+                    model,
+                    plan,
+                    request,
+                    budget,
+                    request.list_hint.as_deref(),
+                    transferred_incumbent,
+                    allocation,
+                    sink,
+                )
             }
         }
         PreparedEngine::Sat(plan) => {
@@ -728,7 +793,7 @@ fn reject_transferred_incumbent(candidate: Option<&CandidateSolution>, engine: E
 
 fn execute_sequential(
     model: &crate::model::Model,
-    stages: &[PreparedEngine],
+    stages: &[PreparedStage],
     request: &SolveRequest,
     budget: &SolveBudget,
     sink: &mut dyn EventSink,
@@ -744,7 +809,7 @@ fn execute_sequential(
             return stopped_sequence_result(budget, prior_reports, last_verified_primal);
         }
         let last = index + 1 == stages.len();
-        if !emit_stage_started(sink, budget, engine_kind(stage), !last)? {
+        if !emit_stage_started(sink, budget, engine_kind(&stage.engine), !last)? {
             return stopped_sequence_result(budget, prior_reports, last_verified_primal);
         }
         let warm_stops = (!last).then(|| budget.warm_start_stops()).flatten();
@@ -752,13 +817,24 @@ fn execute_sequential(
             continue;
         }
         let warm_started = Instant::now();
-        let mut result = match execute_engine(model, stage, request, budget, transferred.as_ref(), warm_stops.as_ref(), sink) {
+        let mut result = match execute_engine(
+            EngineExecution {
+                model,
+                engine: &stage.engine,
+                allocation: stage.allocation,
+                request,
+                budget,
+                transferred_incumbent: transferred.as_ref(),
+                warm_stops: warm_stops.as_ref(),
+            },
+            sink,
+        ) {
             Ok(result) => result,
             Err(SolveError::Interrupted(_)) if last_verified_primal.is_some() => {
                 return stopped_sequence_result(budget, prior_reports, last_verified_primal);
             }
             Err(error) if !last && !budget.hard_cancelled() => {
-                rejected_warm_start_result(engine_kind(stage), warm_started.elapsed(), error)
+                rejected_warm_start_result(engine_kind(&stage.engine), warm_started.elapsed(), error)
             }
             Err(error) => return Err(error),
         };

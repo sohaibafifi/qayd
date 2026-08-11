@@ -10,3 +10,4 @@ pub(crate) mod integer;
 #[allow(dead_code)]
 pub(crate) mod lists;
 pub(crate) mod scenario_schedule;
+pub(crate) mod schedule_ir;

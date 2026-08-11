@@ -13,6 +13,28 @@ use std::time::Duration;
 use super::types::EventControl;
 use crate::search::SolveStats;
 
+/// Worker capacity assigned by a prepared orchestration node.
+///
+/// Engines may choose CP-specific or LS-specific cooperation, but they do not
+/// infer their concurrency from the solve request. This value is the single
+/// runtime source of truth for the number of trajectories to execute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WorkerAllocation(std::num::NonZeroUsize);
+
+impl WorkerAllocation {
+    pub(crate) const fn single() -> Self {
+        Self(std::num::NonZeroUsize::MIN)
+    }
+
+    pub(crate) fn portfolio(workers: usize) -> Self {
+        Self(std::num::NonZeroUsize::new(workers).expect("validated solve requests have at least one worker"))
+    }
+
+    pub(crate) const fn workers(self) -> usize {
+        self.0.get()
+    }
+}
+
 /// One coalesced progress event from a worker.
 #[derive(Debug)]
 pub struct WorkerEvent<E> {

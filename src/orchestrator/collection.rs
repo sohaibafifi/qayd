@@ -597,6 +597,7 @@ fn physical_family(model: &list::CollectionModel) -> ModelFamily {
 
 /// Execute an already compiled collection plan. Only verified candidates cross
 /// the event boundary or appear in the final result.
+#[cfg(test)]
 pub(crate) fn solve_collection_plan(
     semantic: &Model,
     plan: &CollectionSolvePlan,
@@ -606,7 +607,31 @@ pub(crate) fn solve_collection_plan(
     transferred_incumbent: Option<&CandidateSolution>,
     sink: &mut dyn EventSink,
 ) -> Result<SolveResult, SolveError> {
-    solve_collection_plan_inner(semantic, plan, request, budget, list_hint, transferred_incumbent, None, sink)
+    solve_collection_plan_inner(
+        semantic,
+        plan,
+        request,
+        budget,
+        list_hint,
+        transferred_incumbent,
+        None,
+        super::WorkerAllocation::portfolio(request.threads),
+        sink,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn solve_collection_plan_allocated(
+    semantic: &Model,
+    plan: &CollectionSolvePlan,
+    request: &SolveRequest,
+    budget: &SolveBudget,
+    list_hint: Option<&[Vec<i32>]>,
+    transferred_incumbent: Option<&CandidateSolution>,
+    allocation: super::WorkerAllocation,
+    sink: &mut dyn EventSink,
+) -> Result<SolveResult, SolveError> {
+    solve_collection_plan_inner(semantic, plan, request, budget, list_hint, transferred_incumbent, None, allocation, sink)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -618,9 +643,10 @@ pub(crate) fn solve_collection_plan_with_stop(
     list_hint: Option<&[Vec<i32>]>,
     transferred_incumbent: Option<&CandidateSolution>,
     warm_stops: &super::WarmStartStops,
+    allocation: super::WorkerAllocation,
     sink: &mut dyn EventSink,
 ) -> Result<SolveResult, SolveError> {
-    solve_collection_plan_inner(semantic, plan, request, budget, list_hint, transferred_incumbent, Some(warm_stops), sink)
+    solve_collection_plan_inner(semantic, plan, request, budget, list_hint, transferred_incumbent, Some(warm_stops), allocation, sink)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -632,6 +658,7 @@ fn solve_collection_plan_inner(
     list_hint: Option<&[Vec<i32>]>,
     transferred_incumbent: Option<&CandidateSolution>,
     optional_stops: Option<&super::WarmStartStops>,
+    allocation: super::WorkerAllocation,
     sink: &mut dyn EventSink,
 ) -> Result<SolveResult, SolveError> {
     request.validate()?;
@@ -698,13 +725,14 @@ fn solve_collection_plan_inner(
                     transfer_stop,
                     list_hint,
                     max_iterations: plan.local_search_iterations.or(request.limits.iterations).unwrap_or(u64::MAX),
+                    allocation,
                     engine: plan.engine(),
                     started,
                 },
                 &mut |engine, value| record_progress(sink, budget, &mut event_error, engine, value),
             )?,
             CollectionBackend::ScheduleLocalSearch => result_from_schedule_local_search(
-                ScheduleLocalSearchRun { semantic, model, request, budget, engine_stop, transfer_stop, started },
+                ScheduleLocalSearchRun { semantic, model, request, budget, engine_stop, transfer_stop, allocation, started },
                 &mut |engine, value| record_progress(sink, budget, &mut event_error, engine, value),
             )?,
         })
@@ -885,6 +913,7 @@ struct ListLocalSearchRun<'a> {
     transfer_stop: Option<&'a AtomicBool>,
     list_hint: Option<&'a [Vec<i32>]>,
     max_iterations: u64,
+    allocation: super::WorkerAllocation,
     engine: EngineKind,
     started: Instant,
 }
@@ -1032,8 +1061,19 @@ fn audit_local_search_dual_started(state: Option<&Arc<LocalSearchDualAudit>>) {
 }
 
 fn result_from_local_search(run: ListLocalSearchRun<'_>, improvement: &mut impl FnMut(EngineKind, i64)) -> Result<SolveResult, SolveError> {
-    let ListLocalSearchRun { semantic, model, request, budget, engine_stop, transfer_stop, list_hint, max_iterations, engine, started } =
-        run;
+    let ListLocalSearchRun {
+        semantic,
+        model,
+        request,
+        budget,
+        engine_stop,
+        transfer_stop,
+        list_hint,
+        max_iterations,
+        allocation,
+        engine,
+        started,
+    } = run;
     let (mut solution, metadata, structural_bound, iterations) = std::thread::scope(|scope| {
         let dual_start = DeferredDualStart::default();
         let mut dual_gate = DeferredDualGate::new(dual_start.clone());
@@ -1060,12 +1100,13 @@ fn result_from_local_search(run: ListLocalSearchRun<'_>, improvement: &mut impl 
                 dual_released = true;
             }
         };
-        let (solution, metadata, iterations) = if request.threads > 1 {
+        let workers = allocation.workers();
+        let (solution, metadata, iterations) = if workers > 1 {
             let (solution, metrics) = lists::solve_collection_parallel_validated(
                 model,
                 request.seed,
                 engine_stop,
-                request.threads,
+                workers,
                 max_iterations,
                 list_hint,
                 &mut publish_first_incumbent,
@@ -1152,6 +1193,7 @@ struct ScheduleLocalSearchRun<'a> {
     budget: &'a SolveBudget,
     engine_stop: &'a AtomicBool,
     transfer_stop: Option<&'a AtomicBool>,
+    allocation: super::WorkerAllocation,
     started: Instant,
 }
 
@@ -1159,7 +1201,7 @@ fn result_from_schedule_local_search(
     run: ScheduleLocalSearchRun<'_>,
     improvement: &mut impl FnMut(EngineKind, i64),
 ) -> Result<SolveResult, SolveError> {
-    let ScheduleLocalSearchRun { semantic, model, request, budget, engine_stop, transfer_stop, started } = run;
+    let ScheduleLocalSearchRun { semantic, model, request, budget, engine_stop, transfer_stop, allocation, started } = run;
     let schedule = model
         .schedule
         .as_ref()
@@ -1167,7 +1209,7 @@ fn result_from_schedule_local_search(
     let (summary, structural_bound) = std::thread::scope(|scope| {
         let dual_task = scope.spawn(|| dual::compute(model, engine_stop));
         let summary = super::execute_workers(
-            vec![(); request.threads],
+            vec![(); allocation.workers()],
             engine_stop,
             Arc::new(AtomicBool::new(false)),
             request.seed,
@@ -1217,7 +1259,7 @@ fn result_from_schedule_local_search(
     });
     dual::attach(model, &mut solution, structural_bound);
     let mut metadata = vec![
-        ("workers".to_string(), request.threads.to_string()),
+        ("workers".to_string(), allocation.workers().to_string()),
         ("constructor".to_string(), "serial-sgs".to_string()),
         ("construction_seconds".to_string(), construction_elapsed.as_secs_f64().to_string()),
         ("construction_candidates".to_string(), construction_candidates.to_string()),

@@ -3,6 +3,7 @@
 //! [`interval`], and [`objective`]. The orchestrator selects only among plans
 //! that have already compiled successfully.
 
+mod analysis;
 mod compile;
 mod cp_compile;
 mod decompose;
@@ -382,3 +383,4 @@ impl Model {
         id
     }
 }
+pub(crate) use analysis::*;

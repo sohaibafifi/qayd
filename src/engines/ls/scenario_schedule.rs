@@ -10,7 +10,9 @@ use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::model::{BoolLiteral, Constraint, IntDomain, IntExpr, IntGlobalConstraint, IntVarRef, Model, Objective, Relation};
+use crate::model::{AffineForm, BoolLiteral, Constraint, IntDomain, IntExpr, IntGlobalConstraint, IntVarRef, Model, Objective, Relation};
+
+use super::schedule_ir::PrecedenceDag;
 
 /// Bounds the exhaustive Boolean proof used to establish exact-one semantics.
 const MAX_TRUTH_TABLE_PROOF_VARIABLES: usize = 16;
@@ -43,9 +45,7 @@ pub(crate) struct ScenarioSchedulePlan {
     scenarios: Vec<Scenario>,
     resources: usize,
     fixed: Vec<Option<i32>>,
-    successors: Vec<Vec<usize>>,
-    terminal: Vec<bool>,
-    topological: Vec<usize>,
+    precedences: PrecedenceDag,
     objective_value: Option<IntVarRef>,
 }
 
@@ -66,7 +66,6 @@ struct Scenario {
     starts: Vec<IntVarRef>,
     durations: Vec<IntVarRef>,
     completion: IntVarRef,
-    predecessors: Vec<Vec<usize>>,
     weight: i64,
 }
 
@@ -97,7 +96,6 @@ struct ScenarioDraft {
     completion: IntVarRef,
     starts: Vec<IntVarRef>,
     durations: Vec<IntVarRef>,
-    predecessors: Vec<Vec<usize>>,
     successors: Vec<Vec<usize>>,
     terminal: Vec<bool>,
     weight: i64,
@@ -280,7 +278,7 @@ impl ScenarioSchedulePlan {
         let mut selected = vec![0usize; count];
         let mut resource_load = vec![0i128; self.resources];
         for position in 0..count {
-            let operation_index = self.topological[(position + rotation) % count];
+            let operation_index = self.precedences.topological()[(position + rotation) % count];
             let operation = &self.operations[operation_index];
             let mut choice: Option<(i128, i128, IntVarRef, usize)> = None;
             for (mode_index, mode) in operation.modes.iter().enumerate() {
@@ -349,16 +347,10 @@ impl ScenarioSchedulePlan {
         let durations = (0..count)
             .map(|operation| self.operations[operation].modes[selected[operation]].duration_by_scenario[scenario_index])
             .collect::<Vec<_>>();
-        let mut bottom = vec![0i64; count];
-        for &operation in self.topological.iter().rev() {
-            if work.stop.load(Ordering::Acquire) {
-                return None;
-            }
-            let tail = self.successors[operation].iter().map(|&next| bottom[next]).max().unwrap_or(0);
-            bottom[operation] = i64::from(durations[operation]).checked_add(tail)?;
-        }
+        let path_durations = durations.iter().copied().map(i64::from).collect::<Vec<_>>();
+        let bottom = self.precedences.remaining_paths(&path_durations, work.stop)?;
 
-        let mut remaining_predecessors = scenario.predecessors.iter().map(Vec::len).collect::<Vec<_>>();
+        let mut remaining_predecessors = (0..count).map(|operation| self.precedences.predecessors(operation).len()).collect::<Vec<_>>();
         let mut predecessor_finish = vec![i64::MIN; count];
         let mut resource_available = vec![i64::MIN; self.resources];
         let mut scheduled = vec![false; count];
@@ -380,7 +372,7 @@ impl ScenarioSchedulePlan {
                 }
                 let mode = &self.operations[operation].modes[selected[operation]];
                 let lower_bound = predecessor_finish[operation].max(resource_available[mode.resource]);
-                let earliest = domain_ceiling(&model.int_vars()[scenario.starts[operation].0], lower_bound)?;
+                let earliest = model.int_vars()[scenario.starts[operation].0].ceiling(lower_bound)?;
                 let finish = earliest.checked_add(i64::from(durations[operation]))?;
                 let key = dispatch_key(rule, earliest, finish, bottom[operation], durations[operation], operation);
                 if candidate.as_ref().is_none_or(|current: &(DispatchKey, usize, i64, i64)| key < current.0) {
@@ -396,7 +388,7 @@ impl ScenarioSchedulePlan {
             finishes[operation] = finish;
             scheduled[operation] = true;
             resource_available[mode.resource] = finish;
-            for &successor in &self.successors[operation] {
+            for &successor in self.precedences.successors(operation) {
                 if work.stop.load(Ordering::Acquire) {
                     return None;
                 }
@@ -406,8 +398,8 @@ impl ScenarioSchedulePlan {
             debug_assert_eq!(scheduled.iter().filter(|&&done| done).count(), step + 1);
         }
 
-        let terminal_finish = (0..count).filter(|&operation| self.terminal[operation]).map(|operation| finishes[operation]).max()?;
-        let completion = domain_ceiling(&model.int_vars()[scenario.completion.0], terminal_finish)?;
+        let terminal_finish = self.precedences.terminals().map(|operation| finishes[operation]).max()?;
+        let completion = model.int_vars()[scenario.completion.0].ceiling(terminal_finish)?;
         Some((i32::try_from(completion).ok()?, starts))
     }
 
@@ -554,7 +546,7 @@ impl<'a> Compiler<'a> {
         if scenarios.iter().any(|scenario| scenario.successors != successors || scenario.terminal != terminal) {
             return None;
         }
-        let topological = topological_order(&successors, self.stop)?;
+        let precedences = PrecedenceDag::compile(successors, self.stop)?;
         let operations = modes.into_iter().map(|modes| Operation { modes }).collect();
         let scenarios = scenarios
             .into_iter()
@@ -562,20 +554,10 @@ impl<'a> Compiler<'a> {
                 starts: scenario.starts,
                 durations: scenario.durations,
                 completion: scenario.completion,
-                predecessors: scenario.predecessors,
                 weight: scenario.weight,
             })
             .collect();
-        Some(ScenarioSchedulePlan {
-            operations,
-            scenarios,
-            resources,
-            fixed,
-            successors,
-            terminal,
-            topological,
-            objective_value: self.objective_value,
-        })
+        Some(ScenarioSchedulePlan { operations, scenarios, resources, fixed, precedences, objective_value: self.objective_value })
     }
 
     fn mode_implications(&mut self) -> Option<Vec<ModeImplication>> {
@@ -654,7 +636,7 @@ impl<'a> Compiler<'a> {
                 if implication_constraints[index] {
                     continue;
                 }
-                let scope = constraint_scope(constraint);
+                let scope = constraint.int_scope();
                 if !scope.is_empty() && scope.iter().all(|variable| selector_set.contains(variable)) {
                     local.push(index);
                 }
@@ -828,7 +810,6 @@ impl<'a> Compiler<'a> {
             }
             let durations = durations.into_iter().collect::<Option<Vec<_>>>()?;
             let starts = starts.into_iter().collect::<Option<Vec<_>>>()?;
-            let mut predecessors = vec![Vec::new(); operations.len()];
             let mut successors = vec![Vec::new(); operations.len()];
             let mut terminal = vec![false; operations.len()];
             let mut seen_arcs = HashSet::new();
@@ -849,16 +830,12 @@ impl<'a> Compiler<'a> {
                         return None;
                     }
                     successors[from].push(to);
-                    predecessors[to].push(from);
                 }
             }
             for list in &mut successors {
                 list.sort_unstable();
             }
-            for list in &mut predecessors {
-                list.sort_unstable();
-            }
-            if topological_order(&successors, self.stop).is_none()
+            if PrecedenceDag::compile(successors.clone(), self.stop).is_none()
                 || (0..operations.len()).any(|operation| terminal[operation] != successors[operation].is_empty())
             {
                 return None;
@@ -867,7 +844,6 @@ impl<'a> Compiler<'a> {
                 completion: *completion,
                 starts,
                 durations,
-                predecessors,
                 successors,
                 terminal,
                 weight: *self.objective_terms.get(completion)?,
@@ -1017,14 +993,17 @@ fn directly_proves_exact_one(constraint: &Constraint, selectors: &HashSet<IntVar
             Some(affine_proves_exact_one(terms.iter().copied(), constant, selectors))
         }
         Constraint::Intension(IntExpr::Eq(left, right)) => {
-            let mut constant = 0i64;
-            let mut terms = Vec::new();
-            let normalized = collect_affine(left, 1, &mut constant, &mut terms, stop)
-                .and_then(|()| collect_affine(right, -1, &mut constant, &mut terms, stop));
+            let normalized = AffineForm::difference(left, right, stop);
             if stop.load(Ordering::Acquire) {
                 return None;
             }
-            Some(normalized.is_some() && affine_proves_exact_one(terms, constant, selectors))
+            Some(normalized.is_some_and(|form| {
+                affine_proves_exact_one(
+                    form.coefficients.into_iter().map(|(variable, coefficient)| (coefficient, variable)),
+                    form.constant,
+                    selectors,
+                )
+            }))
         }
         _ => Some(false),
     }
@@ -1050,22 +1029,19 @@ fn affine_proves_exact_one(terms: impl IntoIterator<Item = (i64, IntVarRef)>, co
 }
 
 fn positive_affine_terms(expression: &IntExpr, stop: &AtomicBool) -> Option<BTreeMap<IntVarRef, i64>> {
-    let mut constant = 0i64;
-    let mut terms = Vec::new();
-    collect_affine(expression, 1, &mut constant, &mut terms, stop)?;
-    if constant != 0 || terms.is_empty() {
+    let form = AffineForm::expression(expression, stop)?;
+    if form.constant != 0 || form.coefficients.is_empty() {
         return None;
     }
-    let mut normalized = BTreeMap::new();
-    for (coefficient, variable) in terms {
+    for &coefficient in form.coefficients.values() {
         if stop.load(Ordering::Acquire) {
             return None;
         }
-        if coefficient <= 0 || normalized.insert(variable, coefficient).is_some() {
+        if coefficient <= 0 {
             return None;
         }
     }
-    Some(normalized)
+    Some(form.coefficients)
 }
 
 /// Recognize exactly `objective = sum(positive coefficient * variable)`.
@@ -1108,46 +1084,6 @@ fn materialized_positive_sum(constraint: &Constraint, objective: IntVarRef, stop
     Some(result)
 }
 
-fn collect_affine(
-    expression: &IntExpr,
-    scale: i64,
-    constant: &mut i64,
-    terms: &mut Vec<(i64, IntVarRef)>,
-    stop: &AtomicBool,
-) -> Option<()> {
-    if stop.load(Ordering::Acquire) {
-        return None;
-    }
-    match expression {
-        IntExpr::Constant(value) => *constant = constant.checked_add(scale.checked_mul(*value)?)?,
-        IntExpr::Variable(variable) => terms.push((scale, *variable)),
-        IntExpr::Neg(value) => collect_affine(value, scale.checked_neg()?, constant, terms, stop)?,
-        IntExpr::Add(values) => {
-            for value in values {
-                collect_affine(value, scale, constant, terms, stop)?;
-            }
-        }
-        IntExpr::Sub(left, right) => {
-            collect_affine(left, scale, constant, terms, stop)?;
-            collect_affine(right, scale.checked_neg()?, constant, terms, stop)?;
-        }
-        IntExpr::Mul(values) => {
-            let mut multiplier = scale;
-            let mut symbolic = None;
-            for value in values {
-                if let IntExpr::Constant(value) = value {
-                    multiplier = multiplier.checked_mul(*value)?;
-                } else if symbolic.replace(value).is_some() {
-                    return None;
-                }
-            }
-            collect_affine(symbolic?, multiplier, constant, terms, stop)?;
-        }
-        _ => return None,
-    }
-    Some(())
-}
-
 fn mode_implication(expression: &IntExpr) -> Option<(IntVarRef, IntVarRef, i32)> {
     let IntExpr::Imp(guard, body) = expression else {
         return None;
@@ -1185,24 +1121,6 @@ fn precedence_parts(sum: &IntExpr, end: &IntExpr) -> Option<(IntVarRef, IntVarRe
         return None;
     };
     Some((*left, *right, *end))
-}
-
-fn constraint_scope(constraint: &Constraint) -> Vec<IntVarRef> {
-    let mut variables = Vec::new();
-    match constraint {
-        Constraint::Intension(expression) => expression.variables(&mut variables),
-        Constraint::Linear { terms, .. } => variables.extend(terms.iter().map(|(_, variable)| *variable)),
-        Constraint::Clause(literals) => variables.extend(literals.iter().map(|literal| literal.variable)),
-        Constraint::IntegerGlobal(global) => global.variables(&mut variables),
-        Constraint::Selected { selector, constraint } => {
-            variables.push(*selector);
-            variables.extend(constraint_scope(constraint));
-        }
-        _ => {}
-    }
-    variables.sort_unstable();
-    variables.dedup();
-    variables
 }
 
 fn evaluate_local_constraint(constraint: &Constraint, values: &HashMap<IntVarRef, i64>) -> Option<bool> {
@@ -1253,48 +1171,6 @@ fn fixed_domain_value(domain: &IntDomain) -> Option<i32> {
         IntDomain::Set(values) if values.len() == 1 => values.first().copied(),
         _ => None,
     }
-}
-
-fn domain_ceiling(domain: &IntDomain, lower_bound: i64) -> Option<i64> {
-    match domain {
-        IntDomain::Bool => [0i64, 1].into_iter().find(|&value| value >= lower_bound),
-        IntDomain::Range { lo, hi } => {
-            let value = i64::from(*lo).max(lower_bound);
-            (value <= i64::from(*hi)).then_some(value)
-        }
-        IntDomain::Set(values) => values.iter().copied().map(i64::from).filter(|&value| value >= lower_bound).min(),
-    }
-}
-
-fn topological_order(successors: &[Vec<usize>], stop: &AtomicBool) -> Option<Vec<usize>> {
-    let mut indegree = vec![0usize; successors.len()];
-    for list in successors {
-        if stop.load(Ordering::Acquire) {
-            return None;
-        }
-        for &successor in list {
-            *indegree.get_mut(successor)? = indegree[successor].checked_add(1)?;
-        }
-    }
-    let mut ready =
-        indegree.iter().enumerate().filter_map(|(operation, &degree)| (degree == 0).then_some(operation)).collect::<BTreeSet<_>>();
-    let mut order = Vec::with_capacity(successors.len());
-    while let Some(operation) = ready.pop_first() {
-        if stop.load(Ordering::Acquire) {
-            return None;
-        }
-        order.push(operation);
-        for &successor in &successors[operation] {
-            if stop.load(Ordering::Acquire) {
-                return None;
-            }
-            indegree[successor] = indegree[successor].checked_sub(1)?;
-            if indegree[successor] == 0 {
-                ready.insert(successor);
-            }
-        }
-    }
-    (order.len() == successors.len()).then_some(order)
 }
 
 struct DisjointSet {

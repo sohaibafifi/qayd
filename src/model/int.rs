@@ -265,4 +265,16 @@ impl IntDomain {
             Self::Set(values) => values.contains(&value),
         })
     }
+
+    /// Least domain value greater than or equal to `lower_bound`.
+    pub(crate) fn ceiling(&self, lower_bound: i64) -> Option<i64> {
+        match self {
+            Self::Bool => (lower_bound <= 1).then_some(lower_bound.max(0)),
+            Self::Range { lo, hi } => {
+                let value = lower_bound.max(i64::from(*lo));
+                (value <= i64::from(*hi)).then_some(value)
+            }
+            Self::Set(values) => values.iter().copied().map(i64::from).filter(|&value| value >= lower_bound).min(),
+        }
+    }
 }

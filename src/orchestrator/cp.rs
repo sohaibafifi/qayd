@@ -292,7 +292,7 @@ pub(crate) fn solve_cp_plan(
     sink: &mut dyn EventSink,
 ) -> Result<SolveResult, SolveError> {
     request.validate()?;
-    solve_cp_plan_inner(model, plan, request, budget, sink, true)
+    solve_cp_plan_inner(model, plan, super::WorkerAllocation::portfolio(request.threads), request, budget, sink, true)
 }
 
 /// Execute a CP plan against the same semantic model and request that the
@@ -300,16 +300,18 @@ pub(crate) fn solve_cp_plan(
 pub(crate) fn solve_cp_plan_validated(
     model: &Model,
     plan: &CpSolvePlan,
+    allocation: super::WorkerAllocation,
     request: &SolveRequest,
     budget: &SolveBudget,
     sink: &mut dyn EventSink,
 ) -> Result<SolveResult, SolveError> {
-    solve_cp_plan_inner(model, plan, request, budget, sink, false)
+    solve_cp_plan_inner(model, plan, allocation, request, budget, sink, false)
 }
 
 fn solve_cp_plan_inner(
     model: &Model,
     plan: &CpSolvePlan,
+    allocation: super::WorkerAllocation,
     request: &SolveRequest,
     budget: &SolveBudget,
     sink: &mut dyn EventSink,
@@ -341,7 +343,16 @@ fn solve_cp_plan_inner(
     let engine_stop = search_stop.flag();
     let started = Instant::now();
     let mut result = if let Some(local_search) = &plan.local_search {
-        super::integer_search::solve(model, &plan.compiled, local_search, request, budget, engine_stop, sink)?
+        super::integer_search::solve(super::integer_search::IntegerSearchRun {
+            model,
+            compiled: &plan.compiled,
+            plan: local_search,
+            allocation,
+            request,
+            budget,
+            engine_stop,
+            sink,
+        })?
     } else if !plan.compiled.objectives().is_empty() {
         solve_lexicographic(LexicographicSolve {
             model,
@@ -354,6 +365,7 @@ fn solve_cp_plan_inner(
             engine_stop,
             sink,
             incremental: None,
+            allocation,
         })?
     } else {
         solve_satisfaction(SatisfactionSolve {
@@ -365,6 +377,7 @@ fn solve_cp_plan_inner(
             engine_stop,
             started,
             incremental: None,
+            allocation,
         })?
     };
 
@@ -415,6 +428,7 @@ pub(crate) fn solve_cp_session_validated(
             engine_stop,
             started,
             incremental: Some(&mut incremental),
+            allocation: super::WorkerAllocation::single(),
         })?
     } else {
         solve_lexicographic(LexicographicSolve {
@@ -428,6 +442,7 @@ pub(crate) fn solve_cp_session_validated(
             engine_stop,
             sink,
             incremental: Some(&mut incremental),
+            allocation: super::WorkerAllocation::single(),
         })?
     };
     if let Some(candidate) = &result.primal {
@@ -449,16 +464,17 @@ struct SatisfactionSolve<'a, 'session, 'assumptions> {
     engine_stop: &'a std::sync::atomic::AtomicBool,
     started: Instant,
     incremental: Option<&'session mut IncrementalSearch<'assumptions>>,
+    allocation: super::WorkerAllocation,
 }
 
 fn solve_satisfaction(context: SatisfactionSolve<'_, '_, '_>) -> Result<SolveResult, SolveError> {
-    let SatisfactionSolve { model, compiled, guidance, request, budget, engine_stop, started, mut incremental } = context;
+    let SatisfactionSolve { model, compiled, guidance, request, budget, engine_stop, started, mut incremental, allocation } = context;
     let first_worker = incremental.as_ref().map(|search| search.next_worker());
     let problem = clone_problem(compiled.problem());
     let outcome = if let Some(search) = incremental.as_deref_mut() {
         search.solve_csp(problem, engine_stop, request.seed, request.limits.conflicts)
     } else {
-        let options = portfolio::normalize_options(false, false, cp_options(request, request.seed, request.limits.conflicts));
+        let options = portfolio::normalize_options(false, false, cp_options(request, allocation, request.seed, request.limits.conflicts));
         portfolio::solve_csp(problem, engine_stop, options, guidance.clone())
     };
     let conflict_limit_reached =
@@ -511,11 +527,23 @@ struct LexicographicSolve<'a, 'session, 'assumptions> {
     engine_stop: &'a std::sync::atomic::AtomicBool,
     sink: &'a mut dyn EventSink,
     incremental: Option<&'session mut IncrementalSearch<'assumptions>>,
+    allocation: super::WorkerAllocation,
 }
 
 fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveResult, SolveError> {
-    let LexicographicSolve { model, compiled, guidance, assumptions, warm_start, request, budget, engine_stop, sink, mut incremental } =
-        context;
+    let LexicographicSolve {
+        model,
+        compiled,
+        guidance,
+        assumptions,
+        warm_start,
+        request,
+        budget,
+        engine_stop,
+        sink,
+        mut incremental,
+        allocation,
+    } = context;
     let objective_count = compiled.objectives().len();
     let first_incremental_worker = incremental.as_ref().map(|search| search.next_worker());
     let mut reports = Vec::new();
@@ -646,7 +674,7 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
                 let options = portfolio::normalize_options(
                     true,
                     var_objective,
-                    cp_options(request, request.seed.wrapping_add(tier as u64), remaining_conflicts),
+                    cp_options(request, allocation, request.seed.wrapping_add(tier as u64), remaining_conflicts),
                 );
                 portfolio::solve_cop_with_progress(
                     tier_problem,
@@ -783,10 +811,10 @@ fn promote_warm_candidate(candidate: &CandidateSolution) -> CandidateSolution {
     )
 }
 
-fn cp_options(request: &SolveRequest, seed: u64, conflict_limit: Option<u64>) -> RunOptions {
+fn cp_options(request: &SolveRequest, allocation: super::WorkerAllocation, seed: u64, conflict_limit: Option<u64>) -> RunOptions {
     RunOptions {
         seed,
-        workers: request.threads,
+        workers: allocation.workers(),
         split: request.cp.split,
         probes: request.cp.probes,
         lns: request.cp.lns,

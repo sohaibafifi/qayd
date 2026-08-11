@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::constraints::table::STAR;
 use crate::mix64;
-use crate::model::{Constraint, IntDomain, IntExpr, IntGlobalConstraint, IntVarRef, Model, Objective, Relation};
+use crate::model::{AffineForm, Constraint, IntDomain, IntExpr, IntGlobalConstraint, IntVarRef, Model, Objective, Relation};
+
+use super::schedule_ir::PrecedenceDag;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ConstructionBudget {
@@ -39,9 +41,7 @@ pub(crate) struct DisjunctiveSchedulePlan {
     operations: Vec<Operation>,
     resources: Vec<Resource>,
     implicit_resources: Vec<ImplicitResource>,
-    predecessors: Vec<Vec<usize>>,
-    successors: Vec<Vec<usize>>,
-    topological: Vec<usize>,
+    precedences: PrecedenceDag,
     objective_ranking: ObjectiveRanking,
     variable_count: usize,
 }
@@ -104,7 +104,7 @@ impl ObjectiveRanking {
             lower_bound = lower_bound.max(term.evaluate(plan, schedule)?);
         }
         match self {
-            Self::CompletionEnvelope { target, .. } => domain_ceiling(model.int_vars().get(target.0)?, lower_bound),
+            Self::CompletionEnvelope { target, .. } => model.int_vars().get(target.0)?.ceiling(lower_bound),
             Self::ExactMaximum { .. } => {
                 if target.is_some_and(|variable| !model.int_vars().get(variable.0).is_some_and(|domain| domain.contains(lower_bound))) {
                     return None;
@@ -128,8 +128,6 @@ impl ScheduleTerm {
         }
     }
 }
-
-type PrecedenceGraph = (Vec<Vec<usize>>, Vec<Vec<usize>>);
 
 #[derive(Clone, Copy)]
 enum DispatchRule {
@@ -251,15 +249,8 @@ impl DisjunctiveSchedulePlan {
     }
 
     fn remaining_paths(&self, stop: &AtomicBool) -> Option<Vec<i64>> {
-        let mut bottom = vec![0i64; self.operations.len()];
-        for &operation in self.topological.iter().rev() {
-            if stop.load(Ordering::Acquire) {
-                return None;
-            }
-            let tail = self.successors[operation].iter().map(|&successor| bottom[successor]).max().unwrap_or(0);
-            bottom[operation] = self.operations[operation].duration.checked_add(tail)?;
-        }
-        Some(bottom)
+        let durations = self.operations.iter().map(|operation| operation.duration).collect::<Vec<_>>();
+        self.precedences.remaining_paths(&durations, stop)
     }
 
     fn dispatch(
@@ -272,7 +263,7 @@ impl DisjunctiveSchedulePlan {
         counter: &mut WorkCounter,
     ) -> Result<ConstructedSchedule, BuildFailure> {
         let count = self.operations.len();
-        let mut remaining_predecessors = self.predecessors.iter().map(Vec::len).collect::<Vec<_>>();
+        let mut remaining_predecessors = (0..count).map(|operation| self.precedences.predecessors(operation).len()).collect::<Vec<_>>();
         let mut predecessor_finish = vec![i64::MIN; count];
         let mut resource_available = vec![i64::MIN; self.resources.len()];
         let mut starts = vec![0i64; count];
@@ -290,7 +281,11 @@ impl DisjunctiveSchedulePlan {
                 let record = &self.operations[operation];
                 let resource_finish = record.resources.iter().map(|&resource| resource_available[resource]).max().unwrap_or(i64::MIN);
                 let lower_bound = record.earliest.max(predecessor_finish[operation]).max(resource_finish);
-                let start = domain_ceiling(model.int_vars().get(record.start.0).ok_or(BuildFailure::Infeasible)?, lower_bound)
+                let start = model
+                    .int_vars()
+                    .get(record.start.0)
+                    .ok_or(BuildFailure::Infeasible)?
+                    .ceiling(lower_bound)
                     .ok_or(BuildFailure::Infeasible)?;
                 if start > record.latest {
                     return Err(BuildFailure::Infeasible);
@@ -320,7 +315,7 @@ impl DisjunctiveSchedulePlan {
                 resource_available[resource] = finish;
                 resource_sequences[resource].push(operation);
             }
-            for &successor in &self.successors[operation] {
+            for &successor in self.precedences.successors(operation) {
                 remaining_predecessors[successor] = remaining_predecessors[successor].checked_sub(1).ok_or(BuildFailure::Infeasible)?;
                 predecessor_finish[successor] = predecessor_finish[successor].max(finish);
             }
@@ -392,7 +387,7 @@ impl DisjunctiveSchedulePlan {
 
     #[cfg(test)]
     pub(crate) fn precedence_count(&self) -> usize {
-        self.successors.iter().map(Vec::len).sum()
+        self.precedences.all_successors().iter().map(Vec::len).sum()
     }
 }
 
@@ -563,9 +558,8 @@ impl<'a> Compiler<'a> {
         self.explicit_resources()?;
         self.reject_unsupported_schedule_globals()?;
         self.implicit_resources()?;
-        let (predecessors, successors) = self.precedences()?;
-        let objective_ranking = self.prove_objective_ranking(&successors)?;
-        let topological = topological_order(&successors)?;
+        let precedences = self.precedences()?;
+        let objective_ranking = self.prove_objective_ranking(&precedences)?;
         if self.stop.load(Ordering::Acquire) {
             return None;
         }
@@ -573,9 +567,7 @@ impl<'a> Compiler<'a> {
             operations: self.operations,
             resources: self.resources,
             implicit_resources: self.implicit_resources,
-            predecessors,
-            successors,
-            topological,
+            precedences,
             objective_ranking,
             variable_count: self.model.int_vars().len(),
         })
@@ -866,7 +858,7 @@ impl<'a> Compiler<'a> {
             if ignored.contains(&index) {
                 continue;
             }
-            let scope = constraint_scope(constraint);
+            let scope = constraint.int_scope();
             if !scope.iter().any(|variable| auxiliary.contains(variable)) {
                 continue;
             }
@@ -889,11 +881,10 @@ impl<'a> Compiler<'a> {
         for list in &mut successors {
             list.sort_unstable();
         }
-        Some((unique_topological_order(&successors)?, constraints))
+        Some((PrecedenceDag::unique_order(&successors, self.stop)?, constraints))
     }
 
-    fn precedences(&self) -> Option<PrecedenceGraph> {
-        let mut predecessors = vec![Vec::new(); self.operations.len()];
+    fn precedences(&self) -> Option<PrecedenceDag> {
         let mut successors = vec![Vec::new(); self.operations.len()];
         let mut arcs = HashSet::new();
         let operation_starts = self.operation_by_start.keys().copied().collect::<HashSet<_>>();
@@ -907,7 +898,7 @@ impl<'a> Compiler<'a> {
             {
                 continue;
             }
-            let scope = constraint_scope(constraint);
+            let scope = constraint.int_scope();
             let schedule_scope = scope.iter().filter(|variable| operation_starts.contains(variable)).copied().collect::<HashSet<_>>();
             if schedule_scope.len() < 2 {
                 continue;
@@ -921,22 +912,14 @@ impl<'a> Compiler<'a> {
                 return None;
             }
             successors[from].push(to);
-            predecessors[to].push(from);
         }
-        for list in &mut successors {
-            list.sort_unstable();
-        }
-        for list in &mut predecessors {
-            list.sort_unstable();
-        }
-        topological_order(&successors)?;
-        Some((predecessors, successors))
+        PrecedenceDag::compile(successors, self.stop)
     }
 
     /// Compile an exact objective evaluator for constructed schedules and prove
     /// that every operation contributes directly or through fixed precedence.
     /// Surrogate-only rankings are deliberately declined.
-    fn prove_objective_ranking(&self, successors: &[Vec<usize>]) -> Option<ObjectiveRanking> {
+    fn prove_objective_ranking(&self, precedences: &PrecedenceDag) -> Option<ObjectiveRanking> {
         let [Objective::IntExpr { minimize: true, expr }] = self.model.objectives() else {
             return None;
         };
@@ -948,7 +931,7 @@ impl<'a> Compiler<'a> {
             IntExpr::Variable(target) => self.materialized_maximum(*target)?.or_else(|| self.completion_envelope(*target))?,
             _ => return None,
         };
-        self.prove_ranking_coverage(ranking.terms(), successors)?;
+        self.prove_ranking_coverage(ranking.terms(), precedences)?;
         Some(ranking)
     }
 
@@ -975,7 +958,7 @@ impl<'a> Compiler<'a> {
                     .constraints()
                     .iter()
                     .enumerate()
-                    .any(|(index, constraint)| index != *definition && constraint_scope(constraint).contains(&target))
+                    .any(|(index, constraint)| index != *definition && constraint.int_scope().contains(&target))
             {
                 return None;
             }
@@ -997,7 +980,7 @@ impl<'a> Compiler<'a> {
             if self.stop.load(Ordering::Acquire) {
                 return None;
             }
-            if !constraint_scope(constraint).contains(&target) {
+            if !constraint.int_scope().contains(&target) {
                 continue;
             }
             let mut relation = normalized_le_constraint(constraint)??;
@@ -1031,7 +1014,7 @@ impl<'a> Compiler<'a> {
         None
     }
 
-    fn prove_ranking_coverage(&self, terms: &[ScheduleTerm], successors: &[Vec<usize>]) -> Option<()> {
+    fn prove_ranking_coverage(&self, terms: &[ScheduleTerm], precedences: &PrecedenceDag) -> Option<()> {
         let mut covered = vec![false; self.operations.len()];
         for &term in terms {
             match term {
@@ -1044,12 +1027,11 @@ impl<'a> Compiler<'a> {
                 ScheduleTerm::Constant(_) => {}
             }
         }
-        let order = topological_order(successors)?;
-        for &operation in order.iter().rev() {
+        for &operation in precedences.topological().iter().rev() {
             if self.stop.load(Ordering::Acquire) {
                 return None;
             }
-            covered[operation] |= successors[operation].iter().any(|&successor| covered[successor]);
+            covered[operation] |= precedences.successors(operation).iter().any(|&successor| covered[successor]);
         }
         covered.into_iter().all(|operation| operation).then_some(())
     }
@@ -1063,11 +1045,7 @@ impl ObjectiveRanking {
     }
 }
 
-#[derive(Clone, Debug)]
-struct AffineLe {
-    coefficients: BTreeMap<IntVarRef, i64>,
-    constant: i64,
-}
+type AffineLe = AffineForm;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AffineValue {
@@ -1135,11 +1113,7 @@ fn objective_maximum_definition_constraints(model: &Model, stop: &AtomicBool) ->
 }
 
 fn affine_value(expression: &IntExpr, stop: &AtomicBool) -> Option<AffineValue> {
-    if stop.load(Ordering::Acquire) {
-        return None;
-    }
-    let mut affine = AffineLe { coefficients: BTreeMap::new(), constant: 0 };
-    collect_affine(expression, 1, &mut affine)?;
+    let affine = AffineForm::expression(expression, stop)?;
     Some(AffineValue { coefficients: affine.coefficients, constant: affine.constant })
 }
 
@@ -1173,20 +1147,8 @@ fn expand_affine_variable(model: &Model, target: IntVarRef, stop: &AtomicBool) -
 
 fn normalized_eq_constraint(constraint: &Constraint) -> Option<Option<AffineLe>> {
     match constraint {
-        Constraint::Intension(IntExpr::Eq(left, right)) => {
-            let mut affine = AffineLe { coefficients: BTreeMap::new(), constant: 0 };
-            if collect_affine(left, 1, &mut affine).is_none() || collect_affine(right, -1, &mut affine).is_none() {
-                return Some(None);
-            }
-            Some(Some(affine))
-        }
-        Constraint::Linear { terms, relation: Relation::Eq, rhs } => {
-            let mut affine = AffineLe { coefficients: BTreeMap::new(), constant: rhs.checked_neg()? };
-            for &(coefficient, variable) in terms {
-                add_coefficient(&mut affine.coefficients, variable, coefficient)?;
-            }
-            Some(Some(affine))
-        }
+        Constraint::Intension(IntExpr::Eq(left, right)) => Some(AffineForm::difference(left, right, &AtomicBool::new(false))),
+        Constraint::Linear { terms, relation: Relation::Eq, rhs } => Some(AffineForm::linear(terms, *rhs)),
         _ => Some(None),
     }
 }
@@ -1194,25 +1156,9 @@ fn normalized_eq_constraint(constraint: &Constraint) -> Option<Option<AffineLe>>
 fn normalized_le_constraint(constraint: &Constraint) -> Option<Option<AffineLe>> {
     match constraint {
         Constraint::Intension(expression) => normalized_le_expression(expression),
-        Constraint::Linear { terms, relation, rhs } => {
-            let mut affine = AffineLe { coefficients: BTreeMap::new(), constant: 0 };
-            match relation {
-                Relation::Le => {
-                    for &(coefficient, variable) in terms {
-                        add_coefficient(&mut affine.coefficients, variable, coefficient)?;
-                    }
-                    affine.constant = rhs.checked_neg()?;
-                }
-                Relation::Ge => {
-                    for &(coefficient, variable) in terms {
-                        add_coefficient(&mut affine.coefficients, variable, coefficient.checked_neg()?)?;
-                    }
-                    affine.constant = *rhs;
-                }
-                Relation::Eq | Relation::Ne | Relation::Lt | Relation::Gt => return Some(None),
-            }
-            Some(Some(affine))
-        }
+        Constraint::Linear { terms, relation: Relation::Le, rhs } => Some(AffineForm::linear(terms, *rhs)),
+        Constraint::Linear { terms, relation: Relation::Ge, rhs } => Some(AffineForm::linear(terms, *rhs)?.scale(-1)),
+        Constraint::Linear { relation: Relation::Eq | Relation::Ne | Relation::Lt | Relation::Gt, .. } => Some(None),
         _ => Some(None),
     }
 }
@@ -1224,56 +1170,12 @@ fn normalized_le_expression(expression: &IntExpr) -> Option<Option<AffineLe>> {
         IntExpr::Eq(_, _) | IntExpr::Ne(_, _) | IntExpr::Lt(_, _) | IntExpr::Gt(_, _) => return Some(None),
         _ => return Some(None),
     };
-    let mut affine = AffineLe { coefficients: BTreeMap::new(), constant: 0 };
-    if reverse {
-        collect_affine(right, 1, &mut affine)?;
-        collect_affine(left, -1, &mut affine)?;
+    let affine = if reverse {
+        AffineForm::difference(right, left, &AtomicBool::new(false))?
     } else {
-        collect_affine(left, 1, &mut affine)?;
-        collect_affine(right, -1, &mut affine)?;
-    }
+        AffineForm::difference(left, right, &AtomicBool::new(false))?
+    };
     Some(Some(affine))
-}
-
-fn collect_affine(expression: &IntExpr, scale: i64, affine: &mut AffineLe) -> Option<()> {
-    match expression {
-        IntExpr::Constant(value) => affine.constant = affine.constant.checked_add(scale.checked_mul(*value)?)?,
-        IntExpr::Variable(variable) => add_coefficient(&mut affine.coefficients, *variable, scale)?,
-        IntExpr::Neg(value) => collect_affine(value, scale.checked_neg()?, affine)?,
-        IntExpr::Add(values) => {
-            for value in values {
-                collect_affine(value, scale, affine)?;
-            }
-        }
-        IntExpr::Sub(left, right) => {
-            collect_affine(left, scale, affine)?;
-            collect_affine(right, scale.checked_neg()?, affine)?;
-        }
-        IntExpr::Mul(values) => {
-            let mut coefficient = scale;
-            let mut symbolic = None;
-            for value in values {
-                if let IntExpr::Constant(value) = value {
-                    coefficient = coefficient.checked_mul(*value)?;
-                } else if symbolic.replace(value).is_some() {
-                    return None;
-                }
-            }
-            collect_affine(symbolic?, coefficient, affine)?;
-        }
-        _ => return None,
-    }
-    Some(())
-}
-
-fn add_coefficient(coefficients: &mut BTreeMap<IntVarRef, i64>, variable: IntVarRef, value: i64) -> Option<()> {
-    let updated = coefficients.get(&variable).copied().unwrap_or(0).checked_add(value)?;
-    if updated == 0 {
-        coefficients.remove(&variable);
-    } else {
-        coefficients.insert(variable, updated);
-    }
-    Some(())
 }
 
 fn precedence_arc(
@@ -1317,24 +1219,6 @@ fn chain_arc(relation: &AffineLe, starts: &HashMap<IntVarRef, usize>, durations:
     Some((from, to))
 }
 
-fn constraint_scope(constraint: &Constraint) -> Vec<IntVarRef> {
-    let mut variables = Vec::new();
-    match constraint {
-        Constraint::Intension(expression) => expression.variables(&mut variables),
-        Constraint::Linear { terms, .. } => variables.extend(terms.iter().map(|(_, variable)| *variable)),
-        Constraint::Clause(literals) => variables.extend(literals.iter().map(|literal| literal.variable)),
-        Constraint::IntegerGlobal(global) => global.variables(&mut variables),
-        Constraint::Selected { selector, constraint } => {
-            variables.push(*selector);
-            variables.extend(constraint_scope(constraint));
-        }
-        _ => {}
-    }
-    variables.sort_unstable();
-    variables.dedup();
-    variables
-}
-
 fn domain_bounds(domain: &IntDomain) -> Option<(i64, i64)> {
     match domain {
         IntDomain::Bool => Some((0, 1)),
@@ -1346,17 +1230,6 @@ fn domain_bounds(domain: &IntDomain) -> Option<(i64, i64)> {
             let last = *ordered.last()?;
             (ordered.len() == values.len()).then_some((i64::from(first), i64::from(last)))
         }
-    }
-}
-
-fn domain_ceiling(domain: &IntDomain, lower_bound: i64) -> Option<i64> {
-    match domain {
-        IntDomain::Bool => (lower_bound <= 1).then_some(lower_bound.max(0)),
-        IntDomain::Range { lo, hi } => {
-            let value = lower_bound.max(i64::from(*lo));
-            (value <= i64::from(*hi)).then_some(value)
-        }
-        IntDomain::Set(values) => values.iter().copied().map(i64::from).filter(|&value| value >= lower_bound).min(),
     }
 }
 
@@ -1372,52 +1245,4 @@ fn domain_is_zero_based_permutation(domain: &IntDomain, count: usize) -> bool {
         }
         IntDomain::Range { .. } => false,
     }
-}
-
-fn topological_order(successors: &[Vec<usize>]) -> Option<Vec<usize>> {
-    let mut indegree = vec![0usize; successors.len()];
-    for list in successors {
-        for &successor in list {
-            indegree[successor] = indegree.get(successor)?.checked_add(1)?;
-        }
-    }
-    let mut ready =
-        indegree.iter().enumerate().filter_map(|(operation, &degree)| (degree == 0).then_some(operation)).collect::<BTreeSet<_>>();
-    let mut order = Vec::with_capacity(successors.len());
-    while let Some(operation) = ready.pop_first() {
-        order.push(operation);
-        for &successor in &successors[operation] {
-            indegree[successor] = indegree[successor].checked_sub(1)?;
-            if indegree[successor] == 0 {
-                ready.insert(successor);
-            }
-        }
-    }
-    (order.len() == successors.len()).then_some(order)
-}
-
-fn unique_topological_order(successors: &[Vec<usize>]) -> Option<Vec<usize>> {
-    let mut indegree = vec![0usize; successors.len()];
-    for list in successors {
-        for &successor in list {
-            indegree[successor] = indegree.get(successor)?.checked_add(1)?;
-        }
-    }
-    let mut ready =
-        indegree.iter().enumerate().filter_map(|(operation, &degree)| (degree == 0).then_some(operation)).collect::<BTreeSet<_>>();
-    let mut order = Vec::with_capacity(successors.len());
-    while !ready.is_empty() {
-        if ready.len() != 1 {
-            return None;
-        }
-        let operation = ready.pop_first()?;
-        order.push(operation);
-        for &successor in &successors[operation] {
-            indegree[successor] = indegree[successor].checked_sub(1)?;
-            if indegree[successor] == 0 {
-                ready.insert(successor);
-            }
-        }
-    }
-    (order.len() == successors.len()).then_some(order)
 }

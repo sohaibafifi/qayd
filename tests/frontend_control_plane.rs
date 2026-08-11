@@ -98,3 +98,24 @@ fn engines_cannot_construct_the_public_solve_protocol() {
     let list_engine = fs::read_to_string(root.join("src/engines/ls/lists/local_search.rs")).expect("list local-search source");
     assert!(!list_engine.contains("solve_schedule"), "the list engine launches the scheduling engine");
 }
+
+#[test]
+fn portfolio_allocation_and_schedule_analysis_have_one_owner() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let solve = fs::read_to_string(root.join("src/orchestrator/solve.rs")).expect("prepared solve source");
+    let executor = fs::read_to_string(root.join("src/orchestrator/executor.rs")).expect("worker executor source");
+    assert!(solve.contains("WorkerAllocation::portfolio(*workers)"));
+    assert!(executor.contains("struct WorkerAllocation"));
+
+    for relative in ["src/engines/ls/disjunctive_schedule.rs", "src/engines/ls/scenario_schedule.rs"] {
+        let source = fs::read_to_string(root.join(relative)).expect("schedule engine source");
+        for duplicate in ["fn constraint_scope", "fn domain_ceiling", "fn topological_order", "fn collect_affine"] {
+            assert!(!source.contains(duplicate), "{relative} reintroduced the shared scheduling helper `{duplicate}`");
+        }
+        assert!(source.contains("PrecedenceDag"), "{relative} bypasses the shared scheduling graph");
+    }
+
+    let list_eval = fs::read_to_string(root.join("src/engines/ls/lists/eval.rs")).expect("list scorer source");
+    assert!(list_eval.contains("eval_reduction_on_contents"));
+    assert!(!list_eval.contains("match reduction.iterable"), "list LS reintroduced a second reduction evaluator");
+}

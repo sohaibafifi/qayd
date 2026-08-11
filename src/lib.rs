@@ -83,6 +83,9 @@ pub(crate) fn mix64(mut x: u64) -> u64 {
 #[cfg(test)]
 extern crate self as qayd;
 #[cfg(test)]
+#[path = "../tests/internal/architecture_consolidation.rs"]
+mod architecture_consolidation;
+#[cfg(test)]
 #[path = "../tests/internal/backend_phase3.rs"]
 mod backend_phase3;
 #[cfg(test)]

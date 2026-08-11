@@ -210,6 +210,15 @@ pub(crate) fn eval_reduction_on_lists(reduction: &Reduction, lists: &[Vec<i32>])
     eval_reduction_on_lists_impl(reduction, lists, None).ok().flatten()
 }
 
+/// Evaluate one reduction on the concrete contents selected by its iterable.
+///
+/// This is the runtime semantic used by both canonical replay and full LS
+/// recomputation. Incremental LS caches may optimize it, but must agree with
+/// this function whenever they materialize a complete list.
+pub(crate) fn eval_reduction_on_contents(reduction: &Reduction, contents: &[i32]) -> Option<i64> {
+    eval_reduction_on_contents_impl(reduction, contents, None).ok().flatten()
+}
+
 pub(crate) fn eval_reduction_on_lists_interruptible(
     reduction: &Reduction,
     lists: &[Vec<i32>],
@@ -219,6 +228,13 @@ pub(crate) fn eval_reduction_on_lists_interruptible(
 }
 
 fn eval_reduction_on_lists_impl(reduction: &Reduction, lists: &[Vec<i32>], stop: Option<&AtomicBool>) -> Result<Option<i64>, ()> {
+    let Some(contents) = lists.get(reduction.iterable.list()) else {
+        return Ok(None);
+    };
+    eval_reduction_on_contents_impl(reduction, contents, stop)
+}
+
+fn eval_reduction_on_contents_impl(reduction: &Reduction, contents: &[i32], stop: Option<&AtomicBool>) -> Result<Option<i64>, ()> {
     let check_stop = || {
         if stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
             Err(())
@@ -227,9 +243,6 @@ fn eval_reduction_on_lists_impl(reduction: &Reduction, lists: &[Vec<i32>], stop:
         }
     };
     check_stop()?;
-    let Some(contents) = lists.get(reduction.iterable.list()) else {
-        return Ok(None);
-    };
     let arena = &reduction.arena.exprs;
     let body = reduction.body;
     let mut sum = 0i64;
@@ -351,6 +364,13 @@ fn eval_reduction_on_lists_impl(reduction: &Reduction, lists: &[Vec<i32>], stop:
 
 pub(crate) fn eval_expr_checked(arena: &[Expr], id: ExprId, args: &[i64]) -> Option<i64> {
     eval_expr_impl(arena, id, args, None).ok()
+}
+
+/// Total runtime expression semantics used by search scoring. Invalid array
+/// accesses, external failures, and other undefined subexpressions contribute
+/// zero, matching reduction replay.
+pub(crate) fn eval_expr_runtime(arena: &[Expr], id: ExprId, args: &[i64]) -> i64 {
+    eval_expr_checked(arena, id, args).unwrap_or(0)
 }
 
 fn eval_expr_checked_interruptible(arena: &[Expr], id: ExprId, args: &[i64], stop: &AtomicBool) -> Result<Option<i64>, ()> {
