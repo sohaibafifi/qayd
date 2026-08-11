@@ -359,6 +359,7 @@ pub fn merge_search_stats(total: &mut SolveStats, part: SolveStats) {
     total.lp_timeouts = total.lp_timeouts.saturating_add(part.lp_timeouts);
     total.lp_refactorizations = total.lp_refactorizations.saturating_add(part.lp_refactorizations);
     total.lp_micros = total.lp_micros.saturating_add(part.lp_micros);
+    total.lp_node_prunes = total.lp_node_prunes.saturating_add(part.lp_node_prunes);
     if total.lp_root_bound.is_none() {
         total.lp_root_bound = part.lp_root_bound;
     }

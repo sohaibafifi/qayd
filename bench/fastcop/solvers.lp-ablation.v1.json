@@ -52,13 +52,15 @@
         "amthal",
         "--lp-root-ms",
         "50",
+        "--lp-node-ms",
+        "0",
         "--lp-phase-max-vars",
         "0",
         "{instance}"
       ],
       "artifact": "../../target/release/qayd",
       "expected_sha256": null,
-      "version": "qayd 0.9.1, Amthal root bound with primal phase disabled"
+      "version": "qayd 0.9.1, Amthal root bound with primal phase and node LP disabled"
     },
     "qayd-amthal": {
       "argv": [
@@ -76,11 +78,39 @@
         "amthal",
         "--lp-root-ms",
         "50",
+        "--lp-node-ms",
+        "0",
         "{instance}"
       ],
       "artifact": "../../target/release/qayd",
       "expected_sha256": null,
-      "version": "qayd 0.9.1, Amthal root LP with a 50 ms budget"
+      "version": "qayd 0.9.1, Amthal root LP and phase with node LP disabled"
+    },
+    "qayd-amthal-search": {
+      "argv": [
+        "{artifact}",
+        "-t",
+        "{cpu_seconds}",
+        "--threads",
+        "1",
+        "--seed",
+        "{seed}",
+        "--verbose",
+        "--mem-limit",
+        "{memory_mb}",
+        "--linear-backend",
+        "amthal",
+        "--lp-root-ms",
+        "50",
+        "--lp-node-ms",
+        "2",
+        "--lp-node-depth",
+        "8",
+        "{instance}"
+      ],
+      "artifact": "../../target/release/qayd",
+      "expected_sha256": null,
+      "version": "qayd 0.9.1, Amthal root LP, phase, and persistent in-search LP"
     }
   }
 }

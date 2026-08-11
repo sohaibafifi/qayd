@@ -180,7 +180,7 @@ impl SemanticSolveSession {
                 value: assumption.value,
             });
         }
-        let guidance = SearchGuidance { initial_phase, branch_order, primary_branch_scope };
+        let guidance = SearchGuidance { initial_phase, branch_order, primary_branch_scope, linear: None };
         let output = solve_cp_session_validated(
             &self.package.model,
             compiled,

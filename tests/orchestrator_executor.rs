@@ -95,6 +95,7 @@ fn merge_search_stats_covers_every_counter() {
         lp_refactorizations: 15,
         lp_micros: 16,
         lp_root_bound: Some(17),
+        lp_node_prunes: 18,
     };
     let part = SolveStats {
         solutions: 10,
@@ -114,6 +115,7 @@ fn merge_search_stats_covers_every_counter() {
         lp_refactorizations: 150,
         lp_micros: 160,
         lp_root_bound: Some(170),
+        lp_node_prunes: 180,
     };
 
     merge_search_stats(&mut total, part);
@@ -138,6 +140,7 @@ fn merge_search_stats_covers_every_counter() {
             lp_refactorizations: 165,
             lp_micros: 176,
             lp_root_bound: Some(17),
+            lp_node_prunes: 198,
         }
     );
 }

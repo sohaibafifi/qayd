@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report the paired contribution of Qayd's optional root LP relaxation."""
+"""Report the paired contribution of Qayd's optional LP relaxation."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ REPORT_SCHEMA = "qayd.fastcop.lp-ablation/v1"
 NODE_RE = re.compile(r"^c nodes (\d+) failures (\d+)$", re.MULTILINE)
 LP_RE = re.compile(
     r"^c lp rows (\d+) root_bound (\?|[-+]?\d+) solves (\d+) "
-    r"certified (\d+) timeouts (\d+) refactorizations (\d+) "
+    r"certified (\d+)(?: node_prunes (\d+))? timeouts (\d+) refactorizations (\d+) "
     r"time_ms ([0-9]+(?:\.[0-9]+)?)$",
     re.MULTILINE,
 )
@@ -92,6 +92,7 @@ def parse_solver_stats(record: dict[str, Any]) -> dict[str, Any]:
         "lp_root_bound": None,
         "lp_solves": 0,
         "lp_certified": 0,
+        "lp_node_prunes": 0,
         "lp_timeouts": 0,
         "lp_refactorizations": 0,
         "lp_time_ms": 0.0,
@@ -104,9 +105,10 @@ def parse_solver_stats(record: dict[str, Any]) -> dict[str, Any]:
                 "lp_root_bound": None if bound == "?" else int(bound),
                 "lp_solves": int(lp_match.group(3)),
                 "lp_certified": int(lp_match.group(4)),
-                "lp_timeouts": int(lp_match.group(5)),
-                "lp_refactorizations": int(lp_match.group(6)),
-                "lp_time_ms": float(lp_match.group(7)),
+                "lp_node_prunes": int(lp_match.group(5) or 0),
+                "lp_timeouts": int(lp_match.group(6)),
+                "lp_refactorizations": int(lp_match.group(7)),
+                "lp_time_ms": float(lp_match.group(8)),
             }
         )
     return stats
@@ -260,6 +262,7 @@ def summarize_pairs(
                 "lp_root_bound": amthal_stats["lp_root_bound"],
                 "lp_solves": amthal_stats["lp_solves"],
                 "lp_certified": amthal_stats["lp_certified"],
+                "lp_node_prunes": amthal_stats["lp_node_prunes"],
                 "lp_timeouts": amthal_stats["lp_timeouts"],
                 "lp_time_ms": amthal_stats["lp_time_ms"],
                 "certified_absolute_gap": gap,
@@ -272,8 +275,8 @@ def summarize_pairs(
             }
         )
 
-    eligible = [row for row in rows if row["lp_solves"] > 0]
-    certified = [row for row in rows if row["lp_certified"] > 0]
+    eligible = [row for row in rows if row["lp_rows"] > 0]
+    certified = [row for row in rows if row["lp_root_bound"] is not None]
     family_rows = []
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -283,8 +286,8 @@ def summarize_pairs(
             {
                 "family": family,
                 "pairs": len(values),
-                "lp_eligible": sum(row["lp_solves"] > 0 for row in values),
-                "lp_certified": sum(row["lp_certified"] > 0 for row in values),
+                "lp_eligible": sum(row["lp_rows"] > 0 for row in values),
+                "lp_certified": sum(row["lp_root_bound"] is not None for row in values),
                 "amthal_wins": sum(row["outcome"] == "amthal" for row in values),
                 "native_wins": sum(row["outcome"] == "native" for row in values),
                 "ties": sum(row["outcome"] == "tie" for row in values),
@@ -309,6 +312,7 @@ def summarize_pairs(
             for row in certified
         ),
         "lp_timeouts": sum(row["lp_timeouts"] for row in rows),
+        "lp_node_prunes": sum(row["lp_node_prunes"] for row in rows),
         "median_lp_time_ms_eligible": median(row["lp_time_ms"] for row in eligible),
         "median_certified_relative_gap": median(row["certified_relative_gap"] for row in certified),
         "median_wall_ratio": median(row["wall_ratio"] for row in rows),
@@ -340,6 +344,7 @@ def comparison_projection(
         "median_first_incumbent_ratio": summary["median_first_incumbent_ratio"],
         "median_best_incumbent_ratio": summary["median_best_incumbent_ratio"],
         "median_node_ratio": summary["median_node_ratio"],
+        "treatment_lp_node_prunes": summary["lp_node_prunes"],
     }
 
 
@@ -349,16 +354,21 @@ def attach_attribution(
     native_name: str,
     bound_only_name: str,
     amthal_name: str,
+    search_name: Optional[str] = None,
 ) -> None:
     bound_pairs = pair_records(records, native_name, bound_only_name)
     phase_pairs = pair_records(records, bound_only_name, amthal_name)
     bound_summary = summarize_pairs(bound_pairs)
     phase_summary = summarize_pairs(phase_pairs)
     comparisons = [
-        comparison_projection(summary, native_name, amthal_name),
+        comparison_projection(summary, native_name, search_name or amthal_name),
         comparison_projection(bound_summary, native_name, bound_only_name),
         comparison_projection(phase_summary, bound_only_name, amthal_name),
     ]
+    if search_name is not None:
+        search_pairs = pair_records(records, amthal_name, search_name)
+        search_summary = summarize_pairs(search_pairs)
+        comparisons.append(comparison_projection(search_summary, amthal_name, search_name))
 
     mismatches = 0
     for (_native, bound_only), (_bound_only, full) in zip(bound_pairs, phase_pairs):
@@ -381,7 +391,7 @@ def shown(value: Optional[float], *, percent: bool = False) -> str:
 def markdown(summary: dict[str, Any]) -> str:
     outcomes = summary["outcomes"]
     lines = [
-        "# Qayd root LP ablation",
+        "# Qayd LP ablation",
         "",
         f"Paired runs: {summary['pairs']}. Same executable: {'yes' if summary['same_binary'] else 'no'}.",
         "",
@@ -391,6 +401,7 @@ def markdown(summary: dict[str, Any]) -> str:
         f"- Proofs: native {summary['native_proofs']}, Amthal {summary['amthal_proofs']}.",
         f"- Objective outcomes: Amthal {outcomes.get('amthal', 0)}, native {outcomes.get('native', 0)}, ties {outcomes.get('tie', 0)}, neither {outcomes.get('neither', 0)}.",
         f"- LP eligibility: {summary['lp_eligible']}/{summary['pairs']}; certified root bounds: {summary['lp_certified']}/{summary['pairs']}; timeouts: {summary['lp_timeouts']}.",
+        f"- Exactly certified in-search LP prunes: {summary['lp_node_prunes']}.",
         f"- Root bound quality: {summary['lp_exact_at_incumbent']} match the incumbent; {summary['lp_within_10_percent']} are within 10%.",
         f"- Median LP time on eligible models: {shown(summary['median_lp_time_ms_eligible'])} ms.",
         f"- Median certified relative gap: {shown(summary['median_certified_relative_gap'], percent=True)}.",
@@ -410,8 +421,8 @@ def markdown(summary: dict[str, Any]) -> str:
                 "",
                 "The bound-only arm disables LP primal phase guidance. It isolates dual-bound cost and availability from the search-phase effect.",
                 "",
-                "| Treatment vs control | Treatment wins | Control wins | Ties | Neither | Verified incumbents | Proofs | Wall ratio | First ratio | Best ratio | Nodes ratio |",
-                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+                "| Treatment vs control | Treatment wins | Control wins | Ties | Neither | Verified incumbents | Proofs | LP node prunes | Wall ratio | First ratio | Best ratio | Nodes ratio |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
         for row in comparisons:
@@ -421,6 +432,7 @@ def markdown(summary: dict[str, Any]) -> str:
                 f"{row['ties']} | {row['neither']} | "
                 f"{row['treatment_verified_incumbents']}/{row['control_verified_incumbents']} | "
                 f"{row['treatment_proofs']}/{row['control_proofs']} | "
+                f"{row['treatment_lp_node_prunes']} | "
                 f"{shown(row['median_wall_ratio'])} | "
                 f"{shown(row['median_first_incumbent_ratio'])} | "
                 f"{shown(row['median_best_incumbent_ratio'])} | "
@@ -456,6 +468,7 @@ def main() -> int:
     parser.add_argument("results", type=Path, nargs="+")
     parser.add_argument("--native", default="qayd-native")
     parser.add_argument("--amthal", default="qayd-amthal")
+    parser.add_argument("--search", default="qayd-amthal-search")
     parser.add_argument(
         "--bound-only",
         default="qayd-amthal-bound-only",
@@ -467,9 +480,10 @@ def main() -> int:
 
     try:
         records = load_records(args.results)
-        pairs = pair_records(records, args.native, args.amthal)
-        summary = summarize_pairs(pairs)
         solvers = {record.get("solver") for record in records}
+        treatment = args.search if args.search in solvers else args.amthal
+        pairs = pair_records(records, args.native, treatment)
+        summary = summarize_pairs(pairs)
         if args.bound_only in solvers:
             attach_attribution(
                 summary,
@@ -477,6 +491,7 @@ def main() -> int:
                 args.native,
                 args.bound_only,
                 args.amthal,
+                args.search if args.search in solvers else None,
             )
         report = markdown(summary)
         if args.output:

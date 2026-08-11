@@ -464,11 +464,12 @@ fn write_report<W: Write>(w: &mut W, result: &SolveResult) -> std::io::Result<()
     if stats.lp_rows > 0 {
         writeln!(
             w,
-            "c lp rows {} root_bound {} solves {} certified {} timeouts {} refactorizations {} time_ms {:.3}",
+            "c lp rows {} root_bound {} solves {} certified {} node_prunes {} timeouts {} refactorizations {} time_ms {:.3}",
             stats.lp_rows,
             stats.lp_root_bound.map_or_else(|| "?".to_string(), |bound| bound.to_string()),
             stats.lp_solves,
             stats.lp_certified,
+            stats.lp_node_prunes,
             stats.lp_timeouts,
             stats.lp_refactorizations,
             stats.lp_micros as f64 / 1000.0,

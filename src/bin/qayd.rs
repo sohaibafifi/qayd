@@ -48,7 +48,7 @@ fn is_instance(arg: &str) -> bool {
 }
 
 const USAGE: &str =
-    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--mem-limit MB] [--ls] [--split] [--probe N] [--lns N] [--no-learn-csp] [--semantic-branching] [--force-scope-reasons] [--shared-pool-cap N] [--core] [--linear-backend auto|native|amthal] [--lp-root-ms N] [--lp-max-vars N] [--lp-max-rows N] [--lp-max-nonzeros N] [--lp-min-coverage N] [--lp-phase-max-vars N] <instance.xml[.lzma|.xz]>";
+    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--mem-limit MB] [--ls] [--split] [--probe N] [--lns N] [--no-learn-csp] [--semantic-branching] [--force-scope-reasons] [--shared-pool-cap N] [--core] [--linear-backend auto|native|amthal] [--lp-root-ms N] [--lp-node-ms N] [--lp-node-depth N] [--lp-max-vars N] [--lp-max-rows N] [--lp-max-nonzeros N] [--lp-min-coverage N] [--lp-phase-max-vars N] <instance.xml[.lzma|.xz]>";
 
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
@@ -127,6 +127,13 @@ fn main() {
             "--linear-backend" => linear.backend = linear_backend(it.next().map(String::as_str)),
             "--lp-root-ms" => {
                 linear.root_time = Duration::from_millis(parse(it.next().map(String::as_str), "--lp-root-ms needs milliseconds"))
+            }
+            "--lp-node-ms" => {
+                linear.node_time =
+                    Duration::from_millis(parse(it.next().map(String::as_str), "--lp-node-ms needs non-negative milliseconds"))
+            }
+            "--lp-node-depth" => {
+                linear.node_depth_interval = positive(it.next().map(String::as_str), "--lp-node-depth needs a positive integer")
             }
             "--lp-max-vars" => linear.max_variables = positive(it.next().map(String::as_str), "--lp-max-vars needs a positive integer"),
             "--lp-max-rows" => linear.max_rows = positive(it.next().map(String::as_str), "--lp-max-rows needs a positive integer"),

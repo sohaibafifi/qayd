@@ -163,13 +163,17 @@ Common options:
 - `--ls`: search for good COP incumbents without proving optimality.
 - `--split`, `--probe N`, `--lns N`: optional parallel COP strategies.
 - `--core`: after an UNSAT result, print an exact source-constraint MUS.
-- `--linear-backend auto|native|amthal`: select the advisory root LP backend.
+- `--linear-backend auto|native|amthal`: select the optional LP backend.
 - `--lp-root-ms N`: cap the root relaxation wall-clock time.
+- `--lp-node-ms N`: cap each persistent in-search LP reoptimization; zero, the default, disables node LP while retaining the root bound.
+- `--lp-node-depth N`: set the minimum depth interval between in-search LP solves.
 - `--lp-max-vars`, `--lp-max-rows`, `--lp-max-nonzeros`: cap retained model size.
 - `--lp-min-coverage`, `--lp-phase-max-vars`: control eligibility and phase guidance; zero phase variables disables LP phase guidance.
 
 The Amthal backend is linked from the private sibling crate `../amthal` only by
-`--features lp-relaxation`. Without that feature, `auto` preserves the native
+`--features lp-relaxation`. Node relaxations retain one private simplex session
+per search worker, reuse a still-feasible primal, and turn a bound into pruning
+only after exact rational recertification. Without that feature, `auto` preserves the native
 path and an explicit `amthal` request returns a clear configuration error.
 
 ## Python Examples

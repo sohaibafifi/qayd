@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::engines::linear::SearchRelaxationTemplate;
 use crate::ids::VarId;
 use crate::lcg::clause::{ClauseSharing, SharedClausePool};
 use crate::lcg::guarded_sum::GuardedSum;
@@ -18,7 +19,7 @@ use crate::lns::{fix_neighborhood, LnsState};
 use crate::orchestrator::{execute_workers, execute_workers_silent, merge_search_stats, EventControl, WorkerContext};
 use crate::problem::{Objective, Problem};
 use crate::search::{
-    decide_sat_assuming_seeded_with_scope, decide_sat_shared_seeded, find_one_seeded_with_scope, optimize_seeded_with_scope,
+    decide_sat_assuming_seeded_with_scope, decide_sat_shared_seeded, find_one_seeded_with_scope, optimize_seeded_with_scope_and_relaxation,
     probe_seeded_with_scope, split_cube_seeded_with_scope, SharedObjectiveBound, SolveStats,
 };
 use crate::store::Solver;
@@ -54,6 +55,7 @@ pub(crate) struct SearchGuidance {
     pub initial_phase: Vec<Option<i32>>,
     pub branch_order: Vec<VarId>,
     pub primary_branch_scope: Option<Vec<VarId>>,
+    pub linear: Option<SearchRelaxationTemplate>,
 }
 
 impl SearchGuidance {
@@ -271,6 +273,7 @@ struct CopShared {
     clauses: Arc<SharedClausePool>,
     work: WorkQueue,
     minimizing: bool,
+    certified_bound: Option<i64>,
     probe_lower: AtomicI64,
     probe_upper: AtomicI64,
     probe_attempts: AtomicU64,
@@ -302,6 +305,10 @@ impl CopShared {
         *slot = Some((solution.to_vec(), value));
         drop(slot);
         context.publish_latest(Improvement { value, source, solution: self.publish_incumbents.then(|| solution.to_vec()) });
+        if reaches_certified_bound(value, self.certified_bound, self.minimizing) {
+            self.proved.store(true, Ordering::Release);
+            self.stop();
+        }
         true
     }
 
@@ -345,6 +352,10 @@ impl CopShared {
         }
         proved
     }
+}
+
+fn reaches_certified_bound(value: i64, bound: Option<i64>, minimizing: bool) -> bool {
+    bound.is_some_and(|bound| if minimizing { value <= bound } else { value >= bound })
 }
 
 fn run_probe_worker(
@@ -415,7 +426,7 @@ fn optimize_worker(
     let symbolic_snapshot = (!materialized).then(|| SharedObjectiveBound::new(shared.best.load()));
     let shared_bound = if materialized { Some(&shared.best) } else { symbolic_snapshot.as_ref() };
     let mut improved = false;
-    let (_, stats, complete) = optimize_seeded_with_scope(
+    let (_, stats, complete) = optimize_seeded_with_scope_and_relaxation(
         solver,
         vars,
         guidance.primary_branch_scope.as_deref(),
@@ -429,6 +440,7 @@ fn optimize_worker(
         conflict_budget,
         guidance.initial_phase.clone(),
         guidance.branch_order.clone(),
+        guidance.linear.clone(),
         |value, solution| improved |= shared.report_improvement(context, value, solution, source),
     );
     (stats, complete, improved)
@@ -516,7 +528,7 @@ fn optimize_worker_with_seed(
     let shared_bound = materialized.then_some(&shared.best);
     let mut improved = false;
     let search_objective = if bounded_objective_dive { objective.bounded_dive_search() } else { objective.search() };
-    let (_, stats, complete) = optimize_seeded_with_scope(
+    let (_, stats, complete) = optimize_seeded_with_scope_and_relaxation(
         solver,
         vars,
         guidance.primary_branch_scope.as_deref(),
@@ -530,6 +542,7 @@ fn optimize_worker_with_seed(
         conflict_budget,
         Vec::new(),
         Vec::new(),
+        guidance.linear.clone(),
         |value, solution| improved |= shared.report_improvement(context, value, solution, source),
     );
     (stats, complete, improved)
@@ -694,6 +707,7 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
     options: RunOptions,
     guidance: SearchGuidance,
     initial_incumbent: Option<InitialIncumbent>,
+    certified_bound: Option<i64>,
     publish_incumbents: bool,
     on_improvement: &mut dyn FnMut(i64, Option<&[i32]>),
 ) -> Result<ParallelOutcome, String> {
@@ -747,6 +761,7 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
         clauses: Arc::new(SharedClausePool::with_capacity(options.shared_pool_capacity)),
         work: WorkQueue::new(),
         minimizing,
+        certified_bound,
         probe_lower: AtomicI64::new(probe_lower),
         probe_upper: AtomicI64::new(probe_upper),
         probe_attempts: AtomicU64::new(0),
@@ -755,6 +770,18 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
         lns_improved: AtomicU64::new(0),
         publish_incumbents,
     });
+    if initial_value.is_some_and(|value| reaches_certified_bound(value, certified_bound, minimizing)) {
+        return Ok(ParallelOutcome {
+            best: shared.solution.lock().unwrap().clone(),
+            stats: SolveStats::default(),
+            proved: true,
+            shared_clauses: 0,
+            imported_clauses: 0,
+            split_jobs: options.split.then_some((0, 0)),
+            probe_stats: (options.probes > 0).then_some((0, 0)),
+            lns_stats: (options.lns > 0).then_some((0, 0)),
+        });
+    }
     let mut models = Vec::with_capacity(options.workers);
     models.push(problem);
     for _ in 1..options.workers {
@@ -864,7 +891,7 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
                     } else {
                         let mut solver = model.solver.clone();
                         let search_objective = model.objective.as_ref().expect("COP lost its objective").search();
-                        let (_, job_stats, complete) = optimize_seeded_with_scope(
+                        let (_, job_stats, complete) = optimize_seeded_with_scope_and_relaxation(
                             &mut solver,
                             vars,
                             guidance.primary_branch_scope.as_deref(),
@@ -878,6 +905,7 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
                             worker_conflict_quota(options.conflict_limit, context.worker(), regular_workers),
                             guidance.initial_phase.clone(),
                             guidance.branch_order.clone(),
+                            guidance.linear.clone(),
                             |value, solution| {
                                 shared.report_improvement(
                                     &context,

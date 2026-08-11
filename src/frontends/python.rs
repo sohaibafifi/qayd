@@ -411,6 +411,8 @@ struct PySolveStats {
     lp_micros: u64,
     #[pyo3(get)]
     lp_root_bound: Option<i64>,
+    #[pyo3(get)]
+    lp_node_prunes: u64,
 }
 
 /// Result of [`enumerate_mus`](PyModel::enumerate_mus): the minimal unsatisfiable
@@ -731,6 +733,7 @@ impl From<SearchStats> for PySolveStats {
             lp_refactorizations: stats.lp_refactorizations,
             lp_micros: stats.lp_micros,
             lp_root_bound: stats.lp_root_bound,
+            lp_node_prunes: stats.lp_node_prunes,
         }
     }
 }
@@ -960,18 +963,26 @@ fn parse_linear_backend(backend: &str) -> PyResult<LinearBackendMode> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn linear_controls(
     backend: &str,
     root_millis: u64,
+    node_millis: u64,
+    node_depth_interval: usize,
     max_variables: usize,
     max_rows: usize,
     max_nonzeros: usize,
     min_coverage_percent: usize,
     phase_max_variables: usize,
 ) -> PyResult<LinearControls> {
+    if node_depth_interval == 0 {
+        return Err(PyValueError::new_err("lp_node_depth_interval must be a positive integer"));
+    }
     Ok(LinearControls {
         backend: parse_linear_backend(backend)?,
         root_time: Duration::from_millis(root_millis),
+        node_time: Duration::from_millis(node_millis),
+        node_depth_interval,
         max_variables,
         max_rows,
         max_nonzeros,
@@ -1255,6 +1266,7 @@ fn verbose_finish(solution: &PySolution) {
         println!("  lp_root_bound: {}", solution.stats.lp_root_bound.map_or_else(|| "?".to_string(), |bound| bound.to_string()));
         println!("  lp_solves: {}", solution.stats.lp_solves);
         println!("  lp_certified: {}", solution.stats.lp_certified);
+        println!("  lp_node_prunes: {}", solution.stats.lp_node_prunes);
         println!("  lp_time_ms: {:.3}", solution.stats.lp_micros as f64 / 1000.0);
     }
 }
@@ -2230,7 +2242,7 @@ impl PySolveSession {
             .collect())
     }
 
-    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, conflict_budget=None, linear_backend="auto", lp_root_ms=50, lp_max_variables=2000, lp_max_rows=1000, lp_max_nonzeros=100000, lp_min_coverage_percent=1, lp_phase_max_variables=1000))]
+    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, conflict_budget=None, linear_backend="auto", lp_root_ms=50, lp_node_ms=0, lp_node_depth_interval=8, lp_max_variables=2000, lp_max_rows=1000, lp_max_nonzeros=100000, lp_min_coverage_percent=1, lp_phase_max_variables=1000))]
     #[allow(clippy::too_many_arguments)]
     fn solve(
         &mut self,
@@ -2246,6 +2258,8 @@ impl PySolveSession {
         conflict_budget: Option<u64>,
         linear_backend: &str,
         lp_root_ms: u64,
+        lp_node_ms: u64,
+        lp_node_depth_interval: usize,
         lp_max_variables: usize,
         lp_max_rows: usize,
         lp_max_nonzeros: usize,
@@ -2285,6 +2299,8 @@ impl PySolveSession {
             linear: linear_controls(
                 linear_backend,
                 lp_root_ms,
+                lp_node_ms,
+                lp_node_depth_interval,
                 lp_max_variables,
                 lp_max_rows,
                 lp_max_nonzeros,
@@ -3234,7 +3250,7 @@ impl PyModel {
         Ok(())
     }
 
-    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, threads=1, engine="auto", conflict_budget=None, list_hint=None, max_iterations=None, profile=false, memory_limit_mb=None, schedule_cdcl=false, routing_two_way=true, routing_nearest_neighbor=true, routing_warm_start=true, linear_backend="auto", lp_root_ms=50, lp_max_variables=2000, lp_max_rows=1000, lp_max_nonzeros=100000, lp_min_coverage_percent=1, lp_phase_max_variables=1000))]
+    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, threads=1, engine="auto", conflict_budget=None, list_hint=None, max_iterations=None, profile=false, memory_limit_mb=None, schedule_cdcl=false, routing_two_way=true, routing_nearest_neighbor=true, routing_warm_start=true, linear_backend="auto", lp_root_ms=50, lp_node_ms=0, lp_node_depth_interval=8, lp_max_variables=2000, lp_max_rows=1000, lp_max_nonzeros=100000, lp_min_coverage_percent=1, lp_phase_max_variables=1000))]
     #[allow(clippy::too_many_arguments)]
     fn solve(
         &self,
@@ -3260,6 +3276,8 @@ impl PyModel {
         routing_warm_start: bool,
         linear_backend: &str,
         lp_root_ms: u64,
+        lp_node_ms: u64,
+        lp_node_depth_interval: usize,
         lp_max_variables: usize,
         lp_max_rows: usize,
         lp_max_nonzeros: usize,
@@ -3327,6 +3345,8 @@ impl PyModel {
             linear: linear_controls(
                 linear_backend,
                 lp_root_ms,
+                lp_node_ms,
+                lp_node_depth_interval,
                 lp_max_variables,
                 lp_max_rows,
                 lp_max_nonzeros,

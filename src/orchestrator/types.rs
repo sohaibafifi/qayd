@@ -109,6 +109,8 @@ pub enum LinearBackendMode {
 pub struct LinearControls {
     pub backend: LinearBackendMode,
     pub root_time: Duration,
+    pub node_time: Duration,
+    pub node_depth_interval: usize,
     pub max_variables: usize,
     pub max_rows: usize,
     pub max_nonzeros: usize,
@@ -121,6 +123,8 @@ impl Default for LinearControls {
         Self {
             backend: LinearBackendMode::Auto,
             root_time: Duration::from_millis(50),
+            node_time: Duration::ZERO,
+            node_depth_interval: 8,
             max_variables: 2_000,
             max_rows: 1_000,
             max_nonzeros: 100_000,
@@ -275,6 +279,9 @@ impl SolveRequest {
         }
         if self.linear.max_variables == 0 || self.linear.max_rows == 0 || self.linear.max_nonzeros == 0 {
             return Err(SolveError::InvalidRequest("linear relaxation size limits must be positive".to_string()));
+        }
+        if self.linear.node_depth_interval == 0 {
+            return Err(SolveError::InvalidRequest("linear relaxation node depth interval must be positive".to_string()));
         }
         if self.linear.min_coverage_percent > 100 {
             return Err(SolveError::InvalidRequest("linear relaxation minimum coverage must be between 0 and 100 percent".to_string()));

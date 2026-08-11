@@ -24,6 +24,23 @@ fn two_variable_model(relation: Relation, rhs: i64, minimize: bool) -> ModelPack
 }
 
 #[cfg(feature = "lp-relaxation")]
+fn clique_vertex_cover(size: usize) -> ModelPackage {
+    let mut model = Model::new();
+    let vertices = (0..size).map(|_| model.bool_var()).collect::<Vec<_>>();
+    for left in 0..size {
+        for right in (left + 1)..size {
+            model.add_constraint(Constraint::Linear {
+                terms: vec![(1, vertices[left]), (1, vertices[right])],
+                relation: Relation::Ge,
+                rhs: 1,
+            });
+        }
+    }
+    model.add_objective(Objective::IntExpr { minimize: true, expr: IntExpr::Add(vertices.into_iter().map(IntExpr::Variable).collect()) });
+    ModelPackage::new(model)
+}
+
+#[cfg(feature = "lp-relaxation")]
 #[test]
 fn amthal_minimization_bound_is_recertified_and_rounded_for_integer_search() {
     let result = solve_model(&two_variable_model(Relation::Ge, 5, true), &request(LinearBackendMode::Amthal), &mut IgnoreEvents).unwrap();
@@ -93,6 +110,30 @@ fn selected_constraints_are_not_misrepresented_as_unconditional_rows() {
     let result = solve_model(&ModelPackage::new(model), &request(LinearBackendMode::Amthal), &mut IgnoreEvents).unwrap();
     assert_eq!(result.status(), SolveStatus::Optimal);
     assert_eq!(result.aggregate_search_stats().lp_rows, 0);
+}
+
+#[cfg(feature = "lp-relaxation")]
+#[test]
+fn persistent_node_relaxation_prunes_only_after_exact_recertification() {
+    let request = SolveRequest {
+        linear: LinearControls {
+            backend: LinearBackendMode::Amthal,
+            root_time: Duration::from_secs(1),
+            node_time: Duration::from_millis(20),
+            node_depth_interval: 1,
+            phase_max_variables: 0,
+            ..LinearControls::default()
+        },
+        ..SolveRequest::default()
+    };
+    let result = solve_model(&clique_vertex_cover(6), &request, &mut IgnoreEvents).unwrap();
+
+    assert_eq!(result.status(), SolveStatus::Optimal);
+    assert_eq!(result.primal().unwrap().objectives(), [5]);
+    let stats = result.aggregate_search_stats();
+    assert_eq!(stats.lp_root_bound, Some(3));
+    assert!(stats.lp_solves > 1, "the persistent node session never re-optimized");
+    assert!(stats.lp_node_prunes > 0, "no exactly certified node bound reached the incumbent");
 }
 
 #[cfg(not(feature = "lp-relaxation"))]

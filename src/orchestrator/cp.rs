@@ -247,7 +247,7 @@ fn compile_cp_plan_inner(
         integer_warm_start,
         estimated_backend_bytes: resident_bytes,
         mode: request.mode,
-        guidance: SearchGuidance { initial_phase, branch_order, primary_branch_scope },
+        guidance: SearchGuidance { initial_phase, branch_order, primary_branch_scope, linear: None },
         assumptions: request.assumptions.clone(),
         hints: request.hints.clone(),
         primary_branch_scope: request.primary_branch_scope.clone(),
@@ -637,6 +637,7 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
             linear_backends.insert(backend);
         }
         let mut tier_guidance = guidance.clone();
+        tier_guidance.linear = relaxation.search.clone();
         if tier_guidance.initial_phase.len() != tier_problem.solver.store.num_vars() {
             tier_guidance.initial_phase.resize(tier_problem.solver.store.num_vars(), None);
         }
@@ -659,7 +660,7 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
         }
         let progress_prefix = proven_prefix.clone();
         let mut event_error = None;
-        let outcome = {
+        let mut outcome = {
             let mut progress = |objective, assignment: Option<&[i32]>| {
                 if event_error.is_some() {
                     return;
@@ -728,6 +729,7 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
                     options,
                     tier_guidance,
                     initial_incumbent.take(),
+                    relaxation.bound,
                     request.publish_incumbent_assignments,
                     &mut progress,
                 )
@@ -736,6 +738,10 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
         };
         if let Some(error) = event_error {
             return Err(error);
+        }
+        if let (Some((_, value)), Some(bound)) = (&outcome.best, relaxation.bound) {
+            let reaches_bound = if objective.minimizing() { *value <= bound } else { *value >= bound };
+            outcome.proved |= reaches_bound;
         }
 
         merge_search_stats(&mut total_stats, relaxation.stats);

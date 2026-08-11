@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
+use crate::engines::linear::{SearchCheck, SearchRelaxation};
 use crate::expr::Expr;
 use crate::ids::{PropId, VarId};
 use crate::lcg::guarded_sum::GuardedSum;
@@ -916,6 +917,7 @@ impl Cdcl<'_> {
         shared_bound: Option<&SharedObjectiveBound>,
         cube: &[Lit],
         conflict_budget: Option<u64>,
+        relaxation: Option<&mut SearchRelaxation>,
         mut on_improve: F,
     ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
         self.optimize_with_mode(
@@ -927,6 +929,7 @@ impl Cdcl<'_> {
             shared_bound,
             cube,
             conflict_budget,
+            relaxation,
             &mut on_improve,
         )
     }
@@ -942,6 +945,7 @@ impl Cdcl<'_> {
         shared_bound: Option<&SharedObjectiveBound>,
         cube: &[Lit],
         conflict_budget: Option<u64>,
+        mut relaxation: Option<&mut SearchRelaxation>,
         on_improve: &mut F,
     ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
         if let Objective::VarWithAffine { coeffs, vars, .. }
@@ -1064,6 +1068,23 @@ impl Cdcl<'_> {
                     complete = false;
                 }
                 break;
+            }
+            if let Some(relaxation) = relaxation.as_deref_mut() {
+                match relaxation.check(&self.solver.store, enforced) {
+                    SearchCheck::Continue => {}
+                    SearchCheck::Prune(premises) => {
+                        if let Some(keep_searching) = self.resolve_premise_conflict(&premises) {
+                            relaxation.record_prune();
+                            if !keep_searching {
+                                if self.conflict_budget_exhausted() {
+                                    complete = false;
+                                }
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
             }
             if guarded_hint_restart.is_some_and(|restart| restart != self.restarts_done) {
                 guarded_hint_restart = None;

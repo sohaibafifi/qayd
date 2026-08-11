@@ -1,4 +1,4 @@
-//! Backend-neutral advisory linear relaxation.
+//! Backend-neutral linear relaxation for root guidance and exact search pruning.
 //!
 //! A backend may suggest primal values and row multipliers in floating point.
 //! Primal values are only search guidance. A bound is exposed only after qayd
@@ -24,6 +24,41 @@ pub(crate) struct RootRelaxation {
     pub(crate) bound: Option<i64>,
     pub(crate) backend: Option<&'static str>,
     pub(crate) stats: SolveStats,
+    pub(crate) search: Option<SearchRelaxationTemplate>,
+}
+
+#[cfg(not(feature = "lp-relaxation"))]
+#[derive(Clone)]
+pub(crate) struct SearchRelaxationTemplate;
+
+#[cfg(not(feature = "lp-relaxation"))]
+pub(crate) struct SearchRelaxation;
+
+#[cfg(not(feature = "lp-relaxation"))]
+#[allow(dead_code)]
+pub(crate) enum SearchCheck {
+    Continue,
+    Prune(Vec<crate::store::Premise>),
+}
+
+#[cfg(not(feature = "lp-relaxation"))]
+impl SearchRelaxationTemplate {
+    pub(crate) fn start(&self) -> SearchRelaxation {
+        SearchRelaxation
+    }
+}
+
+#[cfg(not(feature = "lp-relaxation"))]
+impl SearchRelaxation {
+    pub(crate) fn check(&mut self, _store: &crate::store::Store, _incumbent: Option<i64>) -> SearchCheck {
+        SearchCheck::Continue
+    }
+
+    pub(crate) fn record_prune(&mut self) {}
+
+    pub(crate) fn stats(&self) -> SolveStats {
+        SolveStats::default()
+    }
 }
 
 #[cfg(not(feature = "lp-relaxation"))]
@@ -42,18 +77,19 @@ pub(crate) fn solve_root(
 mod enabled {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use amthal::{DualSolver, LpForm, LpSolver, LpStatus, Model, Sense};
+    use amthal::{DualSolver, LpForm, LpSession, LpSolver, LpStatus, Model, Sense};
     use num_bigint::BigInt;
     use num_rational::BigRational;
-    use num_traits::{Signed, ToPrimitive};
+    use num_traits::{Signed, ToPrimitive, Zero};
 
     use super::RootRelaxation;
     use crate::ids::VarId;
     use crate::orchestrator::{LinearBackendMode, LinearControls};
     use crate::search::{Objective, SolveStats};
-    use crate::store::Solver;
+    use crate::store::{Premise, Solver, Store};
 
     const MAX_EXACT_F64_INTEGER: u64 = 1u64 << 53;
 
@@ -71,6 +107,40 @@ mod enabled {
         objective: Vec<i128>,
         rows: Vec<LinearRow>,
         bounds: Vec<(i32, i32)>,
+    }
+
+    #[derive(Clone)]
+    struct CertifiedLpBound {
+        value: BigInt,
+        premises: Vec<Premise>,
+    }
+
+    #[derive(Clone)]
+    pub(crate) struct SearchRelaxationTemplate {
+        model: Arc<LinearModel>,
+        form: Arc<LpForm>,
+        minimizing: bool,
+        root_primal: Arc<[f64]>,
+        root_certificate: Option<CertifiedLpBound>,
+        node_time: Duration,
+        depth_interval: usize,
+    }
+
+    pub(crate) struct SearchRelaxation {
+        template: SearchRelaxationTemplate,
+        session: LpSession,
+        solved_bounds: Vec<(i32, i32)>,
+        primal: Vec<f64>,
+        certificate: Option<CertifiedLpBound>,
+        next_depth: usize,
+        last_attempt_depth: usize,
+        refactorizations: usize,
+        stats: SolveStats,
+    }
+
+    pub(crate) enum SearchCheck {
+        Continue,
+        Prune(Vec<Premise>),
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -104,23 +174,7 @@ mod enabled {
             if time_limit.is_zero() || stop.load(Ordering::Acquire) {
                 return None;
             }
-            let mut source = Model::new(Sense::Minimize);
-            source.add_obj_offset(model.objective_constant as f64);
-            let variables: Vec<_> = model
-                .bounds
-                .iter()
-                .zip(&model.objective)
-                .map(|(&(lower, upper), &coefficient)| source.add_continuous(f64::from(lower), f64::from(upper), coefficient as f64))
-                .collect();
-            for row in &model.rows {
-                let terms: Vec<_> = row.terms.iter().map(|&(index, coefficient)| (variables[index], coefficient as f64)).collect();
-                source.add_constraint(
-                    row.lower.map_or(f64::NEG_INFINITY, |bound| bound as f64),
-                    row.upper.map_or(f64::INFINITY, |bound| bound as f64),
-                    &terms,
-                );
-            }
-            let form = LpForm::from_model(&source);
+            let form = amthal_form(model);
             let mut solver = DualSolver { deadline: Some(Instant::now() + time_limit), ..DualSolver::default() };
             let solution = solver.solve(&form, None);
             let status = match solution.status {
@@ -130,6 +184,26 @@ mod enabled {
             };
             Some(LinearSolution { status, primal: solution.x, row_duals: solution.duals, refactorizations: 0 })
         }
+    }
+
+    fn amthal_form(model: &LinearModel) -> LpForm {
+        let mut source = Model::new(Sense::Minimize);
+        source.add_obj_offset(model.objective_constant as f64);
+        let variables: Vec<_> = model
+            .bounds
+            .iter()
+            .zip(&model.objective)
+            .map(|(&(lower, upper), &coefficient)| source.add_continuous(f64::from(lower), f64::from(upper), coefficient as f64))
+            .collect();
+        for row in &model.rows {
+            let terms: Vec<_> = row.terms.iter().map(|&(index, coefficient)| (variables[index], coefficient as f64)).collect();
+            source.add_constraint(
+                row.lower.map_or(f64::NEG_INFINITY, |bound| bound as f64),
+                row.upper.map_or(f64::INFINITY, |bound| bound as f64),
+                &terms,
+            );
+        }
+        LpForm::from_model(&source)
     }
 
     impl LinearModel {
@@ -201,8 +275,8 @@ mod enabled {
             Some(Self { objective_constant, objective: objective_coefficients, rows, bounds })
         }
 
-        fn certify(&self, row_duals: &[f64]) -> Option<i64> {
-            if row_duals.len() != self.rows.len() {
+        fn certify(&self, row_duals: &[f64], bounds: &[(i32, i32)]) -> Option<CertifiedLpBound> {
+            if row_duals.len() != self.rows.len() || bounds.len() != self.objective.len() {
                 return None;
             }
             // Amthal solves [A | -I] z = 0. For every finite multiplier y,
@@ -226,11 +300,20 @@ mod enabled {
                     residual[index] -= &multiplier * BigInt::from(coefficient);
                 }
             }
-            for (coefficient, &(lower, upper)) in residual.into_iter().zip(&self.bounds) {
+            let mut premises = Vec::new();
+            for (index, (coefficient, &(lower, upper))) in residual.into_iter().zip(bounds).enumerate() {
                 let endpoint = if coefficient.is_negative() { upper } else { lower };
+                if !coefficient.is_zero() {
+                    let variable = VarId(u32::try_from(index).ok()?);
+                    premises.push(if coefficient.is_negative() {
+                        Premise::Le { var: variable, bound: upper }
+                    } else {
+                        Premise::Ge { var: variable, bound: lower }
+                    });
+                }
                 bound += coefficient * BigInt::from(endpoint);
             }
-            Some(clamp_bigint(&bound.ceil().to_integer()))
+            Some(CertifiedLpBound { value: bound.ceil().to_integer(), premises })
         }
     }
 
@@ -282,6 +365,156 @@ mod enabled {
         phase
     }
 
+    impl SearchRelaxationTemplate {
+        fn new(
+            model: Arc<LinearModel>,
+            minimizing: bool,
+            primal: Vec<f64>,
+            certificate: Option<CertifiedLpBound>,
+            controls: LinearControls,
+        ) -> Self {
+            let form = Arc::new(amthal_form(&model));
+            Self {
+                model,
+                form,
+                minimizing,
+                root_primal: Arc::from(primal),
+                root_certificate: certificate,
+                node_time: controls.node_time,
+                depth_interval: controls.node_depth_interval.max(1),
+            }
+        }
+
+        pub(crate) fn start(&self) -> SearchRelaxation {
+            SearchRelaxation {
+                template: self.clone(),
+                session: LpSession::new((*self.form).clone()),
+                solved_bounds: self.model.bounds.clone(),
+                primal: self.root_primal.to_vec(),
+                certificate: self.root_certificate.clone(),
+                next_depth: self.depth_interval,
+                last_attempt_depth: 0,
+                refactorizations: 0,
+                stats: SolveStats::default(),
+            }
+        }
+    }
+
+    impl SearchRelaxation {
+        pub(crate) fn check(&mut self, store: &Store, incumbent: Option<i64>) -> SearchCheck {
+            let Some(incumbent) = incumbent else {
+                return SearchCheck::Continue;
+            };
+            if let Some(certificate) = self.active_certificate(store) {
+                if closes_incumbent(&certificate.value, incumbent, self.template.minimizing) {
+                    return SearchCheck::Prune(certificate.premises.clone());
+                }
+            }
+            let level = store.level();
+            if level == 0 || self.template.node_time.is_zero() {
+                return SearchCheck::Continue;
+            }
+            let current = store_bounds(store);
+            let only_tightened = current
+                .iter()
+                .zip(&self.solved_bounds)
+                .all(|(&(lower, upper), &(solved_lower, solved_upper))| lower >= solved_lower && upper <= solved_upper);
+            if only_tightened && primal_within(&self.primal, &current) {
+                return SearchCheck::Continue;
+            }
+            if level < self.last_attempt_depth {
+                self.next_depth = next_scheduled_depth(level, self.template.depth_interval);
+            }
+            if level < self.next_depth {
+                return SearchCheck::Continue;
+            }
+
+            for (index, &(lower, upper)) in current.iter().enumerate() {
+                self.session.set_bounds(index, f64::from(lower), f64::from(upper));
+            }
+            self.session.deadline = Some(Instant::now() + self.template.node_time);
+            let started = Instant::now();
+            let solution = self.session.solve();
+            self.stats.lp_solves = self.stats.lp_solves.saturating_add(1);
+            self.stats.lp_micros = self.stats.lp_micros.saturating_add(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+            self.stats.lp_timeouts = self.stats.lp_timeouts.saturating_add(u64::from(solution.status == LpStatus::TimeLimit));
+            let refactorizations = self.session.refactorizations();
+            self.stats.lp_refactorizations = self
+                .stats
+                .lp_refactorizations
+                .saturating_add(u64::try_from(refactorizations.saturating_sub(self.refactorizations)).unwrap_or(u64::MAX));
+            self.refactorizations = refactorizations;
+            self.solved_bounds = current;
+            self.last_attempt_depth = level;
+            self.next_depth = level.saturating_add(self.template.depth_interval);
+
+            if solution.status != LpStatus::Optimal {
+                self.primal.clear();
+                self.certificate = self.template.root_certificate.clone();
+                return SearchCheck::Continue;
+            }
+            self.primal = solution.x;
+            self.certificate = self.template.model.certify(&solution.duals, &self.solved_bounds);
+            self.stats.lp_certified = self.stats.lp_certified.saturating_add(u64::from(self.certificate.is_some()));
+            match self.active_certificate(store) {
+                Some(certificate) if closes_incumbent(&certificate.value, incumbent, self.template.minimizing) => {
+                    SearchCheck::Prune(certificate.premises.clone())
+                }
+                Some(_) | None => SearchCheck::Continue,
+            }
+        }
+
+        fn active_certificate(&self, store: &Store) -> Option<&CertifiedLpBound> {
+            self.certificate
+                .as_ref()
+                .filter(|certificate| premises_hold(store, &certificate.premises))
+                .or_else(|| self.template.root_certificate.as_ref().filter(|certificate| premises_hold(store, &certificate.premises)))
+        }
+
+        pub(crate) fn record_prune(&mut self) {
+            self.stats.lp_node_prunes = self.stats.lp_node_prunes.saturating_add(1);
+        }
+
+        pub(crate) fn stats(&self) -> SolveStats {
+            self.stats
+        }
+    }
+
+    fn store_bounds(store: &Store) -> Vec<(i32, i32)> {
+        (0..store.num_vars())
+            .map(|index| {
+                let variable = VarId(u32::try_from(index).expect("store variable count exceeds VarId"));
+                (store.min(variable), store.max(variable))
+            })
+            .collect()
+    }
+
+    fn primal_within(primal: &[f64], bounds: &[(i32, i32)]) -> bool {
+        primal.len() == bounds.len()
+            && primal
+                .iter()
+                .zip(bounds)
+                .all(|(&value, &(lower, upper))| value.is_finite() && value >= f64::from(lower) - 1e-7 && value <= f64::from(upper) + 1e-7)
+    }
+
+    fn premises_hold(store: &Store, premises: &[Premise]) -> bool {
+        premises.iter().all(|premise| match *premise {
+            Premise::Ge { var, bound } => store.min(var) >= bound,
+            Premise::Le { var, bound } => store.max(var) <= bound,
+            Premise::Eq { var, val } => store.is_fixed(var) && store.value(var) == val,
+            Premise::Ne { var, val } => !store.contains(var, val),
+        })
+    }
+
+    fn closes_incumbent(normalized_bound: &BigInt, incumbent: i64, minimizing: bool) -> bool {
+        let incumbent = BigInt::from(incumbent);
+        normalized_bound >= &if minimizing { incumbent } else { -incumbent }
+    }
+
+    fn next_scheduled_depth(level: usize, interval: usize) -> usize {
+        level.saturating_div(interval).saturating_add(1).saturating_mul(interval)
+    }
+
     pub(crate) fn solve_root(
         solver: &Solver,
         search: &[VarId],
@@ -296,6 +529,7 @@ mod enabled {
         let Some(model) = LinearModel::build(solver, objective, minimizing, controls, stop) else {
             return RootRelaxation::default();
         };
+        let model = Arc::new(model);
         let backend: Box<dyn LinearBackend> = match controls.backend {
             LinearBackendMode::Auto | LinearBackendMode::Amthal => Box::new(AmthalBackend),
             LinearBackendMode::Native => return RootRelaxation::default(),
@@ -310,16 +544,23 @@ mod enabled {
         stats.lp_micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         stats.lp_timeouts = u64::from(solution.status == LinearStatus::TimeLimit);
         if solution.status != LinearStatus::Optimal || stop.load(Ordering::Acquire) {
-            return RootRelaxation { backend: Some(backend.name()), stats, ..RootRelaxation::default() };
+            let search = (!controls.node_time.is_zero())
+                .then(|| SearchRelaxationTemplate::new(Arc::clone(&model), minimizing, Vec::new(), None, controls));
+            return RootRelaxation { backend: Some(backend.name()), stats, search, ..RootRelaxation::default() };
         }
-        let normalized_bound = model.certify(&solution.row_duals);
-        let bound = normalized_bound.map(|value| if minimizing { value } else { value.saturating_neg() });
+        let certificate = model.certify(&solution.row_duals, &model.bounds);
+        let bound = certificate.as_ref().map(|certificate| {
+            let normalized = if minimizing { certificate.value.clone() } else { -certificate.value.clone() };
+            clamp_bigint(&normalized)
+        });
         stats.lp_certified = u64::from(bound.is_some());
         stats.lp_root_bound = bound;
         let phase = phase_from_primal(solver, search, &solution.primal, controls.phase_max_variables, stop);
-        RootRelaxation { phase, bound, backend: Some(backend.name()), stats }
+        let search = (!controls.node_time.is_zero())
+            .then(|| SearchRelaxationTemplate::new(Arc::clone(&model), minimizing, solution.primal.clone(), certificate, controls));
+        RootRelaxation { phase, bound, backend: Some(backend.name()), stats, search }
     }
 }
 
 #[cfg(feature = "lp-relaxation")]
-pub(crate) use enabled::solve_root;
+pub(crate) use enabled::{solve_root, SearchCheck, SearchRelaxation, SearchRelaxationTemplate};

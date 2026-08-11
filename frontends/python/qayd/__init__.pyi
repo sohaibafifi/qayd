@@ -556,6 +556,8 @@ class SolveStats:
     def lp_micros(self) -> int: ...
     @property
     def lp_root_bound(self) -> Optional[int]: ...
+    @property
+    def lp_node_prunes(self) -> int: ...
     def __repr__(self) -> str: ...
 
 
@@ -676,6 +678,8 @@ class SolveSession:
         conflict_budget: Optional[int] = ...,
         linear_backend: str = ...,
         lp_root_ms: int = ...,
+        lp_node_ms: int = ...,
+        lp_node_depth_interval: int = ...,
         lp_max_variables: int = ...,
         lp_max_rows: int = ...,
         lp_max_nonzeros: int = ...,
@@ -872,6 +876,8 @@ class Model:
         routing_warm_start: bool = ...,
         linear_backend: str = ...,
         lp_root_ms: int = ...,
+        lp_node_ms: int = ...,
+        lp_node_depth_interval: int = ...,
         lp_max_variables: int = ...,
         lp_max_rows: int = ...,
         lp_max_nonzeros: int = ...,

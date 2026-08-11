@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
 use crate::domains::interval::IntervalPresence;
+use crate::engines::linear::{SearchRelaxation, SearchRelaxationTemplate};
 use crate::expr::Expr;
 use crate::ids::{IntervalId, ListId, VarId};
 use crate::lcg::clause::ClauseSharing;
@@ -96,6 +97,8 @@ pub struct SolveStats {
     pub lp_micros: u64,
     /// Certified root bound in the user's objective direction.
     pub lp_root_bound: Option<i64>,
+    /// Search nodes cut by an exactly recertified LP bound.
+    pub lp_node_prunes: u64,
 }
 
 /// A Boolean literal over an integer variable encoded as `{0, 1}` or `{-1, 1}`.
@@ -988,6 +991,43 @@ pub(crate) fn optimize_seeded_with_scope(
     branch_order: Vec<VarId>,
     on_improve: impl FnMut(i64, &[i32]),
 ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
+    optimize_seeded_with_scope_and_relaxation(
+        solver,
+        vars,
+        primary_branch_scope,
+        objective,
+        minimizing,
+        stop,
+        seed,
+        shared_bound,
+        clause_sharing,
+        cube,
+        conflict_budget,
+        initial_phase,
+        branch_order,
+        None,
+        on_improve,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn optimize_seeded_with_scope_and_relaxation(
+    solver: &mut Solver,
+    vars: &[VarId],
+    primary_branch_scope: Option<&[VarId]>,
+    objective: Objective<'_>,
+    minimizing: bool,
+    stop: &AtomicBool,
+    seed: u64,
+    shared_bound: Option<&SharedObjectiveBound>,
+    clause_sharing: Option<ClauseSharing>,
+    cube: &[Lit],
+    conflict_budget: Option<u64>,
+    initial_phase: Vec<Option<i32>>,
+    branch_order: Vec<VarId>,
+    relaxation: Option<SearchRelaxationTemplate>,
+    on_improve: impl FnMut(i64, &[i32]),
+) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
     let lazy_atoms = clause_sharing.as_ref().map(ClauseSharing::lazy_atoms);
     let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, lazy_atoms) else {
         return (None, SolveStats::default(), false);
@@ -997,7 +1037,32 @@ pub(crate) fn optimize_seeded_with_scope(
     }
     cdcl.initial_phase = initial_phase;
     cdcl.branch_order = branch_order;
-    cdcl.optimize(vars, primary_branch_scope, objective, minimizing, stop, shared_bound, cube, conflict_budget, on_improve)
+    let mut relaxation: Option<SearchRelaxation> = relaxation.map(|template| template.start());
+    let mut result = cdcl.optimize(
+        vars,
+        primary_branch_scope,
+        objective,
+        minimizing,
+        stop,
+        shared_bound,
+        cube,
+        conflict_budget,
+        relaxation.as_mut(),
+        on_improve,
+    );
+    if let Some(relaxation) = relaxation {
+        merge_lp_stats(&mut result.1, relaxation.stats());
+    }
+    result
+}
+
+fn merge_lp_stats(total: &mut SolveStats, part: SolveStats) {
+    total.lp_solves = total.lp_solves.saturating_add(part.lp_solves);
+    total.lp_certified = total.lp_certified.saturating_add(part.lp_certified);
+    total.lp_timeouts = total.lp_timeouts.saturating_add(part.lp_timeouts);
+    total.lp_refactorizations = total.lp_refactorizations.saturating_add(part.lp_refactorizations);
+    total.lp_micros = total.lp_micros.saturating_add(part.lp_micros);
+    total.lp_node_prunes = total.lp_node_prunes.saturating_add(part.lp_node_prunes);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1065,7 +1130,7 @@ pub(crate) fn optimize_assuming_seeded_with_scope(
     }
     cdcl.initial_phase = initial_phase;
     cdcl.branch_order = branch_order;
-    cdcl.optimize(vars, primary_branch_scope, objective, minimizing, stop, shared_bound, &cube, conflict_budget, on_improve)
+    cdcl.optimize(vars, primary_branch_scope, objective, minimizing, stop, shared_bound, &cube, conflict_budget, None, on_improve)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -1187,6 +1187,21 @@ impl<'s> Cdcl<'s> {
         }
     }
 
+    /// Inject an externally certified conflict expressed in current domain
+    /// facts. Returns `None` when a premise has no existing atom, in which case
+    /// the caller must conservatively ignore the certificate.
+    pub(crate) fn resolve_premise_conflict(&mut self, premises: &[Premise]) -> Option<bool> {
+        let antecedents = translate_premises(&self.atoms, premises)?;
+        if self.conflict_budget_reached() {
+            self.conflict_limit_reached = true;
+            return Some(false);
+        }
+        if !self.resolve_conflict(Conflict::Generic(antecedents)) {
+            return Some(false);
+        }
+        Some(self.propagate_and_learn())
+    }
+
     /// Preserve the original branch-free conflict loop for the overwhelmingly
     /// common unbounded search path. Bounded workers retain the strict check in
     /// `propagate_and_learn` before resolving each conflict.

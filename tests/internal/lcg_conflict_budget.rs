@@ -8,7 +8,7 @@ use crate::expr::Expr;
 use crate::model::{BoolLiteral, CompiledCp, Constraint, Model};
 use crate::orchestrator::{compile_cp_plan, solve_cp_plan, IgnoreEvents, SolveBudget, SolveLimits, SolveRequest, SolveStatus};
 use crate::problem::{Objective as PhysicalObjective, Problem};
-use crate::search::Objective as SearchObjective;
+use crate::search::{Objective as SearchObjective, SolveStats};
 use crate::Solver;
 
 fn pigeonhole(pigeons: usize, holes: usize) -> Model {
@@ -180,6 +180,7 @@ fn materialized_affine_objective_starts_with_the_complete_pass() {
         RunOptions::default(),
         SearchGuidance::default(),
         None,
+        None,
         true,
         &mut |_, _| {},
     )
@@ -205,6 +206,7 @@ fn exhaustive_bounded_dive_can_publish_and_prove() {
         RunOptions::default(),
         SearchGuidance::default(),
         None,
+        None,
         false,
         &mut |value, _| incumbents.push(value),
     )
@@ -228,6 +230,7 @@ fn small_symbolic_cop_keeps_the_single_exact_trajectory() {
         &mut output,
         RunOptions::default(),
         SearchGuidance::default(),
+        None,
         None,
         false,
         &mut |_, _| {},
@@ -253,6 +256,7 @@ fn interruption_after_a_bounded_dive_incumbent_keeps_the_incumbent() {
         &mut output,
         RunOptions::default(),
         SearchGuidance::default(),
+        None,
         None,
         false,
         &mut |_, _| {
@@ -281,6 +285,7 @@ fn verified_symbolic_incumbent_is_imported_as_a_strict_cutoff() {
         RunOptions::default(),
         SearchGuidance::default(),
         Some(initial),
+        None,
         true,
         &mut |_, _| publications += 1,
     )
@@ -309,6 +314,7 @@ fn verified_materialized_incumbent_is_imported_as_a_strict_cutoff() {
         RunOptions::default(),
         SearchGuidance::default(),
         Some(initial),
+        None,
         true,
         &mut |_, _| publications += 1,
     )
@@ -322,6 +328,31 @@ fn verified_materialized_incumbent_is_imported_as_a_strict_cutoff() {
 }
 
 #[test]
+fn certified_root_bound_closes_a_verified_initial_incumbent_without_search() {
+    let variable_count = 64;
+    let mut solution = vec![1; variable_count];
+    solution.push(variable_count as i32);
+    let initial = InitialIncumbent { solution: solution.clone(), value: variable_count as i64 };
+    let outcome = solve_cop_with_progress(
+        materialized_sum_problem(variable_count),
+        false,
+        &AtomicBool::new(false),
+        &mut Vec::new(),
+        RunOptions::default(),
+        SearchGuidance::default(),
+        Some(initial),
+        Some(variable_count as i64),
+        false,
+        &mut |_, _| {},
+    )
+    .unwrap();
+
+    assert!(outcome.proved);
+    assert_eq!(outcome.best, Some((solution, variable_count as i64)));
+    assert_eq!(outcome.stats, SolveStats::default());
+}
+
+#[test]
 fn malformed_initial_incumbent_is_rejected() {
     let result = solve_cop_with_progress(
         symbolic_sum_problem(8),
@@ -331,6 +362,7 @@ fn malformed_initial_incumbent_is_rejected() {
         RunOptions::default(),
         SearchGuidance::default(),
         Some(InitialIncumbent { solution: vec![0; 7], value: 0 }),
+        None,
         false,
         &mut |_, _| {},
     );
@@ -353,6 +385,7 @@ fn pre_cancelled_portfolio_preserves_the_verified_incumbent() {
         RunOptions::default(),
         SearchGuidance::default(),
         Some(InitialIncumbent { solution: vec![1; variable_count], value: variable_count as i64 }),
+        None,
         false,
         &mut |_, _| {},
     )
