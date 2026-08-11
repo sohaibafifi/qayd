@@ -166,7 +166,7 @@ Common options:
 - `--linear-backend auto|native|amthal`: select the advisory root LP backend.
 - `--lp-root-ms N`: cap the root relaxation wall-clock time.
 - `--lp-max-vars`, `--lp-max-rows`, `--lp-max-nonzeros`: cap retained model size.
-- `--lp-min-coverage`, `--lp-phase-max-vars`: control eligibility and phase guidance.
+- `--lp-min-coverage`, `--lp-phase-max-vars`: control eligibility and phase guidance; zero phase variables disables LP phase guidance.
 
 The Amthal backend is linked from the private sibling crate `../amthal` only by
 `--features lp-relaxation`. Without that feature, `auto` preserves the native

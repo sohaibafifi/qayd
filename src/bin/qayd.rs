@@ -137,7 +137,7 @@ fn main() {
                 linear.min_coverage_percent = parse(it.next().map(String::as_str), "--lp-min-coverage needs a percentage")
             }
             "--lp-phase-max-vars" => {
-                linear.phase_max_variables = positive(it.next().map(String::as_str), "--lp-phase-max-vars needs a positive integer")
+                linear.phase_max_variables = parse(it.next().map(String::as_str), "--lp-phase-max-vars needs a non-negative integer")
             }
             other if other.starts_with('-') => {
                 eprintln!("unknown option {other}");

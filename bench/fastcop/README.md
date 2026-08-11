@@ -121,6 +121,40 @@ python3 bench/fastcop/run.py \
   --output bench/fastcop/results/fortress-qayd.jsonl
 ```
 
+## Root LP ablation
+
+The LP contribution is measured with three variants of the same release binary:
+`qayd-native` disables the optional root relaxation,
+`qayd-amthal-bound-only` computes the certified dual bound without primal phase
+guidance, and `qayd-amthal` enables both with a 50 ms root budget. This separates
+bound quality and overhead from the search-phase effect. Build the instrumented
+binary once, then run a paired campaign with solver-order rotation:
+
+```bash
+cargo build --release --features lp-relaxation --bin qayd
+python3 bench/fastcop/run.py \
+  --solvers bench/fastcop/solvers.lp-ablation.v1.json \
+  --solver qayd-native \
+  --solver qayd-amthal-bound-only \
+  --solver qayd-amthal \
+  --interleave-solvers \
+  --per-family 1 \
+  --cpu-limit 30 \
+  --wall-limit 45 \
+  --memory-mb 8192 \
+  --jobs 1 \
+  --output bench/fastcop/results/lp-ablation-30s/results.jsonl
+python3 bench/fastcop/lp_ablation.py \
+  bench/fastcop/results/lp-ablation-30s/results.jsonl \
+  --output bench/fastcop/results/lp-ablation-30s/report.md \
+  --json bench/fastcop/results/lp-ablation-30s/summary.json
+```
+
+The report compares only checker-accepted incumbents. It also extracts root
+bound coverage, certification rate, LP time, proof counts, incumbent timing,
+searched nodes and family-level wins from the verbose logs. Use `--jobs 1` for
+publishable timing. Parallel jobs remain useful for a quick diagnostic run.
+
 `run.py` writes every `o` event and its arrival time, first and best incumbent,
 status and proof claim, return code, timeout path, peak RSS when available,
 full structured command, solver/checker/instance hashes, seed, host, Git

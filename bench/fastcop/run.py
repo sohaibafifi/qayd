@@ -1771,6 +1771,28 @@ def select_instances(
     return instances
 
 
+def ordered_solver_instances(
+    solver_names: Sequence[str],
+    instances: Sequence[dict[str, Any]],
+    *,
+    interleave: bool,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Build a deterministic run order, optionally balancing paired A/B runs."""
+    if not interleave:
+        return [
+            (solver_name, item)
+            for solver_name in solver_names
+            for item in instances
+        ]
+
+    ordered = []
+    for index, item in enumerate(instances):
+        offset = index % len(solver_names)
+        rotated = [*solver_names[offset:], *solver_names[:offset]]
+        ordered.extend((solver_name, item) for solver_name in rotated)
+    return ordered
+
+
 def ordered_run_results(
     tasks: Sequence[RunTask],
     completed_keys: set[str],
@@ -1949,6 +1971,11 @@ def main() -> int:
         default=1,
         help="number of solver runs executed concurrently (memory limit is per run)",
     )
+    parser.add_argument(
+        "--interleave-solvers",
+        action="store_true",
+        help="interleave solver variants by instance and rotate their order",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--grace", type=nonnegative_float, default=1.0)
     parser.add_argument("--checker-timeout", type=positive_float, default=120.0)
@@ -2094,36 +2121,39 @@ def main() -> int:
         total = len(solver_names) * len(instances)
         skipped = 0
         tasks = []
-        for solver_name in solver_names:
+        for solver_name, item in ordered_solver_instances(
+            solver_names,
+            instances,
+            interleave=args.interleave_solvers,
+        ):
             solver = configured[solver_name]
-            for item in instances:
-                position = len(tasks) + 1
-                identity, _artifact, _checker_artifact = planned_execution_identity(
-                    solver_name,
-                    solver,
-                    solver_path,
-                    checker,
-                    item,
-                    args.cpu_limit,
-                    args.wall_limit,
-                    args.memory_mb,
-                    checker_memory_mb,
-                    args.seed,
-                    args.grace,
-                    args.jobs,
-                    execution_hash,
+            position = len(tasks) + 1
+            identity, _artifact, _checker_artifact = planned_execution_identity(
+                solver_name,
+                solver,
+                solver_path,
+                checker,
+                item,
+                args.cpu_limit,
+                args.wall_limit,
+                args.memory_mb,
+                checker_memory_mb,
+                args.seed,
+                args.grace,
+                args.jobs,
+                execution_hash,
+            )
+            key = identity_key(identity)
+            tasks.append(
+                RunTask(
+                    position=position,
+                    solver_name=solver_name,
+                    solver=solver,
+                    instance_item=item,
+                    run_key=key,
+                    execution_identity=identity,
                 )
-                key = identity_key(identity)
-                tasks.append(
-                    RunTask(
-                        position=position,
-                        solver_name=solver_name,
-                        solver=solver,
-                        instance_item=item,
-                        run_key=key,
-                        execution_identity=identity,
-                    )
-                )
+            )
 
         run_keys = [task.run_key for task in tasks]
         if len(set(run_keys)) != len(run_keys):

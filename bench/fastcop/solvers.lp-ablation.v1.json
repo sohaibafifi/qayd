@@ -1,0 +1,86 @@
+{
+  "checker": {
+    "argv": [
+      "java",
+      "-XX:ActiveProcessorCount=1",
+      "-Xmx{checker_heap_mb}m",
+      "-cp",
+      "{ace_artifact}",
+      "org.xcsp.parser.callbacks.SolutionChecker",
+      "{instance}",
+      "-cm"
+    ],
+    "artifact": "../solvers/ACE-2.5.jar",
+    "expected_sha256": "cb0d0741d7f626c5166371efa2ce8cbe5dc62c49f10180e3ebf4be008106dcc7",
+    "name": "XCSP3 SolutionChecker from ACE 2.5"
+  },
+  "schema": "qayd.fastcop.solvers/v1",
+  "solvers": {
+    "qayd-native": {
+      "argv": [
+        "{artifact}",
+        "-t",
+        "{cpu_seconds}",
+        "--threads",
+        "1",
+        "--seed",
+        "{seed}",
+        "--verbose",
+        "--mem-limit",
+        "{memory_mb}",
+        "--linear-backend",
+        "native",
+        "{instance}"
+      ],
+      "artifact": "../../target/release/qayd",
+      "expected_sha256": null,
+      "version": "qayd 0.9.1, optional root LP disabled"
+    },
+    "qayd-amthal-bound-only": {
+      "argv": [
+        "{artifact}",
+        "-t",
+        "{cpu_seconds}",
+        "--threads",
+        "1",
+        "--seed",
+        "{seed}",
+        "--verbose",
+        "--mem-limit",
+        "{memory_mb}",
+        "--linear-backend",
+        "amthal",
+        "--lp-root-ms",
+        "50",
+        "--lp-phase-max-vars",
+        "0",
+        "{instance}"
+      ],
+      "artifact": "../../target/release/qayd",
+      "expected_sha256": null,
+      "version": "qayd 0.9.1, Amthal root bound with primal phase disabled"
+    },
+    "qayd-amthal": {
+      "argv": [
+        "{artifact}",
+        "-t",
+        "{cpu_seconds}",
+        "--threads",
+        "1",
+        "--seed",
+        "{seed}",
+        "--verbose",
+        "--mem-limit",
+        "{memory_mb}",
+        "--linear-backend",
+        "amthal",
+        "--lp-root-ms",
+        "50",
+        "{instance}"
+      ],
+      "artifact": "../../target/release/qayd",
+      "expected_sha256": null,
+      "version": "qayd 0.9.1, Amthal root LP with a 50 ms budget"
+    }
+  }
+}

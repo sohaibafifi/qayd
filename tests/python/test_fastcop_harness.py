@@ -9,6 +9,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from bench.fastcop import manifest as fastcop_manifest
+from bench.fastcop import lp_ablation as fastcop_lp_ablation
 from bench.fastcop import run as fastcop_run
 from bench.fastcop import score as fastcop_score
 
@@ -629,6 +630,97 @@ def test_per_family_selection_is_deterministic_and_representative():
     )
 
     assert [item["id"] for item in selected] == ["A-1", "A-2", "B-1", "B-2"]
+
+
+def test_interleaved_solver_order_rotates_first_variant():
+    instances = [{"id": "I-1"}, {"id": "I-2"}, {"id": "I-3"}]
+
+    ordered = fastcop_run.ordered_solver_instances(
+        ["native", "amthal"], instances, interleave=True
+    )
+
+    assert [(solver, item["id"]) for solver, item in ordered] == [
+        ("native", "I-1"),
+        ("amthal", "I-1"),
+        ("amthal", "I-2"),
+        ("native", "I-2"),
+        ("native", "I-3"),
+        ("amthal", "I-3"),
+    ]
+
+
+def test_lp_ablation_report_uses_verified_paired_results(tmp_path):
+    native_log = tmp_path / "native.log"
+    native_log.write_text("c nodes 100 failures 20\n", encoding="utf-8")
+    amthal_log = tmp_path / "amthal.log"
+    amthal_log.write_text(
+        "c nodes 80 failures 15\n"
+        "c lp rows 12 root_bound 6 solves 1 certified 1 timeouts 0 "
+        "refactorizations 2 time_ms 1.250\n",
+        encoding="utf-8",
+    )
+    bound_only_log = tmp_path / "bound-only.log"
+    bound_only_log.write_text(amthal_log.read_text(encoding="utf-8"), encoding="utf-8")
+
+    def record(solver, key, objective, log, wall, first):
+        return {
+            "schema": fastcop_lp_ablation.RESULT_SCHEMA,
+            "run_key": key,
+            "solver": solver,
+            "instance": "Example-1",
+            "instance_sha256": "instance-hash",
+            "family": "Example",
+            "objective_sense": "min",
+            "seed": 0,
+            "limits": {"cpu_seconds": 5.0, "wall_seconds": 8.0},
+            "status": "SAT",
+            "proof": False,
+            "best_incumbent": {"value": objective, "elapsed_seconds": first + 1},
+            "first_incumbent": {"value": objective, "elapsed_seconds": first},
+            "elapsed_wall_seconds": wall,
+            "validation": {"valid": True},
+            "logs": {"stdout": str(log)},
+            "provenance": {"artifact_sha256": "same-binary"},
+        }
+
+    native = record("qayd-native", "native", 10, native_log, 5.0, 2.0)
+    bound_only = record(
+        "qayd-amthal-bound-only", "bound-only", 10, bound_only_log, 5.1, 2.0
+    )
+    amthal = record("qayd-amthal", "amthal", 8, amthal_log, 4.0, 1.0)
+
+    pairs = fastcop_lp_ablation.pair_records(
+        [amthal, native], "qayd-native", "qayd-amthal"
+    )
+    summary = fastcop_lp_ablation.summarize_pairs(pairs)
+
+    assert summary["same_binary"] is True
+    assert summary["outcomes"] == {"amthal": 1}
+    assert summary["lp_eligible"] == 1
+    assert summary["lp_certified"] == 1
+    assert summary["lp_exact_at_incumbent"] == 0
+    assert summary["lp_within_10_percent"] == 0
+    assert summary["median_lp_time_ms_eligible"] == 1.25
+    assert summary["median_wall_ratio"] == 0.8
+    assert summary["median_first_incumbent_ratio"] == 0.5
+    assert summary["median_node_ratio"] == 0.8
+    assert summary["details"][0]["certified_absolute_gap"] == 2
+
+    fastcop_lp_ablation.attach_attribution(
+        summary,
+        [native, bound_only, amthal],
+        "qayd-native",
+        "qayd-amthal-bound-only",
+        "qayd-amthal",
+    )
+    assert summary["bound_reproducibility_mismatches"] == 0
+    assert summary["comparisons"][1]["ties"] == 1
+    assert summary["comparisons"][2]["treatment_wins"] == 1
+
+    with pytest.raises(fastcop_lp_ablation.AblationError, match="incomplete"):
+        fastcop_lp_ablation.pair_records(
+            [native], "qayd-native", "qayd-amthal"
+        )
 
 
 def test_execution_and_validation_identities_are_independent():
