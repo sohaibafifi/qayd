@@ -4,6 +4,7 @@
 //! clause learning (which is unsound for enumerating every solution).
 //! [`Cdcl::optimize`] is the COP driver: CDCL branch-and-bound with restarts.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
@@ -30,7 +31,7 @@ const MAX_EXPR_SINGLETON_PROBE_WORK: usize = 32_768;
 /// Small objectives benefit from directed branching on the first dive. Large
 /// objectives first need a cheap feasible assignment before their decisions
 /// can safely dominate the feasibility heuristic.
-const MAX_EAGER_OBJECTIVE_VARIABLES: usize = 32;
+const MAX_IMMEDIATE_OBJECTIVE_VARIABLES: usize = 32;
 
 /// Literal evaluations reserved for a one-shot guarded-objective phase hint.
 /// The first incumbent is published before this bounded local search starts.
@@ -40,6 +41,8 @@ const GUARDED_OBJECTIVE_HINT_WORK: usize = 32_000_000;
 /// domains. Large bounds domains use a direct supported target or an endpoint
 /// so value selection stays bounded at the search-loop level.
 const MAX_ENUMERATED_RANDOM_DOMAIN: usize = 4_096;
+const MIN_BOUNDED_DIVE_DECISIONS: u64 = 4_096;
+const BOUNDED_DIVE_DECISIONS_PER_VARIABLE: u64 = 8;
 
 use crate::mix64;
 
@@ -54,16 +57,21 @@ fn strict_bound(incumbent: i64, minimizing: bool) -> Option<i64> {
 impl Objective<'_> {
     fn value(self, solver: &Solver) -> i64 {
         match self {
-            Self::Var(obj) => solver.store.value(obj) as i64,
+            Self::Var(obj) | Self::VarWithAffine { objective: obj, .. } | Self::BoundedDiveVarWithAffine { objective: obj, .. } => {
+                solver.store.value(obj) as i64
+            }
             // Accumulate in i128 so large coeffs/many terms can't overflow, then
             // clamp: a wrapped objective would post a wrong bound (lost optimum).
-            Self::Linear { coeffs, vars } => coeffs
+            Self::Linear { coeffs, vars } | Self::BoundedDiveLinear { coeffs, vars } => coeffs
                 .iter()
                 .zip(vars)
                 .map(|(&coeff, &var)| coeff as i128 * solver.store.value(var) as i128)
                 .sum::<i128>()
-                .clamp(i64::MIN as i128, i64::MAX as i128) as i64,
-            Self::Expr(expr) => expr.eval(&|var| solver.store.value(var) as i64).expect("objective expression is undefined at a solution"),
+                .clamp(i64::MIN as i128, i64::MAX as i128)
+                as i64,
+            Self::Expr(expr) | Self::BoundedDiveExpr(expr) => {
+                expr.eval(&|var| solver.store.value(var) as i64).expect("objective expression is undefined at a solution")
+            }
         }
     }
 }
@@ -71,6 +79,7 @@ impl Objective<'_> {
 struct ObjectiveImpact {
     coeffs: Vec<u64>,
     directions: Vec<i8>,
+    preferred_values: Vec<Option<i32>>,
     defer_until_incumbent: bool,
 }
 
@@ -88,7 +97,7 @@ fn constant_expr_value(expression: &Expr) -> Option<i128> {
 /// Accumulate exact affine coefficients without allocating a second expression
 /// tree. This is deliberately a value-ordering hint only: nonlinear or
 /// overflowing expressions keep the regular seeded polarity.
-fn affine_expr_directions(expression: &Expr, factor: i128, directions: &mut [i128]) -> bool {
+fn accumulate_affine_expr_directions(expression: &Expr, factor: i128, directions: &mut [i128]) -> bool {
     match expression {
         Expr::Const(_) => true,
         Expr::Var(variable) => {
@@ -98,11 +107,11 @@ fn affine_expr_directions(expression: &Expr, factor: i128, directions: &mut [i12
             directions[variable.index()] = value;
             true
         }
-        Expr::Neg(value) => factor.checked_neg().is_some_and(|factor| affine_expr_directions(value, factor, directions)),
-        Expr::Add(values) => values.iter().all(|value| affine_expr_directions(value, factor, directions)),
+        Expr::Neg(value) => factor.checked_neg().is_some_and(|factor| accumulate_affine_expr_directions(value, factor, directions)),
+        Expr::Add(values) => values.iter().all(|value| accumulate_affine_expr_directions(value, factor, directions)),
         Expr::Sub(left, right) => {
-            affine_expr_directions(left, factor, directions)
-                && factor.checked_neg().is_some_and(|factor| affine_expr_directions(right, factor, directions))
+            accumulate_affine_expr_directions(left, factor, directions)
+                && factor.checked_neg().is_some_and(|factor| accumulate_affine_expr_directions(right, factor, directions))
         }
         Expr::Mul(values) => {
             let mut scaled = factor;
@@ -117,17 +126,200 @@ fn affine_expr_directions(expression: &Expr, factor: i128, directions: &mut [i12
                     return false;
                 }
             }
-            nonconstant.is_none_or(|value| affine_expr_directions(value, scaled, directions))
+            nonconstant.is_none_or(|value| accumulate_affine_expr_directions(value, scaled, directions))
         }
         _ => false,
     }
 }
 
+fn affine_expr_directions(expression: &Expr, factor: i128, directions: &mut [i128]) -> bool {
+    let mut candidate = directions.to_vec();
+    if !accumulate_affine_expr_directions(expression, factor, &mut candidate) {
+        return false;
+    }
+    directions.copy_from_slice(&candidate);
+    true
+}
+
+/// Recover sound improving directions from a monotone expression that is not
+/// affine, notably minima and maxima of affine terms. Direction `2` is an
+/// internal conflict marker: the expression uses that variable with both
+/// monotonicities, so value selection must remain neutral for it.
+fn accumulate_monotone_expr_directions(expression: &Expr, factor: i8, directions: &mut [i8]) -> bool {
+    fn merge(slot: &mut i8, direction: i8) {
+        if direction == 0 || *slot == 2 {
+            return;
+        }
+        if *slot == 0 || *slot == direction {
+            *slot = direction;
+        } else {
+            *slot = 2;
+        }
+    }
+
+    match expression {
+        Expr::Const(_) => true,
+        Expr::Var(variable) => {
+            merge(&mut directions[variable.index()], factor);
+            true
+        }
+        Expr::Neg(value) => accumulate_monotone_expr_directions(value, -factor, directions),
+        Expr::Add(values) | Expr::Min(values) | Expr::Max(values) => {
+            values.iter().all(|value| accumulate_monotone_expr_directions(value, factor, directions))
+        }
+        Expr::Sub(left, right) => {
+            accumulate_monotone_expr_directions(left, factor, directions) && accumulate_monotone_expr_directions(right, -factor, directions)
+        }
+        Expr::Mul(values) => {
+            let mut direction = factor;
+            let mut symbolic = None;
+            for value in values {
+                if let Some(constant) = constant_expr_value(value) {
+                    direction *= constant.signum() as i8;
+                } else if symbolic.replace(value).is_some() {
+                    return false;
+                }
+            }
+            if direction == 0 {
+                true
+            } else {
+                symbolic.is_none_or(|value| accumulate_monotone_expr_directions(value, direction, directions))
+            }
+        }
+        Expr::Abs(_)
+        | Expr::Eq(_, _)
+        | Expr::Ne(_, _)
+        | Expr::Lt(_, _)
+        | Expr::Le(_, _)
+        | Expr::Gt(_, _)
+        | Expr::Ge(_, _)
+        | Expr::And(_)
+        | Expr::Or(_)
+        | Expr::Not(_)
+        | Expr::Imp(_, _)
+        | Expr::Iff(_, _)
+        | Expr::Div(_, _)
+        | Expr::Mod(_, _)
+        | Expr::IfThenElse(_, _, _) => false,
+    }
+}
+
+fn monotone_expr_directions(expression: &Expr, factor: i8, directions: &mut [i128]) -> bool {
+    let mut candidate = vec![0i8; directions.len()];
+    if !accumulate_monotone_expr_directions(expression, factor, &mut candidate) {
+        return false;
+    }
+    for (direction, candidate) in directions.iter_mut().zip(candidate) {
+        *direction = if candidate == 2 { 0 } else { i128::from(candidate) };
+    }
+    true
+}
+
+#[cfg(test)]
+pub(crate) fn audit_affine_expr_directions(expression: &Expr, variables: usize) -> (bool, Vec<i128>) {
+    let mut directions = vec![0; variables];
+    let affine = affine_expr_directions(expression, 1, &mut directions);
+    (affine, directions)
+}
+
+/// Recover exact improving targets from an affine combination of equality
+/// indicators. Constants, nested sums and products by constants are normalized
+/// before checking signs. Every nonconstant leaf must be a complete
+/// `variable == constant` indicator, and one variable may reward only one
+/// target. A partial match would invent a preference for an unrelated term.
+fn equality_indicator_preferences(expression: &Expr, store: &Store, minimizing: bool) -> Option<(Vec<u64>, Vec<Option<i32>>)> {
+    fn equality_target(expression: &Expr) -> Option<(VarId, i32)> {
+        let Expr::Eq(left, right) = expression else {
+            return None;
+        };
+        match (&**left, &**right) {
+            (Expr::Var(variable), Expr::Const(value)) | (Expr::Const(value), Expr::Var(variable)) => {
+                Some((*variable, i32::try_from(*value).ok()?))
+            }
+            _ => None,
+        }
+    }
+
+    fn collect(expression: &Expr, factor: i128, coefficients: &mut BTreeMap<(VarId, i32), i128>) -> Option<()> {
+        match expression {
+            Expr::Const(_) => Some(()),
+            Expr::Add(terms) => {
+                for term in terms {
+                    collect(term, factor, coefficients)?;
+                }
+                Some(())
+            }
+            Expr::Sub(left, right) => {
+                collect(left, factor, coefficients)?;
+                collect(right, factor.checked_neg()?, coefficients)
+            }
+            Expr::Neg(value) => collect(value, factor.checked_neg()?, coefficients),
+            Expr::Mul(factors) => {
+                let mut scaled = factor;
+                let mut symbolic = None;
+                for value in factors {
+                    if let Some(constant) = constant_expr_value(value) {
+                        scaled = scaled.checked_mul(constant)?;
+                    } else if symbolic.replace(value).is_some() {
+                        return None;
+                    }
+                }
+                if scaled == 0 {
+                    return Some(());
+                }
+                match symbolic {
+                    Some(value) => collect(value, scaled, coefficients),
+                    None => Some(()),
+                }
+            }
+            _ => {
+                let target = equality_target(expression)?;
+                let coefficient = coefficients.entry(target).or_default();
+                *coefficient = coefficient.checked_add(factor)?;
+                Some(())
+            }
+        }
+    }
+
+    let mut coefficients = BTreeMap::new();
+    collect(expression, 1, &mut coefficients)?;
+    coefficients.retain(|_, coefficient| *coefficient != 0);
+    let mut impacts = vec![0u64; store.num_vars()];
+    let mut preferences = vec![None; store.num_vars()];
+    for ((variable, value), coefficient) in coefficients {
+        let reward = if minimizing { coefficient.checked_neg()? } else { coefficient };
+        let weight = u64::try_from(reward).ok().filter(|&weight| weight > 0)?;
+        if variable.index() >= store.num_vars() {
+            return None;
+        }
+        if !store.contains(variable, value) {
+            // This equality is identically false on the declared domain, so
+            // it contributes a constant zero and must not influence search.
+            continue;
+        }
+        let slot = preferences.get_mut(variable.index())?;
+        if slot.is_some_and(|current| current != value) {
+            return None;
+        }
+        *slot = Some(value);
+        impacts[variable.index()] = impacts[variable.index()].checked_add(weight)?;
+    }
+    preferences.iter().any(Option::is_some).then_some((impacts, preferences))
+}
+
 impl ObjectiveImpact {
-    fn new(objective: Objective<'_>, nvars: usize, minimizing: bool) -> Option<Self> {
+    fn new(objective: Objective<'_>, solver: &Solver, minimizing: bool) -> Option<Self> {
+        let store = &solver.store;
+        let nvars = store.num_vars();
         let mut impact = vec![0u64; nvars];
         let mut signed = vec![0i128; nvars];
+        let mut preferred_values = vec![None; nvars];
         let mut nonlinear = false;
+        let mut defer_structural = false;
+        let bounded_dive = matches!(
+            objective,
+            Objective::BoundedDiveVarWithAffine { .. } | Objective::BoundedDiveLinear { .. } | Objective::BoundedDiveExpr(_)
+        );
         match objective {
             Objective::Var(var) => {
                 // A materialized objective is often an auxiliary constrained by
@@ -136,29 +328,61 @@ impl ObjectiveImpact {
                 impact[var.index()] = 0;
                 signed[var.index()] = if minimizing { 1 } else { -1 };
             }
-            Objective::Linear { coeffs, vars } => {
-                let eager_priority = vars.len() <= MAX_EAGER_OBJECTIVE_VARIABLES;
+            Objective::VarWithAffine { coeffs, vars, .. }
+            | Objective::Linear { coeffs, vars }
+            | Objective::BoundedDiveLinear { coeffs, vars }
+            | Objective::BoundedDiveVarWithAffine { coeffs, vars, .. } => {
+                // Every Boolean decision fixes its complete contribution to a
+                // linear objective. A bounded dive can therefore prioritize a
+                // wide Boolean sum cheaply. The complete pass preserves the
+                // feasibility variable order for every wide objective and only
+                // uses the exact coefficient signs for value selection after
+                // it has found an incumbent.
+                let boolean_objective =
+                    vars.iter().all(|&variable| store.size(variable) <= 2 && store.min(variable) >= 0 && store.max(variable) <= 1);
+                let prioritize_terms = vars.len() <= MAX_IMMEDIATE_OBJECTIVE_VARIABLES || (bounded_dive && boolean_objective);
                 for (&coeff, &var) in coeffs.iter().zip(vars) {
-                    if eager_priority {
+                    if prioritize_terms {
                         impact[var.index()] = impact[var.index()].saturating_add(coeff.unsigned_abs());
                     }
                     let directed = if minimizing { i128::from(coeff) } else { -i128::from(coeff) };
                     signed[var.index()] = signed[var.index()].checked_add(directed)?;
                 }
             }
-            Objective::Expr(expression) => {
+            Objective::Expr(expression) | Objective::BoundedDiveExpr(expression) => {
                 let factor = if minimizing { 1 } else { -1 };
                 // Affine expressions provide a sound value direction. Do not
                 // let coefficient magnitude eclipse dom/wdeg entirely:
                 // feasibility variables still have to be interleaved with
                 // objective decisions on tightly constrained models.
-                if !affine_expr_directions(expression, factor, &mut signed) {
+                if let Some((equality_impact, equality_preferences)) = equality_indicator_preferences(expression, store, minimizing) {
+                    impact = equality_impact;
+                    preferred_values = equality_preferences;
+                    // On a constrained model, first preserve the ordinary
+                    // feasibility trajectory. Once it supplies an
+                    // incumbent, the exact rewarded values can drive
+                    // improvement. An unconstrained equality sum can use
+                    // its targets immediately.
+                    defer_structural = solver.num_propagators() != 0;
+                    if defer_structural {
+                        // Once feasibility has produced an incumbent, use
+                        // rewarded values as phases while keeping dom/wdeg
+                        // in charge of variable order. Prioritizing every
+                        // rewarded equality can repeatedly attack a jointly
+                        // infeasible all-target assignment.
+                        impact.fill(0);
+                    }
+                } else if !affine_expr_directions(expression, factor, &mut signed)
+                    && !monotone_expr_directions(expression, factor as i8, &mut signed)
+                {
                     nonlinear = true;
-                    // A nonlinear objective still contains useful structural
-                    // information. Syntactic occurrence is a conservative
-                    // sensitivity proxy: it prioritizes selectors shared by
-                    // many guarded terms without inventing an improving value
-                    // direction that may be false.
+                }
+                if nonlinear {
+                    // An otherwise unsupported nonlinear objective still
+                    // contains useful structural information. Syntactic
+                    // occurrence is a conservative sensitivity proxy: it
+                    // prioritizes selectors shared by many terms without
+                    // inventing an improving value direction that may be false.
                     let mut variables = Vec::new();
                     expression.collect_vars(&mut variables);
                     for variable in variables {
@@ -168,16 +392,29 @@ impl ObjectiveImpact {
             }
         }
         let directions: Vec<i8> = signed.into_iter().map(|coeff| coeff.signum() as i8).collect();
-        let active_variables =
-            impact.iter().zip(&directions).filter(|(coefficient, direction)| **coefficient != 0 || **direction != 0).count();
-        let defer_until_incumbent = nonlinear || active_variables > MAX_EAGER_OBJECTIVE_VARIABLES;
-        (active_variables > 0).then_some(Self { coeffs: impact, directions, defer_until_incumbent })
+        let mut active_variables = 0usize;
+        for (index, ((coefficient, direction), preferred)) in impact.iter().zip(&directions).zip(&preferred_values).enumerate() {
+            let variable = VarId(u32::try_from(index).ok()?);
+            if store.size(variable) > 1 && (*coefficient != 0 || *direction != 0 || preferred.is_some()) {
+                active_variables += 1;
+            }
+        }
+        // A wide objective first follows the feasibility heuristic. Once that
+        // supplies a verified incumbent, its exact value directions become a
+        // useful improvement policy. A bounded dive opts into those directions
+        // immediately and remains capped independently of model provenance.
+        let defer_until_incumbent =
+            !bounded_dive && (nonlinear || defer_structural || active_variables > MAX_IMMEDIATE_OBJECTIVE_VARIABLES);
+        (active_variables > 0).then_some(Self { coeffs: impact, directions, preferred_values, defer_until_incumbent })
     }
 
     fn score(&self, solver: &Solver, var: VarId) -> u128 {
         let coeff = self.coeffs[var.index()] as u128;
         if coeff == 0 {
             return 0;
+        }
+        if self.preferred_values[var.index()].is_some() {
+            return coeff;
         }
         let width = i64::from(solver.store.max(var)) - i64::from(solver.store.min(var));
         coeff.saturating_mul(width.max(0) as u128)
@@ -193,6 +430,10 @@ impl ObjectiveImpact {
             std::cmp::Ordering::Greater => Some(false),
             std::cmp::Ordering::Equal => None,
         }
+    }
+
+    fn preferred_value(&self, var: VarId) -> Option<i32> {
+        self.preferred_values[var.index()]
     }
 }
 
@@ -298,6 +539,9 @@ impl Cdcl<'_> {
     /// endpoint. Rephasing only inverts the unguided choice: reversing a known
     /// objective direction was the source of long COP plateaus.
     fn rephase_value(&self, v: VarId, objective: Option<&ObjectiveImpact>) -> i32 {
+        if let Some(value) = objective.and_then(|impact| impact.preferred_value(v)).filter(|&value| self.solver.store.contains(v, value)) {
+            return value;
+        }
         if objective.is_some_and(|impact| impact.prefers_max(v).is_none() && impact.score(self.solver, v) > 0) {
             // For a structural, directionless objective hint, both endpoints
             // are an unnecessarily small neighborhood on non-Boolean domains.
@@ -323,14 +567,20 @@ impl Cdcl<'_> {
                 max
             };
         }
-        // Three seed classes exploit the improving endpoint. The fourth
-        // deliberately explores its opposite, so symbolic-objective portfolio
-        // workers do not all traverse the same deterministic tree.
-        let objective_preference =
-            objective
-                .and_then(|impact| impact.prefers_max(v))
-                .map(|prefers_max| if self.seed & 3 == 1 { !prefers_max } else { prefers_max });
+        // A lone search always follows the exact improving direction. In a
+        // clause-sharing portfolio, one seed class deliberately explores the
+        // opposite branch so workers do not duplicate the same tree.
+        let objective_preference = objective.and_then(|impact| impact.prefers_max(v)).map(|preference| {
+            if self.clause_sharing.is_some() && self.seed & 3 == 1 {
+                !preference
+            } else {
+                preference
+            }
+        });
         let want_max = objective_preference.unwrap_or_else(|| {
+            // While an objective policy is active, variables without an exact
+            // improving direction retain the historical deterministic hash.
+            // Seed zero participates in that hash just like portfolio seeds.
             let diversified = objective.is_some() && mix64(self.seed ^ v.0 as u64) & 1 != 0;
             diversified ^ (self.rephase_mode != 0)
         });
@@ -352,7 +602,7 @@ impl Cdcl<'_> {
             // Rephase only in a lone sequential search. Every `REPHASE_PERIOD`
             // restarts the next segment inverts the default polarity (not random:
             // an opposite dive diversifies the feasibility search without
-            // shredding structured objectives like LABS). Portfolio workers
+            // shredding a structured nonlinear objective). Portfolio workers
             // already diversify across workers, and per-worker rephasing
             // *synchronizes* their polarity flips and hurts - so it is disabled
             // whenever clause sharing (a portfolio) is active.
@@ -485,8 +735,10 @@ impl Cdcl<'_> {
     /// sound) and re-enqueues that propagator instead of posting a new one.
     fn tighten_objective(&mut self, objective: Objective<'_>, minimizing: bool, incumbent: i64, cell: &mut ObjBoundCell) -> bool {
         match objective {
-            Objective::Var(obj) => self.tighten_bound(obj, minimizing, incumbent as i32),
-            Objective::Linear { coeffs, vars } => {
+            Objective::Var(obj)
+            | Objective::VarWithAffine { objective: obj, .. }
+            | Objective::BoundedDiveVarWithAffine { objective: obj, .. } => self.tighten_bound(obj, minimizing, incumbent as i32),
+            Objective::Linear { coeffs, vars } | Objective::BoundedDiveLinear { coeffs, vars } => {
                 let Some(bound) = strict_bound(incumbent, minimizing) else {
                     return false;
                 };
@@ -518,7 +770,7 @@ impl Cdcl<'_> {
                 }
                 self.propagate_and_learn()
             }
-            Objective::Expr(e) => {
+            Objective::Expr(e) | Objective::BoundedDiveExpr(e) => {
                 let Some(bound) = strict_bound(incumbent, minimizing) else {
                     return false;
                 };
@@ -696,11 +948,25 @@ impl Cdcl<'_> {
         conflict_budget: Option<u64>,
         on_improve: &mut F,
     ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
-        if let Objective::Linear { coeffs, vars } = objective {
-            assert_eq!(coeffs.len(), vars.len(), "linear objective: coeffs/terms length mismatch");
+        if let Objective::VarWithAffine { coeffs, vars, .. }
+        | Objective::Linear { coeffs, vars }
+        | Objective::BoundedDiveLinear { coeffs, vars }
+        | Objective::BoundedDiveVarWithAffine { coeffs, vars, .. } = objective
+        {
+            assert_eq!(coeffs.len(), vars.len(), "affine objective view: coeffs/terms length mismatch");
         }
         let mut stats = SolveStats::default();
         let mut best: Option<(Vec<i32>, i64)> = None;
+        let bounded_dive_decisions = matches!(
+            objective,
+            Objective::BoundedDiveVarWithAffine { .. } | Objective::BoundedDiveLinear { .. } | Objective::BoundedDiveExpr(_)
+        )
+        .then(|| {
+            u64::try_from(vars.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(BOUNDED_DIVE_DECISIONS_PER_VARIABLE)
+                .max(MIN_BOUNDED_DIVE_DECISIONS)
+        });
         self.set_conflict_budget(conflict_budget);
         if !self.init() {
             stats.failures = self.conflicts;
@@ -724,7 +990,7 @@ impl Cdcl<'_> {
         } else {
             vec![None; self.solver.store.num_vars()]
         };
-        let objective_impact = ObjectiveImpact::new(objective, self.solver.store.num_vars(), minimizing);
+        let objective_impact = ObjectiveImpact::new(objective, self.solver, minimizing);
         // A generated guarded-sum objective admits a much cheaper local
         // minimization than a generic expression tree. Keep that computation
         // outside the propagator: its assignment is only a phase hint, while
@@ -737,7 +1003,7 @@ impl Cdcl<'_> {
             && cube.is_empty()
             && self.initial_phase.iter().all(Option::is_none)
             && self.branch_order.is_empty()
-            && matches!(objective, Objective::Expr(_));
+            && matches!(objective, Objective::Expr(_) | Objective::BoundedDiveExpr(_));
         let mut guarded_hint_restart = None;
         // A preceding dive or another worker may already have published an
         // incumbent. In that case the imported strict cutoff can prevent this
@@ -748,7 +1014,15 @@ impl Cdcl<'_> {
         if guarded_hint_pending {
             let shared_incumbent =
                 shared_bound.map(|bound| bound.load(Ordering::Relaxed)).filter(|&value| value != i64::MAX && value != i64::MIN);
-            if let (Some(incumbent), Objective::Expr(expression)) = (shared_incumbent, objective) {
+            let expression = match objective {
+                Objective::Expr(expression) | Objective::BoundedDiveExpr(expression) => Some(expression),
+                Objective::Var(_)
+                | Objective::VarWithAffine { .. }
+                | Objective::BoundedDiveVarWithAffine { .. }
+                | Objective::Linear { .. }
+                | Objective::BoundedDiveLinear { .. } => None,
+            };
+            if let (Some(incumbent), Some(expression)) = (shared_incumbent, expression) {
                 if let Some((_, assignment)) = GuardedSum::compile(expression)
                     .and_then(|guarded| guarded.minimize_hint(&self.solver.store, self.seed, stop, GUARDED_OBJECTIVE_HINT_WORK))
                     .filter(|(hint_value, _)| *hint_value < incumbent)
@@ -771,7 +1045,10 @@ impl Cdcl<'_> {
         }
 
         loop {
-            if stop.load(Ordering::Relaxed) || self.conflict_budget_reached() {
+            if stop.load(Ordering::Relaxed)
+                || self.conflict_budget_reached()
+                || bounded_dive_decisions.is_some_and(|budget| stats.nodes >= budget)
+            {
                 complete = false;
                 break;
             }
@@ -802,7 +1079,8 @@ impl Cdcl<'_> {
             // A nonlinear occurrence score has no sound improving polarity.
             // Activate it only after the regular feasibility heuristic has
             // supplied an incumbent and therefore a useful objective bound.
-            let active_objective = objective_impact.as_ref().filter(|impact| !impact.defer_until_incumbent || best.is_some());
+            let active_objective =
+                objective_impact.as_ref().filter(|impact| !impact.defer_until_incumbent || best.is_some() || enforced.is_some());
             match self.select_branch_var(vars, primary_branch_scope, active_objective) {
                 None => {
                     // A successful hinted dive consumes the one-shot policy.
@@ -820,6 +1098,10 @@ impl Cdcl<'_> {
                         &mut obj_bound,
                         on_improve,
                     );
+                    if stop.load(Ordering::Relaxed) {
+                        complete = false;
+                        break;
+                    }
                     if !keep_searching {
                         if self.conflict_budget_exhausted() {
                             complete = false;
@@ -830,10 +1112,15 @@ impl Cdcl<'_> {
                         guarded_hint_pending = false;
                         let incumbent = best.as_ref().expect("the accepted solution is the incumbent").1;
                         let hint = match objective {
-                            Objective::Expr(expression) => GuardedSum::compile(expression).and_then(|guarded| {
-                                guarded.minimize_hint(&self.solver.store, self.seed, stop, GUARDED_OBJECTIVE_HINT_WORK)
-                            }),
-                            Objective::Var(_) | Objective::Linear { .. } => None,
+                            Objective::Expr(expression) | Objective::BoundedDiveExpr(expression) => GuardedSum::compile(expression)
+                                .and_then(|guarded| {
+                                    guarded.minimize_hint(&self.solver.store, self.seed, stop, GUARDED_OBJECTIVE_HINT_WORK)
+                                }),
+                            Objective::Var(_)
+                            | Objective::VarWithAffine { .. }
+                            | Objective::BoundedDiveVarWithAffine { .. }
+                            | Objective::Linear { .. }
+                            | Objective::BoundedDiveLinear { .. } => None,
                         };
                         if let Some((hint_value, assignment)) = hint {
                             // Only displace the incumbent phase when the exact

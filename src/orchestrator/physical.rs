@@ -324,6 +324,19 @@ fn validate_input(input: &PhysicalSolveInput) -> Result<(), SolveError> {
         }
     }
     for objective in &input.objectives {
+        match &objective.objective {
+            ProblemObjective::VarWithAffine(_, _, coefficients, variables) | ProblemObjective::Linear(_, coefficients, variables)
+                if coefficients.len() != variables.len() =>
+            {
+                return Err(SolveError::InvalidRequest(
+                    "physical affine objective has different coefficient and variable counts".to_string(),
+                ));
+            }
+            ProblemObjective::Var(_, _)
+            | ProblemObjective::VarWithAffine(_, _, _, _)
+            | ProblemObjective::Linear(_, _, _)
+            | ProblemObjective::Expr(_, _) => {}
+        }
         for variable in objective_variables(&objective.objective) {
             if variable.index() >= variables {
                 return Err(SolveError::InvalidRequest(format!("physical objective references unknown variable {}", variable.index())));
@@ -384,12 +397,11 @@ fn replay_candidate(
             .fix(variable, value)
             .map_err(|_| SolveError::InvalidResult("physical assignment violates a variable domain".to_string()))?;
     }
-    solver
-        .propagate_until(|| stop.load(std::sync::atomic::Ordering::Acquire))
-        .map_err(|_| SolveError::InvalidResult("physical assignment violates a posted constraint".to_string()))?;
+    let propagation = solver.propagate_until(|| stop.load(std::sync::atomic::Ordering::Acquire));
     if stop.load(std::sync::atomic::Ordering::Acquire) {
         return Err(SolveError::Interrupted("physical assignment propagation was interrupted".to_string()));
     }
+    propagation.map_err(|_| SolveError::InvalidResult("physical assignment violates a posted constraint".to_string()))?;
     for (index, assumption) in assumptions.iter().enumerate() {
         if index & 0xff == 0 && stop.load(std::sync::atomic::Ordering::Acquire) {
             return Err(SolveError::Interrupted("physical assumption replay was interrupted".to_string()));
@@ -439,6 +451,12 @@ fn replay_candidate(
 fn objective_variables(objective: &ProblemObjective) -> Vec<VarId> {
     match objective {
         ProblemObjective::Var(_, variable) => vec![*variable],
+        ProblemObjective::VarWithAffine(_, objective, _, variables) => {
+            let mut result = Vec::with_capacity(variables.len().saturating_add(1));
+            result.push(*objective);
+            result.extend_from_slice(variables);
+            result
+        }
         ProblemObjective::Linear(_, _, variables) => variables.clone(),
         ProblemObjective::Expr(_, expression) => {
             let mut variables = Vec::new();
@@ -450,7 +468,9 @@ fn objective_variables(objective: &ProblemObjective) -> Vec<VarId> {
 
 fn objective_value(objective: &ProblemObjective, solver: &crate::Solver) -> Result<i64, SolveError> {
     match objective {
-        ProblemObjective::Var(_, variable) => Ok(i64::from(solver.store.value(*variable))),
+        ProblemObjective::Var(_, variable) | ProblemObjective::VarWithAffine(_, variable, _, _) => {
+            Ok(i64::from(solver.store.value(*variable)))
+        }
         ProblemObjective::Linear(_, coefficients, variables) => coefficients
             .iter()
             .zip(variables)
@@ -466,7 +486,7 @@ fn objective_value(objective: &ProblemObjective, solver: &crate::Solver) -> Resu
 
 fn post_objective_equality(solver: &mut crate::Solver, objective: &ProblemObjective, value: i64) -> Result<(), SolveError> {
     let expression = match objective {
-        ProblemObjective::Var(_, variable) => crate::expr::Expr::Var(*variable),
+        ProblemObjective::Var(_, variable) | ProblemObjective::VarWithAffine(_, variable, _, _) => crate::expr::Expr::Var(*variable),
         ProblemObjective::Linear(_, coefficients, variables) => crate::expr::Expr::Add(
             coefficients
                 .iter()

@@ -961,6 +961,48 @@ impl Store {
         out.extend(sv.holes.into_iter().map(|h| Premise::Ne { var, val: h }));
     }
 
+    /// Interruptible counterpart of [`domain_premises`](Self::domain_premises).
+    /// Returns `false` after restoring `out` to its original length when an
+    /// exact domain snapshot could not be completed before cancellation.
+    pub fn domain_premises_until(&self, var: VarId, out: &mut Vec<Premise>, should_stop: &dyn Fn() -> bool) -> bool {
+        let initial_len = out.len();
+        if should_stop() {
+            return false;
+        }
+
+        let dom = &self.domains[var.index()];
+        let min = dom.min(&self.trail);
+        let max = dom.max(&self.trail);
+        let size = dom.size(&self.trail) as i64;
+        let mut holes = Vec::new();
+        if size != i64::from(max) - i64::from(min) + 1 && !dom.append_removed_values_until(&self.trail, &mut holes, should_stop) {
+            return false;
+        }
+        if should_stop() {
+            return false;
+        }
+
+        out.push(Premise::Ge { var, bound: min });
+        if should_stop() {
+            out.truncate(initial_len);
+            return false;
+        }
+        out.push(Premise::Le { var, bound: max });
+        for value in holes {
+            if should_stop() {
+                out.truncate(initial_len);
+                return false;
+            }
+            out.push(Premise::Ne { var, val: value });
+        }
+        if should_stop() {
+            out.truncate(initial_len);
+            false
+        } else {
+            true
+        }
+    }
+
     /// Snapshot one variable's current domain as a [`ScopeVar`].
     fn scope_var(&self, var: VarId) -> ScopeVar {
         let dom = &self.domains[var.index()];

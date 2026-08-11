@@ -10,7 +10,8 @@ The full protocol runs one solver at a time by default, with one search worker,
 memory. Each final feasible solution is checked independently with the XCSP3
 `SolutionChecker` shipped in ACE 2.5. A timeout first sends `SIGTERM`, waits one
 second for the solver to publish its final incumbent, then sends `SIGKILL` if
-needed.
+needed. The checker heap is controlled separately and defaults to the smaller
+of 4 GiB and the solver memory limit.
 
 ## Pinned inputs and solvers
 
@@ -71,7 +72,7 @@ campaign resumable without repeating completed cases.
 The optional fifth pipeline argument selects the first `N` instances of every
 model variant. Prefer it to an alphabetic `--limit` for short representative
 studies. The sixth argument is the number of concurrent runs and defaults to
-one.
+one. The seventh argument is the checker Java heap in MiB.
 
 For 25 instances at 180 seconds with two concurrent runs and an 8 GiB limit per
 run:
@@ -83,18 +84,21 @@ run:
   bench/fastcop/results/sample-25-180s-j2 \
   8192 \
   0 \
-  2
+  2 \
+  4096
 ```
 
 `--jobs` parallelizes complete solver runs, not the search inside a solver.
 Every solver still receives one search worker. The memory limit applies to each
 run, so the configured aggregate is `jobs * memory-mb`, in addition to the
-harness and operating system. Result records remain serialized by the parent
-in deterministic plan order, and the run identity includes the job count. A
-campaign can therefore resume safely only with the same selection, limits,
-concurrency setting and solver artifacts. An incompatible reuse of an output
-file or log directory is rejected before a solver starts; choose a new output
-directory when changing those parameters.
+harness and operating system. Checker processes may also overlap, with an
+aggregate Java heap of `jobs * checker-memory-mb`. Result records remain
+serialized by the parent in deterministic plan order, and the execution
+identity includes the job count. A campaign can therefore resume safely only
+with the same selection, solver limits, concurrency setting and solver
+artifacts. An incompatible reuse of an output file or log directory is rejected
+before a solver starts; choose a new output directory when changing those
+parameters.
 CPU accounting based on process-global `RUSAGE_CHILDREN` is deliberately
 disabled for concurrent runs; wall time, peak RSS, solver limits and all
 anytime events remain recorded.
@@ -113,6 +117,7 @@ python3 bench/fastcop/run.py \
   --cpu-limit 30 \
   --wall-limit 45 \
   --memory-mb 65536 \
+  --checker-memory-mb 4096 \
   --output bench/fastcop/results/fortress-qayd.jsonl
 ```
 
@@ -123,6 +128,46 @@ revision, and paths to complete stdout, stderr, and checker logs. A feasible
 objective is excluded from scoring unless its final `v` block passes the
 checker. `--no-check` exists only for harness diagnosis and should not be used
 for competitive numbers.
+
+Solver execution and solution validation have separate identities. The
+`execution_key` depends only on the solver artifact and command, resolved
+solver and limit-launcher hashes, instance, seed, solver limits, concurrency,
+and the execution portion of the harness.
+Changing the checker binary, checker heap, checker timeout, or validation code
+does not make a completed solver execution pending. `run_key` remains as a
+compatibility alias on new records. Old records without a versioned
+`execution_key` can be rechecked, but are deliberately not resumed as current
+executions. Use `--recheck-only` when the validation settings change or when a
+prior checker attempt was inconclusive.
+
+## Rechecking stored solutions
+
+Use `--recheck-only` to validate existing stdout logs without launching any
+solver. The runner rematerializes each compressed instance, invokes only the
+checker, and atomically replaces the JSONL file after all selected checks
+finish. It does not append duplicate runs. The usual `--solver`, `--family`,
+`--instance`, `--limit`, `--per-family`, and `--jobs` selectors apply.
+
+For example, the large `TankAllocation2-0800` checker needs more than the old
+1 GiB derived heap:
+
+```bash
+python3 bench/fastcop/run.py \
+  --recheck-only \
+  --output bench/fastcop/results/holdout-25-180s-j4/results.jsonl \
+  --instance '^TankAllocation2-0800$' \
+  --checker-memory-mb 4096 \
+  --checker-timeout 300 \
+  --jobs 4
+```
+
+Add `--dry-run` first to inspect the exact records that will be checked. An
+accepted assignment restores its stored solver status and incumbent. Checker
+OOM, timeout, forced kill, and other checker failures are classified as
+`checker-oom`, `checker-timeout`, `checker-killed`, and `checker-error`. They
+leave the candidate unverified with status `UNKNOWN`; they do not mark the
+solver or its model family invalid. Only an explicit checker rejection or an
+objective mismatch is a false answer.
 
 ## Scoring
 
@@ -138,6 +183,7 @@ relative to the participating solvers:
 
 ```bash
 python3 bench/fastcop/score.py bench/fastcop/results/final-180s/results.jsonl \
+  --manifest bench/fastcop/results/final-180s/manifest.v1.json \
   --mode both \
   --invalidation family \
   --output bench/fastcop/results/final-180s/scores.json
@@ -149,6 +195,29 @@ family. Use `--invalidation none` for diagnostic scoring, or
 The checker validates assignments and objective values, but it cannot certify
 an UNSAT or optimality claim. Such proof claims remain the responsibility of
 the solver and should be cross-checked when results conflict.
+
+With `--manifest`, scoring also requires the complete solver by instance grid,
+canonical family labels and instance hashes, one seed and resource profile,
+one solver configuration, and one execution harness. Only checker-accepted
+incumbents can receive BB points, and a proof is credited only after a clean
+exit without timeout or forced termination.
+
+To compare a new Qayd-only run with a frozen prior pool without assembling a
+JSONL file by hand, pass both files and opt in to replacing Qayd:
+
+```bash
+python3 bench/fastcop/score.py \
+  bench/fastcop/results/holdout/results.jsonl \
+  bench/fastcop/results/holdout-qayd-new/results.jsonl \
+  --replace-solver qayd \
+  --manifest bench/fastcop/results/holdout/manifest.v1.json \
+  --allow-mixed-execution-harness \
+  --mode both
+```
+
+The mixed-harness flag is intentionally explicit and marks the report as a
+diagnostic comparison. Omit it for a controlled campaign in which every solver
+was run by the same harness revision.
 
 These local measurements reproduce the protocol, not the competition hardware.
 Hardware, JVM, operating system, and executable hashes must accompany any

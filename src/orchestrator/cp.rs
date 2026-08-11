@@ -31,15 +31,36 @@ pub(crate) fn audit_cp_root_problem_clones() -> u64 {
 }
 
 #[cfg(test)]
-pub(crate) fn audit_cp_repair_completion(complete: bool) -> Result<bool, SolveError> {
-    super::integer_ls::audit_cp_repair_completion(complete)
+pub(crate) fn audit_cp_repair_completion(complete: bool, fully_specified: bool) -> Result<bool, SolveError> {
+    super::integer_ls::audit_cp_repair_completion(complete, fully_specified)
+}
+
+#[cfg(test)]
+pub(crate) fn audit_partial_cp_repair_search_rejection() -> Result<bool, SolveError> {
+    super::integer_ls::audit_partial_cp_repair_search_rejection()
+}
+
+#[cfg(test)]
+pub(crate) fn audit_integer_warm_start_preflight(model: &Model, stop: &std::sync::atomic::AtomicBool) -> Option<(u64, u64, u64)> {
+    super::integer_ls::audit_warm_start_preflight(model, stop)
+}
+
+#[cfg(test)]
+pub(crate) fn audit_integer_warm_start_compile(
+    model: &Model,
+    compiled: &CompiledCp,
+    memory_allowance: u64,
+    stop: &std::sync::atomic::AtomicBool,
+) -> (bool, u64) {
+    super::integer_ls::audit_compile_warm_start(model, compiled, memory_allowance, stop)
 }
 
 #[derive(Clone)]
 pub(crate) struct CpSolvePlan {
     compiled: CompiledCp,
     local_search: Option<super::integer_ls::IntegerLocalSearchPlan>,
-    guarded_warm_start: bool,
+    integer_warm_start: Option<super::integer_ls::IntegerWarmStartPlan>,
+    estimated_backend_bytes: u64,
     mode: SolveMode,
     guidance: SearchGuidance,
     assumptions: Vec<super::SemanticAssumption>,
@@ -50,7 +71,7 @@ pub(crate) struct CpSolvePlan {
 
 impl CpSolvePlan {
     pub(crate) fn estimated_backend_bytes(&self) -> u64 {
-        self.compiled.estimated_bytes()
+        self.estimated_backend_bytes
     }
 
     pub(crate) fn engine(&self) -> EngineKind {
@@ -120,10 +141,18 @@ fn compile_cp_plan_inner(
     let estimated_backend_bytes = CompiledCp::estimate_semantic_bytes_interruptible(model, budget.stop())
         .ok_or_else(|| SolveError::Interrupted("solve budget expired during CP memory preflight".to_string()))?
         .saturating_add(u64::try_from(request.assumptions.len()).unwrap_or(u64::MAX).saturating_mul(2048));
-    let estimated_concurrent_bytes = estimated_backend_bytes.saturating_mul(u64::try_from(request.threads).unwrap_or(u64::MAX));
+    let estimated_local_search_bytes = if request.mode == SolveMode::LocalSearch {
+        super::integer_ls::estimate_local_search_plan_bytes(model, budget.stop())
+            .ok_or_else(|| SolveError::Interrupted("solve budget expired during integer local-search memory preflight".to_string()))?
+            .saturating_add(u64::try_from(request.assumptions.len()).unwrap_or(u64::MAX).saturating_mul(256))
+    } else {
+        0
+    };
+    let estimated_per_worker_bytes = estimated_backend_bytes.saturating_add(estimated_local_search_bytes);
+    let estimated_concurrent_bytes = estimated_per_worker_bytes.saturating_mul(u64::try_from(request.threads).unwrap_or(u64::MAX));
     if request.limits.memory_bytes.is_some_and(|memory| estimated_concurrent_bytes > memory) {
         return Err(SolveError::Compile(format!(
-            "estimated CP backend requires {estimated_concurrent_bytes} bytes across concurrent workers, above the memory limit"
+            "estimated CP backend and local-search plan require {estimated_concurrent_bytes} bytes across concurrent workers, above the memory limit"
         )));
     }
     if budget.expired() {
@@ -156,16 +185,40 @@ fn compile_cp_plan_inner(
     .map_err(|error| SolveError::Compile(error.reason))?
     .ok_or_else(|| SolveError::Interrupted("solve budget expired during CP compilation".to_string()))?;
     validate_cp_controls(&compiled, request)?;
-    let local_search = if request.mode == SolveMode::LocalSearch { Some(super::integer_ls::compile(effective, &compiled)?) } else { None };
-    let guarded_warm_start = request.mode != SolveMode::LocalSearch
+    let thread_count = u64::try_from(request.threads).unwrap_or(u64::MAX).max(1);
+    let per_worker_memory = request.limits.memory_bytes.map_or(u64::MAX, |memory| memory / thread_count);
+    let mut resident_bytes = compiled.estimated_bytes();
+    let local_search = if request.mode == SolveMode::LocalSearch {
+        let allowance = per_worker_memory.saturating_sub(resident_bytes);
+        let Some(plan) = super::integer_ls::compile_interruptible(effective, &compiled, budget.stop(), allowance)? else {
+            if budget.expired() {
+                return Err(SolveError::Interrupted("solve budget expired during integer local-search compilation".to_string()));
+            }
+            return Err(SolveError::Compile(
+                "estimated integer local-search plan exceeds the remaining per-worker memory allowance".to_string(),
+            ));
+        };
+        resident_bytes = resident_bytes.saturating_add(plan.estimated_bytes);
+        Some(plan)
+    } else {
+        None
+    };
+    let warm_start_eligible = request.mode != SolveMode::LocalSearch
         && request.threads == 1
         && request.limits.conflicts.is_none()
         && request.cp == super::CpControls::default()
         && request.assumptions.is_empty()
         && request.hints.is_empty()
         && request.primary_branch_scope.is_none()
-        && request.branch_order.is_empty()
-        && super::integer_ls::may_support_guarded_warm_start(effective);
+        && request.branch_order.is_empty();
+    let integer_warm_start = if warm_start_eligible {
+        let allowance = per_worker_memory.saturating_sub(resident_bytes);
+        let warm = super::integer_ls::compile_warm_start(effective, &compiled, allowance, budget.stop());
+        resident_bytes = resident_bytes.saturating_add(warm.estimated_bytes);
+        warm.plan
+    } else {
+        None
+    };
     let (initial_phase, branch_order, primary_branch_scope) = compiled
         .search_guidance_interruptible(&request.hints, &request.branch_order, request.primary_branch_scope.as_deref(), budget.stop())
         .map_err(|error| SolveError::InvalidRequest(error.reason))?
@@ -173,7 +226,8 @@ fn compile_cp_plan_inner(
     Ok(CpSolvePlan {
         compiled,
         local_search,
-        guarded_warm_start,
+        integer_warm_start,
+        estimated_backend_bytes: resident_bytes,
         mode: request.mode,
         guidance: SearchGuidance { initial_phase, branch_order, primary_branch_scope },
         assumptions: request.assumptions.clone(),
@@ -342,26 +396,24 @@ fn solve_lexicographic(context: LexicographicSolve<'_>) -> Result<SolveResult, S
     let mut reports = Vec::new();
     let mut initial_incumbent = None;
     let mut primal = None;
-    if plan.guarded_warm_start && !budget.expired() {
-        if let Ok(warm_plan) = super::integer_ls::compile(model, &plan.compiled) {
-            if let Some(warm) = super::integer_ls::warm_start(model, &plan.compiled, &warm_plan, request, budget, engine_stop)? {
-                let candidate_control = sink.emit(SolveEvent::Candidate(warm.candidate.clone()))?;
-                let progress_control = if candidate_control == EventControl::Continue {
-                    sink.emit(SolveEvent::Progress {
-                        engine: EngineKind::IntegerLocalSearch,
-                        objectives: warm.candidate.objectives().to_vec(),
-                        elapsed: budget.elapsed(),
-                    })?
-                } else {
-                    EventControl::Stop
-                };
-                if progress_control == EventControl::Stop {
-                    budget.cancel_with(TerminationReason::EventSink);
-                }
-                primal = Some(promote_warm_candidate(&warm.candidate));
-                initial_incumbent = Some(portfolio::InitialIncumbent { solution: warm.physical_solution, value: warm.physical_objective });
-                reports.push(warm.report);
+    if let Some(warm_plan) = plan.integer_warm_start.as_ref().filter(|_| !budget.expired()) {
+        if let Some(warm) = super::integer_ls::warm_start(model, &plan.compiled, warm_plan, request, budget, engine_stop)? {
+            let candidate_control = sink.emit(SolveEvent::Candidate(warm.candidate.clone()))?;
+            let progress_control = if candidate_control == EventControl::Continue {
+                sink.emit(SolveEvent::Progress {
+                    engine: EngineKind::IntegerLocalSearch,
+                    objectives: warm.candidate.objectives().to_vec(),
+                    elapsed: budget.elapsed(),
+                })?
+            } else {
+                EventControl::Stop
+            };
+            if progress_control == EventControl::Stop {
+                budget.cancel_with(TerminationReason::EventSink);
             }
+            primal = Some(promote_warm_candidate(&warm.candidate));
+            initial_incumbent = Some(portfolio::InitialIncumbent { solution: warm.physical_solution, value: warm.physical_objective });
+            reports.push(warm.report);
         }
     }
     let exact_started = Instant::now();

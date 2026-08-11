@@ -3,20 +3,26 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::constraints::{count, flatten, graph, intension, interval as interval_constraints, lex, linear, primitives, scheduling, table};
+use crate::constraints::{
+    count, divisibility, flatten, graph, intension, interval as interval_constraints, lex, linear, prefix_set, primitives, scheduling,
+    table,
+};
 use crate::expr::Expr;
 use crate::ids::VarId;
 use crate::problem::{Objective as PhysicalObjective, Problem};
 use crate::Solver;
 
-use super::{Constraint, IntDomain, IntExpr, IntGlobalConstraint, Model, Objective, Relation, SetVarRef};
+use super::{Constraint, IntDomain, IntExpr, IntGlobalConstraint, IntVarRef, Model, Objective, Relation, SetVarRef};
 
 type CompileStep<T> = Result<Option<T>, CpCompileError>;
 type SearchGuidanceParts = (Vec<Option<i32>>, Vec<VarId>, Option<Vec<VarId>>);
+type DivisibilityKey = (IntVarRef, IntVarRef);
+type DivisibilityGroups = BTreeMap<DivisibilityKey, BTreeSet<i64>>;
+type PrefixSetKey = (IntVarRef, Vec<i32>);
+type PrefixSetEntry = (i32, IntVarRef);
+type PrefixSetGroups = BTreeMap<PrefixSetKey, BTreeSet<PrefixSetEntry>>;
 
 const CP_ESTIMATE_BASE_BYTES: u128 = 64 * 1024;
-const MAX_LINEARIZED_AFFINE_OBJECTIVE_VARIABLES: usize = 32;
-
 #[inline]
 fn interrupted(stop: &AtomicBool) -> bool {
     stop.load(Ordering::Acquire)
@@ -25,6 +31,189 @@ fn interrupted(stop: &AtomicBool) -> bool {
 #[inline]
 fn wide(value: usize) -> u128 {
     u128::try_from(value).unwrap_or(u128::MAX)
+}
+
+/// Recover an unconditional affine definition of `objective` from a normalized
+/// linear equality. Only a unit coefficient is accepted, so the resulting view
+/// is an exact integer identity rather than a relaxation. The constant rhs is
+/// irrelevant to value directions and remains represented by the materialized
+/// objective variable itself.
+fn materialized_affine_view(model: &Model, objective: IntVarRef, stop: &AtomicBool) -> Option<(Vec<i64>, Vec<IntVarRef>)> {
+    for constraint in &model.constraints {
+        if interrupted(stop) {
+            return None;
+        }
+        let Constraint::Linear { terms, relation: Relation::Eq, .. } = constraint else {
+            continue;
+        };
+        let mut combined = BTreeMap::<IntVarRef, i64>::new();
+        let mut overflowed = false;
+        for &(coefficient, variable) in terms {
+            if interrupted(stop) {
+                return None;
+            }
+            let Some(sum) = combined.get(&variable).copied().unwrap_or(0).checked_add(coefficient) else {
+                overflowed = true;
+                break;
+            };
+            if sum == 0 {
+                combined.remove(&variable);
+            } else {
+                combined.insert(variable, sum);
+            }
+        }
+        if overflowed {
+            continue;
+        }
+        let Some(objective_coefficient) = combined.remove(&objective) else {
+            continue;
+        };
+        if objective_coefficient != 1 && objective_coefficient != -1 {
+            continue;
+        }
+        let mut coefficients = Vec::with_capacity(combined.len());
+        let mut variables = Vec::with_capacity(combined.len());
+        for (variable, coefficient) in combined {
+            let coefficient = if objective_coefficient == 1 { coefficient.checked_neg()? } else { coefficient };
+            coefficients.push(coefficient);
+            variables.push(variable);
+        }
+        if !variables.is_empty() {
+            return Some((coefficients, variables));
+        }
+    }
+    None
+}
+
+/// Match exactly `mod(variable, divisor) != 0` with a positive divisor greater
+/// than one. Keeping this deliberately narrow prevents unrelated modular
+/// intensions from being consumed by the aggregation pass.
+fn match_divisibility_exclusion(expr: &IntExpr) -> Option<(IntVarRef, i64)> {
+    let IntExpr::Ne(left, right) = expr else {
+        return None;
+    };
+    let modulo = match (left.as_ref(), right.as_ref()) {
+        (modulo @ IntExpr::Mod(_, _), IntExpr::Constant(0)) | (IntExpr::Constant(0), modulo @ IntExpr::Mod(_, _)) => modulo,
+        _ => return None,
+    };
+    let IntExpr::Mod(dividend, divisor) = modulo else {
+        return None;
+    };
+    let (IntExpr::Variable(variable), IntExpr::Constant(divisor)) = (dividend.as_ref(), divisor.as_ref()) else {
+        return None;
+    };
+    (*divisor > 1).then_some((*variable, *divisor))
+}
+
+/// Match exactly `x mod d != 0 || y mod d != 0` and canonicalize the variable
+/// pair. The two modulo operations must use the same divisor.
+fn match_shared_divisibility_exclusion(constraint: &Constraint) -> Option<(DivisibilityKey, i64)> {
+    let Constraint::Intension(IntExpr::Or(terms)) = constraint else {
+        return None;
+    };
+    let [left, right] = terms.as_slice() else {
+        return None;
+    };
+    let (left, left_divisor) = match_divisibility_exclusion(left)?;
+    let (right, right_divisor) = match_divisibility_exclusion(right)?;
+    if left_divisor != right_divisor {
+        return None;
+    }
+    let key = if left <= right { (left, right) } else { (right, left) };
+    Some((key, left_divisor))
+}
+
+fn collect_divisibility_groups(model: &Model, stop: &AtomicBool) -> Option<DivisibilityGroups> {
+    let mut groups = DivisibilityGroups::new();
+    for constraint in &model.constraints {
+        if interrupted(stop) {
+            return None;
+        }
+        if let Some((key, divisor)) = match_shared_divisibility_exclusion(constraint) {
+            groups.entry(key).or_default().insert(divisor);
+        }
+    }
+    Some(groups)
+}
+
+/// Match exactly
+/// `imp(gt(index, threshold), not(or(eq(slot, forbidden)...)))`.
+///
+/// `Err(())` denotes interruption, while `Ok(None)` deliberately leaves every
+/// near-match to the generic intension compiler.
+fn match_prefix_set_exclusion(constraint: &Constraint, stop: &AtomicBool) -> Result<Option<(PrefixSetKey, PrefixSetEntry)>, ()> {
+    if interrupted(stop) {
+        return Err(());
+    }
+    let Constraint::Intension(IntExpr::Imp(antecedent, consequent)) = constraint else {
+        return Ok(None);
+    };
+    let IntExpr::Gt(left, right) = antecedent.as_ref() else {
+        return Ok(None);
+    };
+    let (IntExpr::Variable(index), IntExpr::Constant(threshold)) = (left.as_ref(), right.as_ref()) else {
+        return Ok(None);
+    };
+    let Ok(threshold) = i32::try_from(*threshold) else {
+        return Ok(None);
+    };
+    if threshold == i32::MAX {
+        return Ok(None);
+    }
+    let IntExpr::Not(disjunction) = consequent.as_ref() else {
+        return Ok(None);
+    };
+    let IntExpr::Or(equalities) = disjunction.as_ref() else {
+        return Ok(None);
+    };
+    if equalities.is_empty() {
+        return Ok(None);
+    }
+
+    let mut slot = None;
+    let mut forbidden = BTreeSet::new();
+    for equality in equalities {
+        if interrupted(stop) {
+            return Err(());
+        }
+        let IntExpr::Eq(left, right) = equality else {
+            return Ok(None);
+        };
+        let (variable, value) = match (left.as_ref(), right.as_ref()) {
+            (IntExpr::Variable(variable), IntExpr::Constant(value)) | (IntExpr::Constant(value), IntExpr::Variable(variable)) => {
+                (*variable, *value)
+            }
+            _ => return Ok(None),
+        };
+        if slot.is_some_and(|expected| expected != variable) {
+            return Ok(None);
+        }
+        slot = Some(variable);
+        let Ok(value) = i32::try_from(value) else {
+            return Ok(None);
+        };
+        forbidden.insert(value);
+    }
+    if interrupted(stop) {
+        return Err(());
+    }
+    let slot = slot.expect("a non-empty disjunction establishes its slot variable");
+    let key = (*index, forbidden.into_iter().collect());
+    Ok(Some((key, (threshold, slot))))
+}
+
+fn collect_prefix_set_groups(model: &Model, stop: &AtomicBool) -> Option<PrefixSetGroups> {
+    let mut groups = PrefixSetGroups::new();
+    for constraint in &model.constraints {
+        let matched = match match_prefix_set_exclusion(constraint, stop) {
+            Ok(matched) => matched,
+            Err(()) => return None,
+        };
+        if let Some((key, entry)) = matched {
+            groups.entry(key).or_default().insert(entry);
+        }
+    }
+    Some(groups)
 }
 
 macro_rules! require_step {
@@ -167,9 +356,68 @@ impl CompiledCp {
             sets.push(CompiledSet { values, membership });
         }
 
+        let Some(divisibility_groups) = collect_divisibility_groups(model, stop) else {
+            return Ok(None);
+        };
+        let Some(prefix_set_groups) = collect_prefix_set_groups(model, stop) else {
+            return Ok(None);
+        };
+        let mut posted_divisibility_groups = BTreeSet::new();
+        let mut posted_prefix_set_groups = BTreeSet::new();
         for constraint in &model.constraints {
             if interrupted(stop) {
                 return Ok(None);
+            }
+            if let Some((key, _)) = match_shared_divisibility_exclusion(constraint) {
+                if posted_divisibility_groups.insert(key) {
+                    let divisors =
+                        divisibility_groups.get(&key).expect("every matched shared-divisibility exclusion belongs to a collected group");
+                    let mut physical_divisors = Vec::with_capacity(divisors.len());
+                    for &divisor in divisors {
+                        if interrupted(stop) {
+                            return Ok(None);
+                        }
+                        physical_divisors.push(divisor);
+                    }
+                    let (left, right) = key;
+                    if !divisibility::shared_divisibility_exclusion_interruptible(
+                        &mut solver,
+                        int_variables[left.0],
+                        int_variables[right.0],
+                        &physical_divisors,
+                        stop,
+                    ) {
+                        return Ok(None);
+                    }
+                }
+                continue;
+            }
+            let prefix_match = match match_prefix_set_exclusion(constraint, stop) {
+                Ok(matched) => matched,
+                Err(()) => return Ok(None),
+            };
+            if let Some((key, _)) = prefix_match {
+                if posted_prefix_set_groups.insert(key.clone()) {
+                    let entries = prefix_set_groups.get(&key).expect("every matched prefix exclusion belongs to a collected group");
+                    let mut physical_entries = Vec::with_capacity(entries.len());
+                    for &(threshold, slot) in entries {
+                        if interrupted(stop) {
+                            return Ok(None);
+                        }
+                        physical_entries.push((threshold, int_variables[slot.0]));
+                    }
+                    let (index, forbidden) = key;
+                    if !prefix_set::prefix_set_exclusion_interruptible(
+                        &mut solver,
+                        int_variables[index.0],
+                        &physical_entries,
+                        &forbidden,
+                        stop,
+                    ) {
+                        return Ok(None);
+                    }
+                }
+                continue;
             }
             if post_constraint(&mut solver, &int_variables, &sets, constraint, stop)?.is_none() {
                 return Ok(None);
@@ -183,7 +431,20 @@ impl CompiledCp {
             }
             objectives.push(match objective {
                 Objective::IntExpr { minimize, expr: IntExpr::Variable(variable) } => {
-                    Ok(PhysicalObjective::Var(*minimize, int_variables[variable.0]))
+                    let materialized = int_variables[variable.0];
+                    let affine_view = materialized_affine_view(model, *variable, stop);
+                    if interrupted(stop) {
+                        return Ok(None);
+                    }
+                    Ok(match affine_view {
+                        Some((coefficients, variables)) => PhysicalObjective::VarWithAffine(
+                            *minimize,
+                            materialized,
+                            coefficients,
+                            variables.into_iter().map(|variable| int_variables[variable.0]).collect(),
+                        ),
+                        None => PhysicalObjective::Var(*minimize, materialized),
+                    })
                 }
                 Objective::IntExpr { minimize, expr } => {
                     let Some(expression) = compile_expr(expr, &int_variables, stop)? else {
@@ -194,9 +455,7 @@ impl CompiledCp {
                         return Ok(None);
                     }
                     Ok(match affine {
-                        Some((0, coefficients, variables)) if variables.len() <= MAX_LINEARIZED_AFFINE_OBJECTIVE_VARIABLES => {
-                            PhysicalObjective::Linear(*minimize, coefficients, variables)
-                        }
+                        Some((0, coefficients, variables)) => PhysicalObjective::Linear(*minimize, coefficients, variables),
                         Some(_) | None => PhysicalObjective::Expr(*minimize, expression),
                     })
                 }
@@ -263,12 +522,6 @@ impl CompiledCp {
         &self.sets
     }
 
-    pub(crate) fn compile_expression(&self, expression: &IntExpr) -> Result<Expr, CpCompileError> {
-        let stop = AtomicBool::new(false);
-        self.compile_expression_interruptible(expression, &stop)?
-            .ok_or_else(|| CpCompileError::new("CP expression compilation was interrupted unexpectedly"))
-    }
-
     pub(crate) fn compile_expression_interruptible(&self, expression: &IntExpr, stop: &AtomicBool) -> CompileStep<Expr> {
         compile_expr(expression, &self.int_variables, stop)
     }
@@ -276,7 +529,7 @@ impl CompiledCp {
     pub(crate) fn fix_objective(&self, problem: &mut Problem, tier: usize, value: i64) -> Result<(), CpCompileError> {
         let objective = self.objectives.get(tier).ok_or_else(|| CpCompileError::new(format!("unknown CP objective tier {tier}")))?;
         let expression = match objective {
-            PhysicalObjective::Var(_, variable) => Expr::Var(*variable),
+            PhysicalObjective::Var(_, variable) | PhysicalObjective::VarWithAffine(_, variable, _, _) => Expr::Var(*variable),
             PhysicalObjective::Linear(_, coefficients, variables) => Expr::Add(
                 coefficients
                     .iter()
@@ -422,8 +675,35 @@ fn estimate_semantic_bytes(model: &Model, stop: &AtomicBool) -> Option<u64> {
         }
         bytes = bytes.saturating_add(wide(set.possible.len()).saturating_mul(1536));
     }
+    let divisibility_groups = collect_divisibility_groups(model, stop)?;
+    for (&(left, right), divisors) in &divisibility_groups {
+        if interrupted(stop) {
+            return None;
+        }
+        let scratch_cells = domain_cardinality(model, left).max(domain_cardinality(model, right));
+        bytes = bytes
+            .saturating_add(2048)
+            .saturating_add(wide(divisors.len()).saturating_mul(16))
+            .saturating_add(scratch_cells.saturating_mul(4));
+    }
+    let prefix_set_groups = collect_prefix_set_groups(model, stop)?;
+    for ((_, forbidden), entries) in &prefix_set_groups {
+        if interrupted(stop) {
+            return None;
+        }
+        bytes = bytes
+            .saturating_add(4096)
+            .saturating_add(wide(forbidden.len()).saturating_mul(16))
+            .saturating_add(wide(entries.len()).saturating_mul(192));
+    }
     for constraint in &model.constraints {
-        bytes = bytes.saturating_add(estimate_constraint_bytes(model, constraint, stop)?);
+        let prefix_match = match match_prefix_set_exclusion(constraint, stop) {
+            Ok(matched) => matched,
+            Err(()) => return None,
+        };
+        if match_shared_divisibility_exclusion(constraint).is_none() && prefix_match.is_none() {
+            bytes = bytes.saturating_add(estimate_constraint_bytes(model, constraint, stop)?);
+        }
     }
     for objective in &model.objectives {
         if interrupted(stop) {
@@ -690,7 +970,17 @@ fn estimate_global_bytes(model: &Model, global: &IntGlobalConstraint, stop: &Ato
         IntGlobalConstraint::Circuit { successors, .. } => {
             4096u128.saturating_add(domain_cells(model, successors, stop)?.saturating_mul(64))
         }
-        IntGlobalConstraint::NoOverlap { starts, .. } => 4096u128.saturating_add(wide(starts.len()).saturating_mul(512)),
+        IntGlobalConstraint::NoOverlap { starts, .. } => {
+            let task_count = wide(starts.len());
+            let total_domain_values = domain_cells(model, starts, stop)?;
+            if scheduling::no_overlap_uses_pair_decomposition(starts.len(), total_domain_values) {
+                let pairs = task_count.saturating_mul(task_count.saturating_sub(1)) / 2;
+                let pair_domain_work = total_domain_values.saturating_mul(task_count.saturating_sub(1));
+                4096u128.saturating_add(pairs.saturating_mul(2048)).saturating_add(pair_domain_work.saturating_mul(4))
+            } else {
+                4096u128.saturating_add(task_count.saturating_mul(512))
+            }
+        }
         IntGlobalConstraint::OptionalNoOverlap { starts, .. } => {
             let n = wide(starts.len());
             let pairs = n.saturating_mul(n.saturating_sub(1)) / 2;

@@ -19,16 +19,12 @@ use crate::orchestrator::{execute_workers, execute_workers_silent, merge_search_
 use crate::problem::{Objective, Problem};
 use crate::search::{
     decide_sat_assuming_seeded_with_scope, decide_sat_shared_seeded, find_one_seeded_with_scope, optimize_seeded_with_scope,
-    probe_seeded_with_scope, split_cube_seeded_with_scope, Objective as SearchObjective, SolveStats,
+    probe_seeded_with_scope, split_cube_seeded_with_scope, SolveStats,
 };
 use crate::store::Solver;
 
-const DIVERSIFIED_DIVE_CONFLICTS: u64 = 768;
 const GUARDED_SUM_DIVE_CONFLICTS: u64 = 4_096;
-const STANDARD_DIVE_OFFSETS: &[u64] = &[1];
 const GUARDED_SUM_DIVE_OFFSETS: &[u64] = &[1, 2, 4, 8];
-const MIN_DIVERSIFIED_DIVE_VARIABLES: usize = 64;
-const MIN_DIVERSIFIED_DIVE_OBJECTIVE_TERMS: usize = 32;
 
 /// Solver execution settings. Parallel search is opt-in with `workers > 1`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,11 +66,12 @@ impl SearchGuidance {
     }
 }
 
-/// Select symbolic COPs where bounded seeded dives are cheap relative to the
-/// complete search. Compact guarded sums have their own specialized hint and
-/// benefit even below the generic size threshold. Explicitly bounded and
-/// user-directed searches retain their requested trajectory.
-pub(crate) fn uses_diversified_dive(problem: &Problem, options: RunOptions, guidance: &SearchGuidance) -> bool {
+/// Select COPs for a bounded objective-guided search before the complete pass.
+/// Only an objective with a compact, exact structural search policy may delay
+/// that pass. A wide affine objective alone is not evidence that a sequential
+/// dive will repay its cost, and using its size as a proxy can starve the
+/// canonical feasibility trajectory.
+pub(crate) fn uses_bounded_objective_dive(problem: &Problem, options: RunOptions, guidance: &SearchGuidance) -> bool {
     if options.workers != 1
         || options.split
         || options.probes != 0
@@ -85,36 +82,20 @@ pub(crate) fn uses_diversified_dive(problem: &Problem, options: RunOptions, guid
         return false;
     }
 
-    if matches!(problem.objective.as_ref(), Some(Objective::Expr(true, expression)) if GuardedSum::compile(expression).is_some()) {
-        return true;
-    }
-    if problem.search.len() < MIN_DIVERSIFIED_DIVE_VARIABLES {
-        return false;
-    }
-
-    let objective_terms = match problem.objective.as_ref() {
-        Some(Objective::Linear(_, coefficients, _)) => coefficients.iter().filter(|&&coefficient| coefficient != 0).count(),
-        Some(Objective::Expr(_, expression)) => {
-            let mut variables = Vec::new();
-            expression.collect_vars(&mut variables);
-            variables.len()
-        }
-        Some(Objective::Var(_, _)) | None => 0,
-    };
-    objective_terms >= MIN_DIVERSIFIED_DIVE_OBJECTIVE_TERMS
+    matches!(problem.objective.as_ref(), Some(Objective::Expr(true, expression)) if GuardedSum::compile(expression).is_some())
 }
 
-fn diversified_dive_offsets(problem: &Problem) -> &'static [u64] {
+fn bounded_objective_dive_offsets(problem: &Problem) -> &'static [u64] {
     match problem.objective.as_ref() {
         Some(Objective::Expr(true, expression)) if GuardedSum::compile(expression).is_some() => GUARDED_SUM_DIVE_OFFSETS,
-        Some(_) | None => STANDARD_DIVE_OFFSETS,
+        Some(_) | None => &[],
     }
 }
 
-fn diversified_dive_conflicts(problem: &Problem) -> u64 {
+fn bounded_objective_dive_conflicts(problem: &Problem) -> u64 {
     match problem.objective.as_ref() {
         Some(Objective::Expr(true, expression)) if GuardedSum::compile(expression).is_some() => GUARDED_SUM_DIVE_CONFLICTS,
-        Some(_) | None => DIVERSIFIED_DIVE_CONFLICTS,
+        Some(_) | None => 0,
     }
 }
 
@@ -435,18 +416,16 @@ fn optimize_worker(
     clause_worker: Option<usize>,
     conflict_budget: Option<u64>,
     guidance: &SearchGuidance,
-    import_symbolic_incumbent: bool,
 ) -> (SolveStats, bool, bool) {
     let minimizing = objective.minimizing();
     let materialized = objective.var().is_some();
     let sharing = if materialized { clause_worker.map(|worker| ClauseSharing::new(Arc::clone(&shared.clauses), worker)) } else { None };
-    // Concurrent symbolic workers must keep independent bound propagators. An
-    // exact worker may instead import a stable incumbent supplied before that
-    // worker starts. Use a snapshot so this exception cannot silently become
-    // asynchronous symbolic bound sharing if the caller later grows a worker.
+    // Concurrent symbolic workers must keep independent bound propagators, so
+    // each one imports a stable snapshot of the latest verified incumbent.
+    // Materialized objectives can safely share the atomic cutoff directly.
     // CopShared already reserves i64::MIN and i64::MAX as absence sentinels, so
     // this path deliberately preserves its inability to import those values.
-    let symbolic_snapshot = (!materialized && import_symbolic_incumbent).then(|| AtomicI64::new(shared.best.load(Ordering::Acquire)));
+    let symbolic_snapshot = (!materialized).then(|| AtomicI64::new(shared.best.load(Ordering::Acquire)));
     let shared_bound = if materialized { Some(&shared.best) } else { symbolic_snapshot.as_ref() };
     let mut improved = false;
     let (_, stats, complete) = optimize_seeded_with_scope(
@@ -519,6 +498,7 @@ fn run_lns_worker(
             None,
             Some(lns.budget()),
             guidance,
+            false,
         );
         if improved {
             shared.lns_improved.fetch_add(1, Ordering::Relaxed);
@@ -541,17 +521,19 @@ fn optimize_worker_with_seed(
     clause_worker: Option<usize>,
     conflict_budget: Option<u64>,
     guidance: &SearchGuidance,
+    bounded_objective_dive: bool,
 ) -> (SolveStats, bool, bool) {
     let minimizing = objective.minimizing();
     let materialized = objective.var().is_some();
     let sharing = if materialized { clause_worker.map(|worker| ClauseSharing::new(Arc::clone(&shared.clauses), worker)) } else { None };
     let shared_bound = materialized.then_some(&shared.best);
     let mut improved = false;
+    let search_objective = if bounded_objective_dive { objective.bounded_dive_search() } else { objective.search() };
     let (_, stats, complete) = optimize_seeded_with_scope(
         solver,
         vars,
         guidance.primary_branch_scope.as_deref(),
-        objective.search(),
+        search_objective,
         minimizing,
         context.stop(),
         seed,
@@ -814,11 +796,11 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
                 }
                 let vars = &model.search;
                 if !options.split {
-                    let diversified_dive = !has_initial_incumbent && uses_diversified_dive(&model, options, &guidance);
+                    let bounded_objective_dive = !has_initial_incumbent && uses_bounded_objective_dive(&model, options, &guidance);
                     let mut stats = SolveStats::default();
-                    if diversified_dive {
-                        let dive_conflicts = diversified_dive_conflicts(&model);
-                        for &seed_offset in diversified_dive_offsets(&model) {
+                    if bounded_objective_dive {
+                        let dive_conflicts = bounded_objective_dive_conflicts(&model);
+                        for &seed_offset in bounded_objective_dive_offsets(&model) {
                             if context.is_cancelled() {
                                 break;
                             }
@@ -835,14 +817,16 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
                                 None,
                                 Some(dive_conflicts),
                                 &guidance,
+                                true,
                             );
                             merge_search_stats(&mut stats, dive_stats);
                         }
                     }
 
                     // The proof pass always starts from the immutable prepared
-                    // root. Completion of the bounded dive is deliberately
-                    // ignored, so only this unbounded pass can certify optimality.
+                    // root with its ordinary branching policy. Every verified
+                    // incumbent, whether supplied by a warm start or produced
+                    // by the bounded dive, enters only as a strict cutoff.
                     let mut solver = std::mem::take(&mut model.solver);
                     let source = WorkerSource { kind: "portfolio", worker: context.worker() };
                     let (exact_stats, complete, _) = optimize_worker(
@@ -855,7 +839,6 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
                         Some(context.worker()),
                         worker_conflict_quota(options.conflict_limit, context.worker(), regular_workers),
                         &guidance,
-                        diversified_dive || has_initial_incumbent,
                     );
                     merge_search_stats(&mut stats, exact_stats);
                     if complete {
@@ -867,7 +850,6 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
 
                 let split_target = 2 * regular_workers;
                 let split_limit = 4 * regular_workers as u64;
-                let (_, obj) = var_objective.expect("symbolic objective cannot split");
                 let mut stats = SolveStats::default();
                 while let Some(mut cube) = shared.work.take(context.stop()) {
                     while shared.work.needs_split(split_target, split_limit) {
@@ -894,11 +876,12 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
                         (SolveStats::default(), false)
                     } else {
                         let mut solver = model.solver.clone();
+                        let search_objective = model.objective.as_ref().expect("COP lost its objective").search();
                         let (_, job_stats, complete) = optimize_seeded_with_scope(
                             &mut solver,
                             vars,
                             guidance.primary_branch_scope.as_deref(),
-                            SearchObjective::Var(obj),
+                            search_objective,
                             minimizing,
                             context.stop(),
                             context.seed(),
@@ -936,6 +919,10 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
             if printed.is_none_or(|old| if minimizing { value < old } else { value > old }) {
                 printed = Some(value);
                 on_improvement(value, solution.as_deref());
+                if stop.load(Ordering::Acquire) {
+                    shared.stop();
+                    return Ok(EventControl::Stop);
+                }
                 if verbose {
                     if let Err(error) = writeln!(w, "o {value}")
                         .and_then(|_| writeln!(w, "c incumbent {value} source {} worker {}", source.kind, source.worker))

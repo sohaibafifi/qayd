@@ -238,6 +238,63 @@ impl Domain {
         }
     }
 
+    /// Append absent root-supported values inside the current bounds while
+    /// polling `should_stop`. On interruption, values appended by this call
+    /// are removed again so callers never observe a partial snapshot.
+    pub(crate) fn append_removed_values_until(&self, trail: &Trail, out: &mut Vec<i32>, should_stop: &dyn Fn() -> bool) -> bool {
+        let initial_len = out.len();
+        if should_stop() {
+            return false;
+        }
+        let min = self.min(trail);
+        let max = self.max(trail);
+        let completed = match &self.values {
+            ValueMap::Bounds { holes, holes_len, .. } => {
+                for &value in &holes[..trail.get(*holes_len) as usize] {
+                    if should_stop() {
+                        out.truncate(initial_len);
+                        return false;
+                    }
+                    if min < value && value < max {
+                        out.push(value);
+                    }
+                }
+                true
+            }
+            ValueMap::Dense { root_values: Some(values), .. } | ValueMap::Sparse { values } => {
+                for &value in values.iter() {
+                    if should_stop() {
+                        out.truncate(initial_len);
+                        return false;
+                    }
+                    if min < value && value < max && !self.contains(value, trail) {
+                        out.push(value);
+                    }
+                }
+                true
+            }
+            ValueMap::Dense { root_values: None, .. } => {
+                for index in 0..self.dense.len() {
+                    if should_stop() {
+                        out.truncate(initial_len);
+                        return false;
+                    }
+                    let value = self.value_of(index);
+                    if min < value && value < max && !self.contains(value, trail) {
+                        out.push(value);
+                    }
+                }
+                true
+            }
+        };
+        if completed && !should_stop() {
+            true
+        } else {
+            out.truncate(initial_len);
+            false
+        }
+    }
+
     /// Sorted root support when this domain was created from an explicit set.
     ///
     /// This is independent of the selected physical storage. Compact explicit

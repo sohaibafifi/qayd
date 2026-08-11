@@ -7,6 +7,7 @@ use qayd::constraints::graph::circuit;
 use qayd::constraints::linear::Relation;
 use qayd::constraints::primitives::all_different;
 use qayd::constraints::scheduling::{bin_packing, cumulative, cumulative_var, knapsack, no_overlap};
+use qayd::model::{Constraint, IntGlobalConstraint, Model};
 mod common;
 
 use common::oracle;
@@ -126,6 +127,59 @@ fn no_overlap_rejects_overlap_created_during_propagation() {
     let starts = [s.new_var_set(&[0, 1]), s.new_var_set(&[0, 1]), s.new_var_set(&[1])];
     no_overlap(&mut s, &starts, &[1, 1, 1]);
     assert!(enumerate(&mut s, &starts).is_empty());
+}
+
+#[test]
+fn no_overlap_removes_pairwise_unsupported_interior_starts() {
+    let mut solver = Solver::new();
+    // Decomposition work uses cardinality, not the million-wide numeric span.
+    let first = solver.new_var_set(&[0, 2, 1_000_000]);
+    let second = solver.new_var_set(&[1, 3]);
+    no_overlap(&mut solver, &[first, second], &[2, 2]);
+    solver.enqueue_all();
+    solver.propagate().unwrap();
+
+    assert!(solver.store.contains(first, 0));
+    assert!(!solver.store.contains(first, 2));
+    assert!(solver.store.contains(first, 1_000_000));
+}
+
+#[test]
+fn no_overlap_adapts_posting_to_pair_domain_work() {
+    let mut small = Solver::new();
+    let small_starts = (0..4).map(|_| small.new_var_range(0, 1)).collect::<Vec<_>>();
+    no_overlap(&mut small, &small_starts, &[1; 4]);
+    assert_eq!(small.num_propagators(), 6, "four small tasks should post one propagator per pair");
+
+    let mut medium = Solver::new();
+    let medium_starts = (0..4).map(|_| medium.new_var_range(0, 4_000)).collect::<Vec<_>>();
+    no_overlap(&mut medium, &medium_starts, &[1; 4]);
+    assert_eq!(medium.num_propagators(), 6, "bounded pair-domain work should be decomposed independently of domain storage");
+
+    let mut large = Solver::new();
+    let large_starts = (0..33).map(|_| large.new_var_range(0, 64)).collect::<Vec<_>>();
+    no_overlap(&mut large, &large_starts, &[1; 33]);
+    assert_eq!(large.num_propagators(), 1, "large pair-domain work should retain one global propagator");
+}
+
+#[test]
+fn no_overlap_validation_rejects_negative_and_accepts_i64_durations() {
+    let mut negative = Model::new();
+    let starts = vec![negative.int_range(0, 10), negative.int_range(0, 10)];
+    negative.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::NoOverlap { starts, durations: vec![-1, 1] }));
+    let errors = negative.validate().expect_err("negative no-overlap durations must be rejected").join("\n");
+    assert!(errors.contains("interval duration must be non-negative"), "missing negative-duration diagnostic: {errors}");
+
+    let mut wide = Model::new();
+    let starts = vec![wide.int_range(i32::MIN, i32::MIN), wide.int_range(i32::MAX, i32::MAX)];
+    wide.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::NoOverlap { starts, durations: vec![3_000_000_000, 1] }));
+    wide.validate().expect("integer no-overlap uses i64 durations");
+
+    let mut solver = Solver::new();
+    let first = solver.new_var_set(&[i32::MIN]);
+    let second = solver.new_var_set(&[i32::MAX]);
+    no_overlap(&mut solver, &[first, second], &[3_000_000_000, 1]);
+    assert_eq!(enumerate(&mut solver, &[first, second]), BTreeSet::from([vec![i32::MIN, i32::MAX]]));
 }
 
 #[test]

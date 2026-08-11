@@ -163,8 +163,35 @@ enum DomainDecision {
 #[derive(Clone, Copy)]
 pub(crate) enum Objective<'a> {
     Var(VarId),
-    Linear { coeffs: &'a [i64], vars: &'a [VarId] },
+    /// An authoritative materialized objective whose affine definition remains
+    /// available to the complete pass. Wide views defer their value guidance
+    /// until feasibility has produced an incumbent.
+    VarWithAffine {
+        objective: VarId,
+        coeffs: &'a [i64],
+        vars: &'a [VarId],
+    },
+    /// The same authoritative materialized objective, with its affine view
+    /// enabled from the first decision of a bounded objective dive.
+    BoundedDiveVarWithAffine {
+        objective: VarId,
+        coeffs: &'a [i64],
+        vars: &'a [VarId],
+    },
+    Linear {
+        coeffs: &'a [i64],
+        vars: &'a [VarId],
+    },
+    /// A symbolic affine objective explicitly enabled from the start of a
+    /// bounded objective dive.
+    BoundedDiveLinear {
+        coeffs: &'a [i64],
+        vars: &'a [VarId],
+    },
     Expr(&'a Expr),
+    /// A symbolic expression evaluated like [`Self::Expr`] but subject to the
+    /// bounded-dive decision budget before the complete pass starts.
+    BoundedDiveExpr(&'a Expr),
 }
 
 #[inline]

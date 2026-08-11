@@ -3,7 +3,7 @@
 //! Each callback emits frontend-neutral declarations. Unsupported forms set
 //! `error`; backend compilation happens only after parsing has completed.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use xcsp3_rust_parser::data_structs::expression_tree::xcsp3_utils::{ExpressionTree, Operator as EOp, TreeNode};
 use xcsp3_rust_parser::data_structs::xrelational_operand::xcsp3_core::Operand;
@@ -261,8 +261,29 @@ fn ones(n: usize) -> Vec<i64> {
 }
 
 fn weighted_sum_expr(coeffs: &[i64], vars: &[IntVarRef]) -> Expr {
-    let mut terms = Vec::with_capacity(vars.len());
-    for (&coeff, &var) in coeffs.iter().zip(vars) {
+    let mut combined = BTreeMap::<IntVarRef, i128>::new();
+    let mut normalized = true;
+    for (&coefficient, &variable) in coeffs.iter().zip(vars) {
+        let Some(sum) = combined.get(&variable).copied().unwrap_or(0).checked_add(i128::from(coefficient)) else {
+            normalized = false;
+            break;
+        };
+        if sum == 0 {
+            combined.remove(&variable);
+        } else {
+            combined.insert(variable, sum);
+        }
+    }
+    let normalized_terms = normalized.then(|| {
+        combined
+            .into_iter()
+            .map(|(variable, coefficient)| i64::try_from(coefficient).ok().map(|coefficient| (coefficient, variable)))
+            .collect::<Option<Vec<_>>>()
+    });
+    let terms_and_variables = normalized_terms.flatten().unwrap_or_else(|| coeffs.iter().copied().zip(vars.iter().copied()).collect());
+
+    let mut terms = Vec::with_capacity(terms_and_variables.len());
+    for (coeff, var) in terms_and_variables {
         match coeff {
             0 => {}
             1 => terms.push(expr::var(var)),
@@ -1615,10 +1636,14 @@ impl XcspCallback for Model {
             let d = i64s(lengths);
             let origins = starts.iter().copied().map(|start| vec![start]).collect::<Vec<_>>();
             let len = lengths.iter().map(|&length| vec![expr::int(length as i64)]).collect::<Vec<_>>();
-            if zero_ignored || lengths.iter().any(|&length| length <= 0) {
-                self.post_diffn(origins, len, zero_ignored)?;
-            } else {
+            // With strictly positive fixed durations the zeroIgnored flag is
+            // semantically inert. Keep the compact one-dimensional global in
+            // that common case instead of expanding every pair into a generic
+            // intension constraint.
+            if lengths.iter().all(|&length| length > 0) {
                 no_overlap(&mut self.package.model, &starts, &d);
+            } else {
+                self.post_diffn(origins, len, zero_ignored)?;
             }
             Ok(())
         });
@@ -1980,9 +2005,19 @@ impl Model {
     }
 
     fn set_expr_objective(&mut self, tree: &ExpressionTree, minimize: bool) -> Result<(), String> {
-        let objective_expr = self.tree(tree)?;
-        let aux = self.aux_for(objective_expr);
-        self.objective = Some(SemanticObjective::IntExpr { minimize, expr: expr::var(aux) });
+        let expression = self.tree(tree)?;
+        let expression = match expression {
+            expression @ Expr::Variable(_) => expression,
+            expression => {
+                let (lo, hi) = self.expr_bounds(&expression);
+                if i32::try_from(lo).is_ok() && i32::try_from(hi).is_ok() {
+                    expr::var(self.aux_for(expression))
+                } else {
+                    expression
+                }
+            }
+        };
+        self.objective = Some(SemanticObjective::IntExpr { minimize, expr: expression });
         Ok(())
     }
 
@@ -2050,30 +2085,39 @@ impl Model {
                 if !aligned {
                     return Err("objective: coeffs/terms length mismatch".to_string());
                 }
-                // Saturating throughout: extreme coeffs (near i32::MAX) over wide
-                // domains can exceed i64, and a wrapped span would slip past the
-                // guard below. Saturating fails safe into the Linear fallback.
-                let (mut lo, mut hi) = (0i64, 0i64);
-                for (&c, &v) in coeffs.iter().zip(&vars) {
-                    let (vmin, vmax) = (i64::from(self.min(v)), i64::from(self.max(v)));
-                    let (a, b) = if c >= 0 {
-                        (c.saturating_mul(vmin), c.saturating_mul(vmax))
+                // Materialize every affine objective whose complete range fits
+                // comfortably in one integer variable. The CP compiler can
+                // recover the defining equality as an affine search view, while
+                // bounds continue to use the strongly propagated objective
+                // variable.
+                let mut bounds = Some((0i128, 0i128));
+                for (&coefficient, &variable) in coeffs.iter().zip(&vars) {
+                    let (minimum, maximum) = (i128::from(self.min(variable)), i128::from(self.max(variable)));
+                    let coefficient = i128::from(coefficient);
+                    let (lower, upper) = if coefficient >= 0 {
+                        (coefficient * minimum, coefficient * maximum)
                     } else {
-                        (c.saturating_mul(vmax), c.saturating_mul(vmin))
+                        (coefficient * maximum, coefficient * minimum)
                     };
-                    lo = lo.saturating_add(a);
-                    hi = hi.saturating_add(b);
+                    bounds = bounds.and_then(|(lo, hi)| Some((lo.checked_add(lower)?, hi.checked_add(upper)?)));
                 }
-                if hi.saturating_sub(lo) > MAX_MATERIALIZED_OBJECTIVE_SPAN {
+                let materialized_bounds = bounds.and_then(|(lo, hi)| {
+                    let span = hi.checked_sub(lo)?;
+                    (span <= i128::from(MAX_MATERIALIZED_OBJECTIVE_SPAN))
+                        .then(|| i32::try_from(lo).ok().zip(i32::try_from(hi).ok()))
+                        .flatten()
+                });
+                if materialized_bounds.is_none() {
                     self.objective = Some(SemanticObjective::IntExpr { minimize, expr: weighted_sum_expr(&coeffs, &vars) });
                     return Ok(());
                 }
-                let obj = self.package.model.int_range(clamp(lo), clamp(hi));
-                let mut cc = coeffs;
-                cc.push(-1);
-                let mut vv = vars;
-                vv.push(obj);
-                linear(&mut self.package.model, &cc, &vv, Relation::Eq, 0);
+                let (lo, hi) = materialized_bounds.expect("checked above");
+                let obj = self.package.model.int_range(lo, hi);
+                let mut coefficients = coeffs;
+                coefficients.push(-1);
+                let mut variables = vars;
+                variables.push(obj);
+                linear(&mut self.package.model, &coefficients, &variables, Relation::Eq, 0);
                 obj
             }
             Minimum | Maximum => {

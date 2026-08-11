@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Reproducible XCSP25 FAST COP campaign: Qayd, ACE, ACE-rr, and Choco.
-# Usage: pipeline.sh [CPU_SECONDS] [LIMIT] [OUTPUT_DIR] [MEMORY_MB] [PER_FAMILY] [JOBS]
+# Usage: pipeline.sh [CPU_SECONDS] [LIMIT] [OUTPUT_DIR] [MEMORY_MB] [PER_FAMILY] [JOBS] [CHECKER_MEMORY_MB]
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -11,6 +11,12 @@ OUTPUT_DIR="${3:-$HERE/results/$(date -u +%Y%m%dT%H%M%SZ)}"
 MEMORY_MB="${4:-65536}"
 PER_FAMILY="${5:-0}"
 JOBS="${6:-1}"
+if [[ "$MEMORY_MB" -lt 4096 ]]; then
+    DEFAULT_CHECKER_MEMORY_MB="$MEMORY_MB"
+else
+    DEFAULT_CHECKER_MEMORY_MB=4096
+fi
+CHECKER_MEMORY_MB="${7:-$DEFAULT_CHECKER_MEMORY_MB}"
 DATA="$ROOT/data/XCSP25/COP25"
 
 if ! [[ "$CPU_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
@@ -31,6 +37,10 @@ if ! [[ "$PER_FAMILY" =~ ^(0|[1-9][0-9]*)$ ]]; then
 fi
 if ! [[ "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
     echo "JOBS must be a positive integer" >&2
+    exit 2
+fi
+if ! [[ "$CHECKER_MEMORY_MB" =~ ^[1-9][0-9]*$ ]]; then
+    echo "CHECKER_MEMORY_MB must be a positive integer" >&2
     exit 2
 fi
 if [[ "$LIMIT" -gt 0 && "$PER_FAMILY" -gt 0 ]]; then
@@ -68,6 +78,7 @@ python3 "$HERE/run.py" \
     --cpu-limit "$CPU_SECONDS" \
     --wall-limit "$WALL_SECONDS" \
     --memory-mb "$MEMORY_MB" \
+    --checker-memory-mb "$CHECKER_MEMORY_MB" \
     --jobs "$JOBS" \
     --seed 0 \
     "${SELECTION_ARGS[@]}" \
@@ -75,6 +86,7 @@ python3 "$HERE/run.py" \
     --log-dir "$OUTPUT_DIR/logs"
 
 python3 "$HERE/score.py" "$OUTPUT_DIR/results.jsonl" \
+    --manifest "$OUTPUT_DIR/manifest.v1.json" \
     --mode both \
     --invalidation family \
     --output "$OUTPUT_DIR/scores.json"

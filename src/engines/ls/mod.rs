@@ -5,5 +5,7 @@
 #[doc(hidden)]
 #[allow(dead_code)]
 pub(crate) mod cop;
+pub(crate) mod disjunctive_schedule;
 #[allow(dead_code)]
 pub(crate) mod lists;
+pub(crate) mod scenario_schedule;

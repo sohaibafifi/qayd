@@ -12,9 +12,10 @@ use qayd::model::{
 #[cfg(feature = "python")]
 use qayd::orchestrator::TerminationReason;
 use qayd::orchestrator::{
-    audit_cp_repair_completion, audit_interrupt_next_transfer_replay, compile_collection_plan, compile_model_plan, solve_collection_plan,
-    solve_model_silent, solve_model_with_budget, EngineKind, EventControl, EventSink, ExecutablePlan, RoutingControls, SolveBudget,
-    SolveError, SolveEvent, SolveLimits, SolveMode, SolveRequest, SolveResult, SolveStatus, VerificationLevel,
+    audit_cp_repair_completion, audit_interrupt_next_transfer_replay, audit_partial_cp_repair_search_rejection, compile_collection_plan,
+    compile_model_plan, solve_collection_plan, solve_model_silent, solve_model_with_budget, EngineKind, EventControl, EventSink,
+    ExecutablePlan, RoutingControls, SolveBudget, SolveError, SolveEvent, SolveLimits, SolveMode, SolveRequest, SolveResult, SolveStatus,
+    VerificationLevel,
 };
 fn count(list: usize) -> Reduction {
     let mut arena = ExprArena::default();
@@ -374,13 +375,13 @@ fn guarded_mismatch_cop_uses_a_verified_integer_warm_start() {
     let cell = model.int_range(0, 0);
     let guard = model.bool_var();
     let index = model.int_range(0, 0);
-    let letter = model.bool_var();
+    let symbol = model.bool_var();
     let mismatch = model.bool_var();
     let mismatch_count = model.bool_var();
-    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Element { array: vec![cell], index, value: letter }));
+    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Element { array: vec![cell], index, value: symbol }));
     model.add_constraint(Constraint::Intension(IntExpr::Eq(
         Box::new(IntExpr::Variable(mismatch)),
-        Box::new(IntExpr::Ne(Box::new(IntExpr::Variable(letter)), Box::new(IntExpr::Constant(1)))),
+        Box::new(IntExpr::Ne(Box::new(IntExpr::Variable(symbol)), Box::new(IntExpr::Constant(1)))),
     )));
     model.add_constraint(Constraint::Linear { terms: vec![(1, mismatch), (-1, mismatch_count)], relation: Relation::Eq, rhs: 0 });
     model.add_constraint(Constraint::Intension(IntExpr::Or(vec![
@@ -400,7 +401,7 @@ fn guarded_mismatch_cop_uses_a_verified_integer_warm_start() {
     assert_eq!(result.status(), SolveStatus::Optimal);
     assert_eq!(result.primal().unwrap().objectives(), [7]);
     assert!(result.reports().iter().any(|report| report.engine == Some(EngineKind::IntegerLocalSearch)
-        && report.metadata.iter().any(|(key, value)| key == "ls_role" && value == "guarded_warm_start")));
+        && report.metadata.iter().any(|(key, value)| key == "ls_role" && value == "structural_local_search_warm_start")));
     assert!(result.reports().iter().any(|report| report.engine == Some(EngineKind::IntegerExact)));
 }
 
@@ -410,11 +411,11 @@ fn direct_guarded_element_cop_uses_a_verified_integer_warm_start() {
     let cell = model.int_range(1, 1);
     let guard = model.bool_var();
     let index = model.int_range(0, 0);
-    let letter = model.bool_var();
-    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Element { array: vec![cell], index, value: letter }));
+    let symbol = model.bool_var();
+    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Element { array: vec![cell], index, value: symbol }));
     model.add_constraint(Constraint::Intension(IntExpr::Or(vec![
         IntExpr::Eq(Box::new(IntExpr::Variable(guard)), Box::new(IntExpr::Constant(0))),
-        IntExpr::Eq(Box::new(IntExpr::Variable(letter)), Box::new(IntExpr::Constant(1))),
+        IntExpr::Eq(Box::new(IntExpr::Variable(symbol)), Box::new(IntExpr::Constant(1))),
     ])));
     model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table {
         variables: vec![index],
@@ -429,7 +430,7 @@ fn direct_guarded_element_cop_uses_a_verified_integer_warm_start() {
     assert_eq!(result.status(), SolveStatus::Optimal);
     assert_eq!(result.primal().unwrap().objectives(), [7]);
     assert!(result.reports().iter().any(|report| report.engine == Some(EngineKind::IntegerLocalSearch)
-        && report.metadata.iter().any(|(key, value)| key == "ls_role" && value == "guarded_warm_start")));
+        && report.metadata.iter().any(|(key, value)| key == "ls_role" && value == "structural_local_search_warm_start")));
 }
 
 #[test]
@@ -439,11 +440,11 @@ fn disconnected_direct_guarded_element_does_not_enable_the_warm_start() {
     let guard = model.bool_var();
     let index = model.int_range(0, 0);
     let unrelated_index = model.int_range(0, 0);
-    let letter = model.bool_var();
-    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Element { array: vec![cell], index, value: letter }));
+    let symbol = model.bool_var();
+    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Element { array: vec![cell], index, value: symbol }));
     model.add_constraint(Constraint::Intension(IntExpr::Or(vec![
         IntExpr::Eq(Box::new(IntExpr::Variable(guard)), Box::new(IntExpr::Constant(0))),
-        IntExpr::Eq(Box::new(IntExpr::Variable(letter)), Box::new(IntExpr::Constant(1))),
+        IntExpr::Eq(Box::new(IntExpr::Variable(symbol)), Box::new(IntExpr::Constant(1))),
     ])));
     model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table {
         variables: vec![unrelated_index],
@@ -461,7 +462,7 @@ fn disconnected_direct_guarded_element_does_not_enable_the_warm_start() {
 }
 
 #[test]
-fn disconnected_element_does_not_enable_the_guarded_warm_start() {
+fn disconnected_element_does_not_enable_the_structural_warm_start() {
     let mut model = Model::new();
     let cell = model.int_range(0, 0);
     let guard = model.bool_var();
@@ -497,8 +498,10 @@ fn disconnected_element_does_not_enable_the_guarded_warm_start() {
 
 #[test]
 fn incomplete_cp_repair_rejects_the_optional_candidate() {
-    assert!(!audit_cp_repair_completion(false).unwrap());
-    assert!(matches!(audit_cp_repair_completion(true), Err(SolveError::InvalidResult(_))));
+    assert!(!audit_cp_repair_completion(false, true).unwrap());
+    assert!(matches!(audit_cp_repair_completion(true, true), Err(SolveError::InvalidResult(_))));
+    assert!(!audit_cp_repair_completion(true, false).unwrap());
+    assert!(audit_partial_cp_repair_search_rejection().unwrap());
 }
 
 #[cfg(feature = "python")]
@@ -534,6 +537,35 @@ fn physical_callback_failure_stops_search_without_masking_the_error() {
 
     assert!(matches!(error, SolveError::InvalidResult(message) if message == "physical progress callback failed"));
     assert_eq!(budget.termination_reason(), TerminationReason::Engine);
+}
+
+#[cfg(feature = "python")]
+#[test]
+fn physical_affine_guide_variables_are_validated_before_search() {
+    use crate::orchestrator::{solve_physical_exact_with_budget, IgnoreEvents, PhysicalObjectiveTier, PhysicalSolveInput};
+    use crate::problem::{Objective as ProblemObjective, Problem};
+    use crate::{Solver, VarId};
+
+    let mut solver = Solver::new();
+    let objective = solver.new_var_range(0, 1);
+    let malformed = ProblemObjective::VarWithAffine(true, objective, vec![1], vec![VarId(99)]);
+    let input = PhysicalSolveInput {
+        problem: Problem { solver, search: vec![objective], objective: Some(malformed.clone()) },
+        visible_variables: 1,
+        objectives: vec![PhysicalObjectiveTier { objective: malformed }],
+        assumptions: Vec::new(),
+        hints: Vec::new(),
+        primary_branch_scope: None,
+        branch_order: Vec::new(),
+        shared_clauses: None,
+        first_worker: 0,
+    };
+
+    let error = match solve_physical_exact_with_budget(input, &SolveRequest::default(), &SolveBudget::new(None), &mut IgnoreEvents) {
+        Ok(_) => panic!("an out-of-arena affine guide variable reached search"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, SolveError::InvalidRequest(message) if message.contains("unknown variable 99")));
 }
 
 #[test]

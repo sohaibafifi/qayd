@@ -563,6 +563,59 @@ fn wide_weighted_minimize_objective_stays_symbolic() {
 }
 
 #[test]
+fn narrow_objective_range_outside_i32_stays_symbolic() {
+    let xml = r#"
+      <instance format="XCSP3" type="COP">
+        <variables><var id="x"> 2 </var></variables>
+        <constraints></constraints>
+        <objectives>
+          <minimize type="sum"><list>x</list><coeffs>1500000000</coeffs></minimize>
+        </objectives>
+      </instance>"#;
+    let out = run(xml).unwrap();
+    assert!(out.contains("s OPTIMUM FOUND"), "{out}");
+    assert!(out.contains("o 3000000000"), "{out}");
+}
+
+#[test]
+fn affine_objective_bound_accumulation_does_not_hide_overflow() {
+    let xml = r#"
+      <instance format="XCSP3" type="COP">
+        <variables><var id="x"> 2147483647 </var></variables>
+        <constraints></constraints>
+        <objectives>
+          <minimize type="sum">
+            <list>x x x x x x</list>
+            <coeffs>2147483647 2147483647 2147483647 -2147483647 -2147483647 -4</coeffs>
+          </minimize>
+        </objectives>
+      </instance>"#;
+    let out = run(xml).unwrap();
+    let maximum = i64::from(i32::MAX);
+    let expected = (maximum - 4) * maximum;
+    assert!(out.contains("s OPTIMUM FOUND"), "{out}");
+    assert!(out.contains(&format!("o {expected}")), "{out}");
+}
+
+#[test]
+fn wide_affine_sum_keeps_its_materialized_propagation_view() {
+    let xml = r#"
+      <instance format="XCSP3" type="COP">
+        <variables><array id="x" size="[40]"> 0 1 </array></variables>
+        <constraints></constraints>
+        <objectives><minimize type="sum"><list>x[]</list></minimize></objectives>
+      </instance>"#;
+    let mut output = Vec::new();
+    run_to_with_options(xml, true, &AtomicBool::new(false), &mut output, RunOptions::default()).unwrap();
+    let output = String::from_utf8(output).unwrap();
+
+    assert!(output.contains("c variables 41"), "wide sum did not retain its auxiliary view:\n{output}");
+    assert!(output.contains("c propagators 1"), "wide sum identity was not posted:\n{output}");
+    assert!(output.contains("s OPTIMUM FOUND"), "{output}");
+    assert!(output.contains("o 0"), "{output}");
+}
+
+#[test]
 fn wide_weighted_objective_rejects_unsupported_probe_workers() {
     let mut out = Vec::new();
     let error = run_to_with_options(
@@ -593,6 +646,29 @@ fn sum_of_square_expressions_stays_symbolic() {
     assert!(out.contains("s OPTIMUM FOUND"), "{out}");
     assert!(out.contains("o 8"), "{out}");
     assert!(out.contains("c incumbent 8 source integer-exact"), "{out}");
+}
+
+#[test]
+fn weighted_equality_objective_publishes_the_rewarded_values_first() {
+    let xml = r#"
+      <instance format="XCSP3" type="COP">
+        <variables><array id="x" size="[2]"> 0..5 </array></variables>
+        <constraints></constraints>
+        <objectives>
+          <maximize type="sum">
+            <list> eq(x[0],5) eq(x[1],2) </list>
+            <coeffs> 7 3 </coeffs>
+          </maximize>
+        </objectives>
+      </instance>"#;
+    let mut output = Vec::new();
+    run_to_with_options(xml, true, &AtomicBool::new(false), &mut output, RunOptions::default()).unwrap();
+    let output = String::from_utf8(output).unwrap();
+    let objectives =
+        output.lines().filter_map(|line| line.strip_prefix("o ")).map(|value| value.parse::<i64>().unwrap()).collect::<Vec<_>>();
+
+    assert_eq!(objectives.first(), Some(&10), "weighted equality hint missed its targets:\n{output}");
+    assert!(output.contains("s OPTIMUM FOUND"), "{output}");
 }
 
 #[test]
@@ -767,6 +843,26 @@ fn element_and_objective_expression() {
     let out = run(xml).unwrap();
     assert!(out.contains("s OPTIMUM FOUND"), "{out}");
     assert!(out.contains("o 7"), "{out}"); // max entry of [3,7,5]
+}
+
+#[test]
+fn parallel_roles_accept_a_representable_expression_objective() {
+    let xml = r#"
+      <instance format="XCSP3" type="COP">
+        <variables><array id="x" size="[2]"> 0..2 </array></variables>
+        <constraints></constraints>
+        <objectives><minimize>add(x[0],x[1])</minimize></objectives>
+      </instance>"#;
+
+    for options in
+        [RunOptions { workers: 2, split: true, ..RunOptions::default() }, RunOptions { workers: 2, probes: 1, ..RunOptions::default() }]
+    {
+        let mut out = Vec::new();
+        run_to_with_options(xml, true, &AtomicBool::new(false), &mut out, options).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("s OPTIMUM FOUND"), "{out}");
+        assert!(out.contains("o 0"), "{out}");
+    }
 }
 
 #[test]
@@ -973,6 +1069,27 @@ fn no_overlap_1d_zero_length_not_ignored_still_packs() {
       </instance>"#;
     let out = run(xml).unwrap();
     assert!(out.contains("s SATISFIABLE"), "{out}");
+}
+
+#[test]
+fn positive_fixed_no_overlap_keeps_the_compact_global_when_zero_is_ignored() {
+    let xml = r#"
+      <instance format="XCSP3" type="CSP">
+        <variables>
+          <array id="s" size="[3]"> 0..5 </array>
+        </variables>
+        <constraints>
+          <noOverlap zeroIgnored="true">
+            <origins> s[] </origins>
+            <lengths> 2 2 2 </lengths>
+          </noOverlap>
+        </constraints>
+      </instance>"#;
+    let mut output = Vec::new();
+    run_to_with_options(xml, true, &AtomicBool::new(false), &mut output, RunOptions::default()).unwrap();
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("c propagators 1"), "positive durations were expanded instead of using noOverlap:\n{output}");
+    assert!(output.contains("s SATISFIABLE"), "{output}");
 }
 
 fn low_autocorrelation_10_xml() -> String {

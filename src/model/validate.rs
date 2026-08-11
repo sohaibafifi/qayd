@@ -766,6 +766,9 @@ fn validate_global(model: &Model, global: &IntGlobalConstraint, context: &str, e
             if starts.len() != durations.len() {
                 errors.push(format!("{context}: no-overlap starts and durations differ in length"));
             }
+            if !validate_non_negative_durations(durations, context, errors, stop) {
+                return false;
+            }
         }
         IntGlobalConstraint::OptionalNoOverlap { starts, durations, presences } => {
             if starts.len() != durations.len() || starts.len() != presences.len() {
@@ -912,20 +915,32 @@ fn validate_order_relation(relation: Relation, context: &str, errors: &mut Vec<S
 }
 
 fn validate_interval_durations(durations: &[i64], context: &str, errors: &mut Vec<String>, stop: &AtomicBool) -> bool {
-    let mut negative = false;
+    if !validate_non_negative_durations(durations, context, errors, stop) {
+        return false;
+    }
     let mut too_large = false;
     for duration in durations {
         if interrupted(stop) {
             return false;
         }
-        negative |= *duration < 0;
         too_large |= *duration > i64::from(i32::MAX);
-    }
-    if negative {
-        errors.push(format!("{context}: interval duration must be non-negative"));
     }
     if too_large {
         errors.push(format!("{context}: interval duration exceeds the CP representation"));
+    }
+    !interrupted(stop)
+}
+
+fn validate_non_negative_durations(durations: &[i64], context: &str, errors: &mut Vec<String>, stop: &AtomicBool) -> bool {
+    let mut negative = false;
+    for duration in durations {
+        if interrupted(stop) {
+            return false;
+        }
+        negative |= *duration < 0;
+    }
+    if negative {
+        errors.push(format!("{context}: interval duration must be non-negative"));
     }
     !interrupted(stop)
 }

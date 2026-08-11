@@ -44,8 +44,16 @@ def result(
         "proof_elapsed_seconds": proof_time,
         "incumbents": events,
         "best_incumbent": best,
-        "validation": {"valid": True if best is not None else None},
+        "validation": {
+            "valid": True if best is not None else None,
+            "expected_objective": best["value"] if best is not None else None,
+            "reported_objective": best["value"] if best is not None else None,
+        },
         "invalid": False,
+        "returncode": 0,
+        "execution_error": None,
+        "timed_out": False,
+        "killed": False,
         "elapsed_wall_seconds": elapsed,
     }
 

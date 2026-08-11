@@ -150,6 +150,13 @@ else:
         2,
         expected_objective=123,
     )
+    bare_without_objective = fastcop_run.validate_solution(
+        [sys.executable, str(bare_checker)],
+        accepted,
+        tmp_path / "bare-csp.log",
+        2,
+        expected_objective=None,
+    )
 
     assert valid["valid"] is True
     assert valid["reason"] == "accepted"
@@ -158,8 +165,70 @@ else:
     assert mismatch["valid"] is False
     assert mismatch["reason"] == "objective-mismatch"
     assert mismatch["reported_objective"] == 7
-    assert bare["valid"] is True
+    assert bare["valid"] is None
+    assert bare["reason"] == "checker-missing-objective"
     assert bare["reported_objective"] is None
+    assert bare_without_objective["valid"] is True
+    assert bare_without_objective["reason"] == "accepted"
+
+
+def test_solution_checker_infrastructure_failures_do_not_invalidate_a_family(tmp_path):
+    out_of_memory = write_script(
+        tmp_path / "oom_checker.py",
+        "import sys\nprint('java.lang.OutOfMemoryError: Java heap space')\nraise SystemExit(1)\n",
+    )
+    slow = write_script(
+        tmp_path / "slow_checker.py",
+        "import time\ntime.sleep(10)\nprint('OK')\n",
+    )
+    killed = write_script(
+        tmp_path / "killed_checker.py",
+        "import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n",
+    )
+    broken = write_script(
+        tmp_path / "broken_checker.py",
+        "raise SystemExit(2)\n",
+    )
+    solver_output = tmp_path / "solver.out"
+    solver_output.write_text("s SATISFIABLE\no 1\nv <instantiation/>\n", encoding="utf-8")
+
+    crashed = fastcop_run.validate_solution(
+        [sys.executable, str(out_of_memory)],
+        solver_output,
+        tmp_path / "oom.log",
+        timeout_seconds=2,
+        expected_objective=1,
+    )
+    timed_out = fastcop_run.validate_solution(
+        [sys.executable, str(slow)],
+        solver_output,
+        tmp_path / "timeout.log",
+        timeout_seconds=0.05,
+        expected_objective=1,
+    )
+    killed_result = fastcop_run.validate_solution(
+        [sys.executable, str(killed)],
+        solver_output,
+        tmp_path / "killed.log",
+        timeout_seconds=2,
+        expected_objective=1,
+    )
+    broken_result = fastcop_run.validate_solution(
+        [sys.executable, str(broken)],
+        solver_output,
+        tmp_path / "broken.log",
+        timeout_seconds=2,
+        expected_objective=1,
+    )
+
+    assert crashed["valid"] is None
+    assert crashed["reason"] == "checker-oom"
+    assert timed_out["valid"] is None
+    assert timed_out["reason"] == "checker-timeout"
+    assert killed_result["valid"] is None
+    assert killed_result["reason"] == "checker-killed"
+    assert broken_result["valid"] is None
+    assert broken_result["reason"] == "checker-error"
 
 
 def test_solution_checker_is_cancelled_with_the_campaign(tmp_path):
@@ -186,6 +255,109 @@ def test_solution_checker_is_cancelled_with_the_campaign(tmp_path):
         timer.cancel()
 
 
+def test_checker_infrastructure_failure_is_unknown_not_invalid():
+    record = {
+        "raw_best_incumbent": {"value": 7},
+        "execution_error": None,
+        "returncode": 0,
+    }
+    validation = {
+        "attempted": True,
+        "valid": None,
+        "reason": "checker-oom",
+    }
+    fastcop_run.apply_validation_projection(
+        record,
+        validation,
+        check_solution=True,
+        solver_summary={
+            "claimed_status": "SAT",
+            "claimed_proof": False,
+            "has_solution": True,
+            "best_incumbent": {"value": 7},
+        },
+    )
+
+    assert record["status"] == "UNKNOWN"
+    assert record["invalid"] is False
+    assert record["best_incumbent"] is None
+
+
+@pytest.mark.parametrize("timed_out,killed,returncode", [(False, False, 1), (True, True, -15)])
+def test_incomplete_solver_execution_cannot_keep_an_optimality_proof(
+    timed_out, killed, returncode
+):
+    record = {
+        "raw_best_incumbent": {"value": 7},
+        "execution_error": None,
+        "returncode": returncode,
+        "timed_out": timed_out,
+        "killed": killed,
+    }
+    fastcop_run.apply_validation_projection(
+        record,
+        {"attempted": True, "valid": True, "reason": "accepted"},
+        check_solution=True,
+        solver_summary={
+            "claimed_status": "OPTIMUM",
+            "claimed_proof": True,
+            "has_solution": True,
+            "best_incumbent": {"value": 7},
+        },
+    )
+
+    assert record["status"] == "SAT"
+    assert record["proof"] is False
+
+
+def test_incomplete_unsat_execution_is_not_a_proof():
+    record = {
+        "raw_best_incumbent": None,
+        "execution_error": None,
+        "returncode": 1,
+        "timed_out": False,
+        "killed": False,
+    }
+    fastcop_run.apply_validation_projection(
+        record,
+        {"attempted": False, "valid": None, "reason": "unsat-proof-not-checkable"},
+        check_solution=True,
+        solver_summary={
+            "claimed_status": "UNSAT",
+            "claimed_proof": True,
+            "has_solution": False,
+            "best_incumbent": None,
+        },
+    )
+
+    assert record["status"] == "ERROR"
+    assert record["proof"] is False
+
+
+def test_clean_solver_execution_keeps_a_validated_optimality_proof():
+    record = {
+        "raw_best_incumbent": {"value": 7},
+        "execution_error": None,
+        "returncode": 0,
+        "timed_out": False,
+        "killed": False,
+    }
+    fastcop_run.apply_validation_projection(
+        record,
+        {"attempted": True, "valid": True, "reason": "accepted"},
+        check_solution=True,
+        solver_summary={
+            "claimed_status": "OPTIMUM",
+            "claimed_proof": True,
+            "has_solution": True,
+            "best_incumbent": {"value": 7},
+        },
+    )
+
+    assert record["status"] == "OPTIMUM"
+    assert record["proof"] is True
+
+
 def result(
     solver,
     instance,
@@ -208,9 +380,15 @@ def result(
         "proof": proof,
         "best_incumbent": None if objective is None else {"value": objective},
         "validation": {
-            "valid": False if invalid else (True if objective is not None else None)
+            "valid": False if invalid else (True if objective is not None else None),
+            "expected_objective": objective,
+            "reported_objective": objective,
         },
         "invalid": invalid,
+        "returncode": 0,
+        "execution_error": None,
+        "timed_out": False,
+        "killed": False,
     }
 
 
@@ -271,6 +449,155 @@ def test_false_answer_can_invalidate_only_its_family():
     assert without_family_penalty["pool"]["solvers"]["a"]["score"] == 2.0
 
 
+def test_scorer_rejects_unverified_incumbents_and_incomplete_proofs():
+    error = result("error", "open", "min", 5, status="ERROR")
+    error["validation"] = {"valid": None}
+    error["execution_error"] = "launch failed"
+    valid = result("valid", "open", "min", 10)
+
+    killed_optimum = result(
+        "killed", "proof", "min", 7, status="OPTIMUM", proof=True
+    )
+    killed_optimum["returncode"] = -15
+    killed_optimum["timed_out"] = True
+    killed_optimum["killed"] = True
+    competitor = result("valid", "proof", "min", 8)
+
+    broken_unsat = result(
+        "broken", "unsat", "min", None, status="UNSAT", proof=True
+    )
+    broken_unsat["returncode"] = 1
+    unknown = result("valid", "unsat", "min", None, status="UNKNOWN")
+
+    report = fastcop_score.score_records(
+        [error, valid, killed_optimum, competitor, broken_unsat, unknown],
+        mode="pool",
+        invalidation="none",
+    )
+    rows = {row["instance"]: row for row in report["pool"]["instance_scores"]}
+
+    assert rows["open"]["scores"]["error"]["class"] == "None"
+    assert rows["open"]["scores"]["valid"]["class"] == "BB1"
+    assert rows["proof"]["scores"]["killed"]["class"] == "BB1"
+    assert rows["proof"]["scores"]["killed"]["class"] != "Opt"
+    assert rows["unsat"]["scores"]["broken"]["class"] == "None"
+
+
+def test_score_loader_rejects_missing_and_duplicate_run_keys(tmp_path):
+    missing = result("a", "i", "min", 1)
+    missing.pop("run_key")
+    missing_path = tmp_path / "missing.jsonl"
+    missing_path.write_text(json.dumps(missing) + "\n", encoding="utf-8")
+    with pytest.raises(fastcop_score.ScoreError, match="missing run_key"):
+        fastcop_score.load_records([missing_path])
+
+    duplicate = result("a", "i", "min", 1)
+    duplicate_path = tmp_path / "duplicate.jsonl"
+    duplicate_path.write_text(
+        json.dumps(duplicate) + "\n" + json.dumps(duplicate) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(fastcop_score.ScoreError, match="duplicate run_key"):
+        fastcop_score.load_records([duplicate_path])
+
+
+def test_score_loader_requires_explicit_cross_file_solver_replacement(tmp_path):
+    old = result("qayd", "i", "min", 10)
+    new = result("qayd", "i", "min", 8)
+    new["run_key"] = "qayd-i-new"
+    old_path = tmp_path / "old.jsonl"
+    new_path = tmp_path / "new.jsonl"
+    old_path.write_text(json.dumps(old) + "\n", encoding="utf-8")
+    new_path.write_text(json.dumps(new) + "\n", encoding="utf-8")
+
+    with pytest.raises(fastcop_score.ScoreError, match="multiple runs"):
+        fastcop_score.load_records([old_path, new_path])
+    audit = {}
+    merged = fastcop_score.load_records(
+        [old_path, new_path], replace_solvers=["qayd"], audit=audit
+    )
+    assert len(merged) == 1
+    assert merged[0]["best_incumbent"]["value"] == 8
+    assert audit["replace_solvers"] == ["qayd"]
+    assert audit["replacements"] == [
+        {
+            "solver": "qayd",
+            "instance": "i",
+            "old_run_key": "qayd-i",
+            "new_run_key": "qayd-i-new",
+            "old_input": str(old_path),
+            "new_input": str(new_path),
+        }
+    ]
+    assert all(len(item["sha256"]) == 64 for item in audit["inputs"])
+
+
+def test_manifest_gate_rejects_incomplete_or_mislabeled_campaign():
+    manifest_hash = "a" * 64
+    manifest = {
+        "instances": [
+            {
+                "id": "i",
+                "family": "F",
+                "family_group": "FG",
+                "objective_sense": "min",
+                "sha256": "b" * 64,
+            }
+        ]
+    }
+
+    def campaign_record(solver):
+        record = result(solver, "i", "min", 7)
+        record.update(
+            {
+                "family_group": "FG",
+                "instance_sha256": "b" * 64,
+                "seed": 0,
+                "limits": {
+                    "cpu_seconds": 180.0,
+                    "wall_seconds": 270.0,
+                    "memory_mb": 4096,
+                    "grace_seconds": 1.0,
+                    "parallel_jobs": 4,
+                },
+                "provenance": {
+                    "manifest_sha256": manifest_hash,
+                    "solver_config_sha256": "c" * 64,
+                    "execution_harness_sha256": "d" * 64,
+                },
+            }
+        )
+        return record
+
+    records = [campaign_record("a"), campaign_record("b")]
+    report = fastcop_score.score_records(
+        records,
+        mode="pool",
+        manifest=manifest,
+        manifest_hash=manifest_hash,
+    )
+    assert report["campaign"]["instance_count"] == 1
+
+    mislabeled = [dict(records[0]), dict(records[1])]
+    mislabeled[0]["family"] = "typo"
+    with pytest.raises(fastcop_score.ScoreError, match="family mismatch"):
+        fastcop_score.score_records(
+            mislabeled,
+            mode="pool",
+            manifest=manifest,
+            manifest_hash=manifest_hash,
+        )
+
+    with pytest.raises(fastcop_score.ScoreError, match="campaign is missing"):
+        fastcop_score.score_records(
+            records[:1],
+            mode="pool",
+            solvers=["a", "b"],
+            manifest=manifest,
+            manifest_hash=manifest_hash,
+        )
+
+
 def test_manifest_serialization_is_deterministic(tmp_path, monkeypatch):
     monkeypatch.setattr(fastcop_manifest, "REPO_ROOT", tmp_path)
     instances = tmp_path / "instances"
@@ -304,36 +631,84 @@ def test_per_family_selection_is_deterministic_and_representative():
     assert [item["id"] for item in selected] == ["A-1", "A-2", "B-1", "B-2"]
 
 
-def test_run_identity_covers_termination_and_checker_inputs():
-    arguments = dict(
+def test_execution_and_validation_identities_are_independent():
+    execution_arguments = dict(
         solver_name="qayd",
-        solver_config_hash="solver-config",
         artifact_hash="solver-artifact",
-        checker_hash="checker-artifact",
         instance_id="instance-id",
         instance_hash="instance",
+        objective_sense="min",
         cpu_seconds=5.0,
         wall_seconds=8.0,
         memory_mb=1024,
         seed=0,
         grace_seconds=1.0,
-        checker_timeout=120.0,
-        check_solution=True,
         parallel_jobs=1,
-        harness_hash="harness",
-        manifest_hash="manifest",
+        command=["{artifact}", "-t", "5", "{instance}"],
+        launcher={"path": "/workspace/qayd", "sha256": "launcher-hash"},
+        limit_launcher={"python": {"sha256": "python-hash"}},
+        execution_harness_hash="execution-harness",
     )
-    baseline = fastcop_run.make_run_identity(**arguments)
+    baseline = fastcop_run.make_execution_identity(**execution_arguments)
 
     for field, value in [
         ("grace_seconds", 2.0),
-        ("checker_timeout", 60.0),
-        ("checker_hash", "different-checker"),
         ("parallel_jobs", 2),
+        (
+            "launcher",
+            {"path": "/workspace/qayd", "sha256": "different-launcher"},
+        ),
+        ("limit_launcher", {"python": {"sha256": "different-python"}}),
+        ("execution_harness_hash", "different-execution-harness"),
     ]:
-        changed = dict(arguments)
+        changed = dict(execution_arguments)
         changed[field] = value
-        assert fastcop_run.make_run_identity(**changed) != baseline
+        assert fastcop_run.make_execution_identity(**changed) != baseline
+
+    validation_arguments = dict(
+        execution_key=fastcop_run.identity_key(baseline),
+        checker_hash="checker-artifact",
+        checker_memory_mb=1024,
+        checker_timeout=120.0,
+        checker_command=["java", "-Xmx1024m", "{instance}"],
+        checker_launcher={"path": "/usr/bin/java", "sha256": "java-hash"},
+        limit_launcher={"python": {"sha256": "python-hash"}},
+        solver_stdout_hash="stdout",
+        expected_objective=7,
+        validation_harness_hash="validation-harness",
+    )
+    validation = fastcop_run.make_validation_identity(**validation_arguments)
+    for field, value in [
+        ("checker_hash", "different-checker"),
+        ("checker_memory_mb", 2048),
+        ("checker_timeout", 60.0),
+        (
+            "checker_launcher",
+            {"path": "/usr/bin/java", "sha256": "different-java"},
+        ),
+        ("limit_launcher", {"python": {"sha256": "different-python"}}),
+        ("validation_harness_hash", "different-validation-harness"),
+    ]:
+        changed = dict(validation_arguments)
+        changed[field] = value
+        assert fastcop_run.make_validation_identity(**changed) != validation
+        assert fastcop_run.make_execution_identity(**execution_arguments) == baseline
+
+
+def test_canonical_command_handles_an_embedded_instance_placeholder(tmp_path):
+    planned = fastcop_run.canonicalize_command(
+        [f"--input={fastcop_run.INSTANCE_SENTINEL}"]
+    )
+    scratch = tmp_path / "qayd-fastcop-instance-test"
+    scratch.mkdir()
+    materialized = scratch / "instance.xml"
+    materialized.touch()
+    executed = fastcop_run.canonicalize_command(
+        [f"--input={materialized}"]
+    )
+
+    assert planned == ["--input={instance}"]
+    assert executed == planned
 
 
 def test_jobs_must_be_positive():
@@ -474,6 +849,245 @@ def test_existing_output_must_match_the_current_plan(tmp_path):
         fastcop_run.ensure_output_matches_plan(
             tmp_path / "results.jsonl", [task, second_task], [second_record]
         )
+
+
+def test_legacy_run_key_is_quarantined_from_current_execution_plan():
+    execution_identity = fastcop_run.make_execution_identity(
+        solver_name="qayd",
+        artifact_hash="artifact-hash",
+        instance_id="instance-1",
+        instance_hash="instance-hash",
+        objective_sense="min",
+        cpu_seconds=5.0,
+        wall_seconds=8.0,
+        memory_mb=1024,
+        seed=0,
+        grace_seconds=1.0,
+        parallel_jobs=1,
+        command=["{artifact}", "-t", "5", "{instance}"],
+        launcher={"path": "/workspace/qayd", "sha256": "launcher-hash"},
+        limit_launcher={"python": {"sha256": "python-hash"}},
+        execution_harness_hash="execution-harness",
+    )
+    execution_key = fastcop_run.identity_key(execution_identity)
+    task = fastcop_run.RunTask(
+        position=1,
+        solver_name="qayd",
+        solver={},
+        instance_item={"id": "instance-1"},
+        run_key=execution_key,
+        execution_identity=execution_identity,
+    )
+    legacy = {
+        "solver": "qayd",
+        "instance": "instance-1",
+        "run_key": "legacy-key-containing-checker-settings",
+        "instance_sha256": "instance-hash",
+        "objective_sense": "min",
+        "seed": 0,
+        "limits": {
+            "cpu_seconds": 5.0,
+            "wall_seconds": 8.0,
+            "memory_mb": 1024,
+            "grace_seconds": 1.0,
+            "parallel_jobs": 1,
+            "checker_memory_mb": 256,
+        },
+        "command": [
+            "/workspace/qayd",
+            "-t",
+            "5",
+            "/tmp/qayd-fastcop-instance-old/instance.xml",
+        ],
+        "provenance": {
+            "artifact": "/workspace/qayd",
+            "artifact_sha256": "artifact-hash",
+            "checker_sha256": "old-checker",
+            "harness_sha256": "old-validation-harness",
+        },
+    }
+
+    with pytest.raises(fastcop_run.HarnessError, match="cannot be resumed safely"):
+        fastcop_run.ensure_output_matches_plan(
+            Path("results.jsonl"), [task], [legacy]
+        )
+
+    legacy_key = fastcop_run.ensure_record_execution_key(
+        legacy, allow_legacy=True
+    )
+    assert legacy_key != execution_key
+    assert legacy["execution_key"] == legacy_key
+    assert fastcop_run.ensure_record_execution_key(legacy, allow_legacy=True) == legacy_key
+    assert legacy["run_key"] == "legacy-key-containing-checker-settings"
+
+
+def test_resume_rejects_an_execution_key_that_does_not_match_its_identity():
+    identity = fastcop_run.make_execution_identity(
+        solver_name="qayd",
+        artifact_hash="artifact-hash",
+        instance_id="instance-1",
+        instance_hash="instance-hash",
+        objective_sense="min",
+        cpu_seconds=5.0,
+        wall_seconds=8.0,
+        memory_mb=1024,
+        seed=0,
+        grace_seconds=1.0,
+        parallel_jobs=1,
+        command=["{artifact}", "{instance}"],
+        launcher={"path": "/workspace/qayd", "sha256": "launcher-hash"},
+        limit_launcher={"python": {"sha256": "python-hash"}},
+        execution_harness_hash="execution-harness",
+    )
+    task = fastcop_run.RunTask(
+        position=1,
+        solver_name="qayd",
+        solver={},
+        instance_item={"id": "instance-1"},
+        run_key=fastcop_run.identity_key(identity),
+        execution_identity=identity,
+    )
+    record = {
+        "solver": "qayd",
+        "instance": "instance-1",
+        "run_key": task.run_key,
+        "execution_key": task.run_key,
+        "execution_identity": {**identity, "seed": 99},
+    }
+
+    with pytest.raises(fastcop_run.HarnessError, match="does not match its key"):
+        fastcop_run.ensure_output_matches_plan(
+            Path("results.jsonl"), [task], [record]
+        )
+
+
+def test_recheck_only_reuses_stdout_and_atomically_replaces_validation(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(fastcop_run, "REPO_ROOT", tmp_path)
+    instance = tmp_path / "instance.xml"
+    instance.write_text("<instance/>", encoding="utf-8")
+    stdout = tmp_path / "stored.stdout.log"
+    stdout.write_text(
+        "s SATISFIABLE\no 7\nv <instantiation/>\n", encoding="utf-8"
+    )
+    stderr = tmp_path / "stored.stderr.log"
+    stderr.write_text("", encoding="utf-8")
+    marker = tmp_path / "solver-ran"
+    solver = write_script(
+        tmp_path / "solver.py",
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('ran')\n",
+    )
+    checker = write_script(
+        tmp_path / "checker.py",
+        "import sys\nsys.stdin.read()\nprint('OK\\t7')\n",
+    )
+    solver_config = tmp_path / "solvers.json"
+    solver_config.write_text(
+        json.dumps(
+            {
+                "schema": fastcop_run.SOLVER_SCHEMA,
+                "checker": {
+                    "artifact": checker.name,
+                    "expected_sha256": None,
+                    "argv": [
+                        sys.executable,
+                        "{ace_artifact}",
+                        "{instance}",
+                    ],
+                },
+                "solvers": {
+                    "fake": {
+                        "artifact": solver.name,
+                        "expected_sha256": None,
+                        "argv": [
+                            sys.executable,
+                            "{artifact}",
+                            "{instance}",
+                        ],
+                        "version": "test",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "results.jsonl"
+    record = {
+        "schema": fastcop_run.RESULT_SCHEMA,
+        "run_key": "legacy-validation-coupled-key",
+        "solver": "fake",
+        "instance": "i",
+        "family": "F",
+        "family_group": "F",
+        "objective_sense": "min",
+        "instance_path": instance.name,
+        "instance_sha256": fastcop_manifest.sha256_file(instance),
+        "seed": 0,
+        "limits": {
+            "cpu_seconds": 5.0,
+            "wall_seconds": 8.0,
+            "memory_mb": 512,
+            "grace_seconds": 1.0,
+            "parallel_jobs": 1,
+        },
+        "command": [
+            sys.executable,
+            str(solver),
+            "/tmp/qayd-fastcop-instance-old/instance.xml",
+        ],
+        "status": "INVALID",
+        "proof": False,
+        "best_incumbent": None,
+        "raw_best_incumbent": {"value": 7, "elapsed_seconds": 0.1},
+        "validation": {
+            "attempted": True,
+            "valid": False,
+            "reason": "checker-rejected",
+        },
+        "invalid": True,
+        "returncode": 0,
+        "execution_error": None,
+        "logs": {"stdout": str(stdout), "stderr": str(stderr), "checker": None},
+        "provenance": {
+            "artifact": str(solver),
+            "artifact_sha256": fastcop_manifest.sha256_file(solver),
+        },
+    }
+    fastcop_run.append_record(output, record)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run.py",
+            "--recheck-only",
+            "--solver",
+            "fake",
+            "--solvers",
+            str(solver_config),
+            "--output",
+            str(output),
+            "--checker-memory-mb",
+            "256",
+            "--checker-timeout",
+            "2",
+        ],
+    )
+
+    assert fastcop_run.main() == 0
+
+    records = fastcop_run.load_result_records(output)
+    assert len(records) == 1
+    updated = records[0]
+    assert marker.exists() is False
+    assert updated["run_key"] == "legacy-validation-coupled-key"
+    assert isinstance(updated["execution_key"], str)
+    assert isinstance(updated["validation_key"], str)
+    assert updated["validation"]["reason"] == "accepted"
+    assert updated["validation"]["valid"] is True
+    assert updated["status"] == "SAT"
+    assert updated["invalid"] is False
+    assert updated["best_incumbent"]["value"] == 7
 
 
 def test_parallel_resume_appends_only_the_missing_suffix(tmp_path):

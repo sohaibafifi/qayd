@@ -52,6 +52,10 @@ fn register_variables_until(store: &mut Store, me: PropId, variables: &[VarId], 
     !should_stop()
 }
 
+fn clamp_i128_i32(value: i128) -> i32 {
+    value.clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32
+}
+
 // ===========================================================================
 // noOverlap (disjunctive, pairwise)
 // ===========================================================================
@@ -61,6 +65,137 @@ fn register_variables_until(store: &mut Store, me: PropId, variables: &[VarId], 
 struct NoOverlap {
     starts: Vec<VarId>,
     durations: Vec<i64>,
+}
+
+/// Domain-consistent binary decomposition of one disjunctive task pair.
+#[derive(Clone)]
+struct NoOverlapPair {
+    first: VarId,
+    first_duration: i64,
+    second: VarId,
+    second_duration: i64,
+    scratch: Vec<i32>,
+}
+
+/// Maximum candidate-value inspections in one pass of the binary
+/// decomposition. The estimate depends only on scope and live domain sizes.
+/// Above it, one global bounds propagator avoids quadratic domain scans and a
+/// quadratic number of posted propagators.
+const MAX_NO_OVERLAP_PAIR_DOMAIN_WORK: u128 = 65_536;
+
+/// Decide whether a NoOverlap scope uses its binary decomposition. One pair
+/// scans both domains, so the full-pass work is `(task_count - 1)` times the
+/// sum of domain cardinalities.
+pub(crate) fn no_overlap_uses_pair_decomposition(task_count: usize, total_domain_values: u128) -> bool {
+    total_domain_values.saturating_mul(task_count.saturating_sub(1) as u128) <= MAX_NO_OVERLAP_PAIR_DOMAIN_WORK
+}
+
+fn decompose_no_overlap(store: &Store, starts: &[VarId]) -> bool {
+    let total_domain_values = starts.iter().fold(0u128, |total, &start| total.saturating_add(store.size(start) as u128));
+    no_overlap_uses_pair_decomposition(starts.len(), total_domain_values)
+}
+
+fn propagate_no_overlap_bounds(
+    store: &mut Store,
+    first: VarId,
+    first_duration: i64,
+    second: VarId,
+    second_duration: i64,
+) -> Result<(), Inconsistency> {
+    let first_min_value = store.min(first);
+    let first_max_value = store.max(first);
+    let second_min_value = store.min(second);
+    let second_max_value = store.max(second);
+    let first_min = i128::from(first_min_value);
+    let first_max = i128::from(first_max_value);
+    let second_min = i128::from(second_min_value);
+    let second_max = i128::from(second_max_value);
+    let first_duration = i128::from(first_duration);
+    let second_duration = i128::from(second_duration);
+
+    let first_before_second = first_min + first_duration <= second_max;
+    let second_before_first = second_min + second_duration <= first_max;
+
+    // Bound premises pin each start's live window. Every emitted reason is a
+    // subset of these four literals.
+    let ge_first = Premise::Ge { var: first, bound: first_min_value };
+    let le_first = Premise::Le { var: first, bound: first_max_value };
+    let ge_second = Premise::Ge { var: second, bound: second_min_value };
+    let le_second = Premise::Le { var: second, bound: second_max_value };
+    match (first_before_second, second_before_first) {
+        (false, false) => {
+            if store.explaining() {
+                return Err(store.fail_because(vec![ge_first, le_first, ge_second, le_second]));
+            }
+            return Err(Inconsistency);
+        }
+        (true, false) => {
+            // The second task cannot precede the first, so the first must end
+            // before the second starts.
+            if store.explaining() {
+                store.remove_below_because(second, clamp_i128_i32(first_min + first_duration), vec![ge_first, ge_second, le_first])?;
+                store.remove_above_because(first, clamp_i128_i32(second_max - first_duration), vec![le_second, ge_second, le_first])?;
+            } else {
+                store.remove_below(second, clamp_i128_i32(first_min + first_duration))?;
+                store.remove_above(first, clamp_i128_i32(second_max - first_duration))?;
+            }
+        }
+        (false, true) => {
+            // The first task cannot precede the second, so the second must end
+            // before the first starts.
+            if store.explaining() {
+                store.remove_below_because(first, clamp_i128_i32(second_min + second_duration), vec![ge_second, ge_first, le_second])?;
+                store.remove_above_because(second, clamp_i128_i32(first_max - second_duration), vec![le_first, ge_first, le_second])?;
+            } else {
+                store.remove_below(first, clamp_i128_i32(second_min + second_duration))?;
+                store.remove_above(second, clamp_i128_i32(first_max - second_duration))?;
+            }
+        }
+        (true, true) => {}
+    }
+    Ok(())
+}
+
+fn remove_pairwise_unsupported_values(
+    store: &mut Store,
+    first: VarId,
+    first_duration: i64,
+    second: VarId,
+    second_duration: i64,
+    scratch: &mut Vec<i32>,
+) -> Result<(), Inconsistency> {
+    // With the first start fixed to a, neither ordering has support exactly
+    // when max(second)-first_duration < a < min(second)+second_duration.
+    let second_min = store.min(second);
+    let second_max = store.max(second);
+    let unsupported_first_low = i128::from(second_max) - i128::from(first_duration) + 1;
+    let unsupported_first_high = i128::from(second_min) + i128::from(second_duration) - 1;
+    scratch.clear();
+    scratch.extend(store.values(first).filter(|&value| {
+        let value = i128::from(value);
+        unsupported_first_low <= value && value <= unsupported_first_high
+    }));
+    let why_first =
+        store.explaining().then(|| vec![Premise::Ge { var: second, bound: second_min }, Premise::Le { var: second, bound: second_max }]);
+    for value in scratch.drain(..) {
+        store.remove_because(first, value, why_first.clone().unwrap_or_default())?;
+    }
+
+    let first_min = store.min(first);
+    let first_max = store.max(first);
+    let unsupported_second_low = i128::from(first_max) - i128::from(second_duration) + 1;
+    let unsupported_second_high = i128::from(first_min) + i128::from(first_duration) - 1;
+    scratch.clear();
+    scratch.extend(store.values(second).filter(|&value| {
+        let value = i128::from(value);
+        unsupported_second_low <= value && value <= unsupported_second_high
+    }));
+    let why_second =
+        store.explaining().then(|| vec![Premise::Ge { var: first, bound: first_min }, Premise::Le { var: first, bound: first_max }]);
+    for value in scratch.drain(..) {
+        store.remove_because(second, value, why_second.clone().unwrap_or_default())?;
+    }
+    Ok(())
 }
 
 impl Propagator for NoOverlap {
@@ -79,60 +214,66 @@ impl Propagator for NoOverlap {
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+        self.propagate_core(store, None)
+    }
+
+    fn propagate_until(&mut self, store: &mut Store, should_stop: &dyn Fn() -> bool) -> Result<(), Inconsistency> {
+        self.propagate_core(store, Some(should_stop))
+    }
+}
+
+impl NoOverlap {
+    fn propagate_core(&mut self, store: &mut Store, should_stop: Option<&dyn Fn() -> bool>) -> Result<(), Inconsistency> {
         let n = self.starts.len();
-        local_fixpoint!(self.starts.iter().map(|&s| store.size(s)).sum::<usize>(), {
+        loop {
+            if should_stop.is_some_and(|stop| stop()) {
+                return Ok(());
+            }
+            let before = self.starts.iter().map(|&start| store.size(start)).sum::<usize>();
             for i in 0..n {
+                if should_stop.is_some_and(|stop| stop()) {
+                    return Ok(());
+                }
                 for j in (i + 1)..n {
-                    let (di, dj) = (self.durations[i], self.durations[j]);
-                    let si_min = store.min(self.starts[i]) as i64;
-                    let si_max = store.max(self.starts[i]) as i64;
-                    let sj_min = store.min(self.starts[j]) as i64;
-                    let sj_max = store.max(self.starts[j]) as i64;
-
-                    let i_before_j = si_min + di <= sj_max;
-                    let j_before_i = sj_min + dj <= si_max;
-
-                    // Bound premises pinning each start's live window; every emitted
-                    // reason is a subset of these four literals, so it can never
-                    // exceed the whole-scope fallback width (no guard needed).
-                    let ge_i = Premise::Ge { var: self.starts[i], bound: si_min as i32 };
-                    let le_i = Premise::Le { var: self.starts[i], bound: si_max as i32 };
-                    let ge_j = Premise::Ge { var: self.starts[j], bound: sj_min as i32 };
-                    let le_j = Premise::Le { var: self.starts[j], bound: sj_max as i32 };
-                    match (i_before_j, j_before_i) {
-                        (false, false) => {
-                            // Neither ordering fits: `si_min+di > sj_max` (ge_i+le_j
-                            // kill i-before-j) and `sj_min+dj > si_max` (ge_j+le_i
-                            // kill j-before-i); together no ordering survives.
-                            if store.explaining() {
-                                return Err(store.fail_because(vec![ge_i, le_i, ge_j, le_j]));
-                            }
-                            return Err(Inconsistency);
-                        }
-                        (true, false) => {
-                            // i must precede j (j-before-i infeasible: sj_min+dj > si_max).
-                            if store.explaining() {
-                                store.remove_below_because(self.starts[j], clamp_i32(si_min + di), vec![ge_i, ge_j, le_i])?;
-                                store.remove_above_because(self.starts[i], clamp_i32(sj_max - di), vec![le_j, ge_j, le_i])?;
-                            } else {
-                                store.remove_below(self.starts[j], clamp_i32(si_min + di))?;
-                                store.remove_above(self.starts[i], clamp_i32(sj_max - di))?;
-                            }
-                        }
-                        (false, true) => {
-                            // j must precede i (i-before-j infeasible: si_min+di > sj_max).
-                            if store.explaining() {
-                                store.remove_below_because(self.starts[i], clamp_i32(sj_min + dj), vec![ge_j, ge_i, le_j])?;
-                                store.remove_above_because(self.starts[j], clamp_i32(si_max - dj), vec![le_i, ge_i, le_j])?;
-                            } else {
-                                store.remove_below(self.starts[i], clamp_i32(sj_min + dj))?;
-                                store.remove_above(self.starts[j], clamp_i32(si_max - dj))?;
-                            }
-                        }
-                        (true, true) => {}
+                    if should_stop.is_some_and(|stop| stop()) {
+                        return Ok(());
                     }
+                    propagate_no_overlap_bounds(store, self.starts[i], self.durations[i], self.starts[j], self.durations[j])?;
                 }
             }
+            let after = self.starts.iter().map(|&start| store.size(start)).sum::<usize>();
+            if after == before {
+                return Ok(());
+            }
+        }
+    }
+}
+
+impl Propagator for NoOverlapPair {
+    fn priority(&self) -> Priority {
+        Priority::Linear
+    }
+
+    fn register(&mut self, store: &mut Store, me: PropId) {
+        store.subscribe(self.first, me, Event::BoundChange);
+        store.subscribe(self.second, me, Event::BoundChange);
+    }
+
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        register_variables_until(store, me, &[self.first, self.second], Event::BoundChange, should_stop)
+    }
+
+    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+        local_fixpoint!(store.size(self.first).saturating_add(store.size(self.second)), {
+            remove_pairwise_unsupported_values(
+                store,
+                self.first,
+                self.first_duration,
+                self.second,
+                self.second_duration,
+                &mut self.scratch,
+            )?;
+            propagate_no_overlap_bounds(store, self.first, self.first_duration, self.second, self.second_duration)?;
         });
         Ok(())
     }
@@ -141,7 +282,21 @@ impl Propagator for NoOverlap {
 /// Post `noOverlap`: the tasks must not overlap in time.
 pub fn no_overlap(solver: &mut Solver, starts: &[VarId], durations: &[i64]) {
     assert_eq!(starts.len(), durations.len(), "noOverlap: starts/durations mismatch");
-    solver.post(Box::new(NoOverlap { starts: starts.to_vec(), durations: durations.to_vec() }));
+    if decompose_no_overlap(&solver.store, starts) {
+        for first in 0..starts.len() {
+            for second in (first + 1)..starts.len() {
+                solver.post(Box::new(NoOverlapPair {
+                    first: starts[first],
+                    first_duration: durations[first],
+                    second: starts[second],
+                    second_duration: durations[second],
+                    scratch: Vec::new(),
+                }));
+            }
+        }
+    } else {
+        solver.post(Box::new(NoOverlap { starts: starts.to_vec(), durations: durations.to_vec() }));
+    }
 }
 
 pub(crate) fn no_overlap_interruptible(solver: &mut Solver, starts: &[VarId], durations: &[i64], stop: &AtomicBool) -> bool {
@@ -153,7 +308,25 @@ pub(crate) fn no_overlap_interruptible(solver: &mut Solver, starts: &[VarId], du
         return false;
     };
     let should_stop = || stop.load(Ordering::Acquire);
-    solver.post_until(Box::new(NoOverlap { starts, durations }), &should_stop).is_some()
+    if decompose_no_overlap(&solver.store, &starts) {
+        for first in 0..starts.len() {
+            for second in (first + 1)..starts.len() {
+                let pair = NoOverlapPair {
+                    first: starts[first],
+                    first_duration: durations[first],
+                    second: starts[second],
+                    second_duration: durations[second],
+                    scratch: Vec::new(),
+                };
+                if solver.post_until(Box::new(pair), &should_stop).is_none() {
+                    return false;
+                }
+            }
+        }
+        true
+    } else {
+        solver.post_until(Box::new(NoOverlap { starts, durations }), &should_stop).is_some()
+    }
 }
 
 // ===========================================================================

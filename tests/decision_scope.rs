@@ -171,7 +171,7 @@ fn xcsp_existential_index_witness_is_completed_after_declared_variables() {
 }
 
 #[test]
-fn xcsp_objective_auxiliary_is_completed_outside_the_declared_scope() {
+fn xcsp_expression_objective_is_evaluated_outside_the_declared_scope() {
     let xml = r#"
 <instance format="XCSP3" type="COP">
   <variables>

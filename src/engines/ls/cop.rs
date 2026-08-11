@@ -18,16 +18,16 @@ const MAX_SAMPLED_VARS: usize = 48;
 const RANDOM_WALK_PERIOD: u64 = 17;
 const RESTART_AFTER: u64 = 200;
 const CONSTRUCTIVE_KICK_PERIOD: u64 = 5;
-const WORD_PLACEMENT_NODE_LIMIT: usize = 20_000;
-const WORD_PLACEMENT_EVALUATION_NODE_LIMIT: usize = 1_000;
-const DYNAMIC_WORD_ORDER_LIMIT: usize = 20;
-const LARGE_GRID_DYNAMIC_WORD_CANDIDATES: usize = 8;
-const MAX_GUARDED_GRID_CELLS: usize = u64::BITS as usize;
-const MAX_GUARDED_GRID_PAIR_CELLS: usize = 16;
-const GUARDED_GRID_ANNEAL_STEPS: usize = 50_000;
-const GUARDED_GRID_ANNEAL_CYCLE: usize = 5_000;
-const GUARDED_GRID_HILL_CLIMB_ROUNDS: usize = 2;
-const GUARDED_GRID_PAIR_ROUNDS: usize = 4;
+const SEQUENCE_PLACEMENT_NODE_LIMIT: usize = 20_000;
+const SEQUENCE_PLACEMENT_EVALUATION_NODE_LIMIT: usize = 1_000;
+const DYNAMIC_SEQUENCE_ORDER_LIMIT: usize = 20;
+const LARGE_SHARED_ARRAY_DYNAMIC_SEQUENCE_CANDIDATES: usize = 8;
+const MAX_SHARED_ARRAY_CELLS: usize = u64::BITS as usize;
+const MAX_SHARED_ARRAY_PAIR_CELLS: usize = 16;
+const SHARED_ARRAY_ANNEAL_STEPS: usize = 50_000;
+const SHARED_ARRAY_ANNEAL_CYCLE: usize = 5_000;
+const SHARED_ARRAY_HILL_CLIMB_ROUNDS: usize = 2;
+const SHARED_ARRAY_PAIR_ROUNDS: usize = 4;
 /// Min-conflicts (#1b): domains with at most this many values are scanned in full
 /// (cheap and optimal); larger ones use the bounded candidate set.
 const MIN_CONFLICTS_FULL: usize = 24;
@@ -382,19 +382,29 @@ struct LocalModel {
     affected: Vec<Vec<usize>>,
 }
 
-// TODO(simplify): the guarded-word placement subsystem below (GuardedWord,
-// WordPlacementState, try_place_word/word_trial/place_word_letters, guarded_*,
-// place_guarded_elements) is ~250 LOC of crossword-specific constructive
-// heuristic, fired only for the Extension+Element+guard pattern via
-// has_extension(). It is the largest single simplification target in this file.
-// Decide on bench evidence: if it does not measurably beat generic LS on the
-// word/crossword instances, delete it and let those fall back to the generic
-// constructive path. Until then it stays, gated and isolated.
-struct GuardedWord<'a> {
+/// A strictly recognized sum of squared bilinear-product groups over signs.
+/// The plan stores only the algebraic incidence needed by incremental deltas;
+/// it assumes no ordering, distance pattern, or completeness of the graph.
+struct SignedProductSquaresPlan {
+    signs: Vec<VarId>,
+    groups: Vec<Vec<(usize, usize)>>,
+    incidence: Vec<Vec<GroupIncidence>>,
+}
+
+struct GroupIncidence {
+    group: usize,
+    neighbors: Vec<usize>,
+}
+
+// Specialized shared-array sequence-placement descriptor. The orchestrator's
+// cheap prefilter may request this path, but descriptors are emitted only from
+// an exact local-IR reconstruction. Near-matches stay on generic LS, and every
+// candidate is canonically scored and replayed by CP before publication.
+struct GuardedSequence<'a> {
     guard: VarId,
     weight: i64,
-    array: &'a [VarId],
-    letters: Vec<(VarId, i32)>,
+    shared_array: &'a [VarId],
+    symbols: Vec<(VarId, i32)>,
     max_mismatches: usize,
 }
 
@@ -408,12 +418,12 @@ struct TrialPlacement {
 }
 
 #[derive(Clone, Copy)]
-enum WordPlacementPriority {
+enum SequencePlacementPriority {
     Reuse,
     Weighted { cell_penalty: i64 },
 }
 
-struct GuardedGridWord {
+struct CompiledGuardedSequence {
     weight: i64,
     max_mismatches: usize,
     expected: Vec<i32>,
@@ -421,37 +431,39 @@ struct GuardedGridWord {
     transitions: Vec<Vec<u64>>,
 }
 
-struct GuardedGridEvaluator {
+struct GuardedSequenceEvaluator {
     values: Vec<i32>,
-    words: Vec<GuardedGridWord>,
-    words_by_letter: HashMap<i32, Vec<usize>>,
+    sequences: Vec<CompiledGuardedSequence>,
+    sequences_by_symbol: HashMap<i32, Vec<usize>>,
     active: Vec<bool>,
     score: i64,
 }
 
-impl GuardedGridEvaluator {
-    fn new(model: &LocalModel, assignment: &[i32], words: &[GuardedWord<'_>]) -> Option<Self> {
-        let grid = words.first()?.array;
-        if grid.is_empty()
-            || grid.len() > MAX_GUARDED_GRID_CELLS
-            || words.iter().any(|word| word.array != grid || word.max_mismatches > 1 || word.letters.is_empty())
+impl GuardedSequenceEvaluator {
+    fn new(model: &LocalModel, assignment: &[i32], sequences: &[GuardedSequence<'_>]) -> Option<Self> {
+        let shared_array = sequences.first()?.shared_array;
+        if shared_array.is_empty()
+            || shared_array.len() > MAX_SHARED_ARRAY_CELLS
+            || sequences
+                .iter()
+                .any(|sequence| sequence.shared_array != shared_array || sequence.max_mismatches > 1 || sequence.symbols.is_empty())
         {
             return None;
         }
 
-        let values = grid.iter().map(|var| assignment[var.index()]).collect::<Vec<_>>();
-        let mut compiled_words = Vec::with_capacity(words.len());
-        let mut words_by_letter: HashMap<i32, Vec<usize>> = HashMap::new();
-        for (word_index, word) in words.iter().enumerate() {
-            let expected = word.letters.iter().map(|&(_, value)| value).collect::<Vec<_>>();
+        let values = shared_array.iter().map(|var| assignment[var.index()]).collect::<Vec<_>>();
+        let mut compiled_sequences = Vec::with_capacity(sequences.len());
+        let mut sequences_by_symbol: HashMap<i32, Vec<usize>> = HashMap::new();
+        for (sequence_index, sequence) in sequences.iter().enumerate() {
+            let expected = sequence.symbols.iter().map(|&(_, value)| value).collect::<Vec<_>>();
             for &value in &expected {
-                words_by_letter.entry(value).or_default().push(word_index);
+                sequences_by_symbol.entry(value).or_default().push(sequence_index);
             }
-            let allowed_cells = word
-                .letters
+            let allowed_cells = sequence
+                .symbols
                 .iter()
                 .map(|&(index, _)| {
-                    (0..grid.len()).fold(0u64, |mask, cell| {
+                    (0..shared_array.len()).fold(0u64, |mask, cell| {
                         if model.domains[index.index()].contains(cell as i32) {
                             mask | (1u64 << cell)
                         } else {
@@ -460,13 +472,13 @@ impl GuardedGridEvaluator {
                     })
                 })
                 .collect::<Vec<_>>();
-            let mut transitions = vec![Vec::new(); word.letters.len()];
+            let mut transitions = vec![Vec::new(); sequence.symbols.len()];
             for (position, transition) in transitions.iter_mut().enumerate().skip(1) {
-                let left = word.letters[position - 1].0;
-                let right = word.letters[position].0;
-                *transition = (0..grid.len())
+                let left = sequence.symbols[position - 1].0;
+                let right = sequence.symbols[position].0;
+                *transition = (0..shared_array.len())
                     .map(|from| {
-                        (0..grid.len()).fold(0u64, |mask, to| {
+                        (0..shared_array.len()).fold(0u64, |mask, to| {
                             if from != to && model.pair_allowed(left, right, from as i32, to as i32) {
                                 mask | (1u64 << to)
                             } else {
@@ -476,31 +488,32 @@ impl GuardedGridEvaluator {
                     })
                     .collect();
             }
-            compiled_words.push(GuardedGridWord {
-                weight: word.weight,
-                max_mismatches: word.max_mismatches,
+            compiled_sequences.push(CompiledGuardedSequence {
+                weight: sequence.weight,
+                max_mismatches: sequence.max_mismatches,
                 expected,
                 allowed_cells,
                 transitions,
             });
         }
-        for indices in words_by_letter.values_mut() {
+        for indices in sequences_by_symbol.values_mut() {
             indices.sort_unstable();
             indices.dedup();
         }
 
-        let mut evaluator = Self { values, words: compiled_words, words_by_letter, active: vec![false; words.len()], score: 0 };
+        let mut evaluator =
+            Self { values, sequences: compiled_sequences, sequences_by_symbol, active: vec![false; sequences.len()], score: 0 };
         evaluator.rebuild();
         Some(evaluator)
     }
 
     fn rebuild(&mut self) {
         self.score = 0;
-        for word_index in 0..self.words.len() {
-            let present = self.word_present(word_index);
-            self.active[word_index] = present;
+        for sequence_index in 0..self.sequences.len() {
+            let present = self.sequence_present(sequence_index);
+            self.active[sequence_index] = present;
             if present {
-                self.score = self.score.saturating_add(self.words[word_index].weight);
+                self.score = self.score.saturating_add(self.sequences[sequence_index].weight);
             }
         }
     }
@@ -511,9 +524,9 @@ impl GuardedGridEvaluator {
     }
 
     fn score_for_values(&self, values: &[i32]) -> i64 {
-        (0..self.words.len())
-            .filter(|&word_index| self.word_present_in(word_index, values))
-            .fold(0i64, |score, word_index| score.saturating_add(self.words[word_index].weight))
+        (0..self.sequences.len())
+            .filter(|&sequence_index| self.sequence_present_in(sequence_index, values))
+            .fold(0i64, |score, sequence_index| score.saturating_add(self.sequences[sequence_index].weight))
     }
 
     fn apply_value(&mut self, cell: usize, value: i32) -> i64 {
@@ -521,8 +534,8 @@ impl GuardedGridEvaluator {
         if old_value == value {
             return 0;
         }
-        let mut affected = self.words_by_letter.get(&old_value).cloned().unwrap_or_default();
-        if let Some(indices) = self.words_by_letter.get(&value) {
+        let mut affected = self.sequences_by_symbol.get(&old_value).cloned().unwrap_or_default();
+        if let Some(indices) = self.sequences_by_symbol.get(&value) {
             affected.extend(indices.iter().copied());
         }
         affected.sort_unstable();
@@ -530,48 +543,48 @@ impl GuardedGridEvaluator {
 
         self.values[cell] = value;
         let mut delta = 0i64;
-        for word_index in affected {
-            let present = self.word_present(word_index);
-            if present == self.active[word_index] {
+        for sequence_index in affected {
+            let present = self.sequence_present(sequence_index);
+            if present == self.active[sequence_index] {
                 continue;
             }
-            let weight = self.words[word_index].weight;
+            let weight = self.sequences[sequence_index].weight;
             delta = if present { delta.saturating_add(weight) } else { delta.saturating_sub(weight) };
-            self.active[word_index] = present;
+            self.active[sequence_index] = present;
         }
         self.score = self.score.saturating_add(delta);
         delta
     }
 
-    fn word_present(&self, word_index: usize) -> bool {
-        self.word_present_in(word_index, &self.values)
+    fn sequence_present(&self, sequence_index: usize) -> bool {
+        self.sequence_present_in(sequence_index, &self.values)
     }
 
-    fn word_present_in(&self, word_index: usize, values: &[i32]) -> bool {
-        let word = &self.words[word_index];
-        let matching = word.allowed_cells[0]
+    fn sequence_present_in(&self, sequence_index: usize, values: &[i32]) -> bool {
+        let sequence = &self.sequences[sequence_index];
+        let matching = sequence.allowed_cells[0]
             & values
                 .iter()
                 .enumerate()
-                .fold(0u64, |mask, (cell, &value)| if value == word.expected[0] { mask | (1u64 << cell) } else { mask });
+                .fold(0u64, |mask, (cell, &value)| if value == sequence.expected[0] { mask | (1u64 << cell) } else { mask });
         let mut exact = matching;
-        let mut mismatch = if word.max_mismatches == 1 { word.allowed_cells[0] & !matching } else { 0 };
-        for position in 1..word.expected.len() {
-            let expanded_exact = expand_cells(exact, &word.transitions[position]);
-            let expanded_mismatch = expand_cells(mismatch, &word.transitions[position]);
-            let matching = word.allowed_cells[position]
+        let mut mismatch = if sequence.max_mismatches == 1 { sequence.allowed_cells[0] & !matching } else { 0 };
+        for position in 1..sequence.expected.len() {
+            let expanded_exact = expand_cells(exact, &sequence.transitions[position]);
+            let expanded_mismatch = expand_cells(mismatch, &sequence.transitions[position]);
+            let matching = sequence.allowed_cells[position]
                 & values.iter().enumerate().fold(
                     0u64,
                     |mask, (cell, &value)| {
-                        if value == word.expected[position] {
+                        if value == sequence.expected[position] {
                             mask | (1u64 << cell)
                         } else {
                             mask
                         }
                     },
                 );
-            let mismatching = word.allowed_cells[position] & !matching;
-            mismatch = (expanded_mismatch & matching) | if word.max_mismatches == 1 { expanded_exact & mismatching } else { 0 };
+            let mismatching = sequence.allowed_cells[position] & !matching;
+            mismatch = (expanded_mismatch & matching) | if sequence.max_mismatches == 1 { expanded_exact & mismatching } else { 0 };
             exact = expanded_exact & matching;
             if exact | mismatch == 0 {
                 return false;
@@ -592,15 +605,15 @@ fn expand_cells(mut cells: u64, transitions: &[u64]) -> u64 {
 }
 
 struct GuardedLexPlan {
-    grid: Vec<VarId>,
+    shared_array: Vec<VarId>,
     deferred_constraints: Vec<usize>,
     permutations: Vec<Vec<usize>>,
     guarded_indices: Vec<(VarId, VarId)>,
 }
 
-struct WordPlacementState<'run, 'model> {
+struct SequencePlacementState<'run, 'model> {
     assignment: &'run [i32],
-    word: &'run GuardedWord<'model>,
+    sequence: &'run GuardedSequence<'model>,
     ignored_constraints: &'run [usize],
     values: Vec<Option<i32>>,
     cells: Vec<usize>,
@@ -610,7 +623,7 @@ struct WordPlacementState<'run, 'model> {
     best: Option<TrialPlacement>,
 }
 
-struct WordTraceState<'a> {
+struct SequenceTraceState<'a> {
     cells: Vec<usize>,
     nodes: usize,
     stop: &'a AtomicBool,
@@ -871,7 +884,7 @@ fn constraint_has_lex_touching(constraint: &LocalConstraint, variables: &HashSet
     }
 }
 
-fn mismatch_letters(functionals: &[Functional], counter: VarId) -> Option<Vec<(VarId, i32)>> {
+fn mismatch_symbols(functionals: &[Functional], counter: VarId) -> Option<Vec<(VarId, i32)>> {
     let Functional::Linear { coeff, terms, rhs, .. } = functionals.iter().find(|functional| functional_target(functional) == counter)?
     else {
         return None;
@@ -880,14 +893,14 @@ fn mismatch_letters(functionals: &[Functional], counter: VarId) -> Option<Vec<(V
         return None;
     }
 
-    let mut letters = Vec::with_capacity(terms.len());
+    let mut symbols = Vec::with_capacity(terms.len());
     for &(_, mismatch) in terms {
         let Functional::Expr { expr, .. } = functionals.iter().find(|functional| functional_target(functional) == mismatch)? else {
             return None;
         };
-        letters.push(ne_var_any_const(expr)?);
+        symbols.push(ne_var_any_const(expr)?);
     }
-    Some(letters)
+    Some(symbols)
 }
 
 /// Build the [`LocalModel::affected`] incidence index. Seed it with each
@@ -962,6 +975,15 @@ impl LocalRhs {
 }
 
 impl LocalSearchSpec {
+    pub(crate) fn may_have_signed_product_square_objective(problem: &Problem, stop: &AtomicBool) -> bool {
+        problem
+            .objective
+            .as_ref()
+            .filter(|objective| objective.minimizing())
+            .and_then(|objective| squared_objective_variables(objective, Some(stop)))
+            .is_some()
+    }
+
     pub(crate) fn begin_guarded_constraints(&mut self) -> usize {
         self.suppress_functionals = true;
         self.constraints.len()
@@ -988,15 +1010,29 @@ impl LocalSearchSpec {
             let LocalConstraint::Expr(expr) = constraint else {
                 return false;
             };
-            guarded_mismatch_bound(expr).is_some_and(|(_, counter, _)| mismatch_letters(&self.functionals, counter).is_some())
+            guarded_mismatch_bound(expr).is_some_and(|(_, counter, _)| mismatch_symbols(&self.functionals, counter).is_some())
         })
     }
 
-    pub(crate) fn has_guarded_word_structure(&self, problem: &Problem) -> bool {
-        let Ok(model) = LocalModel::new(problem.clone(), self.clone()) else {
-            return false;
-        };
-        !model.guarded_words(&model.element_views()).is_empty()
+    pub(crate) fn has_guarded_sequence_primitives(&self) -> bool {
+        let has_element = self.functionals.iter().any(|functional| matches!(functional, Functional::Element { .. }));
+        let has_guard = self.constraints.iter().any(|constraint| match constraint {
+            LocalConstraint::Extension { vars, tuples } => guarded_value(vars, tuples).is_some(),
+            LocalConstraint::Expr(expr) => {
+                guarded_expr_value(expr).is_some()
+                    || guarded_mismatch_bound(expr).is_some_and(|(_, counter, _)| mismatch_symbols(&self.functionals, counter).is_some())
+            }
+            _ => false,
+        });
+        has_element && has_guard
+    }
+
+    pub(crate) fn has_signed_product_square_structure(&self, problem: &Problem) -> bool {
+        self.has_signed_product_square_structure_interruptible(problem, &AtomicBool::new(false))
+    }
+
+    pub(crate) fn has_signed_product_square_structure_interruptible(&self, problem: &Problem, stop: &AtomicBool) -> bool {
+        recognizes_signed_product_square_structure(problem, self, stop)
     }
 
     pub fn add_var(&mut self, var: VarId) {
@@ -1168,7 +1204,7 @@ impl LocalSearchSpec {
 }
 
 impl LocalModel {
-    fn new(problem: Problem, spec: LocalSearchSpec) -> Result<Self, usize> {
+    fn new(problem: &Problem, spec: LocalSearchSpec) -> Result<Self, usize> {
         let objective = problem.objective.clone().ok_or(1usize)?;
         let mut domains = Vec::with_capacity(problem.solver.store.num_vars());
         for i in 0..problem.solver.store.num_vars() {
@@ -1201,7 +1237,17 @@ impl LocalModel {
         let bool_tables = bool_tables(&functionals);
         let exact_covers = exact_cover_rows(&constraints, &domains);
         let affected = build_affected(domains.len(), &constraints, &functionals);
-        Ok(Self { domains, mutable, search: problem.search, objective, constraints, functionals, bool_tables, exact_covers, affected })
+        Ok(Self {
+            domains,
+            mutable,
+            search: problem.search.clone(),
+            objective,
+            constraints,
+            functionals,
+            bool_tables,
+            exact_covers,
+            affected,
+        })
     }
 
     fn random_assignment(&self, seed: u64) -> Vec<i32> {
@@ -1222,7 +1268,7 @@ impl LocalModel {
             return assignment;
         }
         let _ = self.complete(&mut assignment);
-        self.place_guarded_elements(assignment, seed, stop)
+        self.place_guarded_sequences(assignment, seed, stop)
     }
 
     fn has_extension(&self) -> bool {
@@ -1257,7 +1303,9 @@ impl LocalModel {
     fn objective_terms(&self) -> Vec<(i64, VarId)> {
         match &self.objective {
             Objective::Var(_, var) => self.expanded_var_terms(*var).unwrap_or_else(|| vec![(1, *var)]),
-            Objective::Linear(_, coeffs, vars) => coeffs.iter().copied().zip(vars.iter().copied()).collect(),
+            Objective::VarWithAffine(_, _, coeffs, vars) | Objective::Linear(_, coeffs, vars) => {
+                coeffs.iter().copied().zip(vars.iter().copied()).collect()
+            }
             Objective::Expr(_, expr) => expr
                 .affine_form_interruptible(&AtomicBool::new(false))
                 .map_or_else(Vec::new, |(_, coeffs, vars)| coeffs.into_iter().zip(vars).collect()),
@@ -1346,16 +1394,16 @@ impl LocalModel {
         best.map(|(_, var)| var)
     }
 
-    fn place_guarded_elements(&self, assignment: Vec<i32>, seed: u64, stop: &AtomicBool) -> Vec<i32> {
+    fn place_guarded_sequences(&self, assignment: Vec<i32>, seed: u64, stop: &AtomicBool) -> Vec<i32> {
         let elements = self.element_views();
-        let mut words = self.guarded_words(&elements);
-        if words.is_empty() {
+        let mut sequences = self.guarded_sequences(&elements);
+        if sequences.is_empty() {
             return assignment;
         }
         if seed == 0 {
-            words.sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.guard.cmp(&b.guard)));
+            sequences.sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.guard.cmp(&b.guard)));
         } else {
-            words.sort_by(|a, b| {
+            sequences.sort_by(|a, b| {
                 let ak = mix64(seed ^ a.guard.index() as u64);
                 let bk = mix64(seed ^ b.guard.index() as u64);
                 let aw = i128::from(a.weight) * i128::from(512 + (ak & 1023));
@@ -1364,21 +1412,21 @@ impl LocalModel {
             });
         }
         let fallback = assignment.clone();
-        let lex_plan = self.guarded_lex_plan(&words);
+        let lex_plan = self.guarded_lex_plan(&sequences);
         let deferred_lex = lex_plan.as_ref().map_or(&[][..], |plan| plan.deferred_constraints.as_slice());
-        let mismatch_aware = words.iter().any(|word| word.max_mismatches > 0);
+        let mismatch_aware = sequences.iter().any(|sequence| sequence.max_mismatches > 0);
         let priorities = if mismatch_aware && seed != 0 {
-            let mut unit_weights = words
+            let mut unit_weights = sequences
                 .iter()
-                .filter(|word| word.weight > 0)
-                .map(|word| word.weight / i64::try_from(word.letters.len()).unwrap_or(1).max(1))
+                .filter(|sequence| sequence.weight > 0)
+                .map(|sequence| sequence.weight / i64::try_from(sequence.symbols.len()).unwrap_or(1).max(1))
                 .collect::<Vec<_>>();
             unit_weights.sort_unstable();
             let unit = unit_weights.get(unit_weights.len() / 2).copied().unwrap_or(1).max(1);
             let multiplier = [1i64, 3, 6][seed as usize % 3];
-            vec![WordPlacementPriority::Weighted { cell_penalty: unit.saturating_mul(multiplier) }]
+            vec![SequencePlacementPriority::Weighted { cell_penalty: unit.saturating_mul(multiplier) }]
         } else {
-            vec![WordPlacementPriority::Reuse]
+            vec![SequencePlacementPriority::Reuse]
         };
 
         let mut best: Option<(i64, Vec<i32>, Vec<i32>)> = None;
@@ -1386,8 +1434,8 @@ impl LocalModel {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            let raw = self.construct_guarded_grid(assignment.clone(), &words, seed, priority, deferred_lex, stop);
-            let Some(finalized) = self.finalize_guarded_candidate(raw.clone(), &words, lex_plan.as_ref(), stop) else {
+            let raw = self.construct_guarded_array(assignment.clone(), &sequences, seed, priority, deferred_lex, stop);
+            let Some(finalized) = self.finalize_guarded_candidate(raw.clone(), &sequences, lex_plan.as_ref(), stop) else {
                 continue;
             };
             let objective = self.objective_value(&finalized).unwrap_or(if self.objective.minimizing() { i64::MAX } else { i64::MIN });
@@ -1402,8 +1450,8 @@ impl LocalModel {
         if stop.load(Ordering::Relaxed) {
             return finalized;
         }
-        let improved_raw = self.improve_guarded_grid(raw, &words, seed, mismatch_aware, stop);
-        let Some(improved) = self.finalize_guarded_candidate(improved_raw, &words, lex_plan.as_ref(), stop) else {
+        let improved_raw = self.improve_guarded_array(raw, &sequences, seed, mismatch_aware, stop);
+        let Some(improved) = self.finalize_guarded_candidate(improved_raw, &sequences, lex_plan.as_ref(), stop) else {
             return finalized;
         };
         let old_value = self.objective_value(&finalized);
@@ -1414,18 +1462,19 @@ impl LocalModel {
         }
     }
 
-    fn construct_guarded_grid(
+    fn construct_guarded_array(
         &self,
         mut assignment: Vec<i32>,
-        words: &[GuardedWord<'_>],
+        sequences: &[GuardedSequence<'_>],
         seed: u64,
-        priority: WordPlacementPriority,
+        priority: SequencePlacementPriority,
         deferred_lex: &[usize],
         stop: &AtomicBool,
     ) -> Vec<i32> {
         let mut fixed = vec![None; self.domains.len()];
-        let mut remaining = (0..words.len()).collect::<Vec<_>>();
-        let dynamic_order = matches!(priority, WordPlacementPriority::Weighted { .. }) || words.len() <= DYNAMIC_WORD_ORDER_LIMIT;
+        let mut remaining = (0..sequences.len()).collect::<Vec<_>>();
+        let dynamic_order =
+            matches!(priority, SequencePlacementPriority::Weighted { .. }) || sequences.len() <= DYNAMIC_SEQUENCE_ORDER_LIMIT;
 
         while !remaining.is_empty() {
             if stop.load(Ordering::Relaxed) {
@@ -1434,13 +1483,13 @@ impl LocalModel {
             let candidate_positions = if dynamic_order {
                 let mut positions = (0..remaining.len()).collect::<Vec<_>>();
                 positions.sort_unstable_by(|&left, &right| {
-                    words[remaining[right]]
+                    sequences[remaining[right]]
                         .weight
-                        .cmp(&words[remaining[left]].weight)
-                        .then_with(|| words[remaining[left]].guard.cmp(&words[remaining[right]].guard))
+                        .cmp(&sequences[remaining[left]].weight)
+                        .then_with(|| sequences[remaining[left]].guard.cmp(&sequences[remaining[right]].guard))
                 });
-                if words.first().is_some_and(|word| word.array.len() > MAX_GUARDED_GRID_CELLS) {
-                    positions.truncate(LARGE_GRID_DYNAMIC_WORD_CANDIDATES);
+                if sequences.first().is_some_and(|sequence| sequence.shared_array.len() > MAX_SHARED_ARRAY_CELLS) {
+                    positions.truncate(LARGE_SHARED_ARRAY_DYNAMIC_SEQUENCE_CANDIDATES);
                 }
                 positions
             } else {
@@ -1451,17 +1500,17 @@ impl LocalModel {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                let word_index = remaining[remaining_pos];
-                let word = &words[word_index];
-                let placement_seed = if seed == 0 { 0 } else { mix64(seed ^ word.guard.index() as u64 ^ remaining.len() as u64) };
-                let Some(candidate) = self.try_place_word(&assignment, &fixed, word, placement_seed, deferred_lex, stop) else {
+                let sequence_index = remaining[remaining_pos];
+                let sequence = &sequences[sequence_index];
+                let placement_seed = if seed == 0 { 0 } else { mix64(seed ^ sequence.guard.index() as u64 ^ remaining.len() as u64) };
+                let Some(candidate) = self.try_place_sequence(&assignment, &fixed, sequence, placement_seed, deferred_lex, stop) else {
                     continue;
                 };
-                let better = selected.as_ref().is_none_or(|(_, best_word_index, best)| {
-                    self.guarded_placement_better(priority, word, &candidate, &words[*best_word_index], best)
+                let better = selected.as_ref().is_none_or(|(_, best_sequence_index, best)| {
+                    self.guarded_placement_better(priority, sequence, &candidate, &sequences[*best_sequence_index], best)
                 });
                 if better {
-                    selected = Some((remaining_pos, word_index, candidate));
+                    selected = Some((remaining_pos, sequence_index, candidate));
                 }
             }
             let Some((remaining_pos, _, candidate)) = selected else {
@@ -1484,42 +1533,43 @@ impl LocalModel {
 
     fn guarded_placement_better(
         &self,
-        priority: WordPlacementPriority,
-        word: &GuardedWord<'_>,
+        priority: SequencePlacementPriority,
+        sequence: &GuardedSequence<'_>,
         candidate: &TrialPlacement,
-        best_word: &GuardedWord<'_>,
+        best_sequence: &GuardedSequence<'_>,
         best: &TrialPlacement,
     ) -> bool {
         let primary = match priority {
-            WordPlacementPriority::Reuse => i128::try_from(usize::MAX - candidate.new_cells).unwrap_or(i128::MAX),
-            WordPlacementPriority::Weighted { cell_penalty } => {
-                i128::from(word.weight) - i128::from(cell_penalty) * candidate.new_cells as i128
+            SequencePlacementPriority::Reuse => i128::try_from(usize::MAX - candidate.new_cells).unwrap_or(i128::MAX),
+            SequencePlacementPriority::Weighted { cell_penalty } => {
+                i128::from(sequence.weight) - i128::from(cell_penalty) * candidate.new_cells as i128
             }
         };
         let best_primary = match priority {
-            WordPlacementPriority::Reuse => i128::try_from(usize::MAX - best.new_cells).unwrap_or(i128::MAX),
-            WordPlacementPriority::Weighted { cell_penalty } => {
-                i128::from(best_word.weight) - i128::from(cell_penalty) * best.new_cells as i128
+            SequencePlacementPriority::Reuse => i128::try_from(usize::MAX - best.new_cells).unwrap_or(i128::MAX),
+            SequencePlacementPriority::Weighted { cell_penalty } => {
+                i128::from(best_sequence.weight) - i128::from(cell_penalty) * best.new_cells as i128
             }
         };
         primary > best_primary
             || (primary == best_primary
                 && (candidate.new_cells < best.new_cells
                     || (candidate.new_cells == best.new_cells
-                        && (word.weight > best_word.weight || (word.weight == best_word.weight && word.guard < best_word.guard)))))
+                        && (sequence.weight > best_sequence.weight
+                            || (sequence.weight == best_sequence.weight && sequence.guard < best_sequence.guard)))))
     }
 
     fn finalize_guarded_candidate(
         &self,
         assignment: Vec<i32>,
-        words: &[GuardedWord<'_>],
+        sequences: &[GuardedSequence<'_>],
         lex_plan: Option<&GuardedLexPlan>,
         stop: &AtomicBool,
     ) -> Option<Vec<i32>> {
         let ignored = lex_plan.map_or(&[][..], |plan| plan.deferred_constraints.as_slice());
-        let materialized = self.materialize_guarded_grid(assignment, words, ignored, stop)?;
+        let materialized = self.materialize_guarded_array(assignment, sequences, ignored, stop)?;
         let mut finalized = match lex_plan {
-            Some(plan) => self.canonicalize_guarded_grid(&materialized, plan, stop)?,
+            Some(plan) => self.canonicalize_guarded_array(&materialized, plan, stop)?,
             None => materialized,
         };
         if finalized.len() != self.domains.len()
@@ -1531,30 +1581,33 @@ impl LocalModel {
         Some(finalized)
     }
 
-    fn guarded_lex_plan(&self, words: &[GuardedWord<'_>]) -> Option<GuardedLexPlan> {
-        let grid = words.first()?.array;
-        if grid.is_empty() || words.iter().any(|word| word.array != grid) || i32::try_from(grid.len() - 1).is_err() {
+    fn guarded_lex_plan(&self, sequences: &[GuardedSequence<'_>]) -> Option<GuardedLexPlan> {
+        let shared_array = sequences.first()?.shared_array;
+        if shared_array.is_empty()
+            || sequences.iter().any(|sequence| sequence.shared_array != shared_array)
+            || i32::try_from(shared_array.len() - 1).is_err()
+        {
             return None;
         }
-        let positions = grid.iter().copied().enumerate().map(|(index, var)| (var, index)).collect::<HashMap<_, _>>();
-        if positions.len() != grid.len() {
+        let positions = shared_array.iter().copied().enumerate().map(|(index, var)| (var, index)).collect::<HashMap<_, _>>();
+        if positions.len() != shared_array.len() {
             return None;
         }
-        let grid_vars = positions.keys().copied().collect::<HashSet<_>>();
+        let shared_array_vars = positions.keys().copied().collect::<HashSet<_>>();
         let mut deferred_constraints = Vec::new();
-        let mut permutations = vec![(0..grid.len()).collect::<Vec<_>>()];
+        let mut permutations = vec![(0..shared_array.len()).collect::<Vec<_>>()];
         for (constraint_index, constraint) in self.constraints.iter().enumerate() {
             match constraint {
                 LocalConstraint::Lex { rows, strict } => {
-                    let touches_grid = rows.iter().flatten().any(|var| grid_vars.contains(var));
-                    if !touches_grid {
+                    let touches_shared_array = rows.iter().flatten().any(|var| shared_array_vars.contains(var));
+                    if !touches_shared_array {
                         continue;
                     }
-                    if *strict || rows.len() != 2 || rows[0].as_slice() != grid || rows[1].len() != grid.len() {
+                    if *strict || rows.len() != 2 || rows[0].as_slice() != shared_array || rows[1].len() != shared_array.len() {
                         return None;
                     }
-                    let mut seen = vec![false; grid.len()];
-                    let mut permutation = Vec::with_capacity(grid.len());
+                    let mut seen = vec![false; shared_array.len()];
+                    let mut permutation = Vec::with_capacity(shared_array.len());
                     for var in &rows[1] {
                         let &position = positions.get(var)?;
                         if seen[position] {
@@ -1571,7 +1624,7 @@ impl LocalModel {
                         permutations.push(permutation);
                     }
                 }
-                LocalConstraint::Selected { constraint, .. } if constraint_has_lex_touching(constraint, &grid_vars) => return None,
+                LocalConstraint::Selected { constraint, .. } if constraint_has_lex_touching(constraint, &shared_array_vars) => return None,
                 _ => {}
             }
         }
@@ -1580,9 +1633,9 @@ impl LocalModel {
         }
 
         let mut index_guards = HashMap::new();
-        for word in words {
-            for &(index, _) in &word.letters {
-                if index_guards.insert(index, word.guard).is_some_and(|guard| guard != word.guard) {
+        for sequence in sequences {
+            for &(index, _) in &sequence.symbols {
+                if index_guards.insert(index, sequence.guard).is_some_and(|guard| guard != sequence.guard) {
                     return None;
                 }
             }
@@ -1592,10 +1645,10 @@ impl LocalModel {
             let Functional::Element { array, index, start_index, .. } = functional else {
                 continue;
             };
-            if !array.iter().any(|var| grid_vars.contains(var)) {
+            if !array.iter().any(|var| shared_array_vars.contains(var)) {
                 continue;
             }
-            if array.as_slice() != grid || *start_index != 0 {
+            if array.as_slice() != shared_array || *start_index != 0 {
                 return None;
             }
             guarded_indices.push((*index, *index_guards.get(index)?));
@@ -1603,35 +1656,35 @@ impl LocalModel {
         guarded_indices.sort_unstable();
         guarded_indices.dedup();
         if guarded_indices.is_empty()
-            || words
+            || sequences
                 .iter()
-                .flat_map(|word| word.letters.iter().map(|&(index, _)| index))
+                .flat_map(|sequence| sequence.symbols.iter().map(|&(index, _)| index))
                 .any(|index| guarded_indices.binary_search_by_key(&index, |&(candidate, _)| candidate).is_err())
         {
             return None;
         }
 
-        Some(GuardedLexPlan { grid: grid.to_vec(), deferred_constraints, permutations, guarded_indices })
+        Some(GuardedLexPlan { shared_array: shared_array.to_vec(), deferred_constraints, permutations, guarded_indices })
     }
 
-    fn canonicalize_guarded_grid(&self, assignment: &[i32], plan: &GuardedLexPlan, stop: &AtomicBool) -> Option<Vec<i32>> {
-        let old_grid = plan.grid.iter().map(|var| assignment[var.index()]).collect::<Vec<_>>();
+    fn canonicalize_guarded_array(&self, assignment: &[i32], plan: &GuardedLexPlan, stop: &AtomicBool) -> Option<Vec<i32>> {
+        let old_shared_array = plan.shared_array.iter().map(|var| assignment[var.index()]).collect::<Vec<_>>();
         let mut best: Option<(Vec<i32>, Vec<i32>)> = None;
         for permutation in &plan.permutations {
-            if stop.load(Ordering::Relaxed) || permutation.len() != plan.grid.len() {
+            if stop.load(Ordering::Relaxed) || permutation.len() != plan.shared_array.len() {
                 return None;
             }
             let mut inverse = vec![usize::MAX; permutation.len()];
             let mut trial = assignment.to_vec();
             let mut in_domain = true;
             for (new_position, &old_position) in permutation.iter().enumerate() {
-                if old_position >= old_grid.len() || inverse[old_position] != usize::MAX {
+                if old_position >= old_shared_array.len() || inverse[old_position] != usize::MAX {
                     in_domain = false;
                     break;
                 }
                 inverse[old_position] = new_position;
-                let variable = plan.grid[new_position];
-                let value = old_grid[old_position];
+                let variable = plan.shared_array[new_position];
+                let value = old_shared_array[old_position];
                 if !self.domains[variable.index()].contains(value) {
                     in_domain = false;
                     break;
@@ -1666,65 +1719,65 @@ impl LocalModel {
             if !in_domain || self.score(&mut trial).violation != 0 {
                 continue;
             }
-            let grid_values = plan.grid.iter().map(|var| trial[var.index()]).collect::<Vec<_>>();
-            if best.as_ref().is_none_or(|(best_grid, _)| grid_values < *best_grid) {
-                best = Some((grid_values, trial));
+            let shared_array_values = plan.shared_array.iter().map(|var| trial[var.index()]).collect::<Vec<_>>();
+            if best.as_ref().is_none_or(|(best_shared_array, _)| shared_array_values < *best_shared_array) {
+                best = Some((shared_array_values, trial));
             }
         }
         best.map(|(_, assignment)| assignment)
     }
 
-    fn improve_guarded_grid(
+    fn improve_guarded_array(
         &self,
         mut assignment: Vec<i32>,
-        words: &[GuardedWord<'_>],
+        sequences: &[GuardedSequence<'_>],
         seed: u64,
         mismatch_aware: bool,
         stop: &AtomicBool,
     ) -> Vec<i32> {
-        let Some(grid) = words.first().map(|word| word.array) else {
+        let Some(shared_array) = sequences.first().map(|sequence| sequence.shared_array) else {
             return assignment;
         };
         if !mismatch_aware
-            || grid.len() > MAX_GUARDED_GRID_CELLS
-            || words.iter().any(|word| word.array != grid)
+            || shared_array.len() > MAX_SHARED_ARRAY_CELLS
+            || sequences.iter().any(|sequence| sequence.shared_array != shared_array)
             || stop.load(Ordering::Relaxed)
         {
             return assignment;
         }
 
-        let mut alphabet = words.iter().flat_map(|word| word.letters.iter().map(|&(_, value)| value)).collect::<Vec<_>>();
-        alphabet.extend(grid.iter().map(|variable| assignment[variable.index()]));
+        let mut alphabet = sequences.iter().flat_map(|sequence| sequence.symbols.iter().map(|&(_, value)| value)).collect::<Vec<_>>();
+        alphabet.extend(shared_array.iter().map(|variable| assignment[variable.index()]));
         alphabet.sort_unstable();
         alphabet.dedup();
         if alphabet.is_empty() {
             return assignment;
         }
 
-        let Some(mut evaluator) = GuardedGridEvaluator::new(self, &assignment, words) else {
+        let Some(mut evaluator) = GuardedSequenceEvaluator::new(self, &assignment, sequences) else {
             return assignment;
         };
         let mut best_values = evaluator.values.clone();
         let mut best_score = evaluator.score;
-        let mut weights = words.iter().map(|word| word.weight.max(1)).collect::<Vec<_>>();
+        let mut weights = sequences.iter().map(|sequence| sequence.weight.max(1)).collect::<Vec<_>>();
         weights.sort_unstable();
         let temperature_scale = weights.get(weights.len() / 2).copied().unwrap_or(1).max(1);
 
-        // Each cycle starts from the best known grid at a high temperature and
+        // Each cycle starts from the best known shared_array at a high temperature and
         // cools deterministically. This makes portfolio seeds meaningfully
         // different while keeping a seed exactly reproducible.
-        for step in 0..GUARDED_GRID_ANNEAL_STEPS {
+        for step in 0..SHARED_ARRAY_ANNEAL_STEPS {
             if step.is_multiple_of(256) && stop.load(Ordering::Relaxed) {
                 break;
             }
-            let cycle_step = step % GUARDED_GRID_ANNEAL_CYCLE;
+            let cycle_step = step % SHARED_ARRAY_ANNEAL_CYCLE;
             if cycle_step == 0 {
                 evaluator.set_values(&best_values);
             }
             let random = mix64(seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA076_1D64_78BD_642F);
-            let cell = random as usize % grid.len();
+            let cell = random as usize % shared_array.len();
             let value = alphabet[mix64(random ^ 0xE703_7ED1_A0B4_28DB) as usize % alphabet.len()];
-            if value == evaluator.values[cell] || !self.domains[grid[cell].index()].contains(value) {
+            if value == evaluator.values[cell] || !self.domains[shared_array[cell].index()].contains(value) {
                 continue;
             }
 
@@ -1733,9 +1786,9 @@ impl LocalModel {
             let accept = if delta >= 0 {
                 true
             } else {
-                let remaining = GUARDED_GRID_ANNEAL_CYCLE - cycle_step;
+                let remaining = SHARED_ARRAY_ANNEAL_CYCLE - cycle_step;
                 let temperature = temperature_scale.saturating_mul(i64::try_from(remaining).unwrap_or(i64::MAX))
-                    / i64::try_from(GUARDED_GRID_ANNEAL_CYCLE).unwrap_or(1);
+                    / i64::try_from(SHARED_ARRAY_ANNEAL_CYCLE).unwrap_or(1);
                 let loss = delta.saturating_neg();
                 let range = temperature.saturating_add(loss).max(1) as u64;
                 mix64(random ^ 0x8EBC_6AF0_9C88_C6E3) % range < temperature.max(0) as u64
@@ -1751,9 +1804,9 @@ impl LocalModel {
         }
 
         evaluator.set_values(&best_values);
-        for _ in 0..GUARDED_GRID_HILL_CLIMB_ROUNDS {
+        for _ in 0..SHARED_ARRAY_HILL_CLIMB_ROUNDS {
             let mut changed = false;
-            for (cell, &variable) in grid.iter().enumerate() {
+            for (cell, &variable) in shared_array.iter().enumerate() {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
@@ -1783,22 +1836,22 @@ impl LocalModel {
 
         // Single-cell local optima are common on the 3x3 and 4x4 variants.
         // Exhaustive two-cell moves are still small at this deliberately tight
-        // grid limit and recover improvements that a blind random walk misses.
-        let pair_rounds = if grid.len() <= MAX_GUARDED_GRID_PAIR_CELLS { GUARDED_GRID_PAIR_ROUNDS } else { 0 };
+        // shared_array limit and recover improvements that a blind random walk misses.
+        let pair_rounds = if shared_array.len() <= MAX_SHARED_ARRAY_PAIR_CELLS { SHARED_ARRAY_PAIR_ROUNDS } else { 0 };
         for _ in 0..pair_rounds {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
             let baseline = evaluator.score;
             let mut best_pair: Option<(i64, usize, i32, usize, i32)> = None;
-            for left in 0..grid.len() {
+            for left in 0..shared_array.len() {
                 let old_left = evaluator.values[left];
                 for &left_value in &alphabet {
-                    if left_value == old_left || !self.domains[grid[left].index()].contains(left_value) {
+                    if left_value == old_left || !self.domains[shared_array[left].index()].contains(left_value) {
                         continue;
                     }
                     evaluator.apply_value(left, left_value);
-                    for (right, &right_variable) in grid.iter().enumerate().skip(left + 1) {
+                    for (right, &right_variable) in shared_array.iter().enumerate().skip(left + 1) {
                         let old_right = evaluator.values[right];
                         for &right_value in &alphabet {
                             if right_value == old_right || !self.domains[right_variable.index()].contains(right_value) {
@@ -1830,7 +1883,7 @@ impl LocalModel {
         if evaluator.score > best_score {
             best_values.clone_from(&evaluator.values);
         }
-        for (position, &variable) in grid.iter().enumerate() {
+        for (position, &variable) in shared_array.iter().enumerate() {
             let value = best_values[position];
             if self.domains[variable.index()].contains(value) {
                 assignment[variable.index()] = value;
@@ -1839,32 +1892,32 @@ impl LocalModel {
         assignment
     }
 
-    fn materialize_guarded_grid(
+    fn materialize_guarded_array(
         &self,
         mut assignment: Vec<i32>,
-        words: &[GuardedWord<'_>],
+        sequences: &[GuardedSequence<'_>],
         ignored_constraints: &[usize],
         stop: &AtomicBool,
     ) -> Option<Vec<i32>> {
-        for word in words {
-            if !self.domains[word.guard.index()].contains(0) {
+        for sequence in sequences {
+            if !self.domains[sequence.guard.index()].contains(0) {
                 return None;
             }
-            assignment[word.guard.index()] = 0;
-            for &(index, _) in &word.letters {
+            assignment[sequence.guard.index()] = 0;
+            for &(index, _) in &sequence.symbols {
                 let domain = &self.domains[index.index()];
                 assignment[index.index()] = if domain.contains(0) { 0 } else { domain.min_value() };
             }
         }
-        for word in words {
-            let Some(cells) = self.trace_guarded_word(&assignment, word, stop) else {
+        for sequence in sequences {
+            let Some(cells) = self.trace_guarded_sequence(&assignment, sequence, stop) else {
                 continue;
             };
-            if !self.domains[word.guard.index()].contains(1) {
+            if !self.domains[sequence.guard.index()].contains(1) {
                 return None;
             }
-            assignment[word.guard.index()] = 1;
-            for (&cell, &(index, _)) in cells.iter().zip(&word.letters) {
+            assignment[sequence.guard.index()] = 1;
+            for (&cell, &(index, _)) in cells.iter().zip(&sequence.symbols) {
                 let value = i32::try_from(cell).ok()?;
                 if !self.domains[index.index()].contains(value) {
                     return None;
@@ -1878,44 +1931,44 @@ impl LocalModel {
         (self.score_ignoring_constraints(&mut assignment, ignored_constraints).violation == 0).then_some(assignment)
     }
 
-    fn trace_guarded_word(&self, assignment: &[i32], word: &GuardedWord<'_>, stop: &AtomicBool) -> Option<Vec<usize>> {
-        let mut state = WordTraceState { cells: vec![0; word.letters.len()], nodes: WORD_PLACEMENT_NODE_LIMIT, stop };
-        self.trace_guarded_letters(assignment, word, 0, None, word.max_mismatches, &mut state).then_some(state.cells)
+    fn trace_guarded_sequence(&self, assignment: &[i32], sequence: &GuardedSequence<'_>, stop: &AtomicBool) -> Option<Vec<usize>> {
+        let mut state = SequenceTraceState { cells: vec![0; sequence.symbols.len()], nodes: SEQUENCE_PLACEMENT_NODE_LIMIT, stop };
+        self.trace_guarded_symbols(assignment, sequence, 0, None, sequence.max_mismatches, &mut state).then_some(state.cells)
     }
 
-    fn trace_guarded_letters(
+    fn trace_guarded_symbols(
         &self,
         assignment: &[i32],
-        word: &GuardedWord<'_>,
+        sequence: &GuardedSequence<'_>,
         pos: usize,
         previous: Option<usize>,
         mismatches_left: usize,
-        state: &mut WordTraceState<'_>,
+        state: &mut SequenceTraceState<'_>,
     ) -> bool {
         if state.nodes == 0 || state.stop.load(Ordering::Relaxed) {
             return false;
         }
         state.nodes -= 1;
-        if pos == word.letters.len() {
+        if pos == sequence.symbols.len() {
             return true;
         }
-        let (index, value) = word.letters[pos];
-        for cell in (0..word.array.len()).rev() {
+        let (index, value) = sequence.symbols[pos];
+        for cell in (0..sequence.shared_array.len()).rev() {
             if previous == Some(cell) || !self.domains[index.index()].contains(cell as i32) {
                 continue;
             }
             if let Some(previous) = previous {
-                let previous_index = word.letters[pos - 1].0;
+                let previous_index = sequence.symbols[pos - 1].0;
                 if !self.pair_allowed(previous_index, index, previous as i32, cell as i32) {
                     continue;
                 }
             }
-            let mismatch = usize::from(assignment[word.array[cell].index()] != value);
+            let mismatch = usize::from(assignment[sequence.shared_array[cell].index()] != value);
             if mismatch > mismatches_left {
                 continue;
             }
             state.cells[pos] = cell;
-            if self.trace_guarded_letters(assignment, word, pos + 1, Some(cell), mismatches_left - mismatch, state) {
+            if self.trace_guarded_symbols(assignment, sequence, pos + 1, Some(cell), mismatches_left - mismatch, state) {
                 return true;
             }
         }
@@ -1932,7 +1985,9 @@ impl LocalModel {
         elements
     }
 
-    fn guarded_words<'a>(&self, elements: &ElementViews<'a>) -> Vec<GuardedWord<'a>> {
+    // This reconstruction is the authoritative structural check. The semantic
+    // orchestration check is intentionally only a cheap compilation prefilter.
+    fn guarded_sequences<'a>(&self, elements: &ElementViews<'a>) -> Vec<GuardedSequence<'a>> {
         let mut requirements: BTreeMap<VarId, Vec<(VarId, i32)>> = BTreeMap::new();
         let mut max_mismatches = BTreeMap::new();
         for constraint in &self.constraints {
@@ -1960,55 +2015,55 @@ impl LocalModel {
             if requirements.contains_key(&guard) {
                 continue;
             }
-            let Some(letters) = mismatch_letters(&self.functionals, counter) else {
+            let Some(symbols) = mismatch_symbols(&self.functionals, counter) else {
                 continue;
             };
-            requirements.insert(guard, letters);
+            requirements.insert(guard, symbols);
             max_mismatches.insert(guard, allowed);
         }
 
-        let mut words = Vec::new();
+        let mut sequences = Vec::new();
         for (guard, reqs) in requirements {
             let Some(weight) = self.objective_weight(guard) else {
                 continue;
             };
-            let mut letters = Vec::with_capacity(reqs.len());
+            let mut symbols = Vec::with_capacity(reqs.len());
             let mut array = None;
             for (target, value) in reqs {
                 let Some(&(candidate_array, index, start_index)) = elements.get(&target) else {
-                    letters.clear();
+                    symbols.clear();
                     break;
                 };
                 if start_index != 0 {
-                    letters.clear();
+                    symbols.clear();
                     break;
                 }
                 if let Some(array) = array {
                     if array != candidate_array {
-                        letters.clear();
+                        symbols.clear();
                         break;
                     }
                 } else {
                     array = Some(candidate_array);
                 }
-                letters.push((index, value));
+                symbols.push((index, value));
             }
             if let Some(array) = array {
-                if !letters.is_empty() && self.domains[guard.index()].contains(1) {
-                    letters.sort_by_key(|&(index, _)| index.index());
-                    let max_mismatches = max_mismatches.get(&guard).copied().unwrap_or(0).min(letters.len());
-                    words.push(GuardedWord { guard, weight, array, letters, max_mismatches });
+                if !symbols.is_empty() && self.domains[guard.index()].contains(1) {
+                    symbols.sort_by_key(|&(index, _)| index.index());
+                    let max_mismatches = max_mismatches.get(&guard).copied().unwrap_or(0).min(symbols.len());
+                    sequences.push(GuardedSequence { guard, weight, shared_array: array, symbols, max_mismatches });
                 }
             }
         }
-        words
+        sequences
     }
 
-    fn try_place_word(
+    fn try_place_sequence(
         &self,
         assignment: &[i32],
         fixed: &[Option<i32>],
-        word: &GuardedWord<'_>,
+        sequence: &GuardedSequence<'_>,
         placement_seed: u64,
         ignored_constraints: &[usize],
         stop: &AtomicBool,
@@ -2016,28 +2071,28 @@ impl LocalModel {
         if stop.load(Ordering::Relaxed) {
             return None;
         }
-        let mut state = WordPlacementState {
+        let mut state = SequencePlacementState {
             assignment,
-            word,
+            sequence,
             ignored_constraints,
-            values: vec![None; word.array.len()],
-            cells: vec![0; word.letters.len()],
-            nodes: WORD_PLACEMENT_EVALUATION_NODE_LIMIT,
+            values: vec![None; sequence.shared_array.len()],
+            cells: vec![0; sequence.symbols.len()],
+            nodes: SEQUENCE_PLACEMENT_EVALUATION_NODE_LIMIT,
             placement_seed,
             stop,
             best: None,
         };
-        for (cell, &var) in word.array.iter().enumerate() {
+        for (cell, &var) in sequence.shared_array.iter().enumerate() {
             state.values[cell] = fixed[var.index()];
         }
-        self.place_word_letters(0, None, word.max_mismatches, 0, &mut state);
+        self.place_sequence_symbols(0, None, sequence.max_mismatches, 0, &mut state);
         state.best
     }
 
-    fn word_trial(
+    fn sequence_trial(
         &self,
         assignment: &[i32],
-        word: &GuardedWord<'_>,
+        sequence: &GuardedSequence<'_>,
         values: &[Option<i32>],
         cells: &[usize],
         new_cells: usize,
@@ -2045,10 +2100,10 @@ impl LocalModel {
     ) -> Option<TrialPlacement> {
         let mut trial = assignment.to_vec();
         let mut placements = Vec::new();
-        trial[word.guard.index()] = 1;
+        trial[sequence.guard.index()] = 1;
         for (cell, &value) in values.iter().enumerate() {
             if let Some(value) = value {
-                let x = word.array[cell];
+                let x = sequence.shared_array[cell];
                 if !self.domains[x.index()].contains(value) {
                     return None;
                 }
@@ -2056,7 +2111,7 @@ impl LocalModel {
                 placements.push((x, value));
             }
         }
-        for (&cell, &(index, _)) in cells.iter().zip(&word.letters) {
+        for (&cell, &(index, _)) in cells.iter().zip(&sequence.symbols) {
             trial[index.index()] = i32::try_from(cell).ok()?;
         }
         (self.score_ignoring_constraints(&mut trial, ignored_constraints).violation == 0).then_some(TrialPlacement {
@@ -2086,13 +2141,13 @@ impl LocalModel {
         self.bool_tables.get(&(right, left)).is_none_or(|true_pairs| true_pairs.binary_search(&(right_value, left_value)).is_ok())
     }
 
-    fn place_word_letters(
+    fn place_sequence_symbols(
         &self,
         pos: usize,
         previous: Option<usize>,
         mismatches_left: usize,
         new_cells: usize,
-        state: &mut WordPlacementState<'_, '_>,
+        state: &mut SequencePlacementState<'_, '_>,
     ) {
         if state.nodes == 0
             || state.stop.load(Ordering::Relaxed)
@@ -2101,16 +2156,16 @@ impl LocalModel {
             return;
         }
         state.nodes -= 1;
-        if pos == state.word.letters.len() {
+        if pos == state.sequence.symbols.len() {
             if let Some(candidate) =
-                self.word_trial(state.assignment, state.word, &state.values, &state.cells, new_cells, state.ignored_constraints)
+                self.sequence_trial(state.assignment, state.sequence, &state.values, &state.cells, new_cells, state.ignored_constraints)
             {
                 state.best = Some(candidate);
             }
             return;
         }
-        let (index, value) = state.word.letters[pos];
-        let cell_count = state.word.array.len();
+        let (index, value) = state.sequence.symbols[pos];
+        let cell_count = state.sequence.shared_array.len();
         let offset = if state.placement_seed == 0 {
             0
         } else {
@@ -2124,10 +2179,10 @@ impl LocalModel {
             if state.stop.load(Ordering::Relaxed) {
                 return;
             }
-            if !self.word_cell_allowed(state.word, pos, previous, index, cell) || state.values[cell] != Some(value) {
+            if !self.sequence_cell_allowed(state.sequence, pos, previous, index, cell) || state.values[cell] != Some(value) {
                 continue;
             }
-            self.descend_word_cell(pos, cell, None, mismatches_left, new_cells, state);
+            self.descend_sequence_cell(pos, cell, None, mismatches_left, new_cells, state);
             if state.best.as_ref().is_some_and(|candidate| candidate.new_cells == new_cells) {
                 return;
             }
@@ -2144,10 +2199,10 @@ impl LocalModel {
                 let Some(old) = state.values[cell] else {
                     continue;
                 };
-                if old == value || !self.word_cell_allowed(state.word, pos, previous, index, cell) {
+                if old == value || !self.sequence_cell_allowed(state.sequence, pos, previous, index, cell) {
                     continue;
                 }
-                self.descend_word_cell(pos, cell, None, mismatches_left - 1, new_cells, state);
+                self.descend_sequence_cell(pos, cell, None, mismatches_left - 1, new_cells, state);
                 if state.best.as_ref().is_some_and(|candidate| candidate.new_cells == new_cells) {
                     return;
                 }
@@ -2155,21 +2210,21 @@ impl LocalModel {
         }
 
         // A free cell whose current value is already a permitted mismatch can
-        // be used without claiming it for later words.
+        // be used without claiming it for later sequences.
         if mismatches_left > 0 {
             for rank in 0..cell_count {
                 let cell = (offset + rank) % cell_count;
                 if state.stop.load(Ordering::Relaxed) {
                     return;
                 }
-                let x = state.word.array[cell];
+                let x = state.sequence.shared_array[cell];
                 if state.values[cell].is_some()
                     || state.assignment[x.index()] == value
-                    || !self.word_cell_allowed(state.word, pos, previous, index, cell)
+                    || !self.sequence_cell_allowed(state.sequence, pos, previous, index, cell)
                 {
                     continue;
                 }
-                self.descend_word_cell(pos, cell, None, mismatches_left - 1, new_cells, state);
+                self.descend_sequence_cell(pos, cell, None, mismatches_left - 1, new_cells, state);
                 if state.best.as_ref().is_some_and(|candidate| candidate.new_cells == new_cells) {
                     return;
                 }
@@ -2183,17 +2238,17 @@ impl LocalModel {
             if state.stop.load(Ordering::Relaxed) {
                 return;
             }
-            let x = state.word.array[cell];
+            let x = state.sequence.shared_array[cell];
             if state.values[cell].is_some()
                 || !self.domains[x.index()].contains(value)
-                || !self.word_cell_allowed(state.word, pos, previous, index, cell)
+                || !self.sequence_cell_allowed(state.sequence, pos, previous, index, cell)
             {
                 continue;
             }
-            self.descend_word_cell(pos, cell, Some(value), mismatches_left, new_cells + 1, state);
+            self.descend_sequence_cell(pos, cell, Some(value), mismatches_left, new_cells + 1, state);
         }
 
-        // If the current free-cell value equals the requested letter, create an
+        // If the current free-cell value equals the requested symbol, create an
         // explicit alternative only when consuming a mismatch is allowed.
         if mismatches_left > 0 {
             for rank in 0..cell_count {
@@ -2201,46 +2256,53 @@ impl LocalModel {
                 if state.stop.load(Ordering::Relaxed) {
                     return;
                 }
-                let x = state.word.array[cell];
+                let x = state.sequence.shared_array[cell];
                 if state.values[cell].is_some()
                     || state.assignment[x.index()] != value
-                    || !self.word_cell_allowed(state.word, pos, previous, index, cell)
+                    || !self.sequence_cell_allowed(state.sequence, pos, previous, index, cell)
                 {
                     continue;
                 }
                 let Some(other) = self.domains[x.index()].first_value_except(value) else {
                     continue;
                 };
-                self.descend_word_cell(pos, cell, Some(other), mismatches_left - 1, new_cells + 1, state);
+                self.descend_sequence_cell(pos, cell, Some(other), mismatches_left - 1, new_cells + 1, state);
             }
         }
     }
 
-    fn word_cell_allowed(&self, word: &GuardedWord<'_>, pos: usize, previous: Option<usize>, index: VarId, cell: usize) -> bool {
+    fn sequence_cell_allowed(
+        &self,
+        sequence: &GuardedSequence<'_>,
+        pos: usize,
+        previous: Option<usize>,
+        index: VarId,
+        cell: usize,
+    ) -> bool {
         if previous == Some(cell) || !self.domains[index.index()].contains(cell as i32) {
             return false;
         }
         previous.is_none_or(|previous| {
-            let previous_index = word.letters[pos - 1].0;
+            let previous_index = sequence.symbols[pos - 1].0;
             self.pair_allowed(previous_index, index, previous as i32, cell as i32)
         })
     }
 
-    fn descend_word_cell(
+    fn descend_sequence_cell(
         &self,
         pos: usize,
         cell: usize,
         set_value: Option<i32>,
         mismatches_left: usize,
         new_cells: usize,
-        state: &mut WordPlacementState<'_, '_>,
+        state: &mut SequencePlacementState<'_, '_>,
     ) {
         let old = state.values[cell];
         if let Some(value) = set_value {
             state.values[cell] = Some(value);
         }
         state.cells[pos] = cell;
-        self.place_word_letters(pos + 1, Some(cell), mismatches_left, new_cells, state);
+        self.place_sequence_symbols(pos + 1, Some(cell), mismatches_left, new_cells, state);
         state.values[cell] = old;
     }
 
@@ -2304,7 +2366,7 @@ impl LocalModel {
 
     fn objective_value(&self, assignment: &[i32]) -> Option<i64> {
         match &self.objective {
-            Objective::Var(_, var) => Some(assignment[var.index()] as i64),
+            Objective::Var(_, var) | Objective::VarWithAffine(_, var, _, _) => Some(assignment[var.index()] as i64),
             Objective::Linear(_, coeffs, vars) => Some(coeffs.iter().zip(vars).map(|(&c, &v)| c * assignment[v.index()] as i64).sum()),
             Objective::Expr(_, expr) => expr.eval(&|v| assignment[v.index()] as i64),
         }
@@ -2435,9 +2497,332 @@ impl LocalModel {
         }
     }
 
+    /// Recognize a complete signed-product-square IR structure. Any relevant
+    /// near-match is declined so the ordinary local-search loop handles it.
+    fn signed_product_squares_plan(&self, stop: Option<&AtomicBool>) -> Option<SignedProductSquaresPlan> {
+        if plan_interrupted(stop) || !self.objective.minimizing() || self.constraints.len() != self.functionals.len() {
+            return None;
+        }
+        let square_targets = squared_objective_variables(&self.objective, stop)?;
+        let square_set = square_targets.iter().copied().collect::<HashSet<_>>();
+        let mutable = self.mutable.iter().copied().collect::<HashSet<_>>();
+
+        // Every non-objective functional must define one bilinear sign variable product.
+        // No constraint is silently ignored by this specialized plan.
+        let mut products = HashMap::<VarId, (VarId, VarId)>::new();
+        let mut signs = HashSet::<VarId>::new();
+        for functional in &self.functionals {
+            if plan_interrupted(stop) {
+                return None;
+            }
+            let target = functional_target(functional);
+            if square_set.contains(&target) {
+                continue;
+            }
+            let Functional::Expr { expr, .. } = functional else {
+                return None;
+            };
+            let (left, right) = binary_product(expr)?;
+            if left == right
+                || square_set.contains(&left)
+                || square_set.contains(&right)
+                || !mutable.contains(&left)
+                || !mutable.contains(&right)
+                || mutable.contains(&target)
+                || !is_sign_domain(self.domains.get(left.index())?)
+                || !is_sign_domain(self.domains.get(right.index())?)
+                || !is_sign_domain(self.domains.get(target.index())?)
+                || products.insert(target, (left, right)).is_some()
+            {
+                return None;
+            }
+            signs.extend([left, right]);
+        }
+        if signs.len() < 2 || products.is_empty() {
+            return None;
+        }
+
+        // Each squared objective variable must be exactly the unit-coefficient
+        // sum of one non-empty group of the products above. Requiring the full
+        // parity range in its domain proves that the derived variable imposes no
+        // hidden restriction on the sign variable assignments searched by the kernel.
+        let mut seen_targets = HashSet::new();
+        let mut used_products = HashSet::new();
+        let mut variable_groups = Vec::<Vec<(VarId, VarId)>>::with_capacity(square_targets.len());
+        for functional in &self.functionals {
+            if plan_interrupted(stop) {
+                return None;
+            }
+            let target = functional_target(functional);
+            if !square_set.contains(&target) {
+                continue;
+            }
+            if mutable.contains(&target) || !seen_targets.insert(target) {
+                return None;
+            }
+            let product_targets = unit_product_sum_targets(functional)?;
+            if product_targets.is_empty() || !domain_contains_unit_sum_range(self.domains.get(target.index())?, product_targets.len(), stop)
+            {
+                return None;
+            }
+            let mut group = Vec::with_capacity(product_targets.len());
+            for product in product_targets {
+                if plan_interrupted(stop) {
+                    return None;
+                }
+                group.push(*products.get(&product)?);
+                used_products.insert(product);
+            }
+            variable_groups.push(group);
+        }
+        if seen_targets != square_set
+            || used_products.len() != products.len()
+            || !products.keys().all(|target| used_products.contains(target))
+        {
+            return None;
+        }
+
+        let mut signs = signs.into_iter().collect::<Vec<_>>();
+        signs.sort_unstable();
+        let sign_indices = signs.iter().enumerate().map(|(index, &variable)| (variable, index)).collect::<HashMap<_, _>>();
+        let mut groups = Vec::with_capacity(variable_groups.len());
+        let mut incidence = (0..signs.len()).map(|_| BTreeMap::<usize, Vec<usize>>::new()).collect::<Vec<_>>();
+        let mut incidence_visits = 0usize;
+        for (group_index, group) in variable_groups.into_iter().enumerate() {
+            if plan_interrupted(stop) {
+                return None;
+            }
+            let mut indexed = Vec::with_capacity(group.len());
+            for (left, right) in group {
+                incidence_visits = incidence_visits.wrapping_add(1);
+                if incidence_visits.is_multiple_of(1_024) && plan_interrupted(stop) {
+                    return None;
+                }
+                let left = *sign_indices.get(&left)?;
+                let right = *sign_indices.get(&right)?;
+                if left == right {
+                    return None;
+                }
+                indexed.push((left, right));
+                incidence[left].entry(group_index).or_default().push(right);
+                incidence[right].entry(group_index).or_default().push(left);
+            }
+            groups.push(indexed);
+        }
+        let incidence = incidence
+            .into_iter()
+            .map(|groups| groups.into_iter().map(|(group, neighbors)| GroupIncidence { group, neighbors }).collect())
+            .collect();
+        Some(SignedProductSquaresPlan { signs, groups, incidence })
+    }
+
     fn search_solution(&self, assignment: &[i32]) -> Vec<i32> {
         self.search.iter().map(|&v| assignment[v.index()]).collect()
     }
+}
+
+fn squared_objective_variables(objective: &Objective, stop: Option<&AtomicBool>) -> Option<Vec<VarId>> {
+    let Objective::Expr(true, expression) = objective else {
+        return None;
+    };
+    let mut variables = Vec::new();
+    let mut pending = vec![expression];
+    let mut visits = 0usize;
+    while let Some(expression) = pending.pop() {
+        visits = visits.wrapping_add(1);
+        if visits.is_multiple_of(1_024) && plan_interrupted(stop) {
+            return None;
+        }
+        match expression {
+            Expr::Add(terms) if !terms.is_empty() => pending.extend(terms),
+            Expr::Mul(terms) => {
+                let [Expr::Var(left), Expr::Var(right)] = terms.as_slice() else {
+                    return None;
+                };
+                if left != right {
+                    return None;
+                }
+                variables.push(*left);
+            }
+            _ => return None,
+        }
+    }
+    if variables.is_empty() {
+        return None;
+    }
+    let mut unique = variables.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    (unique.len() == variables.len()).then_some(unique)
+}
+
+fn recognizes_signed_product_square_structure(problem: &Problem, spec: &LocalSearchSpec, stop: &AtomicBool) -> bool {
+    if stop.load(Ordering::Acquire) || spec.constraints.len() != spec.functionals.len() {
+        return false;
+    }
+    let Some(objective) = problem.objective.as_ref().filter(|objective| objective.minimizing()) else {
+        return false;
+    };
+    let Some(square_targets) = squared_objective_variables(objective, Some(stop)) else {
+        return false;
+    };
+    let square_set = square_targets.iter().copied().collect::<HashSet<_>>();
+    let mutable = problem
+        .search
+        .iter()
+        .copied()
+        .filter(|variable| problem.solver.store.size(*variable) > 1 && !spec.derived.get(variable.index()).copied().unwrap_or(false))
+        .collect::<HashSet<_>>();
+
+    let mut products = HashMap::<VarId, (VarId, VarId)>::new();
+    let mut signs = HashSet::<VarId>::new();
+    for functional in &spec.functionals {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        let target = functional_target(functional);
+        if square_set.contains(&target) {
+            continue;
+        }
+        let Functional::Expr { expr, .. } = functional else {
+            return false;
+        };
+        let Some((left, right)) = binary_product(expr) else {
+            return false;
+        };
+        if left == right
+            || square_set.contains(&left)
+            || square_set.contains(&right)
+            || !mutable.contains(&left)
+            || !mutable.contains(&right)
+            || mutable.contains(&target)
+            || !is_store_sign_domain(problem, left)
+            || !is_store_sign_domain(problem, right)
+            || !is_store_sign_domain(problem, target)
+            || products.insert(target, (left, right)).is_some()
+        {
+            return false;
+        }
+        signs.extend([left, right]);
+    }
+    if signs.len() < 2 || products.is_empty() {
+        return false;
+    }
+
+    let mut seen_targets = HashSet::new();
+    let mut used_products = HashSet::new();
+    for functional in &spec.functionals {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        let target = functional_target(functional);
+        if !square_set.contains(&target) {
+            continue;
+        }
+        let Some(product_targets) = unit_product_sum_targets(functional) else {
+            return false;
+        };
+        if mutable.contains(&target)
+            || !seen_targets.insert(target)
+            || product_targets.is_empty()
+            || !store_domain_contains_unit_sum_range(problem, target, product_targets.len(), stop)
+        {
+            return false;
+        }
+        for product in product_targets {
+            if stop.load(Ordering::Acquire) || !products.contains_key(&product) {
+                return false;
+            }
+            used_products.insert(product);
+        }
+    }
+    seen_targets == square_set && used_products.len() == products.len() && products.keys().all(|target| used_products.contains(target))
+}
+
+fn is_store_sign_domain(problem: &Problem, variable: VarId) -> bool {
+    problem.solver.store.size(variable) == 2
+        && problem.solver.store.min(variable) == -1
+        && problem.solver.store.max(variable) == 1
+        && problem.solver.store.contains(variable, -1)
+        && problem.solver.store.contains(variable, 1)
+}
+
+fn store_domain_contains_unit_sum_range(problem: &Problem, variable: VarId, terms: usize, stop: &AtomicBool) -> bool {
+    let Ok(width) = i32::try_from(terms) else {
+        return false;
+    };
+    let mut value = -i64::from(width);
+    let maximum = i64::from(width);
+    let mut visits = 0usize;
+    while value <= maximum {
+        visits = visits.wrapping_add(1);
+        if visits.is_multiple_of(1_024) && stop.load(Ordering::Acquire) {
+            return false;
+        }
+        let Some(converted) = i32::try_from(value).ok() else {
+            return false;
+        };
+        if !problem.solver.store.contains(variable, converted) {
+            return false;
+        }
+        value += 2;
+    }
+    !stop.load(Ordering::Acquire)
+}
+
+fn binary_product(expression: &Expr) -> Option<(VarId, VarId)> {
+    let Expr::Mul(terms) = expression else {
+        return None;
+    };
+    let [Expr::Var(left), Expr::Var(right)] = terms.as_slice() else {
+        return None;
+    };
+    Some((*left, *right))
+}
+
+fn unit_product_sum_targets(functional: &Functional) -> Option<Vec<VarId>> {
+    match functional {
+        Functional::Expr { expr: Expr::Var(product), .. } => Some(vec![*product]),
+        Functional::Linear { coeff, terms, rhs, .. } if *coeff != 0 && *rhs == 0 => {
+            let mut products = Vec::with_capacity(terms.len());
+            for &(term_coefficient, variable) in terms {
+                let numerator = term_coefficient.checked_neg()?;
+                if numerator % coeff != 0 || numerator / coeff != 1 {
+                    return None;
+                }
+                products.push(variable);
+            }
+            Some(products)
+        }
+        _ => None,
+    }
+}
+
+fn is_sign_domain(domain: &LocalDomain) -> bool {
+    domain.min_value() == -1 && domain.max_value() == 1 && domain.values.len() == 2 && domain.contains(-1) && domain.contains(1)
+}
+
+fn plan_interrupted(stop: Option<&AtomicBool>) -> bool {
+    stop.is_some_and(|stop| stop.load(Ordering::Relaxed))
+}
+
+fn domain_contains_unit_sum_range(domain: &LocalDomain, terms: usize, stop: Option<&AtomicBool>) -> bool {
+    let Ok(width) = i32::try_from(terms) else {
+        return false;
+    };
+    if domain.values.is_empty() {
+        return domain.min <= -width && domain.max >= width;
+    }
+    let values = domain.values.iter().copied().collect::<HashSet<_>>();
+    let mut value = -i64::from(width);
+    let maximum = i64::from(width);
+    while value <= maximum {
+        if plan_interrupted(stop) || !i32::try_from(value).ok().is_some_and(|value| values.contains(&value)) {
+            return false;
+        }
+        value += 2;
+    }
+    true
 }
 
 fn to_i32(value: i64) -> Option<i32> {
@@ -3041,6 +3426,229 @@ fn bump_gls_weights(weights: &mut [i64], con_viol: &[i64], viol_sum: &mut i128, 
     bumped
 }
 
+struct SignedProductSquaresState {
+    signs: Vec<i32>,
+    group_sums: Vec<i128>,
+    energy: i128,
+}
+
+impl SignedProductSquaresState {
+    fn new(plan: &SignedProductSquaresPlan, seed: u64, stop: &AtomicBool) -> Option<Self> {
+        let mut signs = Vec::with_capacity(plan.signs.len());
+        signs.push(1);
+        for index in 1..plan.signs.len() {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            let draw = mix64(seed.wrapping_add((index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)));
+            signs.push(if draw & 1 == 0 { -1 } else { 1 });
+        }
+        let mut visits = 0usize;
+        let mut group_sums = Vec::with_capacity(plan.groups.len());
+        for group in &plan.groups {
+            let mut sum = 0i128;
+            for &(left, right) in group {
+                visits = visits.wrapping_add(1);
+                if visits.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+                    return None;
+                }
+                sum = sum.checked_add(i128::from(signs[left] * signs[right]))?;
+            }
+            group_sums.push(sum);
+        }
+        let energy = group_sums.iter().try_fold(0i128, |energy, &sum| energy.checked_add(sum.checked_mul(sum)?))?;
+        Some(Self { signs, group_sums, energy })
+    }
+
+    fn flip_delta(
+        &self,
+        plan: &SignedProductSquaresPlan,
+        index: usize,
+        stop: &AtomicBool,
+        changes: &mut Vec<(usize, i128)>,
+    ) -> Option<i128> {
+        changes.clear();
+        let mut delta = 0i128;
+        let mut visits = 0usize;
+        for incidence in plan.incidence.get(index)? {
+            let mut affected = 0i128;
+            for &neighbor in &incidence.neighbors {
+                visits = visits.wrapping_add(1);
+                if visits.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+                    return None;
+                }
+                affected = affected.checked_add(i128::from(self.signs[index] * self.signs[neighbor]))?;
+            }
+            let change = affected.checked_mul(-2)?;
+            let old = *self.group_sums.get(incidence.group)?;
+            let group_delta = old.checked_mul(change)?.checked_mul(2)?.checked_add(change.checked_mul(change)?)?;
+            delta = delta.checked_add(group_delta)?;
+            changes.push((incidence.group, change));
+        }
+        Some(delta)
+    }
+
+    fn flip(&mut self, plan: &SignedProductSquaresPlan, index: usize, stop: &AtomicBool, changes: &mut Vec<(usize, i128)>) -> Option<()> {
+        let delta = self.flip_delta(plan, index, stop, changes)?;
+        let energy = self.energy.checked_add(delta)?;
+        if changes.iter().any(|&(group, change)| self.group_sums.get(group).and_then(|sum| sum.checked_add(change)).is_none()) {
+            return None;
+        }
+        for &(group, change) in changes.iter() {
+            self.group_sums[group] = self.group_sums[group].checked_add(change).expect("validated signed-product group update");
+        }
+        self.signs[index] = -self.signs[index];
+        self.energy = energy;
+        debug_assert_eq!(
+            self.energy,
+            self.group_sums.iter().map(|&value| value * value).sum::<i128>(),
+            "signed-product-square delta drifted from its group sums"
+        );
+        debug_assert!(plan.groups.iter().zip(&self.group_sums).all(|(group, &expected)| {
+            group.iter().map(|&(left, right)| i128::from(self.signs[left] * self.signs[right])).sum::<i128>() == expected
+        }));
+        Some(())
+    }
+}
+
+fn materialize_signed_product_squares(
+    model: &LocalModel,
+    plan: &SignedProductSquaresPlan,
+    signs: &[i32],
+    expected_energy: i128,
+) -> Option<(Vec<i32>, i64)> {
+    let expected_energy = i64::try_from(expected_energy).ok()?;
+    let mut assignment = model.min_assignment();
+    for (&variable, &value) in plan.signs.iter().zip(signs) {
+        assignment[variable.index()] = value;
+    }
+    if model.score(&mut assignment).violation != 0 {
+        return None;
+    }
+    let objective = model.objective_value(&assignment)?;
+    if objective != expected_energy {
+        return None;
+    }
+    Some((model.search_solution(&assignment), objective))
+}
+
+fn solve_signed_product_squares<F>(
+    model: &LocalModel,
+    plan: &SignedProductSquaresPlan,
+    stop: &AtomicBool,
+    seed: u64,
+    max_iterations: u64,
+    on_improve: &mut F,
+) -> (Option<(Vec<i32>, i64)>, u64, u64, u64)
+where
+    F: FnMut(i64, &[i32], &'static str),
+{
+    if max_iterations == 0 || stop.load(Ordering::Relaxed) {
+        return (None, 0, 0, 0);
+    }
+
+    let Some(mut state) = SignedProductSquaresState::new(plan, seed, stop) else {
+        return (None, 0, 0, 0);
+    };
+    let mut best_energy = state.energy;
+    let mut best_signs = state.signs.clone();
+    let mut published_energy = None;
+    let mut best_solution = None;
+    let mut iterations = 0u64;
+    let mut moves = 0u64;
+    let mut perturbations = 0u64;
+    let mut tied = Vec::new();
+    let mut kick_indices = (1..state.signs.len()).collect::<Vec<_>>();
+    let mut changes = Vec::new();
+
+    'search: while iterations < max_iterations && !stop.load(Ordering::Relaxed) {
+        let mut best_delta = None;
+        tied.clear();
+        // Global sign inversion preserves every bilinear product, so fixing the
+        // first sign variable to +1 removes that symmetry without excluding an energy.
+        for index in 1..state.signs.len() {
+            if stop.load(Ordering::Relaxed) {
+                break 'search;
+            }
+            let Some(delta) = state.flip_delta(plan, index, stop, &mut changes) else {
+                break 'search;
+            };
+            match best_delta {
+                None => {
+                    best_delta = Some(delta);
+                    tied.push(index);
+                }
+                Some(best) if delta < best => {
+                    best_delta = Some(delta);
+                    tied.clear();
+                    tied.push(index);
+                }
+                Some(best) if delta == best => tied.push(index),
+                Some(_) => {}
+            }
+        }
+        let Some(best_delta) = best_delta else {
+            break;
+        };
+
+        if best_delta < 0 {
+            let draw = mix64(seed ^ iterations ^ (state.energy as u64).rotate_left(17));
+            let index = tied[draw as usize % tied.len()];
+            if state.flip(plan, index, stop, &mut changes).is_none() {
+                break;
+            }
+            moves = moves.saturating_add(1);
+            if state.energy < best_energy {
+                best_energy = state.energy;
+                best_signs.clone_from(&state.signs);
+            }
+        } else {
+            if published_energy.is_none_or(|published| best_energy < published) {
+                if let Some((solution, objective)) = materialize_signed_product_squares(model, plan, &best_signs, best_energy) {
+                    on_improve(objective, &solution, "signed-product-squares");
+                    published_energy = Some(best_energy);
+                    best_solution = Some((solution, objective));
+                }
+            }
+
+            let draw = mix64(seed ^ iterations.rotate_left(23) ^ perturbations.rotate_left(41));
+            // Scale perturbations with the algebraic dimension. Logarithmic
+            // kicks preserve most of a local minimum while still growing on
+            // larger incidence networks.
+            let available = state.signs.len() - 1;
+            let kick_floor = usize::from(available > 1) + 1;
+            let kick_ceiling = (state.signs.len().ilog2() as usize + 1).clamp(kick_floor, available);
+            let kick_count = kick_floor + draw as usize % (kick_ceiling - kick_floor + 1);
+            for offset in 0..kick_count {
+                if stop.load(Ordering::Relaxed) {
+                    break 'search;
+                }
+                let pick =
+                    offset + mix64(draw ^ (offset as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)) as usize % (kick_indices.len() - offset);
+                kick_indices.swap(offset, pick);
+                if state.flip(plan, kick_indices[offset], stop, &mut changes).is_none() {
+                    break 'search;
+                }
+                moves = moves.saturating_add(1);
+                if state.energy < best_energy {
+                    best_energy = state.energy;
+                    best_signs.clone_from(&state.signs);
+                }
+            }
+            perturbations = perturbations.saturating_add(1);
+        }
+        iterations = iterations.saturating_add(1);
+    }
+
+    if published_energy.is_none_or(|published| best_energy < published) {
+        if let Some((solution, objective)) = materialize_signed_product_squares(model, plan, &best_signs, best_energy) {
+            on_improve(objective, &solution, "signed-product-squares");
+            best_solution = Some((solution, objective));
+        }
+    }
+    (best_solution, iterations, moves, perturbations)
+}
+
 pub fn solve_ls<F>(
     problem: Problem,
     spec: LocalSearchSpec,
@@ -3057,6 +3665,21 @@ where
 
 pub(crate) fn solve_ls_capped<F>(
     problem: Problem,
+    spec: LocalSearchSpec,
+    stop: &AtomicBool,
+    seed: u64,
+    config: LsConfig,
+    max_iterations: u64,
+    on_improve: F,
+) -> LocalSearchOutcome
+where
+    F: FnMut(i64, &[i32], &'static str),
+{
+    solve_ls_capped_borrowed(&problem, spec, stop, seed, config, max_iterations, on_improve)
+}
+
+pub(crate) fn solve_ls_capped_borrowed<F>(
+    problem: &Problem,
     spec: LocalSearchSpec,
     stop: &AtomicBool,
     seed: u64,
@@ -3096,6 +3719,11 @@ where
             None
         };
         return LocalSearchOutcome { best, iterations: 0, moves: 0, restarts: 0, constraints, functionals, unsupported };
+    }
+
+    if let Some(plan) = model.signed_product_squares_plan(Some(stop)) {
+        let (best, iterations, moves, restarts) = solve_signed_product_squares(&model, &plan, stop, seed, max_iterations, &mut on_improve);
+        return LocalSearchOutcome { best, iterations, moves, restarts, constraints, functionals, unsupported };
     }
 
     let minimizing = model.objective.minimizing();

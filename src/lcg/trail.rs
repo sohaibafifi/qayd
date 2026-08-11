@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::ids::VarId;
+use crate::ids::{PropId, VarId};
 use crate::lcg::clause::{ClauseDb, ClauseRef, ClauseSharing, SharedClause};
 use crate::lcg::lit::{Atom, AtomKind, AtomTable, LazyAtomRegistry, Lit, LitOrConst};
 use crate::lcg::view::{self, Tri};
@@ -24,6 +24,14 @@ pub const UNSET: u32 = u32::MAX;
 const ROOT_PROBE_MAX_CANDIDATES: usize = 32;
 const ROOT_PROBE_MAX_DOMAIN_SIZE: usize = 16;
 const ROOT_PROBE_MAX_BRANCH_LITS: usize = 512;
+// Root probing clones no state, but it propagates two complete branches for
+// every candidate. On large or dense physical models this optional
+// preprocessing can consume the whole solve budget before the first search
+// node. Search is complete without it, so cap both dimensions of that work.
+const ROOT_PROBE_MAX_PROPAGATORS: usize = 8_192;
+/// Projected propagator-scope visits across both branches of the bounded root
+/// probe. Scope volume is a frontend-independent proxy for wakeup work.
+const ROOT_PROBE_MAX_SCOPE_VISITS: usize = 250_000;
 const RESTART_BASE_CONFLICTS: u64 = 256;
 const FAST_RESTART_BASE_CONFLICTS: u64 = 64;
 const RESTART_LBD_WINDOW: usize = 128;
@@ -1251,6 +1259,10 @@ impl<'s> Cdcl<'s> {
     }
 
     fn root_probe_candidates(&self, vars: &[VarId]) -> Vec<Lit> {
+        let propagators = self.solver.num_propagators();
+        if propagators > ROOT_PROBE_MAX_PROPAGATORS {
+            return Vec::new();
+        }
         let weights = self.solver.weights();
         let mut scored = Vec::new();
         for &var in vars {
@@ -1267,7 +1279,17 @@ impl<'s> Cdcl<'s> {
             }
         }
         scored.sort_unstable_by_key(|&(size, weight, var, _)| (size, weight, var));
-        scored.into_iter().take(ROOT_PROBE_MAX_CANDIDATES).map(|(_, _, _, lit)| lit).collect()
+        let candidates = scored.into_iter().take(ROOT_PROBE_MAX_CANDIDATES).map(|(_, _, _, lit)| lit).collect::<Vec<_>>();
+        let scope_cells = (0..propagators).fold(0usize, |total, index| {
+            let id = PropId(u32::try_from(index).expect("propagator identifiers fit in u32"));
+            total.saturating_add(self.solver.store.scope(id).len())
+        });
+        let projected_scope_visits = scope_cells.saturating_mul(candidates.len()).saturating_mul(2);
+        if projected_scope_visits > ROOT_PROBE_MAX_SCOPE_VISITS {
+            Vec::new()
+        } else {
+            candidates
+        }
     }
 
     fn probe_branch(&mut self, decision: Lit, added: &mut HashSet<(u32, u32)>) -> ProbeOutcome {

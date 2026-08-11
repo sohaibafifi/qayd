@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import fcntl
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -17,6 +19,7 @@ import resource
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -42,6 +45,19 @@ LIMIT_LAUNCHER = Path(__file__).with_name("exec_limit.py").resolve()
 STATUS_RE = re.compile(r"^\s*s\s+(.+?)\s*$", re.IGNORECASE)
 OBJECTIVE_RE = re.compile(r"^\s*o\s+(-?\d+)(?:\s|$)", re.IGNORECASE)
 CHECK_OK_RE = re.compile(r"^OK(?:[ \t]+(-?\d+))?[ \t]*$", re.MULTILINE)
+CHECKER_OOM_RE = re.compile(
+    r"(?:OutOfMemoryError|Java heap space|GC overhead limit exceeded|"
+    r"Cannot reserve enough space|unable to create native thread|"
+    r"insufficient memory for the Java Runtime Environment|"
+    r"Native memory allocation .* failed|Cannot allocate memory)",
+    re.IGNORECASE,
+)
+EXECUTION_IDENTITY_SCHEMA = "qayd.fastcop.execution/v2"
+LEGACY_EXECUTION_IDENTITY_SCHEMA = "qayd.fastcop.execution/legacy-v1"
+VALIDATION_IDENTITY_SCHEMA = "qayd.fastcop.validation/v2"
+INSTANCE_PLACEHOLDER = "{instance}"
+ARTIFACT_PLACEHOLDER = "{artifact}"
+INSTANCE_SENTINEL = "__qayd_materialized_instance__"
 
 
 class HarnessError(RuntimeError):
@@ -59,6 +75,7 @@ class RunTask:
     solver: dict[str, Any]
     instance_item: dict[str, Any]
     run_key: str
+    execution_identity: Optional[dict[str, Any]] = None
 
 
 def canonical_json(value: Any) -> str:
@@ -75,6 +92,9 @@ def harness_sha256() -> str:
         digest.update(path.name.encode("utf-8"))
         digest.update(b"\0")
         digest.update(path.read_bytes())
+        digest.update(b"\0")
+    for component in (open_instance, sha256_file):
+        digest.update(inspect.getsource(component).encode("utf-8"))
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -113,6 +133,14 @@ def load_solvers(path: Path) -> tuple[dict, str]:
             raise HarnessError(f"invalid solver entry: {name}")
         if not all(isinstance(token, str) for token in solver["argv"]):
             raise HarnessError(f"non-string argv token for solver {name}")
+        if any(
+            placeholder in token
+            for token in solver["argv"]
+            for placeholder in ("{checker_heap_mb}", "{ace_artifact}")
+        ):
+            raise HarnessError(
+                f"solver {name} depends on a checker-only command placeholder"
+            )
         artifact = resolve_config_path(path, solver.get("artifact", ""))
         observed = sha256_file(artifact)
         expected = solver.get("expected_sha256")
@@ -601,7 +629,7 @@ def validate_solution(
         if timed_out:
             return {
                 "attempted": True,
-                "valid": False,
+                "valid": None,
                 "reason": "checker-timeout",
                 "returncode": returncode,
                 "elapsed_seconds": round(time.monotonic() - start, 6),
@@ -620,22 +648,45 @@ def validate_solution(
             and "ERROR:" not in output
         )
         objective_matches = (
-            reported_objective is None
-            or expected_objective is None
+            expected_objective is None
             or reported_objective == expected_objective
         )
-        valid = checker_accepted and objective_matches
-        if valid:
+        if CHECKER_OOM_RE.search(output):
+            valid: Optional[bool] = None
+            reason = "checker-oom"
+        elif returncode == -signal.SIGKILL:
+            valid = None
+            reason = "checker-killed"
+        elif checker_accepted and expected_objective is not None and reported_objective is None:
+            valid = None
+            reason = "checker-missing-objective"
+        elif checker_accepted and objective_matches:
+            valid = True
             reason = "accepted"
         elif checker_accepted and not objective_matches:
+            valid = False
             reason = "objective-mismatch"
-        else:
+        elif "ERROR:" in output:
+            valid = False
             reason = "checker-rejected"
+        else:
+            # A checker crash, OOM, signal, or malformed empty response says
+            # nothing about the candidate. Keep it unverified without
+            # invalidating the solver's complete model family.
+            valid = None
+            reason = "checker-error"
+        termination_signal = None
+        if returncode is not None and returncode < 0:
+            try:
+                termination_signal = signal.Signals(-returncode).name
+            except ValueError:
+                termination_signal = f"SIGNAL_{-returncode}"
         return {
             "attempted": True,
             "valid": valid,
             "reason": reason,
             "returncode": returncode,
+            "termination_signal": termination_signal,
             "expected_objective": expected_objective,
             "reported_objective": reported_objective,
             "elapsed_seconds": round(time.monotonic() - start, 6),
@@ -645,10 +696,14 @@ def validate_solution(
     except RunCancelled:
         raise
     except OSError as error:
-        checker_log.write_text(str(error) + "\n", encoding="utf-8")
+        try:
+            checker_log.parent.mkdir(parents=True, exist_ok=True)
+            checker_log.write_text(str(error) + "\n", encoding="utf-8")
+        except OSError:
+            pass
         return {
             "attempted": True,
-            "valid": False,
+            "valid": None,
             "reason": "checker-error",
             "returncode": None,
             "elapsed_seconds": round(time.monotonic() - start, 6),
@@ -688,6 +743,16 @@ def executable_provenance(argv0: str) -> dict[str, Any]:
     }
 
 
+def limit_launcher_provenance() -> dict[str, Any]:
+    return {
+        "python": executable_provenance(sys.executable),
+        "script": {
+            "path": str(LIMIT_LAUNCHER),
+            "sha256": sha256_file(LIMIT_LAUNCHER),
+        },
+    }
+
+
 def git_revision() -> Optional[str]:
     try:
         completed = subprocess.run(
@@ -710,11 +775,11 @@ def make_replacements(
     instance: Path,
     cpu_seconds: float,
     memory_mb: int,
+    checker_memory_mb: int,
     seed: int,
 ) -> dict[str, str]:
     java_reserve_mb = min(4096, max(512, memory_mb // 8))
     java_heap_mb = max(128, memory_mb - java_reserve_mb)
-    checker_heap_mb = max(128, min(4096, memory_mb // 4))
     return {
         "artifact": str(artifact),
         "ace_artifact": str(ace_artifact),
@@ -722,9 +787,233 @@ def make_replacements(
         "cpu_seconds": display_number(cpu_seconds),
         "memory_mb": str(memory_mb),
         "java_heap_mb": str(java_heap_mb),
-        "checker_heap_mb": str(checker_heap_mb),
+        "checker_heap_mb": str(checker_memory_mb),
         "seed": str(seed),
     }
+
+
+def execution_harness_sha256() -> str:
+    """Hash only code that can change a solver execution or its parsing."""
+    digest = hashlib.sha256()
+    components = (
+        display_number,
+        expand_argv,
+        normalize_status,
+        OutputObserver,
+        limited_argv,
+        process_tree_rss_kb,
+        terminate_group,
+        _pipe_reader,
+        execute_streaming,
+        sha256_file,
+        open_instance,
+        materialize,
+        executable_provenance,
+        limit_launcher_provenance,
+        resolve_config_path,
+        make_replacements,
+        canonicalize_command,
+        make_execution_identity,
+        planned_execution_identity,
+        run_one,
+    )
+    digest.update(EXECUTION_IDENTITY_SCHEMA.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(
+        canonical_json(
+            {
+                "status_regex": [STATUS_RE.pattern, STATUS_RE.flags],
+                "objective_regex": [OBJECTIVE_RE.pattern, OBJECTIVE_RE.flags],
+                "instance_placeholder": INSTANCE_PLACEHOLDER,
+                "artifact_placeholder": ARTIFACT_PLACEHOLDER,
+                "instance_sentinel": INSTANCE_SENTINEL,
+            }
+        ).encode("utf-8")
+    )
+    digest.update(b"\0")
+    for component in components:
+        digest.update(inspect.getsource(component).encode("utf-8"))
+        digest.update(b"\0")
+    digest.update(LIMIT_LAUNCHER.read_bytes())
+    return digest.hexdigest()
+
+
+def canonicalize_command(
+    argv: Sequence[str],
+    *,
+    artifact: Optional[Path | str] = None,
+    instance: Optional[Path | str] = None,
+) -> list[str]:
+    """Remove ephemeral artifact and materialized-instance paths from argv."""
+    artifact_text = str(artifact) if artifact is not None else None
+    instance_text = str(instance) if instance is not None else None
+    canonical = []
+    for original in argv:
+        token = original
+        if artifact_text:
+            token = token.replace(artifact_text, ARTIFACT_PLACEHOLDER)
+        if instance_text:
+            token = token.replace(instance_text, INSTANCE_PLACEHOLDER)
+        token = token.replace(INSTANCE_SENTINEL, INSTANCE_PLACEHOLDER)
+        if INSTANCE_PLACEHOLDER not in token:
+            prefix, separator, value = token.rpartition("=")
+            path_value = value if separator else token
+            try:
+                parts = Path(path_value).parts
+            except (OSError, ValueError):
+                parts = ()
+            if (
+                Path(path_value).name == "instance.xml"
+                and any(part.startswith("qayd-fastcop-") for part in parts)
+            ):
+                token = (
+                    f"{prefix}={INSTANCE_PLACEHOLDER}"
+                    if separator
+                    else INSTANCE_PLACEHOLDER
+                )
+        canonical.append(token)
+    return canonical
+
+
+def make_execution_identity(
+    *,
+    solver_name: str,
+    artifact_hash: str,
+    instance_id: str,
+    instance_hash: str,
+    objective_sense: str,
+    cpu_seconds: float,
+    wall_seconds: float,
+    memory_mb: int,
+    seed: int,
+    grace_seconds: float,
+    parallel_jobs: int,
+    command: Sequence[str],
+    launcher: dict[str, Any],
+    limit_launcher: dict[str, Any],
+    execution_harness_hash: str,
+) -> dict[str, Any]:
+    """Inputs that can affect solver work, excluding all validation policy."""
+    return {
+        "schema": EXECUTION_IDENTITY_SCHEMA,
+        "solver": solver_name,
+        "artifact_sha256": artifact_hash,
+        "instance_id": instance_id,
+        "instance_sha256": instance_hash,
+        "objective_sense": objective_sense,
+        "cpu_limit_seconds": float(cpu_seconds),
+        "wall_limit_seconds": float(wall_seconds),
+        "memory_limit_mb": int(memory_mb),
+        "seed": int(seed),
+        "grace_seconds": float(grace_seconds),
+        "parallel_jobs": int(parallel_jobs),
+        "command": list(command),
+        "launcher": copy.deepcopy(launcher),
+        "limit_launcher": copy.deepcopy(limit_launcher),
+        "execution_harness_sha256": execution_harness_hash,
+    }
+
+
+def make_validation_identity(
+    *,
+    execution_key: str,
+    checker_hash: str,
+    checker_memory_mb: int,
+    checker_timeout: float,
+    checker_command: Sequence[str],
+    checker_launcher: dict[str, Any],
+    limit_launcher: dict[str, Any],
+    solver_stdout_hash: str,
+    expected_objective: int,
+    validation_harness_hash: str,
+) -> dict[str, Any]:
+    return {
+        "schema": VALIDATION_IDENTITY_SCHEMA,
+        "execution_key": execution_key,
+        "checker_artifact_sha256": checker_hash,
+        "checker_memory_mb": int(checker_memory_mb),
+        "checker_timeout_seconds": float(checker_timeout),
+        "checker_command": list(checker_command),
+        "checker_launcher": copy.deepcopy(checker_launcher),
+        "limit_launcher": copy.deepcopy(limit_launcher),
+        "solver_stdout_sha256": solver_stdout_hash,
+        "expected_objective": expected_objective,
+        "validation_harness_sha256": validation_harness_hash,
+    }
+
+
+def identity_key(identity: dict[str, Any]) -> str:
+    return sha256_bytes(canonical_json(identity).encode("utf-8"))
+
+
+def execution_identity_from_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Build a quarantined identity for rechecking a legacy v1 record."""
+    try:
+        limits = record["limits"]
+        provenance = record["provenance"]
+        command = record["command"]
+        artifact_hash = provenance["artifact_sha256"]
+    except (KeyError, TypeError) as error:
+        raise HarnessError(
+            f"legacy record {record.get('solver')} {record.get('instance')} "
+            "does not contain enough execution provenance"
+        ) from error
+    if not isinstance(command, list) or not all(
+        isinstance(token, str) for token in command
+    ):
+        raise HarnessError("legacy record has an invalid command")
+    artifact = provenance.get("artifact")
+    return {
+        "schema": LEGACY_EXECUTION_IDENTITY_SCHEMA,
+        "solver": record["solver"],
+        "artifact_sha256": artifact_hash,
+        "instance_id": record["instance"],
+        "instance_sha256": record["instance_sha256"],
+        "objective_sense": record["objective_sense"],
+        "cpu_limit_seconds": float(limits["cpu_seconds"]),
+        "wall_limit_seconds": float(limits["wall_seconds"]),
+        "memory_limit_mb": int(limits["memory_mb"]),
+        "seed": int(record["seed"]),
+        "grace_seconds": float(limits["grace_seconds"]),
+        "parallel_jobs": int(limits.get("parallel_jobs", 1)),
+        "command": canonicalize_command(command, artifact=artifact),
+        "launcher": copy.deepcopy(provenance.get("launcher")),
+        "recorded_execution_harness_sha256": provenance.get(
+            "execution_harness_sha256", provenance.get("harness_sha256")
+        ),
+        "legacy_run_key": record.get("run_key"),
+    }
+
+
+def ensure_record_execution_key(
+    record: dict[str, Any],
+    *,
+    allow_legacy: bool = False,
+) -> str:
+    key = record.get("execution_key")
+    if key is not None:
+        if not isinstance(key, str):
+            raise HarnessError("record execution_key is not a string")
+        identity = record.get("execution_identity")
+        if identity is None:
+            if not allow_legacy:
+                raise HarnessError(
+                    "result has no execution_identity and cannot be resumed "
+                    "safely; choose a new output or use --recheck-only"
+                )
+        elif not isinstance(identity, dict) or identity_key(identity) != key:
+            raise HarnessError("record execution identity does not match its key")
+        return key
+    if not allow_legacy:
+        raise HarnessError(
+            "legacy result has no execution_key and cannot be resumed safely; "
+            "choose a new output or use --recheck-only"
+        )
+    identity = execution_identity_from_record(record)
+    key = identity_key(identity)
+    record["execution_identity"] = identity
+    record["execution_key"] = key
+    return key
 
 
 def load_result_records(path: Path) -> list[dict[str, Any]]:
@@ -757,7 +1046,10 @@ def load_result_records(path: Path) -> list[dict[str, Any]]:
 
 
 def load_completed_keys(path: Path) -> set[str]:
-    return {record["run_key"] for record in load_result_records(path)}
+    return {
+        record.get("execution_key", record["run_key"])
+        for record in load_result_records(path)
+    }
 
 
 def ensure_output_matches_plan(
@@ -766,28 +1058,32 @@ def ensure_output_matches_plan(
     existing_records: Sequence[dict[str, Any]],
 ) -> None:
     planned = {
-        (task.solver_name, task.instance_item["id"]): task.run_key
+        (task.solver_name, task.instance_item["id"]): task
         for task in tasks
     }
     observed_order = []
     seen_keys = set()
     for record in existing_records:
         pair = (record["solver"], record["instance"])
-        expected = planned.get(pair)
-        if expected is None:
+        task = planned.get(pair)
+        if task is None:
             raise HarnessError(
                 f"{output} contains {pair[0]} {pair[1]}, which is outside "
                 "the current selection; choose a new output"
             )
-        if record["run_key"] != expected:
+        if task.execution_identity is None:
+            observed_key = record.get("execution_key", record["run_key"])
+        else:
+            observed_key = ensure_record_execution_key(record)
+        if observed_key != task.run_key:
             raise HarnessError(
                 f"{output} contains an incompatible run for {pair[0]} "
                 f"{pair[1]}; keep the same limits, jobs and artifacts or "
                 "choose a new output"
             )
-        if record["run_key"] not in seen_keys:
-            seen_keys.add(record["run_key"])
-            observed_order.append(record["run_key"])
+        if observed_key not in seen_keys:
+            seen_keys.add(observed_key)
+            observed_order.append(observed_key)
 
     expected_order = [task.run_key for task in tasks[: len(observed_order)]]
     if observed_order != expected_order:
@@ -803,6 +1099,40 @@ def append_record(path: Path, record: dict) -> None:
         target.write(canonical_json(record) + "\n")
         target.flush()
         os.fsync(target.fileno())
+
+
+def replace_records_atomically(
+    path: Path,
+    records: Sequence[dict[str, Any]],
+) -> None:
+    """Replace one JSONL result set without exposing a partial rewrite."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        if path.exists():
+            os.fchmod(descriptor, stat.S_IMODE(path.stat().st_mode))
+        with os.fdopen(descriptor, "w", encoding="utf-8") as target:
+            for record in records:
+                target.write(canonical_json(record) + "\n")
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, path)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def acquire_lock(lock_path: Path, target: str):
@@ -840,42 +1170,332 @@ def release_campaign_lock(handle) -> None:
         handle.close()
 
 
-def make_run_identity(
+def record_stdout_path(record: dict[str, Any]) -> Path:
+    try:
+        value = record["logs"]["stdout"]
+    except (KeyError, TypeError) as error:
+        raise HarnessError(
+            f"record {record.get('solver')} {record.get('instance')} has no stdout log"
+        ) from error
+    if not isinstance(value, str):
+        raise HarnessError("record stdout log is not a path")
+    path = Path(value)
+    return path if path.is_absolute() else (REPO_ROOT / path).resolve()
+
+
+def recover_solver_summary(
+    record: dict[str, Any],
+    stdout_path: Path,
+) -> dict[str, Any]:
+    status = record.get("solver_status")
+    proof = record.get("solver_proof")
+    has_solution = record.get("has_solution")
+    if (
+        isinstance(status, str)
+        and isinstance(proof, bool)
+        and isinstance(has_solution, bool)
+    ):
+        return {
+            "claimed_status": status,
+            "claimed_proof": proof,
+            "has_solution": has_solution,
+            "best_incumbent": record.get("raw_best_incumbent"),
+        }
+    if not stdout_path.is_file():
+        raise HarnessError(f"solver stdout log does not exist: {stdout_path}")
+    observer = OutputObserver(record["objective_sense"])
+    with stdout_path.open(encoding="utf-8", errors="replace") as source:
+        for line in source:
+            observer.observe("stdout", line, 0.0)
+    return observer.summary()
+
+
+def apply_validation_projection(
+    record: dict[str, Any],
+    validation: dict[str, Any],
+    *,
+    check_solution: bool,
+    solver_summary: dict[str, Any],
+) -> None:
+    """Project immutable solver output through the current validation result."""
+    solver_status = solver_summary["claimed_status"]
+    solver_proof = bool(solver_summary["claimed_proof"])
+    has_solution = bool(solver_summary["has_solution"])
+    raw_best = record.get("raw_best_incumbent")
+    if raw_best is None:
+        raw_best = solver_summary.get("best_incumbent")
+
+    record["solver_status"] = solver_status
+    record["solver_proof"] = solver_proof
+    record["has_solution"] = has_solution
+    record["raw_best_incumbent"] = raw_best
+    record["validation"] = validation
+
+    invalid = validation.get("valid") is False
+    feasible_eligible = raw_best is not None and (
+        validation.get("valid") is True or not check_solution
+    )
+    status = solver_status
+    proof = solver_proof
+    proof_execution_complete = (
+        record.get("returncode") == 0
+        and record.get("execution_error") is None
+        and not record.get("timed_out", False)
+        and not record.get("killed", False)
+    )
+    if invalid:
+        status = "INVALID"
+        proof = False
+    elif raw_best is not None and not feasible_eligible:
+        status = "UNKNOWN"
+        proof = False
+    elif record.get("execution_error") is not None:
+        status = "ERROR"
+        proof = False
+    elif proof and not proof_execution_complete:
+        status = "SAT" if feasible_eligible else "ERROR"
+        proof = False
+    elif record.get("returncode") not in (0, None) and status == "UNKNOWN":
+        status = "ERROR"
+
+    record["status"] = status
+    record["proof"] = proof
+    record["invalid"] = invalid
+    record["best_incumbent"] = raw_best if feasible_eligible else None
+
+
+def validation_plan(
+    record: dict[str, Any],
+    solver_config_path: Path,
+    solver_config: dict[str, Any],
+    checker_memory_mb: int,
+    checker_timeout: float,
+    validation_harness_hash: str,
+) -> dict[str, Any]:
+    raw_best = record.get("raw_best_incumbent")
+    if raw_best is None or not isinstance(raw_best.get("value"), int):
+        raise HarnessError("record has no incumbent to validate")
+    stdout_path = record_stdout_path(record)
+    if not stdout_path.is_file():
+        raise HarnessError(f"solver stdout log does not exist: {stdout_path}")
+    solver_name = record["solver"]
+    try:
+        solver = solver_config["solvers"][solver_name]
+    except KeyError as error:
+        raise HarnessError(
+            f"solver {solver_name} is absent from the current solver configuration"
+        ) from error
+    checker = solver_config["checker"]
+    artifact = resolve_config_path(solver_config_path, solver["artifact"])
+    checker_artifact = resolve_config_path(
+        solver_config_path, checker["artifact"]
+    )
+    checker_hash = sha256_file(checker_artifact)
+    limits = record["limits"]
+    replacements = make_replacements(
+        artifact,
+        checker_artifact,
+        Path(INSTANCE_SENTINEL),
+        limits["cpu_seconds"],
+        limits["memory_mb"],
+        checker_memory_mb,
+        record["seed"],
+    )
+    expanded_checker_command = expand_argv(checker["argv"], replacements)
+    checker_command = canonicalize_command(
+        expanded_checker_command, artifact=checker_artifact
+    )
+    checker_launcher = executable_provenance(expanded_checker_command[0])
+    execution_key = record.get("execution_key")
+    if not isinstance(execution_key, str):
+        raise HarnessError("record has no execution_key")
+    identity = make_validation_identity(
+        execution_key=execution_key,
+        checker_hash=checker_hash,
+        checker_memory_mb=checker_memory_mb,
+        checker_timeout=checker_timeout,
+        checker_command=checker_command,
+        checker_launcher=checker_launcher,
+        limit_launcher=limit_launcher_provenance(),
+        solver_stdout_hash=sha256_file(stdout_path),
+        expected_objective=raw_best["value"],
+        validation_harness_hash=validation_harness_hash,
+    )
+    return {
+        "identity": identity,
+        "key": identity_key(identity),
+        "stdout_path": stdout_path,
+        "artifact": artifact,
+        "checker_artifact": checker_artifact,
+        "checker": checker,
+    }
+
+
+def checker_log_path(stdout_path: Path, validation_key: str) -> Path:
+    suffix = ".stdout.log"
+    base = (
+        stdout_path.name[: -len(suffix)]
+        if stdout_path.name.endswith(suffix)
+        else stdout_path.name
+    )
+    return stdout_path.with_name(
+        f"{base}.checker-{validation_key[:16]}.log"
+    )
+
+
+def recheck_record(
+    record: dict[str, Any],
+    solver_config_path: Path,
+    solver_config: dict[str, Any],
+    checker_memory_mb: int,
+    checker_timeout: float,
+    validation_harness_hash: str,
+    stop_event: Optional[threading.Event] = None,
+) -> dict[str, Any]:
+    """Revalidate a stored stdout log without launching its solver again."""
+    updated = copy.deepcopy(record)
+    stdout_path = record_stdout_path(updated)
+    solver_summary = recover_solver_summary(updated, stdout_path)
+    if updated.get("raw_best_incumbent") is None:
+        updated["raw_best_incumbent"] = solver_summary.get("best_incumbent")
+    if updated.get("raw_best_incumbent") is None:
+        raise HarnessError("record has no incumbent to validate")
+    if not solver_summary["has_solution"]:
+        raise HarnessError("record has no final solution to validate")
+    plan = validation_plan(
+        updated,
+        solver_config_path,
+        solver_config,
+        checker_memory_mb,
+        checker_timeout,
+        validation_harness_hash,
+    )
+
+    try:
+        instance_value = updated["instance_path"]
+        expected_hash = updated["instance_sha256"]
+    except KeyError as error:
+        raise HarnessError("record has no instance provenance") from error
+    instance = (REPO_ROOT / instance_value).resolve()
+    if not instance.is_file():
+        raise HarnessError(f"instance does not exist: {instance}")
+    if sha256_file(instance) != expected_hash:
+        raise HarnessError(f"instance changed: {updated['instance']}")
+
+    checker_log = checker_log_path(plan["stdout_path"], plan["key"])
+    with tempfile.TemporaryDirectory(prefix="qayd-fastcop-recheck-") as scratch:
+        materialized = materialize(instance, Path(scratch), stop_event)
+        limits = updated["limits"]
+        replacements = make_replacements(
+            plan["artifact"],
+            plan["checker_artifact"],
+            materialized,
+            limits["cpu_seconds"],
+            limits["memory_mb"],
+            checker_memory_mb,
+            updated["seed"],
+        )
+        checker_argv = expand_argv(plan["checker"]["argv"], replacements)
+        if canonicalize_command(
+            checker_argv,
+            artifact=plan["checker_artifact"],
+            instance=materialized,
+        ) != plan["identity"]["checker_command"]:
+            raise HarnessError("checker command changed after validation planning")
+        if executable_provenance(checker_argv[0]) != plan["identity"][
+            "checker_launcher"
+        ]:
+            raise HarnessError("checker launcher changed after validation planning")
+        if limit_launcher_provenance() != plan["identity"]["limit_launcher"]:
+            raise HarnessError("validation limit launcher changed after planning")
+        validation = validate_solution(
+            checker_argv,
+            plan["stdout_path"],
+            checker_log,
+            checker_timeout,
+            expected_objective=updated["raw_best_incumbent"]["value"],
+            stop_event=stop_event,
+        )
+
+    checked_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    validation["provenance"] = {
+        "checked_at": checked_at,
+        "checker_artifact": str(plan["checker_artifact"]),
+        "checker_artifact_sha256": plan["identity"][
+            "checker_artifact_sha256"
+        ],
+        "checker_memory_mb": checker_memory_mb,
+        "checker_timeout_seconds": checker_timeout,
+        "checker_command": plan["identity"]["checker_command"],
+        "checker_launcher": plan["identity"]["checker_launcher"],
+        "limit_launcher": plan["identity"]["limit_launcher"],
+        "solver_stdout_sha256": plan["identity"][
+            "solver_stdout_sha256"
+        ],
+        "validation_harness_sha256": validation_harness_hash,
+    }
+    validation["identity"] = plan["identity"]
+    updated["validation_key"] = plan["key"]
+    updated.setdefault("logs", {})["checker"] = str(checker_log)
+    apply_validation_projection(
+        updated,
+        validation,
+        check_solution=True,
+        solver_summary=solver_summary,
+    )
+    return updated
+
+
+def planned_execution_identity(
     solver_name: str,
-    solver_config_hash: str,
-    artifact_hash: str,
-    checker_hash: str,
-    instance_id: str,
-    instance_hash: str,
+    solver: dict[str, Any],
+    solver_config_path: Path,
+    checker: dict[str, Any],
+    instance_item: dict[str, Any],
     cpu_seconds: float,
     wall_seconds: float,
     memory_mb: int,
+    checker_memory_mb: int,
     seed: int,
     grace_seconds: float,
-    checker_timeout: float,
-    check_solution: bool,
     parallel_jobs: int,
-    harness_hash: str,
-    manifest_hash: str,
-) -> dict:
-    return {
-        "solver": solver_name,
-        "solver_config_sha256": solver_config_hash,
-        "artifact_sha256": artifact_hash,
-        "checker_artifact_sha256": checker_hash,
-        "instance_id": instance_id,
-        "instance_sha256": instance_hash,
-        "cpu_limit_seconds": cpu_seconds,
-        "wall_limit_seconds": wall_seconds,
-        "memory_limit_mb": memory_mb,
-        "seed": seed,
-        "grace_seconds": grace_seconds,
-        "checker_timeout_seconds": checker_timeout,
-        "check_solution": check_solution,
-        "parallel_jobs": parallel_jobs,
-        "harness_sha256": harness_hash,
-        "manifest_sha256": manifest_hash,
-    }
+    execution_harness_hash: str,
+) -> tuple[dict[str, Any], Path, Path]:
+    artifact = resolve_config_path(solver_config_path, solver["artifact"])
+    checker_artifact = resolve_config_path(
+        solver_config_path, checker["artifact"]
+    )
+    replacements = make_replacements(
+        artifact,
+        checker_artifact,
+        Path(INSTANCE_SENTINEL),
+        cpu_seconds,
+        memory_mb,
+        checker_memory_mb,
+        seed,
+    )
+    expanded_command = expand_argv(solver["argv"], replacements)
+    command = canonicalize_command(expanded_command, artifact=artifact)
+    launcher = executable_provenance(expanded_command[0])
+    limit_launcher = limit_launcher_provenance()
+    identity = make_execution_identity(
+        solver_name=solver_name,
+        artifact_hash=sha256_file(artifact),
+        instance_id=instance_item["id"],
+        instance_hash=instance_item["sha256"],
+        objective_sense=instance_item["objective_sense"],
+        cpu_seconds=cpu_seconds,
+        wall_seconds=wall_seconds,
+        memory_mb=memory_mb,
+        seed=seed,
+        grace_seconds=grace_seconds,
+        parallel_jobs=parallel_jobs,
+        command=command,
+        launcher=launcher,
+        limit_launcher=limit_launcher,
+        execution_harness_hash=execution_harness_hash,
+    )
+    return identity, artifact, checker_artifact
 
 
 def run_one(
@@ -889,12 +1509,14 @@ def run_one(
     cpu_seconds: float,
     wall_seconds: float,
     memory_mb: int,
+    checker_memory_mb: int,
     seed: int,
     grace_seconds: float,
     checker_timeout: float,
     check_solution: bool,
     parallel_jobs: int,
-    harness_hash: str,
+    execution_harness_hash: str,
+    validation_harness_hash: str,
     log_directory: Path,
     stop_event: Optional[threading.Event] = None,
 ) -> dict:
@@ -904,48 +1526,46 @@ def run_one(
     observed_instance_hash = sha256_file(original_instance)
     if observed_instance_hash != instance_item["sha256"]:
         raise HarnessError(f"instance changed: {instance_item['id']}")
-    artifact = resolve_config_path(solver_config_path, solver["artifact"])
-    artifact_hash = sha256_file(artifact)
-    checker_artifact = resolve_config_path(solver_config_path, checker["artifact"])
-    checker_hash = sha256_file(checker_artifact)
-
-    identity = make_run_identity(
+    identity, artifact, checker_artifact = planned_execution_identity(
         solver_name,
-        solver_config_hash,
-        artifact_hash,
-        checker_hash,
-        instance_item["id"],
-        observed_instance_hash,
+        solver,
+        solver_config_path,
+        checker,
+        instance_item,
         cpu_seconds,
         wall_seconds,
         memory_mb,
+        checker_memory_mb,
         seed,
         grace_seconds,
-        checker_timeout,
-        check_solution,
         parallel_jobs,
-        harness_hash,
-        manifest_hash,
+        execution_harness_hash,
     )
-    run_key = sha256_bytes(canonical_json(identity).encode("utf-8"))
+    execution_key = identity_key(identity)
     safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", instance_item["id"])
-    base = log_directory / solver_name / f"{safe_id}-{run_key}"
+    base = log_directory / solver_name / f"{safe_id}-{execution_key}"
     stdout_path = Path(f"{base}.stdout.log")
     stderr_path = Path(f"{base}.stderr.log")
-    checker_log = Path(f"{base}.checker.log")
-    try:
-        checker_log.unlink()
-    except FileNotFoundError:
-        pass
+    checker_log: Optional[Path] = None
+    validation_key: Optional[str] = None
 
     preparation_start = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="qayd-fastcop-instance-") as scratch:
         materialized = materialize(original_instance, Path(scratch), stop_event)
         preparation_seconds = time.monotonic() - preparation_start
         replacements = make_replacements(
-            artifact, checker_artifact, materialized, cpu_seconds, memory_mb, seed
+            artifact, checker_artifact, materialized, cpu_seconds, memory_mb, checker_memory_mb, seed
         )
         argv = expand_argv(solver["argv"], replacements)
+        if canonicalize_command(
+            argv, artifact=artifact, instance=materialized
+        ) != identity["command"]:
+            raise HarnessError("solver command changed after execution planning")
+        launcher = executable_provenance(argv[0])
+        if launcher != identity["launcher"]:
+            raise HarnessError("solver launcher changed after execution planning")
+        if limit_launcher_provenance() != identity["limit_launcher"]:
+            raise HarnessError("execution limit launcher changed after planning")
         execution = execute_streaming(
             argv,
             instance_item["objective_sense"],
@@ -993,6 +1613,25 @@ def run_one(
             }
         else:
             checker_argv = expand_argv(checker["argv"], replacements)
+            checker_hash = sha256_file(checker_artifact)
+            checker_launcher = executable_provenance(checker_argv[0])
+            validation_limit_launcher = limit_launcher_provenance()
+            validation_identity = make_validation_identity(
+                execution_key=execution_key,
+                checker_hash=checker_hash,
+                checker_memory_mb=checker_memory_mb,
+                checker_timeout=checker_timeout,
+                checker_command=canonicalize_command(
+                    checker_argv, artifact=checker_artifact
+                ),
+                checker_launcher=checker_launcher,
+                limit_launcher=validation_limit_launcher,
+                solver_stdout_hash=sha256_file(stdout_path),
+                expected_objective=best["value"],
+                validation_harness_hash=validation_harness_hash,
+            )
+            validation_key = identity_key(validation_identity)
+            checker_log = checker_log_path(stdout_path, validation_key)
             validation = validate_solution(
                 checker_argv,
                 stdout_path,
@@ -1001,30 +1640,30 @@ def run_one(
                 expected_objective=best["value"],
                 stop_event=stop_event,
             )
-
-    status = execution["claimed_status"]
-    proof = execution["claimed_proof"]
-    invalid = validation.get("valid") is False
-    feasible_eligible = best is not None and (
-        validation.get("valid") is True or not check_solution
-    )
-    if invalid:
-        status = "INVALID"
-        proof = False
-    elif best is not None and not feasible_eligible:
-        status = "UNKNOWN"
-        proof = False
-    elif execution["execution_error"] is not None:
-        status = "ERROR"
-        proof = False
-    elif execution["returncode"] not in (0, None) and status == "UNKNOWN":
-        status = "ERROR"
+            checked_at = dt.datetime.now(dt.timezone.utc).isoformat()
+            validation["identity"] = validation_identity
+            validation["provenance"] = {
+                "checked_at": checked_at,
+                "checker_artifact": str(checker_artifact),
+                "checker_artifact_sha256": checker_hash,
+                "checker_memory_mb": checker_memory_mb,
+                "checker_timeout_seconds": checker_timeout,
+                "checker_command": validation_identity["checker_command"],
+                "checker_launcher": checker_launcher,
+                "limit_launcher": validation_limit_launcher,
+                "solver_stdout_sha256": validation_identity[
+                    "solver_stdout_sha256"
+                ],
+                "validation_harness_sha256": validation_harness_hash,
+            }
 
     started_at = dt.datetime.now(dt.timezone.utc).isoformat()
-    launcher = executable_provenance(argv[0])
-    return {
+    record = {
         "schema": RESULT_SCHEMA,
-        "run_key": run_key,
+        "run_key": execution_key,
+        "execution_key": execution_key,
+        "execution_identity": identity,
+        "validation_key": validation_key,
         "solver": solver_name,
         "solver_version": solver.get("version"),
         "instance": instance_item["id"],
@@ -1042,15 +1681,18 @@ def run_one(
             "parallel_jobs": parallel_jobs,
         },
         "command": argv,
-        "status": status,
-        "proof": proof,
+        "solver_status": execution["claimed_status"],
+        "solver_proof": execution["claimed_proof"],
+        "has_solution": execution["has_solution"],
+        "status": execution["claimed_status"],
+        "proof": execution["claimed_proof"],
         "proof_elapsed_seconds": execution["proof_elapsed_seconds"],
         "incumbents": execution["incumbents"],
         "first_incumbent": execution["first_incumbent"],
-        "best_incumbent": execution["best_incumbent"] if feasible_eligible else None,
+        "best_incumbent": execution["best_incumbent"],
         "raw_best_incumbent": execution["best_incumbent"],
         "validation": validation,
-        "invalid": invalid,
+        "invalid": False,
         "timed_out": execution["timed_out"],
         "killed": execution["killed"],
         "termination_signal": execution["termination_signal"],
@@ -1063,18 +1705,20 @@ def run_one(
         "logs": {
             "stdout": str(stdout_path),
             "stderr": str(stderr_path),
-            "checker": str(checker_log) if checker_log.exists() else None,
+            "checker": (
+                str(checker_log)
+                if checker_log is not None and checker_log.exists()
+                else None
+            ),
         },
         "provenance": {
             "recorded_at": started_at,
             "manifest_sha256": manifest_hash,
             "solver_config_sha256": solver_config_hash,
             "artifact": str(artifact),
-            "artifact_sha256": artifact_hash,
-            "checker_artifact": str(checker_artifact),
-            "checker_sha256": checker_hash,
-            "launcher": launcher,
-            "harness_sha256": harness_hash,
+            "artifact_sha256": identity["artifact_sha256"],
+            "launcher": identity["launcher"],
+            "execution_harness_sha256": execution_harness_hash,
             "cpu_accounting": (
                 "rusage-children" if parallel_jobs == 1
                 else "unavailable-concurrent-runs"
@@ -1085,6 +1729,13 @@ def run_one(
             "python": platform.python_version(),
         },
     }
+    apply_validation_projection(
+        record,
+        validation,
+        check_solution=check_solution,
+        solver_summary=execution,
+    )
+    return record
 
 
 def select_instances(
@@ -1179,6 +1830,104 @@ def ordered_run_results(
         executor.shutdown(wait=True)
 
 
+def select_recheck_indices(
+    records: Sequence[dict[str, Any]],
+    solver_names: Optional[Sequence[str]],
+    families: Sequence[str],
+    pattern: Optional[str],
+    limit: int,
+    per_family: int,
+) -> list[int]:
+    requested_solvers = set(solver_names) if solver_names else None
+    requested_families = set(families)
+    matcher = re.compile(pattern) if pattern else None
+
+    instances: list[tuple[str, str, str]] = []
+    seen_instances = set()
+    for record in records:
+        instance = record["instance"]
+        family = record.get("family", "")
+        family_group = record.get("family_group", family)
+        if requested_families and not (
+            family in requested_families or family_group in requested_families
+        ):
+            continue
+        if matcher is not None and matcher.search(instance) is None:
+            continue
+        if instance not in seen_instances:
+            seen_instances.add(instance)
+            instances.append((instance, family, family_group))
+
+    if per_family:
+        counts: dict[str, int] = {}
+        selected_instances = []
+        for instance, family, _family_group in instances:
+            count = counts.get(family, 0)
+            if count >= per_family:
+                continue
+            counts[family] = count + 1
+            selected_instances.append(instance)
+    else:
+        selected_instances = [instance for instance, _family, _group in instances]
+        if limit:
+            selected_instances = selected_instances[:limit]
+    selected = set(selected_instances)
+    return [
+        index
+        for index, record in enumerate(records)
+        if record["instance"] in selected
+        and (
+            requested_solvers is None
+            or record["solver"] in requested_solvers
+        )
+    ]
+
+
+def record_is_recheckable(record: dict[str, Any]) -> bool:
+    if record.get("raw_best_incumbent") is None:
+        return False
+    if record.get("has_solution") is False:
+        return False
+    return record.get("validation", {}).get("reason") != "missing-final-solution"
+
+
+def recheck_records(
+    records: Sequence[dict[str, Any]],
+    indices: Sequence[int],
+    jobs: int,
+    worker: Callable[[dict[str, Any]], dict[str, Any]],
+    stop_event: threading.Event,
+) -> tuple[list[dict[str, Any]], list[int]]:
+    """Recheck selected records concurrently and retain original JSONL order."""
+    updated = list(records)
+    eligible = [index for index in indices if record_is_recheckable(records[index])]
+    if jobs == 1:
+        try:
+            for index in eligible:
+                updated[index] = worker(records[index])
+        except BaseException:
+            stop_event.set()
+            raise
+        return updated, eligible
+
+    executor = ThreadPoolExecutor(
+        max_workers=jobs,
+        thread_name_prefix="qayd-fastcop-recheck",
+    )
+    futures = {index: executor.submit(worker, records[index]) for index in eligible}
+    try:
+        for index in eligible:
+            updated[index] = futures[index].result()
+    except BaseException:
+        stop_event.set()
+        for future in futures.values():
+            future.cancel()
+        raise
+    finally:
+        executor.shutdown(wait=True)
+    return updated, eligible
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
@@ -1189,6 +1938,11 @@ def main() -> int:
     parser.add_argument("--cpu-limit", type=positive_float, default=180.0)
     parser.add_argument("--wall-limit", type=positive_float, default=270.0)
     parser.add_argument("--memory-mb", type=positive_int, default=65536)
+    parser.add_argument(
+        "--checker-memory-mb",
+        type=positive_int,
+        help="checker Java heap in MiB (defaults to min(4096, --memory-mb))",
+    )
     parser.add_argument(
         "--jobs",
         type=positive_int,
@@ -1209,16 +1963,27 @@ def main() -> int:
         help="deterministically select the first N instances of every family",
     )
     parser.add_argument("--no-check", action="store_true")
-    parser.add_argument("--rerun", action="store_true", help="do not skip completed run keys")
+    parser.add_argument(
+        "--rerun",
+        action="store_true",
+        help="do not skip completed solver executions",
+    )
+    parser.add_argument(
+        "--recheck-only",
+        action="store_true",
+        help="rerun only the checker over stored stdout logs and atomically update JSONL",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     lock_handles = []
     try:
-        manifest_path = args.manifest.resolve()
+        if args.recheck_only and (args.rerun or args.no_check):
+            raise HarnessError(
+                "--recheck-only is incompatible with --rerun and --no-check"
+            )
         solver_path = args.solvers.resolve()
-        manifest = load_manifest(manifest_path)
-        manifest_hash = sha256_file(manifest_path)
+        checker_memory_mb = args.checker_memory_mb or min(4096, args.memory_mb)
         solver_config, solver_hash = load_solvers(solver_path)
         configured = solver_config["solvers"]
         solver_names = args.solver_names or list(configured)
@@ -1227,11 +1992,6 @@ def main() -> int:
             raise HarnessError(f"unknown solver(s): {', '.join(unknown)}")
         if len(set(solver_names)) != len(solver_names):
             raise HarnessError("--solver entries must be unique")
-        instances = select_instances(
-            manifest, args.family, args.instance, args.limit, args.per_family
-        )
-        if not instances:
-            raise HarnessError("instance selection is empty")
         output = args.output.resolve()
         log_directory = (
             args.log_dir.resolve() if args.log_dir
@@ -1239,45 +1999,121 @@ def main() -> int:
         )
         if not args.dry_run:
             lock_handles.append(acquire_campaign_lock(output))
-            lock_handles.append(acquire_log_lock(log_directory))
+            if not args.recheck_only:
+                lock_handles.append(acquire_log_lock(log_directory))
         existing_records = load_result_records(output)
-        completed = (
-            set()
-            if args.rerun
-            else {record["run_key"] for record in existing_records}
+        checker = solver_config["checker"]
+        execution_hash = execution_harness_sha256()
+        validation_hash = harness_sha256()
+
+        if args.recheck_only:
+            if not existing_records:
+                raise HarnessError(f"no stored executions in {output}")
+            for record in existing_records:
+                ensure_record_execution_key(record, allow_legacy=True)
+            indices = select_recheck_indices(
+                existing_records,
+                solver_names,
+                args.family,
+                args.instance,
+                args.limit,
+                args.per_family,
+            )
+            if not indices:
+                raise HarnessError("recheck selection is empty")
+            if args.dry_run:
+                for position, index in enumerate(indices, 1):
+                    record = existing_records[index]
+                    state = (
+                        "recheck"
+                        if record_is_recheckable(record)
+                        else "not-checkable"
+                    )
+                    print(
+                        f"[{position}/{len(indices)}] {record['solver']} "
+                        f"{record['instance']}: {state}",
+                        flush=True,
+                    )
+                return 0
+
+            stop_event = threading.Event()
+
+            def recheck_worker(record: dict[str, Any]) -> dict[str, Any]:
+                try:
+                    return recheck_record(
+                        record,
+                        solver_path,
+                        solver_config,
+                        checker_memory_mb,
+                        args.checker_timeout,
+                        validation_hash,
+                        stop_event,
+                    )
+                except RunCancelled:
+                    raise
+                except (HarnessError, OSError) as error:
+                    raise HarnessError(
+                        f"{record['solver']} {record['instance']}: {error}"
+                    ) from error
+
+            updated, eligible = recheck_records(
+                existing_records,
+                indices,
+                args.jobs,
+                recheck_worker,
+                stop_event,
+            )
+            replace_records_atomically(output, updated)
+            eligible_set = set(eligible)
+            for position, index in enumerate(indices, 1):
+                record = updated[index]
+                state = (
+                    f"validation={record['validation']['reason']}"
+                    if index in eligible_set
+                    else "not-checkable"
+                )
+                print(
+                    f"[{position}/{len(indices)}] {record['solver']} "
+                    f"{record['instance']}: {state}",
+                    flush=True,
+                )
+            print(
+                f"results={output} rechecked={len(eligible)} "
+                f"unchanged={len(indices) - len(eligible)}"
+            )
+            return 0
+
+        manifest_path = args.manifest.resolve()
+        manifest = load_manifest(manifest_path)
+        manifest_hash = sha256_file(manifest_path)
+        instances = select_instances(
+            manifest, args.family, args.instance, args.limit, args.per_family
         )
+        if not instances:
+            raise HarnessError("instance selection is empty")
         total = len(solver_names) * len(instances)
         skipped = 0
-        checker = solver_config["checker"]
-        checker_artifact = resolve_config_path(solver_path, checker["artifact"])
-        checker_hash = sha256_file(checker_artifact)
-        harness_hash = harness_sha256()
         tasks = []
         for solver_name in solver_names:
             solver = configured[solver_name]
-            artifact = resolve_config_path(solver_path, solver["artifact"])
-            artifact_hash = sha256_file(artifact)
             for item in instances:
                 position = len(tasks) + 1
-                identity = make_run_identity(
+                identity, _artifact, _checker_artifact = planned_execution_identity(
                     solver_name,
-                    solver_hash,
-                    artifact_hash,
-                    checker_hash,
-                    item["id"],
-                    item["sha256"],
+                    solver,
+                    solver_path,
+                    checker,
+                    item,
                     args.cpu_limit,
                     args.wall_limit,
                     args.memory_mb,
+                    checker_memory_mb,
                     args.seed,
                     args.grace,
-                    args.checker_timeout,
-                    not args.no_check,
                     args.jobs,
-                    harness_hash,
-                    manifest_hash,
+                    execution_hash,
                 )
-                key = sha256_bytes(canonical_json(identity).encode("utf-8"))
+                key = identity_key(identity)
                 tasks.append(
                     RunTask(
                         position=position,
@@ -1285,6 +2121,7 @@ def main() -> int:
                         solver=solver,
                         instance_item=item,
                         run_key=key,
+                        execution_identity=identity,
                     )
                 )
 
@@ -1292,6 +2129,14 @@ def main() -> int:
         if len(set(run_keys)) != len(run_keys):
             raise HarnessError("run plan contains duplicate identities")
         ensure_output_matches_plan(output, tasks, existing_records)
+        completed = (
+            set()
+            if args.rerun
+            else {
+                record.get("execution_key", record["run_key"])
+                for record in existing_records
+            }
+        )
 
         if args.dry_run:
             for task in tasks:
@@ -1309,7 +2154,8 @@ def main() -> int:
         if args.jobs > 1:
             print(
                 f"parallel jobs={args.jobs}; per-run memory={args.memory_mb} MiB; "
-                f"aggregate configured memory={args.jobs * args.memory_mb} MiB",
+                f"aggregate configured solver memory={args.jobs * args.memory_mb} MiB; "
+                f"aggregate checker heap={args.jobs * checker_memory_mb} MiB",
                 flush=True,
             )
 
@@ -1328,12 +2174,14 @@ def main() -> int:
                     args.cpu_limit,
                     args.wall_limit,
                     args.memory_mb,
+                    checker_memory_mb,
                     args.seed,
                     args.grace,
                     args.checker_timeout,
                     not args.no_check,
                     args.jobs,
-                    harness_hash,
+                    execution_hash,
+                    validation_hash,
                     log_directory,
                     stop_event,
                 )
@@ -1343,7 +2191,7 @@ def main() -> int:
                 raise HarnessError(
                     f"{task.solver_name} {task.instance_item['id']}: {error}"
                 ) from error
-            if record["run_key"] != task.run_key:
+            if record["execution_key"] != task.run_key:
                 raise HarnessError(
                     f"run identity changed while executing {task.solver_name} "
                     f"{task.instance_item['id']}"
@@ -1366,7 +2214,7 @@ def main() -> int:
                 )
                 continue
             append_record(output, record)
-            completed.add(record["run_key"])
+            completed.add(record["execution_key"])
             incumbent = record["best_incumbent"]
             objective = f" obj={incumbent['value']}" if incumbent else ""
             validation = record["validation"]["reason"]

@@ -3,10 +3,10 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use crate::constraints::table;
-use crate::model::{Automaton, CompiledCp, Constraint, IntExpr, IntGlobalConstraint, Model, Objective};
+use crate::model::{Automaton, CompiledCp, Constraint, IntExpr, IntGlobalConstraint, Mdd, MddArc, Model, Objective, Relation};
 use crate::orchestrator::{
-    audit_cp_root_problem_clones, compile_cp_plan, solve_cp_plan, IgnoreEvents, SolveBudget, SolveError, SolveLimits, SolveRequest,
-    SolveStatus,
+    audit_cp_root_problem_clones, audit_integer_warm_start_compile, audit_integer_warm_start_preflight, compile_cp_plan, solve_cp_plan,
+    IgnoreEvents, SolveBudget, SolveError, SolveLimits, SolveRequest, SolveStatus,
 };
 use crate::problem::Objective as PhysicalObjective;
 use crate::Solver;
@@ -109,6 +109,78 @@ fn table_memory_estimate_counts_distinct_supports_not_tuple_square() {
 }
 
 #[test]
+fn integer_warm_start_preflight_counts_table_and_mdd_payloads() {
+    const TABLE_ARITY: usize = 8;
+    const TABLE_ROWS: usize = 4_096;
+    const MDD_LAYERS: usize = 4;
+    const MDD_ARCS_PER_LAYER: usize = 4_096;
+    let mut model = Model::new();
+    let table_variables = (0..TABLE_ARITY).map(|_| model.bool_var()).collect::<Vec<_>>();
+    let tuples = (0..TABLE_ROWS).map(|row| (0..TABLE_ARITY).map(|column| ((row >> column) & 1) as i32).collect::<Vec<_>>()).collect();
+    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table { variables: table_variables, tuples, positive: true }));
+    let mdd_variables = (0..MDD_LAYERS).map(|_| model.bool_var()).collect::<Vec<_>>();
+    let layers = (0..MDD_LAYERS)
+        .map(|_| (0..MDD_ARCS_PER_LAYER).map(|arc| MddArc { from: arc, value: (arc & 1) as i32, to: arc }).collect::<Vec<_>>())
+        .collect();
+    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Mdd {
+        variables: mdd_variables,
+        mdd: Mdd { layers, nodes_per_layer: vec![MDD_ARCS_PER_LAYER; MDD_LAYERS + 1] },
+    }));
+
+    let (local_bytes, structural_bytes, inspection_work) =
+        audit_integer_warm_start_preflight(&model, &AtomicBool::new(false)).expect("preflight completed");
+    let table_cells = TABLE_ARITY * TABLE_ROWS;
+    let mdd_arcs = MDD_LAYERS * MDD_ARCS_PER_LAYER;
+    assert!(local_bytes >= u64::try_from(table_cells * 4 + mdd_arcs * std::mem::size_of::<MddArc>()).unwrap());
+    assert!(inspection_work >= u64::try_from(table_cells + mdd_arcs).unwrap());
+    assert!(structural_bytes > 0);
+
+    assert!(audit_integer_warm_start_preflight(&model, &AtomicBool::new(true)).is_none());
+}
+
+#[test]
+fn optional_integer_warm_start_obeys_its_memory_allowance_and_prearmed_stop() {
+    let mut model = Model::new();
+    let cell = model.int_range(1, 1);
+    let guard = model.bool_var();
+    let index = model.int_range(0, 0);
+    let letter = model.bool_var();
+    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Element { array: vec![cell], index, value: letter }));
+    model.add_constraint(Constraint::Intension(IntExpr::Or(vec![
+        IntExpr::Eq(Box::new(IntExpr::Variable(guard)), Box::new(IntExpr::Constant(0))),
+        IntExpr::Eq(Box::new(IntExpr::Variable(letter)), Box::new(IntExpr::Constant(1))),
+    ])));
+    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table {
+        variables: vec![index],
+        tuples: vec![vec![0]],
+        positive: true,
+    }));
+    model.add_objective(Objective::IntExpr { minimize: false, expr: IntExpr::Mul(vec![IntExpr::Constant(7), IntExpr::Variable(guard)]) });
+    let compiled = CompiledCp::compile_interruptible(&model, &AtomicBool::new(false)).unwrap().unwrap();
+
+    assert_eq!(audit_integer_warm_start_compile(&model, &compiled, 0, &AtomicBool::new(false)), (false, 0));
+    let (local_plan_bytes, _, _) =
+        audit_integer_warm_start_preflight(&model, &AtomicBool::new(false)).expect("warm-start preflight completed");
+    assert_eq!(
+        audit_integer_warm_start_compile(&model, &compiled, local_plan_bytes, &AtomicBool::new(false)),
+        (false, 0),
+        "the memory gate must include the transient normalized LS copy"
+    );
+    let (compiled_plan, estimated_bytes) = audit_integer_warm_start_compile(&model, &compiled, u64::MAX, &AtomicBool::new(false));
+    assert!(compiled_plan);
+    assert!(estimated_bytes > 0);
+    assert_eq!(audit_integer_warm_start_compile(&model, &compiled, u64::MAX, &AtomicBool::new(true)), (false, 0));
+
+    let cp_bytes = CompiledCp::estimate_semantic_bytes_interruptible(&model, &AtomicBool::new(false)).unwrap();
+    let unlimited = compile_cp_plan(&model, &SolveRequest::default(), &SolveBudget::new(None)).unwrap();
+    assert!(unlimited.estimated_backend_bytes() > cp_bytes, "the resident warm-start plan was not added to the CP estimate");
+    let limited_request =
+        SolveRequest { limits: SolveLimits { memory_bytes: Some(cp_bytes), ..SolveLimits::default() }, ..SolveRequest::default() };
+    let limited = compile_cp_plan(&model, &limited_request, &SolveBudget::new(None)).unwrap();
+    assert_eq!(limited.estimated_backend_bytes(), cp_bytes, "an optional warm start must be omitted when no memory remains");
+}
+
+#[test]
 fn flat_expression_lowering_stops_while_collecting_operands() {
     let mut model = Model::new();
     let variable = model.int_range(0, 1);
@@ -161,6 +233,77 @@ fn affine_cp_objective_is_normalized_and_duplicate_terms_are_combined() {
     assert!(*minimize);
     assert_eq!(coefficients, &[3, -4]);
     assert_eq!(variables, compiled.int_variables());
+}
+
+#[test]
+fn large_affine_cp_objective_stays_linear() {
+    let mut model = Model::new();
+    let variables = (0..64).map(|_| model.bool_var()).collect::<Vec<_>>();
+    model.add_objective(Objective::IntExpr {
+        minimize: true,
+        expr: IntExpr::Add(variables.iter().copied().map(IntExpr::Variable).collect()),
+    });
+
+    let compiled = CompiledCp::compile_interruptible(&model, &AtomicBool::new(false)).unwrap().unwrap();
+
+    let PhysicalObjective::Linear(minimize, coefficients, physical_variables) = &compiled.objectives()[0] else {
+        panic!("large affine objective was left as a symbolic expression");
+    };
+    assert!(*minimize);
+    assert_eq!(coefficients, &vec![1; variables.len()]);
+    assert_eq!(physical_variables, compiled.int_variables());
+}
+
+#[test]
+fn materialized_objective_recovers_an_exact_affine_search_view() {
+    let mut model = Model::new();
+    let x = model.int_range(0, 4);
+    let y = model.int_range(-2, 3);
+    let objective = model.int_range(-20, 20);
+    model.add_constraint(Constraint::Linear { terms: vec![(3, x), (-1, x), (-3, y), (-1, objective)], relation: Relation::Eq, rhs: 5 });
+    model.add_objective(Objective::IntExpr { minimize: true, expr: IntExpr::Variable(objective) });
+
+    let compiled = CompiledCp::compile_interruptible(&model, &AtomicBool::new(false)).unwrap().unwrap();
+
+    let PhysicalObjective::VarWithAffine(minimize, physical_objective, coefficients, variables) = &compiled.objectives()[0] else {
+        panic!("unit defining equality did not produce an affine objective view");
+    };
+    assert!(*minimize);
+    assert_eq!(*physical_objective, compiled.int_variables()[objective.0]);
+    assert_eq!(coefficients, &[2, -3]);
+    assert_eq!(variables, &compiled.int_variables()[..2]);
+}
+
+#[test]
+fn positive_unit_objective_coefficient_recovers_the_same_affine_view() {
+    let mut model = Model::new();
+    let x = model.int_range(0, 4);
+    let objective = model.int_range(9, 25);
+    model.add_constraint(Constraint::Linear { terms: vec![(-4, x), (1, objective)], relation: Relation::Eq, rhs: 9 });
+    model.add_objective(Objective::IntExpr { minimize: false, expr: IntExpr::Variable(objective) });
+
+    let compiled = CompiledCp::compile_interruptible(&model, &AtomicBool::new(false)).unwrap().unwrap();
+
+    let PhysicalObjective::VarWithAffine(minimize, physical_objective, coefficients, variables) = &compiled.objectives()[0] else {
+        panic!("positive unit defining equality did not produce an affine objective view");
+    };
+    assert!(!minimize);
+    assert_eq!(*physical_objective, compiled.int_variables()[objective.0]);
+    assert_eq!(coefficients, &[4]);
+    assert_eq!(variables, &[compiled.int_variables()[x.0]]);
+}
+
+#[test]
+fn nonunit_materialized_objective_equality_is_not_used_as_an_affine_view() {
+    let mut model = Model::new();
+    let x = model.int_range(0, 4);
+    let objective = model.int_range(0, 4);
+    model.add_constraint(Constraint::Linear { terms: vec![(1, x), (-2, objective)], relation: Relation::Eq, rhs: 0 });
+    model.add_objective(Objective::IntExpr { minimize: true, expr: IntExpr::Variable(objective) });
+
+    let compiled = CompiledCp::compile_interruptible(&model, &AtomicBool::new(false)).unwrap().unwrap();
+
+    assert!(matches!(compiled.objectives()[0], PhysicalObjective::Var(true, _)));
 }
 
 #[test]

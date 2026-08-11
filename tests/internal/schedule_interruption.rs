@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use qayd::constraints::interval::{no_overlap, no_overlap_until};
+use qayd::constraints::scheduling::no_overlap as no_overlap_ints;
 use qayd::engines::schedule::{self, Options, Status};
 use qayd::engines::CollectionCompileContext;
 use qayd::model::list::{CollectionModel, IntervalVar, Mode, Resource, Schedule};
@@ -112,6 +113,31 @@ fn no_overlap_propagation_stops_inside_one_expensive_call() {
         .expect("cooperative interruption is not an inconsistency");
 
     assert!(polls.get() >= 8);
+    assert!(solver.fd_at_fixpoint(), "the interrupted propagation queue must be cleared");
+}
+
+#[test]
+fn integer_no_overlap_global_propagation_stops_inside_one_expensive_call() {
+    let mut solver = Solver::new();
+    let mut starts = vec![solver.new_var_range(0, 0)];
+    starts.extend((1..33).map(|_| solver.new_var_range(0, 64)));
+    let mut durations = vec![10];
+    durations.extend([1; 32]);
+    no_overlap_ints(&mut solver, &starts, &durations);
+    assert_eq!(solver.num_propagators(), 1, "the test must exercise the global fallback");
+    let polls = Cell::new(0usize);
+
+    solver
+        .propagate_until(|| {
+            let next = polls.get() + 1;
+            polls.set(next);
+            next >= 5
+        })
+        .expect("cooperative interruption is not an inconsistency");
+
+    assert!(polls.get() >= 5);
+    assert_eq!(solver.store.min(starts[1]), 10, "the first sound inference may survive cancellation");
+    assert_eq!(solver.store.min(starts[2]), 0, "propagation must stop before the next pair");
     assert!(solver.fd_at_fixpoint(), "the interrupted propagation queue must be cleared");
 }
 

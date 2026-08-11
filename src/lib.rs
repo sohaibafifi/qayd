@@ -92,6 +92,12 @@ mod collection;
 #[path = "../tests/internal/cp_compile_interruption.rs"]
 mod cp_compile_interruption;
 #[cfg(test)]
+#[path = "../tests/internal/disjunctive_schedule.rs"]
+mod disjunctive_schedule;
+#[cfg(test)]
+#[path = "../tests/internal/divisibility_compaction.rs"]
+mod divisibility_compaction;
+#[cfg(test)]
 #[path = "../tests/internal/lcg_atom_layout.rs"]
 mod lcg_atom_layout;
 #[cfg(test)]
@@ -103,6 +109,9 @@ mod lcg_guarded_sum;
 #[cfg(test)]
 #[path = "../tests/internal/lcg_objective_branching.rs"]
 mod lcg_objective_branching;
+#[cfg(test)]
+#[path = "../tests/internal/lcg_root_probe_budget.rs"]
+mod lcg_root_probe_budget;
 #[cfg(test)]
 #[path = "../tests/internal/list_alns_phase4.rs"]
 mod list_alns_phase4;
@@ -152,6 +161,9 @@ mod phase7;
 #[path = "../tests/internal/phase9_phase10.rs"]
 mod phase9_phase10;
 #[cfg(test)]
+#[path = "../tests/internal/prefix_set_compaction.rs"]
+mod prefix_set_compaction;
+#[cfg(test)]
 #[path = "../tests/internal/routing_alns_elite.rs"]
 mod routing_alns_elite;
 #[cfg(test)]
@@ -160,6 +172,9 @@ mod routing_neighborhoods;
 #[cfg(test)]
 #[path = "../tests/internal/routing_search.rs"]
 mod routing_search;
+#[cfg(test)]
+#[path = "../tests/internal/scenario_schedule.rs"]
+mod scenario_schedule;
 #[cfg(test)]
 #[path = "../tests/internal/schedule_compile_contract.rs"]
 mod schedule_compile_contract;
