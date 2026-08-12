@@ -368,6 +368,7 @@ pub fn merge_search_stats(total: &mut SolveStats, part: SolveStats) {
     total.lp_nonzeros = total.lp_nonzeros.saturating_add(part.lp_nonzeros);
     total.lp_solves = total.lp_solves.saturating_add(part.lp_solves);
     total.lp_certified = total.lp_certified.saturating_add(part.lp_certified);
+    total.lp_route_ng_size = total.lp_route_ng_size.max(part.lp_route_ng_size);
     total.lp_timeouts = total.lp_timeouts.saturating_add(part.lp_timeouts);
     total.lp_refactorizations = total.lp_refactorizations.saturating_add(part.lp_refactorizations);
     total.lp_micros = total.lp_micros.saturating_add(part.lp_micros);

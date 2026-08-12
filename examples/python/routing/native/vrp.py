@@ -37,6 +37,9 @@ parser.add_argument("--lp-root-ms", type=int, default=1000, help="route-master L
 parser.add_argument("--lp-max-variables", type=int, default=2000)
 parser.add_argument("--lp-max-rows", type=int, default=1000)
 parser.add_argument("--lp-max-nonzeros", type=int, default=100000)
+parser.add_argument("--lp-route-ng-size", type=int, default=8)
+parser.add_argument("--lp-route-max-labels", type=int, default=2000000)
+parser.add_argument("--lp-route-dual-stabilization-percent", type=int, default=75)
 parser.add_argument("--engine", choices=("auto", "exact", "ls"), default="ls")
 parser.add_argument("--solution", help="VRP solution file used as an LS warm start")
 parser.add_argument("--verbose", action="store_true")
@@ -51,6 +54,9 @@ if (
     or args.lp_max_variables <= 0
     or args.lp_max_rows <= 0
     or args.lp_max_nonzeros <= 0
+    or not 1 <= args.lp_route_ng_size <= 16
+    or args.lp_route_max_labels <= 0
+    or not 1 <= args.lp_route_dual_stabilization_percent <= 100
     or (args.max_iterations is not None and args.max_iterations < 0)
 ):
     raise SystemExit("threads and LP size limits must be positive; time limits and seed must be non-negative")
@@ -130,6 +136,9 @@ solve_options = {
     "lp_max_variables": args.lp_max_variables,
     "lp_max_rows": args.lp_max_rows,
     "lp_max_nonzeros": args.lp_max_nonzeros,
+    "lp_route_ng_size": args.lp_route_ng_size,
+    "lp_route_max_labels": args.lp_route_max_labels,
+    "lp_route_dual_stabilization_percent": args.lp_route_dual_stabilization_percent,
 }
 if hint is not None:
     solve_options["list_hint"] = hint
@@ -181,6 +190,7 @@ construction_record = {
     "lp_model_status": solution.stats.lp_model_status,
     "lp_solves": solution.stats.lp_solves,
     "lp_certified": solution.stats.lp_certified,
+    "lp_route_ng_size_completed": solution.stats.lp_route_ng_size,
     "lp_simplex_time_ms": solution.stats.lp_micros / 1000,
 }
 
@@ -205,6 +215,9 @@ if solution.lists is None:
         "routing_warm_start": args.routing_warm_start,
         "linear_backend": args.linear_backend,
         "lp_root_ms": args.lp_root_ms,
+        "lp_route_ng_size": args.lp_route_ng_size,
+        "lp_route_max_labels": args.lp_route_max_labels,
+        "lp_route_dual_stabilization_percent": args.lp_route_dual_stabilization_percent,
     }
     print(json.dumps(record, sort_keys=True) if args.json else f"instance: {name}  status: {solution.status}")
     raise SystemExit(0)
@@ -251,6 +264,9 @@ record = {
     "routing_warm_start": args.routing_warm_start,
     "linear_backend": args.linear_backend,
     "lp_root_ms": args.lp_root_ms,
+    "lp_route_ng_size": args.lp_route_ng_size,
+    "lp_route_max_labels": args.lp_route_max_labels,
+    "lp_route_dual_stabilization_percent": args.lp_route_dual_stabilization_percent,
     "routes": route_records,
     "verified": True,
 }
@@ -268,7 +284,8 @@ else:
     if solution.stats.lp_model_status != "not-attempted":
         print(
             f"  route LP: {solution.stats.lp_root_bound}  solves: {solution.stats.lp_solves}"
-            f"  certified: {solution.stats.lp_certified}  simplex: {solution.stats.lp_micros / 1000:.3f} ms"
+            f"  certified: {solution.stats.lp_certified}  ng: {solution.stats.lp_route_ng_size}"
+            f"  simplex: {solution.stats.lp_micros / 1000:.3f} ms"
         )
     for index, route in enumerate(route_records):
         if route["nodes"]:

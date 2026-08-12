@@ -118,6 +118,14 @@ pub struct LinearControls {
     pub min_coverage_percent: usize,
     /// Maximum physical CP model size eligible for LP primal phase guidance.
     pub phase_max_variables: usize,
+    /// Number of remembered customers in each routing ng-neighborhood. A
+    /// value of one recovers q-route pricing.
+    pub route_ng_size: usize,
+    /// Hard label cap for exact ng-route pricing. Reaching it declines the LP
+    /// certificate instead of pruning labels heuristically.
+    pub route_max_labels: usize,
+    /// Weight of the restricted-master dual in stabilized routing pricing.
+    pub route_dual_stabilization_percent: usize,
 }
 
 impl Default for LinearControls {
@@ -132,6 +140,9 @@ impl Default for LinearControls {
             max_nonzeros: 100_000,
             min_coverage_percent: 1,
             phase_max_variables: 1_000,
+            route_ng_size: 8,
+            route_max_labels: 2_000_000,
+            route_dual_stabilization_percent: 75,
         }
     }
 }

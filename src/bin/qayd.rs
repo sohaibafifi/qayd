@@ -48,7 +48,7 @@ fn is_instance(arg: &str) -> bool {
 }
 
 const USAGE: &str =
-    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--mem-limit MB] [--ls] [--split] [--probe N] [--lns N] [--no-learn-csp] [--semantic-branching] [--force-scope-reasons] [--shared-pool-cap N] [--core] [--linear-backend auto|native|amthal] [--lp-root-ms N] [--lp-node-ms N] [--lp-node-depth N] [--lp-max-vars N] [--lp-max-rows N] [--lp-max-nonzeros N] [--lp-min-coverage N] [--lp-phase-max-vars N] <instance.xml[.lzma|.xz]>";
+    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--mem-limit MB] [--ls] [--split] [--probe N] [--lns N] [--no-learn-csp] [--semantic-branching] [--force-scope-reasons] [--shared-pool-cap N] [--core] [--linear-backend auto|native|amthal] [--lp-root-ms N] [--lp-node-ms N] [--lp-node-depth N] [--lp-max-vars N] [--lp-max-rows N] [--lp-max-nonzeros N] [--lp-min-coverage N] [--lp-phase-max-vars N] [--lp-route-ng-size N] [--lp-route-max-labels N] [--lp-route-dual-stabilization-percent N] <instance.xml[.lzma|.xz]>";
 
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
@@ -62,6 +62,14 @@ fn parse<T: FromStr>(value: Option<&str>, message: &str) -> T {
 fn positive(value: Option<&str>, message: &str) -> usize {
     let value = parse(value, message);
     if value == 0 {
+        fail(message);
+    }
+    value
+}
+
+fn bounded_positive(value: Option<&str>, maximum: usize, message: &str) -> usize {
+    let value = positive(value, message);
+    if value > maximum {
         fail(message);
     }
     value
@@ -145,6 +153,20 @@ fn main() {
             }
             "--lp-phase-max-vars" => {
                 linear.phase_max_variables = parse(it.next().map(String::as_str), "--lp-phase-max-vars needs a non-negative integer")
+            }
+            "--lp-route-ng-size" => {
+                linear.route_ng_size =
+                    bounded_positive(it.next().map(String::as_str), 16, "--lp-route-ng-size needs an integer between 1 and 16")
+            }
+            "--lp-route-max-labels" => {
+                linear.route_max_labels = positive(it.next().map(String::as_str), "--lp-route-max-labels needs a positive integer")
+            }
+            "--lp-route-dual-stabilization-percent" => {
+                linear.route_dual_stabilization_percent = bounded_positive(
+                    it.next().map(String::as_str),
+                    100,
+                    "--lp-route-dual-stabilization-percent needs an integer between 1 and 100",
+                )
             }
             other if other.starts_with('-') => {
                 eprintln!("unknown option {other}");

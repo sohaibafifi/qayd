@@ -31,6 +31,9 @@ def _args():
         lp_max_variables=2000,
         lp_max_rows=1000,
         lp_max_nonzeros=100000,
+        lp_route_ng_size=8,
+        lp_route_max_labels=2000000,
+        lp_route_dual_stabilization_percent=75,
     )
 
 
@@ -51,7 +54,9 @@ def _record(arm, primal, dual, lp_bound=None, errors=None):
         "lp_simplex_time_ms": 25.0 if lp_bound is not None else 0.0,
         "lp_solves": 4 if lp_bound is not None else 0,
         "lp_certified": 4 if lp_bound is not None else 0,
-        "bound_method": "certified q-route LP relaxation" if lp_bound is not None else "directed assignment relaxation",
+        "lp_route_ng_size": 8,
+        "lp_route_ng_size_completed": 8 if lp_bound is not None else 0,
+        "bound_method": "stabilized ng-route fleet LP relaxation" if lp_bound is not None else "directed assignment relaxation",
         "wall_seconds": 10.1,
         "peak_memory_mb": 100.0,
         "validation_errors": errors or [],
@@ -100,6 +105,9 @@ def test_certification_checks_incumbent_and_known_solution():
     assert "dual_bound crosses the verified incumbent" in errors
     assert "dual_bound crosses the known feasible solution" in errors
     assert "lp_root_bound crosses the known feasible solution" in errors
+
+    invalid["lp_route_ng_size_completed"] = 9
+    assert "completed ng-route size is outside the requested range" in ablation.validate_record(invalid, 110)
 
 
 def test_summary_is_paired_and_keeps_primal_and_dual_directions_distinct():

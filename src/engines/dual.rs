@@ -5,6 +5,8 @@
 
 #[cfg(test)]
 use std::cell::Cell;
+#[cfg(feature = "lp-relaxation")]
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -30,13 +32,13 @@ const MAX_VRPTW_METRIC_NODES: usize = 128;
 const MAX_ROUTING_RELAXATION_NODES: usize = 2_048;
 const INF: i64 = i64::MAX;
 #[cfg(feature = "lp-relaxation")]
-const MAX_Q_ROUTE_ROUNDS: usize = 64;
+const MAX_ROUTE_MASTER_ROUNDS: usize = 64;
 #[cfg(feature = "lp-relaxation")]
-const MAX_Q_ROUTE_STATES: usize = 2_000_000;
+const MAX_NG_ROUTE_BASE_STATES: usize = 2_000_000;
 #[cfg(feature = "lp-relaxation")]
-const MAX_Q_ROUTE_TRANSITIONS: usize = 200_000_000;
+const MAX_NG_ROUTE_BASE_TRANSITIONS: usize = 200_000_000;
 #[cfg(feature = "lp-relaxation")]
-const Q_ROUTE_PROJECTION_SCALE: usize = 1 << 10;
+const ROUTE_DUAL_PROJECTION_SCALE: usize = 1 << 10;
 
 /// A certified bound before a primal solution is known.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,7 +77,7 @@ fn compute_internal(model: &CollectionModel, controls: Option<LinearControls>, s
             }
             best = stronger(best, routing.column_generation_bound(stop), true);
             if let Some(controls) = controls {
-                best = stronger(best, routing.q_route_lp_bound(controls, stop), true);
+                best = stronger(best, routing.route_master_lp_bound(controls, stop), true);
             }
         }
     }
@@ -154,6 +156,7 @@ fn merge_lp_stats(total: &mut SolveStats, part: SolveStats) {
     total.lp_nonzeros = total.lp_nonzeros.saturating_add(part.lp_nonzeros);
     total.lp_solves = total.lp_solves.saturating_add(part.lp_solves);
     total.lp_certified = total.lp_certified.saturating_add(part.lp_certified);
+    total.lp_route_ng_size = total.lp_route_ng_size.max(part.lp_route_ng_size);
     total.lp_timeouts = total.lp_timeouts.saturating_add(part.lp_timeouts);
     total.lp_refactorizations = total.lp_refactorizations.saturating_add(part.lp_refactorizations);
     total.lp_micros = total.lp_micros.saturating_add(part.lp_micros);
@@ -1511,23 +1514,32 @@ impl RoutingRelaxation {
     }
 
     #[cfg(not(feature = "lp-relaxation"))]
-    fn q_route_lp_bound(&self, _controls: LinearControls, _stop: &AtomicBool) -> Option<DualBound> {
+    fn route_master_lp_bound(&self, _controls: LinearControls, _stop: &AtomicBool) -> Option<DualBound> {
         None
     }
 
     #[cfg(feature = "lp-relaxation")]
-    fn q_route_lp_bound(&self, controls: LinearControls, stop: &AtomicBool) -> Option<DualBound> {
+    fn route_master_lp_bound(&self, controls: LinearControls, stop: &AtomicBool) -> Option<DualBound> {
         use crate::engines::linear::{solve_advisory, AdvisoryLinearProblem, AdvisoryLinearRow, AdvisoryLinearStatus};
         use crate::orchestrator::LinearBackendMode;
 
         let customers = self.costs.len().checked_sub(1)?;
+        let master_variables = customers.checked_add(2)?;
         if customers <= MAX_COLUMN_GENERATION_CUSTOMERS
             || controls.backend == LinearBackendMode::Native
             || controls.root_time.is_zero()
-            || customers > controls.max_variables
+            || master_variables > controls.max_variables
             || customers > controls.max_rows
             || self.costs.iter().flatten().any(|&cost| cost < 0)
+            || !(1..=16).contains(&controls.route_ng_size)
+            || controls.route_max_labels == 0
+            || !(1..=100).contains(&controls.route_dual_stabilization_percent)
         {
+            return None;
+        }
+        let min_routes = self.min_routes();
+        let max_routes = self.routes.min(customers);
+        if min_routes > max_routes {
             return None;
         }
         let (demands, capacity) = match &self.capacity {
@@ -1543,7 +1555,7 @@ impl RoutingRelaxation {
         let scaled_demands = demands.iter().map(|&demand| usize::try_from(demand / divisor).ok()).collect::<Option<Vec<_>>>()?;
         let states = scaled_capacity.checked_add(1)?.checked_mul(customers)?;
         let transitions = scaled_capacity.checked_mul(customers)?.checked_mul(customers)?;
-        if states > MAX_Q_ROUTE_STATES || transitions > MAX_Q_ROUTE_TRANSITIONS {
+        if states > MAX_NG_ROUTE_BASE_STATES || transitions > MAX_NG_ROUTE_BASE_TRANSITIONS {
             return None;
         }
 
@@ -1553,16 +1565,24 @@ impl RoutingRelaxation {
         if singleton_costs.iter().any(|&cost| cost < 0 || cost.unsigned_abs() > u128::from(1u64 << 53)) {
             return None;
         }
+        let fleet_dual_limit = singleton_costs.iter().try_fold(0i128, |sum, &cost| sum.checked_add(cost))?;
+        if fleet_dual_limit.unsigned_abs() > u128::from(1u64 << 53)
+            || singleton_costs
+                .iter()
+                .any(|&cost| cost.checked_add(fleet_dual_limit).is_none_or(|limit| limit.unsigned_abs() > u128::from(1u64 << 53)))
+        {
+            return None;
+        }
         let mut columns = singleton_costs
             .iter()
             .enumerate()
             .map(|(customer, &cost)| {
                 let mut counts = vec![0u32; customers];
                 counts[customer] = 1;
-                QRouteColumn { counts, cost }
+                RouteColumn { counts, cost }
             })
             .collect::<Vec<_>>();
-        let generated_reserve = controls.max_rows.saturating_sub(columns.len()).min(MAX_Q_ROUTE_ROUNDS);
+        let generated_reserve = controls.max_rows.saturating_sub(columns.len()).min(MAX_ROUTE_MASTER_ROUNDS);
         let pair_slots = controls.max_rows.saturating_sub(columns.len()).saturating_sub(generated_reserve);
         let mut pairs = Vec::new();
         for left in 0..customers {
@@ -1581,7 +1601,7 @@ impl RoutingRelaxation {
                 let mut counts = vec![0u32; customers];
                 counts[left] = 1;
                 counts[right] = 1;
-                pairs.push((savings, QRouteColumn { counts, cost }));
+                pairs.push((savings, RouteColumn { counts, cost }));
             }
         }
         pairs.sort_unstable_by_key(|(savings, _)| *savings);
@@ -1590,14 +1610,26 @@ impl RoutingRelaxation {
         let started_at = Instant::now();
         let deadline = started_at.checked_add(controls.root_time)?;
         let generation_deadline = started_at.checked_add(controls.root_time.mul_f32(0.75)).unwrap_or(deadline).min(deadline);
-        let base_dual = route_master_base_dual(&self.costs)?;
-        let base_sum = base_dual.iter().try_fold(0i128, |sum, &value| sum.checked_add(value))?;
-        let mut best = i64::try_from(ceil_scaled(base_sum, COLUMN_DUAL_SCALE)?).ok()?;
+        let q_neighborhoods = NgNeighborhoods::build(&self.costs, 1, generation_deadline, stop)?;
+        let generation_pricing = RoutePricing {
+            costs: &self.costs,
+            demands: &scaled_demands,
+            capacity: scaled_capacity,
+            max_labels: controls.route_max_labels,
+            deadline: generation_deadline,
+            stop,
+        };
+        let base_dual = RouteMasterDual { customers: route_master_base_dual(&self.costs)?, fleet_lower: 0, fleet_upper: 0 };
+        let base_value = base_dual.objective(min_routes, max_routes)?;
+        let mut best_scaled = base_value;
+        let mut best = i64::try_from(ceil_scaled(best_scaled, COLUMN_DUAL_SCALE)?).ok()?;
+        let mut center = base_dual.clone();
         let mut last_dual = None;
+        let mut stabilization_percent = controls.route_dual_stabilization_percent;
         let mut stats = SolveStats {
             lp_model_status: LinearModelStatus::Ready,
-            lp_variables: u64::try_from(customers).unwrap_or(u64::MAX),
-            lp_columns: u64::try_from(customers).unwrap_or(u64::MAX),
+            lp_variables: u64::try_from(master_variables).unwrap_or(u64::MAX),
+            lp_columns: u64::try_from(master_variables).unwrap_or(u64::MAX),
             lp_covered_variables: u64::try_from(customers).unwrap_or(u64::MAX),
             lp_objective_variables: u64::try_from(customers).unwrap_or(u64::MAX),
             lp_objective_covered_variables: u64::try_from(customers).unwrap_or(u64::MAX),
@@ -1606,26 +1638,43 @@ impl RoutingRelaxation {
             ..SolveStats::default()
         };
 
-        for _ in 0..MAX_Q_ROUTE_ROUNDS {
+        for _ in 0..MAX_ROUTE_MASTER_ROUNDS {
             if stop.load(Ordering::Acquire) || Instant::now() >= generation_deadline || columns.len() > controls.max_rows {
                 break;
             }
-            let nonzeros = columns.iter().map(|column| column.counts.iter().filter(|&&count| count != 0).count()).sum::<usize>();
+            let nonzeros =
+                columns.iter().map(|column| column.counts.iter().filter(|&&count| count != 0).count().saturating_add(2)).sum::<usize>();
             if nonzeros > controls.max_nonzeros {
                 break;
             }
             let problem = AdvisoryLinearProblem {
-                objective: vec![-1; customers],
-                bounds: singleton_costs.iter().map(|&upper| (0, upper)).collect(),
+                objective: {
+                    let mut objective = vec![-1; customers];
+                    objective.push(-i128::try_from(min_routes).ok()?);
+                    objective.push(i128::try_from(max_routes).ok()?);
+                    objective
+                },
+                bounds: {
+                    let mut bounds = singleton_costs
+                        .iter()
+                        .map(|&upper| upper.checked_add(fleet_dual_limit).map(|limit| (0, limit)))
+                        .collect::<Option<Vec<_>>>()?;
+                    bounds.extend([(0, fleet_dual_limit), (0, fleet_dual_limit)]);
+                    bounds
+                },
                 rows: columns
                     .iter()
                     .map(|column| AdvisoryLinearRow {
-                        terms: column
-                            .counts
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(customer, &count)| (count != 0).then_some((customer, i128::from(count))))
-                            .collect(),
+                        terms: {
+                            let mut terms = column
+                                .counts
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(customer, &count)| (count != 0).then_some((customer, i128::from(count))))
+                                .collect::<Vec<_>>();
+                            terms.extend([(customers, 1), (customers + 1, -1)]);
+                            terms
+                        },
                         lower: None,
                         upper: Some(column.cost),
                     })
@@ -1647,33 +1696,41 @@ impl RoutingRelaxation {
                 }
                 AdvisoryLinearStatus::Other => break,
             }
-            if solution.primal.len() != customers {
+            if solution.primal.len() != master_variables {
                 break;
             }
-            let dual = solution.primal.iter().map(|&value| scaled_floor(value, COLUMN_DUAL_SCALE)).collect::<Option<Vec<_>>>();
-            let Some(dual) = dual else { break };
-            last_dual = Some(dual.clone());
-            let Some(priced) = price_q_route(&self.costs, &scaled_demands, scaled_capacity, &dual, generation_deadline, stop) else {
+            let Some(raw_dual) = RouteMasterDual::from_primal(&solution.primal, customers) else { break };
+            last_dual = Some(raw_dual.clone());
+            let Some(proposal) = center.blend(&raw_dual, stabilization_percent, 100) else { break };
+            let Some(priced) = generation_pricing.price(&proposal, &q_neighborhoods) else {
                 break;
             };
+            stats.lp_route_ng_size = stats.lp_route_ng_size.max(1);
 
             // Shifting every customer multiplier by the most negative reduced
-            // cost makes it feasible for every nonempty q-route. Since the
-            // q-route family contains every elementary CVRP route, the result
-            // is also feasible for the original route-master dual.
+            // cost makes it feasible for every nonempty q-route. The q-route
+            // family contains every elementary CVRP route, so the result also
+            // certifies the semantic route master, including its fleet rows.
             let shift = priced.reduced_cost.min(0);
-            let certified_sum = dual.iter().try_fold(0i128, |sum, &value| sum.checked_add(value.checked_add(shift)?));
-            let Some(certified_sum) = certified_sum else { break };
-            let Some(certified) = ceil_scaled(certified_sum, COLUMN_DUAL_SCALE).and_then(|value| i64::try_from(value).ok()) else {
+            let Some(certified_dual) = proposal.shift_customers(shift) else { break };
+            let Some(certified_value) = certified_dual.objective(min_routes, max_routes) else { break };
+            let Some(certified) = ceil_scaled(certified_value, COLUMN_DUAL_SCALE).and_then(|value| i64::try_from(value).ok()) else {
                 break;
             };
-            best = best.max(certified);
+            if certified_value > best_scaled {
+                best_scaled = certified_value;
+                best = certified;
+                center = certified_dual;
+                stabilization_percent = stabilization_percent.saturating_add(5).min(95);
+            } else {
+                stabilization_percent = stabilization_percent.saturating_sub(5).max(50);
+            }
             stats.lp_certified = stats.lp_certified.saturating_add(1);
             stats.lp_root_bound = Some(best);
             if priced.reduced_cost >= 0 {
                 break;
             }
-            let next_nonzeros = nonzeros.saturating_add(priced.counts.iter().filter(|&&count| count != 0).count());
+            let next_nonzeros = nonzeros.saturating_add(priced.counts.iter().filter(|&&count| count != 0).count().saturating_add(2));
             if columns.len() >= controls.max_rows || next_nonzeros > controls.max_nonzeros {
                 break;
             }
@@ -1685,42 +1742,203 @@ impl RoutingRelaxation {
                 }
             } else {
                 column_index.insert(priced.counts.clone(), columns.len());
-                columns.push(QRouteColumn { counts: priced.counts, cost: priced.cost });
+                columns.push(RouteColumn { counts: priced.counts, cost: priced.cost });
             }
         }
         if let Some(candidate) = last_dual {
-            if let Some(projected) =
-                project_route_master_dual(&self.costs, &scaled_demands, scaled_capacity, &base_dual, &candidate, deadline, stop)
-            {
-                let projected_sum = projected.iter().try_fold(0i128, |sum, &value| sum.checked_add(value))?;
-                best = best.max(i64::try_from(ceil_scaled(projected_sum, COLUMN_DUAL_SCALE)?).ok()?);
+            let projection_pricing = RoutePricing {
+                costs: &self.costs,
+                demands: &scaled_demands,
+                capacity: scaled_capacity,
+                max_labels: controls.route_max_labels,
+                deadline,
+                stop,
+            };
+            let mut projection_base = center;
+            let mut previous_ng_size = 0;
+            for ng_size in [1, 2.min(controls.route_ng_size), 4.min(controls.route_ng_size), controls.route_ng_size] {
+                if ng_size == previous_ng_size {
+                    continue;
+                }
+                previous_ng_size = ng_size;
+                let Some(projected) = projection_pricing.project(&projection_base, &candidate, ng_size) else {
+                    if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+                        stats.lp_timeouts = stats.lp_timeouts.saturating_add(1);
+                    }
+                    break;
+                };
+                let projected_value = projected.objective(min_routes, max_routes)?;
+                if projected_value > best_scaled {
+                    best_scaled = projected_value;
+                    best = i64::try_from(ceil_scaled(best_scaled, COLUMN_DUAL_SCALE)?).ok()?;
+                }
+                projection_base = projected;
+                stats.lp_route_ng_size = stats.lp_route_ng_size.max(u64::try_from(ng_size).unwrap_or(u64::MAX));
                 stats.lp_certified = stats.lp_certified.saturating_add(1);
                 stats.lp_root_bound = Some(best);
-            } else if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
-                stats.lp_timeouts = stats.lp_timeouts.saturating_add(1);
             }
         }
         stats.lp_rows = u64::try_from(columns.len()).unwrap_or(u64::MAX);
         stats.lp_source_rows = stats.lp_rows;
-        stats.lp_nonzeros =
-            u64::try_from(columns.iter().map(|column| column.counts.iter().filter(|&&count| count != 0).count()).sum::<usize>())
-                .unwrap_or(u64::MAX);
-        Some(DualBound { value: best, method: "certified q-route LP relaxation", stats })
+        stats.lp_nonzeros = u64::try_from(
+            columns.iter().map(|column| column.counts.iter().filter(|&&count| count != 0).count().saturating_add(2)).sum::<usize>(),
+        )
+        .unwrap_or(u64::MAX);
+        Some(DualBound { value: best, method: "stabilized ng-route fleet LP relaxation", stats })
     }
 }
 
 #[cfg(feature = "lp-relaxation")]
 #[derive(Clone)]
-struct QRouteColumn {
+struct RouteColumn {
     counts: Vec<u32>,
     cost: i128,
 }
 
 #[cfg(feature = "lp-relaxation")]
-struct PricedQRoute {
+#[derive(Clone)]
+struct RouteMasterDual {
+    customers: Vec<i128>,
+    fleet_lower: i128,
+    fleet_upper: i128,
+}
+
+#[cfg(feature = "lp-relaxation")]
+impl RouteMasterDual {
+    fn from_primal(primal: &[f64], customers: usize) -> Option<Self> {
+        if primal.len() != customers.checked_add(2)? {
+            return None;
+        }
+        Some(Self {
+            customers: primal[..customers].iter().map(|&value| scaled_floor(value, COLUMN_DUAL_SCALE)).collect::<Option<Vec<_>>>()?,
+            fleet_lower: scaled_floor(primal[customers], COLUMN_DUAL_SCALE)?.max(0),
+            fleet_upper: scaled_ceil(primal[customers + 1], COLUMN_DUAL_SCALE)?.max(0),
+        })
+    }
+
+    fn objective(&self, min_routes: usize, max_routes: usize) -> Option<i128> {
+        self.customers
+            .iter()
+            .try_fold(0i128, |sum, &value| sum.checked_add(value))?
+            .checked_add(self.fleet_lower.checked_mul(i128::try_from(min_routes).ok()?)?)?
+            .checked_sub(self.fleet_upper.checked_mul(i128::try_from(max_routes).ok()?)?)
+    }
+
+    fn blend(&self, target: &Self, numerator: usize, denominator: usize) -> Option<Self> {
+        if self.customers.len() != target.customers.len() || numerator > denominator || denominator == 0 {
+            return None;
+        }
+        let blend = |anchor: i128, value: i128| {
+            value
+                .checked_sub(anchor)?
+                .checked_mul(i128::try_from(numerator).ok()?)?
+                .div_euclid(i128::try_from(denominator).ok()?)
+                .checked_add(anchor)
+        };
+        Some(Self {
+            customers: self
+                .customers
+                .iter()
+                .zip(&target.customers)
+                .map(|(&anchor, &value)| blend(anchor, value))
+                .collect::<Option<Vec<_>>>()?,
+            fleet_lower: blend(self.fleet_lower, target.fleet_lower)?.max(0),
+            fleet_upper: blend(self.fleet_upper, target.fleet_upper)?.max(0),
+        })
+    }
+
+    fn shift_customers(&self, shift: i128) -> Option<Self> {
+        Some(Self {
+            customers: self.customers.iter().map(|&value| value.checked_add(shift)).collect::<Option<Vec<_>>>()?,
+            fleet_lower: self.fleet_lower,
+            fleet_upper: self.fleet_upper,
+        })
+    }
+}
+
+#[cfg(feature = "lp-relaxation")]
+struct PricedNgRoute {
     reduced_cost: i128,
     counts: Vec<u32>,
     cost: i128,
+}
+
+#[cfg(feature = "lp-relaxation")]
+#[derive(Clone, Copy)]
+struct NgLabel {
+    reduced_cost: i128,
+    trace: usize,
+}
+
+#[cfg(feature = "lp-relaxation")]
+#[derive(Clone, Copy)]
+struct NgTrace {
+    customer: usize,
+    predecessor: Option<usize>,
+}
+
+#[cfg(feature = "lp-relaxation")]
+struct NgNeighborhoods {
+    members: Vec<Vec<usize>>,
+    positions: Vec<u8>,
+    customers: usize,
+}
+
+#[cfg(feature = "lp-relaxation")]
+impl NgNeighborhoods {
+    fn build(costs: &[Vec<i64>], requested_size: usize, deadline: Instant, stop: &AtomicBool) -> Option<Self> {
+        let customers = costs.len().checked_sub(1)?;
+        if customers == 0 || requested_size == 0 || requested_size > 16 || costs.iter().any(|row| row.len() != costs.len()) {
+            return None;
+        }
+        let size = requested_size.min(customers);
+        let mut members = Vec::with_capacity(customers);
+        let mut positions = vec![u8::MAX; customers.checked_mul(customers)?];
+        for customer in 0..customers {
+            if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+                return None;
+            }
+            let mut neighborhood = Vec::with_capacity(size);
+            neighborhood.push(customer);
+            if size > 1 {
+                let mut nearest = (0..customers)
+                    .filter(|&other| other != customer)
+                    .map(|other| {
+                        let distance = i128::from(costs[customer + 1][other + 1]) + i128::from(costs[other + 1][customer + 1]);
+                        (distance, other)
+                    })
+                    .collect::<Vec<_>>();
+                nearest.sort_unstable();
+                neighborhood.extend(nearest.into_iter().take(size - 1).map(|(_, other)| other));
+            }
+            for (position, &member) in neighborhood.iter().enumerate() {
+                positions[customer * customers + member] = u8::try_from(position).ok()?;
+            }
+            members.push(neighborhood);
+        }
+        Some(Self { members, positions, customers })
+    }
+
+    fn position(&self, neighborhood: usize, customer: usize) -> Option<u8> {
+        let position = *self.positions.get(neighborhood.checked_mul(self.customers)?.checked_add(customer)?)?;
+        (position != u8::MAX).then_some(position)
+    }
+
+    fn extend(&self, last: usize, memory: u16, next: usize) -> Option<u16> {
+        if self.position(last, next).is_some_and(|position| memory & (1u16 << position) != 0) {
+            return None;
+        }
+        let mut extended = 1u16 << self.position(next, next)?;
+        for (source_position, &remembered) in self.members.get(last)?.iter().enumerate() {
+            if memory & (1u16 << source_position) == 0 {
+                continue;
+            }
+            if let Some(target_position) = self.position(next, remembered) {
+                extended |= 1u16 << target_position;
+            }
+        }
+        Some(extended)
+    }
 }
 
 #[cfg(feature = "lp-relaxation")]
@@ -1743,6 +1961,18 @@ fn scaled_floor(value: f64, scale: i128) -> Option<i128> {
         return None;
     }
     Some(scaled.floor() as i128)
+}
+
+#[cfg(feature = "lp-relaxation")]
+fn scaled_ceil(value: f64, scale: i128) -> Option<i128> {
+    if !value.is_finite() {
+        return None;
+    }
+    let scaled = value * scale as f64;
+    if !scaled.is_finite() || scaled < i128::MIN as f64 || scaled > i128::MAX as f64 {
+        return None;
+    }
+    Some(scaled.ceil() as i128)
 }
 
 #[cfg(feature = "lp-relaxation")]
@@ -1769,143 +1999,170 @@ fn route_master_base_dual(costs: &[Vec<i64>]) -> Option<Vec<i128>> {
 }
 
 #[cfg(feature = "lp-relaxation")]
-fn blend_route_dual(base: &[i128], candidate: &[i128], numerator: usize) -> Option<Vec<i128>> {
-    if base.len() != candidate.len() || numerator > Q_ROUTE_PROJECTION_SCALE {
-        return None;
-    }
-    base.iter()
-        .zip(candidate)
-        .map(|(&anchor, &target)| {
-            target
-                .checked_sub(anchor)?
-                .checked_mul(i128::try_from(numerator).ok()?)?
-                .div_euclid(i128::try_from(Q_ROUTE_PROJECTION_SCALE).ok()?)
-                .checked_add(anchor)
-        })
-        .collect()
+struct RoutePricing<'a> {
+    costs: &'a [Vec<i64>],
+    demands: &'a [usize],
+    capacity: usize,
+    max_labels: usize,
+    deadline: Instant,
+    stop: &'a AtomicBool,
 }
 
 #[cfg(feature = "lp-relaxation")]
-fn project_route_master_dual(
-    costs: &[Vec<i64>],
-    demands: &[usize],
-    capacity: usize,
-    base: &[i128],
-    candidate: &[i128],
-    deadline: Instant,
-    stop: &AtomicBool,
-) -> Option<Vec<i128>> {
-    let priced = price_q_route(costs, demands, capacity, candidate, deadline, stop)?;
-    if priced.reduced_cost >= 0 {
-        return Some(candidate.to_vec());
+impl RoutePricing<'_> {
+    fn project(&self, base: &RouteMasterDual, candidate: &RouteMasterDual, ng_size: usize) -> Option<RouteMasterDual> {
+        let neighborhoods = NgNeighborhoods::build(self.costs, ng_size, self.deadline, self.stop)?;
+        let priced = self.price(candidate, &neighborhoods)?;
+        if priced.reduced_cost >= 0 {
+            return Some(candidate.clone());
+        }
+        let mut feasible_numerator = 0usize;
+        let mut infeasible_numerator = ROUTE_DUAL_PROJECTION_SCALE;
+        let mut feasible = base.clone();
+        while feasible_numerator + 1 < infeasible_numerator {
+            if self.stop.load(Ordering::Acquire) || Instant::now() >= self.deadline {
+                return None;
+            }
+            let middle = (feasible_numerator + infeasible_numerator) / 2;
+            let trial = base.blend(candidate, middle, ROUTE_DUAL_PROJECTION_SCALE)?;
+            if self.price(&trial, &neighborhoods)?.reduced_cost >= 0 {
+                feasible_numerator = middle;
+                feasible = trial;
+            } else {
+                infeasible_numerator = middle;
+            }
+        }
+        Some(feasible)
     }
-    let mut feasible_numerator = 0usize;
-    let mut infeasible_numerator = Q_ROUTE_PROJECTION_SCALE;
-    let mut feasible = base.to_vec();
-    while feasible_numerator + 1 < infeasible_numerator {
-        if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+
+    fn price(&self, dual: &RouteMasterDual, neighborhoods: &NgNeighborhoods) -> Option<PricedNgRoute> {
+        let customers = self.demands.len();
+        if customers == 0
+            || self.capacity == 0
+            || self.demands.iter().any(|&demand| demand == 0 || demand > self.capacity)
+            || dual.customers.len() != customers
+            || self.costs.len() != customers + 1
+            || neighborhoods.customers != customers
+            || self.max_labels == 0
+        {
             return None;
         }
-        let middle = (feasible_numerator + infeasible_numerator) / 2;
-        let trial = blend_route_dual(base, candidate, middle)?;
-        if price_q_route(costs, demands, capacity, &trial, deadline, stop)?.reduced_cost >= 0 {
-            feasible_numerator = middle;
-            feasible = trial;
-        } else {
-            infeasible_numerator = middle;
-        }
-    }
-    Some(feasible)
-}
-
-#[cfg(feature = "lp-relaxation")]
-fn price_q_route(
-    costs: &[Vec<i64>],
-    demands: &[usize],
-    capacity: usize,
-    dual: &[i128],
-    deadline: Instant,
-    stop: &AtomicBool,
-) -> Option<PricedQRoute> {
-    let customers = demands.len();
-    if customers == 0 || dual.len() != customers || costs.len() != customers + 1 {
-        return None;
-    }
-    let states = capacity.checked_add(1)?.checked_mul(customers)?;
-    let infinity = i128::MAX / 4;
-    let mut reduced = vec![infinity; states];
-    let mut predecessor = vec![usize::MAX; states];
-    for customer in 0..customers {
-        let load = demands[customer];
-        let index = load.checked_mul(customers)?.checked_add(customer)?;
-        reduced[index] = i128::from(costs[0][customer + 1]).checked_mul(COLUMN_DUAL_SCALE)?.checked_sub(dual[customer])?;
-    }
-    let mut visited_transitions = 0usize;
-    for load in 1..=capacity {
-        for last in 0..customers {
-            let index = load.checked_mul(customers)?.checked_add(last)?;
-            let prefix = reduced[index];
-            if prefix == infinity {
-                continue;
+        let states = self.capacity.checked_add(1)?.checked_mul(customers)?;
+        let mut labels = vec![BTreeMap::<u16, NgLabel>::new(); states];
+        let mut traces = Vec::new();
+        for customer in 0..customers {
+            let load = self.demands[customer];
+            let index = load.checked_mul(customers)?.checked_add(customer)?;
+            let memory = 1u16 << neighborhoods.position(customer, customer)?;
+            let trace = traces.len();
+            traces.push(NgTrace { customer, predecessor: None });
+            labels[index].insert(
+                memory,
+                NgLabel {
+                    reduced_cost: i128::from(self.costs[0][customer + 1])
+                        .checked_mul(COLUMN_DUAL_SCALE)?
+                        .checked_sub(dual.customers[customer])?,
+                    trace,
+                },
+            );
+            if traces.len() > self.max_labels {
+                return None;
             }
-            for next in 0..customers {
-                if next == last {
+        }
+        let mut visited_transitions = 0usize;
+        for load in 1..=self.capacity {
+            for last in 0..customers {
+                let index = load.checked_mul(customers)?.checked_add(last)?;
+                if labels[index].is_empty() {
                     continue;
                 }
-                visited_transitions = visited_transitions.saturating_add(1);
-                if visited_transitions.is_multiple_of(4_096) && (stop.load(Ordering::Acquire) || Instant::now() >= deadline) {
-                    return None;
-                }
-                let next_load = load.checked_add(demands[next])?;
-                if next_load > capacity {
-                    continue;
-                }
-                let candidate =
-                    prefix.checked_add(i128::from(costs[last + 1][next + 1]).checked_mul(COLUMN_DUAL_SCALE)?)?.checked_sub(dual[next])?;
-                let next_index = next_load.checked_mul(customers)?.checked_add(next)?;
-                if candidate < reduced[next_index] {
-                    reduced[next_index] = candidate;
-                    predecessor[next_index] = index;
+                let current = labels[index].iter().map(|(&memory, label)| (memory, *label)).collect::<Vec<_>>();
+                for (memory, label) in current {
+                    for next in 0..customers {
+                        visited_transitions = visited_transitions.saturating_add(1);
+                        if visited_transitions.is_multiple_of(4_096)
+                            && (self.stop.load(Ordering::Acquire) || Instant::now() >= self.deadline)
+                        {
+                            return None;
+                        }
+                        let Some(next_memory) = neighborhoods.extend(last, memory, next) else { continue };
+                        let next_load = load.checked_add(self.demands[next])?;
+                        if next_load > self.capacity {
+                            continue;
+                        }
+                        let candidate = label
+                            .reduced_cost
+                            .checked_add(i128::from(self.costs[last + 1][next + 1]).checked_mul(COLUMN_DUAL_SCALE)?)?
+                            .checked_sub(dual.customers[next])?;
+                        let next_index = next_load.checked_mul(customers)?.checked_add(next)?;
+                        if labels[next_index]
+                            .iter()
+                            .any(|(&known_memory, known)| known_memory & next_memory == known_memory && known.reduced_cost <= candidate)
+                        {
+                            continue;
+                        }
+                        let dominated = labels[next_index]
+                            .iter()
+                            .filter_map(|(&known_memory, known)| {
+                                (known_memory & next_memory == next_memory && known.reduced_cost >= candidate).then_some(known_memory)
+                            })
+                            .collect::<Vec<_>>();
+                        for known_memory in dominated {
+                            labels[next_index].remove(&known_memory);
+                        }
+                        let trace = traces.len();
+                        traces.push(NgTrace { customer: next, predecessor: Some(label.trace) });
+                        labels[next_index].insert(next_memory, NgLabel { reduced_cost: candidate, trace });
+                        if traces.len() > self.max_labels {
+                            return None;
+                        }
+                    }
                 }
             }
         }
-    }
-    let mut best = None;
-    for load in 1..=capacity {
-        for last in 0..customers {
-            let index = load.checked_mul(customers)?.checked_add(last)?;
-            if reduced[index] == infinity {
-                continue;
+        let mut best = None;
+        for load in 1..=self.capacity {
+            if self.stop.load(Ordering::Acquire) || Instant::now() >= self.deadline {
+                return None;
             }
-            let closed = reduced[index].checked_add(i128::from(costs[last + 1][0]).checked_mul(COLUMN_DUAL_SCALE)?)?;
-            if best.is_none_or(|(_, known)| closed < known) {
-                best = Some((index, closed));
+            for last in 0..customers {
+                let index = load.checked_mul(customers)?.checked_add(last)?;
+                for label in labels[index].values() {
+                    let closed = label
+                        .reduced_cost
+                        .checked_add(i128::from(self.costs[last + 1][0]).checked_mul(COLUMN_DUAL_SCALE)?)?
+                        .checked_sub(dual.fleet_lower)?
+                        .checked_add(dual.fleet_upper)?;
+                    if best.is_none_or(|(_, known)| closed < known) {
+                        best = Some((label.trace, closed));
+                    }
+                }
             }
         }
-    }
-    let (mut state, reduced_cost) = best?;
-    let mut reversed = Vec::new();
-    loop {
-        reversed.push(state % customers);
-        let previous = predecessor[state];
-        if previous == usize::MAX {
-            break;
+        let (mut trace, reduced_cost) = best?;
+        let mut reversed = Vec::new();
+        loop {
+            let current = *traces.get(trace)?;
+            reversed.push(current.customer);
+            let Some(previous) = current.predecessor else {
+                break;
+            };
+            trace = previous;
         }
-        state = previous;
+        reversed.reverse();
+        let mut counts = vec![0u32; customers];
+        for &customer in &reversed {
+            counts[customer] = counts[customer].checked_add(1)?;
+        }
+        let first = *reversed.first()?;
+        let last = *reversed.last()?;
+        let mut cost = i128::from(self.costs[0][first + 1]);
+        for pair in reversed.windows(2) {
+            cost = cost.checked_add(i128::from(self.costs[pair[0] + 1][pair[1] + 1]))?;
+        }
+        cost = cost.checked_add(i128::from(self.costs[last + 1][0]))?;
+        Some(PricedNgRoute { reduced_cost, counts, cost })
     }
-    reversed.reverse();
-    let mut counts = vec![0u32; customers];
-    for &customer in &reversed {
-        counts[customer] = counts[customer].checked_add(1)?;
-    }
-    let first = *reversed.first()?;
-    let last = *reversed.last()?;
-    let mut cost = i128::from(costs[0][first + 1]);
-    for pair in reversed.windows(2) {
-        cost = cost.checked_add(i128::from(costs[pair[0] + 1][pair[1] + 1]))?;
-    }
-    cost = cost.checked_add(i128::from(costs[last + 1][0]))?;
-    Some(PricedQRoute { reduced_cost, counts, cost })
 }
 
 fn minimum_one_tree(costs: &[Vec<i64>], penalties: &[i128], stop: &AtomicBool) -> Option<(i128, Vec<i32>)> {

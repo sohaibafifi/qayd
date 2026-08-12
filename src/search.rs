@@ -161,6 +161,8 @@ pub struct SolveStats {
     pub lp_solves: u64,
     /// Floating-point dual candidates recertified exactly by qayd.
     pub lp_certified: u64,
+    /// Largest ng-neighborhood whose exact route pricing completed.
+    pub lp_route_ng_size: u64,
     /// LP solves stopped by their local wall-clock allowance.
     pub lp_timeouts: u64,
     /// Complete basis refactorizations reported by the backend.
@@ -1131,6 +1133,7 @@ pub(crate) fn optimize_seeded_with_scope_and_relaxation(
 fn merge_lp_stats(total: &mut SolveStats, part: SolveStats) {
     total.lp_solves = total.lp_solves.saturating_add(part.lp_solves);
     total.lp_certified = total.lp_certified.saturating_add(part.lp_certified);
+    total.lp_route_ng_size = total.lp_route_ng_size.max(part.lp_route_ng_size);
     total.lp_timeouts = total.lp_timeouts.saturating_add(part.lp_timeouts);
     total.lp_refactorizations = total.lp_refactorizations.saturating_add(part.lp_refactorizations);
     total.lp_micros = total.lp_micros.saturating_add(part.lp_micros);

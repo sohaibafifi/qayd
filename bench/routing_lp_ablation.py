@@ -176,6 +176,9 @@ def run_id(
         args.lp_max_variables,
         args.lp_max_rows,
         args.lp_max_nonzeros,
+        args.lp_route_ng_size,
+        args.lp_route_max_labels,
+        args.lp_route_dual_stabilization_percent,
     ]
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
@@ -253,6 +256,12 @@ def command_for(job: dict[str, Any], args: argparse.Namespace) -> list[str]:
         str(args.lp_max_rows),
         "--lp-max-nonzeros",
         str(args.lp_max_nonzeros),
+        "--lp-route-ng-size",
+        str(args.lp_route_ng_size),
+        "--lp-route-max-labels",
+        str(args.lp_route_max_labels),
+        "--lp-route-dual-stabilization-percent",
+        str(args.lp_route_dual_stabilization_percent),
         "--json",
     ]
     if args.max_iterations is not None:
@@ -286,6 +295,12 @@ def validate_record(record: dict[str, Any], known_upper_bound: int | None) -> li
             errors.append(f"{field} crosses the verified incumbent")
         if bound is not None and known_upper_bound is not None and bound > known_upper_bound:
             errors.append(f"{field} crosses the known feasible solution")
+    completed_ng_size = integer_value(record.get("lp_route_ng_size_completed"))
+    requested_ng_size = integer_value(record.get("lp_route_ng_size"))
+    if completed_ng_size is None:
+        errors.append("missing integer completed ng-route size")
+    elif completed_ng_size < 0 or requested_ng_size is None or completed_ng_size > requested_ng_size:
+        errors.append("completed ng-route size is outside the requested range")
     return errors
 
 
@@ -320,6 +335,9 @@ def execute(job: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
         "seed": job["seed"],
         "threads": args.threads,
         "launcher": args.launcher,
+        "lp_route_ng_size": args.lp_route_ng_size,
+        "lp_route_max_labels": args.lp_route_max_labels,
+        "lp_route_dual_stabilization_percent": args.lp_route_dual_stabilization_percent,
         "order_position": job["order_position"],
         "wall_seconds": measured["wall_seconds"],
         "peak_memory_mb": measured["peak_memory_mb"],
@@ -598,6 +616,9 @@ def sidecar_payload(
         "lp_max_variables": args.lp_max_variables,
         "lp_max_rows": args.lp_max_rows,
         "lp_max_nonzeros": args.lp_max_nonzeros,
+        "lp_route_ng_size": args.lp_route_ng_size,
+        "lp_route_max_labels": args.lp_route_max_labels,
+        "lp_route_dual_stabilization_percent": args.lp_route_dual_stabilization_percent,
         "artifact": artifact,
         "host": provenance,
     }
@@ -686,6 +707,9 @@ def main() -> int:
     parser.add_argument("--lp-max-variables", type=int, default=2000)
     parser.add_argument("--lp-max-rows", type=int, default=1000)
     parser.add_argument("--lp-max-nonzeros", type=int, default=100000)
+    parser.add_argument("--lp-route-ng-size", type=int, default=8)
+    parser.add_argument("--lp-route-max-labels", type=int, default=2000000)
+    parser.add_argument("--lp-route-dual-stabilization-percent", type=int, default=75)
     parser.add_argument("--memory-limit-mb", type=int, default=0)
     parser.add_argument("--grace-seconds", type=float, default=20.0)
     parser.add_argument("--prepare-qayd", action="store_true", help="build the LP-enabled extension first")
@@ -706,6 +730,9 @@ def main() -> int:
         or args.lp_max_variables <= 0
         or args.lp_max_rows <= 0
         or args.lp_max_nonzeros <= 0
+        or not 1 <= args.lp_route_ng_size <= 16
+        or args.lp_route_max_labels <= 0
+        or not 1 <= args.lp_route_dual_stabilization_percent <= 100
         or (args.max_iterations is not None and args.max_iterations < 0)
     ):
         parser.error("threads, jobs, and LP size limits must be positive; other limits must be non-negative")

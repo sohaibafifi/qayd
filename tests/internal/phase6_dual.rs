@@ -370,7 +370,7 @@ fn routing_duals_stay_below_random_small_cvrp_optima() {
 
 #[cfg(feature = "lp-relaxation")]
 #[test]
-fn q_route_master_lp_is_recertified_before_publication() {
+fn ng_route_master_lp_is_recertified_before_publication() {
     let customers = 17usize;
     let mut costs = vec![vec![1i64; customers + 1]; customers + 1];
     for (node, row) in costs.iter_mut().enumerate() {
@@ -398,6 +398,98 @@ fn q_route_master_lp_is_recertified_before_publication() {
     assert!(bound.stats.lp_solves > 0);
     assert!(bound.stats.lp_certified > 0);
     assert!(bound.stats.lp_root_bound.is_some_and(|lp| lp <= 188));
+    assert_eq!(bound.method, "stabilized ng-route fleet LP relaxation");
+}
+
+#[cfg(feature = "lp-relaxation")]
+#[test]
+fn ng_memory_strengthens_two_cycle_pricing_without_crossing_singletons() {
+    let customers = 17usize;
+    let mut costs = vec![vec![50i64; customers + 1]; customers + 1];
+    for (node, row) in costs.iter_mut().enumerate() {
+        row[node] = 0;
+        if node > 0 {
+            row[0] = 10;
+        }
+    }
+    costs[0].iter_mut().skip(1).for_each(|cost| *cost = 10);
+    for left in (1..customers).step_by(2) {
+        costs[left][left + 1] = 1;
+        costs[left + 1][left] = 1;
+    }
+    let model = routing_model(&costs, &vec![1i64; customers + 1], customers, Some(3));
+    let controls = |route_ng_size| LinearControls {
+        backend: LinearBackendMode::Amthal,
+        root_time: Duration::from_secs(2),
+        max_rows: 256,
+        route_ng_size,
+        ..LinearControls::default()
+    };
+    let q_route = compute_with_linear(&model, controls(1), &AtomicBool::new(false)).expect("q-route bound");
+    let ng_route = compute_with_linear(&model, controls(2), &AtomicBool::new(false)).expect("ng-route bound");
+
+    assert!(ng_route.value >= q_route.value);
+    assert!(ng_route.value <= 340, "ng-route dual {} crossed the singleton solution", ng_route.value);
+}
+
+#[cfg(feature = "lp-relaxation")]
+#[test]
+fn route_master_enforces_the_semantic_fleet_limit() {
+    let customers = 17usize;
+    let mut costs = vec![vec![100i64; customers + 1]; customers + 1];
+    for (node, row) in costs.iter_mut().enumerate() {
+        row[node] = 0;
+        if node > 0 {
+            row[0] = 10;
+        }
+    }
+    costs[0].iter_mut().skip(1).for_each(|cost| *cost = 10);
+    let demands = vec![1i64; customers + 1];
+    let flexible = routing_model(&costs, &demands, customers, Some(customers as i64));
+    let one_vehicle = routing_model(&costs, &demands, 1, Some(customers as i64));
+    let controls = LinearControls {
+        backend: LinearBackendMode::Amthal,
+        root_time: Duration::from_secs(2),
+        max_rows: 256,
+        route_ng_size: 2,
+        ..LinearControls::default()
+    };
+    let flexible_bound = compute_with_linear(&flexible, controls, &AtomicBool::new(false)).expect("flexible fleet bound");
+    let fixed_bound = compute_with_linear(&one_vehicle, controls, &AtomicBool::new(false)).expect("one-vehicle bound");
+    let flexible_lp = flexible_bound.stats.lp_root_bound.expect("flexible route-master bound");
+    let fixed_lp = fixed_bound.stats.lp_root_bound.expect("one-vehicle route-master bound");
+
+    assert!(fixed_lp > flexible_lp, "fleet LP {fixed_lp} did not improve on {flexible_lp}");
+    assert!(fixed_lp <= 1_620, "fleet dual {fixed_lp} crossed the Hamiltonian route");
+}
+
+#[cfg(feature = "lp-relaxation")]
+#[test]
+fn route_pricing_label_cap_keeps_the_last_complete_certificate() {
+    let customers = 17usize;
+    let mut costs = vec![vec![4i64; customers + 1]; customers + 1];
+    for (node, row) in costs.iter_mut().enumerate() {
+        row[node] = 0;
+        if node > 0 {
+            row[0] = 10;
+        }
+    }
+    costs[0].iter_mut().skip(1).for_each(|cost| *cost = 10);
+    let model = routing_model(&costs, &vec![1i64; customers + 1], customers, Some(3));
+    let controls = LinearControls {
+        backend: LinearBackendMode::Amthal,
+        root_time: Duration::from_secs(2),
+        max_rows: 256,
+        route_ng_size: 8,
+        route_max_labels: 1,
+        ..LinearControls::default()
+    };
+    let bound = compute_with_linear(&model, controls, &AtomicBool::new(false)).expect("fallback bound");
+    let route_lp = bound.stats.lp_root_bound.expect("initial complete route certificate");
+
+    assert!(route_lp <= 340, "truncated pricing published an invalid bound {route_lp}");
+    assert_eq!(bound.stats.lp_certified, 1);
+    assert_eq!(bound.stats.lp_route_ng_size, 0);
 }
 
 #[cfg(feature = "lp-relaxation")]

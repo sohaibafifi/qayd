@@ -424,6 +424,8 @@ struct PySolveStats {
     #[pyo3(get)]
     lp_certified: u64,
     #[pyo3(get)]
+    lp_route_ng_size: u64,
+    #[pyo3(get)]
     lp_timeouts: u64,
     #[pyo3(get)]
     lp_refactorizations: u64,
@@ -759,6 +761,7 @@ impl From<SearchStats> for PySolveStats {
             lp_nonzeros: stats.lp_nonzeros,
             lp_solves: stats.lp_solves,
             lp_certified: stats.lp_certified,
+            lp_route_ng_size: stats.lp_route_ng_size,
             lp_timeouts: stats.lp_timeouts,
             lp_refactorizations: stats.lp_refactorizations,
             lp_micros: stats.lp_micros,
@@ -1004,9 +1007,21 @@ fn linear_controls(
     max_nonzeros: usize,
     min_coverage_percent: usize,
     phase_max_variables: usize,
+    route_ng_size: usize,
+    route_max_labels: usize,
+    route_dual_stabilization_percent: usize,
 ) -> PyResult<LinearControls> {
     if node_depth_interval == 0 {
         return Err(PyValueError::new_err("lp_node_depth_interval must be a positive integer"));
+    }
+    if !(1..=16).contains(&route_ng_size) {
+        return Err(PyValueError::new_err("lp_route_ng_size must be between 1 and 16"));
+    }
+    if route_max_labels == 0 {
+        return Err(PyValueError::new_err("lp_route_max_labels must be a positive integer"));
+    }
+    if !(1..=100).contains(&route_dual_stabilization_percent) {
+        return Err(PyValueError::new_err("lp_route_dual_stabilization_percent must be between 1 and 100"));
     }
     Ok(LinearControls {
         backend: parse_linear_backend(backend)?,
@@ -1018,6 +1033,9 @@ fn linear_controls(
         max_nonzeros,
         min_coverage_percent,
         phase_max_variables,
+        route_ng_size,
+        route_max_labels,
+        route_dual_stabilization_percent,
     })
 }
 
@@ -2289,7 +2307,7 @@ impl PySolveSession {
             .collect())
     }
 
-    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, conflict_budget=None, linear_backend="auto", lp_root_ms=50, lp_node_ms=0, lp_node_depth_interval=8, lp_max_variables=2000, lp_max_rows=1000, lp_max_nonzeros=100000, lp_min_coverage_percent=1, lp_phase_max_variables=1000))]
+    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, conflict_budget=None, linear_backend="auto", lp_root_ms=50, lp_node_ms=0, lp_node_depth_interval=8, lp_max_variables=2000, lp_max_rows=1000, lp_max_nonzeros=100000, lp_min_coverage_percent=1, lp_phase_max_variables=1000, lp_route_ng_size=8, lp_route_max_labels=2000000, lp_route_dual_stabilization_percent=75))]
     #[allow(clippy::too_many_arguments)]
     fn solve(
         &mut self,
@@ -2312,6 +2330,9 @@ impl PySolveSession {
         lp_max_nonzeros: usize,
         lp_min_coverage_percent: usize,
         lp_phase_max_variables: usize,
+        lp_route_ng_size: usize,
+        lp_route_max_labels: usize,
+        lp_route_dual_stabilization_percent: usize,
     ) -> PyResult<PySolution> {
         if let Some(callback) = on_incumbent {
             if !callback.is_callable() {
@@ -2353,6 +2374,9 @@ impl PySolveSession {
                 lp_max_nonzeros,
                 lp_min_coverage_percent,
                 lp_phase_max_variables,
+                lp_route_ng_size,
+                lp_route_max_labels,
+                lp_route_dual_stabilization_percent,
             )?,
             ..SolveRequest::default()
         };
@@ -3297,7 +3321,7 @@ impl PyModel {
         Ok(())
     }
 
-    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, threads=1, engine="auto", conflict_budget=None, list_hint=None, max_iterations=None, profile=false, memory_limit_mb=None, schedule_cdcl=false, routing_two_way=true, routing_nearest_neighbor=true, routing_warm_start=true, linear_backend="auto", lp_root_ms=50, lp_node_ms=0, lp_node_depth_interval=8, lp_max_variables=2000, lp_max_rows=1000, lp_max_nonzeros=100000, lp_min_coverage_percent=1, lp_phase_max_variables=1000))]
+    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, threads=1, engine="auto", conflict_budget=None, list_hint=None, max_iterations=None, profile=false, memory_limit_mb=None, schedule_cdcl=false, routing_two_way=true, routing_nearest_neighbor=true, routing_warm_start=true, linear_backend="auto", lp_root_ms=50, lp_node_ms=0, lp_node_depth_interval=8, lp_max_variables=2000, lp_max_rows=1000, lp_max_nonzeros=100000, lp_min_coverage_percent=1, lp_phase_max_variables=1000, lp_route_ng_size=8, lp_route_max_labels=2000000, lp_route_dual_stabilization_percent=75))]
     #[allow(clippy::too_many_arguments)]
     fn solve(
         &self,
@@ -3330,6 +3354,9 @@ impl PyModel {
         lp_max_nonzeros: usize,
         lp_min_coverage_percent: usize,
         lp_phase_max_variables: usize,
+        lp_route_ng_size: usize,
+        lp_route_max_labels: usize,
+        lp_route_dual_stabilization_percent: usize,
     ) -> PyResult<PySolution> {
         if threads == 0 {
             return Err(PyValueError::new_err("threads must be a positive integer"));
@@ -3399,6 +3426,9 @@ impl PyModel {
                 lp_max_nonzeros,
                 lp_min_coverage_percent,
                 lp_phase_max_variables,
+                lp_route_ng_size,
+                lp_route_max_labels,
+                lp_route_dual_stabilization_percent,
             )?,
             ..SolveRequest::default()
         };

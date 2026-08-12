@@ -239,6 +239,15 @@ because a stronger root bound can still consume CPU that would otherwise go to
 local search. `--analyze-only` reconstructs both reports from the JSONL and its
 provenance sidecar without requiring the original instances.
 
+Routing-pricing experiments are explicit and reproducible. Use
+`--lp-route-ng-size N` to set the target ng-neighborhood, with `1` recovering
+q-route pricing, `--lp-route-max-labels N` to set the exact label
+cap, and `--lp-route-dual-stabilization-percent P` to control the initial
+restricted-master weight. The solver progressively strengthens memory up to
+the requested ng size, and never turns a truncated label search into a bound.
+Each JSON record distinguishes `lp_route_ng_size` requested from
+`lp_route_ng_size_completed` exactly certified.
+
 ## Linear backend probe
 
 `linear_backend_probe.py` compares Amthal and HiGHS on the same MIPLIB easy
