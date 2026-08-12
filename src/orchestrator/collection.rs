@@ -13,6 +13,7 @@ use crate::engines::CompileFailure;
 use crate::engines::{dual, list_exact, routing, schedule};
 use crate::model::list::{self, CollectionSolution};
 use crate::model::{self, CompiledCollection, ListRole, Model};
+use crate::search::SolveStats;
 
 use super::{
     Assignment, Bound, CandidateSolution, EngineKind, EngineReport, EventControl, EventSink, IntervalValue, ModelFamily, ProofClaim,
@@ -324,8 +325,10 @@ pub(crate) fn preflight_collection_memory(semantic: &Model, request: &SolveReque
 }
 
 fn validate_collection_request(semantic: &Model, model: &list::CollectionModel, request: &SolveRequest) -> Result<(), SolveError> {
-    if request.linear != super::LinearControls::default() {
-        return Err(SolveError::InvalidRequest("linear relaxation controls require an exact integer CP objective".to_string()));
+    if !request.linear.node_time.is_zero() {
+        return Err(SolveError::InvalidRequest(
+            "in-search linear relaxations require an exact integer CP objective; collection plans support root bounds only".to_string(),
+        ));
     }
     if request.sat != super::SatControls::default() {
         return Err(SolveError::InvalidRequest("SAT controls require a semantic Boolean clause model".to_string()));
@@ -687,7 +690,7 @@ fn solve_collection_plan_inner(
             CollectionBackend::RoutingExact(compiled) => {
                 let warm = transferred_incumbent.map(warm_solution_from_verified).transpose()?;
                 let (outcome, structural_bound) = std::thread::scope(|scope| {
-                    let dual_task = scope.spawn(|| dual::compute(model, engine_stop));
+                    let dual_task = scope.spawn(|| dual::compute_with_linear(model, request.linear, engine_stop));
                     let outcome = routing::solve_compiled(compiled, request.seed, engine_stop, warm.as_ref(), &mut |value| {
                         record_progress(sink, budget, &mut event_error, EngineKind::RoutingExact, value);
                     });
@@ -768,6 +771,9 @@ fn result_from_routing(
     elapsed: Duration,
     budget: &SolveBudget,
 ) -> Result<SolveResult, SolveError> {
+    if let Some(bound) = &structural_bound {
+        super::merge_search_stats(&mut outcome.stats, bound.stats);
+    }
     let status = if outcome.solution.feasible {
         if outcome.complete {
             SolveStatus::Optimal
@@ -1090,13 +1096,18 @@ fn result_from_local_search(run: ListLocalSearchRun<'_>, improvement: &mut impl 
                 }
                 #[cfg(test)]
                 audit_local_search_dual_started(dual_audit.as_ref());
-                dual::compute(model, engine_stop)
+                dual::compute_with_linear(model, request.linear, engine_stop)
             })
         };
         let mut dual_released = false;
         let mut publish_first_incumbent = |value| {
             #[cfg(test)]
-            let _progress_audit = LocalSearchProgressAudit::new();
+            {
+                let progress_audit = LocalSearchProgressAudit::new();
+                improvement(engine, value);
+                drop(progress_audit);
+            }
+            #[cfg(not(test))]
             improvement(engine, value);
             if !dual_released {
                 dual_gate.release();
@@ -1162,6 +1173,8 @@ fn result_from_local_search(run: ListLocalSearchRun<'_>, improvement: &mut impl 
         let structural_bound = dual_task.join().map_err(|_| SolveError::Engine("dual-bound worker panicked".to_string()))?;
         Ok::<_, SolveError>((solution, metadata, structural_bound, iterations))
     })?;
+    let mut search = structural_bound.as_ref().map_or_else(SolveStats::default, |bound| bound.stats);
+    search.nodes = iterations;
     dual::attach(model, &mut solution, structural_bound);
     let status = if solution.feasible { SolveStatus::Satisfiable } else { SolveStatus::Unknown };
     let mut result = finish_collection_result(
@@ -1172,13 +1185,7 @@ fn result_from_local_search(run: ListLocalSearchRun<'_>, improvement: &mut impl 
             status,
             source: engine,
             proof: None,
-            report: EngineReport {
-                engine: Some(engine),
-                search: crate::search::SolveStats { nodes: iterations, ..Default::default() },
-                elapsed: started.elapsed(),
-                improvements: 0,
-                metadata,
-            },
+            report: EngineReport { engine: Some(engine), search, elapsed: started.elapsed(), improvements: 0, metadata },
         },
         budget,
         transfer_stop,

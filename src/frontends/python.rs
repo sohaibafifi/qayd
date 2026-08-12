@@ -1378,6 +1378,13 @@ fn verbose_collection_bound(solution: &PySolution) {
             println!("  bound method: {method}");
         }
     }
+    if solution.stats.lp_model_status != "not-attempted" {
+        println!("  route LP status: {}", solution.stats.lp_model_status);
+        println!("  route LP bound: {}", solution.stats.lp_root_bound.map_or_else(|| "?".to_string(), |bound| bound.to_string()));
+        println!("  route LP solves: {}", solution.stats.lp_solves);
+        println!("  route LP certified: {}", solution.stats.lp_certified);
+        println!("  route LP simplex time: {:.3} ms", solution.stats.lp_micros as f64 / 1000.0);
+    }
 }
 
 /// SIGINT (Ctrl-C), the same value on Unix and Windows.

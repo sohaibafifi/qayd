@@ -18,6 +18,38 @@ use crate::search::SolveStats;
 #[cfg(not(feature = "lp-relaxation"))]
 use crate::store::Solver;
 
+/// Backend-neutral continuous problem used by engines whose semantic
+/// relaxation is not compiled from the integer CP store. Coefficients remain
+/// exact here and are projected to floating point only at the backend edge.
+#[cfg(feature = "lp-relaxation")]
+pub(crate) struct AdvisoryLinearProblem {
+    pub(crate) objective: Vec<i128>,
+    pub(crate) bounds: Vec<(i128, i128)>,
+    pub(crate) rows: Vec<AdvisoryLinearRow>,
+}
+
+#[cfg(feature = "lp-relaxation")]
+pub(crate) struct AdvisoryLinearRow {
+    pub(crate) terms: Vec<(usize, i128)>,
+    pub(crate) lower: Option<i128>,
+    pub(crate) upper: Option<i128>,
+}
+
+#[cfg(feature = "lp-relaxation")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdvisoryLinearStatus {
+    Optimal,
+    TimeLimit,
+    Other,
+}
+
+#[cfg(feature = "lp-relaxation")]
+pub(crate) struct AdvisoryLinearSolution {
+    pub(crate) status: AdvisoryLinearStatus,
+    pub(crate) primal: Vec<f64>,
+    pub(crate) refactorizations: u64,
+}
+
 #[derive(Default)]
 pub(crate) struct RootRelaxation {
     pub(crate) phase: Vec<Option<i32>>,
@@ -85,7 +117,7 @@ mod enabled {
     use num_rational::BigRational;
     use num_traits::{Signed, ToPrimitive, Zero};
 
-    use super::RootRelaxation;
+    use super::{AdvisoryLinearProblem, AdvisoryLinearSolution, AdvisoryLinearStatus, RootRelaxation};
     use crate::engines::linear_lift::{lift_expression_objective, LiftError, LiftLimits, LiftedRow};
     use crate::ids::VarId;
     use crate::orchestrator::{LinearBackendMode, LinearControls};
@@ -240,6 +272,50 @@ mod enabled {
             );
         }
         LpForm::from_model(&source)
+    }
+
+    pub(crate) fn solve_advisory(
+        problem: &AdvisoryLinearProblem,
+        backend_mode: LinearBackendMode,
+        time_limit: Duration,
+        stop: &AtomicBool,
+    ) -> Option<AdvisoryLinearSolution> {
+        if backend_mode == LinearBackendMode::Native
+            || time_limit.is_zero()
+            || stop.load(Ordering::Acquire)
+            || problem.objective.len() != problem.bounds.len()
+        {
+            return None;
+        }
+        if problem.objective.iter().any(|&value| !exact_as_f64(value))
+            || problem.bounds.iter().any(|&(lower, upper)| lower > upper || !exact_as_f64(lower) || !exact_as_f64(upper))
+            || problem.rows.iter().any(|row| {
+                row.lower.zip(row.upper).is_some_and(|(lower, upper)| lower > upper)
+                    || row.lower.is_some_and(|value| !exact_as_f64(value))
+                    || row.upper.is_some_and(|value| !exact_as_f64(value))
+                    || row.terms.iter().any(|&(column, coefficient)| column >= problem.objective.len() || !exact_as_f64(coefficient))
+            })
+        {
+            return None;
+        }
+        let model = LinearModel {
+            objective_constant: 0,
+            objective: problem.objective.clone(),
+            rows: problem.rows.iter().map(|row| LinearRow { terms: row.terms.clone(), lower: row.lower, upper: row.upper }).collect(),
+            bounds: problem.bounds.clone(),
+            variables: vec![None; problem.objective.len()],
+        };
+        let backend: Box<dyn LinearBackend> = match backend_mode {
+            LinearBackendMode::Auto | LinearBackendMode::Amthal => Box::new(AmthalBackend),
+            LinearBackendMode::Native => return None,
+        };
+        let solution = backend.solve(&model, time_limit, stop)?;
+        let status = match solution.status {
+            LinearStatus::Optimal => AdvisoryLinearStatus::Optimal,
+            LinearStatus::TimeLimit => AdvisoryLinearStatus::TimeLimit,
+            LinearStatus::Other => AdvisoryLinearStatus::Other,
+        };
+        Some(AdvisoryLinearSolution { status, primal: solution.primal, refactorizations: solution.refactorizations })
     }
 
     impl LinearModel {
@@ -748,5 +824,7 @@ mod enabled {
     }
 }
 
+#[cfg(feature = "lp-relaxation")]
+pub(crate) use enabled::solve_advisory;
 #[cfg(feature = "lp-relaxation")]
 pub(crate) use enabled::{solve_root, SearchCheck, SearchRelaxation, SearchRelaxationTemplate};

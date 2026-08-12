@@ -90,7 +90,8 @@ pub struct RoutingControls {
     pub warm_start: bool,
 }
 
-/// Optional continuous relaxation used by exact integer CP search.
+/// Optional continuous relaxation used by exact integer CP search and by
+/// certified root bounds for compatible collection engines.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LinearBackendMode {
     /// Use the best linked advisory backend, if any.

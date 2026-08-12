@@ -1,6 +1,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+#[cfg(feature = "lp-relaxation")]
+use std::time::Duration;
 
+#[cfg(feature = "lp-relaxation")]
+use qayd::engines::dual::compute_with_linear;
 use qayd::engines::dual::{
     attach, audit_reset_routing_relaxation_edge_evaluations, audit_routing_relaxation_edge_evaluations, compute, DualAuditGuard,
 };
@@ -12,6 +16,8 @@ use qayd::orchestrator::{
     audit_watch_local_search_dual, compile_collection_plan, solve_collection_plan, EngineKind, EventCallback, EventControl,
     LocalSearchDualAudit, SolveBudget, SolveError, SolveEvent, SolveLimits, SolveMode, SolveRequest,
 };
+#[cfg(feature = "lp-relaxation")]
+use qayd::orchestrator::{LinearBackendMode, LinearControls};
 
 fn edge_term(list: usize, costs: &[Vec<i64>]) -> Reduction {
     let mut arena = ExprArena::default();
@@ -360,6 +366,76 @@ fn routing_duals_stay_below_random_small_cvrp_optima() {
         let bound = compute(&model, &AtomicBool::new(false)).expect("routing relaxation");
         assert!(bound.value <= optimum, "dual {} crossed optimum {optimum}", bound.value);
     }
+}
+
+#[cfg(feature = "lp-relaxation")]
+#[test]
+fn q_route_master_lp_is_recertified_before_publication() {
+    let customers = 17usize;
+    let mut costs = vec![vec![1i64; customers + 1]; customers + 1];
+    for (node, row) in costs.iter_mut().enumerate() {
+        row[node] = 0;
+        if node == 0 {
+            row.iter_mut().skip(1).for_each(|cost| *cost = 10);
+        } else {
+            row[0] = 10;
+        }
+    }
+    let demands = vec![1i64; customers + 1];
+    let model = routing_model(&costs, &demands, customers, Some(2));
+    let controls = LinearControls {
+        backend: LinearBackendMode::Amthal,
+        root_time: Duration::from_secs(2),
+        max_rows: 256,
+        ..LinearControls::default()
+    };
+    let bound = compute_with_linear(&model, controls, &AtomicBool::new(false)).expect("routing bound");
+
+    // Eight two-customer routes and one singleton give a feasible solution of
+    // 8 * 21 + 20 = 188. Every published route-master value must stay below it.
+    assert!(bound.value <= 188, "certified dual {} crossed a feasible CVRP solution", bound.value);
+    assert_eq!(bound.stats.lp_model_status, qayd::search::LinearModelStatus::Ready);
+    assert!(bound.stats.lp_solves > 0);
+    assert!(bound.stats.lp_certified > 0);
+    assert!(bound.stats.lp_root_bound.is_some_and(|lp| lp <= 188));
+}
+
+#[cfg(feature = "lp-relaxation")]
+#[test]
+fn routing_local_search_reports_the_certified_route_lp() {
+    let customers = 17usize;
+    let mut costs = vec![vec![1i64; customers + 1]; customers + 1];
+    for (node, row) in costs.iter_mut().enumerate() {
+        row[node] = 0;
+        if node == 0 {
+            row.iter_mut().skip(1).for_each(|cost| *cost = 10);
+        } else {
+            row[0] = 10;
+        }
+    }
+    let collection = routing_model(&costs, &vec![1i64; customers + 1], customers, Some(2));
+    let semantic = Model::from_collection(&collection);
+    let request = SolveRequest {
+        mode: SolveMode::LocalSearch,
+        limits: SolveLimits { iterations: Some(4), ..SolveLimits::default() },
+        linear: LinearControls {
+            backend: LinearBackendMode::Amthal,
+            root_time: Duration::from_secs(1),
+            max_rows: 256,
+            ..LinearControls::default()
+        },
+        ..SolveRequest::default()
+    };
+    let budget = SolveBudget::new(None);
+    let plan = compile_collection_plan(&semantic, &request, &budget).expect("routing local-search plan");
+    let mut sink = EventCallback(|_| Ok::<_, SolveError>(EventControl::Continue));
+    let result = solve_collection_plan(&semantic, &plan, &request, &budget, None, None, &mut sink).expect("routing result");
+    let stats = result.aggregate_search_stats();
+
+    assert!(stats.lp_solves > 0);
+    assert!(stats.lp_certified > 0);
+    assert!(stats.lp_root_bound.is_some());
+    assert!(result.bounds().first().zip(result.primal()).is_some_and(|(bound, primal)| bound.value <= primal.objectives()[0]));
 }
 
 #[test]

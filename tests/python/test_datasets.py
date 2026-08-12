@@ -349,6 +349,27 @@ def test_api_and_native_examples_generate_without_an_instance(script, arguments,
 
 
 @pytest.mark.parametrize(
+    "script",
+    [
+        "examples/python/routing/api/vrp.py",
+        "examples/python/routing/native/vrp.py",
+    ],
+)
+def test_vrp_launchers_accept_compact_solution_warm_starts(script):
+    record = _run_example(
+        script,
+        "examples/instances/routing/tiny-cvrp.vrp",
+        "--solution",
+        "examples/instances/routing/tiny-cvrp.sol",
+        "--linear-backend",
+        "native",
+    )
+    assert record["instance"] == "X-n5-k2"
+    assert record["vehicles"] == 4
+    assert record["verified"] is True
+
+
+@pytest.mark.parametrize(
     ("script", "instance", "expected_name"),
     [
         (

@@ -124,6 +124,16 @@ Python extension checks:
 cargo clippy --all-targets --features python -- -D warnings
 ```
 
+To enable the optional certified LP bounds in the Python extension, build both
+features explicitly:
+
+```bash
+uv run maturin develop --profile pyext --features python,lp-relaxation
+uv run examples/python/routing/api/vrp.py \
+  data/vrplib/CVRP/X-n101-k25.vrp \
+  --time-limit 120 --threads 8 --linear-backend amthal
+```
+
 ## CLI
 
 ```bash

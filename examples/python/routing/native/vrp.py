@@ -32,14 +32,28 @@ parser.add_argument("--profile", action="store_true")
 parser.add_argument("--routing-two-way", action=argparse.BooleanOptionalAction, default=True)
 parser.add_argument("--routing-nearest-neighbor", action=argparse.BooleanOptionalAction, default=True)
 parser.add_argument("--routing-warm-start", action=argparse.BooleanOptionalAction, default=True)
+parser.add_argument("--linear-backend", choices=("auto", "native", "amthal"), default="auto")
+parser.add_argument("--lp-root-ms", type=int, default=1000, help="route-master LP budget in milliseconds")
+parser.add_argument("--lp-max-variables", type=int, default=2000)
+parser.add_argument("--lp-max-rows", type=int, default=1000)
+parser.add_argument("--lp-max-nonzeros", type=int, default=100000)
 parser.add_argument("--engine", choices=("auto", "exact", "ls"), default="ls")
 parser.add_argument("--solution", help="VRP solution file used as an LS warm start")
 parser.add_argument("--verbose", action="store_true")
 parser.add_argument("--json", action="store_true", help="emit one machine-readable result")
 args = parser.parse_args()
 
-if args.threads <= 0 or args.time_limit < 0 or args.seed < 0 or (args.max_iterations is not None and args.max_iterations < 0):
-    raise SystemExit("threads must be positive; time limit and seed must be non-negative")
+if (
+    args.threads <= 0
+    or args.time_limit < 0
+    or args.seed < 0
+    or args.lp_root_ms < 0
+    or args.lp_max_variables <= 0
+    or args.lp_max_rows <= 0
+    or args.lp_max_nonzeros <= 0
+    or (args.max_iterations is not None and args.max_iterations < 0)
+):
+    raise SystemExit("threads and LP size limits must be positive; time limits and seed must be non-negative")
 
 instance = read_cvrplib(args.instance) if args.instance else None
 if instance is None:
@@ -90,7 +104,16 @@ for route in routes:
 
 hint = None
 if args.solution:
-    hint = [list(route) for route in read_vrp_solution(args.solution, instance=instance).routes]
+    raw_hint = [list(route) for route in read_vrp_solution(args.solution).routes]
+    universe = set(customers)
+    hint = (
+        raw_hint
+        if all(customer in universe for route in raw_hint for customer in route)
+        else [[instance.normalize_node(customer) for customer in route] for route in raw_hint]
+    )
+    if len(hint) > vehicles:
+        raise SystemExit(f"solution uses {len(hint)} routes but the model allows only {vehicles}")
+    hint.extend([] for _ in range(vehicles - len(hint)))
 solve_options = {
     "engine": args.engine,
     "threads": args.threads,
@@ -102,6 +125,11 @@ solve_options = {
     "routing_two_way": args.routing_two_way,
     "routing_nearest_neighbor": args.routing_nearest_neighbor,
     "routing_warm_start": args.routing_warm_start,
+    "linear_backend": args.linear_backend,
+    "lp_root_ms": args.lp_root_ms,
+    "lp_max_variables": args.lp_max_variables,
+    "lp_max_rows": args.lp_max_rows,
+    "lp_max_nonzeros": args.lp_max_nonzeros,
 }
 if hint is not None:
     solve_options["list_hint"] = hint
@@ -149,6 +177,11 @@ construction_record = {
         for name, uses, generated, evaluated, cpu_nanos, improvements, global_bests, positive_rewards, weight in solution.neighborhood_profile
     ],
     "routing_counters": None if solution.routing_counters is None else dict(solution.routing_counters),
+    "lp_root_bound": solution.stats.lp_root_bound,
+    "lp_model_status": solution.stats.lp_model_status,
+    "lp_solves": solution.stats.lp_solves,
+    "lp_certified": solution.stats.lp_certified,
+    "lp_simplex_time_ms": solution.stats.lp_micros / 1000,
 }
 
 if solution.lists is None:
@@ -170,6 +203,8 @@ if solution.lists is None:
         "routing_two_way": args.routing_two_way,
         "routing_nearest_neighbor": args.routing_nearest_neighbor,
         "routing_warm_start": args.routing_warm_start,
+        "linear_backend": args.linear_backend,
+        "lp_root_ms": args.lp_root_ms,
     }
     print(json.dumps(record, sort_keys=True) if args.json else f"instance: {name}  status: {solution.status}")
     raise SystemExit(0)
@@ -214,6 +249,8 @@ record = {
     "routing_two_way": args.routing_two_way,
     "routing_nearest_neighbor": args.routing_nearest_neighbor,
     "routing_warm_start": args.routing_warm_start,
+    "linear_backend": args.linear_backend,
+    "lp_root_ms": args.lp_root_ms,
     "routes": route_records,
     "verified": True,
 }
@@ -228,6 +265,11 @@ else:
     )
     print(f"instance: {name}  customers: {len(customers)}  vehicles: {vehicles}  capacity: {capacity}")
     print(f"status: {solution.status}  distance: {total_distance}{gap}{certified}  elapsed: {elapsed:.3f}s")
+    if solution.stats.lp_model_status != "not-attempted":
+        print(
+            f"  route LP: {solution.stats.lp_root_bound}  solves: {solution.stats.lp_solves}"
+            f"  certified: {solution.stats.lp_certified}  simplex: {solution.stats.lp_micros / 1000:.3f} ms"
+        )
     for index, route in enumerate(route_records):
         if route["nodes"]:
             print(f"  route {index}: load {route['load']:5d}  {[node_ids[depot], *route['nodes'], node_ids[depot]]}")
