@@ -231,6 +231,200 @@ fn model_build_rejection_exposes_its_exact_reason() {
     assert_eq!(stats.lp_source_rows, 0);
 }
 
+#[cfg(feature = "lp-relaxation")]
+#[test]
+fn nonlinear_boolean_objective_is_lifted_without_materializing_cp_variables() {
+    let mut model = Model::new();
+    let left = model.bool_var();
+    let right = model.bool_var();
+    model
+        .add_objective(Objective::IntExpr { minimize: false, expr: IntExpr::And(vec![IntExpr::Variable(left), IntExpr::Variable(right)]) });
+
+    let result = solve_model(&ModelPackage::new(model), &request(LinearBackendMode::Amthal), &mut IgnoreEvents).unwrap();
+    assert_eq!(result.status(), SolveStatus::Optimal);
+    assert_eq!(result.primal().unwrap().objectives(), [1]);
+    let stats = result.aggregate_search_stats();
+    assert_eq!(stats.lp_model_status, qayd::search::LinearModelStatus::Ready);
+    assert_eq!(stats.lp_root_bound, Some(1));
+    assert!(stats.lp_auxiliary_columns > 0);
+    assert_eq!(stats.lp_objective_fallbacks, 0);
+}
+
+#[cfg(feature = "lp-relaxation")]
+#[test]
+fn weighted_equality_indicators_get_a_generic_extended_formulation() {
+    let mut model = Model::new();
+    let left = model.int_range(0, 2);
+    let right = model.int_range(0, 3);
+    model.add_objective(Objective::IntExpr {
+        minimize: false,
+        expr: IntExpr::Add(vec![
+            IntExpr::Mul(vec![IntExpr::Constant(7), IntExpr::Eq(Box::new(IntExpr::Variable(left)), Box::new(IntExpr::Constant(2)))]),
+            IntExpr::Mul(vec![IntExpr::Constant(3), IntExpr::Eq(Box::new(IntExpr::Variable(right)), Box::new(IntExpr::Constant(0)))]),
+        ]),
+    });
+
+    let result = solve_model(&ModelPackage::new(model), &request(LinearBackendMode::Amthal), &mut IgnoreEvents).unwrap();
+    assert_eq!(result.status(), SolveStatus::Optimal);
+    assert_eq!(result.primal().unwrap().objectives(), [10]);
+    assert_eq!(result.aggregate_search_stats().lp_root_bound, Some(10));
+}
+
+#[cfg(feature = "lp-relaxation")]
+#[test]
+fn integer_square_uses_a_certifiable_convex_envelope() {
+    let mut model = Model::new();
+    let value = model.int_range(-2, 2);
+    model.add_constraint(Constraint::Linear { terms: vec![(1, value)], relation: Relation::Ge, rhs: 1 });
+    model
+        .add_objective(Objective::IntExpr { minimize: true, expr: IntExpr::Mul(vec![IntExpr::Variable(value), IntExpr::Variable(value)]) });
+
+    let result = solve_model(&ModelPackage::new(model), &request(LinearBackendMode::Amthal), &mut IgnoreEvents).unwrap();
+    assert_eq!(result.status(), SolveStatus::Optimal);
+    assert_eq!(result.primal().unwrap().objectives(), [1]);
+    assert_eq!(result.aggregate_search_stats().lp_root_bound, Some(1));
+}
+
+#[cfg(feature = "lp-relaxation")]
+fn assert_nonlinear_bound_is_valid(label: &str, model: Model, minimizing: bool) {
+    let result = solve_model(&ModelPackage::new(model), &request(LinearBackendMode::Amthal), &mut IgnoreEvents).unwrap();
+    assert_eq!(result.status(), SolveStatus::Optimal, "{label}");
+    let optimum = result.primal().unwrap().objectives()[0];
+    let stats = result.aggregate_search_stats();
+    assert_eq!(stats.lp_model_status, qayd::search::LinearModelStatus::Ready, "{label}");
+    let bound = stats.lp_root_bound.unwrap_or_else(|| panic!("missing certified bound for {label}"));
+    if minimizing {
+        assert!(bound <= optimum, "invalid lower bound for {label}: {bound} > {optimum}");
+    } else {
+        assert!(bound >= optimum, "invalid upper bound for {label}: {bound} < {optimum}");
+    }
+}
+
+#[cfg(feature = "lp-relaxation")]
+#[test]
+fn generic_lifts_keep_certified_bounds_valid_across_expression_families() {
+    let mut absolute = Model::new();
+    let x = absolute.int_range(-3, 2);
+    absolute.add_objective(Objective::IntExpr { minimize: true, expr: IntExpr::Abs(Box::new(IntExpr::Variable(x))) });
+    assert_nonlinear_bound_is_valid("absolute", absolute, true);
+
+    let mut extrema = Model::new();
+    let x = extrema.int_range(-2, 3);
+    let y = extrema.int_range(1, 4);
+    extrema.add_objective(Objective::IntExpr { minimize: false, expr: IntExpr::Min(vec![IntExpr::Variable(x), IntExpr::Variable(y)]) });
+    assert_nonlinear_bound_is_valid("minimum", extrema, false);
+
+    let mut maximum = Model::new();
+    let x = maximum.int_range(-2, 3);
+    let y = maximum.int_range(1, 4);
+    maximum.add_objective(Objective::IntExpr { minimize: true, expr: IntExpr::Max(vec![IntExpr::Variable(x), IntExpr::Variable(y)]) });
+    assert_nonlinear_bound_is_valid("maximum", maximum, true);
+
+    let mut product = Model::new();
+    let x = product.int_range(-2, 3);
+    let y = product.int_range(-1, 2);
+    product.add_objective(Objective::IntExpr { minimize: true, expr: IntExpr::Mul(vec![IntExpr::Variable(x), IntExpr::Variable(y)]) });
+    assert_nonlinear_bound_is_valid("product", product, true);
+
+    let mut square = Model::new();
+    let x = square.int_range(-3, 2);
+    square.add_objective(Objective::IntExpr { minimize: false, expr: IntExpr::Mul(vec![IntExpr::Variable(x), IntExpr::Variable(x)]) });
+    assert_nonlinear_bound_is_valid("square maximization", square, false);
+
+    let mut comparisons = Model::new();
+    let x = comparisons.int_range(-1, 2);
+    comparisons.add_objective(Objective::IntExpr {
+        minimize: false,
+        expr: IntExpr::Add(vec![
+            IntExpr::Eq(Box::new(IntExpr::Variable(x)), Box::new(IntExpr::Constant(1))),
+            IntExpr::Ne(Box::new(IntExpr::Variable(x)), Box::new(IntExpr::Constant(0))),
+            IntExpr::Lt(Box::new(IntExpr::Variable(x)), Box::new(IntExpr::Constant(2))),
+            IntExpr::Ge(Box::new(IntExpr::Variable(x)), Box::new(IntExpr::Constant(1))),
+        ]),
+    });
+    assert_nonlinear_bound_is_valid("comparisons", comparisons, false);
+
+    let mut logic = Model::new();
+    let left = logic.bool_var();
+    let right = logic.bool_var();
+    logic.add_objective(Objective::IntExpr {
+        minimize: false,
+        expr: IntExpr::Add(vec![
+            IntExpr::Not(Box::new(IntExpr::Variable(left))),
+            IntExpr::Or(vec![IntExpr::Variable(left), IntExpr::Variable(right)]),
+            IntExpr::Imp(Box::new(IntExpr::Variable(left)), Box::new(IntExpr::Variable(right))),
+            IntExpr::Iff(Box::new(IntExpr::Variable(left)), Box::new(IntExpr::Variable(right))),
+        ]),
+    });
+    assert_nonlinear_bound_is_valid("logic", logic, false);
+
+    let mut conditional = Model::new();
+    let condition = conditional.bool_var();
+    let then_value = conditional.int_range(-2, 3);
+    let else_value = conditional.int_range(1, 4);
+    conditional.add_objective(Objective::IntExpr {
+        minimize: false,
+        expr: IntExpr::IfThenElse(
+            Box::new(IntExpr::Variable(condition)),
+            Box::new(IntExpr::Variable(then_value)),
+            Box::new(IntExpr::Variable(else_value)),
+        ),
+    });
+    assert_nonlinear_bound_is_valid("conditional", conditional, false);
+}
+
+#[cfg(feature = "lp-relaxation")]
+#[test]
+fn unsupported_or_over_budget_terms_fall_back_to_safe_interval_bounds() {
+    let mut model = Model::new();
+    let variables = (0..3).map(|_| model.bool_var()).collect::<Vec<_>>();
+    model.add_constraint(Constraint::Linear {
+        terms: variables.iter().copied().map(|variable| (1, variable)).collect(),
+        relation: Relation::Ge,
+        rhs: 1,
+    });
+    model.add_objective(Objective::IntExpr { minimize: true, expr: IntExpr::And(variables.into_iter().map(IntExpr::Variable).collect()) });
+    let request = SolveRequest {
+        linear: LinearControls {
+            backend: LinearBackendMode::Amthal,
+            root_time: Duration::from_secs(1),
+            max_rows: 1,
+            ..LinearControls::default()
+        },
+        ..SolveRequest::default()
+    };
+
+    let result = solve_model(&ModelPackage::new(model), &request, &mut IgnoreEvents).unwrap();
+    assert_eq!(result.status(), SolveStatus::Optimal);
+    assert_eq!(result.primal().unwrap().objectives(), [0]);
+    let stats = result.aggregate_search_stats();
+    assert_eq!(stats.lp_model_status, qayd::search::LinearModelStatus::Ready);
+    assert_eq!(stats.lp_root_bound, Some(0));
+    assert_eq!(stats.lp_auxiliary_columns, 0);
+    assert!(stats.lp_objective_fallbacks > 0);
+}
+
+#[cfg(feature = "lp-relaxation")]
+#[test]
+fn unsupported_division_uses_a_certified_interval_fallback() {
+    let mut model = Model::new();
+    let numerator = model.int_range(-5, 5);
+    let denominator = model.int_range(1, 2);
+    model.add_constraint(Constraint::Linear { terms: vec![(1, numerator)], relation: Relation::Ge, rhs: -5 });
+    model.add_objective(Objective::IntExpr {
+        minimize: true,
+        expr: IntExpr::Div(Box::new(IntExpr::Variable(numerator)), Box::new(IntExpr::Variable(denominator))),
+    });
+
+    let result = solve_model(&ModelPackage::new(model), &request(LinearBackendMode::Amthal), &mut IgnoreEvents).unwrap();
+    assert_eq!(result.status(), SolveStatus::Optimal);
+    assert_eq!(result.primal().unwrap().objectives(), [-5]);
+    let stats = result.aggregate_search_stats();
+    assert_eq!(stats.lp_model_status, qayd::search::LinearModelStatus::Ready);
+    assert_eq!(stats.lp_root_bound, Some(-5));
+    assert_eq!(stats.lp_objective_fallbacks, 1);
+}
+
 #[cfg(not(feature = "lp-relaxation"))]
 #[test]
 fn requesting_an_unlinked_amthal_backend_is_an_explicit_error() {

@@ -656,7 +656,7 @@ def test_lp_ablation_report_uses_verified_paired_results(tmp_path):
     amthal_log.write_text(
         "c nodes 80 failures 15\n"
         "c lp model ready vars 20 columns 12 covered 12 objective_vars 2 objective_covered 2 "
-        "source_rows 12 rows 12 nonzeros 30\n"
+        "auxiliary 3 fallback_terms 1 source_rows 12 rows 12 nonzeros 30\n"
         "c lp rows 12 root_bound 6 solves 2 certified 2 node_prunes 3 timeouts 0 "
         "refactorizations 2 time_ms 1.250\n",
         encoding="utf-8",
@@ -700,14 +700,23 @@ def test_lp_ablation_report_uses_verified_paired_results(tmp_path):
     assert summary["outcomes"] == {"amthal": 1}
     assert summary["lp_eligible"] == 1
     assert summary["lp_certified"] == 1
+    assert summary["lp_invalid_certified_bounds"] == 0
     assert summary["lp_node_prunes"] == 3
     assert summary["lp_exact_at_incumbent"] == 0
     assert summary["lp_within_10_percent"] == 0
     assert summary["median_lp_time_ms_eligible"] == 1.25
+    assert summary["lp_lifted_models"] == 1
+    assert summary["lp_lifted_certified"] == 1
+    assert summary["median_lp_auxiliary_columns_eligible"] == 3
+    assert summary["median_lp_auxiliary_columns_lifted"] == 3
+    assert summary["lp_objective_fallbacks"] == 1
     assert summary["median_wall_ratio"] == 0.8
     assert summary["median_first_incumbent_ratio"] == 0.5
     assert summary["median_node_ratio"] == 0.8
     assert summary["details"][0]["certified_absolute_gap"] == 2
+    assert summary["details"][0]["certified_bound_valid"] is True
+    assert fastcop_lp_ablation.certified_gap(8, 9, "min") is None
+    assert fastcop_lp_ablation.certified_bound_valid(8, 9, "min") is False
 
     fastcop_lp_ablation.attach_attribution(
         summary,

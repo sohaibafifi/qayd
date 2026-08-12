@@ -52,6 +52,9 @@ pub(crate) mod cp;
 
 pub(crate) mod linear;
 
+#[cfg(feature = "lp-relaxation")]
+mod linear_lift;
+
 #[allow(dead_code)]
 pub(crate) mod dual;
 

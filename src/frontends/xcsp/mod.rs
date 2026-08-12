@@ -464,13 +464,15 @@ fn write_report<W: Write>(w: &mut W, result: &SolveResult) -> std::io::Result<()
     if stats.lp_model_status != Default::default() {
         writeln!(
             w,
-            "c lp model {} vars {} columns {} covered {} objective_vars {} objective_covered {} source_rows {} rows {} nonzeros {}",
+            "c lp model {} vars {} columns {} covered {} objective_vars {} objective_covered {} auxiliary {} fallback_terms {} source_rows {} rows {} nonzeros {}",
             stats.lp_model_status.as_str(),
             stats.lp_variables,
             stats.lp_columns,
             stats.lp_covered_variables,
             stats.lp_objective_variables,
             stats.lp_objective_covered_variables,
+            stats.lp_auxiliary_columns,
+            stats.lp_objective_fallbacks,
             stats.lp_source_rows,
             stats.lp_rows,
             stats.lp_nonzeros,

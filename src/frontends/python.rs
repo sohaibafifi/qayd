@@ -412,6 +412,10 @@ struct PySolveStats {
     #[pyo3(get)]
     lp_objective_covered_variables: u64,
     #[pyo3(get)]
+    lp_auxiliary_columns: u64,
+    #[pyo3(get)]
+    lp_objective_fallbacks: u64,
+    #[pyo3(get)]
     lp_source_rows: u64,
     #[pyo3(get)]
     lp_nonzeros: u64,
@@ -749,6 +753,8 @@ impl From<SearchStats> for PySolveStats {
             lp_covered_variables: stats.lp_covered_variables,
             lp_objective_variables: stats.lp_objective_variables,
             lp_objective_covered_variables: stats.lp_objective_covered_variables,
+            lp_auxiliary_columns: stats.lp_auxiliary_columns,
+            lp_objective_fallbacks: stats.lp_objective_fallbacks,
             lp_source_rows: stats.lp_source_rows,
             lp_nonzeros: stats.lp_nonzeros,
             lp_solves: stats.lp_solves,
@@ -1292,6 +1298,8 @@ fn verbose_finish(solution: &PySolution) {
         println!("  lp_covered_variables: {}", solution.stats.lp_covered_variables);
         println!("  lp_objective_variables: {}", solution.stats.lp_objective_variables);
         println!("  lp_objective_covered_variables: {}", solution.stats.lp_objective_covered_variables);
+        println!("  lp_auxiliary_columns: {}", solution.stats.lp_auxiliary_columns);
+        println!("  lp_objective_fallbacks: {}", solution.stats.lp_objective_fallbacks);
         println!("  lp_source_rows: {}", solution.stats.lp_source_rows);
         println!("  lp_rows: {}", solution.stats.lp_rows);
         println!("  lp_nonzeros: {}", solution.stats.lp_nonzeros);

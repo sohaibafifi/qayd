@@ -86,6 +86,7 @@ mod enabled {
     use num_traits::{Signed, ToPrimitive, Zero};
 
     use super::RootRelaxation;
+    use crate::engines::linear_lift::{lift_expression_objective, LiftError, LiftLimits, LiftedRow};
     use crate::ids::VarId;
     use crate::orchestrator::{LinearBackendMode, LinearControls};
     use crate::search::{LinearModelStatus, Objective, SolveStats};
@@ -106,8 +107,8 @@ mod enabled {
         objective_constant: i128,
         objective: Vec<i128>,
         rows: Vec<LinearRow>,
-        bounds: Vec<(i32, i32)>,
-        variables: Vec<VarId>,
+        bounds: Vec<(i128, i128)>,
+        variables: Vec<Option<VarId>>,
     }
 
     #[derive(Default)]
@@ -118,6 +119,8 @@ mod enabled {
         covered_variables: usize,
         objective_variables: usize,
         objective_covered_variables: usize,
+        auxiliary_columns: usize,
+        objective_fallbacks: usize,
         source_rows: usize,
         rows: usize,
         nonzeros: usize,
@@ -132,6 +135,8 @@ mod enabled {
                 lp_covered_variables: u64::try_from(self.covered_variables).unwrap_or(u64::MAX),
                 lp_objective_variables: u64::try_from(self.objective_variables).unwrap_or(u64::MAX),
                 lp_objective_covered_variables: u64::try_from(self.objective_covered_variables).unwrap_or(u64::MAX),
+                lp_auxiliary_columns: u64::try_from(self.auxiliary_columns).unwrap_or(u64::MAX),
+                lp_objective_fallbacks: u64::try_from(self.objective_fallbacks).unwrap_or(u64::MAX),
                 lp_source_rows: u64::try_from(self.source_rows).unwrap_or(u64::MAX),
                 lp_rows: u64::try_from(self.rows).unwrap_or(u64::MAX),
                 lp_nonzeros: u64::try_from(self.nonzeros).unwrap_or(u64::MAX),
@@ -160,7 +165,7 @@ mod enabled {
     pub(crate) struct SearchRelaxation {
         template: SearchRelaxationTemplate,
         session: LpSession,
-        solved_bounds: Vec<(i32, i32)>,
+        solved_bounds: Vec<(i128, i128)>,
         primal: Vec<f64>,
         certificate: Option<CertifiedLpBound>,
         next_depth: usize,
@@ -224,7 +229,7 @@ mod enabled {
             .bounds
             .iter()
             .zip(&model.objective)
-            .map(|(&(lower, upper), &coefficient)| source.add_continuous(f64::from(lower), f64::from(upper), coefficient as f64))
+            .map(|(&(lower, upper), &coefficient)| source.add_continuous(lower as f64, upper as f64, coefficient as f64))
             .collect();
         for row in &model.rows {
             let terms: Vec<_> = row.terms.iter().map(|&(index, coefficient)| (variables[index], coefficient as f64)).collect();
@@ -247,8 +252,7 @@ mod enabled {
         ) -> (Option<Self>, SolveStats) {
             let variable_count = solver.store.num_vars();
             let source_rows = solver.linear_relaxation();
-            let mut diagnostics =
-                BuildDiagnostics { variables: variable_count, source_rows: source_rows.len(), ..BuildDiagnostics::default() };
+            let mut diagnostics = BuildDiagnostics { variables: variable_count, ..BuildDiagnostics::default() };
             macro_rules! reject {
                 ($status:expr) => {{
                     diagnostics.status = $status;
@@ -261,57 +265,82 @@ mod enabled {
             if variable_count == 0 {
                 reject!(LinearModelStatus::NoVariables);
             }
-            if source_rows.is_empty() {
-                reject!(LinearModelStatus::NoRows);
-            }
             let scale = if minimizing { 1i128 } else { -1i128 };
-            let Some((constant, coefficients, variables)) = objective_affine(objective, stop) else {
-                reject!(if stop.load(Ordering::Acquire) { LinearModelStatus::Interrupted } else { LinearModelStatus::NonAffineObjective });
-            };
-            let Some(objective_constant) = i128::from(constant).checked_mul(scale) else {
+            let mut column_bounds = (0..variable_count)
+                .map(|index| {
+                    let variable = u32::try_from(index).ok().map(VarId)?;
+                    Some((i128::from(solver.store.min(variable)), i128::from(solver.store.max(variable))))
+                })
+                .collect::<Option<Vec<_>>>();
+            let Some(mut column_bounds) = column_bounds.take() else {
                 reject!(LinearModelStatus::InvalidObjective);
             };
-            let mut objective_coefficients = vec![0i128; variable_count];
-            for (coefficient, variable) in coefficients.into_iter().zip(variables) {
-                let Some(scaled) = i128::from(coefficient).checked_mul(scale) else {
-                    reject!(LinearModelStatus::InvalidObjective);
-                };
-                let Some(slot) = objective_coefficients.get_mut(variable.index()) else {
-                    reject!(LinearModelStatus::InvalidObjective);
-                };
-                let Some(value) = slot.checked_add(scaled) else {
-                    reject!(LinearModelStatus::InvalidObjective);
-                };
-                *slot = value;
-            }
-            if !exact_as_f64(objective_constant) || objective_coefficients.iter().any(|&coefficient| !exact_as_f64(coefficient)) {
+            let (objective_constant, objective_coefficients, lifted_rows) = match objective {
+                Objective::Expr(expression) | Objective::BoundedDiveExpr(expression) => {
+                    let lifted = match lift_expression_objective(
+                        expression,
+                        scale,
+                        &solver.store,
+                        LiftLimits {
+                            max_columns: controls.max_variables,
+                            max_rows: controls.max_rows,
+                            max_nonzeros: controls.max_nonzeros,
+                        },
+                        stop,
+                    ) {
+                        Ok(lifted) => lifted,
+                        Err(LiftError::Interrupted) => reject!(LinearModelStatus::Interrupted),
+                        Err(LiftError::Invalid) => reject!(LinearModelStatus::InvalidObjective),
+                    };
+                    diagnostics.objective_fallbacks = lifted.fallbacks;
+                    diagnostics.auxiliary_columns = lifted.auxiliary_bounds.len();
+                    column_bounds.extend(lifted.auxiliary_bounds);
+                    (lifted.constant, lifted.terms, lifted.rows)
+                }
+                objective => {
+                    let Some((constant, coefficients, variables)) = objective_affine(objective) else {
+                        reject!(LinearModelStatus::InvalidObjective);
+                    };
+                    let Some(constant) = i128::from(constant).checked_mul(scale) else {
+                        reject!(LinearModelStatus::InvalidObjective);
+                    };
+                    let mut terms = BTreeMap::new();
+                    for (coefficient, variable) in coefficients.into_iter().zip(variables) {
+                        let Some(coefficient) = i128::from(coefficient).checked_mul(scale) else {
+                            reject!(LinearModelStatus::InvalidObjective);
+                        };
+                        let Some(combined) = terms.get(&variable.index()).copied().unwrap_or(0i128).checked_add(coefficient) else {
+                            reject!(LinearModelStatus::InvalidObjective);
+                        };
+                        if combined == 0 {
+                            terms.remove(&variable.index());
+                        } else {
+                            terms.insert(variable.index(), combined);
+                        }
+                    }
+                    (constant, terms, Vec::new())
+                }
+            };
+            if !exact_as_f64(objective_constant)
+                || objective_coefficients.keys().any(|&column| column >= column_bounds.len())
+                || objective_coefficients.values().any(|&coefficient| !exact_as_f64(coefficient))
+                || column_bounds.iter().any(|&(lower, upper)| lower > upper || !exact_as_f64(lower) || !exact_as_f64(upper))
+            {
                 reject!(LinearModelStatus::InvalidObjective);
             }
-            let objective_variables = objective_coefficients
-                .iter()
-                .enumerate()
-                .filter_map(|(index, &coefficient)| (coefficient != 0).then_some(index))
-                .collect::<BTreeSet<_>>();
-            diagnostics.objective_variables = objective_variables.len();
-            if objective_variables.len() > controls.max_variables {
-                diagnostics.columns = objective_variables.len();
+            let objective_columns = objective_coefficients.keys().copied().collect::<BTreeSet<_>>();
+            diagnostics.objective_variables = objective_columns.iter().filter(|&&column| column < variable_count).count();
+            if objective_columns.len() > controls.max_variables {
+                diagnostics.columns = objective_columns.len();
                 reject!(LinearModelStatus::TooManyVariables);
             }
 
-            let mut ordered_sources = source_rows.iter().collect::<Vec<_>>();
-            ordered_sources.sort_by_key(|source| !source.variables.iter().any(|variable| objective_variables.contains(&variable.index())));
-            let mut rows = Vec::with_capacity(source_rows.len().min(controls.max_rows));
-            let mut covered = BTreeSet::new();
-            let mut nonzeros = 0usize;
-            let mut skipped_for_columns = false;
-            let mut skipped_for_nonzeros = false;
-            for source in ordered_sources {
-                if stop.load(Ordering::Acquire) {
-                    reject!(LinearModelStatus::Interrupted);
-                }
-                if rows.len() >= controls.max_rows {
-                    break;
-                }
+            let mut candidates = Vec::<(u8, BTreeMap<usize, i128>, Option<i128>, Option<i128>)>::new();
+            for LiftedRow { terms, lower, upper } in lifted_rows {
+                let terms = terms.into_iter().collect::<BTreeMap<_, _>>();
+                candidates.push((0, terms, lower, upper));
+            }
+            for source in source_rows {
                 if source.coefficients.len() != source.variables.len() {
                     reject!(LinearModelStatus::InvalidRow);
                 }
@@ -324,10 +353,27 @@ mod enabled {
                     *slot = value;
                 }
                 normalized.retain(|_, coefficient| *coefficient != 0);
-                if normalized.keys().any(|&index| index >= variable_count)
+                let priority = u8::from(!normalized.keys().any(|column| objective_columns.contains(column))) + 1;
+                candidates.push((priority, normalized, source.lower.map(i128::from), source.upper.map(i128::from)));
+            }
+            diagnostics.source_rows = candidates.len();
+            candidates.sort_by_key(|candidate| candidate.0);
+            let mut rows = Vec::with_capacity(candidates.len().min(controls.max_rows));
+            let mut covered = BTreeSet::new();
+            let mut nonzeros = 0usize;
+            let mut skipped_for_columns = false;
+            let mut skipped_for_nonzeros = false;
+            for (_, normalized, lower, upper) in candidates {
+                if stop.load(Ordering::Acquire) {
+                    reject!(LinearModelStatus::Interrupted);
+                }
+                if rows.len() >= controls.max_rows {
+                    break;
+                }
+                if normalized.keys().any(|&index| index >= column_bounds.len())
                     || normalized.values().any(|&coefficient| !exact_as_f64(coefficient))
-                    || source.lower.is_some_and(|bound| !exact_as_f64(i128::from(bound)))
-                    || source.upper.is_some_and(|bound| !exact_as_f64(i128::from(bound)))
+                    || lower.is_some_and(|bound| !exact_as_f64(bound))
+                    || upper.is_some_and(|bound| !exact_as_f64(bound))
                 {
                     reject!(LinearModelStatus::InvalidRow);
                 }
@@ -339,23 +385,20 @@ mod enabled {
                     continue;
                 }
                 let added_columns =
-                    normalized.keys().filter(|&&index| !covered.contains(&index) && !objective_variables.contains(&index)).count();
-                if covered.union(&objective_variables).count().saturating_add(added_columns) > controls.max_variables {
+                    normalized.keys().filter(|&&index| !covered.contains(&index) && !objective_columns.contains(&index)).count();
+                if covered.union(&objective_columns).count().saturating_add(added_columns) > controls.max_variables {
                     skipped_for_columns = true;
                     continue;
                 }
                 nonzeros = updated_nonzeros;
                 diagnostics.nonzeros = nonzeros;
                 covered.extend(normalized.keys().copied());
-                rows.push(LinearRow {
-                    terms: normalized.into_iter().collect(),
-                    lower: source.lower.map(i128::from),
-                    upper: source.upper.map(i128::from),
-                });
+                rows.push(LinearRow { terms: normalized.into_iter().collect(), lower, upper });
             }
             diagnostics.rows = rows.len();
-            diagnostics.covered_variables = covered.len();
-            diagnostics.objective_covered_variables = objective_variables.intersection(&covered).count();
+            diagnostics.covered_variables = covered.iter().filter(|&&column| column < variable_count).count();
+            diagnostics.objective_covered_variables =
+                objective_columns.intersection(&covered).filter(|&&column| column < variable_count).count();
             if rows.is_empty() {
                 reject!(if skipped_for_nonzeros {
                     LinearModelStatus::TooManyNonzeros
@@ -365,17 +408,14 @@ mod enabled {
                     LinearModelStatus::NoRows
                 });
             }
-            let active_variables = covered.union(&objective_variables).copied().collect::<Vec<_>>();
-            diagnostics.columns = active_variables.len();
-            if covered.len().saturating_mul(100) < active_variables.len().saturating_mul(controls.min_coverage_percent) {
+            let active_columns = covered.union(&objective_columns).copied().collect::<Vec<_>>();
+            diagnostics.columns = active_columns.len();
+            diagnostics.auxiliary_columns = active_columns.iter().filter(|&&column| column >= variable_count).count();
+            if covered.len().saturating_mul(100) < active_columns.len().saturating_mul(controls.min_coverage_percent) {
                 reject!(LinearModelStatus::LowCoverage);
             }
-            let Some(variables) = active_variables.iter().map(|&index| u32::try_from(index).ok().map(VarId)).collect::<Option<Vec<_>>>()
-            else {
-                reject!(LinearModelStatus::InvalidRow);
-            };
             let index_by_variable =
-                active_variables.iter().enumerate().map(|(column, &variable)| (variable, column)).collect::<BTreeMap<_, _>>();
+                active_columns.iter().enumerate().map(|(column, &variable)| (variable, column)).collect::<BTreeMap<_, _>>();
             for row in &mut rows {
                 for (index, _) in &mut row.terms {
                     let Some(&column) = index_by_variable.get(index) else {
@@ -384,13 +424,17 @@ mod enabled {
                     *index = column;
                 }
             }
-            let objective = active_variables.iter().map(|&index| objective_coefficients[index]).collect();
-            let bounds = variables.iter().map(|&variable| (solver.store.min(variable), solver.store.max(variable))).collect();
+            let objective = active_columns.iter().map(|column| objective_coefficients.get(column).copied().unwrap_or(0)).collect();
+            let bounds = active_columns.iter().map(|&column| column_bounds[column]).collect();
+            let variables = active_columns
+                .iter()
+                .map(|&column| if column < variable_count { u32::try_from(column).ok().map(VarId) } else { None })
+                .collect();
             diagnostics.status = LinearModelStatus::Ready;
             (Some(Self { objective_constant, objective, rows, bounds, variables }), diagnostics.into_stats())
         }
 
-        fn certify(&self, row_duals: &[f64], bounds: &[(i32, i32)]) -> Option<CertifiedLpBound> {
+        fn certify(&self, row_duals: &[f64], bounds: &[(i128, i128)]) -> Option<CertifiedLpBound> {
             if row_duals.len() != self.rows.len() || bounds.len() != self.objective.len() {
                 return None;
             }
@@ -419,12 +463,13 @@ mod enabled {
             for (index, (coefficient, &(lower, upper))) in residual.into_iter().zip(bounds).enumerate() {
                 let endpoint = if coefficient.is_negative() { upper } else { lower };
                 if !coefficient.is_zero() {
-                    let variable = *self.variables.get(index)?;
-                    premises.push(if coefficient.is_negative() {
-                        Premise::Le { var: variable, bound: upper }
-                    } else {
-                        Premise::Ge { var: variable, bound: lower }
-                    });
+                    if let Some(variable) = *self.variables.get(index)? {
+                        premises.push(if coefficient.is_negative() {
+                            Premise::Le { var: variable, bound: i32::try_from(upper).ok()? }
+                        } else {
+                            Premise::Ge { var: variable, bound: i32::try_from(lower).ok()? }
+                        });
+                    }
                 }
                 bound += coefficient * BigInt::from(endpoint);
             }
@@ -432,7 +477,7 @@ mod enabled {
         }
     }
 
-    fn objective_affine(objective: Objective<'_>, stop: &AtomicBool) -> Option<(i64, Vec<i64>, Vec<VarId>)> {
+    fn objective_affine(objective: Objective<'_>) -> Option<(i64, Vec<i64>, Vec<VarId>)> {
         match objective {
             Objective::Var(variable) => Some((0, vec![1], vec![variable])),
             Objective::VarWithAffine { objective, .. } | Objective::BoundedDiveVarWithAffine { objective, .. } => {
@@ -441,7 +486,7 @@ mod enabled {
             Objective::Linear { coeffs, vars } | Objective::BoundedDiveLinear { coeffs, vars } => {
                 (coeffs.len() == vars.len()).then(|| (0, coeffs.to_vec(), vars.to_vec()))
             }
-            Objective::Expr(expression) | Objective::BoundedDiveExpr(expression) => expression.affine_form_interruptible(stop),
+            Objective::Expr(_) | Objective::BoundedDiveExpr(_) => None,
         }
     }
 
@@ -456,7 +501,7 @@ mod enabled {
     fn phase_from_primal(
         solver: &Solver,
         search: &[VarId],
-        variables: &[VarId],
+        variables: &[Option<VarId>],
         primal: &[f64],
         max_variables: usize,
         stop: &AtomicBool,
@@ -468,7 +513,12 @@ mod enabled {
         if primal.len() != variables.len() || solver.store.num_vars() > max_variables || stop.load(Ordering::Acquire) {
             return Vec::new();
         }
-        let values = variables.iter().copied().zip(primal.iter().copied()).collect::<BTreeMap<_, _>>();
+        let values = variables
+            .iter()
+            .copied()
+            .zip(primal.iter().copied())
+            .filter_map(|(variable, value)| variable.map(|variable| (variable, value)))
+            .collect::<BTreeMap<_, _>>();
         let mut phase = vec![None; solver.store.num_vars()];
         for &variable in search {
             let Some(&value) = values.get(&variable) else {
@@ -543,7 +593,7 @@ mod enabled {
             if level == 0 || self.template.node_time.is_zero() {
                 return SearchCheck::Continue;
             }
-            let current = store_bounds(store, &self.template.model.variables);
+            let current = store_bounds(store, &self.template.model.variables, &self.template.model.bounds);
             let only_tightened = current
                 .iter()
                 .zip(&self.solved_bounds)
@@ -559,7 +609,7 @@ mod enabled {
             }
 
             for (index, &(lower, upper)) in current.iter().enumerate() {
-                self.session.set_bounds(index, f64::from(lower), f64::from(upper));
+                self.session.set_bounds(index, lower as f64, upper as f64);
             }
             self.session.deadline = Some(Instant::now() + self.template.node_time);
             let started = Instant::now();
@@ -609,16 +659,21 @@ mod enabled {
         }
     }
 
-    fn store_bounds(store: &Store, variables: &[VarId]) -> Vec<(i32, i32)> {
-        variables.iter().map(|&variable| (store.min(variable), store.max(variable))).collect()
+    fn store_bounds(store: &Store, variables: &[Option<VarId>], root_bounds: &[(i128, i128)]) -> Vec<(i128, i128)> {
+        variables
+            .iter()
+            .copied()
+            .zip(root_bounds)
+            .map(|(variable, &root)| variable.map_or(root, |variable| (i128::from(store.min(variable)), i128::from(store.max(variable)))))
+            .collect()
     }
 
-    fn primal_within(primal: &[f64], bounds: &[(i32, i32)]) -> bool {
+    fn primal_within(primal: &[f64], bounds: &[(i128, i128)]) -> bool {
         primal.len() == bounds.len()
             && primal
                 .iter()
                 .zip(bounds)
-                .all(|(&value, &(lower, upper))| value.is_finite() && value >= f64::from(lower) - 1e-7 && value <= f64::from(upper) + 1e-7)
+                .all(|(&value, &(lower, upper))| value.is_finite() && value >= lower as f64 - 1e-7 && value <= upper as f64 + 1e-7)
     }
 
     fn premises_hold(store: &Store, premises: &[Premise]) -> bool {
@@ -679,7 +734,14 @@ mod enabled {
         });
         stats.lp_certified = u64::from(bound.is_some());
         stats.lp_root_bound = bound;
-        let phase = phase_from_primal(solver, search, &model.variables, &solution.primal, controls.phase_max_variables, stop);
+        // Extended formulations can return many equally valid auxiliary
+        // primals. Use them for bounds without letting an arbitrary projected
+        // point perturb the default CP search trajectory.
+        let phase = if model.variables.iter().any(Option::is_none) {
+            Vec::new()
+        } else {
+            phase_from_primal(solver, search, &model.variables, &solution.primal, controls.phase_max_variables, stop)
+        };
         let search = (!controls.node_time.is_zero())
             .then(|| SearchRelaxationTemplate::new(Arc::clone(&model), minimizing, solution.primal.clone(), certificate, controls));
         RootRelaxation { phase, bound, backend: Some(backend.name()), stats, search }

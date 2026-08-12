@@ -24,7 +24,7 @@ LP_RE = re.compile(
 )
 LP_MODEL_RE = re.compile(
     r"^c lp model ([a-z-]+) vars (\d+) columns (\d+) covered (\d+) objective_vars (\d+) "
-    r"objective_covered (\d+) source_rows (\d+) rows (\d+) nonzeros (\d+)$",
+    r"objective_covered (\d+)(?: auxiliary (\d+) fallback_terms (\d+))? source_rows (\d+) rows (\d+) nonzeros (\d+)$",
     re.MULTILINE,
 )
 
@@ -108,6 +108,8 @@ def parse_solver_stats(record: dict[str, Any]) -> dict[str, Any]:
         "lp_covered_variables": 0,
         "lp_objective_variables": 0,
         "lp_objective_covered_variables": 0,
+        "lp_auxiliary_columns": 0,
+        "lp_objective_fallbacks": 0,
         "lp_source_rows": 0,
         "lp_nonzeros": 0,
     }
@@ -120,9 +122,11 @@ def parse_solver_stats(record: dict[str, Any]) -> dict[str, Any]:
                 "lp_covered_variables": int(model_match.group(4)),
                 "lp_objective_variables": int(model_match.group(5)),
                 "lp_objective_covered_variables": int(model_match.group(6)),
-                "lp_source_rows": int(model_match.group(7)),
-                "lp_rows": int(model_match.group(8)),
-                "lp_nonzeros": int(model_match.group(9)),
+                "lp_auxiliary_columns": int(model_match.group(7) or 0),
+                "lp_objective_fallbacks": int(model_match.group(8) or 0),
+                "lp_source_rows": int(model_match.group(9)),
+                "lp_rows": int(model_match.group(10)),
+                "lp_nonzeros": int(model_match.group(11)),
             }
         )
     if lp_match:
@@ -184,7 +188,17 @@ def certified_gap(objective: Optional[int], bound: Optional[int], sense: str) ->
     if objective is None or bound is None:
         return None
     gap = objective - bound if sense == "min" else bound - objective
-    return max(0, gap)
+    return gap if gap >= 0 else None
+
+
+def certified_bound_valid(objective: Optional[int], bound: Optional[int], sense: str) -> Optional[bool]:
+    if objective is None or bound is None:
+        return None
+    if sense == "min":
+        return bound <= objective
+    if sense == "max":
+        return bound >= objective
+    raise AblationError(f"unknown objective sense: {sense}")
 
 
 def pair_records(
@@ -251,6 +265,7 @@ def summarize_pairs(
             outcome = "amthal" if delta > 0 else "native" if delta < 0 else "tie"
         outcomes[outcome] += 1
         gap = certified_gap(amthal_objective, amthal_stats["lp_root_bound"], sense)
+        bound_valid = certified_bound_valid(amthal_objective, amthal_stats["lp_root_bound"], sense)
         rows.append(
             {
                 "instance": native["instance"],
@@ -294,6 +309,8 @@ def summarize_pairs(
                 "lp_objective_covered_variables": amthal_stats[
                     "lp_objective_covered_variables"
                 ],
+                "lp_auxiliary_columns": amthal_stats["lp_auxiliary_columns"],
+                "lp_objective_fallbacks": amthal_stats["lp_objective_fallbacks"],
                 "lp_source_rows": amthal_stats["lp_source_rows"],
                 "lp_rows": amthal_stats["lp_rows"],
                 "lp_nonzeros": amthal_stats["lp_nonzeros"],
@@ -304,6 +321,7 @@ def summarize_pairs(
                 "lp_timeouts": amthal_stats["lp_timeouts"],
                 "lp_time_ms": amthal_stats["lp_time_ms"],
                 "certified_absolute_gap": gap,
+                "certified_bound_valid": bound_valid,
                 "certified_relative_gap": (
                     gap / max(1, abs(amthal_objective))
                     if gap is not None and amthal_objective is not None
@@ -315,6 +333,7 @@ def summarize_pairs(
 
     eligible = [row for row in rows if row["lp_rows"] > 0]
     certified = [row for row in rows if row["lp_root_bound"] is not None]
+    lifted = [row for row in eligible if row["lp_auxiliary_columns"] > 0]
     family_rows = []
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -346,6 +365,9 @@ def summarize_pairs(
             sorted(Counter(row["lp_model_status"] for row in rows).items())
         ),
         "lp_certified": len(certified),
+        "lp_invalid_certified_bounds": sum(row["certified_bound_valid"] is False for row in rows),
+        "lp_lifted_models": len(lifted),
+        "lp_lifted_certified": sum(row["lp_root_bound"] is not None for row in lifted),
         "lp_exact_at_incumbent": sum(row["root_bound_matches_incumbent"] for row in certified),
         "lp_within_10_percent": sum(
             row["certified_relative_gap"] is not None
@@ -356,6 +378,13 @@ def summarize_pairs(
         "lp_node_prunes": sum(row["lp_node_prunes"] for row in rows),
         "median_lp_time_ms_eligible": median(row["lp_time_ms"] for row in eligible),
         "median_lp_columns_eligible": median(row["lp_columns"] for row in eligible),
+        "median_lp_auxiliary_columns_eligible": median(
+            row["lp_auxiliary_columns"] for row in eligible
+        ),
+        "median_lp_auxiliary_columns_lifted": median(
+            row["lp_auxiliary_columns"] for row in lifted
+        ),
+        "lp_objective_fallbacks": sum(row["lp_objective_fallbacks"] for row in rows),
         "median_lp_retained_row_fraction": median(
             row["lp_rows"] / row["lp_source_rows"]
             for row in eligible
@@ -448,8 +477,10 @@ def markdown(summary: dict[str, Any]) -> str:
         f"- Proofs: native {summary['native_proofs']}, Amthal {summary['amthal_proofs']}.",
         f"- Objective outcomes: Amthal {outcomes.get('amthal', 0)}, native {outcomes.get('native', 0)}, ties {outcomes.get('tie', 0)}, neither {outcomes.get('neither', 0)}.",
         f"- LP eligibility: {summary['lp_eligible']}/{summary['pairs']}; certified root bounds: {summary['lp_certified']}/{summary['pairs']}; timeouts: {summary['lp_timeouts']}.",
+        f"- Certified bounds crossing a verified incumbent: {summary['lp_invalid_certified_bounds']}.",
         f"- LP model outcomes: {summary['lp_model_statuses']}.",
         f"- Median active LP columns: {shown(summary['median_lp_columns_eligible'])}; median retained-row fraction: {shown(summary['median_lp_retained_row_fraction'], percent=True)}.",
+        f"- Nonlinear extended formulations: {summary['lp_lifted_models']}/{summary['pairs']}; certified: {summary['lp_lifted_certified']}/{summary['lp_lifted_models']}; median auxiliary columns when lifted: {shown(summary['median_lp_auxiliary_columns_lifted'])}; interval fallback terms: {summary['lp_objective_fallbacks']}.",
         f"- Exactly certified in-search LP prunes: {summary['lp_node_prunes']}.",
         f"- Root bound quality: {summary['lp_exact_at_incumbent']} match the incumbent; {summary['lp_within_10_percent']} are within 10%.",
         f"- Median LP time on eligible models: {shown(summary['median_lp_time_ms_eligible'])} ms.",

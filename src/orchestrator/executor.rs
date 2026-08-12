@@ -362,6 +362,8 @@ pub fn merge_search_stats(total: &mut SolveStats, part: SolveStats) {
     total.lp_covered_variables = total.lp_covered_variables.saturating_add(part.lp_covered_variables);
     total.lp_objective_variables = total.lp_objective_variables.saturating_add(part.lp_objective_variables);
     total.lp_objective_covered_variables = total.lp_objective_covered_variables.saturating_add(part.lp_objective_covered_variables);
+    total.lp_auxiliary_columns = total.lp_auxiliary_columns.saturating_add(part.lp_auxiliary_columns);
+    total.lp_objective_fallbacks = total.lp_objective_fallbacks.saturating_add(part.lp_objective_fallbacks);
     total.lp_source_rows = total.lp_source_rows.saturating_add(part.lp_source_rows);
     total.lp_nonzeros = total.lp_nonzeros.saturating_add(part.lp_nonzeros);
     total.lp_solves = total.lp_solves.saturating_add(part.lp_solves);

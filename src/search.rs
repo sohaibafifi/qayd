@@ -79,7 +79,7 @@ pub enum LinearModelStatus {
     NoRows,
     /// The recorded rows exceed the configured row limit.
     TooManyRows,
-    /// The active objective cannot be represented as an affine expression.
+    /// Reserved compatibility status for an objective without a relaxation.
     NonAffineObjective,
     /// The objective is malformed, overflows exact arithmetic, or cannot be
     /// represented exactly by the floating backend.
@@ -149,7 +149,11 @@ pub struct SolveStats {
     pub lp_objective_variables: u64,
     /// Objective variables also occurring in at least one retained row.
     pub lp_objective_covered_variables: u64,
-    /// Unnormalized convex rows offered by propagator construction.
+    /// Active continuous columns introduced only for nonlinear expressions.
+    pub lp_auxiliary_columns: u64,
+    /// Objective subexpressions replaced by a sound interval lower bound.
+    pub lp_objective_fallbacks: u64,
+    /// Unnormalized convex rows offered before matrix-size selection.
     pub lp_source_rows: u64,
     /// Nonzero matrix coefficients retained after normalization.
     pub lp_nonzeros: u64,

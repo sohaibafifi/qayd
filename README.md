@@ -60,35 +60,11 @@ Priority order: correct, simple, fast.
   allocate atoms by support; wide domains allocate shared atoms on demand. Short
   learned clauses are strengthened by budgeted CP-aware vivification through the
   global propagators.
-- **Parallel search.** CSP find-one/UNSAT runs a portfolio of CDCL workers that
-  differ by seed and restart cadence and cross-pollinate short low-LBD learned
-  clauses; the first to find a solution or prove unsatisfiability wins. COP
-  branch-and-bound keeps wide linear and expression
-  objectives symbolic. Opt-in portfolio workers share incumbents; workers with
-  materialized objectives also share short low-LBD clauses. `--split` enables
-  proof-job stealing inspired by [Buffered Work
-  Stealing](https://doi.org/10.1007/978-3-031-95973-8_13), and `--probe`
-  dedicates materialized-objective workers to optimistic probes. `--lns`
-  dedicates workers to bounded incumbent-driven [Large Neighborhood
-  Search](https://doi.org/10.1007/978-3-319-91086-4_4).
-- **Optional certified LP relaxation.** Exact integer COPs can retain convex
-  linear rows and solve a root relaxation through the lightweight Amthal
-  backend. Floating primal values are used only as phase guidance. A dual bound
-  is published only after qayd reconstructs it with exact rational arithmetic.
-  The feature is opt-in and all limits are explicit `SolveRequest`, CLI, or
-  Python arguments.
-- **Local-search COP engine.** `--ls` searches for feasible COP incumbents and
-  objective improvements without proving optimality. It uses local scoring for
-  common constraints, constructive starts for guarded table/element patterns,
-  guided local search, and focused repair for simple Boolean exact-cover rows.
-- **Adaptive ordered-list search.** List, routing, sequencing, and packing models
-  use ALNS with online-scored Shaw, segment, and worst removals plus greedy,
-  regret-2, and regret-3 insertion. Simulated annealing and late acceptance
-  preserve diversification, while GLS penalties steer violated and objective
-  list reductions. The Python list engine can run a multithread portfolio with
-  distinct intensification, balanced, and diversification profiles. 
-- **Beta MiniZinc support.** The `qayd-fzn` driver speaks the MiniZinc solver protocol,
-  so it can be used as a backend for the MiniZinc CLI and IDE. See
+- **Parallel search.**
+- **Optional certified LP relaxation.**
+- **Local-search COP engine.**
+- **Adaptive ordered-list search.**
+- **Beta MiniZinc support.** See
   [the MiniZinc integration notes](frontends/flatzinc/minizinc/README.md).
 - **Beta SAT and Pseudo-Boolean frontends.**
 
@@ -170,14 +146,15 @@ Common options:
 - `--lp-max-vars`, `--lp-max-rows`, `--lp-max-nonzeros`: cap active columns and retained matrix size. Rows touching the objective are retained first.
 - `--lp-min-coverage`, `--lp-phase-max-vars`: control eligibility and phase guidance; the phase guard counts physical CP variables, and zero disables LP phase guidance.
 
-The Amthal backend is linked from the private (net yet released) sibling crate `../amthal` only by
+The Amthal backend is linked from the private (not yet released) sibling crate `../amthal` only by
 `--features lp-relaxation`. Node relaxations retain one private simplex session
 per search worker, reuse a still-feasible primal, and turn a bound into pruning
 only after exact rational recertification. Without that feature, `auto` preserves the native
 path and an explicit `amthal` request returns a clear configuration error.
 Verbose output reports both the physical variable count and compact LP column
-count, source and retained rows, nonzeros, objective coverage, and an explicit
-construction status such as `ready`, `no-rows`, or `non-affine-objective`.
+count, nonlinear auxiliary columns, interval fallbacks, candidate and retained
+rows, nonzeros, objective coverage, and an explicit construction status such as
+`ready`, `no-rows`, or `invalid-objective`.
 
 ## Python Examples
 
