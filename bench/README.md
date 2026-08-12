@@ -213,6 +213,32 @@ Runs resume by default. Use `--restart` to replace the campaign, `--generate-onl
 to inspect inputs before solving, or `--analyze-only` to rebuild reports from
 existing results. All configuration is passed as command-line arguments.
 
+## CVRPLIB root-LP ablation
+
+`routing_lp_ablation.py` measures the routing route-master LP against the
+structural bound with paired instances, seeds, search budgets, and worker
+counts. The default arms are structural, 250 ms, 1 s, and 3 s of root LP. The
+arm order rotates between comparison groups to reduce order bias. Every bound
+is checked against both the independently verified incumbent and an adjacent
+CVRPLIB solution cost when available.
+
+```sh
+uv run bench/routing_lp_ablation.py \
+  --glob 'data/vrplib/CVRP/X-*.vrp' \
+  --budget 10 --seed 0,1,2,3,4 \
+  --threads 1 --jobs 1 --prepare-qayd \
+  --out bench/results/routing-lp-ablation/results.jsonl
+```
+
+The JSONL is resumable only while the source tree, extension artifact, and
+campaign configuration remain identical. `--jobs N` runs `N` solver processes
+concurrently and is recorded in the provenance sidecar. For clean CPU timing,
+prefer `--jobs 1`; use process parallelism for a throughput-oriented campaign.
+The generated summary reports dual improvement and primal quality separately,
+because a stronger root bound can still consume CPU that would otherwise go to
+local search. `--analyze-only` reconstructs both reports from the JSONL and its
+provenance sidecar without requiring the original instances.
+
 ## Linear backend probe
 
 `linear_backend_probe.py` compares Amthal and HiGHS on the same MIPLIB easy
