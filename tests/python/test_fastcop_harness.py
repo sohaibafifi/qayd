@@ -655,6 +655,8 @@ def test_lp_ablation_report_uses_verified_paired_results(tmp_path):
     amthal_log = tmp_path / "amthal.log"
     amthal_log.write_text(
         "c nodes 80 failures 15\n"
+        "c lp model ready vars 20 columns 12 covered 12 objective_vars 2 objective_covered 2 "
+        "source_rows 12 rows 12 nonzeros 30\n"
         "c lp rows 12 root_bound 6 solves 2 certified 2 node_prunes 3 timeouts 0 "
         "refactorizations 2 time_ms 1.250\n",
         encoding="utf-8",

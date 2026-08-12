@@ -1408,14 +1408,47 @@ impl Solver {
 
     #[cfg(feature = "lp-relaxation")]
     pub(crate) fn record_linear_relaxation(&mut self, coefficients: &[i64], variables: &[VarId], lower: Option<i64>, upper: Option<i64>) {
-        if self.current_selector.is_none() {
-            self.linear_relaxation.push(LinearRelaxationRow {
-                coefficients: coefficients.to_vec(),
-                variables: variables.to_vec(),
-                lower,
-                upper,
-            });
+        let Some(selector) = self.current_selector else {
+            self.push_linear_relaxation(coefficients, variables, lower, upper);
+            return;
+        };
+        let Some((minimum, maximum)) = linear_activity_bounds(&self.store, coefficients, variables) else {
+            return;
+        };
+        if let Some(lower) = lower {
+            let gap = i128::from(lower) - minimum;
+            if gap <= 0 {
+                self.push_linear_relaxation(coefficients, variables, Some(lower), None);
+            } else if let (Ok(selector_coefficient), Ok(relaxed_lower)) = (i64::try_from(-gap), i64::try_from(minimum)) {
+                let mut coefficients = coefficients.to_vec();
+                let mut variables = variables.to_vec();
+                coefficients.push(selector_coefficient);
+                variables.push(selector);
+                self.push_linear_relaxation(&coefficients, &variables, Some(relaxed_lower), None);
+            }
         }
+        if let Some(upper) = upper {
+            let gap = maximum - i128::from(upper);
+            if gap <= 0 {
+                self.push_linear_relaxation(coefficients, variables, None, Some(upper));
+            } else if let (Ok(selector_coefficient), Ok(relaxed_upper)) = (i64::try_from(gap), i64::try_from(maximum)) {
+                let mut coefficients = coefficients.to_vec();
+                let mut variables = variables.to_vec();
+                coefficients.push(selector_coefficient);
+                variables.push(selector);
+                self.push_linear_relaxation(&coefficients, &variables, None, Some(relaxed_upper));
+            }
+        }
+    }
+
+    #[cfg(feature = "lp-relaxation")]
+    fn push_linear_relaxation(&mut self, coefficients: &[i64], variables: &[VarId], lower: Option<i64>, upper: Option<i64>) {
+        self.linear_relaxation.push(LinearRelaxationRow {
+            coefficients: coefficients.to_vec(),
+            variables: variables.to_vec(),
+            lower,
+            upper,
+        });
     }
 
     #[cfg(feature = "lp-relaxation")]
@@ -1536,4 +1569,26 @@ impl Solver {
     pub fn fd_at_fixpoint(&self) -> bool {
         self.store.queue_is_empty()
     }
+}
+
+#[cfg(feature = "lp-relaxation")]
+fn linear_activity_bounds(store: &Store, coefficients: &[i64], variables: &[VarId]) -> Option<(i128, i128)> {
+    if coefficients.len() != variables.len() {
+        return None;
+    }
+    let mut minimum = 0i128;
+    let mut maximum = 0i128;
+    for (&coefficient, &variable) in coefficients.iter().zip(variables) {
+        let coefficient = i128::from(coefficient);
+        let lower = i128::from(store.min(variable));
+        let upper = i128::from(store.max(variable));
+        let (term_minimum, term_maximum) = if coefficient >= 0 {
+            (coefficient.checked_mul(lower)?, coefficient.checked_mul(upper)?)
+        } else {
+            (coefficient.checked_mul(upper)?, coefficient.checked_mul(lower)?)
+        };
+        minimum = minimum.checked_add(term_minimum)?;
+        maximum = maximum.checked_add(term_maximum)?;
+    }
+    Some((minimum, maximum))
 }

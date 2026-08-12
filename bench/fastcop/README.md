@@ -152,10 +152,12 @@ python3 bench/fastcop/lp_ablation.py \
   --json bench/fastcop/results/lp-ablation-30s/summary.json
 ```
 
-The report compares only checker-accepted incumbents. It also extracts root
-bound coverage, certification rate, exactly certified node prunes, LP time,
-proof counts, incumbent timing, searched nodes and family-level wins from the verbose logs. Use `--jobs 1` for
-publishable timing. Parallel jobs remain useful for a quick diagnostic run.
+The report compares only checker-accepted incumbents. It also extracts the LP
+construction status, physical and compact column counts, source and retained
+rows, objective coverage, root-bound certification, exactly certified node
+prunes, LP time, proof counts, incumbent timing, searched nodes and
+family-level wins from the verbose logs. Use `--jobs 1` for publishable timing.
+Parallel jobs remain useful for a quick diagnostic run.
 
 `run.py` writes every `o` event and its arrival time, first and best incumbent,
 status and proof claim, return code, timeout path, peak RSS when available,

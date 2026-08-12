@@ -1290,7 +1290,9 @@ fn post_global(solver: &mut Solver, map: &[VarId], global: &IntGlobalConstraint,
             lex::channel(solver, &mapped!(left), &mapped!(right));
         }
         IntGlobalConstraint::Circuit { successors, cutset } => {
-            graph::circuit_with(solver, &mapped!(successors), *cutset);
+            let successors = mapped!(successors);
+            primitives::record_all_different_relaxation(solver, &successors);
+            graph::circuit_with(solver, &successors, *cutset);
         }
         IntGlobalConstraint::NoOverlap { starts, durations } => {
             if !scheduling::no_overlap_interruptible(solver, &mapped!(starts), durations, stop) {

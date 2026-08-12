@@ -402,7 +402,7 @@ pub(crate) fn linear_interruptible(
 }
 
 #[cfg(feature = "lp-relaxation")]
-fn record_relaxation(solver: &mut Solver, coefficients: &[i64], variables: &[VarId], relation: Relation, rhs: i64) {
+pub(crate) fn record_relaxation(solver: &mut Solver, coefficients: &[i64], variables: &[VarId], relation: Relation, rhs: i64) {
     match relation {
         Relation::Le => solver.record_linear_relaxation(coefficients, variables, None, Some(rhs)),
         Relation::Lt => {
@@ -423,7 +423,7 @@ fn record_relaxation(solver: &mut Solver, coefficients: &[i64], variables: &[Var
 
 #[cfg(not(feature = "lp-relaxation"))]
 #[inline]
-fn record_relaxation(_solver: &mut Solver, _coefficients: &[i64], _variables: &[VarId], _relation: Relation, _rhs: i64) {}
+pub(crate) fn record_relaxation(_solver: &mut Solver, _coefficients: &[i64], _variables: &[VarId], _relation: Relation, _rhs: i64) {}
 
 /// Post \( \sum_i \texttt{vars}[i] \;\texttt{rel}\; \texttt{rhs} \) (all coefficients 1).
 pub fn sum(solver: &mut Solver, vars: &[VarId], rel: Relation, rhs: i64) {

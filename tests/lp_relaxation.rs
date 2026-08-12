@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+#[cfg(feature = "lp-relaxation")]
+use qayd::model::IntGlobalConstraint;
 use qayd::model::{Constraint, IntExpr, Model, ModelPackage, Objective, Relation};
 #[cfg(not(feature = "lp-relaxation"))]
 use qayd::orchestrator::SolveError;
@@ -97,7 +99,7 @@ fn affine_intension_comparisons_feed_the_same_relaxation_ir() {
 
 #[cfg(feature = "lp-relaxation")]
 #[test]
-fn selected_constraints_are_not_misrepresented_as_unconditional_rows() {
+fn selected_constraints_use_a_selector_guarded_big_m_row() {
     let mut model = Model::new();
     let selector = model.bool_var();
     let value = model.int_range(0, 10);
@@ -109,7 +111,8 @@ fn selected_constraints_are_not_misrepresented_as_unconditional_rows() {
 
     let result = solve_model(&ModelPackage::new(model), &request(LinearBackendMode::Amthal), &mut IgnoreEvents).unwrap();
     assert_eq!(result.status(), SolveStatus::Optimal);
-    assert_eq!(result.aggregate_search_stats().lp_rows, 0);
+    assert!(result.aggregate_search_stats().lp_rows > 0);
+    assert_eq!(result.aggregate_search_stats().lp_root_bound, Some(0));
 }
 
 #[cfg(feature = "lp-relaxation")]
@@ -134,6 +137,98 @@ fn persistent_node_relaxation_prunes_only_after_exact_recertification() {
     assert_eq!(stats.lp_root_bound, Some(3));
     assert!(stats.lp_solves > 1, "the persistent node session never re-optimized");
     assert!(stats.lp_node_prunes > 0, "no exactly certified node bound reached the incumbent");
+}
+
+#[cfg(feature = "lp-relaxation")]
+#[test]
+fn reified_affine_comparison_uses_a_valid_big_m_relaxation() {
+    let mut model = Model::new();
+    let x = model.int_range(0, 10);
+    let selected = model.bool_var();
+    model.add_constraint(Constraint::Intension(IntExpr::Iff(
+        Box::new(IntExpr::Variable(selected)),
+        Box::new(IntExpr::Ge(Box::new(IntExpr::Variable(x)), Box::new(IntExpr::Constant(5)))),
+    )));
+    model.add_objective(Objective::IntExpr {
+        minimize: true,
+        expr: IntExpr::Add(vec![IntExpr::Variable(x), IntExpr::Mul(vec![IntExpr::Constant(-100), IntExpr::Variable(selected)])]),
+    });
+
+    let result = solve_model(&ModelPackage::new(model), &request(LinearBackendMode::Amthal), &mut IgnoreEvents).unwrap();
+    assert_eq!(result.status(), SolveStatus::Optimal);
+    assert_eq!(result.primal().unwrap().objectives(), [-95]);
+    assert_eq!(result.aggregate_search_stats().lp_root_bound, Some(-95));
+}
+
+#[cfg(feature = "lp-relaxation")]
+#[test]
+fn all_different_adds_exact_aggregate_bounds_for_a_permutation() {
+    let mut model = Model::new();
+    let variables = (0..4).map(|_| model.int_range(0, 3)).collect::<Vec<_>>();
+    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::AllDifferent { variables: variables.clone(), except: Vec::new() }));
+    model.add_objective(Objective::IntExpr { minimize: true, expr: IntExpr::Add(variables.into_iter().map(IntExpr::Variable).collect()) });
+
+    let result = solve_model(&ModelPackage::new(model), &request(LinearBackendMode::Amthal), &mut IgnoreEvents).unwrap();
+    assert_eq!(result.status(), SolveStatus::Optimal);
+    assert_eq!(result.primal().unwrap().objectives(), [6]);
+    assert_eq!(result.aggregate_search_stats().lp_root_bound, Some(6));
+}
+
+#[cfg(feature = "lp-relaxation")]
+#[test]
+fn boolean_count_is_reused_as_a_linear_relaxation() {
+    let mut model = Model::new();
+    let variables = (0..4).map(|_| model.bool_var()).collect::<Vec<_>>();
+    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Count {
+        variables: variables.clone(),
+        value: 1,
+        relation: Relation::Ge,
+        count: 3,
+    }));
+    model.add_objective(Objective::IntExpr { minimize: true, expr: IntExpr::Add(variables.into_iter().map(IntExpr::Variable).collect()) });
+
+    let result = solve_model(&ModelPackage::new(model), &request(LinearBackendMode::Amthal), &mut IgnoreEvents).unwrap();
+    assert_eq!(result.status(), SolveStatus::Optimal);
+    assert_eq!(result.primal().unwrap().objectives(), [3]);
+    assert_eq!(result.aggregate_search_stats().lp_root_bound, Some(3));
+}
+
+#[cfg(feature = "lp-relaxation")]
+#[test]
+fn boolean_clause_and_reified_or_feed_the_relaxation() {
+    let mut model = Model::new();
+    let left = model.bool_var();
+    let right = model.bool_var();
+    let disjunction = model.bool_var();
+    model.add_constraint(Constraint::Intension(IntExpr::Or(vec![
+        IntExpr::Eq(Box::new(IntExpr::Variable(left)), Box::new(IntExpr::Constant(1))),
+        IntExpr::Eq(Box::new(IntExpr::Variable(right)), Box::new(IntExpr::Constant(1))),
+    ])));
+    model.add_constraint(Constraint::Intension(IntExpr::Iff(
+        Box::new(IntExpr::Variable(disjunction)),
+        Box::new(IntExpr::Or(vec![IntExpr::Variable(left), IntExpr::Variable(right)])),
+    )));
+    model.add_objective(Objective::IntExpr { minimize: true, expr: IntExpr::Variable(disjunction) });
+
+    let result = solve_model(&ModelPackage::new(model), &request(LinearBackendMode::Amthal), &mut IgnoreEvents).unwrap();
+    assert_eq!(result.status(), SolveStatus::Optimal);
+    assert_eq!(result.primal().unwrap().objectives(), [1]);
+    assert_eq!(result.aggregate_search_stats().lp_root_bound, Some(1));
+}
+
+#[cfg(feature = "lp-relaxation")]
+#[test]
+fn model_build_rejection_exposes_its_exact_reason() {
+    let mut model = Model::new();
+    let x = model.int_range(0, 10);
+    model.add_constraint(Constraint::Intension(IntExpr::Ne(Box::new(IntExpr::Variable(x)), Box::new(IntExpr::Constant(4)))));
+    model.add_objective(Objective::IntExpr { minimize: true, expr: IntExpr::Variable(x) });
+
+    let result = solve_model(&ModelPackage::new(model), &request(LinearBackendMode::Amthal), &mut IgnoreEvents).unwrap();
+    let stats = result.aggregate_search_stats();
+    assert_eq!(stats.lp_model_status, qayd::search::LinearModelStatus::NoRows);
+    assert_eq!(stats.lp_variables, 1);
+    assert_eq!(stats.lp_source_rows, 0);
 }
 
 #[cfg(not(feature = "lp-relaxation"))]

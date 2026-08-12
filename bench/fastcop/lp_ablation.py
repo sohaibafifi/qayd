@@ -22,6 +22,11 @@ LP_RE = re.compile(
     r"time_ms ([0-9]+(?:\.[0-9]+)?)$",
     re.MULTILINE,
 )
+LP_MODEL_RE = re.compile(
+    r"^c lp model ([a-z-]+) vars (\d+) columns (\d+) covered (\d+) objective_vars (\d+) "
+    r"objective_covered (\d+) source_rows (\d+) rows (\d+) nonzeros (\d+)$",
+    re.MULTILINE,
+)
 
 
 class AblationError(RuntimeError):
@@ -85,6 +90,7 @@ def parse_solver_stats(record: dict[str, Any]) -> dict[str, Any]:
     text = stdout_path(record).read_text(encoding="utf-8", errors="replace")
     node_match = NODE_RE.search(text)
     lp_match = LP_RE.search(text)
+    model_match = LP_MODEL_RE.search(text)
     stats: dict[str, Any] = {
         "nodes": int(node_match.group(1)) if node_match else None,
         "failures": int(node_match.group(2)) if node_match else None,
@@ -96,7 +102,29 @@ def parse_solver_stats(record: dict[str, Any]) -> dict[str, Any]:
         "lp_timeouts": 0,
         "lp_refactorizations": 0,
         "lp_time_ms": 0.0,
+        "lp_model_status": "not-attempted",
+        "lp_variables": 0,
+        "lp_columns": 0,
+        "lp_covered_variables": 0,
+        "lp_objective_variables": 0,
+        "lp_objective_covered_variables": 0,
+        "lp_source_rows": 0,
+        "lp_nonzeros": 0,
     }
+    if model_match:
+        stats.update(
+            {
+                "lp_model_status": model_match.group(1),
+                "lp_variables": int(model_match.group(2)),
+                "lp_columns": int(model_match.group(3)),
+                "lp_covered_variables": int(model_match.group(4)),
+                "lp_objective_variables": int(model_match.group(5)),
+                "lp_objective_covered_variables": int(model_match.group(6)),
+                "lp_source_rows": int(model_match.group(7)),
+                "lp_rows": int(model_match.group(8)),
+                "lp_nonzeros": int(model_match.group(9)),
+            }
+        )
     if lp_match:
         bound = lp_match.group(2)
         stats.update(
@@ -258,7 +286,17 @@ def summarize_pairs(
                 "node_ratio": ratio(amthal_stats["nodes"], native_stats["nodes"]),
                 "native_nodes": native_stats["nodes"],
                 "amthal_nodes": amthal_stats["nodes"],
+                "lp_model_status": amthal_stats["lp_model_status"],
+                "lp_variables": amthal_stats["lp_variables"],
+                "lp_columns": amthal_stats["lp_columns"],
+                "lp_covered_variables": amthal_stats["lp_covered_variables"],
+                "lp_objective_variables": amthal_stats["lp_objective_variables"],
+                "lp_objective_covered_variables": amthal_stats[
+                    "lp_objective_covered_variables"
+                ],
+                "lp_source_rows": amthal_stats["lp_source_rows"],
                 "lp_rows": amthal_stats["lp_rows"],
+                "lp_nonzeros": amthal_stats["lp_nonzeros"],
                 "lp_root_bound": amthal_stats["lp_root_bound"],
                 "lp_solves": amthal_stats["lp_solves"],
                 "lp_certified": amthal_stats["lp_certified"],
@@ -304,6 +342,9 @@ def summarize_pairs(
         "native_proofs": sum(row["native_proof"] for row in rows),
         "amthal_proofs": sum(row["amthal_proof"] for row in rows),
         "lp_eligible": len(eligible),
+        "lp_model_statuses": dict(
+            sorted(Counter(row["lp_model_status"] for row in rows).items())
+        ),
         "lp_certified": len(certified),
         "lp_exact_at_incumbent": sum(row["root_bound_matches_incumbent"] for row in certified),
         "lp_within_10_percent": sum(
@@ -314,6 +355,12 @@ def summarize_pairs(
         "lp_timeouts": sum(row["lp_timeouts"] for row in rows),
         "lp_node_prunes": sum(row["lp_node_prunes"] for row in rows),
         "median_lp_time_ms_eligible": median(row["lp_time_ms"] for row in eligible),
+        "median_lp_columns_eligible": median(row["lp_columns"] for row in eligible),
+        "median_lp_retained_row_fraction": median(
+            row["lp_rows"] / row["lp_source_rows"]
+            for row in eligible
+            if row["lp_source_rows"] > 0
+        ),
         "median_certified_relative_gap": median(row["certified_relative_gap"] for row in certified),
         "median_wall_ratio": median(row["wall_ratio"] for row in rows),
         "median_first_incumbent_ratio": median(row["first_incumbent_ratio"] for row in rows),
@@ -401,6 +448,8 @@ def markdown(summary: dict[str, Any]) -> str:
         f"- Proofs: native {summary['native_proofs']}, Amthal {summary['amthal_proofs']}.",
         f"- Objective outcomes: Amthal {outcomes.get('amthal', 0)}, native {outcomes.get('native', 0)}, ties {outcomes.get('tie', 0)}, neither {outcomes.get('neither', 0)}.",
         f"- LP eligibility: {summary['lp_eligible']}/{summary['pairs']}; certified root bounds: {summary['lp_certified']}/{summary['pairs']}; timeouts: {summary['lp_timeouts']}.",
+        f"- LP model outcomes: {summary['lp_model_statuses']}.",
+        f"- Median active LP columns: {shown(summary['median_lp_columns_eligible'])}; median retained-row fraction: {shown(summary['median_lp_retained_row_fraction'], percent=True)}.",
         f"- Exactly certified in-search LP prunes: {summary['lp_node_prunes']}.",
         f"- Root bound quality: {summary['lp_exact_at_incumbent']} match the incumbent; {summary['lp_within_10_percent']} are within 10%.",
         f"- Median LP time on eligible models: {shown(summary['median_lp_time_ms_eligible'])} ms.",

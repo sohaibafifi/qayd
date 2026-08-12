@@ -60,6 +60,58 @@ pub enum SearchControl {
     Stop,
 }
 
+/// Result of constructing the optional LP relaxation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LinearModelStatus {
+    /// No LP construction was requested.
+    #[default]
+    NotAttempted,
+    /// The relaxation passed all validation and size limits.
+    Ready,
+    /// Construction was cancelled with the enclosing solve.
+    Interrupted,
+    /// The physical CP model has no integer variables.
+    NoVariables,
+    /// The affine objective alone, or every usable row, exceeds the configured
+    /// active-column limit.
+    TooManyVariables,
+    /// No unconditional convex row was available.
+    NoRows,
+    /// The recorded rows exceed the configured row limit.
+    TooManyRows,
+    /// The active objective cannot be represented as an affine expression.
+    NonAffineObjective,
+    /// The objective is malformed, overflows exact arithmetic, or cannot be
+    /// represented exactly by the floating backend.
+    InvalidObjective,
+    /// A recorded row is malformed, overflows exact arithmetic, or cannot be
+    /// represented exactly by the floating backend.
+    InvalidRow,
+    /// The normalized matrix exceeds the configured nonzero limit.
+    TooManyNonzeros,
+    /// Too few active LP columns occur in the retained rows.
+    LowCoverage,
+}
+
+impl LinearModelStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAttempted => "not-attempted",
+            Self::Ready => "ready",
+            Self::Interrupted => "interrupted",
+            Self::NoVariables => "no-variables",
+            Self::TooManyVariables => "too-many-variables",
+            Self::NoRows => "no-rows",
+            Self::TooManyRows => "too-many-rows",
+            Self::NonAffineObjective => "non-affine-objective",
+            Self::InvalidObjective => "invalid-objective",
+            Self::InvalidRow => "invalid-row",
+            Self::TooManyNonzeros => "too-many-nonzeros",
+            Self::LowCoverage => "low-coverage",
+        }
+    }
+}
+
 /// Counters gathered during a search.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SolveStats {
@@ -85,6 +137,22 @@ pub struct SolveStats {
     pub binary_implications: u64,
     /// Convex rows retained by the optional root LP relaxation.
     pub lp_rows: u64,
+    /// Outcome of constructing the optional LP matrix.
+    pub lp_model_status: LinearModelStatus,
+    /// Physical integer variables considered by LP construction.
+    pub lp_variables: u64,
+    /// Active LP columns after removing unrelated physical variables.
+    pub lp_columns: u64,
+    /// Physical variables occurring in at least one retained row.
+    pub lp_covered_variables: u64,
+    /// Distinct physical variables occurring in the affine objective.
+    pub lp_objective_variables: u64,
+    /// Objective variables also occurring in at least one retained row.
+    pub lp_objective_covered_variables: u64,
+    /// Unnormalized convex rows offered by propagator construction.
+    pub lp_source_rows: u64,
+    /// Nonzero matrix coefficients retained after normalization.
+    pub lp_nonzeros: u64,
     /// LP solves attempted.
     pub lp_solves: u64,
     /// Floating-point dual candidates recertified exactly by qayd.

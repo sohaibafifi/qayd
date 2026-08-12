@@ -354,6 +354,16 @@ pub fn merge_search_stats(total: &mut SolveStats, part: SolveStats) {
     total.watched_literal_scans = total.watched_literal_scans.saturating_add(part.watched_literal_scans);
     total.binary_implications = total.binary_implications.saturating_add(part.binary_implications);
     total.lp_rows = total.lp_rows.saturating_add(part.lp_rows);
+    if total.lp_model_status == crate::search::LinearModelStatus::NotAttempted {
+        total.lp_model_status = part.lp_model_status;
+    }
+    total.lp_variables = total.lp_variables.saturating_add(part.lp_variables);
+    total.lp_columns = total.lp_columns.saturating_add(part.lp_columns);
+    total.lp_covered_variables = total.lp_covered_variables.saturating_add(part.lp_covered_variables);
+    total.lp_objective_variables = total.lp_objective_variables.saturating_add(part.lp_objective_variables);
+    total.lp_objective_covered_variables = total.lp_objective_covered_variables.saturating_add(part.lp_objective_covered_variables);
+    total.lp_source_rows = total.lp_source_rows.saturating_add(part.lp_source_rows);
+    total.lp_nonzeros = total.lp_nonzeros.saturating_add(part.lp_nonzeros);
     total.lp_solves = total.lp_solves.saturating_add(part.lp_solves);
     total.lp_certified = total.lp_certified.saturating_add(part.lp_certified);
     total.lp_timeouts = total.lp_timeouts.saturating_add(part.lp_timeouts);

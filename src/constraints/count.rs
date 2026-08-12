@@ -98,7 +98,28 @@ impl Propagator for Count {
 
 /// Post `#{ i : vars[i] = value }  rel  k`.
 pub fn count(solver: &mut Solver, vars: &[VarId], value: i32, rel: Relation, k: i64) {
+    record_boolean_count_relaxation(solver, vars, value, rel, k);
     solver.post(Box::new(Count { vars: vars.to_vec(), value, rel, k }));
+}
+
+fn record_boolean_count_relaxation(solver: &mut Solver, vars: &[VarId], value: i32, rel: Relation, k: i64) {
+    if !matches!(value, 0 | 1) || vars.iter().any(|&var| solver.store.min(var) < 0 || solver.store.max(var) > 1) {
+        return;
+    }
+    let mut coefficients = vec![1; vars.len()];
+    let rhs = if value == 1 {
+        k
+    } else {
+        coefficients.fill(-1);
+        let Ok(count) = i64::try_from(vars.len()) else {
+            return;
+        };
+        let Some(rhs) = k.checked_sub(count) else {
+            return;
+        };
+        rhs
+    };
+    crate::constraints::linear::record_relaxation(solver, &coefficients, vars, rel, rhs);
 }
 
 // ===========================================================================
@@ -541,6 +562,18 @@ impl Propagator for InSet {
 pub fn cardinality(solver: &mut Solver, vars: &[VarId], values: &[i32], low: &[i64], high: &[i64], closed: bool) {
     assert_eq!(values.len(), low.len(), "cardinality: values/low mismatch");
     assert_eq!(values.len(), high.len(), "cardinality: values/high mismatch");
+    if vars.iter().all(|&var| solver.store.min(var) >= 0 && solver.store.max(var) <= 1) {
+        for ((&value, &lower), &upper) in values.iter().zip(low).zip(high) {
+            record_boolean_count_relaxation(solver, vars, value, Relation::Ge, lower);
+            record_boolean_count_relaxation(solver, vars, value, Relation::Le, upper);
+        }
+        if closed && !values.contains(&0) {
+            record_boolean_count_relaxation(solver, vars, 0, Relation::Eq, 0);
+        }
+        if closed && !values.contains(&1) {
+            record_boolean_count_relaxation(solver, vars, 1, Relation::Eq, 0);
+        }
+    }
     solver.post(Box::new(Cardinality {
         vars: vars.to_vec(),
         listed_values: values.to_vec(),

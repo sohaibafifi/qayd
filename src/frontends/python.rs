@@ -400,6 +400,22 @@ struct PySolveStats {
     #[pyo3(get)]
     lp_rows: u64,
     #[pyo3(get)]
+    lp_model_status: String,
+    #[pyo3(get)]
+    lp_variables: u64,
+    #[pyo3(get)]
+    lp_columns: u64,
+    #[pyo3(get)]
+    lp_covered_variables: u64,
+    #[pyo3(get)]
+    lp_objective_variables: u64,
+    #[pyo3(get)]
+    lp_objective_covered_variables: u64,
+    #[pyo3(get)]
+    lp_source_rows: u64,
+    #[pyo3(get)]
+    lp_nonzeros: u64,
+    #[pyo3(get)]
     lp_solves: u64,
     #[pyo3(get)]
     lp_certified: u64,
@@ -727,6 +743,14 @@ impl From<SearchStats> for PySolveStats {
             vivified_clauses: stats.vivified_clauses,
             vivified_lits: stats.vivified_lits,
             lp_rows: stats.lp_rows,
+            lp_model_status: stats.lp_model_status.as_str().to_string(),
+            lp_variables: stats.lp_variables,
+            lp_columns: stats.lp_columns,
+            lp_covered_variables: stats.lp_covered_variables,
+            lp_objective_variables: stats.lp_objective_variables,
+            lp_objective_covered_variables: stats.lp_objective_covered_variables,
+            lp_source_rows: stats.lp_source_rows,
+            lp_nonzeros: stats.lp_nonzeros,
             lp_solves: stats.lp_solves,
             lp_certified: stats.lp_certified,
             lp_timeouts: stats.lp_timeouts,
@@ -1261,8 +1285,16 @@ fn verbose_finish(solution: &PySolution) {
     println!("  nodes: {}", solution.stats.nodes);
     println!("  failures: {}", solution.stats.failures);
     println!("  learned_lits: {}", solution.stats.learned_lits);
-    if solution.stats.lp_rows > 0 {
+    if solution.stats.lp_model_status != "not-attempted" {
+        println!("  lp_model_status: {}", solution.stats.lp_model_status);
+        println!("  lp_variables: {}", solution.stats.lp_variables);
+        println!("  lp_columns: {}", solution.stats.lp_columns);
+        println!("  lp_covered_variables: {}", solution.stats.lp_covered_variables);
+        println!("  lp_objective_variables: {}", solution.stats.lp_objective_variables);
+        println!("  lp_objective_covered_variables: {}", solution.stats.lp_objective_covered_variables);
+        println!("  lp_source_rows: {}", solution.stats.lp_source_rows);
         println!("  lp_rows: {}", solution.stats.lp_rows);
+        println!("  lp_nonzeros: {}", solution.stats.lp_nonzeros);
         println!("  lp_root_bound: {}", solution.stats.lp_root_bound.map_or_else(|| "?".to_string(), |bound| bound.to_string()));
         println!("  lp_solves: {}", solution.stats.lp_solves);
         println!("  lp_certified: {}", solution.stats.lp_certified);

@@ -158,11 +158,13 @@ impl Propagator for LessOrEqual {
 
 /// Post \( x \le y \).
 pub fn less_or_equal(solver: &mut Solver, x: VarId, y: VarId) -> PropId {
+    crate::constraints::linear::record_relaxation(solver, &[1, -1], &[x, y], Relation::Le, 0);
     solver.post(Box::new(LessOrEqual { x, y, k: 0 }))
 }
 
 /// Post `x < y`.
 pub fn less_than(solver: &mut Solver, x: VarId, y: VarId) -> PropId {
+    crate::constraints::linear::record_relaxation(solver, &[1, -1], &[x, y], Relation::Le, -1);
     solver.post(Box::new(LessOrEqual { x, y, k: 1 }))
 }
 
@@ -210,6 +212,9 @@ impl Propagator for Instantiation {
 /// Post `vars[i] = vals[i]` for all `i`.
 pub fn instantiation(solver: &mut Solver, vars: &[VarId], vals: &[i32]) {
     assert_eq!(vars.len(), vals.len(), "instantiation: length mismatch");
+    for (&variable, &value) in vars.iter().zip(vals) {
+        crate::constraints::linear::record_relaxation(solver, &[1], &[variable], Relation::Eq, i64::from(value));
+    }
     solver.post(Box::new(Instantiation { vars: vars.to_vec(), vals: vals.to_vec() }));
 }
 
@@ -258,6 +263,9 @@ impl Propagator for AllEqual {
 
 /// Post `vars[0] = vars[1] = ...`.
 pub fn all_equal(solver: &mut Solver, vars: &[VarId]) {
+    for pair in vars.windows(2) {
+        crate::constraints::linear::record_relaxation(solver, &[1, -1], pair, Relation::Eq, 0);
+    }
     solver.post(Box::new(AllEqual { vars: vars.to_vec(), common: Vec::new(), buf: Vec::new() }));
 }
 
@@ -310,12 +318,18 @@ impl Propagator for Extremum {
 /// Post `y = min(xs)`. `xs` must be non-empty.
 pub fn minimum(solver: &mut Solver, y: VarId, xs: &[VarId]) {
     assert!(!xs.is_empty(), "minimum: empty list");
+    for &x in xs {
+        crate::constraints::linear::record_relaxation(solver, &[1, -1], &[y, x], Relation::Le, 0);
+    }
     solver.post(Box::new(Extremum { y, xs: xs.to_vec(), is_min: true }));
 }
 
 /// Post `y = max(xs)`. `xs` must be non-empty.
 pub fn maximum(solver: &mut Solver, y: VarId, xs: &[VarId]) {
     assert!(!xs.is_empty(), "maximum: empty list");
+    for &x in xs {
+        crate::constraints::linear::record_relaxation(solver, &[1, -1], &[y, x], Relation::Ge, 0);
+    }
     solver.post(Box::new(Extremum { y, xs: xs.to_vec(), is_min: false }));
 }
 
@@ -855,7 +869,73 @@ impl Propagator for AllDifferent {
 
 /// Post `allDifferent(vars)` with Régin domain-consistent filtering.
 pub fn all_different(solver: &mut Solver, vars: &[VarId]) {
+    record_all_different_relaxation(solver, vars);
     solver.post(Box::new(AllDifferent { vars: vars.to_vec(), ..Default::default() }));
+}
+
+/// Add the aggregate sum bounds implied by pairwise distinct integer values.
+/// Domain holes are deliberately relaxed to intervals. This keeps the row
+/// cheap and valid while still making permutations produce an exact sum.
+#[cfg(feature = "lp-relaxation")]
+pub(crate) fn record_all_different_relaxation(solver: &mut Solver, vars: &[VarId]) {
+    let Some((lower, upper)) = distinct_sum_bounds(&solver.store, vars) else {
+        return;
+    };
+    let coefficients = vec![1; vars.len()];
+    solver.record_linear_relaxation(&coefficients, vars, Some(lower), Some(upper));
+}
+
+#[cfg(not(feature = "lp-relaxation"))]
+#[inline]
+pub(crate) fn record_all_different_relaxation(_solver: &mut Solver, _vars: &[VarId]) {}
+
+#[cfg(feature = "lp-relaxation")]
+fn distinct_sum_bounds(store: &Store, vars: &[VarId]) -> Option<(i64, i64)> {
+    if vars.is_empty() {
+        return Some((0, 0));
+    }
+    let mut intervals = vars.iter().map(|&var| (store.min(var), store.max(var))).collect::<Vec<_>>();
+    intervals.sort_unstable();
+    let mut merged = Vec::<(i32, i32)>::with_capacity(intervals.len());
+    for (lower, upper) in intervals {
+        match merged.last_mut() {
+            Some((_, previous_upper)) if i64::from(lower) <= i64::from(*previous_upper) + 1 => {
+                *previous_upper = (*previous_upper).max(upper);
+            }
+            _ => merged.push((lower, upper)),
+        }
+    }
+    let count = i128::try_from(vars.len()).ok()?;
+    let lower = extreme_distinct_sum(&merged, count, false)?;
+    let upper = extreme_distinct_sum(&merged, count, true)?;
+    Some((i64::try_from(lower).ok()?, i64::try_from(upper).ok()?))
+}
+
+#[cfg(feature = "lp-relaxation")]
+fn extreme_distinct_sum(intervals: &[(i32, i32)], mut remaining: i128, descending: bool) -> Option<i128> {
+    let mut sum = 0i128;
+    let mut visit = |&(lower, upper): &(i32, i32)| -> Option<()> {
+        if remaining == 0 {
+            return Some(());
+        }
+        let available = i128::from(upper) - i128::from(lower) + 1;
+        let take = available.min(remaining);
+        let start = if descending { i128::from(upper) - take + 1 } else { i128::from(lower) };
+        let end = if descending { i128::from(upper) } else { i128::from(lower) + take - 1 };
+        sum = sum.checked_add(take.checked_mul(start.checked_add(end)?)?.checked_div(2)?)?;
+        remaining -= take;
+        Some(())
+    };
+    if descending {
+        for interval in intervals.iter().rev() {
+            visit(interval)?;
+        }
+    } else {
+        for interval in intervals {
+            visit(interval)?;
+        }
+    }
+    (remaining == 0).then_some(sum)
 }
 
 // ---------------------------------------------------------------------------

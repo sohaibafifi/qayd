@@ -115,6 +115,7 @@ pub struct LinearControls {
     pub max_rows: usize,
     pub max_nonzeros: usize,
     pub min_coverage_percent: usize,
+    /// Maximum physical CP model size eligible for LP primal phase guidance.
     pub phase_max_variables: usize,
 }
 
