@@ -332,7 +332,7 @@ impl ReductionCache {
         &self,
         reduction: &Reduction,
         old: &[i32],
-        candidate: &dyn ListView,
+        candidate: &(impl ListView + ?Sized),
         scratch: &mut EvalScratch,
         stop: &AtomicBool,
     ) -> EvaluationResult<Option<i64>> {
@@ -351,7 +351,7 @@ impl ReductionCache {
             }
             Iterable::Pairs(_) => self.pairs_delta(reduction, old, candidate, scratch, stop)?,
             Iterable::Scan { init: _, boundary, step, end, .. } => {
-                self.scan_delta(reduction, old, candidate, prefix, *boundary, *step, *end, scratch, stop)?;
+                self.scan_delta(reduction, old, candidate, prefix, suffix, *boundary, *step, *end, scratch, stop)?;
             }
             Iterable::Windows { size, inner, .. } => {
                 self.windows_delta(reduction, old, candidate, prefix, suffix, *size, *inner, scratch, stop)?;
@@ -366,7 +366,7 @@ impl ReductionCache {
         &self,
         reduction: &Reduction,
         old: &[i32],
-        candidate: &dyn ListView,
+        candidate: &(impl ListView + ?Sized),
         prefix: usize,
         suffix: usize,
         scratch: &mut EvalScratch,
@@ -385,7 +385,7 @@ impl ReductionCache {
     fn set_items_delta(
         &self,
         reduction: &Reduction,
-        candidate: &dyn ListView,
+        candidate: &(impl ListView + ?Sized),
         scratch: &mut EvalScratch,
         stop: &AtomicBool,
     ) -> EvaluationResult<()> {
@@ -415,7 +415,7 @@ impl ReductionCache {
         &self,
         reduction: &Reduction,
         old: &[i32],
-        candidate: &dyn ListView,
+        candidate: &(impl ListView + ?Sized),
         prefix: usize,
         suffix: usize,
         start: i32,
@@ -441,7 +441,7 @@ impl ReductionCache {
         &self,
         reduction: &Reduction,
         old: &[i32],
-        candidate: &dyn ListView,
+        candidate: &(impl ListView + ?Sized),
         scratch: &mut EvalScratch,
         stop: &AtomicBool,
     ) -> EvaluationResult<()> {
@@ -552,31 +552,73 @@ impl ReductionCache {
         &self,
         reduction: &Reduction,
         old: &[i32],
-        candidate: &dyn ListView,
+        candidate: &(impl ListView + ?Sized),
         prefix: usize,
+        suffix: usize,
         boundary: i32,
         step: crate::model::list::ExprId,
         end: Option<i32>,
         scratch: &mut EvalScratch,
         stop: &AtomicBool,
     ) -> EvaluationResult<()> {
-        extend_interruptible(&mut scratch.removed, &self.outputs[prefix..], stop)?;
         let mut acc = self.scan_acc[prefix];
         let mut prev = if prefix == 0 { boundary } else { old[prefix - 1] };
-        for (work, pos) in (prefix..candidate.len()).enumerate() {
+        let old_suffix_start = old.len().saturating_sub(suffix);
+        let new_suffix_start = candidate.len().saturating_sub(suffix);
+        let mut work = 0usize;
+
+        for pos in prefix..new_suffix_start {
             poll_stop(stop, work)?;
             let current = candidate.at(pos);
             let next = eval_expr(&reduction.arena.exprs, step, &[i64::from(current), acc, i64::from(prev)]);
             scratch.added.push(eval_expr(&reduction.arena.exprs, reduction.body, &[i64::from(current), next, i64::from(prev)]));
             acc = next;
             prev = current;
+            work = work.saturating_add(1);
         }
-        if let Some(end) = end {
+
+        // A deterministic scan can reuse an unchanged suffix only when both
+        // pieces of threaded state, the accumulator and predecessor, rejoin the
+        // accepted cache. If they do not match at the edit boundary, advance
+        // through the common suffix until they do. This is exact for arbitrary
+        // scan expressions and turns the usual feasible routing insertion into
+        // O(changed span) work without imposing VRPTW-specific semantics.
+        let old_predecessor = if old_suffix_start == 0 { boundary } else { old[old_suffix_start.saturating_sub(1)] };
+        let mut reuse_from = (acc == self.scan_acc[old_suffix_start] && prev == old_predecessor).then_some(old_suffix_start);
+        if reuse_from.is_none() {
+            for offset in 0..suffix {
+                poll_stop(stop, work)?;
+                let new_pos = new_suffix_start + offset;
+                let old_pos = old_suffix_start + offset;
+                let current = candidate.at(new_pos);
+                debug_assert_eq!(current, old[old_pos]);
+                let next = eval_expr(&reduction.arena.exprs, step, &[i64::from(current), acc, i64::from(prev)]);
+                scratch.added.push(eval_expr(&reduction.arena.exprs, reduction.body, &[i64::from(current), next, i64::from(prev)]));
+                acc = next;
+                prev = current;
+                work = work.saturating_add(1);
+                let old_boundary = old_pos + 1;
+                if acc == self.scan_acc[old_boundary] {
+                    reuse_from = Some(old_boundary);
+                    break;
+                }
+            }
+        }
+
+        let old_reuse_start = if let Some(reuse_from) = reuse_from {
+            reuse_from
+        } else if let Some(end) = end {
+            poll_stop(stop, work)?;
             let next = eval_expr(&reduction.arena.exprs, step, &[i64::from(end), acc, i64::from(prev)]);
             scratch.added.push(eval_expr(&reduction.arena.exprs, reduction.body, &[i64::from(end), next, i64::from(prev)]));
-        }
+            self.outputs.len()
+        } else {
+            old.len()
+        };
+
+        extend_interruptible(&mut scratch.removed, &self.outputs[prefix..old_reuse_start], stop)?;
         scratch.recomputed_scan_steps = u64::try_from(scratch.added.len()).unwrap_or(u64::MAX);
-        self.finish_contiguous_sum(prefix, self.outputs.len(), scratch, stop)
+        self.finish_contiguous_sum(prefix, old_reuse_start, scratch, stop)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -584,7 +626,7 @@ impl ReductionCache {
         &self,
         reduction: &Reduction,
         old: &[i32],
-        candidate: &dyn ListView,
+        candidate: &(impl ListView + ?Sized),
         prefix: usize,
         suffix: usize,
         size: usize,
@@ -939,7 +981,7 @@ fn select_after_changes_interruptible(
     Ok(Some(low as i64))
 }
 
-fn edge_nodes(view: &dyn ListView, edge: usize, start: i32, end: i32) -> (i32, i32) {
+fn edge_nodes(view: &(impl ListView + ?Sized), edge: usize, start: i32, end: i32) -> (i32, i32) {
     let from = if edge == 0 { start } else { view.at(edge - 1) };
     let to = if edge == view.len() { end } else { view.at(edge) };
     (from, to)

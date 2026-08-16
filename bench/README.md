@@ -155,6 +155,42 @@ For the full campaign, use `--suite competitive`, budgets such as
 `--hexaly-home`, `--hgs-binary`, and `--lkh-binary`. The runner is resumable by
 default. Use `--restart` only when intentionally replacing an output file.
 
+### VRPTW fleet-first qualification
+
+The Solomon sentinel gate uses C101, R101, RC101, C201, R201 and RC201 with
+seeds 0 through 4, a 10-second wall-clock budget and one worker. The report
+checks every run independently before aggregating fleet, distance and RSS. It
+also requires full Solomon incumbent coverage and matched Homberger 200/400
+families, so a successful six-instance sample cannot be presented as a scale
+qualification.
+
+```sh
+uv run bench/campaign.py \
+  --suite positioning --family positioning-vrptw \
+  --solver qayd-api --solver hexaly \
+  --budget 10 --seed 0,1,2,3,4 --threads 1 \
+  --qayd-engine ls --profile-qayd \
+  --hexaly-home /opt/hexaly_14_5 \
+  --out bench/results/vrptw-sentinels.jsonl
+
+uv run bench/vrptw_search_report.py \
+  --qayd-campaign bench/results/vrptw-sentinels.jsonl \
+  --hexaly-campaign bench/results/vrptw-sentinels.jsonl \
+  --solomon-campaign bench/results/vrptw-solomon.jsonl \
+  --homberger-campaign bench/results/vrptw-homberger.jsonl \
+  --json bench/results/vrptw-search-report.json \
+  --markdown bench/results/vrptw-search-report.md \
+  --require-acceptance
+```
+
+Duplicate `(instance, seed)` records fail the final gate. Keep each campaign
+source-disjoint or restart its output deliberately. The JSON report retains
+per-instance distance gaps and same-fleet seed pairs. The publication threshold
+uses the median of instance-level median gaps whose median fleets match. The
+Homberger scale table publishes the strict doubled 200-customer fleet limit and
+a separate acceptance limit with one additional route for integer granularity;
+two or more excess routes fail the gate.
+
 Qayd LS profiling is explicit and enabled by the campaign runner. Use
 `--no-profile-qayd` for quality-only measurements or `--max-iterations N` for a
 deterministic work budget. The same controls are available as

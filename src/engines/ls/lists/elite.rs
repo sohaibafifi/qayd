@@ -72,6 +72,7 @@ pub(super) struct EliteEntry {
     score: Score,
     edges: Vec<EliteEdge>,
     hash: u64,
+    fleet: usize,
 }
 
 impl EliteEntry {
@@ -230,52 +231,53 @@ impl ElitePool {
         }
         let edges = sorted_edges_bounded(lists, self.preserve_route_identity, self.canonicalize_reverse, context)?;
         let hash = stable_edge_hash_bounded(&edges, context)?;
+        let fleet = lists.iter().filter(|route| !route.is_empty()).count();
 
-        if let Some(index) = self.duplicate_index(hash, &edges, context)? {
+        if let Some(index) = self.duplicate_index(fleet, hash, &edges, context)? {
             if score_cmp_bounded(score, &self.entries[index].score, context)?.is_ge() {
                 return Ok(false);
             }
             let insertion = self.insertion_index(score, hash, Some(index), context)?;
-            let entry = clone_entry_bounded(lists, score, edges, hash, context)?;
+            let entry = clone_entry_bounded(lists, score, edges, hash, fleet, context)?;
             self.commit_entry(Some(index), insertion, entry, context)?;
             return Ok(true);
         }
 
         if self.entries.is_empty() {
-            let entry = clone_entry_bounded(lists, score, edges, hash, context)?;
+            let entry = clone_entry_bounded(lists, score, edges, hash, fleet, context)?;
             self.commit_entry(None, 0, entry, context)?;
             return Ok(true);
         }
 
-        let (closest_distance, closest_index) = self.closest_entry(&edges, context)?.expect("the pool is non-empty");
-        context.unit()?;
-        let diversity_floor = (edges.len() / 16).max(2);
-        if closest_distance < diversity_floor && score_cmp_bounded(score, &self.entries[closest_index].score, context)?.is_ge() {
-            return Ok(false);
-        }
-        if closest_distance < diversity_floor {
-            let insertion = self.insertion_index(score, hash, Some(closest_index), context)?;
-            let entry = clone_entry_bounded(lists, score, edges, hash, context)?;
-            self.commit_entry(Some(closest_index), insertion, entry, context)?;
-            return Ok(true);
+        let fleet_entries = self.entries.iter().filter(|entry| entry.fleet == fleet).count();
+        if let Some((closest_distance, closest_index)) = self.closest_entry(fleet, &edges, context)? {
+            context.unit()?;
+            let diversity_floor = (edges.len() / 16).max(2);
+            if closest_distance < diversity_floor && score_cmp_bounded(score, &self.entries[closest_index].score, context)?.is_ge() {
+                return Ok(false);
+            }
+            if closest_distance < diversity_floor {
+                let insertion = self.insertion_index(score, hash, Some(closest_index), context)?;
+                let entry = clone_entry_bounded(lists, score, edges, hash, fleet, context)?;
+                self.commit_entry(Some(closest_index), insertion, entry, context)?;
+                return Ok(true);
+            }
         }
 
         let insertion = self.insertion_index(score, hash, None, context)?;
-        if self.entries.len() < self.capacity {
-            let entry = clone_entry_bounded(lists, score, edges, hash, context)?;
+        if fleet_entries < self.capacity {
+            let entry = clone_entry_bounded(lists, score, edges, hash, fleet, context)?;
             self.commit_entry(None, insertion, entry, context)?;
             return Ok(true);
         }
 
         let candidate = EliteCandidateView { score, edges: &edges, hash };
-        let remove = self.least_diverse_with_candidate(candidate, insertion, context)?;
-        if remove == insertion {
+        let Some(remove) = self.least_diverse_in_fleet(candidate, fleet, context)? else {
             return Ok(false);
-        }
-        let physical_remove = if remove < insertion { remove } else { remove.saturating_sub(1) };
-        let final_insertion = insertion.saturating_sub(usize::from(physical_remove < insertion));
-        let entry = clone_entry_bounded(lists, score, edges, hash, context)?;
-        self.commit_entry(Some(physical_remove), final_insertion, entry, context)?;
+        };
+        let final_insertion = insertion.saturating_sub(usize::from(remove < insertion));
+        let entry = clone_entry_bounded(lists, score, edges, hash, fleet, context)?;
+        self.commit_entry(Some(remove), final_insertion, entry, context)?;
         Ok(true)
     }
 
@@ -319,12 +321,16 @@ impl ElitePool {
     ) -> Result<Option<usize>, EliteOperationStatus> {
         let source_edges = sorted_edges_bounded(&source.lists, self.preserve_route_identity, self.canonicalize_reverse, context)?;
         let source_hash = stable_edge_hash_bounded(&source_edges, context)?;
+        let source_fleet = source.lists.iter().filter(|route| !route.is_empty()).count();
         context.begin(EliteTask::ArchiveOrdering)?;
         let allocation = context.reserve(1)?;
         let mut ranked = Vec::with_capacity(self.entries.len());
         context.complete(allocation);
         for (index, entry) in self.entries.iter().enumerate() {
             context.unit()?;
+            if entry.fleet != source_fleet {
+                continue;
+            }
             if entry.hash == source_hash && edges_equal_bounded(&entry.edges, &source_edges, context)? {
                 continue;
             }
@@ -344,13 +350,14 @@ impl ElitePool {
 
     fn duplicate_index<H: EliteHooks>(
         &self,
+        fleet: usize,
         hash: u64,
         edges: &[EliteEdge],
         context: &mut EliteWorkContext<'_, H>,
     ) -> Result<Option<usize>, EliteOperationStatus> {
         for (index, entry) in self.entries.iter().enumerate() {
             context.unit()?;
-            if entry.hash == hash && edges_equal_bounded(&entry.edges, edges, context)? {
+            if entry.fleet == fleet && entry.hash == hash && edges_equal_bounded(&entry.edges, edges, context)? {
                 return Ok(Some(index));
             }
         }
@@ -359,13 +366,17 @@ impl ElitePool {
 
     fn closest_entry<H: EliteHooks>(
         &self,
+        fleet: usize,
         edges: &[EliteEdge],
         context: &mut EliteWorkContext<'_, H>,
     ) -> Result<Option<(usize, usize)>, EliteOperationStatus> {
         let mut closest = None;
         for (index, entry) in self.entries.iter().enumerate() {
-            let distance = edge_distance_sorted_bounded(edges, &entry.edges, context)?;
             context.unit()?;
+            if entry.fleet != fleet {
+                continue;
+            }
+            let distance = edge_distance_sorted_bounded(edges, &entry.edges, context)?;
             if closest.is_none_or(|best: (usize, usize)| (distance, index) < best) {
                 closest = Some((distance, index));
             }
@@ -395,34 +406,60 @@ impl ElitePool {
         Ok(insertion)
     }
 
-    fn least_diverse_with_candidate<H: EliteHooks>(
+    /// Return the physical entry to evict from one fleet bucket, or `None` when
+    /// the candidate itself is the least useful member. Fleet buckets are
+    /// intentionally independent: a good solution with k vehicles cannot evict
+    /// the search material retained for k-1, nor can relinking cross that
+    /// semantic boundary.
+    fn least_diverse_in_fleet<H: EliteHooks>(
         &self,
         candidate: EliteCandidateView<'_>,
-        insertion: usize,
+        fleet: usize,
         context: &mut EliteWorkContext<'_, H>,
-    ) -> Result<usize, EliteOperationStatus> {
-        let virtual_len = self.entries.len().saturating_add(1);
+    ) -> Result<Option<usize>, EliteOperationStatus> {
+        context.begin(EliteTask::ArchiveOrdering)?;
+        let allocation = context.reserve(1)?;
+        let mut members: Vec<(Option<usize>, EliteCandidateView<'_>)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.fleet == fleet)
+            .map(|(index, entry)| (Some(index), EliteCandidateView { score: &entry.score, edges: &entry.edges, hash: entry.hash }))
+            .collect();
+        members.push((None, candidate));
+        context.complete(allocation);
+
+        let mut best = 0usize;
+        for index in 1..members.len() {
+            if score_hash_cmp_bounded(members[index].1.score, members[index].1.hash, members[best].1.score, members[best].1.hash, context)?
+                .is_lt()
+            {
+                best = index;
+            }
+        }
         let mut selected: Option<(usize, usize)> = None;
-        for index in 1..virtual_len {
-            let entry = self.virtual_entry(candidate, insertion, index);
+        for index in 0..members.len() {
+            if index == best {
+                continue;
+            }
+            let entry = members[index].1;
             let mut nearest = usize::MAX;
-            for other in 0..virtual_len {
+            for (other, &(_, other_entry)) in members.iter().enumerate() {
                 if other == index {
                     continue;
                 }
-                let other_entry = self.virtual_entry(candidate, insertion, other);
                 nearest = nearest.min(edge_distance_sorted_bounded(entry.edges, other_entry.edges, context)?);
             }
             let replace = match selected {
                 None => true,
-                Some((best_nearest, best_index)) if nearest < best_nearest => true,
+                Some((best_nearest, _)) if nearest < best_nearest => true,
                 Some((best_nearest, best_index)) if nearest == best_nearest => {
-                    let best = self.virtual_entry(candidate, insertion, best_index);
-                    match score_cmp_bounded(entry.score, best.score, context)? {
+                    let selected_entry = members[best_index].1;
+                    match score_cmp_bounded(entry.score, selected_entry.score, context)? {
                         std::cmp::Ordering::Greater => true,
                         std::cmp::Ordering::Equal => {
                             context.unit()?;
-                            entry.hash > best.hash
+                            entry.hash > selected_entry.hash
                         }
                         std::cmp::Ordering::Less => false,
                     }
@@ -433,17 +470,7 @@ impl ElitePool {
                 selected = Some((nearest, index));
             }
         }
-        Ok(selected.expect("a non-best archive entry exists").1)
-    }
-
-    fn virtual_entry<'a>(&'a self, candidate: EliteCandidateView<'a>, insertion: usize, index: usize) -> EliteCandidateView<'a> {
-        if index == insertion {
-            candidate
-        } else {
-            let physical = index.saturating_sub(usize::from(index > insertion));
-            let entry = &self.entries[physical];
-            EliteCandidateView { score: &entry.score, edges: &entry.edges, hash: entry.hash }
-        }
+        Ok(members[selected.expect("a non-best fleet entry exists").1].0)
     }
 
     fn commit_entry<H: EliteHooks>(
@@ -709,6 +736,7 @@ fn clone_entry_bounded<H: EliteHooks>(
     score: &Score,
     edges: Vec<EliteEdge>,
     hash: u64,
+    fleet: usize,
     context: &mut EliteWorkContext<'_, H>,
 ) -> Result<EliteEntry, EliteOperationStatus> {
     context.begin(EliteTask::ListCloning)?;
@@ -731,7 +759,7 @@ fn clone_entry_bounded<H: EliteHooks>(
         context.unit()?;
         cloned_score.tiers.push(tier);
     }
-    Ok(EliteEntry { lists: cloned_lists, score: cloned_score, edges, hash })
+    Ok(EliteEntry { lists: cloned_lists, score: cloned_score, edges, hash, fleet })
 }
 
 fn sort_elite_ranks_bounded<H: EliteHooks>(
@@ -1459,7 +1487,8 @@ fn audit_flat_relink_model(item_count: usize) -> CollectionModel {
 
 #[cfg(test)]
 fn audit_target_entry(lists: Vec<Vec<i32>>) -> EliteEntry {
-    EliteEntry { lists, score: Score { violation: 0, tiers: std::iter::empty().collect() }, edges: Vec::new(), hash: 0 }
+    let fleet = lists.iter().filter(|route| !route.is_empty()).count();
+    EliteEntry { lists, score: Score { violation: 0, tiers: std::iter::empty().collect() }, edges: Vec::new(), hash: 0, fleet }
 }
 
 #[doc(hidden)]

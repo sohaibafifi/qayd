@@ -196,3 +196,6 @@ mod semantic_preparation_interruption;
 #[cfg(test)]
 #[path = "../tests/internal/verification_boundaries.rs"]
 mod verification_boundaries;
+#[cfg(test)]
+#[path = "../tests/internal/vrptw_search.rs"]
+mod vrptw_search;

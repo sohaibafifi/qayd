@@ -15,8 +15,8 @@ use smallvec::SmallVec;
 
 use super::alns::{
     build_candidate, build_candidate_bounded, build_macro_candidate_bounded, routing_compound_structural_floor,
-    routing_relink_structural_floor, routing_route_elimination_floor, AcceptanceKind, AlnsBuildStatus, AlnsController, AlnsWorkBudget,
-    MacroOperator, SearchProfile,
+    routing_relink_structural_floor, routing_route_elimination_floor, AcceptanceKind, AlnsBuildRun, AlnsBuildStatus, AlnsController,
+    AlnsWorkBudget, MacroOperator, SearchProfile,
 };
 use super::elite::{elite_archive_budget, elite_selection_budget, path_relink_bounded, EliteOperationStatus, ElitePool, PathRelinkStatus};
 use super::eval::{eval_reduction, violation_of, INFEASIBLE};
@@ -30,6 +30,7 @@ use super::portfolio::WorkerCoordination;
 use super::routing_search::{RoutingSearchControl, SliceKind};
 use crate::engines::dual;
 use crate::mix64;
+use crate::model::list::scan::{time_window_scan_signature, TimeWindowScanSpec};
 use crate::model::list::{
     CollectionModel, CollectionSolution, Constraint, Expr, ExprId, GlobalConstraint, Iterable, MaxTerm, ReduceOp, Reduction,
 };
@@ -296,8 +297,13 @@ struct RoutingSignature {
     demands: Option<Arc<Vec<i64>>>,
     capacity: Option<i64>,
     has_time_windows: bool,
+    time_windows: Option<TimeWindowScanSpec>,
     has_fleet_objective: bool,
     reverse_equivalent: bool,
+    distance_scale: u64,
+    demand_scale: u64,
+    time_scale: u64,
+    slack_scale: u64,
 }
 
 pub(super) struct CandidateNeighbors {
@@ -308,10 +314,18 @@ pub(super) struct CandidateNeighbors {
     /// at most two adjacency entries per directed kNN edge, including route
     /// boundary nodes such as the depot.
     routing_map: HashMap<i32, Vec<i32>>,
+    /// Semantic neighbors derived from a recognized time-window scan.
+    semantic_map: HashMap<i32, Vec<i32>>,
 }
 
 impl CandidateNeighbors {
-    fn build(model: &CollectionModel, matrix: Arc<Vec<Vec<i64>>>, limit: usize, stop: &AtomicBool) -> Option<Self> {
+    fn build(
+        model: &CollectionModel,
+        matrix: Arc<Vec<Vec<i64>>>,
+        routing: Option<&RoutingSignature>,
+        limit: usize,
+        stop: &AtomicBool,
+    ) -> Option<Self> {
         let n = matrix.len();
         if n == 0 || matrix.iter().any(|row| row.len() != n) {
             return None;
@@ -342,6 +356,7 @@ impl CandidateNeighbors {
         let keep = limit.min(targets.len().saturating_sub(1));
 
         let mut map = HashMap::with_capacity(values.len());
+        let mut semantic_map = HashMap::with_capacity(values.len());
         for &from in &values {
             if stop.load(Ordering::Relaxed) {
                 return None;
@@ -351,6 +366,7 @@ impl CandidateNeighbors {
             // full sort here used to make candidate construction O(n² log n)
             // and left one whole row uninterruptible.
             let mut heap = BinaryHeap::with_capacity(keep);
+            let mut semantic_heap = BinaryHeap::with_capacity(keep);
             for (target_at, &to) in targets.iter().enumerate() {
                 if target_at.is_multiple_of(256) && stop.load(Ordering::Relaxed) {
                     return None;
@@ -366,10 +382,24 @@ impl CandidateNeighbors {
                     heap.pop();
                     heap.push(entry);
                 }
+                if let Some(routing) = routing.filter(|signature| signature.time_windows.is_some()) {
+                    let semantic_entry = (routing_relatedness(routing, from, to, true), to);
+                    if semantic_heap.len() < keep {
+                        semantic_heap.push(semantic_entry);
+                    } else if semantic_heap.peek().is_some_and(|worst| semantic_entry < *worst) {
+                        semantic_heap.pop();
+                        semantic_heap.push(semantic_entry);
+                    }
+                }
             }
             let mut near = heap.into_vec();
             near.sort_unstable_by_key(|&(cost, to)| (cost, to));
             map.insert(from, near.into_iter().map(|(_, to)| to).collect());
+            if !semantic_heap.is_empty() {
+                let mut related = semantic_heap.into_vec();
+                related.sort_unstable();
+                semantic_map.insert(from, related.into_iter().map(|(_, to)| to).collect());
+            }
         }
 
         // Routing treats a candidate edge as undirected.  Build that view in
@@ -392,7 +422,7 @@ impl CandidateNeighbors {
                 }
             }
         }
-        Some(Self { map, routing_map })
+        Some(Self { map, routing_map, semantic_map })
     }
 
     pub(super) fn contains(&self, a: i32, b: i32) -> bool {
@@ -407,11 +437,140 @@ impl CandidateNeighbors {
         self.routing_map.get(&item).map_or(&[], Vec::as_slice)
     }
 
-    /// The nearest neighbour of `from` (by edge cost) that is currently present and
-    /// not already removed -- the relatedness ranking used by Shaw removal.
-    pub(super) fn nearest_present(&self, from: i32, removed: &HashSet<i32>, present: &HashSet<i32>) -> Option<i32> {
-        self.map.get(&from)?.iter().copied().find(|to| present.contains(to) && !removed.contains(to))
+    pub(super) fn semantic_neighbors(&self, item: i32) -> &[i32] {
+        self.semantic_map.get(&item).map_or(&[], Vec::as_slice)
     }
+
+    pub(super) fn contains_semantic(&self, left: i32, right: i32) -> bool {
+        self.contains(left, right)
+            || self.semantic_map.get(&left).is_some_and(|near| near.contains(&right))
+            || self.semantic_map.get(&right).is_some_and(|near| near.contains(&left))
+    }
+}
+
+fn interleaved_construction_neighbors(neighbors: &CandidateNeighbors, item: i32, limit: usize) -> Vec<i32> {
+    let geometric = neighbors.neighbors(item);
+    let semantic = neighbors.semantic_neighbors(item);
+    let mut combined = Vec::with_capacity(limit.min(geometric.len().saturating_add(semantic.len())));
+    let mut seen = HashSet::with_capacity(combined.capacity());
+    for index in 0..geometric.len().max(semantic.len()) {
+        for candidate in [semantic.get(index), geometric.get(index)].into_iter().flatten() {
+            if combined.len() >= limit {
+                return combined;
+            }
+            if seen.insert(*candidate) {
+                combined.push(*candidate);
+            }
+        }
+    }
+    combined
+}
+
+fn normalized_difference(left: i64, right: i64, scale: u64) -> u64 {
+    let difference = (i128::from(left) - i128::from(right)).unsigned_abs();
+    u64::try_from(difference.saturating_mul(1_000) / u128::from(scale.max(1))).unwrap_or(u64::MAX)
+}
+
+impl PerList {
+    pub(super) fn minimizes_fleet(&self) -> bool {
+        self.routing.as_ref().is_some_and(|routing| routing.has_fleet_objective)
+    }
+
+    /// Deterministic Shaw relatedness assembled from model semantics. Every
+    /// component is normalized before weighting, so distance units cannot drown
+    /// window, slack, demand, or route-membership information.
+    pub(super) fn shaw_relatedness(&self, left: i32, right: i32, same_route: bool) -> u64 {
+        let Some(routing) = &self.routing else {
+            return u64::from(!same_route).saturating_mul(1_000);
+        };
+        routing_relatedness(routing, left, right, same_route)
+    }
+
+    /// Remaining normalized resource margin after a feasible routing edit.
+    /// Fleet reduction maximizes this before distance so early insertions do
+    /// not consume the only room needed by later customers.
+    pub(super) fn routing_headroom(&self, route: &[i32]) -> i64 {
+        let Some(routing) = &self.routing else { return 0 };
+        let mut headroom = 0i128;
+        if let (Some(demands), Some(capacity)) = (&routing.demands, routing.capacity) {
+            let load = route.iter().fold(0i64, |total, &item| {
+                total.saturating_add(usize::try_from(item).ok().and_then(|index| demands.get(index)).copied().unwrap_or(0))
+            });
+            let remaining = capacity.saturating_sub(load).max(0);
+            headroom = headroom.saturating_add(i128::from(remaining).saturating_mul(1_000) / i128::from(capacity.max(1)));
+        }
+        if let Some(windows) = &routing.time_windows {
+            let Ok(mut previous) = usize::try_from(routing.depot) else { return 0 };
+            let mut departure = windows.earliest.get(previous).copied().unwrap_or(0);
+            let mut minimum = i64::MAX;
+            for &item in route.iter().chain(std::iter::once(&routing.depot)) {
+                let Ok(current) = usize::try_from(item) else { return 0 };
+                let travel = windows.travel.get(previous).and_then(|row| row.get(current)).copied().unwrap_or(i64::MAX);
+                let earliest = windows.earliest.get(current).copied().unwrap_or(0);
+                let latest = windows.latest_start.get(current).copied().unwrap_or(i64::MIN);
+                let start = earliest.max(departure.saturating_add(travel));
+                minimum = minimum.min(latest.saturating_sub(start));
+                departure = start.saturating_add(windows.service.get(current).copied().unwrap_or(0));
+                previous = current;
+            }
+            let time_margin = i128::from(minimum.max(0)).saturating_mul(1_000) / i128::from(routing.time_scale.max(1));
+            headroom = headroom.saturating_add(time_margin);
+        }
+        i64::try_from(headroom).unwrap_or(i64::MAX)
+    }
+}
+
+fn routing_relatedness(routing: &RoutingSignature, left: i32, right: i32, same_route: bool) -> u64 {
+    let (Ok(left_index), Ok(right_index)) = (usize::try_from(left), usize::try_from(right)) else {
+        return u64::MAX;
+    };
+    let spatial = routing
+        .matrix
+        .get(left_index)
+        .and_then(|row| row.get(right_index))
+        .copied()
+        .map_or(1_000, |distance| normalized_difference(distance, 0, routing.distance_scale));
+    let demand = routing.demands.as_ref().map_or(0, |demands| {
+        demands
+            .get(left_index)
+            .copied()
+            .zip(demands.get(right_index).copied())
+            .map_or(0, |(left, right)| normalized_difference(left, right, routing.demand_scale))
+    });
+    let (window, slack, temporal_arc) = routing.time_windows.as_ref().map_or((0, 0, 0), |windows| {
+        let Some((&left_earliest, &right_earliest, &left_latest, &right_latest)) = windows
+            .earliest
+            .get(left_index)
+            .zip(windows.earliest.get(right_index))
+            .zip(windows.latest_start.get(left_index).zip(windows.latest_start.get(right_index)))
+            .map(|((left_earliest, right_earliest), (left_latest, right_latest))| {
+                (left_earliest, right_earliest, left_latest, right_latest)
+            })
+        else {
+            return (0, 0, 0);
+        };
+        let center_left = i128::from(left_earliest).saturating_add(i128::from(left_latest));
+        let center_right = i128::from(right_earliest).saturating_add(i128::from(right_latest));
+        let window = u64::try_from((center_left - center_right).unsigned_abs().saturating_mul(500) / u128::from(routing.time_scale.max(1)))
+            .unwrap_or(u64::MAX);
+        let slack = normalized_difference(
+            left_latest.saturating_sub(left_earliest),
+            right_latest.saturating_sub(right_earliest),
+            routing.slack_scale,
+        );
+        let temporal_arc = windows.travel.get(left_index).and_then(|row| row.get(right_index)).copied().map_or(0, |travel| {
+            let service = windows.service.get(left_index).copied().unwrap_or(0);
+            normalized_difference(service.saturating_add(travel), 0, routing.time_scale)
+        });
+        (window, slack, temporal_arc)
+    });
+    spatial
+        .saturating_mul(9)
+        .saturating_add(window.saturating_mul(3))
+        .saturating_add(slack.saturating_mul(2))
+        .saturating_add(temporal_arc.saturating_mul(2))
+        .saturating_add(demand.saturating_mul(2))
+        .saturating_add(u64::from(!same_route).saturating_mul(5_000))
 }
 
 #[derive(Clone, Copy)]
@@ -546,15 +705,51 @@ fn routing_signature(model: &CollectionModel) -> Option<RoutingSignature> {
     let demands = capacity_constraint.and_then(|constraint| direct_item_array(&constraint.reduction));
     let capacity = capacity_constraint.map(|constraint| constraint.rhs);
     let has_time_windows = model.constraints.iter().any(|constraint| matches!(constraint.reduction.iterable, Iterable::Scan { .. }));
-    let has_fleet_objective =
-        model.objectives.iter().flat_map(|tier| tier.reductions()).any(|reduction| matches!(reduction.op, ReduceOp::Used));
+    let time_windows = model.constraints.iter().find_map(time_window_scan_signature);
+    let has_fleet_objective = model.objectives.first().is_some_and(|tier| {
+        tier.minimize
+            && tier.max_terms.as_ref().is_none_or(|terms| terms.is_empty())
+            && tier.terms.len() == model.lists
+            && tier.terms.iter().all(|reduction| {
+                matches!(reduction.op, ReduceOp::Used) && matches!(reduction.iterable, Iterable::Items(_)) && reduction.coeff > 0
+            })
+    });
     let reverse_equivalent = model
         .objectives
         .iter()
         .flat_map(|tier| tier.reductions())
         .chain(model.constraints.iter().map(|constraint| &constraint.reduction))
         .all(reversal_invariant_reduction);
-    Some(RoutingSignature { depot, matrix, demands, capacity, has_time_windows, has_fleet_objective, reverse_equivalent })
+    let distance_scale = matrix.iter().flat_map(|row| row.iter()).map(|value| value.unsigned_abs()).max().unwrap_or(1).max(1);
+    let demand_scale = demands
+        .as_ref()
+        .and_then(|values| {
+            let minimum = values.iter().copied().min()?;
+            let maximum = values.iter().copied().max()?;
+            Some(maximum.saturating_sub(minimum).unsigned_abs().max(1))
+        })
+        .unwrap_or(1);
+    let (time_scale, slack_scale) = time_windows.as_ref().map_or((1, 1), |windows| {
+        let earliest = windows.earliest.iter().copied().min().unwrap_or(0);
+        let latest = windows.latest_start.iter().copied().max().unwrap_or(earliest);
+        let slack =
+            windows.earliest.iter().zip(windows.latest_start.iter()).map(|(&start, &end)| end.saturating_sub(start)).max().unwrap_or(0);
+        (latest.saturating_sub(earliest).unsigned_abs().max(1), slack.unsigned_abs().max(1))
+    });
+    Some(RoutingSignature {
+        depot,
+        matrix,
+        demands,
+        capacity,
+        has_time_windows,
+        time_windows,
+        has_fleet_objective,
+        reverse_equivalent,
+        distance_scale,
+        demand_scale,
+        time_scale,
+        slack_scale,
+    })
 }
 
 /// Whether the specialized sliced routing trajectory can consume this physical
@@ -818,6 +1013,8 @@ impl PerList {
         let routing_gls = enable_routing_gls.then(|| routing_gls(&objective, &senses, stop)).flatten();
         let routing = has_edges.then(|| routing_signature(model)).flatten();
         let construction_limit = ((model.items.len() as f64).sqrt().ceil() as usize).clamp(8, 64);
+        let candidates = candidate_matrix
+            .and_then(|matrix| CandidateNeighbors::build(model, matrix, routing.as_ref(), candidate_limit.max(construction_limit), stop));
         Self {
             objective,
             max_objective,
@@ -829,8 +1026,7 @@ impl PerList {
             globals: Globals::build(model, stop),
             has_edges,
             route_bounds,
-            candidates: candidate_matrix
-                .and_then(|matrix| CandidateNeighbors::build(model, matrix, candidate_limit.max(construction_limit), stop)),
+            candidates,
             routing,
             infeas_cand: true,
             interchangeable_lists: Cell::new(interchangeable_lists),
@@ -917,6 +1113,15 @@ impl PerList {
             }
         }
         Some(bumped)
+    }
+
+    fn reset_routing_gls(&self) -> bool {
+        let Some(gls) = &self.routing_gls else { return false };
+        for row in gls.penalties.borrow_mut().iter_mut() {
+            row.fill(0);
+        }
+        gls.lambda.set(1);
+        true
     }
 
     pub(super) fn has_max_objective(&self) -> bool {
@@ -1615,6 +1820,7 @@ impl State {
 
 struct InitialConstruction {
     state: State,
+    incumbent: Option<State>,
     name: &'static str,
     elapsed: std::time::Duration,
     feasible_history: Vec<InitialFeasible>,
@@ -1752,8 +1958,8 @@ fn construction_positions(per: &PerList, route: &[i32], item: i32) -> Vec<usize>
         .iter()
         .copied()
         .filter(|&position| {
-            position.checked_sub(1).is_some_and(|before| neighbors.contains(item, route[before]))
-                || route.get(position).is_some_and(|&after| neighbors.contains(item, after))
+            position.checked_sub(1).is_some_and(|before| neighbors.contains_semantic(item, route[before]))
+                || route.get(position).is_some_and(|&after| neighbors.contains_semantic(item, after))
                 || route.is_empty()
         })
         .collect();
@@ -1919,7 +2125,7 @@ fn savings_state(
     let neighbor_limit = if routing.has_time_windows { base_neighbor_limit.saturating_mul(2).min(64) } else { base_neighbor_limit };
     for &from in &model.items {
         let nearby: Vec<i32> = if let Some(neighbors) = &per.candidates {
-            neighbors.neighbors(from).iter().copied().take(neighbor_limit).collect()
+            interleaved_construction_neighbors(neighbors, from, neighbor_limit)
         } else {
             model.items.iter().copied().filter(|&item| item != from).take(neighbor_limit).collect()
         };
@@ -2025,7 +2231,7 @@ fn savings_from_singletons_state(
     let neighbor_limit = if routing.has_time_windows { base_neighbor_limit.saturating_mul(2).min(64) } else { base_neighbor_limit };
     for &from in &model.items {
         let nearby: Vec<i32> = if let Some(neighbors) = &per.candidates {
-            neighbors.neighbors(from).iter().copied().take(neighbor_limit).collect()
+            interleaved_construction_neighbors(neighbors, from, neighbor_limit)
         } else {
             model.items.iter().copied().filter(|&item| item != from).take(neighbor_limit).collect()
         };
@@ -2090,6 +2296,177 @@ fn savings_from_singletons_state(
     best_feasible.map(|(state, _)| state)
 }
 
+fn routing_construction_orders(model: &CollectionModel, routing: &RoutingSignature, randomized: &[usize]) -> Vec<Vec<usize>> {
+    let stable: Vec<usize> = (0..model.items.len()).collect();
+    let mut reversed = stable.clone();
+    reversed.reverse();
+    let mut orders = vec![stable];
+    if let Some(windows) = routing.time_windows.as_ref() {
+        let item_value = |index: usize| model.items[index];
+        let time = |values: &[i64], index: usize| {
+            usize::try_from(item_value(index)).ok().and_then(|item| values.get(item)).copied().unwrap_or(i64::MAX)
+        };
+        let mut earliest = (0..model.items.len()).collect::<Vec<_>>();
+        earliest.sort_by_key(|&index| (time(&windows.earliest, index), item_value(index)));
+        let mut latest = (0..model.items.len()).collect::<Vec<_>>();
+        latest.sort_by_key(|&index| (time(&windows.latest_start, index), item_value(index)));
+        let mut tight = (0..model.items.len()).collect::<Vec<_>>();
+        tight.sort_by_key(|&index| {
+            (
+                time(&windows.latest_start, index).saturating_sub(time(&windows.earliest, index)),
+                time(&windows.earliest, index),
+                item_value(index),
+            )
+        });
+        orders.extend([earliest, latest, tight]);
+    }
+    orders.extend([randomized.to_vec(), reversed]);
+    let mut unique = Vec::with_capacity(orders.len());
+    for order in orders {
+        if !unique.contains(&order) {
+            unique.push(order);
+        }
+    }
+    unique
+}
+
+fn sequential_insertion_state(
+    model: &CollectionModel,
+    per: &PerList,
+    attempt: u64,
+    seed: u64,
+    stop: &AtomicBool,
+    candidates: &mut u64,
+    candidate_budget: u64,
+) -> Option<State> {
+    let routing = per.routing.as_ref()?;
+    let windows = routing.time_windows.as_ref()?;
+    let depot = usize::try_from(routing.depot).ok()?;
+    let depot_distance = |item: i32| {
+        let item = usize::try_from(item).ok()?;
+        routing.matrix.get(depot)?.get(item).copied()
+    };
+    let depot_round_trip = |item: i32| {
+        let item = usize::try_from(item).ok()?;
+        routing
+            .matrix
+            .get(depot)?
+            .get(item)
+            .copied()
+            .zip(routing.matrix.get(item)?.get(depot).copied())
+            .map(|(outbound, inbound)| outbound.saturating_add(inbound))
+    };
+    let latest = |item: i32| usize::try_from(item).ok().and_then(|item| windows.latest_start.get(item)).copied().unwrap_or(i64::MAX);
+    let slack = |item: i32| {
+        usize::try_from(item)
+            .ok()
+            .and_then(|item| windows.earliest.get(item).zip(windows.latest_start.get(item)))
+            .map_or(i64::MAX, |(&earliest, &latest)| latest.saturating_sub(earliest))
+    };
+    let mut remaining = model.items.clone();
+    let mut routes = Vec::new();
+    while !remaining.is_empty() {
+        if stop.load(Ordering::Relaxed) || *candidates >= candidate_budget || routes.len() >= model.lists {
+            return None;
+        }
+        let classical = attempt < 6;
+        let old_variant = attempt.saturating_sub(6);
+        let seed_rule = if classical {
+            attempt % 2
+        } else {
+            match old_variant {
+                0 => 1,
+                1 => 2,
+                2 => 0,
+                _ => 2,
+            }
+        };
+        let seed_at = match seed_rule {
+            0 => remaining
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, &item)| (depot_distance(item).unwrap_or(i64::MIN), std::cmp::Reverse(latest(item)), item))
+                .map(|(index, _)| index),
+            1 => remaining
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, &item)| (latest(item), std::cmp::Reverse(depot_distance(item)), item))
+                .map(|(index, _)| index),
+            _ => remaining
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, &item)| (slack(item), latest(item), std::cmp::Reverse(depot_distance(item)), item))
+                .map(|(index, _)| index),
+        }?;
+        let route_seed = remaining.swap_remove(seed_at);
+        let mut route = vec![route_seed];
+        let (mut route_metrics, mut route_starts, mut return_start) = fixed_route_schedule(routing, &route)?;
+        let (distance_weight, delay_weight) = match (attempt / 2) % 3 {
+            0 => (2i128, 0i128),
+            1 => (1, 1),
+            _ => (0, 2),
+        };
+
+        loop {
+            if stop.load(Ordering::Relaxed) || *candidates >= candidate_budget {
+                return None;
+            }
+            let mut selected: Option<(i128, i64, u64, usize, usize, FixedRouteMetrics)> = None;
+            for (remaining_at, &item) in remaining.iter().enumerate() {
+                for position in 0..=route.len() {
+                    if *candidates >= candidate_budget {
+                        return None;
+                    }
+                    *candidates = candidates.saturating_add(1);
+                    per.metrics.record_candidate();
+                    let mut inserted = Vec::with_capacity(route.len().saturating_add(1));
+                    inserted.extend_from_slice(&route[..position]);
+                    inserted.push(item);
+                    inserted.extend_from_slice(&route[position..]);
+                    let observed = (position < route.len()).then_some(position.saturating_add(1));
+                    let Some((metrics, successor_start, candidate_return)) = fixed_route_probe(routing, &inserted, observed) else {
+                        continue;
+                    };
+                    let distance_delta = metrics.distance.saturating_sub(route_metrics.distance);
+                    let delay = if position < route.len() {
+                        successor_start.unwrap_or(i64::MAX).saturating_sub(route_starts[position]).max(0)
+                    } else {
+                        candidate_return.saturating_sub(return_start).max(0)
+                    };
+                    let radial = depot_distance(item).unwrap_or(0);
+                    let desirability = if classical {
+                        let insertion_cost = distance_weight
+                            .saturating_mul(i128::from(distance_delta))
+                            .saturating_add(delay_weight.saturating_mul(i128::from(delay)));
+                        i128::from(radial).saturating_mul(2).saturating_sub(insertion_cost)
+                    } else {
+                        let slack_loss = route_metrics.minimum_slack.saturating_sub(metrics.minimum_slack).max(0);
+                        let lambda = i128::from(if old_variant >= 2 { 2 } else { 1 });
+                        lambda
+                            .saturating_mul(i128::from(depot_round_trip(item).unwrap_or(0)))
+                            .saturating_sub(i128::from(distance_delta).saturating_mul(2))
+                            .saturating_sub(i128::from(slack_loss))
+                    };
+                    let tie = mix64(seed ^ mix64(attempt) ^ mix64(item as i64 as u64));
+                    let rank = (desirability, metrics.minimum_slack, std::cmp::Reverse(tie));
+                    if selected.as_ref().is_none_or(|current| rank > (current.0, current.1, std::cmp::Reverse(current.2))) {
+                        selected = Some((desirability, metrics.minimum_slack, tie, remaining_at, position, metrics));
+                    }
+                }
+            }
+            let Some((_, _, _, remaining_at, position, metrics)) = selected else { break };
+            let item = remaining.swap_remove(remaining_at);
+            route.insert(position, item);
+            (route_metrics, route_starts, return_start) = fixed_route_schedule(routing, &route)?;
+            debug_assert_eq!(route_metrics.distance, metrics.distance);
+        }
+        routes.push(route);
+    }
+    routes.resize(model.lists.max(1), Vec::new());
+    let state = State::from_lists_interruptible(model, per, routes, stop)?;
+    (full_score_raw(per, &state).violation == 0).then_some(state)
+}
+
 fn routing_construction(
     model: &CollectionModel,
     per: &PerList,
@@ -2110,11 +2487,12 @@ fn routing_construction(
     }
     let started = Instant::now();
     let root = ((model.items.len() as f64).sqrt().ceil() as u64).clamp(8, 64);
-    let candidate_budget = (model.items.len() as u64).saturating_mul(root).saturating_mul(96).clamp(10_000, 2_000_000);
+    let candidate_budget = (model.items.len() as u64).saturating_mul(root).saturating_mul(7_680).clamp(40_000, 30_000_000);
     let mut candidates = 0u64;
     let mut feasible_history = Vec::new();
     let mut best: Option<(State, &'static str)> = None;
     let mut fallback_lists = None;
+    let construction_orders = routing_construction_orders(model, routing, order);
 
     if let Some(singletons) = singleton_state(model, per, stop) {
         let singleton_score = full_score_raw(per, &singletons);
@@ -2177,17 +2555,38 @@ fn routing_construction(
         best = Some((saved, "parallel-savings"));
     }
 
-    if model.items.len() <= 256 || best.is_none() {
-        let stable: Vec<usize> = (0..model.items.len()).collect();
-        let mut reversed = stable.clone();
-        reversed.reverse();
-        let mut orders = vec![stable, order.to_vec(), reversed];
-        orders.dedup();
-        for attempt in orders {
-            if stop.load(Ordering::Relaxed) || candidates >= candidate_budget {
+    if model.items.len() <= 512 && candidates < candidate_budget {
+        let sequential_budget =
+            u64::try_from(model.items.len()).unwrap_or(u64::MAX).saturating_pow(2).saturating_mul(128).clamp(100_000, 20_000_000);
+        let sequential_limit = candidates.saturating_add(sequential_budget).min(candidate_budget);
+        for attempt in 0..10 {
+            if stop.load(Ordering::Relaxed) || candidates >= sequential_limit {
                 break;
             }
-            if let Some(cheapest) = cheapest_insertion_state(model, per, &attempt, stop, &mut candidates, candidate_budget) {
+            let Some(candidate) = sequential_insertion_state(model, per, attempt, seed, stop, &mut candidates, sequential_limit) else {
+                continue;
+            };
+            let score = full_score_raw(per, &candidate);
+            if observe_construction_incumbent(&mut feasible_history, &candidate, score.clone(), started.elapsed(), candidates) {
+                fallback_lists = Some((candidate.lists.clone(), "sequential-insertion"));
+                if per.tiers > 0 {
+                    report(tier_value(per, &score, 0));
+                }
+            }
+            if best.as_ref().is_none_or(|(incumbent, _)| score < full_score_raw(per, incumbent)) {
+                best = Some((candidate, "sequential-insertion"));
+            }
+        }
+    }
+
+    if model.items.len() <= 512 || best.is_none() {
+        let insertion_budget = (model.items.len() as u64).saturating_mul(root).saturating_mul(640).clamp(10_000, 2_000_000);
+        let insertion_limit = candidates.saturating_add(insertion_budget).min(candidate_budget);
+        for attempt in &construction_orders {
+            if stop.load(Ordering::Relaxed) || candidates >= insertion_limit {
+                break;
+            }
+            if let Some(cheapest) = cheapest_insertion_state(model, per, attempt, stop, &mut candidates, insertion_limit) {
                 let score = full_score_raw(per, &cheapest);
                 if score.violation == 0 {
                     let improved =
@@ -2207,7 +2606,14 @@ fn routing_construction(
     }
 
     if model.items.len() <= 160 && candidates < candidate_budget {
-        if let Some(regret) = regret_insertion_state(model, per, order, seed, stop, &mut candidates, candidate_budget) {
+        for (attempt_index, attempt) in construction_orders.iter().enumerate() {
+            if stop.load(Ordering::Relaxed) || candidates >= candidate_budget {
+                break;
+            }
+            let attempt_seed = seed ^ mix64(u64::try_from(attempt_index).unwrap_or(u64::MAX));
+            let Some(regret) = regret_insertion_state(model, per, attempt, attempt_seed, stop, &mut candidates, candidate_budget) else {
+                continue;
+            };
             let score = full_score_raw(per, &regret);
             if score.violation == 0 {
                 let improved = observe_construction_incumbent(&mut feasible_history, &regret, score.clone(), started.elapsed(), candidates);
@@ -2229,7 +2635,46 @@ fn routing_construction(
     }
     let (state, name) = best?;
     let reported = per.tiers > 0 && !feasible_history.is_empty();
-    Some(InitialConstruction { state, name, elapsed: started.elapsed(), feasible_history, candidates, reported })
+    Some(InitialConstruction { state, incumbent: None, name, elapsed: started.elapsed(), feasible_history, candidates, reported })
+}
+
+fn combine_routing_constructions(per: &PerList, mut primary: InitialConstruction, mut stable: InitialConstruction) -> InitialConstruction {
+    let primary_score = full_score_raw(per, &primary.state);
+    let stable_score = full_score_raw(per, &stable.state);
+    let primary_fleet = primary.state.lists.iter().filter(|route| !route.is_empty()).count();
+    let stable_fleet = stable.state.lists.iter().filter(|route| !route.is_empty()).count();
+    let search_stable = stable_fleet <= primary_fleet;
+    let primary_is_best = primary_score < stable_score;
+    let best_reported = primary_is_best && primary.reported;
+
+    let offset = primary.elapsed;
+    let candidate_offset = primary.candidates;
+    for snapshot in &mut stable.feasible_history {
+        snapshot.elapsed = offset.saturating_add(snapshot.elapsed);
+        snapshot.candidates = candidate_offset.saturating_add(snapshot.candidates);
+    }
+    primary.feasible_history.extend(stable.feasible_history);
+    primary.candidates = primary.candidates.saturating_add(stable.candidates);
+    primary.elapsed = primary.elapsed.saturating_add(stable.elapsed);
+    primary.reported = best_reported;
+    primary.name = "routing-portfolio";
+
+    if search_stable {
+        if primary_is_best {
+            stable.incumbent = Some(primary.state);
+        }
+        stable.feasible_history = primary.feasible_history;
+        stable.candidates = primary.candidates;
+        stable.elapsed = primary.elapsed;
+        stable.reported = primary.reported;
+        stable.name = primary.name;
+        stable
+    } else {
+        if !primary_is_best {
+            primary.incumbent = Some(stable.state);
+        }
+        primary
+    }
 }
 
 /// Raw (unsigned) value of a tier, undoing the maximisation sign flip.
@@ -2428,12 +2873,378 @@ fn routing_macro_budget(
 ) -> Option<AlnsWorkBudget> {
     let exploratory = routing_exploration_budget(model);
     let required = match operator {
-        MacroOperator::RouteElimination => routing_route_elimination_floor(model, per, state, stop)?,
+        MacroOperator::RouteElimination => {
+            let greedy = routing_route_elimination_floor(model, per, state, stop)?;
+            AlnsWorkBudget::new(greedy.generated.saturating_mul(8), greedy.evaluated.saturating_mul(8))
+        }
         MacroOperator::EjectionChain | MacroOperator::ChainRelocate | MacroOperator::GuidedSegmentExchange => {
             AlnsWorkBudget::new(routing_compound_structural_floor(model, per, state, stop)?, 1)
         }
     };
     Some(AlnsWorkBudget::new(exploratory.generated.max(required.generated), exploratory.evaluated.max(required.evaluated)))
+}
+
+#[derive(Clone, Copy)]
+struct FixedRouteMetrics {
+    distance: i64,
+    minimum_slack: i64,
+}
+
+#[derive(Clone)]
+struct FixedFleetPartial {
+    routes: Vec<Arc<Vec<i32>>>,
+    metrics: Vec<Option<FixedRouteMetrics>>,
+}
+
+type FixedFleetRank = (usize, i64, std::cmp::Reverse<i64>, usize, u64);
+
+impl FixedFleetPartial {
+    fn rank(&self, target_used: usize, seed: u64) -> FixedFleetRank {
+        let used = self.routes.iter().filter(|route| !route.is_empty()).count();
+        let distance = self.metrics.iter().flatten().fold(0i64, |total, metrics| total.saturating_add(metrics.distance));
+        let minimum_slack = self.metrics.iter().flatten().map(|metrics| metrics.minimum_slack).min().unwrap_or(i64::MAX);
+        let minimum_len = self.routes.iter().map(|route| route.len()).min().unwrap_or(0);
+        let maximum_len = self.routes.iter().map(|route| route.len()).max().unwrap_or(0);
+        let tie = self.routes.iter().enumerate().fold(seed, |hash, (list, route)| {
+            mix64(hash ^ mix64(list as u64) ^ mix64(route.last().copied().unwrap_or(-1) as i64 as u64) ^ mix64(route.len() as u64))
+        });
+        (target_used.saturating_sub(used), distance, std::cmp::Reverse(minimum_slack), maximum_len.saturating_sub(minimum_len), tie)
+    }
+
+    fn signature(&self) -> Vec<(usize, i32)> {
+        self.routes.iter().map(|route| (route.len(), route.last().copied().unwrap_or(-1))).collect()
+    }
+}
+
+fn fixed_route_probe(
+    routing: &RoutingSignature,
+    route: &[i32],
+    observed_position: Option<usize>,
+) -> Option<(FixedRouteMetrics, Option<i64>, i64)> {
+    if route.is_empty() {
+        return None;
+    }
+    let windows = routing.time_windows.as_ref()?;
+    let depot = usize::try_from(routing.depot).ok()?;
+    let mut previous = depot;
+    let mut departure = windows.earliest.get(depot).copied()?;
+    let mut minimum_slack = i64::MAX;
+    let mut distance = 0i64;
+    let mut load = 0i64;
+    let mut observed_start = None;
+    for (position, &item) in route.iter().enumerate() {
+        let current = usize::try_from(item).ok()?;
+        if let Some(demands) = &routing.demands {
+            load = load.saturating_add(demands.get(current).copied()?);
+            if routing.capacity.is_some_and(|capacity| load > capacity) {
+                return None;
+            }
+        }
+        let travel = windows.travel.get(previous)?.get(current).copied()?;
+        let start = windows.earliest.get(current).copied()?.max(departure.saturating_add(travel));
+        let latest = windows.latest_start.get(current).copied()?;
+        if start > latest {
+            return None;
+        }
+        if observed_position == Some(position) {
+            observed_start = Some(start);
+        }
+        minimum_slack = minimum_slack.min(latest.saturating_sub(start));
+        departure = start.saturating_add(windows.service.get(current).copied()?);
+        distance = distance.saturating_add(routing.matrix.get(previous)?.get(current).copied()?);
+        previous = current;
+    }
+    let return_start =
+        windows.earliest.get(depot).copied()?.max(departure.saturating_add(windows.travel.get(previous)?.get(depot).copied()?));
+    let depot_latest = windows.latest_start.get(depot).copied()?;
+    if return_start > depot_latest {
+        return None;
+    }
+    minimum_slack = minimum_slack.min(depot_latest.saturating_sub(return_start));
+    distance = distance.saturating_add(routing.matrix.get(previous)?.get(depot).copied()?);
+    Some((FixedRouteMetrics { distance, minimum_slack }, observed_start, return_start))
+}
+
+fn fixed_route_metrics(routing: &RoutingSignature, route: &[i32]) -> Option<FixedRouteMetrics> {
+    fixed_route_probe(routing, route, None).map(|(metrics, _, _)| metrics)
+}
+
+fn fixed_route_schedule(routing: &RoutingSignature, route: &[i32]) -> Option<(FixedRouteMetrics, Vec<i64>, i64)> {
+    let (metrics, _, return_start) = fixed_route_probe(routing, route, None)?;
+    let windows = routing.time_windows.as_ref()?;
+    let mut previous = usize::try_from(routing.depot).ok()?;
+    let mut departure = windows.earliest.get(previous).copied()?;
+    let mut starts = Vec::with_capacity(route.len());
+    for &item in route {
+        let current = usize::try_from(item).ok()?;
+        let start =
+            windows.earliest.get(current).copied()?.max(departure.saturating_add(windows.travel.get(previous)?.get(current).copied()?));
+        starts.push(start);
+        departure = start.saturating_add(windows.service.get(current).copied()?);
+        previous = current;
+    }
+    Some((metrics, starts, return_start))
+}
+
+fn fixed_fleet_order(items: &[i32], routing: &RoutingSignature, attempt: u64, seed: u64) -> Vec<i32> {
+    let mut order = items.to_vec();
+    let depot = usize::try_from(routing.depot).unwrap_or(0);
+    let windows = routing.time_windows.as_ref().expect("fixed-fleet rebuilding requires recognized time windows");
+    let depot_distance = |item: i32| {
+        usize::try_from(item).ok().and_then(|index| routing.matrix.get(depot).and_then(|row| row.get(index))).copied().unwrap_or(i64::MIN)
+    };
+    let earliest = |item: i32| usize::try_from(item).ok().and_then(|index| windows.earliest.get(index)).copied().unwrap_or(i64::MAX);
+    let latest = |item: i32| usize::try_from(item).ok().and_then(|index| windows.latest_start.get(index)).copied().unwrap_or(i64::MAX);
+    match attempt % 6 {
+        0 => order.sort_unstable_by_key(|&item| (latest(item), std::cmp::Reverse(depot_distance(item)), item)),
+        1 => order.sort_unstable_by_key(|&item| (earliest(item), latest(item), std::cmp::Reverse(depot_distance(item)), item)),
+        2 => order.sort_unstable_by_key(|&item| {
+            (latest(item).saturating_sub(earliest(item)), latest(item), std::cmp::Reverse(depot_distance(item)), item)
+        }),
+        3 => order.sort_unstable_by_key(|&item| (std::cmp::Reverse(depot_distance(item)), latest(item), item)),
+        4 => order.sort_unstable_by_key(|&item| (mix64(seed ^ mix64(item as i64 as u64)), item)),
+        _ => order.sort_unstable_by_key(|&item| (std::cmp::Reverse(latest(item)), std::cmp::Reverse(depot_distance(item)), item)),
+    }
+    order
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fixed_fleet_beam_state(
+    model: &CollectionModel,
+    per: &PerList,
+    target: usize,
+    attempt: u64,
+    seed: u64,
+    stop: &AtomicBool,
+    candidates: &mut u64,
+    candidate_budget: u64,
+) -> Option<State> {
+    let routing = per.routing.as_ref()?;
+    if target == 0 || model.items.len() < target {
+        return None;
+    }
+    let mut lists = fixed_fleet_beam_lists(&model.items, routing, &per.metrics, target, attempt, seed, stop, candidates, candidate_budget)?;
+    lists.resize_with(model.lists.max(1), Vec::new);
+    let state = State::from_lists_interruptible(model, per, lists, stop)?;
+    (full_score_raw(per, &state).violation == 0 && state.lists.iter().filter(|route| !route.is_empty()).count() == target).then_some(state)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fixed_fleet_beam_lists(
+    items: &[i32],
+    routing: &RoutingSignature,
+    metrics: &MetricsRecorder,
+    target: usize,
+    attempt: u64,
+    seed: u64,
+    stop: &AtomicBool,
+    candidates: &mut u64,
+    candidate_budget: u64,
+) -> Option<Vec<Vec<i32>>> {
+    routing.time_windows.as_ref()?;
+    if target == 0 || items.len() < target {
+        return None;
+    }
+    let width = match (items.len() >= 256, attempt % 3) {
+        (true, 0) => 16,
+        (true, 1) => 48,
+        (true, _) => 32,
+        (false, 0) => 64,
+        (false, 1) => 256,
+        (false, _) => 128,
+    };
+    let empty = Arc::new(Vec::new());
+    let mut beam = vec![FixedFleetPartial { routes: vec![empty; target], metrics: vec![None; target] }];
+    let order = fixed_fleet_order(items, routing, attempt, seed);
+    for (inserted, item) in order.into_iter().enumerate() {
+        if stop.load(Ordering::Relaxed) || *candidates >= candidate_budget {
+            return None;
+        }
+        let mut next = Vec::with_capacity(beam.len().saturating_mul(target).saturating_mul(8));
+        for partial in &beam {
+            for list in 0..target {
+                let route = &partial.routes[list];
+                for position in 0..=route.len() {
+                    if *candidates >= candidate_budget {
+                        return None;
+                    }
+                    *candidates = candidates.saturating_add(1);
+                    metrics.record_candidate();
+                    let mut replacement = Vec::with_capacity(route.len().saturating_add(1));
+                    replacement.extend_from_slice(&route[..position]);
+                    replacement.push(item);
+                    replacement.extend_from_slice(&route[position..]);
+                    let Some(metrics) = fixed_route_metrics(routing, &replacement) else { continue };
+                    let mut candidate = partial.clone();
+                    candidate.routes[list] = Arc::new(replacement);
+                    candidate.metrics[list] = Some(metrics);
+                    next.push(candidate);
+                }
+            }
+        }
+        if next.is_empty() {
+            return None;
+        }
+        let target_used = target.min(inserted.saturating_add(1));
+        next.sort_unstable_by_key(|candidate| candidate.rank(target_used, seed));
+        let mut signatures = HashSet::with_capacity(width);
+        beam.clear();
+        for candidate in next {
+            if signatures.insert(candidate.signature()) {
+                beam.push(candidate);
+                if beam.len() >= width {
+                    break;
+                }
+            }
+        }
+    }
+    beam.sort_unstable_by_key(|candidate| candidate.rank(target, seed));
+    beam.into_iter().next().map(|partial| partial.routes.into_iter().map(|route| route.as_ref().clone()).collect())
+}
+
+fn fixed_fleet_rebuild(
+    model: &CollectionModel,
+    per: &PerList,
+    current: &State,
+    attempt: u64,
+    seed: u64,
+    stop: &AtomicBool,
+) -> AlnsBuildRun {
+    let started = Instant::now();
+    let fleet = current.lists.iter().filter(|route| !route.is_empty()).count();
+    let target = fleet.saturating_sub(1);
+    let mut candidates = 0u64;
+    let candidate_budget = u64::try_from(model.items.len())
+        .unwrap_or(u64::MAX)
+        .saturating_pow(2)
+        .saturating_mul(u64::try_from(target.max(1)).unwrap_or(u64::MAX))
+        .saturating_mul(32)
+        .clamp(250_000, 4_000_000);
+    let candidate = (target > 0)
+        .then(|| fixed_fleet_beam_state(model, per, target, attempt, seed, stop, &mut candidates, candidate_budget))
+        .flatten()
+        .filter(|state| {
+            full_score_raw(per, state).violation == 0 && state.lists.iter().filter(|route| !route.is_empty()).count() <= target
+        });
+    let status = if candidate.is_some() {
+        AlnsBuildStatus::Built
+    } else if stop.load(Ordering::Relaxed) {
+        AlnsBuildStatus::Interrupted
+    } else if candidates >= candidate_budget {
+        AlnsBuildStatus::BudgetExhausted
+    } else {
+        AlnsBuildStatus::Infeasible
+    };
+    let cpu_nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    AlnsBuildRun {
+        status,
+        candidate,
+        generated: candidates,
+        evaluated: candidates,
+        work_units: candidates.saturating_mul(2),
+        structural_work: 0,
+        repair_index_work: 0,
+        canonical_rebuilds: u64::from(matches!(status, AlnsBuildStatus::Built)),
+        cpu_nanos,
+        destroy_generated: 0,
+        destroy_evaluated: 0,
+        destroy_cpu_nanos: 0,
+        repair_generated: candidates,
+        repair_evaluated: candidates,
+        repair_cpu_nanos: cpu_nanos,
+        destroy_executed: false,
+        repair_executed: true,
+        removed: model.items.len(),
+        eliminated_route: matches!(status, AlnsBuildStatus::Built),
+    }
+}
+
+fn fixed_pair_rebuild(model: &CollectionModel, per: &PerList, current: &State, attempt: u64, seed: u64, stop: &AtomicBool) -> AlnsBuildRun {
+    let started = Instant::now();
+    let routes: Vec<usize> = current.lists.iter().enumerate().filter_map(|(list, route)| (!route.is_empty()).then_some(list)).collect();
+    let mut pairs: Vec<(u64, u64, usize, usize)> = routes
+        .iter()
+        .enumerate()
+        .flat_map(|(left_at, &left)| {
+            routes.iter().skip(left_at + 1).map(move |&right| {
+                let relatedness = current.lists[left]
+                    .iter()
+                    .flat_map(|&left_item| {
+                        current.lists[right].iter().map(move |&right_item| per.shaw_relatedness(left_item, right_item, false))
+                    })
+                    .min()
+                    .unwrap_or(u64::MAX);
+                let tie = mix64(seed ^ mix64(left as u64) ^ mix64(right as u64));
+                (relatedness, tie, left, right)
+            })
+        })
+        .collect();
+    pairs.sort_unstable();
+    let pair_count = pairs.len();
+    let attempt_index = usize::try_from(attempt).unwrap_or(usize::MAX);
+    let selected = pairs.get(attempt_index % pair_count.max(1)).map(|&(_, _, left, right)| (left, right));
+    let beam_attempt = attempt_index / pair_count.max(1);
+    let mut candidates = 0u64;
+    let selected_items = selected.map_or(0, |(left, right)| current.lists[left].len().saturating_add(current.lists[right].len()));
+    let candidate_budget = u64::try_from(selected_items).unwrap_or(u64::MAX).saturating_pow(2).saturating_mul(64).clamp(100_000, 1_000_000);
+    let candidate = selected
+        .and_then(|(left, right)| {
+            let items: Vec<i32> = current.lists[left].iter().chain(&current.lists[right]).copied().collect();
+            let routing = per.routing.as_ref()?;
+            let rebuilt = fixed_fleet_beam_lists(
+                &items,
+                routing,
+                &per.metrics,
+                2,
+                u64::try_from(beam_attempt).unwrap_or(u64::MAX),
+                seed ^ mix64(attempt),
+                stop,
+                &mut candidates,
+                candidate_budget,
+            )?;
+            let mut lists = current.lists.clone();
+            lists[left] = rebuilt[0].clone();
+            lists[right] = rebuilt[1].clone();
+            State::from_lists_interruptible(model, per, lists, stop)
+        })
+        .filter(|state| {
+            let score = full_score_raw(per, state);
+            score.violation == 0
+                && score < full_score_raw(per, current)
+                && state.lists.iter().filter(|route| !route.is_empty()).count()
+                    == current.lists.iter().filter(|route| !route.is_empty()).count()
+        });
+    let status = if candidate.is_some() {
+        AlnsBuildStatus::Built
+    } else if stop.load(Ordering::Relaxed) {
+        AlnsBuildStatus::Interrupted
+    } else if candidates >= candidate_budget {
+        AlnsBuildStatus::BudgetExhausted
+    } else {
+        AlnsBuildStatus::Infeasible
+    };
+    let cpu_nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    AlnsBuildRun {
+        status,
+        candidate,
+        generated: candidates,
+        evaluated: candidates,
+        work_units: candidates.saturating_mul(2),
+        structural_work: 0,
+        repair_index_work: 0,
+        canonical_rebuilds: u64::from(matches!(status, AlnsBuildStatus::Built)),
+        cpu_nanos,
+        destroy_generated: 0,
+        destroy_evaluated: 0,
+        destroy_cpu_nanos: 0,
+        repair_generated: candidates,
+        repair_evaluated: candidates,
+        repair_cpu_nanos: cpu_nanos,
+        destroy_executed: false,
+        repair_executed: true,
+        removed: selected_items,
+        eliminated_route: false,
+    }
 }
 
 fn routing_relink_budget(model: &CollectionModel, per: &PerList, state: &State, stop: &AtomicBool) -> Option<AlnsWorkBudget> {
@@ -2634,8 +3445,9 @@ fn run_routing_search(
     }
     let mut elite =
         ElitePool::new(8, !per.interchangeable_lists.get(), per.routing.as_ref().is_some_and(|routing| routing.reverse_equivalent));
-    if *best_feasible {
-        let _ = consider_elite_candidate(model, &mut elite, &mut control, state, best_score, stop);
+    let initial_state_score = full_score_raw(per, state);
+    if initial_state_score.violation == 0 {
+        let _ = consider_elite_candidate(model, &mut elite, &mut control, state, &initial_state_score, stop);
     }
     let mut granular_scans: [RoutingScanMemory; 6] = std::array::from_fn(|_| RoutingScanMemory::new());
     let mut global_scans: [RoutingScanMemory; 6] = std::array::from_fn(|_| RoutingScanMemory::new());
@@ -2643,6 +3455,12 @@ fn run_routing_search(
     let mut stagnant = 0u64;
     let mut slice = 0u64;
     let mut state_consistent = true;
+    let mut best_fleet = best_lists.iter().filter(|route| !route.is_empty()).count();
+    let mut fleet_stagnant = 0u64;
+    let mut fleet_rebuild_attempts = 0u64;
+    let mut fleet_beam_refinement = (items < 200 || best_fleet <= items.max(1).isqrt()).then_some(best_fleet);
+    let fleet_window = u64::try_from(items.saturating_mul(2).clamp(64, 512)).unwrap_or(512);
+    let stable_warmup = u64::try_from(items.saturating_mul(8).clamp(64, 2_048)).unwrap_or(2_048);
 
     'routing: while !stop.load(Ordering::Relaxed) && slice < max_iters {
         slice = slice.saturating_add(1);
@@ -2670,7 +3488,27 @@ fn run_routing_search(
             stagnant = 0;
         }
 
-        let slice_kind = control.next_slice(stagnant, elite.len() > 1);
+        let observed_fleet = best_lists.iter().filter(|route| !route.is_empty()).count();
+        if observed_fleet < best_fleet {
+            best_fleet = observed_fleet;
+            fleet_stagnant = 0;
+            fleet_rebuild_attempts = 0;
+            fleet_beam_refinement = (items < 200 || best_fleet <= items.max(1).isqrt()).then_some(best_fleet);
+            if per.reset_routing_gls() {
+                state.refresh_edge_penalties(per);
+                invalidate_routing_scans(&mut routing_index, &mut granular_scans, &mut global_scans);
+            }
+        } else {
+            fleet_stagnant = fleet_stagnant.saturating_add(1);
+        }
+        let fleet_focus =
+            per.minimizes_fleet() && best_fleet > 1 && fleet_stagnant >= fleet_window && fleet_stagnant.is_multiple_of(fleet_window);
+        if fleet_focus {
+            alns.reset_after_injection(&full_score_raw(per, state));
+            reset_routing_scans(&mut granular_scans);
+            reset_routing_scans(&mut global_scans);
+        }
+        let slice_kind = if fleet_focus { SliceKind::Macro } else { control.next_slice(stagnant, elite.len() > 1) };
         if stagnant > 0 && slice.is_multiple_of(16) {
             let penalties = per.bump_gls(state);
             state.refresh_edge_penalties(per);
@@ -2680,7 +3518,11 @@ fn run_routing_search(
                 reset_routing_scans(&mut global_scans);
             }
         }
-        let operator_seed = seed ^ mix64(slice) ^ mix64(stagnant);
+        // Start from a bounded deterministic intensification trajectory, then
+        // hand tie-breaking back to the caller seed. This gives every run a
+        // reproducible baseline while preserving long-run diversity.
+        let trajectory_seed = if slice <= stable_warmup { 0 } else { seed };
+        let operator_seed = trajectory_seed ^ mix64(slice) ^ mix64(stagnant);
 
         match slice_kind {
             SliceKind::Descent | SliceKind::Global => {
@@ -2787,7 +3629,16 @@ fn run_routing_search(
                 if global_best && coordination.as_ref().is_some_and(|shared| shared.publish(best_lists, best_score, *best_feasible)) {
                     alns.record_shared_publication();
                 }
-                let acceptance = alns.accept(&current_guided, &candidate_guided, &current_raw, &candidate_raw, operator_seed, slice);
+                let worsens_fleet = per.minimizes_fleet()
+                    && current_raw.violation == 0
+                    && candidate_raw.violation == 0
+                    && candidate.lists.iter().filter(|route| !route.is_empty()).count()
+                        > state.lists.iter().filter(|route| !route.is_empty()).count();
+                let acceptance = if worsens_fleet {
+                    alns.reject_semantic_worsening(&current_raw)
+                } else {
+                    alns.accept(&current_guided, &candidate_guided, &current_raw, &candidate_raw, operator_seed, slice)
+                };
                 let archive_interrupted = candidate_raw.violation == 0
                     && consider_elite_candidate(model, &mut elite, &mut control, &candidate, &candidate_raw, stop)
                         == EliteOperationStatus::Interrupted;
@@ -2803,12 +3654,31 @@ fn run_routing_search(
                 stagnant = if global_best { 0 } else { stagnant.saturating_add(1) };
             }
             SliceKind::Macro => {
-                let operator = control.choose_macro(operator_seed);
-                let Some(budget) = routing_macro_budget(model, per, state, operator, stop) else {
-                    observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
-                    break;
+                let operator = if fleet_focus { MacroOperator::RouteElimination } else { control.choose_macro(operator_seed) };
+                let smallest_route = state.lists.iter().filter(|route| !route.is_empty()).map(Vec::len).min().unwrap_or(0);
+                let root = items.max(1).isqrt();
+                let dense_fleet = best_fleet > 4 && smallest_route > root;
+                let pair_count = best_fleet.saturating_mul(best_fleet.saturating_sub(1)).saturating_div(2);
+                let pair_refinement_limit = pair_count.min(best_fleet.saturating_mul(2).clamp(6, 32)) as u64;
+                let run = if fleet_focus && dense_fleet && fleet_rebuild_attempts < 6 {
+                    let attempt = fleet_rebuild_attempts;
+                    fleet_rebuild_attempts = fleet_rebuild_attempts.saturating_add(1);
+                    let run = fixed_fleet_rebuild(model, per, state, attempt, operator_seed, stop);
+                    if let Some(candidate) = &run.candidate {
+                        fleet_beam_refinement = Some(candidate.lists.iter().filter(|route| !route.is_empty()).count());
+                    }
+                    run
+                } else if fleet_focus && fleet_beam_refinement == Some(best_fleet) && fleet_rebuild_attempts < pair_refinement_limit {
+                    let attempt = fleet_rebuild_attempts;
+                    fleet_rebuild_attempts = fleet_rebuild_attempts.saturating_add(1);
+                    fixed_pair_rebuild(model, per, state, attempt, operator_seed, stop)
+                } else {
+                    let Some(budget) = routing_macro_budget(model, per, state, operator, stop) else {
+                        observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
+                        break;
+                    };
+                    build_macro_candidate_bounded(model, per, state, operator, operator_seed, budget, stop)
                 };
-                let run = build_macro_candidate_bounded(model, per, state, operator, operator_seed, budget, stop);
                 observe_routing_checkpoint(&mut control, started, per, best_lists, best_score, *best_feasible);
                 if run.status == AlnsBuildStatus::Interrupted {
                     control.record_macro(operator, run.status, run.generated, run.evaluated, run.cpu_nanos, false, false, false);
@@ -3141,31 +4011,57 @@ pub(super) fn solve_collection_capped_worker(
             let score = full_score_raw(&per, &state);
             let elapsed = construction_started.elapsed();
             let feasible_history = (score.violation == 0).then(|| initial_feasible(&state, score, elapsed, 0)).into_iter().collect();
-            InitialConstruction { state, name: "warm-start", elapsed, feasible_history, candidates: 0, reported: false }
+            InitialConstruction { state, incumbent: None, name: "warm-start", elapsed, feasible_history, candidates: 0, reported: false }
         }),
-        None => routing_construction(model, &per, &order, seed, stop, report).or_else(|| {
-            State::greedy(model, &per, &order, seed, profile.diversify_initial_descent(), stop).map(|state| {
-                let score = full_score_raw(&per, &state);
-                let elapsed = construction_started.elapsed();
-                let feasible_history = (score.violation == 0).then(|| initial_feasible(&state, score, elapsed, 0)).into_iter().collect();
-                InitialConstruction { state, name: "generic-greedy", elapsed, feasible_history, candidates: 0, reported: false }
+        None => {
+            let primary = routing_construction(model, &per, &order, seed, stop, report);
+            let construction = if seed != 0 && primary.is_some() && per.minimizes_fleet() && !stop.load(Ordering::Relaxed) {
+                let mut stable_order: Vec<usize> = (0..n).collect();
+                shuffle(&mut stable_order, 0);
+                let mut silent = |_| {};
+                let stable = routing_construction(model, &per, &stable_order, 0, stop, &mut silent);
+                match (primary, stable) {
+                    (Some(primary), Some(stable)) => Some(combine_routing_constructions(&per, primary, stable)),
+                    (primary, _) => primary,
+                }
+            } else {
+                primary
+            };
+            construction.or_else(|| {
+                State::greedy(model, &per, &order, seed, profile.diversify_initial_descent(), stop).map(|state| {
+                    let score = full_score_raw(&per, &state);
+                    let elapsed = construction_started.elapsed();
+                    let feasible_history =
+                        (score.violation == 0).then(|| initial_feasible(&state, score, elapsed, 0)).into_iter().collect();
+                    InitialConstruction {
+                        state,
+                        incumbent: None,
+                        name: "generic-greedy",
+                        elapsed,
+                        feasible_history,
+                        candidates: 0,
+                        reported: false,
+                    }
+                })
             })
-        }),
+        }
     };
     let Some(construction) = construction else {
         return no_solution();
     };
     let InitialConstruction {
         mut state,
+        incumbent,
         name: constructor_name,
         elapsed: construction_elapsed,
         feasible_history,
         candidates: construction_candidates,
         reported: construction_reported,
     } = construction;
-    let construction_score = full_score_raw(&per, &state);
+    let construction_incumbent = incumbent.as_ref().unwrap_or(&state);
+    let construction_score = full_score_raw(&per, construction_incumbent);
     let construction_objectives = objective_values(&per, &construction_score);
-    let fleet = Some(state.lists.iter().filter(|route| !route.is_empty()).count());
+    let fleet = Some(construction_incumbent.lists.iter().filter(|route| !route.is_empty()).count());
     let constructor_cost = per
         .routing
         .as_ref()
@@ -3185,9 +4081,9 @@ pub(super) fn solve_collection_capped_worker(
         fleet,
         constructor_cost,
     );
-    let (mut best_lists, mut best_score, mut best_feasible) = snapshot(&per, &state);
+    let (mut best_lists, mut best_score, mut best_feasible) = snapshot(&per, construction_incumbent);
     let mut alns = if per.routing.is_some() {
-        AlnsController::new_routing_profile(n, &best_score, profile)
+        AlnsController::new_routing_profile(n, &full_score_raw(&per, &state), profile)
     } else {
         AlnsController::new_profile(n, &best_score, profile)
     };

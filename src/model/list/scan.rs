@@ -9,6 +9,8 @@
 //! This module is used by the routing compiler itself. Capability recognition
 //! and lowering are therefore one operation, with no predictive classifier.
 
+use std::sync::Arc;
+
 use crate::expr::{self, Expr as KExpr};
 use crate::ids::VarId;
 
@@ -24,6 +26,129 @@ const I32_HALF_HI: i64 = (i32::MAX as i64) / 2;
 /// Table indices fold to constants (they are accumulator-free), so this is the
 /// only variable leaf the bounds pass ever sees.
 const ACC: VarId = VarId(u32::MAX);
+
+/// Canonical hard time-window scan recognized from its expression semantics.
+/// This is an optional optimization view only. Failure to recognize it leaves
+/// the model on the generic exact scan evaluator.
+#[derive(Clone)]
+pub(crate) struct TimeWindowScanSpec {
+    pub travel: Arc<Vec<Vec<i64>>>,
+    pub earliest: Arc<Vec<i64>>,
+    pub latest_start: Arc<Vec<i64>>,
+    pub service: Arc<Vec<i64>>,
+}
+
+type StartTables = (Arc<Vec<i64>>, Arc<Vec<Vec<i64>>>);
+
+/// Recognize `departure = max(earliest[cur], departure + travel[prev][cur])
+/// + service[cur]` with a non-negative lateness sum constrained to zero.
+///
+/// Tables are returned by shared reference, so the LS layer can derive temporal
+/// relatedness without copying model data or introducing a second semantic IR.
+pub(crate) fn time_window_scan_signature(constraint: &Constraint) -> Option<TimeWindowScanSpec> {
+    if constraint.op != Op::Le
+        || constraint.rhs != 0
+        || !matches!(constraint.reduction.op, ReduceOp::Sum)
+        || constraint.reduction.coeff <= 0
+    {
+        return None;
+    }
+    let Iterable::Scan { init: _, boundary, step, end, .. } = constraint.reduction.iterable else { return None };
+    let arena = &constraint.reduction.arena.exprs;
+    let (start, service) = match_commutative(arena, step, false, |id| max_start_expr(arena, id), |id| direct_array(arena, id, 0))?;
+    let (earliest, travel) = start;
+    let lateness = zero_max_other(arena, constraint.reduction.body)?;
+    let (departure_or_start, latest) = sub_with_array_rhs(arena, lateness, 0)?;
+    let latest_start = if expr_is_arg(arena, departure_or_start, 1) {
+        Arc::new(latest.iter().enumerate().map(|(index, &value)| value.saturating_sub(service.get(index).copied().unwrap_or(0))).collect())
+    } else {
+        let Expr::Sub(departure, service_expr) = arena.get(departure_or_start.0 as usize)? else { return None };
+        if !expr_is_arg(arena, *departure, 1) {
+            return None;
+        }
+        let emitted_service = direct_array(arena, *service_expr, 0)?;
+        if !same_array(&service, &emitted_service) {
+            return None;
+        }
+        latest
+    };
+    let size = earliest.len();
+    if service.len() != size
+        || latest_start.len() != size
+        || travel.len() != size
+        || travel.iter().any(|row| row.len() != size)
+        || usize::try_from(boundary).ok().is_none_or(|index| index >= size)
+        || end.is_some_and(|value| usize::try_from(value).ok().is_none_or(|index| index >= size))
+    {
+        return None;
+    }
+    Some(TimeWindowScanSpec { travel, earliest, latest_start, service })
+}
+
+fn same_array(left: &Arc<Vec<i64>>, right: &Arc<Vec<i64>>) -> bool {
+    Arc::ptr_eq(left, right) || left.as_ref() == right.as_ref()
+}
+
+fn expr_is_arg(arena: &[Expr], id: ExprId, arg: u8) -> bool {
+    matches!(arena.get(id.0 as usize), Some(Expr::Arg(found)) if *found == arg)
+}
+
+fn direct_array(arena: &[Expr], id: ExprId, arg: u8) -> Option<Arc<Vec<i64>>> {
+    let Expr::Array(values, index) = arena.get(id.0 as usize)? else { return None };
+    expr_is_arg(arena, *index, arg).then(|| Arc::clone(values))
+}
+
+fn direct_travel(arena: &[Expr], id: ExprId) -> Option<Arc<Vec<Vec<i64>>>> {
+    let Expr::Matrix(values, row, column) = arena.get(id.0 as usize)? else { return None };
+    (expr_is_arg(arena, *row, 2) && expr_is_arg(arena, *column, 0)).then(|| Arc::clone(values))
+}
+
+fn match_commutative<A, B>(
+    arena: &[Expr],
+    id: ExprId,
+    maximum: bool,
+    mut left_match: impl FnMut(ExprId) -> Option<A>,
+    mut right_match: impl FnMut(ExprId) -> Option<B>,
+) -> Option<(A, B)> {
+    let (left, right) = match (maximum, arena.get(id.0 as usize)?) {
+        (false, Expr::Add(left, right)) | (true, Expr::Max(left, right)) => (*left, *right),
+        _ => return None,
+    };
+    left_match(left).zip(right_match(right)).or_else(|| left_match(right).zip(right_match(left)))
+}
+
+fn max_start_expr(arena: &[Expr], id: ExprId) -> Option<StartTables> {
+    match_commutative(
+        arena,
+        id,
+        true,
+        |branch| direct_array(arena, branch, 0),
+        |branch| {
+            let Expr::Add(left, right) = arena.get(branch.0 as usize)? else { return None };
+            if expr_is_arg(arena, *left, 1) {
+                direct_travel(arena, *right)
+            } else if expr_is_arg(arena, *right, 1) {
+                direct_travel(arena, *left)
+            } else {
+                None
+            }
+        },
+    )
+}
+
+fn zero_max_other(arena: &[Expr], id: ExprId) -> Option<ExprId> {
+    let Expr::Max(left, right) = arena.get(id.0 as usize)? else { return None };
+    match (arena.get(left.0 as usize), arena.get(right.0 as usize)) {
+        (Some(Expr::Const(0)), _) => Some(*right),
+        (_, Some(Expr::Const(0))) => Some(*left),
+        _ => None,
+    }
+}
+
+fn sub_with_array_rhs(arena: &[Expr], id: ExprId, arg: u8) -> Option<(ExprId, Arc<Vec<i64>>)> {
+    let Expr::Sub(left, right) = arena.get(id.0 as usize)? else { return None };
+    Some((*left, direct_array(arena, *right, arg)?))
+}
 
 /// A homogeneous per-route `Sum` scan, ready to lower onto the successor world.
 /// Derived domains are a sound superset of every reachable value (the i32 store

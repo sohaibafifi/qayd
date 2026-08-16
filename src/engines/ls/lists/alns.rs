@@ -416,6 +416,17 @@ impl AlnsController {
         kind
     }
 
+    /// Advance acceptance memory after a semantic prefix guard rejects a
+    /// candidate before annealing. Routing uses this for a strict fleet-first
+    /// objective, where temporary distance gains may never buy an extra route.
+    pub(super) fn reject_semantic_worsening(&mut self, current_raw: &Score) -> AcceptanceKind {
+        let reheat = 1.0 + 1.0 / self.config.late_window as f64;
+        self.temperature = (self.temperature * reheat).min(self.config.initial_temperature);
+        self.late_scores[self.late_cursor] = current_raw.clone();
+        self.late_cursor = (self.late_cursor + 1) % self.late_scores.len();
+        AcceptanceKind::Rejected
+    }
+
     pub(super) fn record(
         &mut self,
         destroy: DestroyOperator,
@@ -1025,7 +1036,7 @@ fn build_candidate_inner(
         let routes_before = nonempty_routes(&lists);
         let target = if work.is_bounded() { bounded_destroy_target(model.items.len(), choice, work.budget) } else { choice.target };
         let (removed, allow_empty_route) = match choice.destroy {
-            DestroyOperator::Shaw => (destroy_shaw(&mut lists, per.candidates.as_ref(), target, seed, work, stop)?, true),
+            DestroyOperator::Shaw => (destroy_shaw(&mut lists, per, target, seed, work, stop)?, true),
             DestroyOperator::Segments => (destroy_segments(&mut lists, target, seed, work, stop)?, true),
             DestroyOperator::Worst => (destroy_worst(per, current, &mut lists, target, seed, work, stop)?, true),
             DestroyOperator::Route => (destroy_route(&mut lists, target, seed, work, stop)?, false),
@@ -1459,7 +1470,7 @@ pub(super) fn routing_route_elimination_floor(
     if let Some(candidates) = &per.candidates {
         for &item in &model.items {
             poll.tick()?;
-            max_neighbors = max_neighbors.max(candidates.neighbors(item).len());
+            max_neighbors = max_neighbors.max(candidates.neighbors(item).len().saturating_add(candidates.semantic_neighbors(item).len()));
         }
     }
 
@@ -1725,7 +1736,7 @@ fn destroy_segments(
 
 fn destroy_shaw(
     lists: &mut [Vec<i32>],
-    candidates: Option<&CandidateNeighbors>,
+    per: &PerList,
     target: usize,
     seed: u64,
     work: &mut WorkCounter,
@@ -1733,12 +1744,14 @@ fn destroy_shaw(
 ) -> Result<Vec<i32>, Abort> {
     let mut present = HashSet::new();
     let mut all = Vec::new();
-    for list in lists.iter() {
+    let mut owner = HashMap::new();
+    for (list_index, list) in lists.iter().enumerate() {
         work.structural(stop)?;
-        for &item in list {
+        for (position, &item) in list.iter().enumerate() {
             work.structural(stop)?;
             present.insert(item);
             all.push(item);
+            owner.insert(item, (list_index, position));
         }
     }
     if present.is_empty() {
@@ -1753,12 +1766,10 @@ fn destroy_shaw(
     let mut step = 0u64;
     while removed.len() < target && removed.len() < present.len() {
         let pivot = order[(mix64(seed ^ mix64(step)) % order.len() as u64) as usize];
-        let related = if let Some(item) = nearest_candidate(candidates, pivot, &removed, &present, work, stop)? {
-            Some(item)
-        } else if let Some(item) = positional_neighbor(lists, pivot, &removed, work, stop)? {
-            Some(item)
-        } else {
-            random_available(&all, &removed, seed ^ step, work, stop)?
+        let related = shaw_related_candidate(per, lists, &owner, &all, pivot, &removed, &present, seed ^ step, work, stop)?;
+        let related = match related {
+            Some(item) => Some(item),
+            None => random_available(&all, &removed, seed ^ step, work, stop)?,
         };
         let Some(next) = related else { break };
         work.generated(stop)?;
@@ -1783,57 +1794,75 @@ fn destroy_shaw(
     Ok(result)
 }
 
-fn nearest_candidate(
-    candidates: Option<&CandidateNeighbors>,
+fn push_shaw_candidate(
+    pool: &mut Vec<i32>,
+    seen: &mut HashSet<i32>,
+    item: i32,
     pivot: i32,
     removed: &HashSet<i32>,
     present: &HashSet<i32>,
-    work: &mut WorkCounter,
-    stop: &AtomicBool,
-) -> Result<Option<i32>, Abort> {
-    let Some(candidates) = candidates else { return Ok(None) };
-    for &item in candidates.neighbors(pivot) {
-        work.structural(stop)?;
-        if present.contains(&item) && !removed.contains(&item) {
-            return Ok(Some(item));
-        }
+    limit: usize,
+) {
+    if pool.len() < limit && item != pivot && present.contains(&item) && !removed.contains(&item) && seen.insert(item) {
+        pool.push(item);
     }
-    Ok(None)
 }
 
-fn positional_neighbor(
+#[allow(clippy::too_many_arguments)]
+fn shaw_related_candidate(
+    per: &PerList,
     lists: &[Vec<i32>],
+    owner: &HashMap<i32, (usize, usize)>,
+    all: &[i32],
     pivot: i32,
     removed: &HashSet<i32>,
+    present: &HashSet<i32>,
+    seed: u64,
     work: &mut WorkCounter,
     stop: &AtomicBool,
 ) -> Result<Option<i32>, Abort> {
-    for list in lists {
-        work.structural(stop)?;
-        let mut position = None;
-        for (index, &item) in list.iter().enumerate() {
-            work.structural(stop)?;
-            if item == pivot {
-                position = Some(index);
+    const RELATED_POOL: usize = 32;
+    let mut pool = Vec::with_capacity(RELATED_POOL);
+    let mut seen = HashSet::with_capacity(RELATED_POOL);
+    if let Some(candidates) = &per.candidates {
+        for &item in candidates.neighbors(pivot) {
+            if pool.len() >= RELATED_POOL {
                 break;
             }
-        }
-        let Some(position) = position else { continue };
-        for distance in 1..list.len() {
             work.structural(stop)?;
-            if let Some(&item) = position.checked_sub(distance).and_then(|index| list.get(index)) {
-                if !removed.contains(&item) {
-                    return Ok(Some(item));
-                }
-            }
-            if let Some(&item) = list.get(position + distance) {
-                if !removed.contains(&item) {
-                    return Ok(Some(item));
-                }
-            }
+            push_shaw_candidate(&mut pool, &mut seen, item, pivot, removed, present, RELATED_POOL);
         }
     }
-    Ok(None)
+    if let Some(&(route, position)) = owner.get(&pivot) {
+        work.structural(stop)?;
+        if let Some(&before) = position.checked_sub(1).and_then(|index| lists[route].get(index)) {
+            push_shaw_candidate(&mut pool, &mut seen, before, pivot, removed, present, RELATED_POOL);
+        }
+        if let Some(&after) = lists[route].get(position + 1) {
+            push_shaw_candidate(&mut pool, &mut seen, after, pivot, removed, present, RELATED_POOL);
+        }
+    }
+    if !all.is_empty() {
+        let start = (mix64(seed) % all.len() as u64) as usize;
+        for offset in 0..all.len() {
+            if pool.len() >= RELATED_POOL {
+                break;
+            }
+            work.structural(stop)?;
+            push_shaw_candidate(&mut pool, &mut seen, all[(start + offset) % all.len()], pivot, removed, present, RELATED_POOL);
+        }
+    }
+    let pivot_route = owner.get(&pivot).map(|&(route, _)| route);
+    let mut best = None;
+    for item in pool {
+        work.structural(stop)?;
+        let relatedness = per.shaw_relatedness(pivot, item, pivot_route == owner.get(&item).map(|&(route, _)| route));
+        let tie = mix64(seed ^ mix64(item as i64 as u64));
+        if best.is_none_or(|current: (u64, u64, i32)| (relatedness, tie, item) < current) {
+            best = Some((relatedness, tie, item));
+        }
+    }
+    Ok(best.map(|(_, _, item)| item))
 }
 
 fn random_available(
@@ -2044,6 +2073,7 @@ struct RepairWorkspace {
     index: RepairIndex,
     routes: Vec<usize>,
     allowed: Vec<bool>,
+    fleet_reduction: bool,
 }
 
 impl RepairWorkspace {
@@ -2055,7 +2085,7 @@ impl RepairWorkspace {
         for &route in &routes {
             allowed[route] = true;
         }
-        Ok(Self { index: RepairIndex::build(state, work, stop)?, routes, allowed })
+        Ok(Self { index: RepairIndex::build(state, work, stop)?, routes, allowed, fleet_reduction: !allow_empty })
     }
 }
 
@@ -2111,6 +2141,25 @@ fn push_bounded_placement(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn push_neighbor_placements(
+    placements: &mut Vec<(usize, usize)>,
+    seen: &mut HashSet<(usize, usize)>,
+    workspace: &RepairWorkspace,
+    neighbor: i32,
+    limit: usize,
+    work: &mut WorkCounter,
+    stop: &AtomicBool,
+) -> Result<(), Abort> {
+    work.structural(stop)?;
+    let Some(&(list, position)) = workspace.index.locations.get(&neighbor) else { return Ok(()) };
+    if !workspace.allowed[list] {
+        return Ok(());
+    }
+    push_bounded_placement(placements, seen, (list, position), limit, work, stop)?;
+    push_bounded_placement(placements, seen, (list, position + 1), limit, work, stop)
+}
+
 fn repair_placements_bounded(
     per: &PerList,
     state: &State,
@@ -2123,21 +2172,30 @@ fn repair_placements_bounded(
     let mut placements = Vec::with_capacity(placement_limit.min(MAX_REPAIR_PLACEMENTS));
     let mut seen = HashSet::with_capacity(placement_limit.min(MAX_REPAIR_PLACEMENTS));
     if let Some(neighbors) = &per.candidates {
-        for &neighbor in neighbors.neighbors(item) {
+        if workspace.fleet_reduction {
+            for &list in &workspace.routes {
+                push_bounded_placement(&mut placements, &mut seen, (list, 0), placement_limit, work, stop)?;
+                push_bounded_placement(&mut placements, &mut seen, (list, state.lists[list].len()), placement_limit, work, stop)?;
+            }
+        }
+        let geometric = neighbors.neighbors(item);
+        let semantic = if workspace.fleet_reduction { neighbors.semantic_neighbors(item) } else { &[] };
+        for index in 0..geometric.len().max(semantic.len()) {
             if placements.len() >= placement_limit {
                 break;
             }
-            work.structural(stop)?;
-            let Some(&(list, position)) = workspace.index.locations.get(&neighbor) else { continue };
-            if !workspace.allowed[list] {
-                continue;
+            if let Some(&neighbor) = semantic.get(index) {
+                push_neighbor_placements(&mut placements, &mut seen, workspace, neighbor, placement_limit, work, stop)?;
             }
-            push_bounded_placement(&mut placements, &mut seen, (list, position), placement_limit, work, stop)?;
-            push_bounded_placement(&mut placements, &mut seen, (list, position + 1), placement_limit, work, stop)?;
+            if let Some(&neighbor) = geometric.get(index) {
+                push_neighbor_placements(&mut placements, &mut seen, workspace, neighbor, placement_limit, work, stop)?;
+            }
         }
-        for &list in &workspace.routes {
-            push_bounded_placement(&mut placements, &mut seen, (list, 0), placement_limit, work, stop)?;
-            push_bounded_placement(&mut placements, &mut seen, (list, state.lists[list].len()), placement_limit, work, stop)?;
+        if !workspace.fleet_reduction {
+            for &list in &workspace.routes {
+                push_bounded_placement(&mut placements, &mut seen, (list, 0), placement_limit, work, stop)?;
+                push_bounded_placement(&mut placements, &mut seen, (list, state.lists[list].len()), placement_limit, work, stop)?;
+            }
         }
         return Ok(placements);
     }
@@ -2221,8 +2279,8 @@ fn repair_positions(per: &PerList, route: &[i32], item: i32, work: &mut WorkCoun
         all.push(position);
         if per.candidates.as_ref().is_none_or(|neighbors| {
             route.is_empty()
-                || position.checked_sub(1).is_some_and(|before| neighbors.contains(item, route[before]))
-                || route.get(position).is_some_and(|&after| neighbors.contains(item, after))
+                || position.checked_sub(1).is_some_and(|before| neighbors.contains_semantic(item, route[before]))
+                || route.get(position).is_some_and(|&after| neighbors.contains_semantic(item, after))
         }) {
             granular.push(position);
         }
@@ -2427,17 +2485,7 @@ pub(super) fn build_macro_candidate_bounded(
     stop: &AtomicBool,
 ) -> AlnsBuildRun {
     if matches!(operator, MacroOperator::RouteElimination) {
-        let choice = AlnsChoice { destroy: DestroyOperator::Route, repair: RepairOperator::Regret2, target: 1 };
-        let mut run = build_candidate_bounded(model, per, current, choice, seed, budget, stop);
-        if let Some(candidate) = &run.candidate {
-            let fleet_reduced = nonempty_routes(&candidate.lists) < nonempty_routes(&current.lists);
-            if !fleet_reduced || full_score_raw(per, candidate).violation != 0 {
-                run.status = AlnsBuildStatus::Infeasible;
-                run.candidate = None;
-                run.eliminated_route = false;
-            }
-        }
-        return run;
+        return build_route_elimination_candidate_bounded(model, per, current, seed, budget, stop);
     }
 
     let started = CpuTimer::start();
@@ -2480,6 +2528,73 @@ pub(super) fn build_macro_candidate_bounded(
         removed: 0,
         eliminated_route: false,
     }
+}
+
+fn build_route_elimination_candidate_bounded(
+    model: &CollectionModel,
+    per: &PerList,
+    current: &State,
+    seed: u64,
+    budget: AlnsWorkBudget,
+    stop: &AtomicBool,
+) -> AlnsBuildRun {
+    let started = CpuTimer::start();
+    let mut work = WorkCounter::new(budget);
+    let mut breakdown = BuildBreakdown::default();
+    let choice = AlnsChoice { destroy: DestroyOperator::Route, repair: RepairOperator::Regret2, target: 1 };
+    let greedy = build_candidate_inner(model, per, current, choice, seed, stop, &mut work, &mut breakdown);
+    let mut removed = 0;
+    let mut candidate = None;
+    let mut terminal = None;
+
+    match greedy {
+        Ok((built, count, _)) => {
+            removed = count;
+            if route_is_eliminated(per, current, &built) {
+                candidate = Some(built);
+            }
+        }
+        Err(Abort::Interrupted) => terminal = Some(Abort::Interrupted),
+        Err(Abort::BudgetExhausted) => {
+            terminal = Some(Abort::BudgetExhausted);
+        }
+        Err(Abort::Infeasible) => {}
+    }
+
+    if candidate.is_none() && terminal.is_none() {
+        match eliminate_route_with_ejections(model, per, current, seed ^ 0x8EBC_6AF0_9C88_C6E3, &mut work, stop) {
+            Ok(Some(built)) => candidate = Some(built),
+            Ok(None) => terminal = Some(Abort::Infeasible),
+            Err(abort) => terminal = Some(abort),
+        }
+    }
+
+    let status = if candidate.is_some() { AlnsBuildStatus::Built } else { terminal.unwrap_or(Abort::Infeasible).status() };
+    AlnsBuildRun {
+        status,
+        eliminated_route: candidate.is_some(),
+        candidate,
+        generated: work.generated,
+        evaluated: work.evaluated,
+        work_units: work.generated.saturating_add(work.evaluated),
+        structural_work: work.structural,
+        repair_index_work: work.repair_index,
+        canonical_rebuilds: work.canonical_rebuilds,
+        cpu_nanos: started.elapsed_nanos(),
+        destroy_generated: breakdown.destroy_generated,
+        destroy_evaluated: breakdown.destroy_evaluated,
+        destroy_cpu_nanos: breakdown.destroy_cpu_nanos,
+        repair_generated: breakdown.repair_generated,
+        repair_evaluated: breakdown.repair_evaluated,
+        repair_cpu_nanos: breakdown.repair_cpu_nanos,
+        destroy_executed: breakdown.destroy_executed,
+        repair_executed: breakdown.repair_executed,
+        removed,
+    }
+}
+
+fn route_is_eliminated(per: &PerList, current: &State, candidate: &State) -> bool {
+    nonempty_routes(&candidate.lists) < nonempty_routes(&current.lists) && full_score_raw(per, candidate).violation == 0
 }
 
 fn improving_raw(before: &Score, after: &Score) -> bool {
@@ -2907,7 +3022,7 @@ struct EjectionContext<'a> {
 
 struct EjectionOverlay<'a> {
     base: &'a [Vec<i32>],
-    touched: SmallVec<[(usize, Vec<i32>); 4]>,
+    touched: SmallVec<[(usize, Vec<i32>); 8]>,
 }
 
 impl<'a> EjectionOverlay<'a> {
@@ -2922,11 +3037,6 @@ impl<'a> EjectionOverlay<'a> {
     fn route_mut(&mut self, list: usize, work: &mut WorkCounter, stop: &AtomicBool) -> Result<&mut Vec<i32>, Abort> {
         if let Some(position) = self.touched.iter().position(|(owner, _)| *owner == list) {
             return Ok(&mut self.touched[position].1);
-        }
-        // A depth-three chain touches at most the source and three destination
-        // routes, so the SmallVec never spills to the heap.
-        if self.touched.len() >= 4 {
-            return Err(Abort::Infeasible);
         }
         work.structural_units(u64::try_from(self.base[list].len().saturating_add(1)).unwrap_or(u64::MAX), stop)?;
         self.touched.push((list, clone_route_reserved(&self.base[list], stop)?));
@@ -2949,6 +3059,285 @@ impl<'a> EjectionOverlay<'a> {
     fn final_len(&self, list: usize) -> usize {
         self.route(list).len()
     }
+
+    fn replace_route(&mut self, list: usize, route: Vec<i32>, work: &mut WorkCounter, stop: &AtomicBool) -> Result<(), Abort> {
+        work.structural(stop)?;
+        if let Some(position) = self.touched.iter().position(|(owner, _)| *owner == list) {
+            self.touched[position].1 = route;
+        } else {
+            self.touched.push((list, route));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PendingEjection {
+    item: i32,
+    origin: usize,
+    depth: usize,
+}
+
+struct RouteEliminationOption {
+    destination: usize,
+    route: Vec<i32>,
+    ejected: Option<PendingEjection>,
+    rank: (u8, i64, i64, SmallVec<[i64; 4]>, u64),
+}
+
+struct InfeasibleInsertion {
+    destination: usize,
+    route: Vec<i32>,
+    rank: (i64, i64, SmallVec<[i64; 4]>, u64),
+}
+
+struct RouteEliminationContext<'a> {
+    model: &'a CollectionModel,
+    per: &'a PerList,
+    current: &'a State,
+    before: Score,
+    eliminated: usize,
+    initial_removed: usize,
+    seed: u64,
+    work: &'a mut WorkCounter,
+    stop: &'a AtomicBool,
+    list_scratch: EvalScratch,
+    score_scratch: EvalScratch,
+    overrides: Vec<(i32, usize)>,
+}
+
+fn signed_list_objectives(per: &PerList, score: &ListScore) -> SmallVec<[i64; 4]> {
+    score.objectives.iter().enumerate().map(|(tier, &value)| if per.senses[tier] { value } else { value.saturating_neg() }).collect()
+}
+
+fn retain_best<T, K: Ord>(entries: &mut Vec<T>, entry: T, limit: usize, key: impl Fn(&T) -> K) {
+    entries.push(entry);
+    entries.sort_unstable_by_key(&key);
+    entries.truncate(limit);
+}
+
+fn route_elimination_positions(
+    per: &PerList,
+    route: &[i32],
+    item: i32,
+    work: &mut WorkCounter,
+    stop: &AtomicBool,
+) -> Result<Vec<usize>, Abort> {
+    let preferred = repair_positions(per, route, item, work, stop)?;
+    if route.len() <= 32 {
+        return Ok((0..=route.len()).collect());
+    }
+    Ok(preferred)
+}
+
+fn score_route_elimination_list(context: &mut RouteEliminationContext<'_>, list: usize, route: &[i32]) -> Result<ListScore, Abort> {
+    context.work.evaluated(context.stop)?;
+    context.per.metrics.record_candidate();
+    Ok(trial_list_score_view(context.per, context.current, list, route, None, &mut context.list_scratch))
+}
+
+fn route_elimination_options(
+    context: &mut RouteEliminationContext<'_>,
+    overlay: &EjectionOverlay<'_>,
+    pending: PendingEjection,
+    forbidden: &HashSet<i32>,
+) -> Result<Vec<RouteEliminationOption>, Abort> {
+    const DIRECT_OPTIONS: usize = 8;
+    const INFEASIBLE_INSERTIONS: usize = 12;
+    const EJECTION_OPTIONS: usize = 8;
+    const MAX_EJECTION_DEPTH: usize = 4;
+
+    let mut direct = Vec::with_capacity(DIRECT_OPTIONS);
+    let mut infeasible = Vec::with_capacity(INFEASIBLE_INSERTIONS);
+    let destinations =
+        rotated_indices(context.current.lists.len(), context.seed ^ mix64(pending.item as i64 as u64) ^ mix64(pending.depth as u64));
+    for destination in destinations {
+        if destination == context.eliminated || destination == pending.origin || overlay.route(destination).is_empty() {
+            continue;
+        }
+        let positions = route_elimination_positions(context.per, overlay.route(destination), pending.item, context.work, context.stop)?;
+        for position in positions {
+            let base = overlay.route(destination);
+            context.work.structural_many(base.len().saturating_add(1), context.stop)?;
+            let mut route = clone_route_reserved(base, context.stop)?;
+            route.insert(position.min(route.len()), pending.item);
+            let score = score_route_elimination_list(context, destination, &route)?;
+            let objectives = signed_list_objectives(context.per, &score);
+            let headroom = context.per.routing_headroom(&route).saturating_neg();
+            let tie = mix64(context.seed ^ mix64(pending.item as i64 as u64) ^ mix64(destination as u64) ^ mix64(position as u64));
+            if score.violation == 0 {
+                let option = RouteEliminationOption { destination, route, ejected: None, rank: (0, 0, headroom, objectives, tie) };
+                retain_best(&mut direct, option, DIRECT_OPTIONS, |candidate| candidate.rank.clone());
+            } else if pending.depth < MAX_EJECTION_DEPTH {
+                let insertion = InfeasibleInsertion { destination, route, rank: (score.violation, headroom, objectives, tie) };
+                retain_best(&mut infeasible, insertion, INFEASIBLE_INSERTIONS, |candidate| candidate.rank.clone());
+            }
+        }
+    }
+
+    if pending.depth >= MAX_EJECTION_DEPTH {
+        return Ok(direct);
+    }
+
+    let mut ejections = Vec::with_capacity(EJECTION_OPTIONS);
+    for insertion in infeasible {
+        for position in
+            rotated_indices(insertion.route.len(), context.seed ^ mix64(insertion.destination as u64) ^ mix64(pending.item as i64 as u64))
+        {
+            let ejected = insertion.route[position];
+            if ejected == pending.item || forbidden.contains(&ejected) {
+                continue;
+            }
+            context.work.structural_many(insertion.route.len(), context.stop)?;
+            let mut route = clone_route_reserved(&insertion.route, context.stop)?;
+            route.remove(position);
+            let score = score_route_elimination_list(context, insertion.destination, &route)?;
+            if score.violation != 0 {
+                continue;
+            }
+            let objectives = signed_list_objectives(context.per, &score);
+            let headroom = context.per.routing_headroom(&route).saturating_neg();
+            let tie = mix64(context.seed ^ mix64(ejected as i64 as u64) ^ mix64(insertion.destination as u64) ^ mix64(position as u64));
+            let option = RouteEliminationOption {
+                destination: insertion.destination,
+                route,
+                ejected: Some(PendingEjection { item: ejected, origin: insertion.destination, depth: pending.depth + 1 }),
+                rank: (1, 0, headroom, objectives, tie),
+            };
+            retain_best(&mut ejections, option, EJECTION_OPTIONS, |candidate| candidate.rank.clone());
+        }
+    }
+    let mut options = Vec::with_capacity(direct.len().saturating_add(ejections.len()));
+    let mut direct = direct.into_iter();
+    let mut ejections = ejections.into_iter();
+    loop {
+        let before = options.len();
+        options.extend(direct.by_ref().take(2));
+        options.extend(ejections.by_ref().take(1));
+        if options.len() == before {
+            break;
+        }
+    }
+    Ok(options)
+}
+
+fn search_route_elimination(
+    context: &mut RouteEliminationContext<'_>,
+    overlay: EjectionOverlay<'_>,
+    pending: Vec<PendingEjection>,
+    forbidden: HashSet<i32>,
+) -> Result<Option<State>, Abort> {
+    const BRANCHES: usize = 6;
+    const MAX_EXTRA_EJECTIONS: usize = 6;
+
+    if pending.is_empty() {
+        let mut scoring = EjectionContext {
+            model: context.model,
+            per: context.per,
+            current: context.current,
+            before: context.before.clone(),
+            work: context.work,
+            stop: context.stop,
+            seed: context.seed,
+            list_scratch: std::mem::take(&mut context.list_scratch),
+            score_scratch: std::mem::take(&mut context.score_scratch),
+            overrides: std::mem::take(&mut context.overrides),
+        };
+        let score = score_ejection_overlay(&mut scoring, &overlay)?;
+        let result = if score.violation == 0 && improving_raw(&scoring.before, &score) && overlay.final_len(context.eliminated) == 0 {
+            Some(materialize_ejection_overlay(&mut scoring, overlay)?)
+        } else {
+            None
+        };
+        context.list_scratch = scoring.list_scratch;
+        context.score_scratch = scoring.score_scratch;
+        context.overrides = scoring.overrides;
+        return Ok(result);
+    }
+    if forbidden.len() > context.initial_removed.saturating_add(MAX_EXTRA_EJECTIONS) {
+        return Ok(None);
+    }
+
+    let mut selected: Option<(usize, Vec<RouteEliminationOption>)> = None;
+    for index in rotated_indices(pending.len(), context.seed ^ mix64(forbidden.len() as u64)) {
+        let options = route_elimination_options(context, &overlay, pending[index], &forbidden)?;
+        if options.is_empty() {
+            return Ok(None);
+        }
+        if selected.as_ref().is_none_or(|(_, best)| options.len() < best.len()) {
+            selected = Some((index, options));
+        }
+    }
+    let (selected_index, options) = selected.expect("pending route-elimination items are non-empty");
+
+    for option in options.into_iter().take(BRANCHES) {
+        context.work.structural_many(pending.len().saturating_add(forbidden.len()), context.stop)?;
+        let mut next_pending = pending.clone();
+        next_pending.swap_remove(selected_index);
+        let mut next_forbidden = forbidden.clone();
+        if let Some(ejected) = option.ejected {
+            next_forbidden.insert(ejected.item);
+            next_pending.push(ejected);
+        }
+        let mut next = overlay.fork(context.work, context.stop)?;
+        next.replace_route(option.destination, option.route, context.work, context.stop)?;
+        if let Some(candidate) = search_route_elimination(context, next, next_pending, next_forbidden)? {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn eliminate_route_with_ejections(
+    model: &CollectionModel,
+    per: &PerList,
+    current: &State,
+    seed: u64,
+    work: &mut WorkCounter,
+    stop: &AtomicBool,
+) -> Result<Option<State>, Abort> {
+    if nonempty_routes(&current.lists) < 2 {
+        return Ok(None);
+    }
+    let mut sources: Vec<usize> =
+        current.lists.iter().enumerate().filter_map(|(list, route)| (!route.is_empty()).then_some(list)).collect();
+    let minimum = sources.iter().map(|&list| current.lists[list].len()).min().unwrap_or(0);
+    let maximum = minimum.saturating_add(integer_sqrt(minimum.max(1)).max(1));
+    sources.retain(|&list| current.lists[list].len() <= maximum);
+    let sort_work =
+        u64::try_from(sources.len()).unwrap_or(u64::MAX).saturating_mul(ceil_log2(u64::try_from(sources.len()).unwrap_or(u64::MAX)));
+    work.structural_units(sort_work, stop)?;
+    sources.sort_by_key(|&list| (mix64(seed ^ mix64(list as u64)), current.lists[list].len()));
+
+    for eliminated in sources {
+        work.generated(stop)?;
+        let removed = &current.lists[eliminated];
+        let mut overlay = EjectionOverlay::new(&current.lists);
+        work.structural_many(removed.len(), stop)?;
+        overlay.route_mut(eliminated, work, stop)?.clear();
+        work.structural_many(removed.len().saturating_mul(2), stop)?;
+        let pending = removed.iter().copied().map(|item| PendingEjection { item, origin: eliminated, depth: 0 }).collect::<Vec<_>>();
+        let forbidden = removed.iter().copied().collect::<HashSet<_>>();
+        let mut context = RouteEliminationContext {
+            model,
+            per,
+            current,
+            before: full_score_raw(per, current),
+            eliminated,
+            initial_removed: removed.len(),
+            seed: seed ^ mix64(eliminated as u64),
+            work,
+            stop,
+            list_scratch: EvalScratch::default(),
+            score_scratch: EvalScratch::default(),
+            overrides: Vec::new(),
+        };
+        if let Some(candidate) = search_route_elimination(&mut context, overlay, pending, forbidden)? {
+            debug_assert!(route_is_eliminated(per, current, &candidate));
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
 }
 
 fn ejection_chain(
@@ -2974,7 +3363,14 @@ fn ejection_chain(
         score_scratch: EvalScratch::default(),
         overrides: Vec::new(),
     };
-    for src in rotated_indices(current.lists.len(), seed) {
+    let mut sources: Vec<usize> = rotated_indices(current.lists.len(), seed).collect();
+    if per.minimizes_fleet() {
+        let sort_work =
+            u64::try_from(sources.len()).unwrap_or(u64::MAX).saturating_mul(ceil_log2(u64::try_from(sources.len()).unwrap_or(u64::MAX)));
+        context.work.structural_units(sort_work, context.stop)?;
+        sources.sort_by_key(|&list| (current.lists[list].len(), mix64(seed ^ mix64(list as u64))));
+    }
+    for src in sources {
         for position in rotated_indices(current.lists[src].len(), seed ^ mix64(src as u64)) {
             context.work.generated(context.stop)?;
             let item = current.lists[src][position];
@@ -3001,7 +3397,6 @@ fn eject_insert(
     visited: &mut SmallVec<[i32; 4]>,
 ) -> Result<Option<State>, Abort> {
     const MAX_DEPTH: usize = 2;
-    const EJECTION_BRANCHES: usize = 4;
     let route_count = context.current.lists.len();
     for dst in rotated_indices(route_count, context.seed ^ mix64(item as i64 as u64) ^ mix64(depth as u64)) {
         if dst == origin {
@@ -3030,8 +3425,14 @@ fn eject_insert(
                 continue;
             }
 
-            let mut branched = 0usize;
-            for eject_at in rotated_indices(inserted.route(dst).len(), context.seed ^ mix64(dst as u64) ^ mix64(insert_at as u64)) {
+            for eject_at in temporal_ejection_positions(
+                context.per,
+                inserted.route(dst),
+                item,
+                context.seed ^ mix64(dst as u64) ^ mix64(insert_at as u64),
+                context.work,
+                context.stop,
+            )? {
                 let ejected = inserted.route(dst)[eject_at];
                 if ejected == item || visited.contains(&ejected) {
                     continue;
@@ -3044,14 +3445,36 @@ fn eject_insert(
                     return Ok(Some(result));
                 }
                 visited.pop();
-                branched += 1;
-                if branched >= EJECTION_BRANCHES {
-                    break;
-                }
             }
         }
     }
     Ok(None)
+}
+
+fn temporal_ejection_positions(
+    per: &PerList,
+    route: &[i32],
+    inserted: i32,
+    seed: u64,
+    work: &mut WorkCounter,
+    stop: &AtomicBool,
+) -> Result<Vec<usize>, Abort> {
+    const EJECTION_BRANCHES: usize = 4;
+    let mut ranked = Vec::with_capacity(EJECTION_BRANCHES);
+    for (position, &item) in route.iter().enumerate() {
+        work.structural(stop)?;
+        if item == inserted {
+            continue;
+        }
+        let key = (per.shaw_relatedness(inserted, item, true), mix64(seed ^ mix64(item as i64 as u64)), position);
+        let insertion = ranked.partition_point(|current| current <= &key);
+        work.structural_many(ranked.len().saturating_add(1), stop)?;
+        if insertion < EJECTION_BRANCHES {
+            ranked.insert(insertion, key);
+            ranked.truncate(EJECTION_BRANCHES);
+        }
+    }
+    Ok(ranked.into_iter().map(|(_, _, position)| position).collect())
 }
 
 fn score_ejection_overlay(context: &mut EjectionContext<'_>, overlay: &EjectionOverlay<'_>) -> Result<Score, Abort> {
