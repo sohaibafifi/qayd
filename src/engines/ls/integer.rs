@@ -964,7 +964,7 @@ fn compile_global(
         IntGlobalConstraint::Table { variables, tuples, positive } => {
             let mut copied = Vec::with_capacity(tuples.len());
             let mut cells = 0usize;
-            for tuple in tuples {
+            for tuple in tuples.iter() {
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     return Ok(false);
                 }

@@ -145,7 +145,7 @@ fn validated_verification_still_replays_constraints_and_honors_interruption() {
 fn table_model(tuples: Vec<Vec<i32>>, positive: bool) -> Model {
     let mut model = Model::new();
     let variables = (0..3).map(|_| model.int_range(i32::MIN, i32::MAX)).collect();
-    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table { variables, tuples, positive }));
+    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table { variables, tuples: tuples.into(), positive }));
     model
 }
 

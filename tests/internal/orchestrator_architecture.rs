@@ -386,7 +386,7 @@ fn guarded_mismatch_cop_uses_a_verified_integer_warm_start() {
     ])));
     model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table {
         variables: vec![index],
-        tuples: vec![vec![0]],
+        tuples: vec![vec![0]].into(),
         positive: true,
     }));
     model.add_objective(Objective::IntExpr { minimize: false, expr: IntExpr::Mul(vec![IntExpr::Constant(7), IntExpr::Variable(guard)]) });
@@ -415,7 +415,7 @@ fn direct_guarded_element_cop_uses_a_verified_integer_warm_start() {
     ])));
     model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table {
         variables: vec![index],
-        tuples: vec![vec![0]],
+        tuples: vec![vec![0]].into(),
         positive: true,
     }));
     model.add_objective(Objective::IntExpr { minimize: false, expr: IntExpr::Mul(vec![IntExpr::Constant(7), IntExpr::Variable(guard)]) });
@@ -444,7 +444,7 @@ fn disconnected_direct_guarded_element_does_not_enable_the_warm_start() {
     ])));
     model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table {
         variables: vec![unrelated_index],
-        tuples: vec![vec![0]],
+        tuples: vec![vec![0]].into(),
         positive: true,
     }));
     model.add_objective(Objective::IntExpr { minimize: false, expr: IntExpr::Mul(vec![IntExpr::Constant(7), IntExpr::Variable(guard)]) });
@@ -479,7 +479,7 @@ fn disconnected_element_does_not_enable_the_structural_warm_start() {
     ])));
     model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table {
         variables: vec![index],
-        tuples: vec![vec![0]],
+        tuples: vec![vec![0]].into(),
         positive: true,
     }));
     model.add_objective(Objective::IntExpr { minimize: false, expr: IntExpr::Mul(vec![IntExpr::Constant(7), IntExpr::Variable(guard)]) });

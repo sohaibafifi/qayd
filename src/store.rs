@@ -182,11 +182,10 @@ pub struct Store {
     /// Ablation switch: always explain with the whole-scope snapshot, ignoring
     /// propagator-supplied premises. Off in normal use.
     force_scope_reasons: bool,
-    /// A premise the [`Selected`](crate::propagator::Selected) wrapper stamps
-    /// onto every tight reason its inner propagator emits, so the selector
-    /// literal appears in the nogood (letting an unsat core trace to it). `None`
-    /// outside a selected propagator's `propagate`.
-    injected_premise: Option<Premise>,
+    /// Premises injected by nested guarded propagators. A stack preserves both
+    /// a semantic `Selected` owner and an inner reification literal in every
+    /// tight reason.
+    injected_premises: Vec<Premise>,
     /// Research instrumentation (off by default): when `Some`, every tight
     /// propagator reason records `(distinct witness variables, propagator scope
     /// size, kind)` with `kind` = 1 for a failure, 0 for an inference. Used by the
@@ -837,9 +836,7 @@ impl Store {
                 // premises *and* `sel = 1`; stamp the latter so the nogood carries it.
                 if will_change {
                     self.record_finesse(&p, false);
-                    if let Some(prem) = self.injected_premise {
-                        p.push(prem);
-                    }
+                    p.extend(self.injected_premises.iter().copied());
                 }
                 Cause::Premises(p)
             }
@@ -852,15 +849,15 @@ impl Store {
         self.force_scope_reasons = on;
     }
 
-    /// Stage the premise a [`Selected`](crate::propagator::Selected) wrapper
-    /// attributes to every tight reason its inner propagator emits while active.
+    /// Push a premise attributed to every tight reason emitted by a nested
+    /// guarded propagator while it is active.
     pub(crate) fn set_injected_premise(&mut self, premise: Premise) {
-        self.injected_premise = Some(premise);
+        self.injected_premises.push(premise);
     }
 
-    /// Stop stamping the injected premise.
+    /// Pop the most recently injected premise.
     pub(crate) fn clear_injected_premise(&mut self) {
-        self.injected_premise = None;
+        self.injected_premises.pop();
     }
 
     /// Append `premise` to any staged [`fail_because`](Store::fail_because)
@@ -959,7 +956,7 @@ impl Store {
     pub(crate) fn clear_pending(&mut self) {
         self.pending_premises = None;
         self.pending_conflict = None;
-        self.injected_premise = None;
+        self.injected_premises.clear();
     }
 
     /// Append premises pinning `var`'s current domain exactly: `Ge min`,
@@ -1333,6 +1330,13 @@ pub struct Solver {
     /// [`Selected`] guard on this selector, used to build constraint-level
     /// unsat cores. `None` in normal solving (no wrapping, no overhead).
     current_selector: Option<VarId>,
+    /// Physical intensions lowered to native propagators while this solver was
+    /// built. Kept on the plan so frontends can report compilation coverage.
+    native_intensions: u64,
+    /// Intensions that still require the universal expression propagator.
+    fallback_intensions: u64,
+    /// Propagator invocations performed by this solver clone.
+    propagation_calls: u64,
     #[cfg(feature = "lp-relaxation")]
     linear_relaxation: Vec<LinearRelaxationRow>,
 }
@@ -1404,6 +1408,22 @@ impl Solver {
     /// [`crate::mus`].
     pub fn set_selector(&mut self, sel: Option<VarId>) {
         self.current_selector = sel;
+    }
+
+    pub(crate) fn mark_native_intension(&mut self) {
+        self.native_intensions = self.native_intensions.saturating_add(1);
+    }
+
+    pub(crate) fn mark_fallback_intension(&mut self) {
+        self.fallback_intensions = self.fallback_intensions.saturating_add(1);
+    }
+
+    pub(crate) fn intension_lowering_counts(&self) -> (u64, u64) {
+        (self.native_intensions, self.fallback_intensions)
+    }
+
+    pub(crate) fn propagation_calls(&self) -> u64 {
+        self.propagation_calls
     }
 
     #[cfg(feature = "lp-relaxation")]
@@ -1522,6 +1542,7 @@ impl Solver {
 
     fn run_prop(&mut self, id: PropId) -> Result<(), Inconsistency> {
         PROP_CALLS.with(|c| c.set(c.get() + 1));
+        self.propagation_calls = self.propagation_calls.saturating_add(1);
         if self.store.prio[id.index()] == Priority::Expensive {
             EXPENSIVE_CALLS.with(|c| c.set(c.get() + 1));
         }
@@ -1542,6 +1563,7 @@ impl Solver {
 
     fn run_prop_until(&mut self, id: PropId, should_stop: &dyn Fn() -> bool) -> Result<(), Inconsistency> {
         PROP_CALLS.with(|c| c.set(c.get() + 1));
+        self.propagation_calls = self.propagation_calls.saturating_add(1);
         if self.store.prio[id.index()] == Priority::Expensive {
             EXPENSIVE_CALLS.with(|c| c.set(c.get() + 1));
         }

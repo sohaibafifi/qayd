@@ -8,7 +8,7 @@ use std::fmt::Display;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use xcsp3_rust_parser::xcsp_runner::XcspRunner;
 
@@ -288,7 +288,9 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
         return Err("semantic branching requires exact mode".to_string());
     }
     let path = stage_xml(xml)?;
+    let parse_started = Instant::now();
     let ParsedXcsp { package, search, output, stats, has_objective, groups } = parse_problem(&path.0)?;
+    let parse_elapsed = parse_started.elapsed();
     let core = options.core.then(|| CoreContext::instrument(&package, &groups)).transpose()?;
 
     if verbose {
@@ -304,6 +306,7 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
         writeln!(w, "c bounds domains {}", stats.bounds_domains).map_err(io_err)?;
         writeln!(w, "c semantic variables {}", search.len()).map_err(io_err)?;
         writeln!(w, "c propagators {}", stats.constraints).map_err(io_err)?;
+        writeln!(w, "c parse time {:.6}s", parse_elapsed.as_secs_f64()).map_err(io_err)?;
         writeln!(w, "c seed {}", options.seed).map_err(io_err)?;
         writeln!(w, "c workers {}", options.workers).map_err(io_err)?;
         if !has_objective {
@@ -458,6 +461,7 @@ fn candidate_values(candidate: &crate::orchestrator::CandidateSolution) -> Resul
 fn write_report<W: Write>(w: &mut W, result: &SolveResult) -> std::io::Result<()> {
     let stats = result.aggregate_search_stats();
     writeln!(w, "c nodes {} failures {}", stats.nodes, stats.failures)?;
+    writeln!(w, "c lcg atoms {} propagator calls {}", stats.lcg_atoms, stats.propagator_calls)?;
     if stats.vivified_clauses > 0 {
         writeln!(w, "c inprocessing vivified {} removed {}", stats.vivified_clauses, stats.vivified_lits)?;
     }
@@ -495,6 +499,31 @@ fn write_report<W: Write>(w: &mut W, result: &SolveResult) -> std::io::Result<()
 
     let value =
         |key| result.reports().iter().flat_map(|report| &report.metadata).find_map(|(name, value)| (name == key).then_some(value.as_str()));
+    let summed = |key| {
+        let values = result
+            .reports()
+            .iter()
+            .flat_map(|report| &report.metadata)
+            .filter_map(|(name, value)| if name == key { value.parse::<u64>().ok() } else { None })
+            .collect::<Vec<_>>();
+        (!values.is_empty()).then(|| values.into_iter().fold(0u64, u64::saturating_add))
+    };
+    if let (Some(instances), Some(templates), Some(native), Some(fallback), Some(propagators)) = (
+        summed("table_instances"),
+        summed("table_templates"),
+        summed("native_intensions"),
+        summed("fallback_intensions"),
+        summed("physical_propagators"),
+    ) {
+        writeln!(
+            w,
+            "c compilation tables {instances} templates {templates} native_intensions {native} fallback_intensions {fallback} physical_propagators {propagators}"
+        )?;
+    }
+    if let Some(build) = value("backend_build_seconds") {
+        writeln!(w, "c backend build time {build}s")?;
+    }
+    writeln!(w, "c search time {:.6}s", result.elapsed().as_secs_f64())?;
     if let (Some(fixed), Some(before), Some(after)) =
         (value("presolve_fixed"), value("presolve_search_before"), value("presolve_search_after"))
     {

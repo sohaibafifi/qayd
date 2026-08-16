@@ -346,6 +346,8 @@ pub fn merge_search_stats(total: &mut SolveStats, part: SolveStats) {
     total.solutions = total.solutions.saturating_add(part.solutions);
     total.nodes = total.nodes.saturating_add(part.nodes);
     total.failures = total.failures.saturating_add(part.failures);
+    total.lcg_atoms = total.lcg_atoms.max(part.lcg_atoms);
+    total.propagator_calls = total.propagator_calls.saturating_add(part.propagator_calls);
     total.learned_lits = total.learned_lits.saturating_add(part.learned_lits);
     total.vivified_clauses = total.vivified_clauses.saturating_add(part.vivified_clauses);
     total.vivified_lits = total.vivified_lits.saturating_add(part.vivified_lits);

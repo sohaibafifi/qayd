@@ -1,5 +1,7 @@
 //! Integer variable declarations.
 
+use std::sync::Arc;
+
 /// Reference to an integer variable declaration inside [`Model`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct IntVarRef(pub usize);
@@ -95,7 +97,9 @@ pub enum IntGlobalConstraint {
     },
     Table {
         variables: Vec<IntVarRef>,
-        tuples: Vec<Vec<i32>>,
+        /// Immutable table body. XCSP groups and cloned semantic models share
+        /// this allocation instead of duplicating every tuple per scope.
+        tuples: Arc<[Vec<i32>]>,
         positive: bool,
     },
     Regular {

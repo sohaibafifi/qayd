@@ -39,10 +39,40 @@ fn selected_element(selector_value: i64) -> ModelPackage {
     ModelPackage::new(model)
 }
 
+fn selected_reified_affine(selector_value: i64) -> ModelPackage {
+    let mut model = Model::new();
+    let outer = model.bool_var();
+    let inner = model.bool_var();
+    let left = model.int_range(1, 1);
+    let right = model.int_range(1, 1);
+    model.add_constraint(Constraint::Linear { terms: vec![(1, outer)], relation: Relation::Eq, rhs: selector_value });
+    model.add_constraint(Constraint::Linear { terms: vec![(1, inner)], relation: Relation::Eq, rhs: 0 });
+    model.add_constraint(Constraint::Selected {
+        selector: outer,
+        constraint: Box::new(Constraint::Intension(IntExpr::Iff(
+            Box::new(IntExpr::Not(Box::new(IntExpr::Variable(inner)))),
+            Box::new(IntExpr::Le(
+                Box::new(IntExpr::Add(vec![IntExpr::Variable(left), IntExpr::Variable(right)])),
+                Box::new(IntExpr::Constant(0)),
+            )),
+        ))),
+    });
+    ModelPackage::new(model)
+}
+
 #[test]
 fn disabled_selector_does_not_apply_functional_global() {
     let disabled = solve_model_silent(&selected_element(0), &SolveRequest::default()).unwrap();
     let enabled = solve_model_silent(&selected_element(1), &SolveRequest::default()).unwrap();
+
+    assert_eq!(disabled.status(), SolveStatus::Satisfiable);
+    assert_eq!(enabled.status(), SolveStatus::Unsatisfiable);
+}
+
+#[test]
+fn selected_reified_affine_keeps_both_guard_levels() {
+    let disabled = solve_model_silent(&selected_reified_affine(0), &SolveRequest::default()).unwrap();
+    let enabled = solve_model_silent(&selected_reified_affine(1), &SolveRequest::default()).unwrap();
 
     assert_eq!(disabled.status(), SolveStatus::Satisfiable);
     assert_eq!(enabled.status(), SolveStatus::Unsatisfiable);

@@ -192,7 +192,7 @@ fn no_overlap(model: &mut SemanticModel, starts: &[IntVarRef], durations: &[i64]
 }
 
 fn extension(model: &mut SemanticModel, variables: &[IntVarRef], tuples: &[Vec<i32>], positive: bool) {
-    global(model, IntGlobalConstraint::Table { variables: variables.to_vec(), tuples: tuples.to_vec(), positive });
+    global(model, IntGlobalConstraint::Table { variables: variables.to_vec(), tuples: tuples.to_vec().into(), positive });
 }
 
 fn regular(model: &mut SemanticModel, variables: &[IntVarRef], dfa: Dfa) {

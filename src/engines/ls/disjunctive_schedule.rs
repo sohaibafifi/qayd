@@ -753,7 +753,7 @@ impl<'a> Compiler<'a> {
                 }
                 let operation_array = array.as_ref()?;
                 let mut duration_by_position = BTreeMap::new();
-                for tuple in tuples {
+                for tuple in tuples.iter() {
                     if self.stop.load(Ordering::Acquire) {
                         return None;
                     }

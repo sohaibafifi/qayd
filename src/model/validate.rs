@@ -693,7 +693,7 @@ fn validate_global(model: &Model, global: &IntGlobalConstraint, context: &str, e
         }
         IntGlobalConstraint::Table { variables, tuples, .. } => {
             let mut wrong_arity = false;
-            for tuple in tuples {
+            for tuple in tuples.iter() {
                 if interrupted(stop) {
                     return false;
                 }

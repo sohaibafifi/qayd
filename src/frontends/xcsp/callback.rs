@@ -3,7 +3,10 @@
 //! Each callback emits frontend-neutral declarations. Unsupported forms set
 //! `error`; backend compilation happens only after parsing has completed.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use xcsp3_rust_parser::data_structs::expression_tree::xcsp3_utils::{ExpressionTree, Operator as EOp, TreeNode};
 use xcsp3_rust_parser::data_structs::xrelational_operand::xcsp3_core::Operand;
@@ -226,8 +229,8 @@ fn no_overlap(model: &mut SemanticModel, starts: &[IntVarRef], durations: &[i64]
     global(model, IntGlobalConstraint::NoOverlap { starts: starts.to_vec(), durations: durations.to_vec() });
 }
 
-fn extension(model: &mut SemanticModel, variables: &[IntVarRef], tuples: &[Vec<i32>], positive: bool) {
-    global(model, IntGlobalConstraint::Table { variables: variables.to_vec(), tuples: tuples.to_vec(), positive });
+fn extension(model: &mut SemanticModel, variables: &[IntVarRef], tuples: Arc<[Vec<i32>]>, positive: bool) {
+    global(model, IntGlobalConstraint::Table { variables: variables.to_vec(), tuples, positive });
 }
 
 fn regular(model: &mut SemanticModel, variables: &[IntVarRef], dfa: Dfa) {
@@ -335,6 +338,7 @@ pub struct Model {
     ids: HashMap<String, IntVarRef>,
     arrays: HashMap<String, ArrayDecl>,
     constants: HashMap<i32, IntVarRef>,
+    table_bodies: HashMap<u64, Vec<Arc<[Vec<i32>]>>>,
 }
 
 /// Right-hand side of a condition.
@@ -364,7 +368,21 @@ impl Model {
             ids: HashMap::new(),
             arrays: HashMap::new(),
             constants: HashMap::new(),
+            table_bodies: HashMap::new(),
         }
+    }
+
+    fn intern_table(&mut self, tuples: Vec<Vec<i32>>) -> Arc<[Vec<i32>]> {
+        let mut hasher = DefaultHasher::new();
+        tuples.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+        let bucket = self.table_bodies.entry(fingerprint).or_default();
+        if let Some(shared) = bucket.iter().find(|shared| shared.as_ref() == tuples.as_slice()) {
+            return Arc::clone(shared);
+        }
+        let shared: Arc<[Vec<i32>]> = Arc::from(tuples);
+        bucket.push(Arc::clone(&shared));
+        shared
     }
 
     pub(super) fn into_package(mut self) -> ModelPackage {
@@ -1059,7 +1077,8 @@ impl XcspCallback for Model {
         guard!(self, {
             let vars = self.scope(list)?;
             let tuples = tuples.iter().map(|t| t.iter().map(|&v| if v == i32::MAX { STAR } else { v }).collect()).collect::<Vec<Vec<_>>>();
-            extension(&mut self.package.model, &vars, &tuples, is_support);
+            let tuples = self.intern_table(tuples);
+            extension(&mut self.package.model, &vars, tuples, is_support);
             Ok(())
         });
     }
@@ -1068,7 +1087,8 @@ impl XcspCallback for Model {
         guard!(self, {
             let v = self.var_id(list)?;
             let tuples = values.iter().map(|&x| vec![x]).collect::<Vec<_>>();
-            extension(&mut self.package.model, &[v], &tuples, is_support);
+            let tuples = self.intern_table(tuples);
+            extension(&mut self.package.model, &[v], tuples, is_support);
             Ok(())
         });
     }

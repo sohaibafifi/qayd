@@ -392,6 +392,10 @@ struct PySolveStats {
     #[pyo3(get)]
     failures: u64,
     #[pyo3(get)]
+    lcg_atoms: u64,
+    #[pyo3(get)]
+    propagator_calls: u64,
+    #[pyo3(get)]
     learned_lits: u64,
     #[pyo3(get)]
     vivified_clauses: u64,
@@ -745,6 +749,8 @@ impl From<SearchStats> for PySolveStats {
             solutions: stats.solutions,
             nodes: stats.nodes,
             failures: stats.failures,
+            lcg_atoms: stats.lcg_atoms,
+            propagator_calls: stats.propagator_calls,
             learned_lits: stats.learned_lits,
             vivified_clauses: stats.vivified_clauses,
             vivified_lits: stats.vivified_lits,
@@ -2680,7 +2686,11 @@ impl PyModel {
         if tuples.iter().any(|tuple| tuple.len() != vars.len()) {
             return Err(PyValueError::new_err("every tuple must match the variable arity"));
         }
-        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table { variables: vars, tuples, positive }));
+        self.add_integer_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table {
+            variables: vars,
+            tuples: tuples.into(),
+            positive,
+        }));
         Ok(())
     }
 

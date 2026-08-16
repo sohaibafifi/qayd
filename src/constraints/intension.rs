@@ -2,8 +2,10 @@
 //! Filtering: disentailment by bounds, probing each unfixed value, then an exact
 //! check once all vars are fixed (the correctness safety net for weak bounds).
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use super::linear::{self, Relation as LinearRelation};
 use crate::expr::Expr;
 use crate::ids::{PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Propagator};
@@ -87,6 +89,235 @@ pub fn intension(solver: &mut Solver, expr: Expr) {
     assert!(intension_interruptible(solver, expr, &stop));
 }
 
+type BooleanLiteral = (VarId, bool);
+
+struct AffinePredicate {
+    coefficients: Vec<i64>,
+    variables: Vec<VarId>,
+    relation: LinearRelation,
+    rhs: i64,
+}
+
+enum BooleanFormula {
+    Literal(BooleanLiteral),
+    Or(Vec<BooleanLiteral>),
+    And(Vec<BooleanLiteral>),
+}
+
+enum NativeIntension {
+    All(Vec<NativeIntension>),
+    Clauses(Vec<Vec<BooleanLiteral>>),
+    Linear(AffinePredicate),
+    ReifiedLinear { selector: VarId, active_value: i32, predicate: AffinePredicate, equivalence: bool },
+}
+
+fn complement(relation: LinearRelation) -> LinearRelation {
+    match relation {
+        LinearRelation::Eq => LinearRelation::Ne,
+        LinearRelation::Ne => LinearRelation::Eq,
+        LinearRelation::Le => LinearRelation::Gt,
+        LinearRelation::Lt => LinearRelation::Ge,
+        LinearRelation::Ge => LinearRelation::Lt,
+        LinearRelation::Gt => LinearRelation::Le,
+    }
+}
+
+fn affine_predicate(store: &Store, expression: &Expr, stop: &AtomicBool) -> Option<AffinePredicate> {
+    let (left, right, relation) = match expression {
+        Expr::Eq(left, right) => (left.as_ref(), right.as_ref(), LinearRelation::Eq),
+        Expr::Ne(left, right) => (left.as_ref(), right.as_ref(), LinearRelation::Ne),
+        Expr::Le(left, right) => (left.as_ref(), right.as_ref(), LinearRelation::Le),
+        Expr::Lt(left, right) => (left.as_ref(), right.as_ref(), LinearRelation::Lt),
+        Expr::Ge(left, right) => (left.as_ref(), right.as_ref(), LinearRelation::Ge),
+        Expr::Gt(left, right) => (left.as_ref(), right.as_ref(), LinearRelation::Gt),
+        _ => return None,
+    };
+    let (left_constant, left_coefficients, left_variables) = left.affine_form_interruptible(stop)?;
+    let (right_constant, right_coefficients, right_variables) = right.affine_form_interruptible(stop)?;
+    let rhs = i64::try_from(i128::from(right_constant) - i128::from(left_constant)).ok()?;
+    let mut combined = BTreeMap::<VarId, i128>::new();
+    for (coefficient, variable) in left_coefficients.into_iter().zip(left_variables) {
+        *combined.entry(variable).or_default() += i128::from(coefficient);
+    }
+    for (coefficient, variable) in right_coefficients.into_iter().zip(right_variables) {
+        *combined.entry(variable).or_default() -= i128::from(coefficient);
+    }
+    combined.retain(|_, coefficient| *coefficient != 0);
+    let mut coefficients = Vec::with_capacity(combined.len());
+    let mut variables = Vec::with_capacity(combined.len());
+    for (variable, coefficient) in combined {
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        coefficients.push(i64::try_from(coefficient).ok()?);
+        variables.push(variable);
+    }
+    linear::native_supported(store, &coefficients, &variables, relation, rhs).then_some(AffinePredicate {
+        coefficients,
+        variables,
+        relation,
+        rhs,
+    })
+}
+
+fn boolean_formula(store: &Store, expression: &Expr) -> Option<BooleanFormula> {
+    if let Some(literal) = boolean_literal(store, expression) {
+        return Some(BooleanFormula::Literal(literal));
+    }
+    match expression {
+        Expr::Or(terms) => terms.iter().map(|term| boolean_literal(store, term)).collect::<Option<Vec<_>>>().map(BooleanFormula::Or),
+        Expr::And(terms) => terms.iter().map(|term| boolean_literal(store, term)).collect::<Option<Vec<_>>>().map(BooleanFormula::And),
+        _ => None,
+    }
+}
+
+fn imply_formula(antecedent: BooleanLiteral, consequent: BooleanFormula) -> NativeIntension {
+    let disabled = (antecedent.0, !antecedent.1);
+    let clauses = match consequent {
+        BooleanFormula::Literal(literal) => vec![vec![disabled, literal]],
+        BooleanFormula::Or(mut literals) => {
+            literals.insert(0, disabled);
+            vec![literals]
+        }
+        BooleanFormula::And(literals) => literals.into_iter().map(|literal| vec![disabled, literal]).collect(),
+    };
+    NativeIntension::Clauses(clauses)
+}
+
+fn equivalent_formula(selector: BooleanLiteral, formula: BooleanFormula) -> NativeIntension {
+    let selector_false = (selector.0, !selector.1);
+    let clauses = match formula {
+        BooleanFormula::Literal(literal) => vec![vec![selector_false, literal], vec![selector, (literal.0, !literal.1)]],
+        BooleanFormula::Or(literals) => {
+            let mut clauses = Vec::with_capacity(literals.len() + 1);
+            let mut forward = Vec::with_capacity(literals.len() + 1);
+            forward.push(selector_false);
+            forward.extend(literals.iter().copied());
+            clauses.push(forward);
+            clauses.extend(literals.into_iter().map(|literal| vec![selector, (literal.0, !literal.1)]));
+            clauses
+        }
+        BooleanFormula::And(literals) => {
+            let mut clauses = Vec::with_capacity(literals.len() + 1);
+            clauses.extend(literals.iter().copied().map(|literal| vec![selector_false, literal]));
+            let mut reverse = Vec::with_capacity(literals.len() + 1);
+            reverse.push(selector);
+            reverse.extend(literals.into_iter().map(|literal| (literal.0, !literal.1)));
+            clauses.push(reverse);
+            clauses
+        }
+    };
+    NativeIntension::Clauses(clauses)
+}
+
+fn reified_equivalence(store: &Store, left: &Expr, right: &Expr, stop: &AtomicBool) -> Option<NativeIntension> {
+    let selector = boolean_literal(store, left)?;
+    if let Some(formula) = boolean_formula(store, right) {
+        return Some(equivalent_formula(selector, formula));
+    }
+    let predicate = affine_predicate(store, right, stop)?;
+    let opposite = complement(predicate.relation);
+    if !linear::native_supported(store, &predicate.coefficients, &predicate.variables, opposite, predicate.rhs) {
+        return None;
+    }
+    Some(NativeIntension::ReifiedLinear { selector: selector.0, active_value: i32::from(selector.1), predicate, equivalence: true })
+}
+
+fn native_intension(store: &Store, expression: &Expr, stop: &AtomicBool) -> Option<NativeIntension> {
+    if stop.load(Ordering::Acquire) {
+        return None;
+    }
+    match expression {
+        Expr::Const(value) => {
+            return Some(NativeIntension::Clauses(if *value == 0 { vec![Vec::new()] } else { Vec::new() }));
+        }
+        Expr::And(terms) => {
+            let plans = terms.iter().map(|term| native_intension(store, term, stop)).collect::<Option<Vec<_>>>()?;
+            return Some(NativeIntension::All(plans));
+        }
+        Expr::Imp(antecedent, consequent) => {
+            let selector = boolean_literal(store, antecedent)?;
+            if let Some(formula) = boolean_formula(store, consequent) {
+                return Some(imply_formula(selector, formula));
+            }
+            let predicate = affine_predicate(store, consequent, stop)?;
+            return Some(NativeIntension::ReifiedLinear {
+                selector: selector.0,
+                active_value: i32::from(selector.1),
+                predicate,
+                equivalence: false,
+            });
+        }
+        Expr::Iff(left, right) | Expr::Eq(left, right) => {
+            if let Some(plan) = reified_equivalence(store, left, right, stop).or_else(|| reified_equivalence(store, right, left, stop)) {
+                return Some(plan);
+            }
+        }
+        _ => {}
+    }
+    if let Some(formula) = boolean_formula(store, expression) {
+        return Some(match formula {
+            BooleanFormula::Literal(literal) => NativeIntension::Clauses(vec![vec![literal]]),
+            BooleanFormula::Or(literals) => NativeIntension::Clauses(vec![literals]),
+            BooleanFormula::And(literals) => NativeIntension::Clauses(literals.into_iter().map(|literal| vec![literal]).collect()),
+        });
+    }
+    affine_predicate(store, expression, stop).map(NativeIntension::Linear)
+}
+
+fn post_clause(solver: &mut Solver, literals: Vec<BooleanLiteral>, stop: &AtomicBool) -> bool {
+    let mut signs = BTreeMap::<VarId, u8>::new();
+    for (variable, positive) in literals {
+        let sign = if positive { 1 } else { 2 };
+        let entry = signs.entry(variable).or_default();
+        *entry |= sign;
+        if *entry == 3 {
+            return true;
+        }
+    }
+    let Ok(negative) = i64::try_from(signs.values().filter(|&&sign| sign == 2).count()) else {
+        return false;
+    };
+    let mut coefficients = Vec::with_capacity(signs.len());
+    let mut variables = Vec::with_capacity(signs.len());
+    for (variable, sign) in signs {
+        coefficients.push(if sign == 1 { 1 } else { -1 });
+        variables.push(variable);
+    }
+    let Some(rhs) = 1i64.checked_sub(negative) else {
+        return false;
+    };
+    linear::linear_without_relaxation_interruptible(solver, coefficients, variables, LinearRelation::Ge, rhs, stop)
+}
+
+fn post_native_intension(solver: &mut Solver, plan: NativeIntension, stop: &AtomicBool) -> bool {
+    match plan {
+        NativeIntension::All(plans) => plans.into_iter().all(|plan| post_native_intension(solver, plan, stop)),
+        NativeIntension::Clauses(clauses) => clauses.into_iter().all(|clause| post_clause(solver, clause, stop)),
+        NativeIntension::Linear(predicate) => linear::linear_without_relaxation_interruptible(
+            solver,
+            predicate.coefficients,
+            predicate.variables,
+            predicate.relation,
+            predicate.rhs,
+            stop,
+        ),
+        NativeIntension::ReifiedLinear { selector, active_value, predicate, equivalence } => linear::reified_linear_interruptible(
+            solver,
+            linear::ReifiedLinearSpec {
+                selector,
+                active_value,
+                coefficients: predicate.coefficients,
+                variables: predicate.variables,
+                relation: predicate.relation,
+                rhs: predicate.rhs,
+                equivalence,
+            },
+            stop,
+        ),
+    }
+}
+
 /// Post an intension expression while polling during variable collection and
 /// propagator registration. A `false` result requires discarding `solver`.
 pub(crate) fn intension_interruptible(solver: &mut Solver, expr: Expr, stop: &AtomicBool) -> bool {
@@ -96,6 +327,16 @@ pub(crate) fn intension_interruptible(solver: &mut Solver, expr: Expr, stop: &At
     #[cfg(feature = "lp-relaxation")]
     {
         record_convex_relaxation(solver, &expr, stop);
+    }
+    if let Some(plan) = native_intension(&solver.store, &expr, stop) {
+        let posted = post_native_intension(solver, plan, stop);
+        if posted {
+            solver.mark_native_intension();
+        }
+        return posted;
+    }
+    if stop.load(Ordering::Acquire) {
+        return false;
     }
     let mut vars = Vec::new();
     if !collect_vars_interruptible(&expr, &mut vars, stop) {
@@ -107,7 +348,11 @@ pub(crate) fn intension_interruptible(solver: &mut Solver, expr: Expr, stop: &At
     }
     vars.dedup();
     let should_stop = || stop.load(Ordering::Acquire);
-    solver.post_until(Box::new(Intension { expr, vars, scratch: Vec::new() }), &should_stop).is_some()
+    let posted = solver.post_until(Box::new(Intension { expr, vars, scratch: Vec::new() }), &should_stop).is_some();
+    if posted {
+        solver.mark_fallback_intension();
+    }
+    posted
 }
 
 #[cfg(feature = "lp-relaxation")]
@@ -176,12 +421,10 @@ fn record_convex_relaxation(solver: &mut Solver, expression: &Expr, stop: &Atomi
     }
 }
 
-#[cfg(feature = "lp-relaxation")]
 fn is_boolean(store: &Store, variable: VarId) -> bool {
     store.min(variable) >= 0 && store.max(variable) <= 1
 }
 
-#[cfg(feature = "lp-relaxation")]
 fn boolean_literal(store: &Store, expression: &Expr) -> Option<(VarId, bool)> {
     match expression {
         Expr::Var(variable) if is_boolean(store, *variable) => Some((*variable, true)),
@@ -196,7 +439,6 @@ fn boolean_literal(store: &Store, expression: &Expr) -> Option<(VarId, bool)> {
     }
 }
 
-#[cfg(feature = "lp-relaxation")]
 fn boolean_equality_literal(store: &Store, left: &Expr, right: &Expr, negated: bool) -> Option<(VarId, bool)> {
     let (variable, value) = match (left, right) {
         (Expr::Var(variable), Expr::Const(value)) | (Expr::Const(value), Expr::Var(variable)) => (*variable, *value),
@@ -208,7 +450,6 @@ fn boolean_equality_literal(store: &Store, left: &Expr, right: &Expr, negated: b
     Some((variable, (value == 1) != negated))
 }
 
-#[cfg(feature = "lp-relaxation")]
 fn boolean_threshold_literal(store: &Store, left: &Expr, right: &Expr, threshold: i64, positive: bool) -> Option<(VarId, bool)> {
     let (Expr::Var(variable), Expr::Const(value)) = (left, right) else {
         return None;

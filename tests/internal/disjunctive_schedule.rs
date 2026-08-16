@@ -1,4 +1,5 @@
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use crate::constraints::table::STAR;
 use crate::engines::ls::disjunctive_schedule::{ConstructionBudget, DisjunctiveSchedulePlan, MAX_CONSTRUCTION_WORK, MAX_REPAIR_CANDIDATES};
@@ -65,7 +66,7 @@ fn fixture() -> Fixture {
             &mut model,
             Constraint::IntegerGlobal(IntGlobalConstraint::Table {
                 variables: vec![positions[slot], selected_durations[slot]],
-                tuples: vec![vec![0, 2], vec![1, 3], vec![2, 1]],
+                tuples: vec![vec![0, 2], vec![1, 3], vec![2, 1]].into(),
                 positive: true,
             }),
         ));
@@ -403,7 +404,8 @@ fn permutation_channel_rejects_incomplete_or_ambiguous_proofs() {
     else {
         unreachable!()
     };
-    tuples.pop();
+    let shortened: Arc<[Vec<i32>]> = tuples[..tuples.len() - 1].to_vec().into();
+    *tuples = shortened;
     assert!(compile(&incomplete_table.model).is_none());
 
     let mut wildcard_table = fixture();
@@ -412,7 +414,7 @@ fn permutation_channel_rejects_incomplete_or_ambiguous_proofs() {
     else {
         unreachable!()
     };
-    tuples[0][1] = STAR;
+    Arc::make_mut(tuples)[0][1] = STAR;
     assert!(compile(&wildcard_table.model).is_none());
 
     let mut duration_mismatch = fixture();
@@ -421,7 +423,7 @@ fn permutation_channel_rejects_incomplete_or_ambiguous_proofs() {
     else {
         unreachable!()
     };
-    tuples[0][1] = 3;
+    Arc::make_mut(tuples)[0][1] = 3;
     assert!(compile(&duration_mismatch.model).is_none());
 }
 

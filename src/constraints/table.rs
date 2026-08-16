@@ -558,17 +558,12 @@ pub fn extension(solver: &mut Solver, vars: &[VarId], tuples: &[Vec<i32>], posit
     extension_from_template(solver, vars, extension_template(vars.len(), tuples), positive);
 }
 
-/// Interruptible extension lowering. A `false` result requires discarding the
-/// partially built solver.
+#[cfg(test)]
 pub(crate) fn extension_interruptible(solver: &mut Solver, vars: &[VarId], tuples: &[Vec<i32>], positive: bool, stop: &AtomicBool) -> bool {
-    let Some(template) = ExtensionTemplate::new_interruptible(vars.len(), tuples, stop).map(Arc::new) else {
+    let Some(template) = extension_template_interruptible(vars.len(), tuples, stop) else {
         return false;
     };
-    let Some(propagator) = Extension::new_interruptible(&mut solver.store, vars, template, positive, stop) else {
-        return false;
-    };
-    let should_stop = || stop.load(Ordering::Acquire);
-    solver.post_until(Box::new(propagator), &should_stop).is_some()
+    extension_from_template_interruptible(solver, vars, template, positive, stop)
 }
 
 /// Compile an extension table's immutable tuple bitsets.
@@ -576,10 +571,32 @@ pub fn extension_template(arity: usize, tuples: &[Vec<i32>]) -> Arc<ExtensionTem
     Arc::new(ExtensionTemplate::new(arity, tuples))
 }
 
+/// Interruptibly compile an immutable extension-table body. Callers may retain
+/// and reuse the returned template for every scope with the same arity.
+pub(crate) fn extension_template_interruptible(arity: usize, tuples: &[Vec<i32>], stop: &AtomicBool) -> Option<Arc<ExtensionTemplate>> {
+    ExtensionTemplate::new_interruptible(arity, tuples, stop).map(Arc::new)
+}
+
 /// Post an extension constraint backed by a shared immutable template.
 pub fn extension_from_template(solver: &mut Solver, vars: &[VarId], template: Arc<ExtensionTemplate>, positive: bool) {
     let prop = Extension::new(&mut solver.store, vars, template, positive);
     solver.post(Box::new(prop));
+}
+
+/// Interruptibly post an extension constraint from an already compiled table
+/// body. A `false` result requires discarding the partially built solver.
+pub(crate) fn extension_from_template_interruptible(
+    solver: &mut Solver,
+    vars: &[VarId],
+    template: Arc<ExtensionTemplate>,
+    positive: bool,
+    stop: &AtomicBool,
+) -> bool {
+    let Some(propagator) = Extension::new_interruptible(&mut solver.store, vars, template, positive, stop) else {
+        return false;
+    };
+    let should_stop = || stop.load(Ordering::Acquire);
+    solver.post_until(Box::new(propagator), &should_stop).is_some()
 }
 
 // ===========================================================================

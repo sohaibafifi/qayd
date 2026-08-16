@@ -1,7 +1,8 @@
 //! Compiler from the semantic integer/set model to the CP physical plan.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::constraints::{
     count, divisibility, flatten, graph, intension, interval as interval_constraints, lex, linear, prefix_set, primitives, scheduling,
@@ -21,6 +22,22 @@ type DivisibilityGroups = BTreeMap<DivisibilityKey, BTreeSet<i64>>;
 type PrefixSetKey = (IntVarRef, Vec<i32>);
 type PrefixSetEntry = (i32, IntVarRef);
 type PrefixSetGroups = BTreeMap<PrefixSetKey, BTreeSet<PrefixSetEntry>>;
+type TableTemplateKey = (usize, usize, usize);
+
+#[derive(Default)]
+struct TableTemplateCache {
+    templates: HashMap<TableTemplateKey, Arc<table::ExtensionTemplate>>,
+    instances: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CpCompilationStats {
+    pub table_instances: u64,
+    pub table_templates: u64,
+    pub native_intensions: u64,
+    pub fallback_intensions: u64,
+    pub physical_propagators: u64,
+}
 
 const CP_ESTIMATE_BASE_BYTES: u128 = 64 * 1024;
 #[inline]
@@ -258,6 +275,7 @@ pub(crate) struct CompiledCp {
     int_variables: Vec<VarId>,
     sets: Vec<CompiledSet>,
     estimated_bytes: u64,
+    compilation: CpCompilationStats,
 }
 
 pub(crate) struct DecodedCpAssignment {
@@ -363,6 +381,7 @@ impl CompiledCp {
         };
         let mut posted_divisibility_groups = BTreeSet::new();
         let mut posted_prefix_set_groups = BTreeSet::new();
+        let mut table_templates = TableTemplateCache::default();
         for constraint in &model.constraints {
             if interrupted(stop) {
                 return Ok(None);
@@ -418,7 +437,7 @@ impl CompiledCp {
                 }
                 continue;
             }
-            if post_constraint(&mut solver, &int_variables, &sets, constraint, stop)?.is_none() {
+            if post_constraint(&mut solver, &int_variables, &sets, constraint, &mut table_templates, stop)?.is_none() {
                 return Ok(None);
             }
         }
@@ -496,12 +515,21 @@ impl CompiledCp {
         if interrupted(stop) {
             return Ok(None);
         }
+        let (native_intensions, fallback_intensions) = solver.intension_lowering_counts();
+        let compilation = CpCompilationStats {
+            table_instances: table_templates.instances,
+            table_templates: u64::try_from(table_templates.templates.len()).unwrap_or(u64::MAX),
+            native_intensions,
+            fallback_intensions,
+            physical_propagators: u64::try_from(solver.num_propagators()).unwrap_or(u64::MAX),
+        };
         Ok(Some(Self {
             problem: Problem { solver, search, objective: objectives.first().cloned() },
             objectives,
             int_variables,
             sets,
             estimated_bytes,
+            compilation,
         }))
     }
 
@@ -511,6 +539,10 @@ impl CompiledCp {
 
     pub(crate) fn objectives(&self) -> &[PhysicalObjective] {
         &self.objectives
+    }
+
+    pub(crate) fn compilation_stats(&self) -> CpCompilationStats {
+        self.compilation
     }
 
     pub(crate) fn int_variables(&self) -> &[VarId] {
@@ -695,13 +727,14 @@ fn estimate_semantic_bytes(model: &Model, stop: &AtomicBool) -> Option<u64> {
             .saturating_add(wide(forbidden.len()).saturating_mul(16))
             .saturating_add(wide(entries.len()).saturating_mul(192));
     }
+    let mut table_templates = BTreeSet::new();
     for constraint in &model.constraints {
         let prefix_match = match match_prefix_set_exclusion(constraint, stop) {
             Ok(matched) => matched,
             Err(()) => return None,
         };
         if match_shared_divisibility_exclusion(constraint).is_none() && prefix_match.is_none() {
-            bytes = bytes.saturating_add(estimate_constraint_bytes(model, constraint, stop)?);
+            bytes = bytes.saturating_add(estimate_constraint_bytes(model, constraint, &mut table_templates, stop)?);
         }
     }
     for objective in &model.objectives {
@@ -715,16 +748,23 @@ fn estimate_semantic_bytes(model: &Model, stop: &AtomicBool) -> Option<u64> {
     Some(u64::try_from(bytes).unwrap_or(u64::MAX))
 }
 
-fn estimate_constraint_bytes(model: &Model, constraint: &Constraint, stop: &AtomicBool) -> Option<u128> {
+fn estimate_constraint_bytes(
+    model: &Model,
+    constraint: &Constraint,
+    table_templates: &mut BTreeSet<TableTemplateKey>,
+    stop: &AtomicBool,
+) -> Option<u128> {
     if interrupted(stop) {
         return None;
     }
     Some(match constraint {
         Constraint::Intension(expr) => 1024u128.saturating_add(estimate_expr_bytes(expr, stop)?),
-        Constraint::Selected { constraint, .. } => 512u128.saturating_add(estimate_constraint_bytes(model, constraint, stop)?),
+        Constraint::Selected { constraint, .. } => {
+            512u128.saturating_add(estimate_constraint_bytes(model, constraint, table_templates, stop)?)
+        }
         Constraint::Linear { terms, .. } => 1024u128.saturating_add(wide(terms.len()).saturating_mul(96)),
         Constraint::Clause(literals) => 1024u128.saturating_add(wide(literals.len()).saturating_mul(160)),
-        Constraint::IntegerGlobal(global) => estimate_global_bytes(model, global, stop)?,
+        Constraint::IntegerGlobal(global) => estimate_global_bytes(model, global, table_templates, stop)?,
         Constraint::SetSubset { subset, superset } | Constraint::SetDisjoint { left: subset, right: superset } => {
             let cells = model
                 .sets
@@ -892,7 +932,12 @@ fn table_support_count(tuples: &[Vec<i32>], arity: usize, stop: &AtomicBool) -> 
     Some(total)
 }
 
-fn estimate_global_bytes(model: &Model, global: &IntGlobalConstraint, stop: &AtomicBool) -> Option<u128> {
+fn estimate_global_bytes(
+    model: &Model,
+    global: &IntGlobalConstraint,
+    table_templates: &mut BTreeSet<TableTemplateKey>,
+    stop: &AtomicBool,
+) -> Option<u128> {
     if interrupted(stop) {
         return None;
     }
@@ -925,18 +970,21 @@ fn estimate_global_bytes(model: &Model, global: &IntGlobalConstraint, stop: &Ato
             let arity = wide(variables.len());
             let tuple_count = wide(tuples.len());
             let words = tuple_count.saturating_add(63) / 64;
-            let support_values = table_support_count(tuples, variables.len(), stop)?;
-            let support_bitsets = support_values.saturating_mul(words).saturating_mul(8);
-            let support_maps = support_values.saturating_mul(64);
-            let table_body = arity.saturating_mul(tuple_count).saturating_mul(4);
+            let key = (variables.len(), tuples.as_ptr() as usize, tuples.len());
+            let template = if table_templates.insert(key) {
+                let support_values = table_support_count(tuples, variables.len(), stop)?;
+                support_values
+                    .saturating_mul(words)
+                    .saturating_mul(8)
+                    .saturating_add(support_values.saturating_mul(64))
+                    .saturating_add(arity.saturating_mul(tuple_count).saturating_mul(4))
+                    .saturating_add(4096)
+            } else {
+                0
+            };
             let layered_scratch = arity.saturating_add(1).saturating_mul(words).saturating_mul(if *positive { 48 } else { 32 });
             let residues = domain_cells(model, variables, stop)?.saturating_mul(if *positive { 160 } else { 32 });
-            8192u128
-                .saturating_add(support_bitsets)
-                .saturating_add(support_maps)
-                .saturating_add(table_body)
-                .saturating_add(layered_scratch)
-                .saturating_add(residues)
+            4096u128.saturating_add(template).saturating_add(layered_scratch).saturating_add(residues)
         }
         IntGlobalConstraint::Regular { variables, automaton } => {
             let layers = wide(variables.len()).saturating_add(1);
@@ -1038,6 +1086,7 @@ fn post_constraint(
     int_variables: &[VarId],
     sets: &[CompiledSet],
     constraint: &Constraint,
+    table_templates: &mut TableTemplateCache,
     stop: &AtomicBool,
 ) -> CompileStep<()> {
     if interrupted(stop) {
@@ -1052,7 +1101,7 @@ fn post_constraint(
         }
         Constraint::Selected { selector, constraint } => {
             solver.set_selector(Some(int_variables[selector.0]));
-            let result = post_constraint(solver, int_variables, sets, constraint, stop);
+            let result = post_constraint(solver, int_variables, sets, constraint, table_templates, stop);
             solver.set_selector(None);
             if result?.is_none() {
                 return Ok(None);
@@ -1090,7 +1139,7 @@ fn post_constraint(
             }
         }
         Constraint::IntegerGlobal(global) => {
-            if post_global(solver, int_variables, global, stop)?.is_none() {
+            if post_global(solver, int_variables, global, table_templates, stop)?.is_none() {
                 return Ok(None);
             }
         }
@@ -1171,7 +1220,13 @@ fn post_constraint(
     }
 }
 
-fn post_global(solver: &mut Solver, map: &[VarId], global: &IntGlobalConstraint, stop: &AtomicBool) -> CompileStep<()> {
+fn post_global(
+    solver: &mut Solver,
+    map: &[VarId],
+    global: &IntGlobalConstraint,
+    table_templates: &mut TableTemplateCache,
+    stop: &AtomicBool,
+) -> CompileStep<()> {
     if interrupted(stop) {
         return Ok(None);
     }
@@ -1221,7 +1276,20 @@ fn post_global(solver: &mut Solver, map: &[VarId], global: &IntGlobalConstraint,
             count::n_values(solver, &mapped!(ids), physical_relation(*relation), *count_value);
         }
         IntGlobalConstraint::Table { variables: ids, tuples, positive } => {
-            if !table::extension_interruptible(solver, &mapped!(ids), tuples, *positive, stop) {
+            let variables = mapped!(ids);
+            let key = (ids.len(), tuples.as_ptr() as usize, tuples.len());
+            table_templates.instances = table_templates.instances.saturating_add(1);
+            let template = match table_templates.templates.get(&key) {
+                Some(template) => Arc::clone(template),
+                None => {
+                    let Some(template) = table::extension_template_interruptible(ids.len(), tuples, stop) else {
+                        return Ok(None);
+                    };
+                    table_templates.templates.insert(key, Arc::clone(&template));
+                    template
+                }
+            };
+            if !table::extension_from_template_interruptible(solver, &variables, template, *positive, stop) {
                 return Ok(None);
             }
         }

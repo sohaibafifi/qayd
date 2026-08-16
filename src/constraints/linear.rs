@@ -300,6 +300,136 @@ impl Propagator for LinearNeq {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PredicateTruth {
+    True,
+    False,
+    Unknown,
+}
+
+/// A Boolean selector guarding an affine predicate. With `equivalence=false`,
+/// only `selector == active_value` implies the predicate. With equivalence, the
+/// opposite selector value enforces the exact complementary relation too.
+#[derive(Clone)]
+struct ReifiedLinear {
+    selector: VarId,
+    active_value: i32,
+    equivalence: bool,
+    coefficients: Vec<i64>,
+    variables: Vec<VarId>,
+    relation: Relation,
+    rhs: i64,
+    when_true: Box<dyn Propagator>,
+    when_false: Option<Box<dyn Propagator>>,
+}
+
+impl ReifiedLinear {
+    fn activity(&self, store: &Store) -> (i128, i128) {
+        self.coefficients.iter().zip(&self.variables).fold((0i128, 0i128), |(minimum, maximum), (&coefficient, &variable)| {
+            let coefficient = i128::from(coefficient);
+            let lo = i128::from(store.min(variable));
+            let hi = i128::from(store.max(variable));
+            let (term_min, term_max) =
+                if coefficient >= 0 { (coefficient * lo, coefficient * hi) } else { (coefficient * hi, coefficient * lo) };
+            (minimum + term_min, maximum + term_max)
+        })
+    }
+
+    fn truth(&self, store: &Store) -> PredicateTruth {
+        let (minimum, maximum) = self.activity(store);
+        let rhs = i128::from(self.rhs);
+        match self.relation {
+            Relation::Eq if minimum == maximum && minimum == rhs => PredicateTruth::True,
+            Relation::Eq if rhs < minimum || rhs > maximum => PredicateTruth::False,
+            Relation::Ne if rhs < minimum || rhs > maximum => PredicateTruth::True,
+            Relation::Ne if minimum == maximum && minimum == rhs => PredicateTruth::False,
+            Relation::Le if maximum <= rhs => PredicateTruth::True,
+            Relation::Le if minimum > rhs => PredicateTruth::False,
+            Relation::Lt if maximum < rhs => PredicateTruth::True,
+            Relation::Lt if minimum >= rhs => PredicateTruth::False,
+            Relation::Ge if minimum >= rhs => PredicateTruth::True,
+            Relation::Ge if maximum < rhs => PredicateTruth::False,
+            Relation::Gt if minimum > rhs => PredicateTruth::True,
+            Relation::Gt if maximum <= rhs => PredicateTruth::False,
+            _ => PredicateTruth::Unknown,
+        }
+    }
+
+    fn reason(&self, store: &Store) -> Vec<Premise> {
+        let mut reason = Vec::new();
+        for &variable in &self.variables {
+            store.domain_premises(variable, &mut reason);
+        }
+        reason
+    }
+
+    fn propagate_active(&mut self, store: &mut Store, should_stop: &dyn Fn() -> bool) -> Result<(), Inconsistency> {
+        if should_stop() {
+            return Ok(());
+        }
+        let value = store.value(self.selector);
+        let inner = if value == self.active_value {
+            &mut self.when_true
+        } else if self.equivalence {
+            self.when_false.as_mut().expect("equivalent reification owns a complement propagator")
+        } else {
+            return Ok(());
+        };
+        let premise = Premise::Eq { var: self.selector, val: value };
+        store.set_injected_premise(premise);
+        let result = inner.propagate_until(store, should_stop);
+        if result.is_err() {
+            store.push_conflict_premise(premise);
+        }
+        store.clear_injected_premise();
+        result
+    }
+}
+
+impl Propagator for ReifiedLinear {
+    fn priority(&self) -> Priority {
+        Priority::Linear
+    }
+
+    fn register(&mut self, store: &mut Store, me: PropId) {
+        store.subscribe(self.selector, me, Event::DomainChange);
+        for &variable in &self.variables {
+            store.subscribe(variable, me, Event::DomainChange);
+        }
+    }
+
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        if should_stop() {
+            return false;
+        }
+        store.subscribe(self.selector, me, Event::DomainChange);
+        register_variables_until(store, me, &self.variables, Event::DomainChange, should_stop)
+    }
+
+    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+        self.propagate_until(store, &|| false)
+    }
+
+    fn propagate_until(&mut self, store: &mut Store, should_stop: &dyn Fn() -> bool) -> Result<(), Inconsistency> {
+        if should_stop() {
+            return Ok(());
+        }
+        if store.is_fixed(self.selector) {
+            return self.propagate_active(store, should_stop);
+        }
+        let value = match self.truth(store) {
+            PredicateTruth::True if self.equivalence => Some(self.active_value),
+            PredicateTruth::False => Some(1 - self.active_value),
+            PredicateTruth::True | PredicateTruth::Unknown => None,
+        };
+        if let Some(value) = value {
+            let reason = self.reason(store);
+            store.fix_because(self.selector, value, reason)?;
+        }
+        Ok(())
+    }
+}
+
 /// Floor of `a / b` for integers (Rust `/` truncates toward zero).
 fn floor_div(a: i64, b: i64) -> i64 {
     let q = a / b;
@@ -329,6 +459,96 @@ pub(crate) fn clamp_i32(x: i64) -> i32 {
 
 fn neg(coeffs: &[i64]) -> Vec<i64> {
     coeffs.iter().map(|&a| -a).collect()
+}
+
+fn complement(relation: Relation) -> Relation {
+    match relation {
+        Relation::Eq => Relation::Ne,
+        Relation::Ne => Relation::Eq,
+        Relation::Le => Relation::Gt,
+        Relation::Lt => Relation::Ge,
+        Relation::Ge => Relation::Lt,
+        Relation::Gt => Relation::Le,
+    }
+}
+
+fn boxed_linear_checked(mut coefficients: Vec<i64>, variables: Vec<VarId>, relation: Relation, rhs: i64) -> Option<Box<dyn Propagator>> {
+    Some(match relation {
+        Relation::Le => Box::new(LinearLeq { term_min: vec![0; variables.len()], coeffs: coefficients, vars: variables, c: rhs }),
+        Relation::Lt => {
+            Box::new(LinearLeq { term_min: vec![0; variables.len()], coeffs: coefficients, vars: variables, c: rhs.checked_sub(1)? })
+        }
+        Relation::Ge | Relation::Gt => {
+            for coefficient in &mut coefficients {
+                *coefficient = coefficient.checked_neg()?;
+            }
+            let bound = if relation == Relation::Ge { rhs.checked_neg()? } else { rhs.checked_add(1)?.checked_neg()? };
+            Box::new(LinearLeq { term_min: vec![0; variables.len()], coeffs: coefficients, vars: variables, c: bound })
+        }
+        Relation::Eq => Box::new(LinearEq {
+            term_min: vec![0; variables.len()],
+            term_max: vec![0; variables.len()],
+            coeffs: coefficients,
+            vars: variables,
+            c: rhs,
+        }),
+        Relation::Ne => Box::new(LinearNeq { coeffs: coefficients, vars: variables, c: rhs }),
+    })
+}
+
+/// Whether the existing native linear propagators can represent this row
+/// without an intermediate `i64` overflow.
+pub(crate) fn native_supported(store: &Store, coefficients: &[i64], variables: &[VarId], relation: Relation, rhs: i64) -> bool {
+    if coefficients.len() != variables.len() {
+        return false;
+    }
+    let activity_fits = coefficients
+        .iter()
+        .zip(variables)
+        .try_fold((0i64, 0i64), |(minimum, maximum), (&coefficient, &variable)| {
+            let lo = i64::from(store.min(variable));
+            let hi = i64::from(store.max(variable));
+            let (term_min, term_max) = if coefficient >= 0 {
+                (coefficient.checked_mul(lo)?, coefficient.checked_mul(hi)?)
+            } else {
+                (coefficient.checked_mul(hi)?, coefficient.checked_mul(lo)?)
+            };
+            Some((minimum.checked_add(term_min)?, maximum.checked_add(term_max)?))
+        })
+        .is_some();
+    activity_fits && boxed_linear_checked(coefficients.to_vec(), variables.to_vec(), relation, rhs).is_some()
+}
+
+pub(crate) struct ReifiedLinearSpec {
+    pub selector: VarId,
+    pub active_value: i32,
+    pub coefficients: Vec<i64>,
+    pub variables: Vec<VarId>,
+    pub relation: Relation,
+    pub rhs: i64,
+    pub equivalence: bool,
+}
+
+/// Post an implication or equivalence between a Boolean literal and an affine
+/// predicate using native linear propagators only.
+pub(crate) fn reified_linear_interruptible(solver: &mut Solver, spec: ReifiedLinearSpec, stop: &AtomicBool) -> bool {
+    let ReifiedLinearSpec { selector, active_value, coefficients, variables, relation, rhs, equivalence } = spec;
+    if stop.load(Ordering::Acquire)
+        || !matches!(active_value, 0 | 1)
+        || !native_supported(&solver.store, &coefficients, &variables, relation, rhs)
+        || (equivalence && !native_supported(&solver.store, &coefficients, &variables, complement(relation), rhs))
+    {
+        return false;
+    }
+    let when_true = boxed_linear_checked(coefficients.clone(), variables.clone(), relation, rhs)
+        .expect("native support was checked before building the reified predicate");
+    let when_false = equivalence.then(|| {
+        boxed_linear_checked(coefficients.clone(), variables.clone(), complement(relation), rhs)
+            .expect("native support was checked before building the reified complement")
+    });
+    let propagator = ReifiedLinear { selector, active_value, equivalence, coefficients, variables, relation, rhs, when_true, when_false };
+    let should_stop = || stop.load(Ordering::Acquire);
+    solver.post_until(Box::new(propagator), &should_stop).is_some()
 }
 
 fn register_variables_until(store: &mut Store, me: PropId, variables: &[VarId], event: Event, should_stop: &dyn Fn() -> bool) -> bool {
@@ -367,17 +587,44 @@ pub fn linear(solver: &mut Solver, coeffs: &[i64], vars: &[VarId], rel: Relation
 /// result requires discarding `solver`.
 pub(crate) fn linear_interruptible(
     solver: &mut Solver,
-    mut coeffs: Vec<i64>,
+    coeffs: Vec<i64>,
     vars: Vec<VarId>,
     rel: Relation,
     rhs: i64,
     stop: &AtomicBool,
 ) -> bool {
+    linear_interruptible_with_relaxation(solver, coeffs, vars, rel, rhs, stop, true)
+}
+
+/// Post a row that has already been represented in the relaxation by its
+/// semantic source. This keeps physical normalization from duplicating LP rows.
+pub(crate) fn linear_without_relaxation_interruptible(
+    solver: &mut Solver,
+    coeffs: Vec<i64>,
+    vars: Vec<VarId>,
+    rel: Relation,
+    rhs: i64,
+    stop: &AtomicBool,
+) -> bool {
+    linear_interruptible_with_relaxation(solver, coeffs, vars, rel, rhs, stop, false)
+}
+
+fn linear_interruptible_with_relaxation(
+    solver: &mut Solver,
+    mut coeffs: Vec<i64>,
+    vars: Vec<VarId>,
+    rel: Relation,
+    rhs: i64,
+    stop: &AtomicBool,
+    record: bool,
+) -> bool {
     assert_eq!(coeffs.len(), vars.len(), "linear: coeffs/vars length mismatch");
     if stop.load(Ordering::Acquire) {
         return false;
     }
-    record_relaxation(solver, &coeffs, &vars, rel, rhs);
+    if record {
+        record_relaxation(solver, &coeffs, &vars, rel, rhs);
+    }
     let should_stop = || stop.load(Ordering::Acquire);
     let propagator: Box<dyn Propagator> = match rel {
         Relation::Le => Box::new(LinearLeq { term_min: vec![0; vars.len()], coeffs, vars, c: rhs }),

@@ -121,6 +121,10 @@ pub struct SolveStats {
     pub nodes: u64,
     /// Number of dead ends (propagation failures).
     pub failures: u64,
+    /// Peak number of LCG atoms addressable by one search worker.
+    pub lcg_atoms: u64,
+    /// Native propagator invocations performed after the search engine started.
+    pub propagator_calls: u64,
     /// Total literals across all learned clauses (CDCL search only).
     pub learned_lits: u64,
     /// Learned clauses shortened by CP-aware vivification.

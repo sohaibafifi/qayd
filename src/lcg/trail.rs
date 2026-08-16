@@ -272,6 +272,9 @@ pub struct Cdcl<'s> {
     pub(crate) solver: &'s mut Solver,
     /// Boolean atom numbering over the solver's variables.
     pub(crate) atoms: AtomTable,
+    /// Solver counter at engine construction, excluding compilation and any
+    /// root propagation completed by the orchestrator.
+    propagation_calls_at_start: u64,
     /// Assigned literals in chronological order (each is true).
     trail: Vec<Lit>,
     /// `level_starts[d]` = `trail` index where level `d` begins. Always non-empty;
@@ -432,9 +435,11 @@ impl<'s> Cdcl<'s> {
             }
         }
         let n = atoms.num_atoms();
+        let propagation_calls_at_start = solver.propagation_calls();
         Cdcl {
             solver,
             atoms,
+            propagation_calls_at_start,
             trail: Vec::new(),
             level_starts: vec![0],
             atom_level: vec![UNSET; n],
@@ -677,6 +682,8 @@ impl<'s> Cdcl<'s> {
     }
 
     pub(crate) fn copy_inprocessing_stats(&self, stats: &mut crate::search::SolveStats) {
+        stats.lcg_atoms = u64::try_from(self.atoms.num_atoms()).unwrap_or(u64::MAX);
+        stats.propagator_calls = self.solver.propagation_calls().saturating_sub(self.propagation_calls_at_start);
         stats.learned_lits = self.learned_lits;
         stats.vivified_clauses = self.vivified_clauses;
         stats.vivified_lits = self.vivified_lits;

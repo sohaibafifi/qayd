@@ -286,6 +286,56 @@ fn group_extension_supports_are_sat() {
 }
 
 #[test]
+fn grouped_extensions_share_one_physical_template() {
+    let xml = r#"
+      <instance format="XCSP3" type="CSP">
+        <variables><array id="x" size="[3]"> 0..2 </array></variables>
+        <constraints>
+          <group>
+            <extension><list>%0 %1</list><supports>(0,1)(1,2)</supports></extension>
+            <args>x[0] x[1]</args>
+            <args>x[1] x[2]</args>
+          </group>
+        </constraints>
+      </instance>"#;
+    let mut output = Vec::new();
+
+    run_to_with_options(xml, true, &AtomicBool::new(false), &mut output, RunOptions::default()).unwrap();
+
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("s SATISFIABLE"), "{output}");
+    assert!(output.contains("c compilation tables 2 templates 1"), "{output}");
+}
+
+#[test]
+fn native_intensions_and_generic_fallback_are_reported_separately() {
+    let xml = r#"
+      <instance format="XCSP3" type="CSP">
+        <variables>
+          <array id="x" size="[2]"> -2..2 </array>
+          <array id="b" size="[3]"> 0..1 </array>
+        </variables>
+        <constraints>
+          <intension>le(add(mul(2,x[0]),x[1]),3)</intension>
+          <intension>or(not(b[0]),b[1])</intension>
+          <intension>iff(not(b[2]),ge(sub(x[0],x[1]),0))</intension>
+          <intension>le(mul(x[0],x[1]),4)</intension>
+        </constraints>
+      </instance>"#;
+    let mut output = Vec::new();
+
+    run_to_with_options(xml, true, &AtomicBool::new(false), &mut output, RunOptions::default()).unwrap();
+
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("s SATISFIABLE"), "{output}");
+    assert!(output.contains("native_intensions 3 fallback_intensions 1"), "{output}");
+    assert!(output.contains("c parse time "), "{output}");
+    assert!(output.contains("c backend build time "), "{output}");
+    assert!(output.contains("c lcg atoms "), "{output}");
+    assert!(output.contains("c search time "), "{output}");
+}
+
+#[test]
 fn grouped_sign_products_are_batched() {
     let xml = r#"
       <instance format="XCSP3" type="CSP">

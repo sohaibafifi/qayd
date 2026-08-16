@@ -1652,7 +1652,7 @@ fn remap_int_global_interruptible(
                 Some(variables) => variables,
                 None => return Ok(None),
             },
-            tuples: clone_nested_slice_interruptible(tuples, stop)?,
+            tuples: tuples.clone(),
             positive: *positive,
         },
         Global::Regular { variables, automaton } => Global::Regular {

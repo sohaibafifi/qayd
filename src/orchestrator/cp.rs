@@ -387,6 +387,10 @@ fn solve_cp_plan_inner(
         })?
     };
 
+    if let Some(report) = result.reports.first_mut() {
+        append_compilation_metadata(&mut report.metadata, &plan.compiled);
+    }
+
     if let Some(candidate) = &result.primal {
         verify_assumptions(candidate, &plan.assumptions)?;
     }
@@ -1055,4 +1059,15 @@ fn cp_metadata(
         metadata.extend([("lns_attempts".to_string(), attempts.to_string()), ("lns_improved".to_string(), improved.to_string())]);
     }
     metadata
+}
+
+fn append_compilation_metadata(metadata: &mut Vec<(String, String)>, compiled: &CompiledCp) {
+    let stats = compiled.compilation_stats();
+    metadata.extend([
+        ("table_instances".to_string(), stats.table_instances.to_string()),
+        ("table_templates".to_string(), stats.table_templates.to_string()),
+        ("native_intensions".to_string(), stats.native_intensions.to_string()),
+        ("fallback_intensions".to_string(), stats.fallback_intensions.to_string()),
+        ("physical_propagators".to_string(), stats.physical_propagators.to_string()),
+    ]);
 }

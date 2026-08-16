@@ -101,11 +101,38 @@ fn table_memory_estimate_counts_distinct_supports_not_tuple_square() {
     let variables = (0..ARITY).map(|_| model.bool_var()).collect::<Vec<_>>();
     let tuples =
         (0..(1usize << ARITY)).map(|bits| (0..ARITY).map(|column| ((bits >> column) & 1) as i32).collect::<Vec<_>>()).collect::<Vec<_>>();
-    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table { variables, tuples, positive: true }));
+    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table { variables, tuples: tuples.into(), positive: true }));
 
     let estimate = CompiledCp::estimate_semantic_bytes_interruptible(&model, &AtomicBool::new(false)).unwrap();
 
     assert!(estimate < 10 * 1024 * 1024, "repetitive table estimate is still quadratic in tuple count: {estimate}");
+}
+
+#[test]
+fn table_memory_estimate_counts_a_shared_body_once() {
+    fn model_with_bodies(first: Arc<[Vec<i32>]>, second: Arc<[Vec<i32>]>) -> Model {
+        let mut model = Model::new();
+        let variables = (0..4).map(|_| model.bool_var()).collect::<Vec<_>>();
+        model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table {
+            variables: variables[..2].to_vec(),
+            tuples: first,
+            positive: true,
+        }));
+        model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table {
+            variables: variables[2..].to_vec(),
+            tuples: second,
+            positive: true,
+        }));
+        model
+    }
+
+    let body: Arc<[Vec<i32>]> = vec![vec![0, 0], vec![1, 1]].into();
+    let shared = model_with_bodies(Arc::clone(&body), body);
+    let separate = model_with_bodies(vec![vec![0, 0], vec![1, 1]].into(), vec![vec![0, 0], vec![1, 1]].into());
+    let shared_bytes = CompiledCp::estimate_semantic_bytes_interruptible(&shared, &AtomicBool::new(false)).unwrap();
+    let separate_bytes = CompiledCp::estimate_semantic_bytes_interruptible(&separate, &AtomicBool::new(false)).unwrap();
+
+    assert!(shared_bytes < separate_bytes, "shared={shared_bytes}, separate={separate_bytes}");
 }
 
 #[test]
@@ -116,8 +143,13 @@ fn integer_warm_start_preflight_counts_table_and_mdd_payloads() {
     const MDD_ARCS_PER_LAYER: usize = 4_096;
     let mut model = Model::new();
     let table_variables = (0..TABLE_ARITY).map(|_| model.bool_var()).collect::<Vec<_>>();
-    let tuples = (0..TABLE_ROWS).map(|row| (0..TABLE_ARITY).map(|column| ((row >> column) & 1) as i32).collect::<Vec<_>>()).collect();
-    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table { variables: table_variables, tuples, positive: true }));
+    let tuples: Vec<Vec<i32>> =
+        (0..TABLE_ROWS).map(|row| (0..TABLE_ARITY).map(|column| ((row >> column) & 1) as i32).collect::<Vec<_>>()).collect();
+    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table {
+        variables: table_variables,
+        tuples: tuples.into(),
+        positive: true,
+    }));
     let mdd_variables = (0..MDD_LAYERS).map(|_| model.bool_var()).collect::<Vec<_>>();
     let layers = (0..MDD_LAYERS)
         .map(|_| (0..MDD_ARCS_PER_LAYER).map(|arc| MddArc { from: arc, value: (arc & 1) as i32, to: arc }).collect::<Vec<_>>())
@@ -152,7 +184,7 @@ fn optional_integer_warm_start_obeys_its_memory_allowance_and_prearmed_stop() {
     ])));
     model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table {
         variables: vec![index],
-        tuples: vec![vec![0]],
+        tuples: vec![vec![0]].into(),
         positive: true,
     }));
     model.add_objective(Objective::IntExpr { minimize: false, expr: IntExpr::Mul(vec![IntExpr::Constant(7), IntExpr::Variable(guard)]) });

@@ -95,6 +95,7 @@ fn affine_intension_comparisons_feed_the_same_relaxation_ir() {
     let result = solve_model(&ModelPackage::new(model), &request(LinearBackendMode::Amthal), &mut IgnoreEvents).unwrap();
     assert_eq!(result.status(), SolveStatus::Optimal);
     assert_eq!(result.aggregate_search_stats().lp_root_bound, Some(3));
+    assert_eq!(result.aggregate_search_stats().lp_source_rows, 1, "native lowering duplicated the semantic relaxation row");
 }
 
 #[cfg(feature = "lp-relaxation")]
