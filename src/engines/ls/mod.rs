@@ -6,6 +6,7 @@
 #[allow(dead_code)]
 pub(crate) mod cop;
 pub(crate) mod disjunctive_schedule;
+pub(crate) mod exact_cover;
 pub(crate) mod integer;
 #[allow(dead_code)]
 pub(crate) mod lists;

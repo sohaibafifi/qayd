@@ -26,6 +26,10 @@ use crate::store::Solver;
 
 const GUARDED_SUM_DIVE_CONFLICTS: u64 = 4_096;
 const GUARDED_SUM_DIVE_OFFSETS: &[u64] = &[1, 2, 4, 8];
+const MATERIALIZED_DIVE_CONFLICTS: u64 = 16_384;
+const MATERIALIZED_DIVE_OFFSETS: &[u64] = &[7];
+const MIN_MATERIALIZED_DIVE_VARIABLES: usize = 32;
+const MAX_MATERIALIZED_DIVE_VARIABLES: usize = 128;
 
 /// Solver execution settings. Parallel search is opt-in with `workers > 1`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,11 +72,19 @@ impl SearchGuidance {
     }
 }
 
+fn has_compact_materialized_objective(problem: &Problem) -> bool {
+    let Some(Objective::Var(_, objective)) = problem.objective.as_ref() else {
+        return false;
+    };
+    let active = problem.search.iter().filter(|&&variable| !problem.solver.store.is_fixed(variable)).count();
+    problem.solver.num_propagators() != 0
+        && !problem.solver.store.is_fixed(*objective)
+        && (MIN_MATERIALIZED_DIVE_VARIABLES..=MAX_MATERIALIZED_DIVE_VARIABLES).contains(&active)
+}
+
 /// Select COPs for a bounded objective-guided search before the complete pass.
-/// Only an objective with a compact, exact structural search policy may delay
-/// that pass. A wide affine objective alone is not evidence that a sequential
-/// dive will repay its cost, and using its size as a proxy can starve the
-/// canonical feasibility trajectory.
+/// Compact guarded sums have a specialized policy. Compact materialized
+/// objectives get one diversified scout before the complete proof pass.
 pub(crate) fn uses_bounded_objective_dive(problem: &Problem, options: RunOptions, guidance: &SearchGuidance) -> bool {
     if options.workers != 1
         || options.split
@@ -85,11 +97,13 @@ pub(crate) fn uses_bounded_objective_dive(problem: &Problem, options: RunOptions
     }
 
     matches!(problem.objective.as_ref(), Some(Objective::Expr(true, expression)) if GuardedSum::compile(expression).is_some())
+        || has_compact_materialized_objective(problem)
 }
 
 fn bounded_objective_dive_offsets(problem: &Problem) -> &'static [u64] {
     match problem.objective.as_ref() {
         Some(Objective::Expr(true, expression)) if GuardedSum::compile(expression).is_some() => GUARDED_SUM_DIVE_OFFSETS,
+        Some(Objective::Var(_, _)) if has_compact_materialized_objective(problem) => MATERIALIZED_DIVE_OFFSETS,
         Some(_) | None => &[],
     }
 }
@@ -97,6 +111,7 @@ fn bounded_objective_dive_offsets(problem: &Problem) -> &'static [u64] {
 fn bounded_objective_dive_conflicts(problem: &Problem) -> u64 {
     match problem.objective.as_ref() {
         Some(Objective::Expr(true, expression)) if GuardedSum::compile(expression).is_some() => GUARDED_SUM_DIVE_CONFLICTS,
+        Some(Objective::Var(_, _)) if has_compact_materialized_objective(problem) => MATERIALIZED_DIVE_CONFLICTS,
         Some(_) | None => 0,
     }
 }

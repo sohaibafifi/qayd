@@ -12,6 +12,7 @@ use crate::constraints::linear::Relation as PhysicalRelation;
 use crate::constraints::table::{Dfa, Mdd, MddArc, STAR};
 use crate::engines::ls::cop::{LocalRhs, LocalSearchSpec};
 use crate::engines::ls::disjunctive_schedule::DisjunctiveSchedulePlan;
+use crate::engines::ls::exact_cover::ExactCoverPlan;
 use crate::engines::ls::scenario_schedule::ScenarioSchedulePlan;
 use crate::expr::Expr;
 use crate::ids::VarId;
@@ -31,6 +32,7 @@ pub(crate) struct IntegerLocalSearchPlan {
 #[derive(Clone)]
 pub(crate) enum IntegerWarmStartPlan {
     Local(IntegerLocalSearchPlan),
+    ExactCover(ExactCoverPlan),
     ScenarioSchedule(ScenarioSchedulePlan),
     DisjunctiveSchedule(DisjunctiveSchedulePlan),
     Fallbacks(Vec<IntegerWarmStartPlan>),
@@ -326,9 +328,17 @@ pub(crate) fn compile_warm_start(
     let allowance = memory_allowance.min(MAX_WARM_START_PLAN_BYTES);
     let mut plans = Vec::new();
     let mut estimated_bytes = 0u64;
-    if preflight.structural_plan_bytes <= allowance {
+    if let Some(plan) = ExactCoverPlan::compile(model, stop, allowance) {
+        let plan_bytes = plan.estimated_bytes();
+        if plan_bytes <= allowance {
+            estimated_bytes = plan_bytes;
+            plans.push(IntegerWarmStartPlan::ExactCover(plan));
+        }
+    }
+    let scenario_allowance = allowance.saturating_sub(estimated_bytes);
+    if preflight.structural_plan_bytes <= scenario_allowance {
         if let Some(plan) = ScenarioSchedulePlan::compile(model, stop) {
-            estimated_bytes = preflight.structural_plan_bytes;
+            estimated_bytes = estimated_bytes.saturating_add(preflight.structural_plan_bytes);
             plans.push(IntegerWarmStartPlan::ScenarioSchedule(plan));
         }
     }

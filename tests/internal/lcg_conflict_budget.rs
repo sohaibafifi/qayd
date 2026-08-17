@@ -102,6 +102,15 @@ fn materialized_sum_problem(variable_count: usize) -> Problem {
     Problem { solver, search, objective: Some(PhysicalObjective::VarWithAffine(false, objective, vec![1; variable_count], variables)) }
 }
 
+fn compact_materialized_problem(variable_count: usize) -> Problem {
+    let mut solver = Solver::new();
+    let mut search = (0..variable_count).map(|_| solver.new_var_range(0, 1)).collect::<Vec<_>>();
+    let objective = solver.new_var_range(0, variable_count as i32);
+    linear(&mut solver, &[1], &[objective], Relation::Ge, 0);
+    search.push(objective);
+    Problem { solver, search, objective: Some(PhysicalObjective::Var(true, objective)) }
+}
+
 #[test]
 fn materialized_affine_search_views_keep_the_authoritative_variable() {
     let problem = materialized_sum_problem(64);
@@ -161,6 +170,9 @@ fn bounded_objective_dive_requires_an_exact_structural_policy() {
     assert!(!uses_bounded_objective_dive(&guarded_sum_problem(8), RunOptions { conflict_limit: Some(10_000), ..options }, &guidance,));
 
     assert!(!uses_bounded_objective_dive(&materialized_sum_problem(64), options, &guidance));
+    assert!(!uses_bounded_objective_dive(&compact_materialized_problem(30), options, &guidance));
+    assert!(uses_bounded_objective_dive(&compact_materialized_problem(50), options, &guidance));
+    assert!(!uses_bounded_objective_dive(&compact_materialized_problem(128), options, &guidance));
 
     let mut mostly_fixed = symbolic_sum_problem(64);
     for &variable in &mostly_fixed.search[..40] {

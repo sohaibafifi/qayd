@@ -150,8 +150,9 @@ const DETERMINISTIC_DISPATCH_RULES: [DispatchRule; 7] = [
     DispatchRule::MinimumSlack,
     DispatchRule::MostResources,
 ];
-const SEEDED_ATTEMPTS_PER_OPERATION: u64 = 32;
-const MAX_SEEDED_ATTEMPTS: u64 = 512;
+const SEEDED_ATTEMPTS_PER_OPERATION: u64 = 256;
+const MAX_SEEDED_ATTEMPTS: u64 = 4_096;
+const SEEDED_LANES: u64 = 8;
 pub(crate) const MAX_CONSTRUCTION_WORK: u64 = 2_097_152;
 pub(crate) const MAX_REPAIR_CANDIDATES: usize = 8;
 const ATTEMPT_SEED_STRIDE: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -198,7 +199,7 @@ impl DisjunctiveSchedulePlan {
                 (*DETERMINISTIC_DISPATCH_RULES.get(index)?, 0)
             } else {
                 let diversified = attempt.checked_sub(deterministic_attempts)?.checked_add(1)?;
-                (DispatchRule::Seeded, mix64(seed ^ diversified.wrapping_mul(ATTEMPT_SEED_STRIDE)))
+                (DispatchRule::Seeded, diversified_rule_seed(seed, diversified))
             };
             match self.dispatch(model, rule, rule_seed, &bottom, stop, &mut counter) {
                 Ok(schedule) => {
@@ -389,6 +390,13 @@ impl DisjunctiveSchedulePlan {
     pub(crate) fn precedence_count(&self) -> usize {
         self.precedences.all_successors().iter().map(Vec::len).sum()
     }
+}
+
+pub(crate) fn diversified_rule_seed(seed: u64, attempt: u64) -> u64 {
+    let index = attempt.saturating_sub(1);
+    let lane = index % SEEDED_LANES;
+    let round = index / SEEDED_LANES + 1;
+    mix64(seed.wrapping_add(lane) ^ round.wrapping_mul(ATTEMPT_SEED_STRIDE))
 }
 
 fn assign(model: &Model, assignment: &mut [Option<i32>], variable: IntVarRef, value: i32) -> Option<()> {

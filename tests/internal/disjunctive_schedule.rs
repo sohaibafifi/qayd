@@ -2,7 +2,21 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::constraints::table::STAR;
-use crate::engines::ls::disjunctive_schedule::{ConstructionBudget, DisjunctiveSchedulePlan, MAX_CONSTRUCTION_WORK, MAX_REPAIR_CANDIDATES};
+use crate::engines::ls::disjunctive_schedule::{
+    diversified_rule_seed, ConstructionBudget, DisjunctiveSchedulePlan, MAX_CONSTRUCTION_WORK, MAX_REPAIR_CANDIDATES,
+};
+
+#[test]
+fn seeded_construction_interleaves_neighboring_reproducible_streams() {
+    let seed = 17;
+    for round in 1..=5 {
+        for lane in 0..8 {
+            let interleaved_attempt = (round - 1) * 8 + lane + 1;
+            let lane_attempt = (round - 1) * 8 + 1;
+            assert_eq!(diversified_rule_seed(seed, interleaved_attempt), diversified_rule_seed(seed + lane, lane_attempt));
+        }
+    }
+}
 use crate::model::{Constraint, IntDomain, IntExpr, IntGlobalConstraint, IntVarRef, Model, ModelPackage, Objective, Relation};
 use crate::orchestrator::{solve_model_silent, EngineKind, SolveRequest, SolveStatus};
 
@@ -280,10 +294,10 @@ fn construction_attempts_scale_with_size_under_a_fixed_work_cap() {
     let small = compile(&small_model).unwrap();
     let small_budget = small.construction_budget().unwrap();
     let small_work_per_attempt = 16u64 * 16;
-    assert_eq!(small_budget.work / small_work_per_attempt, 519);
+    assert_eq!(small_budget.work / small_work_per_attempt, 4_103);
     assert!(small_budget.work < MAX_CONSTRUCTION_WORK);
     let candidates = small.construct(&small_model, 0, &AtomicBool::new(false), small_budget).unwrap();
-    assert_eq!(candidates.work / small_work_per_attempt, 519);
+    assert_eq!(candidates.work / small_work_per_attempt, 4_103);
     assert_eq!(candidates.materializations, MAX_REPAIR_CANDIDATES);
     assert!(candidates.materializations < candidates.work as usize / small_work_per_attempt as usize);
 

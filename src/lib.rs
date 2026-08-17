@@ -101,6 +101,9 @@ mod disjunctive_schedule;
 #[path = "../tests/internal/divisibility_compaction.rs"]
 mod divisibility_compaction;
 #[cfg(test)]
+#[path = "../tests/internal/exact_cover_warm_start.rs"]
+mod exact_cover_warm_start;
+#[cfg(test)]
 #[path = "../tests/internal/lcg_atom_layout.rs"]
 mod lcg_atom_layout;
 #[cfg(test)]
