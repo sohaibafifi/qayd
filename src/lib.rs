@@ -179,6 +179,9 @@ mod routing_neighborhoods;
 #[path = "../tests/internal/routing_search.rs"]
 mod routing_search;
 #[cfg(test)]
+#[path = "../tests/internal/sat_preprocess_interrupt.rs"]
+mod sat_preprocess_interrupt;
+#[cfg(test)]
 #[path = "../tests/internal/scenario_schedule.rs"]
 mod scenario_schedule;
 #[cfg(test)]

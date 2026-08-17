@@ -1,6 +1,8 @@
-//! Linear (weighted-sum) constraints. All arithmetic in `i64` so sums of `i32`
-//! terms cannot overflow.
+//! Linear weighted-sum constraints. General integer rows use checked `i64`
+//! activity bounds. Normalized Boolean inequalities use `i128` so duplicate
+//! coefficients and strict relations remain safe at the public `i64` boundary.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ids::{PropId, VarId};
@@ -9,6 +11,101 @@ use crate::store::{Premise, Solver, Store};
 
 /// Sentinel for "exclude no term" (conflict reason: every term contributes).
 const NO_SKIP: usize = usize::MAX;
+
+#[derive(Clone, Copy)]
+struct WeightedBoolLiteral {
+    variable: VarId,
+    active_value: i32,
+    weight: i128,
+}
+
+/// A normalized pseudo-Boolean inequality `sum(weight * literal) <= bound`.
+///
+/// Every weight is positive. Negative affine coefficients are represented by
+/// complemented literals and a shifted bound. The representation uses `i128`
+/// so combining duplicate variables and strict relations cannot overflow at
+/// the public `i64` boundary.
+#[derive(Clone)]
+struct BooleanLinearLeq {
+    literals: Vec<WeightedBoolLiteral>,
+    bound: i128,
+}
+
+impl BooleanLinearLeq {
+    fn reason_above(&self, store: &Store, threshold: i128, skip: usize) -> Vec<Premise> {
+        if !store.explaining() {
+            return Vec::new();
+        }
+        let mut total = 0i128;
+        let mut reason = Vec::new();
+        for (index, literal) in self.literals.iter().enumerate() {
+            if index == skip || !store.is_fixed(literal.variable) || store.value(literal.variable) != literal.active_value {
+                continue;
+            }
+            reason.push(Premise::Eq { var: literal.variable, val: literal.active_value });
+            total += literal.weight;
+            if total > threshold {
+                break;
+            }
+        }
+        debug_assert!(total > threshold, "pseudo-Boolean explanation does not cross its threshold");
+        reason
+    }
+}
+
+impl Propagator for BooleanLinearLeq {
+    fn priority(&self) -> Priority {
+        Priority::Linear
+    }
+
+    fn register(&mut self, store: &mut Store, me: PropId) {
+        for literal in &self.literals {
+            store.subscribe(literal.variable, me, Event::Fix);
+        }
+    }
+
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        for literal in &self.literals {
+            if should_stop() {
+                return false;
+            }
+            store.subscribe(literal.variable, me, Event::Fix);
+        }
+        !should_stop()
+    }
+
+    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+        let true_sum = self
+            .literals
+            .iter()
+            .filter(|literal| store.is_fixed(literal.variable) && store.value(literal.variable) == literal.active_value)
+            .map(|literal| literal.weight)
+            .sum::<i128>();
+        if true_sum > self.bound {
+            return if store.explaining() {
+                let reason = self.reason_above(store, self.bound, NO_SKIP);
+                Err(store.fail_because(reason))
+            } else {
+                Err(Inconsistency)
+            };
+        }
+
+        let slack = self.bound - true_sum;
+        for index in 0..self.literals.len() {
+            let literal = self.literals[index];
+            if store.is_fixed(literal.variable) || literal.weight <= slack {
+                continue;
+            }
+            if store.explaining() {
+                let reason = self.reason_above(store, self.bound - literal.weight, index);
+                store.fix_because(literal.variable, 1 - literal.active_value, reason)?;
+            } else {
+                store.fix(literal.variable, 1 - literal.active_value)?;
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Comparison operator for a linear constraint.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -561,6 +658,57 @@ fn register_variables_until(store: &mut Store, me: PropId, variables: &[VarId], 
     !should_stop()
 }
 
+fn normalized_boolean_leq(
+    store: &Store,
+    coefficients: &[i64],
+    variables: &[VarId],
+    coefficient_scale: i128,
+    mut bound: i128,
+) -> Option<BooleanLinearLeq> {
+    if coefficients.len() != variables.len() || variables.iter().any(|&variable| store.min(variable) < 0 || store.max(variable) > 1) {
+        return None;
+    }
+
+    let mut combined = BTreeMap::<VarId, i128>::new();
+    for (&coefficient, &variable) in coefficients.iter().zip(variables) {
+        let coefficient = i128::from(coefficient).checked_mul(coefficient_scale)?;
+        let next = combined.get(&variable).copied().unwrap_or(0).checked_add(coefficient)?;
+        if next == 0 {
+            combined.remove(&variable);
+        } else {
+            combined.insert(variable, next);
+        }
+    }
+
+    let mut literals = Vec::with_capacity(combined.len());
+    for (variable, coefficient) in combined {
+        let (active_value, weight) = if coefficient > 0 {
+            (1, coefficient)
+        } else {
+            let weight = coefficient.checked_neg()?;
+            bound = bound.checked_add(weight)?;
+            (0, weight)
+        };
+        literals.push(WeightedBoolLiteral { variable, active_value, weight });
+    }
+    literals.sort_by_key(|literal| (std::cmp::Reverse(literal.weight), literal.variable, literal.active_value));
+    Some(BooleanLinearLeq { literals, bound })
+}
+
+fn boolean_linear_leq(store: &Store, coefficients: &[i64], variables: &[VarId], relation: Relation, rhs: i64) -> Option<BooleanLinearLeq> {
+    let rhs = i128::from(rhs);
+    match relation {
+        Relation::Le => normalized_boolean_leq(store, coefficients, variables, 1, rhs),
+        Relation::Lt => normalized_boolean_leq(store, coefficients, variables, 1, rhs - 1),
+        Relation::Ge => normalized_boolean_leq(store, coefficients, variables, -1, -rhs),
+        Relation::Gt => normalized_boolean_leq(store, coefficients, variables, -1, -rhs - 1),
+        // Keep equalities as one physical propagator. Splitting an equality
+        // into two rows changes dom/wdeg ownership and can dominate branching
+        // even though the filtering is logically equivalent.
+        Relation::Eq | Relation::Ne => None,
+    }
+}
+
 fn post_leq(solver: &mut Solver, coeffs: &[i64], vars: &[VarId], c: i64) {
     solver.post(Box::new(LinearLeq::new(coeffs, vars, c)));
 }
@@ -569,6 +717,10 @@ fn post_leq(solver: &mut Solver, coeffs: &[i64], vars: &[VarId], c: i64) {
 pub fn linear(solver: &mut Solver, coeffs: &[i64], vars: &[VarId], rel: Relation, rhs: i64) {
     assert_eq!(coeffs.len(), vars.len(), "linear: coeffs/vars length mismatch");
     record_relaxation(solver, coeffs, vars, rel, rhs);
+    if let Some(propagator) = boolean_linear_leq(&solver.store, coeffs, vars, rel, rhs) {
+        solver.post(Box::new(propagator));
+        return;
+    }
     match rel {
         Relation::Le => post_leq(solver, coeffs, vars, rhs),
         Relation::Lt => post_leq(solver, coeffs, vars, rhs - 1),
@@ -626,6 +778,12 @@ fn linear_interruptible_with_relaxation(
         record_relaxation(solver, &coeffs, &vars, rel, rhs);
     }
     let should_stop = || stop.load(Ordering::Acquire);
+    if let Some(propagator) = boolean_linear_leq(&solver.store, &coeffs, &vars, rel, rhs) {
+        if stop.load(Ordering::Acquire) || solver.post_until(Box::new(propagator), &should_stop).is_none() {
+            return false;
+        }
+        return !stop.load(Ordering::Acquire);
+    }
     let propagator: Box<dyn Propagator> = match rel {
         Relation::Le => Box::new(LinearLeq { term_min: vec![0; vars.len()], coeffs, vars, c: rhs }),
         Relation::Lt => Box::new(LinearLeq { term_min: vec![0; vars.len()], coeffs, vars, c: rhs - 1 }),

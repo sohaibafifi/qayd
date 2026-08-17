@@ -255,9 +255,12 @@ pub fn solve_cnf_with_backend_seeded_options(
 /// Solve a CNF instance through the native backend with explicit preprocessing
 /// options.
 pub fn solve_cnf_native_seeded_options(cnf: &Cnf, stop: &AtomicBool, seed: u64, options: PreprocessOptions) -> SatResult {
-    let (simplified, preprocess, reconstruction) = match preprocess_cnf(cnf, options) {
+    let (simplified, preprocess, reconstruction) = match preprocess_cnf(cnf, options, stop) {
         PreprocessOutcome::Unsatisfiable(stats) => {
             return SatResult { status: Status::Unsatisfiable, assignment: None, stats: SolveStats::default(), preprocess: stats };
+        }
+        PreprocessOutcome::Interrupted(stats) => {
+            return SatResult { status: Status::Unknown, assignment: None, stats: SolveStats::default(), preprocess: stats };
         }
         PreprocessOutcome::Simplified(cnf, stats, reconstruction) => (cnf, stats, reconstruction),
     };
@@ -322,7 +325,7 @@ pub fn solve_cnf_native_seeded_with_proof_options<W: io::Write>(
     writer: &mut proof::ProofWriter<W>,
 ) -> io::Result<SatResult> {
     let mut write_error = None;
-    let (simplified, preprocess, reconstruction) = match preprocess_cnf_with_proof(cnf, options, &mut |step| {
+    let (simplified, preprocess, reconstruction) = match preprocess_cnf_with_proof(cnf, options, stop, &mut |step| {
         if write_error.is_none() {
             if let Err(err) = writer.write_step(&step) {
                 write_error = Some(err);
@@ -335,6 +338,13 @@ pub fn solve_cnf_native_seeded_with_proof_options<W: io::Write>(
             }
             writer.flush()?;
             return Ok(SatResult { status: Status::Unsatisfiable, assignment: None, stats: SolveStats::default(), preprocess: stats });
+        }
+        PreprocessOutcome::Interrupted(stats) => {
+            if let Some(err) = write_error {
+                return Err(err);
+            }
+            writer.flush()?;
+            return Ok(SatResult { status: Status::Unknown, assignment: None, stats: SolveStats::default(), preprocess: stats });
         }
         PreprocessOutcome::Simplified(cnf, stats, reconstruction) => (cnf, stats, reconstruction),
     };
@@ -456,6 +466,7 @@ impl<'a> PreprocessProof<'a> {
 enum PreprocessOutcome {
     Simplified(Cnf, PreprocessStats, Vec<ReconstructionStep>),
     Unsatisfiable(PreprocessStats),
+    Interrupted(PreprocessStats),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -464,23 +475,41 @@ enum ReconstructionStep {
     BlockedClause { clause: Vec<i32>, blocking_lit: i32 },
 }
 
-fn preprocess_cnf(cnf: &Cnf, options: PreprocessOptions) -> PreprocessOutcome {
+fn preprocess_cnf(cnf: &Cnf, options: PreprocessOptions, stop: &AtomicBool) -> PreprocessOutcome {
     let mut proof = PreprocessProof::none();
-    preprocess_cnf_inner(cnf, options, &mut proof)
+    preprocess_cnf_inner(cnf, options, stop, &mut proof)
 }
 
-fn preprocess_cnf_with_proof(cnf: &Cnf, options: PreprocessOptions, proof: &mut dyn FnMut(proof::ProofStep)) -> PreprocessOutcome {
+fn preprocess_cnf_with_proof(
+    cnf: &Cnf,
+    options: PreprocessOptions,
+    stop: &AtomicBool,
+    proof: &mut dyn FnMut(proof::ProofStep),
+) -> PreprocessOutcome {
     let mut proof = PreprocessProof::new(proof);
-    preprocess_cnf_inner(cnf, options, &mut proof)
+    preprocess_cnf_inner(cnf, options, stop, &mut proof)
 }
 
-fn preprocess_cnf_inner(cnf: &Cnf, options: PreprocessOptions, proof: &mut PreprocessProof<'_>) -> PreprocessOutcome {
+fn preprocess_cnf_inner(cnf: &Cnf, options: PreprocessOptions, stop: &AtomicBool, proof: &mut PreprocessProof<'_>) -> PreprocessOutcome {
     let mut stats = PreprocessStats { input_clauses: cnf.clauses.len() as u64, ..PreprocessStats::default() };
+    if stop.load(Ordering::Relaxed) {
+        return PreprocessOutcome::Interrupted(stats);
+    }
     let mut assigned = vec![None; cnf.vars];
-    let mut clauses = cnf.clauses.clone();
+    let mut work = 0usize;
+    let mut clauses = Vec::with_capacity(cnf.clauses.len());
+    for clause in &cnf.clauses {
+        if preprocessing_stopped(stop, &mut work) {
+            return PreprocessOutcome::Interrupted(stats);
+        }
+        clauses.push(clause.clone());
+    }
     let mut reconstruction = Vec::new();
 
     loop {
+        if stop.load(Ordering::Relaxed) {
+            return PreprocessOutcome::Interrupted(stats);
+        }
         stats.rounds += 1;
         let mut changed = false;
         let mut simplified = Vec::with_capacity(clauses.len());
@@ -488,10 +517,16 @@ fn preprocess_cnf_inner(cnf: &Cnf, options: PreprocessOptions, proof: &mut Prepr
         let mut polarity = vec![(false, false); cnf.vars];
 
         for clause in &clauses {
+            if preprocessing_stopped(stop, &mut work) {
+                return PreprocessOutcome::Interrupted(stats);
+            }
             let original = canonical_clause(clause);
             let mut out: Vec<i32> = Vec::with_capacity(clause.len());
             let mut satisfied = false;
             for &lit in clause {
+                if preprocessing_stopped(stop, &mut work) {
+                    return PreprocessOutcome::Interrupted(stats);
+                }
                 let var = lit.unsigned_abs() as usize;
                 if var == 0 || var > cnf.vars {
                     return PreprocessOutcome::Unsatisfiable(stats);
@@ -551,6 +586,9 @@ fn preprocess_cnf_inner(cnf: &Cnf, options: PreprocessOptions, proof: &mut Prepr
         }
 
         for lit in units {
+            if preprocessing_stopped(stop, &mut work) {
+                return PreprocessOutcome::Interrupted(stats);
+            }
             let idx = lit.unsigned_abs() as usize - 1;
             let value = lit > 0;
             match assigned[idx] {
@@ -570,6 +608,9 @@ fn preprocess_cnf_inner(cnf: &Cnf, options: PreprocessOptions, proof: &mut Prepr
 
         if options.pure_literals && !changed {
             for (idx, &(pos, neg)) in polarity.iter().enumerate() {
+                if preprocessing_stopped(stop, &mut work) {
+                    return PreprocessOutcome::Interrupted(stats);
+                }
                 if assigned[idx].is_none() && (pos ^ neg) {
                     let lit = if pos { idx as i32 + 1 } else { -(idx as i32 + 1) };
                     proof.add(&[lit]);
@@ -580,30 +621,45 @@ fn preprocess_cnf_inner(cnf: &Cnf, options: PreprocessOptions, proof: &mut Prepr
             }
         }
 
-        if !changed && options.subsumption && remove_subsumed_clauses(&mut simplified, &mut stats, proof) {
-            changed = true;
+        if !changed && options.subsumption {
+            match remove_subsumed_clauses(&mut simplified, &mut stats, stop, proof) {
+                Some(true) => changed = true,
+                Some(false) => {}
+                None => return PreprocessOutcome::Interrupted(stats),
+            }
         }
 
-        if !changed && options.self_subsuming_resolution && self_subsume_clauses(&mut simplified, &mut stats, proof) {
-            changed = true;
+        if !changed && options.self_subsuming_resolution {
+            match self_subsume_clauses(&mut simplified, &mut stats, stop, proof) {
+                Some(true) => changed = true,
+                Some(false) => {}
+                None => return PreprocessOutcome::Interrupted(stats),
+            }
         }
 
         if !changed && options.bounded_variable_elimination {
-            match eliminate_bounded_variable(&mut simplified, cnf.vars, &assigned, &mut stats, &mut reconstruction, proof) {
+            match eliminate_bounded_variable(&mut simplified, cnf.vars, &assigned, &mut stats, &mut reconstruction, stop, proof) {
                 EliminationResult::Changed => changed = true,
                 EliminationResult::Unsatisfiable => return PreprocessOutcome::Unsatisfiable(stats),
+                EliminationResult::Interrupted => return PreprocessOutcome::Interrupted(stats),
                 EliminationResult::Unchanged => {}
             }
         }
 
-        if !changed && options.blocked_clause_elimination && remove_blocked_clause(&mut simplified, &mut stats, &mut reconstruction, proof)
-        {
-            changed = true;
+        if !changed && options.blocked_clause_elimination {
+            match remove_blocked_clause(&mut simplified, &mut stats, &mut reconstruction, stop, proof) {
+                Some(true) => changed = true,
+                Some(false) => {}
+                None => return PreprocessOutcome::Interrupted(stats),
+            }
         }
 
         if !changed {
             let mut final_clauses = Vec::new();
             for (idx, value) in assigned.into_iter().enumerate() {
+                if preprocessing_stopped(stop, &mut work) {
+                    return PreprocessOutcome::Interrupted(stats);
+                }
                 if let Some(value) = value {
                     let lit = if value { idx as i32 + 1 } else { -(idx as i32 + 1) };
                     final_clauses.push(vec![lit]);
@@ -618,15 +674,24 @@ fn preprocess_cnf_inner(cnf: &Cnf, options: PreprocessOptions, proof: &mut Prepr
     }
 }
 
-fn remove_subsumed_clauses(clauses: &mut Vec<Vec<i32>>, stats: &mut PreprocessStats, proof: &mut PreprocessProof<'_>) -> bool {
+fn remove_subsumed_clauses(
+    clauses: &mut Vec<Vec<i32>>,
+    stats: &mut PreprocessStats,
+    stop: &AtomicBool,
+    proof: &mut PreprocessProof<'_>,
+) -> Option<bool> {
     let mut removed = vec![false; clauses.len()];
     let mut changed = false;
+    let mut work = 0usize;
 
     for i in 0..clauses.len() {
         if removed[i] {
             continue;
         }
         for j in 0..clauses.len() {
+            if preprocessing_stopped(stop, &mut work) {
+                return None;
+            }
             if i == j || removed[j] {
                 continue;
             }
@@ -636,7 +701,7 @@ fn remove_subsumed_clauses(clauses: &mut Vec<Vec<i32>>, stats: &mut PreprocessSt
             if clauses[i].len() == clauses[j].len() && i > j {
                 continue;
             }
-            if sorted_subset(&clauses[i], &clauses[j]) {
+            if sorted_subset(&clauses[i], &clauses[j], stop, &mut work)? {
                 removed[j] = true;
                 proof.delete(&clauses[j]);
                 stats.subsumed_clauses += 1;
@@ -654,26 +719,48 @@ fn remove_subsumed_clauses(clauses: &mut Vec<Vec<i32>>, stats: &mut PreprocessSt
         }
         *clauses = keep;
     }
-    changed
+    Some(changed)
 }
 
-fn self_subsume_clauses(clauses: &mut [Vec<i32>], stats: &mut PreprocessStats, proof: &mut PreprocessProof<'_>) -> bool {
+fn self_subsume_clauses(
+    clauses: &mut [Vec<i32>],
+    stats: &mut PreprocessStats,
+    stop: &AtomicBool,
+    proof: &mut PreprocessProof<'_>,
+) -> Option<bool> {
     let mut changed = false;
+    let mut work = 0usize;
 
     loop {
         let mut changed_this_round = false;
         'scan: for i in 0..clauses.len() {
             for j in 0..clauses.len() {
+                if preprocessing_stopped(stop, &mut work) {
+                    return None;
+                }
                 if i == j {
                     continue;
                 }
                 let source = clauses[i].clone();
                 for &lit in &source {
+                    if preprocessing_stopped(stop, &mut work) {
+                        return None;
+                    }
                     let neg = -lit;
                     if !contains_lit(&clauses[j], neg) {
                         continue;
                     }
-                    if source.iter().filter(|&&other| other != lit).all(|&other| contains_lit(&clauses[j], other)) {
+                    let mut subsumes_without_lit = true;
+                    for &other in &source {
+                        if preprocessing_stopped(stop, &mut work) {
+                            return None;
+                        }
+                        if other != lit && !contains_lit(&clauses[j], other) {
+                            subsumes_without_lit = false;
+                            break;
+                        }
+                    }
+                    if subsumes_without_lit {
                         let old = clauses[j].clone();
                         clauses[j].retain(|&other| other != neg);
                         proof.add(&clauses[j]);
@@ -691,13 +778,14 @@ fn self_subsume_clauses(clauses: &mut [Vec<i32>], stats: &mut PreprocessStats, p
         }
     }
 
-    changed
+    Some(changed)
 }
 
 enum EliminationResult {
     Unchanged,
     Changed,
     Unsatisfiable,
+    Interrupted,
 }
 
 fn eliminate_bounded_variable(
@@ -706,11 +794,16 @@ fn eliminate_bounded_variable(
     assigned: &[Option<bool>],
     stats: &mut PreprocessStats,
     reconstruction: &mut Vec<ReconstructionStep>,
+    stop: &AtomicBool,
     proof: &mut PreprocessProof<'_>,
 ) -> EliminationResult {
     const BVE_PAIR_LIMIT: usize = 4096;
+    let mut work = 0usize;
 
     for var in 1..=vars as i32 {
+        if preprocessing_stopped(stop, &mut work) {
+            return EliminationResult::Interrupted;
+        }
         if assigned[var as usize - 1].is_some() {
             continue;
         }
@@ -720,6 +813,9 @@ fn eliminate_bounded_variable(
         let mut positive_indices = Vec::new();
         let mut negative_indices = Vec::new();
         for (idx, clause) in clauses.iter().enumerate() {
+            if preprocessing_stopped(stop, &mut work) {
+                return EliminationResult::Interrupted;
+            }
             if contains_lit(clause, pos_lit) {
                 positive_indices.push(idx);
             }
@@ -739,8 +835,13 @@ fn eliminate_bounded_variable(
         let mut resolvents: Vec<Vec<i32>> = Vec::new();
         for &p_idx in &positive_indices {
             for &n_idx in &negative_indices {
-                let Some(resolvent) = resolve_on_var(&clauses[p_idx], pos_lit, &clauses[n_idx]) else {
-                    continue;
+                if preprocessing_stopped(stop, &mut work) {
+                    return EliminationResult::Interrupted;
+                }
+                let resolvent = match resolve_on_var(&clauses[p_idx], pos_lit, &clauses[n_idx], stop, &mut work) {
+                    None => return EliminationResult::Interrupted,
+                    Some(None) => continue,
+                    Some(Some(resolvent)) => resolvent,
                 };
                 if resolvent.is_empty() {
                     proof.add(&[]);
@@ -764,9 +865,15 @@ fn eliminate_bounded_variable(
         let positive = positive_indices.iter().map(|&idx| clauses[idx].clone()).collect::<Vec<_>>();
         let negative = negative_indices.iter().map(|&idx| clauses[idx].clone()).collect::<Vec<_>>();
         for resolvent in &resolvents {
+            if preprocessing_stopped(stop, &mut work) {
+                return EliminationResult::Interrupted;
+            }
             proof.add(resolvent);
         }
         for clause in positive.iter().chain(&negative) {
+            if preprocessing_stopped(stop, &mut work) {
+                return EliminationResult::Interrupted;
+            }
             proof.delete(clause);
         }
         let mut remove = vec![false; clauses.len()];
@@ -776,6 +883,9 @@ fn eliminate_bounded_variable(
 
         let mut next = Vec::with_capacity(clauses.len() - old_count + resolvents.len());
         for (idx, clause) in clauses.drain(..).enumerate() {
+            if preprocessing_stopped(stop, &mut work) {
+                return EliminationResult::Interrupted;
+            }
             if !remove[idx] {
                 next.push(clause);
             }
@@ -792,20 +902,26 @@ fn eliminate_bounded_variable(
     EliminationResult::Unchanged
 }
 
-fn resolve_on_var(positive: &[i32], pos_lit: i32, negative: &[i32]) -> Option<Vec<i32>> {
+fn resolve_on_var(positive: &[i32], pos_lit: i32, negative: &[i32], stop: &AtomicBool, work: &mut usize) -> Option<Option<Vec<i32>>> {
     let mut out = Vec::with_capacity(positive.len() + negative.len() - 2);
     for &lit in positive {
-        if lit != pos_lit && !push_resolvent_lit(&mut out, lit) {
+        if preprocessing_stopped(stop, work) {
             return None;
+        }
+        if lit != pos_lit && !push_resolvent_lit(&mut out, lit) {
+            return Some(None);
         }
     }
     for &lit in negative {
-        if lit != -pos_lit && !push_resolvent_lit(&mut out, lit) {
+        if preprocessing_stopped(stop, work) {
             return None;
+        }
+        if lit != -pos_lit && !push_resolvent_lit(&mut out, lit) {
+            return Some(None);
         }
     }
     out.sort_unstable();
-    Some(out)
+    Some(Some(out))
 }
 
 fn push_resolvent_lit(out: &mut Vec<i32>, lit: i32) -> bool {
@@ -822,31 +938,56 @@ fn remove_blocked_clause(
     clauses: &mut Vec<Vec<i32>>,
     stats: &mut PreprocessStats,
     reconstruction: &mut Vec<ReconstructionStep>,
+    stop: &AtomicBool,
     proof: &mut PreprocessProof<'_>,
-) -> bool {
+) -> Option<bool> {
+    let mut work = 0usize;
     for idx in 0..clauses.len() {
+        if preprocessing_stopped(stop, &mut work) {
+            return None;
+        }
         let clause = clauses[idx].clone();
         for &lit in &clause {
-            if clause_is_blocked(clauses, idx, lit) {
+            if preprocessing_stopped(stop, &mut work) {
+                return None;
+            }
+            if clause_is_blocked(clauses, idx, lit, stop, &mut work)? {
                 proof.delete(&clause);
                 clauses.remove(idx);
                 reconstruction.push(ReconstructionStep::BlockedClause { clause, blocking_lit: lit });
                 stats.blocked_clauses += 1;
-                return true;
+                return Some(true);
             }
         }
     }
-    false
+    Some(false)
 }
 
-fn clause_is_blocked(clauses: &[Vec<i32>], clause_idx: usize, blocking_lit: i32) -> bool {
-    clauses.iter().enumerate().all(|(idx, other)| {
-        idx == clause_idx || !contains_lit(other, -blocking_lit) || resolvent_is_tautological(&clauses[clause_idx], blocking_lit, other)
-    })
+fn clause_is_blocked(clauses: &[Vec<i32>], clause_idx: usize, blocking_lit: i32, stop: &AtomicBool, work: &mut usize) -> Option<bool> {
+    for (idx, other) in clauses.iter().enumerate() {
+        if preprocessing_stopped(stop, work) {
+            return None;
+        }
+        if idx != clause_idx
+            && contains_lit(other, -blocking_lit)
+            && !resolvent_is_tautological(&clauses[clause_idx], blocking_lit, other, stop, work)?
+        {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
-fn resolvent_is_tautological(clause: &[i32], blocking_lit: i32, other: &[i32]) -> bool {
-    clause.iter().any(|&lit| lit != blocking_lit && contains_lit(other, -lit))
+fn resolvent_is_tautological(clause: &[i32], blocking_lit: i32, other: &[i32], stop: &AtomicBool, work: &mut usize) -> Option<bool> {
+    for &lit in clause {
+        if preprocessing_stopped(stop, work) {
+            return None;
+        }
+        if lit != blocking_lit && contains_lit(other, -lit) {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 fn reconstruct_assignment(assignment: &mut [bool], reconstruction: &[ReconstructionStep]) {
@@ -890,20 +1031,33 @@ fn lit_satisfied(lit: i32, assignment: &[bool]) -> bool {
     }
 }
 
-fn sorted_subset(a: &[i32], b: &[i32]) -> bool {
+fn sorted_subset(a: &[i32], b: &[i32], stop: &AtomicBool, work: &mut usize) -> Option<bool> {
     let mut i = 0;
     let mut j = 0;
     while i < a.len() && j < b.len() {
+        if preprocessing_stopped(stop, work) {
+            return None;
+        }
         match a[i].cmp(&b[j]) {
             std::cmp::Ordering::Equal => {
                 i += 1;
                 j += 1;
             }
             std::cmp::Ordering::Greater => j += 1,
-            std::cmp::Ordering::Less => return false,
+            std::cmp::Ordering::Less => return Some(false),
         }
     }
-    i == a.len()
+    Some(i == a.len())
+}
+
+#[inline]
+fn preprocessing_stopped(stop: &AtomicBool, work: &mut usize) -> bool {
+    *work += 1;
+    if *work < 1024 {
+        return false;
+    }
+    *work = 0;
+    stop.load(Ordering::Relaxed)
 }
 
 fn contains_lit(clause: &[i32], lit: i32) -> bool {
