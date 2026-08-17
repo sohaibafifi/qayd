@@ -61,7 +61,7 @@ def load(path):
 
 def par2(rows, timeout):
     s = 0.0
-    for r in rows.values():
+    for r in rows:
         # COP-aware: an unproved COP incumbent (SATISFIABLE) is charged as
         # unsolved, so a solver that gives up early with an incumbent is not
         # rewarded as if it had proved the optimum.
@@ -188,8 +188,8 @@ def main():
     print(f"  only {na}             : {only_a}")
     print(f"  only {nb}             : {only_b}")
     print(f"  neither               : {neither}")
-    print(f"  PAR2 {na} : {par2(A, args.timeout):.1f}  (lower better)")
-    print(f"  PAR2 {nb} : {par2(B, args.timeout):.1f}")
+    print(f"  PAR2 {na} : {par2((A[i] for i in common), args.timeout):.1f}  (lower better)")
+    print(f"  PAR2 {nb} : {par2((B[i] for i in common), args.timeout):.1f}")
     print(f"  speed (solved-by-both): {na} faster {a_faster} | {nb} faster {b_faster}")
     if obj_tie or a_better or a_worse:
         print(f"  objective quality (incumbent by both): same {obj_tie} | {na} better {a_better} | {na} worse {a_worse}")

@@ -152,3 +152,15 @@ def test_invalid_assignment_is_not_solved_or_a_contradiction(tmp_path):
     assert "  baseline solved : 1" in out
     assert "  invalid assignments: qayd 1 | baseline 0" in out
     assert "CONTRADICTIONS (soundness bug!) : 0" in out
+
+
+def test_par2_uses_only_the_common_instance_set(tmp_path):
+    out = compare_output(
+        tmp_path,
+        [row("common", "UNSAT", "", "?"), row("only-a", "UNKNOWN", "", "?")],
+        [row("common", "UNSAT", "", "?")],
+        timeout=10,
+    )
+
+    assert "PAR2 qayd : 1.0" in out
+    assert "PAR2 baseline : 1.0" in out
