@@ -12,5 +12,6 @@ pub mod linear;
 pub mod list;
 pub(crate) mod prefix_set;
 pub mod primitives;
+pub(crate) mod resource_profile;
 pub mod scheduling;
 pub mod table;

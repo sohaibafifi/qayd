@@ -1,9 +1,7 @@
 //! Small decompositions used by front-ends for higher-level constraints.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
-use crate::constraints::intension::{self as intension_constraint, intension};
-use crate::constraints::linear::{self as linear_constraint, linear, Relation};
+use crate::constraints::intension::intension;
+use crate::constraints::linear::{linear, Relation};
 use crate::expr::{self, Expr};
 use crate::ids::VarId;
 use crate::store::Solver;
@@ -50,28 +48,6 @@ pub fn post_all_different_except(solver: &mut Solver, vars: &[VarId], except: &[
     }
 }
 
-pub(crate) fn post_all_different_except_interruptible(solver: &mut Solver, vars: &[VarId], except: &[i32], stop: &AtomicBool) -> bool {
-    for i in 0..vars.len() {
-        for j in (i + 1)..vars.len() {
-            if stop.load(Ordering::Acquire) {
-                return false;
-            }
-            let mut terms = Vec::with_capacity(except.len().saturating_add(1));
-            terms.push(expr::ne(expr::var(vars[i]), expr::var(vars[j])));
-            for &value in except {
-                if stop.load(Ordering::Acquire) {
-                    return false;
-                }
-                terms.push(expr::eq(expr::var(vars[i]), expr::int(i64::from(value))));
-            }
-            if !intension_constraint::intension_interruptible(solver, expr::or(terms), stop) {
-                return false;
-            }
-        }
-    }
-    !stop.load(Ordering::Acquire)
-}
-
 pub fn post_channel_onehot_index(solver: &mut Solver, xs: &[VarId], value: VarId, start_index: i32) {
     for (i, &x) in xs.iter().enumerate() {
         let idx = start_index as i64 + i as i64;
@@ -106,53 +82,6 @@ pub fn post_bin_loads(solver: &mut Solver, items: &[VarId], sizes: &[i64], loads
         vars.push(load);
         linear(solver, &coeffs, &vars, Relation::Eq, 0);
     }
-}
-
-pub(crate) fn post_bin_loads_interruptible(
-    solver: &mut Solver,
-    items: &[VarId],
-    sizes: &[i64],
-    loads: &[VarId],
-    stop: &AtomicBool,
-) -> bool {
-    assert!(loads.len() <= i32::MAX as usize, "binPacking: too many bins");
-    if stop.load(Ordering::Acquire) {
-        return false;
-    }
-    if loads.is_empty() {
-        return items.is_empty() || linear_constraint::linear_interruptible(solver, Vec::new(), Vec::new(), Relation::Eq, 1, stop);
-    }
-
-    let last_bin = loads.len() as i64 - 1;
-    for &item in items {
-        if stop.load(Ordering::Acquire)
-            || !linear_constraint::linear_interruptible(solver, vec![1], vec![item], Relation::Ge, 0, stop)
-            || !linear_constraint::linear_interruptible(solver, vec![1], vec![item], Relation::Le, last_bin, stop)
-        {
-            return false;
-        }
-    }
-
-    for (bin, &load) in loads.iter().enumerate() {
-        if stop.load(Ordering::Acquire) {
-            return false;
-        }
-        let mut coefficients = Vec::with_capacity(items.len().saturating_add(1));
-        let mut variables = Vec::with_capacity(items.len().saturating_add(1));
-        for (index, &item) in items.iter().enumerate() {
-            if stop.load(Ordering::Acquire) {
-                return false;
-            }
-            coefficients.push(sizes[index]);
-            variables.push(eq_const_indicator(solver, item, bin as i32));
-        }
-        coefficients.push(-1);
-        variables.push(load);
-        if !linear_constraint::linear_interruptible(solver, coefficients, variables, Relation::Eq, 0, stop) {
-            return false;
-        }
-    }
-    !stop.load(Ordering::Acquire)
 }
 
 pub fn post_diffn(solver: &mut Solver, origins: &[Vec<VarId>], lengths: &[Vec<Expr>], zero_ignored: bool) -> Result<(), String> {

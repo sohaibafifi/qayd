@@ -486,6 +486,9 @@ pub fn element_const(solver: &mut Solver, array: &[i32], idx: VarId, value: VarI
 #[derive(Clone, Default)]
 struct AllDifferent {
     vars: Vec<VarId>,
+    /// Values allowed to repeat. They are represented by one private matching
+    /// node per variable, so they never consume a shared value capacity.
+    except: Vec<i32>,
     /// Persistent matching hint: `matching[i]` = value assigned to `vars[i]`
     /// (`i32::MIN` = unmatched / no hint yet).
     matching: Vec<i32>,
@@ -623,8 +626,18 @@ impl Propagator for AllDifferent {
         if n == 0 {
             return Ok(());
         }
+        // If every variable can independently take an exempt value, every
+        // current value has support: keep one variable on that value and put
+        // every other variable on any exempt value. Régin cannot filter until
+        // at least one variable loses all exempt alternatives.
+        if !self.except.is_empty()
+            && self.vars.iter().all(|&variable| store.values(variable).any(|value| self.except.binary_search(&value).is_ok()))
+        {
+            return Ok(());
+        }
         let AllDifferent {
             vars,
+            except,
             matching,
             values,
             adj,
@@ -647,14 +660,18 @@ impl Propagator for AllDifferent {
             visited,
         } = self;
 
-        // Value universe (sorted, deduped); value index = position.
+        // Shared value universe (sorted, deduped). Exempt values are encoded by
+        // one private value node per variable below. A single private node is
+        // sufficient even when several exempt values remain in a domain: each
+        // such value has identical, unlimited-repeat semantics.
         values.clear();
         for &v in vars.iter() {
-            values.extend(store.values(v));
+            values.extend(store.values(v).filter(|value| except.binary_search(value).is_err()));
         }
         values.sort_unstable();
         values.dedup();
-        let m = values.len();
+        let shared_values = values.len();
+        let m = shared_values + if except.is_empty() { 0 } else { n };
         if m < n {
             return Err(Inconsistency); // pigeonhole
         }
@@ -665,7 +682,17 @@ impl Propagator for AllDifferent {
         }
         for (i, &v) in vars.iter().enumerate() {
             adj[i].clear();
-            adj[i].extend(store.values(v).map(|val| index_of(values, val)));
+            let mut has_exempt = false;
+            for val in store.values(v) {
+                if except.binary_search(&val).is_ok() {
+                    has_exempt = true;
+                } else {
+                    adj[i].push(index_of(values, val));
+                }
+            }
+            if has_exempt {
+                adj[i].push(shared_values + i);
+            }
         }
 
         // Warm-start the matching from the previous call: keep each hinted pair
@@ -681,7 +708,7 @@ impl Propagator for AllDifferent {
         for i in 0..n {
             let mv = matching[i];
             if mv != i32::MIN && store.contains(vars[i], mv) {
-                let vidx = index_of(values, mv);
+                let vidx = if except.binary_search(&mv).is_ok() { shared_values + i } else { index_of(values, mv) };
                 if val_to_var[vidx] < 0 {
                     var_to_val[i] = vidx as i32;
                     val_to_var[vidx] = i as i32;
@@ -719,7 +746,15 @@ impl Propagator for AllDifferent {
 
         // Persist the matching (as concrete values) for the next call.
         for i in 0..n {
-            matching[i] = values[var_to_val[i] as usize];
+            let matched = var_to_val[i] as usize;
+            matching[i] = if matched < shared_values {
+                values[matched]
+            } else {
+                store
+                    .values(vars[i])
+                    .find(|value| except.binary_search(value).is_ok())
+                    .expect("private matching nodes require an exempt domain value")
+            };
         }
 
         // Oriented graph: nodes 0..n vars, n..n+m values.
@@ -785,6 +820,9 @@ impl Propagator for AllDifferent {
         for (i, &var) in vars.iter().enumerate() {
             let matched = var_to_val[i] as usize;
             for val in store.values(var) {
+                if except.binary_search(&val).is_ok() {
+                    continue;
+                }
                 let vidx = index_of(values, val);
                 if vidx != matched && comp[i] != comp[n + vidx] && !reachable[n + vidx] {
                     removals.push((i, vidx));
@@ -871,6 +909,19 @@ impl Propagator for AllDifferent {
 pub fn all_different(solver: &mut Solver, vars: &[VarId]) {
     record_all_different_relaxation(solver, vars);
     solver.post(Box::new(AllDifferent { vars: vars.to_vec(), ..Default::default() }));
+}
+
+/// Post `allDifferent(vars) except except`: non-exempt values have capacity
+/// one, while exempt values may be repeated by any number of variables.
+pub fn all_different_except(solver: &mut Solver, vars: &[VarId], except: &[i32]) {
+    if except.is_empty() {
+        all_different(solver, vars);
+        return;
+    }
+    let mut except = except.to_vec();
+    except.sort_unstable();
+    except.dedup();
+    solver.post(Box::new(AllDifferent { vars: vars.to_vec(), except, ..Default::default() }));
 }
 
 /// Add the aggregate sum bounds implied by pairwise distinct integer values.

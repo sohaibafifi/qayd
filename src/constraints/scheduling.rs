@@ -3,13 +3,17 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::constraints::linear::{clamp_i32, linear, Relation};
+use crate::constraints::interval as interval_constraints;
+use crate::constraints::linear::{linear, Relation};
+use crate::constraints::resource_profile::{
+    build_profile, earliest_feasible_start, first_overload, latest_feasible_start, mandatory_height_limit, peak_usage, ProfileSegment,
+};
 use crate::ids::{PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Priority, Propagator};
 use crate::store::{Premise, Solver, Store};
 
 /// Ceiling of `a / b` for `a >= 0`, `b > 0`.
-fn ceil_div_pos(a: i64, b: i64) -> i64 {
+fn ceil_div_pos(a: i128, b: i128) -> i128 {
     (a + b - 1) / b
 }
 
@@ -65,34 +69,6 @@ fn clamp_i128_i32(value: i128) -> i32 {
 struct NoOverlap {
     starts: Vec<VarId>,
     durations: Vec<i64>,
-}
-
-/// Domain-consistent binary decomposition of one disjunctive task pair.
-#[derive(Clone)]
-struct NoOverlapPair {
-    first: VarId,
-    first_duration: i64,
-    second: VarId,
-    second_duration: i64,
-    scratch: Vec<i32>,
-}
-
-/// Maximum candidate-value inspections in one pass of the binary
-/// decomposition. The estimate depends only on scope and live domain sizes.
-/// Above it, one global bounds propagator avoids quadratic domain scans and a
-/// quadratic number of posted propagators.
-const MAX_NO_OVERLAP_PAIR_DOMAIN_WORK: u128 = 65_536;
-
-/// Decide whether a NoOverlap scope uses its binary decomposition. One pair
-/// scans both domains, so the full-pass work is `(task_count - 1)` times the
-/// sum of domain cardinalities.
-pub(crate) fn no_overlap_uses_pair_decomposition(task_count: usize, total_domain_values: u128) -> bool {
-    total_domain_values.saturating_mul(task_count.saturating_sub(1) as u128) <= MAX_NO_OVERLAP_PAIR_DOMAIN_WORK
-}
-
-fn decompose_no_overlap(store: &Store, starts: &[VarId]) -> bool {
-    let total_domain_values = starts.iter().fold(0u128, |total, &start| total.saturating_add(store.size(start) as u128));
-    no_overlap_uses_pair_decomposition(starts.len(), total_domain_values)
 }
 
 fn propagate_no_overlap_bounds(
@@ -156,48 +132,6 @@ fn propagate_no_overlap_bounds(
     Ok(())
 }
 
-fn remove_pairwise_unsupported_values(
-    store: &mut Store,
-    first: VarId,
-    first_duration: i64,
-    second: VarId,
-    second_duration: i64,
-    scratch: &mut Vec<i32>,
-) -> Result<(), Inconsistency> {
-    // With the first start fixed to a, neither ordering has support exactly
-    // when max(second)-first_duration < a < min(second)+second_duration.
-    let second_min = store.min(second);
-    let second_max = store.max(second);
-    let unsupported_first_low = i128::from(second_max) - i128::from(first_duration) + 1;
-    let unsupported_first_high = i128::from(second_min) + i128::from(second_duration) - 1;
-    scratch.clear();
-    scratch.extend(store.values(first).filter(|&value| {
-        let value = i128::from(value);
-        unsupported_first_low <= value && value <= unsupported_first_high
-    }));
-    let why_first =
-        store.explaining().then(|| vec![Premise::Ge { var: second, bound: second_min }, Premise::Le { var: second, bound: second_max }]);
-    for value in scratch.drain(..) {
-        store.remove_because(first, value, why_first.clone().unwrap_or_default())?;
-    }
-
-    let first_min = store.min(first);
-    let first_max = store.max(first);
-    let unsupported_second_low = i128::from(first_max) - i128::from(second_duration) + 1;
-    let unsupported_second_high = i128::from(first_min) + i128::from(first_duration) - 1;
-    scratch.clear();
-    scratch.extend(store.values(second).filter(|&value| {
-        let value = i128::from(value);
-        unsupported_second_low <= value && value <= unsupported_second_high
-    }));
-    let why_second =
-        store.explaining().then(|| vec![Premise::Ge { var: first, bound: first_min }, Premise::Le { var: first, bound: first_max }]);
-    for value in scratch.drain(..) {
-        store.remove_because(second, value, why_second.clone().unwrap_or_default())?;
-    }
-    Ok(())
-}
-
 impl Propagator for NoOverlap {
     fn priority(&self) -> Priority {
         Priority::Expensive
@@ -249,51 +183,16 @@ impl NoOverlap {
     }
 }
 
-impl Propagator for NoOverlapPair {
-    fn priority(&self) -> Priority {
-        Priority::Linear
-    }
-
-    fn register(&mut self, store: &mut Store, me: PropId) {
-        store.subscribe(self.first, me, Event::BoundChange);
-        store.subscribe(self.second, me, Event::BoundChange);
-    }
-
-    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
-        register_variables_until(store, me, &[self.first, self.second], Event::BoundChange, should_stop)
-    }
-
-    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
-        local_fixpoint!(store.size(self.first).saturating_add(store.size(self.second)), {
-            remove_pairwise_unsupported_values(
-                store,
-                self.first,
-                self.first_duration,
-                self.second,
-                self.second_duration,
-                &mut self.scratch,
-            )?;
-            propagate_no_overlap_bounds(store, self.first, self.first_duration, self.second, self.second_duration)?;
-        });
-        Ok(())
-    }
-}
-
 /// Post `noOverlap`: the tasks must not overlap in time.
 pub fn no_overlap(solver: &mut Solver, starts: &[VarId], durations: &[i64]) {
     assert_eq!(starts.len(), durations.len(), "noOverlap: starts/durations mismatch");
-    if decompose_no_overlap(&solver.store, starts) {
-        for first in 0..starts.len() {
-            for second in (first + 1)..starts.len() {
-                solver.post(Box::new(NoOverlapPair {
-                    first: starts[first],
-                    first_duration: durations[first],
-                    second: starts[second],
-                    second_duration: durations[second],
-                    scratch: Vec::new(),
-                }));
-            }
-        }
+    if let Some(durations) = durations.iter().map(|&duration| i32::try_from(duration).ok()).collect::<Option<Vec<_>>>() {
+        let intervals = starts
+            .iter()
+            .zip(durations)
+            .map(|(&start, duration)| solver.store.register_interval(start, duration, None))
+            .collect::<Vec<_>>();
+        interval_constraints::mandatory_no_overlap(solver, &intervals);
     } else {
         solver.post(Box::new(NoOverlap { starts: starts.to_vec(), durations: durations.to_vec() }));
     }
@@ -308,22 +207,15 @@ pub(crate) fn no_overlap_interruptible(solver: &mut Solver, starts: &[VarId], du
         return false;
     };
     let should_stop = || stop.load(Ordering::Acquire);
-    if decompose_no_overlap(&solver.store, &starts) {
-        for first in 0..starts.len() {
-            for second in (first + 1)..starts.len() {
-                let pair = NoOverlapPair {
-                    first: starts[first],
-                    first_duration: durations[first],
-                    second: starts[second],
-                    second_duration: durations[second],
-                    scratch: Vec::new(),
-                };
-                if solver.post_until(Box::new(pair), &should_stop).is_none() {
-                    return false;
-                }
+    if let Some(durations) = durations.iter().map(|&duration| i32::try_from(duration).ok()).collect::<Option<Vec<_>>>() {
+        let mut intervals = Vec::with_capacity(starts.len());
+        for (&start, duration) in starts.iter().zip(durations) {
+            if should_stop() {
+                return false;
             }
+            intervals.push(solver.store.register_interval(start, duration, None));
         }
-        true
+        interval_constraints::mandatory_no_overlap_until(solver, intervals, &should_stop).is_some()
     } else {
         solver.post_until(Box::new(NoOverlap { starts, durations }), &should_stop).is_some()
     }
@@ -340,15 +232,16 @@ struct Cumulative {
     dur: Vec<i64>,
     height: Vec<i64>,
     capacity: i64,
-    profile: Vec<i64>,
+    events: Vec<(i128, i128)>,
+    profile: Vec<ProfileSegment>,
     buf: Vec<i32>,
     /// Reused scratch for energetic overload checking.
-    est: Vec<i64>,
-    lct: Vec<i64>,
-    energy: Vec<i64>,
+    est: Vec<i128>,
+    lct: Vec<i128>,
+    energy: Vec<i128>,
     by_est: Vec<usize>,
     by_lct: Vec<usize>,
-    lb: Vec<i64>,
+    lb: Vec<i128>,
 }
 
 impl Cumulative {
@@ -362,7 +255,7 @@ impl Cumulative {
     /// only raises mins (and `remove` only lowers maxes), so mandatory parts only
     /// grow within a pass; reading live bounds is thus a sound superset of the
     /// stale-profile cause (reason_before_step demotes any bound this call moved).
-    fn overload_premises(&self, store: &Store, t: i64, except: Option<usize>, extra: i64) -> Vec<Premise> {
+    fn overload_premises(&self, store: &Store, t: i128, except: Option<usize>, extra: i128) -> Vec<Premise> {
         let mut why = Vec::new();
         let mut sum = extra;
         for k in 0..self.starts.len() {
@@ -371,13 +264,13 @@ impl Cumulative {
             if Some(k) == except || self.height[k] == 0 {
                 continue;
             }
-            let kmin = store.min(self.starts[k]) as i64;
-            let kmax = store.max(self.starts[k]) as i64;
-            if kmax <= t && t < kmin + self.dur[k] {
-                why.push(Premise::Ge { var: self.starts[k], bound: kmin as i32 });
-                why.push(Premise::Le { var: self.starts[k], bound: kmax as i32 });
-                sum += self.height[k];
-                if sum > self.capacity {
+            let kmin = i128::from(store.min(self.starts[k]));
+            let kmax = i128::from(store.max(self.starts[k]));
+            if kmax <= t && t < kmin + i128::from(self.dur[k]) {
+                why.push(Premise::Ge { var: self.starts[k], bound: store.min(self.starts[k]) });
+                why.push(Premise::Le { var: self.starts[k], bound: store.max(self.starts[k]) });
+                sum += i128::from(self.height[k]);
+                if sum > i128::from(self.capacity) {
                     break;
                 }
             }
@@ -412,20 +305,20 @@ impl Propagator for Cumulative {
         local_fixpoint!((0..n).map(|i| store.size(self.starts[i])).sum::<usize>(), {
             // Snapshot est, lct, energy.
             for i in 0..n {
-                self.est[i] = store.min(self.starts[i]) as i64;
-                self.lct[i] = store.max(self.starts[i]) as i64 + self.dur[i];
-                self.energy[i] = self.height[i] * self.dur[i];
+                self.est[i] = i128::from(store.min(self.starts[i]));
+                self.lct[i] = i128::from(store.max(self.starts[i])) + i128::from(self.dur[i]);
+                self.energy[i] = i128::from(self.height[i]) * i128::from(self.dur[i]);
             }
 
             // Energetic overload check: window [L, U) energy > capacity*(U-L) fails.
             self.by_est.sort_unstable_by(|&a, &b| self.est[b].cmp(&self.est[a]));
             for u in 0..n {
                 let ub = self.lct[u];
-                let mut e = 0i64;
+                let mut e = 0i128;
                 for &k in &self.by_est {
                     if self.lct[k] <= ub {
                         e += self.energy[k];
-                        if e > self.capacity * (ub - self.est[k]) {
+                        if e > i128::from(self.capacity) * (ub - self.est[k]) {
                             return Err(Inconsistency);
                         }
                     }
@@ -438,12 +331,12 @@ impl Propagator for Cumulative {
             self.lb.copy_from_slice(&self.est);
             #[allow(clippy::needless_range_loop)]
             for i in 0..n {
-                let hi = self.height[i];
+                let hi = i128::from(self.height[i]);
                 if hi == 0 {
                     continue;
                 }
-                let mut e_omega = 0i64;
-                let mut est_omega = i64::MAX;
+                let mut e_omega = 0i128;
+                let mut est_omega = i128::MAX;
                 for &j in &self.by_lct {
                     if j == i {
                         continue;
@@ -451,8 +344,8 @@ impl Propagator for Cumulative {
                     e_omega += self.energy[j];
                     est_omega = est_omega.min(self.est[j]);
                     let u = self.lct[j];
-                    if e_omega + self.energy[i] > self.capacity * (u - est_omega.min(self.est[i])) {
-                        let rest = e_omega - (self.capacity - hi) * (u - est_omega);
+                    if e_omega + self.energy[i] > i128::from(self.capacity) * (u - est_omega.min(self.est[i])) {
+                        let rest = e_omega - (i128::from(self.capacity) - hi) * (u - est_omega);
                         if rest > 0 {
                             self.lb[i] = self.lb[i].max(est_omega + ceil_div_pos(rest, hi));
                         }
@@ -462,68 +355,71 @@ impl Propagator for Cumulative {
             #[allow(clippy::needless_range_loop)]
             for i in 0..n {
                 if self.lb[i] > self.est[i] {
-                    store.remove_below(self.starts[i], clamp_i32(self.lb[i]))?;
+                    store.remove_below(self.starts[i], clamp_i128_i32(self.lb[i]))?;
                 }
             }
 
-            // Time-tabling over the mandatory-part profile.
-            let hmin = self.est.iter().copied().min().unwrap();
-            let hmax = self.lct.iter().copied().max().unwrap();
-            if hmax > hmin {
-                let horizon = (hmax - hmin) as usize;
-                self.profile.clear();
-                self.profile.resize(horizon, 0);
-                for i in 0..n {
-                    let mand_start = store.max(self.starts[i]) as i64;
-                    let mand_end = store.min(self.starts[i]) as i64 + self.dur[i];
-                    for t in mand_start..mand_end {
-                        self.profile[(t - hmin) as usize] += self.height[i];
-                    }
+            // Sparse time-tabling over mandatory-part events. Memory is O(n),
+            // independent of the numeric horizon.
+            build_profile(
+                (0..n).map(|i| {
+                    (
+                        i128::from(store.max(self.starts[i])),
+                        i128::from(store.min(self.starts[i])) + i128::from(self.dur[i]),
+                        i128::from(self.height[i]),
+                    )
+                }),
+                &mut self.events,
+                &mut self.profile,
+            );
+            if let Some(segment) = self.profile.iter().find(|segment| segment.usage > i128::from(self.capacity)) {
+                if store.explaining() {
+                    return Err(store.fail_because(self.overload_premises(store, segment.start, None, 0)));
                 }
-                for (offset, &p) in self.profile.iter().enumerate() {
-                    if p > self.capacity {
-                        // Overload at instant t: cite a covering subset whose
-                        // mandatory parts force Σ height > capacity there.
-                        if store.explaining() {
-                            let t = hmin + offset as i64;
-                            return Err(store.fail_because(self.overload_premises(store, t, None, 0)));
-                        }
+                return Err(Inconsistency);
+            }
+            for i in 0..n {
+                let hi = i128::from(self.height[i]);
+                let mand_start = i128::from(store.max(self.starts[i]));
+                let mand_end = i128::from(store.min(self.starts[i])) + i128::from(self.dur[i]);
+                if !store.explaining() {
+                    let earliest = i128::from(store.min(self.starts[i]));
+                    let latest = i128::from(store.max(self.starts[i]));
+                    let duration = i128::from(self.dur[i]);
+                    let own_part = Some((mand_start, mand_end, hi));
+                    let capacity = i128::from(self.capacity);
+                    let Some(new_min) = earliest_feasible_start(&self.profile, earliest, latest, duration, hi, own_part, capacity) else {
                         return Err(Inconsistency);
-                    }
+                    };
+                    let Some(new_max) = latest_feasible_start(&self.profile, new_min, latest, duration, hi, own_part, capacity) else {
+                        return Err(Inconsistency);
+                    };
+                    store.remove_below(self.starts[i], clamp_i128_i32(new_min))?;
+                    store.remove_above(self.starts[i], clamp_i128_i32(new_max))?;
+                    continue;
                 }
-                // Forbid starts whose window exceeds capacity vs others' mandatory parts.
-                for i in 0..n {
-                    let hi = self.height[i];
-                    let mand_start = store.max(self.starts[i]) as i64;
-                    let mand_end = store.min(self.starts[i]) as i64 + self.dur[i];
-                    self.buf.clear();
-                    self.buf.extend(store.values(self.starts[i]));
-                    for &start in &self.buf {
-                        let s = start as i64;
-                        let conflict = (s..s + self.dur[i]).find(|&t| {
-                            let idx = (t - hmin) as usize;
-                            let own = if t >= mand_start && t < mand_end { hi } else { 0 };
-                            self.profile[idx] - own + hi > self.capacity
-                        });
-                        if let Some(t_c) = conflict {
-                            // At t_c the other tasks' mandatory parts already leave
-                            // < hi free, so i cannot occupy `start`. Cite that
-                            // covering subset (i's own bound is not needed: the
-                            // subset alone fills t_c beyond capacity - hi).
-                            if store.explaining() {
-                                let why = self.overload_premises(store, t_c, Some(i), hi);
-                                // Empty premises only happen when `hi` alone busts the
-                                // capacity (degenerate height > capacity): root-implied,
-                                // but keep the scope fallback rather than an
-                                // antecedent-free reason at depth.
-                                if why.is_empty() {
-                                    store.remove(self.starts[i], start)?;
-                                } else {
-                                    store.remove_because(self.starts[i], start, why)?;
-                                }
-                            } else {
+                self.buf.clear();
+                self.buf.extend(store.values(self.starts[i]));
+                for &start in &self.buf {
+                    let start_time = i128::from(start);
+                    let conflict = first_overload(
+                        &self.profile,
+                        start_time,
+                        start_time + i128::from(self.dur[i]),
+                        hi,
+                        Some((mand_start, mand_end, hi)),
+                        i128::from(self.capacity),
+                    );
+                    if let Some((t_c, _)) = conflict {
+                        if store.explaining() {
+                            let why = self.overload_premises(store, t_c, Some(i), hi);
+                            if why.is_empty() {
                                 store.remove(self.starts[i], start)?;
+                            } else {
+                                store.remove_because(self.starts[i], start, why)?;
                             }
+                        } else {
+                            store.remove(self.starts[i], start)?;
                         }
                     }
                 }
@@ -543,6 +439,7 @@ pub fn cumulative(solver: &mut Solver, starts: &[VarId], durations: &[i64], heig
         dur: durations.to_vec(),
         height: heights.to_vec(),
         capacity,
+        events: Vec::new(),
         profile: Vec::new(),
         buf: Vec::new(),
         est: vec![0; n],
@@ -582,6 +479,7 @@ pub(crate) fn cumulative_interruptible(
         dur,
         height,
         capacity,
+        events: Vec::new(),
         profile: Vec::new(),
         buf: Vec::new(),
         est: vec![0; n],
@@ -607,8 +505,8 @@ struct CumulativeVar {
     dur: Vec<VarId>,
     height: Vec<VarId>,
     capacity: VarId,
-    profile: Vec<i64>,
-    buf: Vec<i32>,
+    events: Vec<(i128, i128)>,
+    profile: Vec<ProfileSegment>,
 }
 
 impl CumulativeVar {
@@ -660,77 +558,55 @@ impl Propagator for CumulativeVar {
             return Ok(());
         }
         local_fixpoint!(self.state(store), {
-            let cap_max = store.max(self.capacity) as i64;
-
-            // Time horizon over all tasks (longest possible durations).
-            let mut hmin = i64::MAX;
-            let mut hmax = i64::MIN;
-            for i in 0..n {
-                hmin = hmin.min(store.min(self.starts[i]) as i64);
-                hmax = hmax.max(store.max(self.starts[i]) as i64 + store.max(self.dur[i]) as i64);
-            }
-            if hmax <= hmin {
-                break;
-            }
-            let horizon = (hmax - hmin) as usize;
-            self.profile.clear();
-            self.profile.resize(horizon, 0);
-
-            // Profile of min heights over mandatory parts.
-            for i in 0..n {
-                let h_lo = store.min(self.height[i]) as i64;
-                if h_lo == 0 {
-                    continue;
-                }
-                let mand_start = store.max(self.starts[i]) as i64;
-                let mand_end = store.min(self.starts[i]) as i64 + store.min(self.dur[i]) as i64;
-                for t in mand_start..mand_end {
-                    self.profile[(t - hmin) as usize] += h_lo;
-                }
-            }
+            let cap_max = i128::from(store.max(self.capacity));
+            build_profile(
+                (0..n).map(|i| {
+                    (
+                        i128::from(store.max(self.starts[i])),
+                        i128::from(store.min(self.starts[i])) + i128::from(store.min(self.dur[i])),
+                        i128::from(store.min(self.height[i])),
+                    )
+                }),
+                &mut self.events,
+                &mut self.profile,
+            );
 
             // Overload check; tighten cap.min up to the peak.
-            let peak = self.profile.iter().copied().max().unwrap_or(0);
+            let peak = peak_usage(&self.profile);
             if peak > cap_max {
                 return Err(Inconsistency);
             }
-            if peak > store.min(self.capacity) as i64 {
-                store.remove_below(self.capacity, clamp_i32(peak))?;
+            if peak > i128::from(store.min(self.capacity)) {
+                store.remove_below(self.capacity, clamp_i128_i32(peak))?;
             }
 
             for i in 0..n {
-                let h_lo = store.min(self.height[i]) as i64;
-                let d_lo = store.min(self.dur[i]) as i64;
-                let mand_start = store.max(self.starts[i]) as i64;
-                let mand_end = store.min(self.starts[i]) as i64 + d_lo;
+                let h_lo = i128::from(store.min(self.height[i]));
+                let d_lo = i128::from(store.min(self.dur[i]));
+                let mand_start = i128::from(store.max(self.starts[i]));
+                let mand_end = i128::from(store.min(self.starts[i])) + d_lo;
 
                 // During mandatory part, h_i ≤ cap_max − others' min usage.
                 if mand_end > mand_start {
-                    let mut slack = i64::MAX;
-                    for t in mand_start..mand_end {
-                        let others = self.profile[(t - hmin) as usize] - h_lo;
-                        slack = slack.min(cap_max - others);
-                    }
-                    if slack < store.max(self.height[i]) as i64 {
-                        store.remove_above(self.height[i], clamp_i32(slack))?;
+                    let slack = mandatory_height_limit(&self.profile, mand_start, mand_end, h_lo, cap_max);
+                    if slack < i128::from(store.max(self.height[i])) {
+                        store.remove_above(self.height[i], clamp_i128_i32(slack))?;
                     }
                 }
 
                 // Forbid starts whose least occupation [s, s+min_dur) exceeds cap_max.
                 if h_lo > 0 && d_lo > 0 {
-                    self.buf.clear();
-                    self.buf.extend(store.values(self.starts[i]));
-                    for &start in &self.buf {
-                        let s = start as i64;
-                        let conflict = (s..s + d_lo).any(|t| {
-                            let idx = (t - hmin) as usize;
-                            let own = if t >= mand_start && t < mand_end { h_lo } else { 0 };
-                            self.profile[idx] - own + h_lo > cap_max
-                        });
-                        if conflict {
-                            store.remove(self.starts[i], start)?;
-                        }
-                    }
+                    let earliest = i128::from(store.min(self.starts[i]));
+                    let latest = i128::from(store.max(self.starts[i]));
+                    let own_part = Some((mand_start, mand_end, h_lo));
+                    let Some(new_min) = earliest_feasible_start(&self.profile, earliest, latest, d_lo, h_lo, own_part, cap_max) else {
+                        return Err(Inconsistency);
+                    };
+                    let Some(new_max) = latest_feasible_start(&self.profile, new_min, latest, d_lo, h_lo, own_part, cap_max) else {
+                        return Err(Inconsistency);
+                    };
+                    store.remove_below(self.starts[i], clamp_i128_i32(new_min))?;
+                    store.remove_above(self.starts[i], clamp_i128_i32(new_max))?;
                 }
             }
         });
@@ -748,8 +624,8 @@ pub fn cumulative_var(solver: &mut Solver, starts: &[VarId], durations: &[VarId]
         dur: durations.to_vec(),
         height: heights.to_vec(),
         capacity,
+        events: Vec::new(),
         profile: Vec::new(),
-        buf: Vec::new(),
     }));
 }
 
@@ -774,7 +650,7 @@ pub(crate) fn cumulative_var_interruptible(
     };
     let should_stop = || stop.load(Ordering::Acquire);
     solver
-        .post_until(Box::new(CumulativeVar { starts, dur, height, capacity, profile: Vec::new(), buf: Vec::new() }), &should_stop)
+        .post_until(Box::new(CumulativeVar { starts, dur, height, capacity, events: Vec::new(), profile: Vec::new() }), &should_stop)
         .is_some()
 }
 
@@ -788,8 +664,11 @@ struct BinPacking {
     items: Vec<VarId>,
     sizes: Vec<i64>,
     capacities: Vec<i64>,
-    load: Vec<i64>,
+    load: Vec<i128>,
     buf: Vec<i32>,
+    domains: Vec<Vec<usize>>,
+    subsets: Vec<Vec<usize>>,
+    subset_mask: Vec<bool>,
 }
 
 impl Propagator for BinPacking {
@@ -809,6 +688,9 @@ impl Propagator for BinPacking {
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
         let nbins = self.capacities.len();
+        if nbins == 0 {
+            return if self.items.is_empty() { Ok(()) } else { Err(Inconsistency) };
+        }
         local_fixpoint!(self.items.iter().map(|&it| store.size(it)).sum::<usize>(), {
             for &it in &self.items {
                 store.remove_below(it, 0)?;
@@ -820,11 +702,11 @@ impl Propagator for BinPacking {
             self.load.resize(nbins, 0);
             for (i, &it) in self.items.iter().enumerate() {
                 if store.is_fixed(it) {
-                    self.load[store.value(it) as usize] += self.sizes[i];
+                    self.load[store.value(it) as usize] += i128::from(self.sizes[i]);
                 }
             }
             for b in 0..nbins {
-                if self.load[b] > self.capacities[b] {
+                if self.load[b] > i128::from(self.capacities[b]) {
                     return Err(Inconsistency);
                 }
             }
@@ -837,8 +719,61 @@ impl Propagator for BinPacking {
                 self.buf.clear();
                 self.buf.extend(store.values(self.items[i]));
                 for &b in &self.buf {
-                    if self.load[b as usize] + self.sizes[i] > self.capacities[b as usize] {
+                    if self.load[b as usize] + i128::from(self.sizes[i]) > i128::from(self.capacities[b as usize]) {
                         store.remove(self.items[i], b)?;
+                    }
+                }
+            }
+
+            // Every item must be assigned once, so aggregate capacity is a
+            // necessary global bound even before any item is fixed.
+            let total_size = self.sizes.iter().fold(0i128, |sum, &size| sum + i128::from(size));
+            let total_capacity = self.capacities.iter().fold(0i128, |sum, &capacity| sum + i128::from(capacity));
+            if total_size > total_capacity {
+                return Err(Inconsistency);
+            }
+
+            // Shaw-style load subsets derived from live item domains. For a
+            // bin set B, every item whose domain is contained in B contributes
+            // mandatory energy to B. Overload fails; exact saturation removes
+            // B from every other positive-size item.
+            if self.domains.len() < self.items.len() {
+                self.domains.resize_with(self.items.len(), Vec::new);
+            }
+            self.subsets.clear();
+            for (i, &item) in self.items.iter().enumerate() {
+                self.domains[i].clear();
+                self.domains[i].extend(store.values(item).map(|bin| bin as usize));
+            }
+            self.subsets.extend(self.domains.iter().take(self.items.len()).cloned());
+            self.subsets.sort_unstable();
+            self.subsets.dedup();
+            self.subset_mask.resize(nbins, false);
+            for subset in &self.subsets {
+                self.subset_mask.fill(false);
+                for &bin in subset {
+                    self.subset_mask[bin] = true;
+                }
+                let capacity = subset.iter().fold(0i128, |sum, &bin| sum + i128::from(self.capacities[bin]));
+                let mut mandatory = 0i128;
+                for (i, domain) in self.domains.iter().take(self.items.len()).enumerate() {
+                    if domain.iter().all(|&bin| self.subset_mask[bin]) {
+                        mandatory += i128::from(self.sizes[i]);
+                    }
+                }
+                if mandatory > capacity {
+                    return Err(Inconsistency);
+                }
+                if mandatory == capacity {
+                    for i in 0..self.items.len() {
+                        if self.sizes[i] == 0 || self.domains[i].iter().all(|&bin| self.subset_mask[bin]) {
+                            continue;
+                        }
+                        self.buf.clear();
+                        self.buf.extend(store.values(self.items[i]).filter(|&bin| self.subset_mask[bin as usize]));
+                        for bin in self.buf.drain(..) {
+                            store.remove(self.items[i], bin)?;
+                        }
                     }
                 }
             }
@@ -857,6 +792,9 @@ pub fn bin_packing(solver: &mut Solver, items: &[VarId], sizes: &[i64], capaciti
         capacities: capacities.to_vec(),
         load: Vec::new(),
         buf: Vec::new(),
+        domains: Vec::new(),
+        subsets: Vec::new(),
+        subset_mask: Vec::new(),
     }));
 }
 
@@ -878,7 +816,165 @@ pub(crate) fn bin_packing_interruptible(
         return false;
     };
     let should_stop = || stop.load(Ordering::Acquire);
-    solver.post_until(Box::new(BinPacking { items, sizes, capacities, load: Vec::new(), buf: Vec::new() }), &should_stop).is_some()
+    solver
+        .post_until(
+            Box::new(BinPacking {
+                items,
+                sizes,
+                capacities,
+                load: Vec::new(),
+                buf: Vec::new(),
+                domains: Vec::new(),
+                subsets: Vec::new(),
+                subset_mask: Vec::new(),
+            }),
+            &should_stop,
+        )
+        .is_some()
+}
+
+/// Native bin loads: `loads[b]` is exactly the total size of items assigned to
+/// bin `b`. Bounds and item domains are propagated in both directions without
+/// one-hot indicator variables.
+#[derive(Clone)]
+struct BinLoads {
+    items: Vec<VarId>,
+    sizes: Vec<i64>,
+    loads: Vec<VarId>,
+    committed: Vec<i128>,
+    possible: Vec<i128>,
+    buf: Vec<i32>,
+}
+
+impl BinLoads {
+    fn state(&self, store: &Store) -> usize {
+        self.items.iter().chain(&self.loads).fold(0usize, |state, &variable| state.saturating_add(store.size(variable)))
+    }
+}
+
+impl Propagator for BinLoads {
+    fn priority(&self) -> Priority {
+        Priority::Expensive
+    }
+
+    fn register(&mut self, store: &mut Store, me: PropId) {
+        for &item in &self.items {
+            store.subscribe(item, me, Event::DomainChange);
+        }
+        for &load in &self.loads {
+            store.subscribe(load, me, Event::BoundChange);
+        }
+    }
+
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        register_variables_until(store, me, &self.items, Event::DomainChange, should_stop)
+            && register_variables_until(store, me, &self.loads, Event::BoundChange, should_stop)
+    }
+
+    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+        let bins = self.loads.len();
+        if bins == 0 {
+            return if self.items.is_empty() { Ok(()) } else { Err(Inconsistency) };
+        }
+        local_fixpoint!(self.state(store), {
+            for &item in &self.items {
+                store.remove_below(item, 0)?;
+                store.remove_above(item, bins as i32 - 1)?;
+            }
+
+            self.committed.fill(0);
+            self.possible.fill(0);
+            for (index, &item) in self.items.iter().enumerate() {
+                let size = i128::from(self.sizes[index]);
+                if store.is_fixed(item) {
+                    self.committed[store.value(item) as usize] += size;
+                }
+                for bin in store.values(item) {
+                    self.possible[bin as usize] += size;
+                }
+            }
+            for bin in 0..bins {
+                if self.committed[bin] > i128::from(store.max(self.loads[bin]))
+                    || self.possible[bin] < i128::from(store.min(self.loads[bin]))
+                {
+                    return Err(Inconsistency);
+                }
+                store.remove_below(self.loads[bin], clamp_i128_i32(self.committed[bin]))?;
+                store.remove_above(self.loads[bin], clamp_i128_i32(self.possible[bin]))?;
+            }
+
+            // Loads partition the total item size exactly.
+            let total = self.sizes.iter().fold(0i128, |sum, &size| sum + i128::from(size));
+            let sum_min = self.loads.iter().fold(0i128, |sum, &load| sum + i128::from(store.min(load)));
+            let sum_max = self.loads.iter().fold(0i128, |sum, &load| sum + i128::from(store.max(load)));
+            if total < sum_min || total > sum_max {
+                return Err(Inconsistency);
+            }
+            for &load in &self.loads {
+                let min = i128::from(store.min(load));
+                let max = i128::from(store.max(load));
+                store.remove_below(load, clamp_i128_i32(total - (sum_max - max)))?;
+                store.remove_above(load, clamp_i128_i32(total - (sum_min - min)))?;
+            }
+
+            for index in 0..self.items.len() {
+                if store.is_fixed(self.items[index]) || self.sizes[index] == 0 {
+                    continue;
+                }
+                let size = i128::from(self.sizes[index]);
+                self.buf.clear();
+                self.buf.extend(store.values(self.items[index]));
+                let mut required = None;
+                for &bin in &self.buf {
+                    let bin = bin as usize;
+                    if self.committed[bin] + size > i128::from(store.max(self.loads[bin])) {
+                        store.remove(self.items[index], bin as i32)?;
+                    } else if self.possible[bin] - size < i128::from(store.min(self.loads[bin]))
+                        && required.replace(bin as i32).is_some_and(|other| other != bin as i32)
+                    {
+                        return Err(Inconsistency);
+                    }
+                }
+                if let Some(bin) = required {
+                    store.fix(self.items[index], bin)?;
+                }
+            }
+        });
+        Ok(())
+    }
+}
+
+pub fn bin_loads(solver: &mut Solver, items: &[VarId], sizes: &[i64], loads: &[VarId]) {
+    assert_eq!(items.len(), sizes.len(), "binLoads: items/sizes mismatch");
+    solver.post(Box::new(BinLoads {
+        items: items.to_vec(),
+        sizes: sizes.to_vec(),
+        loads: loads.to_vec(),
+        committed: vec![0; loads.len()],
+        possible: vec![0; loads.len()],
+        buf: Vec::new(),
+    }));
+}
+
+pub(crate) fn bin_loads_interruptible(solver: &mut Solver, items: &[VarId], sizes: &[i64], loads: &[VarId], stop: &AtomicBool) -> bool {
+    assert_eq!(items.len(), sizes.len(), "binLoads: items/sizes mismatch");
+    let Some(items) = copy_slice_interruptible(items, stop) else {
+        return false;
+    };
+    let Some(sizes) = copy_slice_interruptible(sizes, stop) else {
+        return false;
+    };
+    let Some(loads) = copy_slice_interruptible(loads, stop) else {
+        return false;
+    };
+    let bins = loads.len();
+    let should_stop = || stop.load(Ordering::Acquire);
+    solver
+        .post_until(
+            Box::new(BinLoads { items, sizes, loads, committed: vec![0; bins], possible: vec![0; bins], buf: Vec::new() }),
+            &should_stop,
+        )
+        .is_some()
 }
 
 // ===========================================================================

@@ -801,20 +801,45 @@ fn validate_global(model: &Model, global: &IntGlobalConstraint, context: &str, e
                 validate_bool(model, *presence, context, "alternative presence", errors);
             }
         }
-        IntGlobalConstraint::Cumulative { starts, durations, demands, .. }
-            if starts.len() != durations.len() || starts.len() != demands.len() =>
-        {
-            errors.push(format!("{context}: cumulative arrays differ in length"));
+        IntGlobalConstraint::Cumulative { starts, durations, demands, capacity } => {
+            if starts.len() != durations.len() || starts.len() != demands.len() {
+                errors.push(format!("{context}: cumulative arrays differ in length"));
+            }
+            if !validate_non_negative_durations(durations, context, errors, stop) {
+                return false;
+            }
+            if *capacity < 0 {
+                errors.push(format!("{context}: cumulative demands and capacity must be non-negative"));
+            }
+            if !validate_non_negative_values(demands, context, "cumulative demands", errors, stop) {
+                return false;
+            }
         }
         IntGlobalConstraint::CumulativeVar { starts, durations, demands, .. }
             if starts.len() != durations.len() || starts.len() != demands.len() =>
         {
             errors.push(format!("{context}: variable cumulative arrays differ in length"));
         }
-        IntGlobalConstraint::BinPacking { items, sizes, .. } | IntGlobalConstraint::BinLoads { items, sizes, .. }
-            if items.len() != sizes.len() =>
-        {
-            errors.push(format!("{context}: bin-packing items and sizes differ in length"));
+        IntGlobalConstraint::BinPacking { items, sizes, capacities } => {
+            if items.len() != sizes.len() {
+                errors.push(format!("{context}: bin-packing items and sizes differ in length"));
+            }
+            if !validate_non_negative_values(sizes, context, "bin-packing sizes", errors, stop)
+                || !validate_non_negative_values(capacities, context, "bin-packing capacities", errors, stop)
+            {
+                return false;
+            }
+            if !items.is_empty() && capacities.is_empty() {
+                errors.push(format!("{context}: bin-packing has items but no bins"));
+            }
+        }
+        IntGlobalConstraint::BinLoads { items, sizes, .. } => {
+            if items.len() != sizes.len() {
+                errors.push(format!("{context}: bin-load items and sizes differ in length"));
+            }
+            if !validate_non_negative_values(sizes, context, "bin-load sizes", errors, stop) {
+                return false;
+            }
         }
         IntGlobalConstraint::Knapsack { variables, weights, profits, .. }
             if variables.len() != weights.len() || variables.len() != profits.len() =>
@@ -943,6 +968,20 @@ fn validate_non_negative_durations(durations: &[i64], context: &str, errors: &mu
         errors.push(format!("{context}: interval duration must be non-negative"));
     }
     !interrupted(stop)
+}
+
+fn validate_non_negative_values(values: &[i64], context: &str, label: &str, errors: &mut Vec<String>, stop: &AtomicBool) -> bool {
+    let mut negative = false;
+    for &value in values {
+        if interrupted(stop) {
+            return false;
+        }
+        negative |= value < 0;
+    }
+    if negative {
+        errors.push(format!("{context}: {label} must be non-negative"));
+    }
+    true
 }
 
 fn validate_bool(model: &Model, variable: super::IntVarRef, context: &str, role: &str, errors: &mut Vec<String>) {

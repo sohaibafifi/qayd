@@ -336,6 +336,40 @@ fn native_intensions_and_generic_fallback_are_reported_separately() {
 }
 
 #[test]
+fn dominant_globals_are_lowered_only_from_semantic_constraints() {
+    let xml = r#"
+      <instance format="XCSP3" type="CSP">
+        <variables>
+          <array id="a" size="[3]"> 0..2 </array>
+          <array id="s" size="[2]"> 0..2 </array>
+          <array id="p" size="[3]"> 0..1 </array>
+        </variables>
+        <constraints>
+          <allDifferent><list>a[]</list><except>0</except></allDifferent>
+          <noOverlap><origins>s[]</origins><lengths>1 1</lengths></noOverlap>
+          <cumulative>
+            <origins>s[]</origins><lengths>1 1</lengths><heights>1 1</heights><condition>(le,1)</condition>
+          </cumulative>
+          <lex><list>a[0] a[1]</list><list>a[1] a[2]</list><operator>le</operator></lex>
+          <binPacking><list>p[]</list><sizes>1 1 1</sizes><condition>(le,2)</condition></binPacking>
+          <intension>or(le(add(s[0],1),s[1]),le(add(s[1],1),s[0]))</intension>
+        </constraints>
+      </instance>"#;
+    let mut output = Vec::new();
+
+    run_to_with_options(xml, true, &AtomicBool::new(false), &mut output, RunOptions::default()).unwrap();
+
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("s SATISFIABLE"), "{output}");
+    assert!(
+        output.contains(
+            "c globals all_different_except 1 no_overlap 1 no_overlap_fallback 0 cumulative 1 cumulative_fallback 0 lex 1 bin_packing 1 bin_loads 0"
+        ),
+        "{output}"
+    );
+}
+
+#[test]
 fn grouped_sign_products_are_batched() {
     let xml = r#"
       <instance format="XCSP3" type="CSP">

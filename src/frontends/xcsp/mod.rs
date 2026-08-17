@@ -520,6 +520,30 @@ fn write_report<W: Write>(w: &mut W, result: &SolveResult) -> std::io::Result<()
             "c compilation tables {instances} templates {templates} native_intensions {native} fallback_intensions {fallback} physical_propagators {propagators}"
         )?;
     }
+    if let (
+        Some(all_different_except),
+        Some(no_overlap),
+        Some(no_overlap_fallback),
+        Some(cumulative),
+        Some(cumulative_fallback),
+        Some(lex),
+        Some(bin_packing),
+        Some(bin_loads),
+    ) = (
+        summed("native_all_different_except"),
+        summed("native_no_overlap"),
+        summed("no_overlap_fallback"),
+        summed("native_cumulative"),
+        summed("cumulative_fallback"),
+        summed("native_lex"),
+        summed("native_bin_packing"),
+        summed("native_bin_loads"),
+    ) {
+        writeln!(
+            w,
+            "c globals all_different_except {all_different_except} no_overlap {no_overlap} no_overlap_fallback {no_overlap_fallback} cumulative {cumulative} cumulative_fallback {cumulative_fallback} lex {lex} bin_packing {bin_packing} bin_loads {bin_loads}"
+        )?;
+    }
     if let Some(build) = value("backend_build_seconds") {
         writeln!(w, "c backend build time {build}s")?;
     }

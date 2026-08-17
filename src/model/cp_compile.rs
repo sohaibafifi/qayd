@@ -5,8 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::constraints::{
-    count, divisibility, flatten, graph, intension, interval as interval_constraints, lex, linear, prefix_set, primitives, scheduling,
-    table,
+    count, divisibility, graph, intension, interval as interval_constraints, lex, linear, prefix_set, primitives, scheduling, table,
 };
 use crate::expr::Expr;
 use crate::ids::VarId;
@@ -30,12 +29,32 @@ struct TableTemplateCache {
     instances: u64,
 }
 
+#[derive(Default)]
+struct GlobalLoweringCounts {
+    all_different_except: u64,
+    no_overlap: u64,
+    no_overlap_fallback: u64,
+    cumulative: u64,
+    cumulative_fallback: u64,
+    lex: u64,
+    bin_packing: u64,
+    bin_loads: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CpCompilationStats {
     pub table_instances: u64,
     pub table_templates: u64,
     pub native_intensions: u64,
     pub fallback_intensions: u64,
+    pub native_all_different_except: u64,
+    pub native_no_overlap: u64,
+    pub no_overlap_fallback: u64,
+    pub native_cumulative: u64,
+    pub cumulative_fallback: u64,
+    pub native_lex: u64,
+    pub native_bin_packing: u64,
+    pub native_bin_loads: u64,
     pub physical_propagators: u64,
 }
 
@@ -382,6 +401,7 @@ impl CompiledCp {
         let mut posted_divisibility_groups = BTreeSet::new();
         let mut posted_prefix_set_groups = BTreeSet::new();
         let mut table_templates = TableTemplateCache::default();
+        let mut global_lowering = GlobalLoweringCounts::default();
         for constraint in &model.constraints {
             if interrupted(stop) {
                 return Ok(None);
@@ -437,7 +457,8 @@ impl CompiledCp {
                 }
                 continue;
             }
-            if post_constraint(&mut solver, &int_variables, &sets, constraint, &mut table_templates, stop)?.is_none() {
+            if post_constraint(&mut solver, &int_variables, &sets, constraint, &mut table_templates, &mut global_lowering, stop)?.is_none()
+            {
                 return Ok(None);
             }
         }
@@ -521,6 +542,14 @@ impl CompiledCp {
             table_templates: u64::try_from(table_templates.templates.len()).unwrap_or(u64::MAX),
             native_intensions,
             fallback_intensions,
+            native_all_different_except: global_lowering.all_different_except,
+            native_no_overlap: global_lowering.no_overlap,
+            no_overlap_fallback: global_lowering.no_overlap_fallback,
+            native_cumulative: global_lowering.cumulative,
+            cumulative_fallback: global_lowering.cumulative_fallback,
+            native_lex: global_lowering.lex,
+            native_bin_packing: global_lowering.bin_packing,
+            native_bin_loads: global_lowering.bin_loads,
             physical_propagators: u64::try_from(solver.num_propagators()).unwrap_or(u64::MAX),
         };
         Ok(Some(Self {
@@ -848,70 +877,6 @@ fn domain_cells(model: &Model, variables: &[super::IntVarRef], stop: &AtomicBool
     Some(cells)
 }
 
-fn domain_bounds(model: &Model, variable: super::IntVarRef, stop: &AtomicBool) -> Option<Option<(i64, i64)>> {
-    if interrupted(stop) {
-        return None;
-    }
-    Some(match model.int_vars.get(variable.0)? {
-        IntDomain::Bool => Some((0, 1)),
-        IntDomain::Range { lo, hi } => Some((i64::from(*lo), i64::from(*hi))),
-        IntDomain::Set(values) => {
-            let mut lo = i32::MAX;
-            let mut hi = i32::MIN;
-            for &value in values {
-                if interrupted(stop) {
-                    return None;
-                }
-                lo = lo.min(value);
-                hi = hi.max(value);
-            }
-            (!values.is_empty()).then_some((i64::from(lo), i64::from(hi)))
-        }
-    })
-}
-
-fn fixed_cumulative_horizon(model: &Model, starts: &[super::IntVarRef], durations: &[i64], stop: &AtomicBool) -> Option<u128> {
-    let mut first = true;
-    let mut earliest = i64::MAX;
-    let mut latest_end = i64::MIN;
-    for (&start, &duration) in starts.iter().zip(durations) {
-        if interrupted(stop) {
-            return None;
-        }
-        let Some((lo, hi)) = domain_bounds(model, start, stop)? else {
-            continue;
-        };
-        first = false;
-        earliest = earliest.min(lo);
-        latest_end = latest_end.max(hi.saturating_add(duration.max(0)));
-    }
-    Some(if first { 0 } else { u128::try_from(latest_end.saturating_sub(earliest).max(0)).unwrap_or(u128::MAX) })
-}
-
-fn variable_cumulative_horizon(
-    model: &Model,
-    starts: &[super::IntVarRef],
-    durations: &[super::IntVarRef],
-    stop: &AtomicBool,
-) -> Option<u128> {
-    let mut first = true;
-    let mut earliest = i64::MAX;
-    let mut latest_end = i64::MIN;
-    for (&start, &duration) in starts.iter().zip(durations) {
-        if interrupted(stop) {
-            return None;
-        }
-        let Some((lo, hi)) = domain_bounds(model, start, stop)? else {
-            continue;
-        };
-        let duration_hi = domain_bounds(model, duration, stop)?.map_or(0, |(_, hi)| hi.max(0));
-        first = false;
-        earliest = earliest.min(lo);
-        latest_end = latest_end.max(hi.saturating_add(duration_hi));
-    }
-    Some(if first { 0 } else { u128::try_from(latest_end.saturating_sub(earliest).max(0)).unwrap_or(u128::MAX) })
-}
-
 fn table_support_count(tuples: &[Vec<i32>], arity: usize, stop: &AtomicBool) -> Option<u128> {
     let mut total = 0u128;
     // One set at a time keeps the estimator's peak temporary memory bounded by
@@ -945,12 +910,11 @@ fn estimate_global_bytes(
         IntGlobalConstraint::AllDifferent { variables, except } => {
             let n = wide(variables.len());
             let domains = domain_cells(model, variables, stop)?;
-            if except.is_empty() {
-                4096u128.saturating_add(n.saturating_mul(512)).saturating_add(domains.saturating_mul(48))
-            } else {
-                let pairs = n.saturating_mul(n.saturating_sub(1)) / 2;
-                4096u128.saturating_add(pairs.saturating_mul(wide(except.len()).saturating_add(1)).saturating_mul(256))
-            }
+            let private_values = if except.is_empty() { 0 } else { n };
+            4096u128
+                .saturating_add(n.saturating_mul(512))
+                .saturating_add(domains.saturating_mul(48))
+                .saturating_add(private_values.saturating_mul(128))
         }
         IntGlobalConstraint::AllEqual(variables)
         | IntGlobalConstraint::Ordered { variables, .. }
@@ -1018,15 +982,9 @@ fn estimate_global_bytes(
             4096u128.saturating_add(domain_cells(model, successors, stop)?.saturating_mul(64))
         }
         IntGlobalConstraint::NoOverlap { starts, .. } => {
-            let task_count = wide(starts.len());
-            let total_domain_values = domain_cells(model, starts, stop)?;
-            if scheduling::no_overlap_uses_pair_decomposition(starts.len(), total_domain_values) {
-                let pairs = task_count.saturating_mul(task_count.saturating_sub(1)) / 2;
-                let pair_domain_work = total_domain_values.saturating_mul(task_count.saturating_sub(1));
-                4096u128.saturating_add(pairs.saturating_mul(2048)).saturating_add(pair_domain_work.saturating_mul(4))
-            } else {
-                4096u128.saturating_add(task_count.saturating_mul(512))
-            }
+            let n = wide(starts.len());
+            let pairs = n.saturating_mul(n.saturating_sub(1)) / 2;
+            8192u128.saturating_add(n.saturating_mul(2048)).saturating_add(pairs.saturating_mul(24))
         }
         IntGlobalConstraint::OptionalNoOverlap { starts, .. } => {
             let n = wide(starts.len());
@@ -1034,17 +992,14 @@ fn estimate_global_bytes(
             8192u128.saturating_add(n.saturating_mul(2048)).saturating_add(pairs.saturating_mul(8 * 1024))
         }
         IntGlobalConstraint::AlternativeChannel { starts, .. } => 8192u128.saturating_add(wide(starts.len()).saturating_mul(3 * 1024)),
-        IntGlobalConstraint::Cumulative { starts, durations, .. } => 8192u128
-            .saturating_add(wide(starts.len()).saturating_mul(1024))
-            .saturating_add(fixed_cumulative_horizon(model, starts, durations, stop)?.saturating_mul(16)),
-        IntGlobalConstraint::CumulativeVar { starts, durations, .. } => 8192u128
-            .saturating_add(wide(starts.len()).saturating_mul(1024))
-            .saturating_add(variable_cumulative_horizon(model, starts, durations, stop)?.saturating_mul(16)),
+        IntGlobalConstraint::Cumulative { starts, .. } | IntGlobalConstraint::CumulativeVar { starts, .. } => {
+            8192u128.saturating_add(wide(starts.len()).saturating_mul(2048))
+        }
         IntGlobalConstraint::BinPacking { items, capacities, .. } => {
             4096u128.saturating_add(wide(items.len()).saturating_mul(512)).saturating_add(wide(capacities.len()).saturating_mul(128))
         }
         IntGlobalConstraint::BinLoads { items, loads, .. } => {
-            4096u128.saturating_add(wide(items.len()).saturating_mul(wide(loads.len())).saturating_mul(3 * 1024))
+            4096u128.saturating_add(wide(items.len()).saturating_mul(512)).saturating_add(wide(loads.len()).saturating_mul(512))
         }
         IntGlobalConstraint::Knapsack { variables, .. } => 4096u128.saturating_add(wide(variables.len()).saturating_mul(384)),
         IntGlobalConstraint::ValuePrecedence { variables, values, covered } => {
@@ -1087,6 +1042,7 @@ fn post_constraint(
     sets: &[CompiledSet],
     constraint: &Constraint,
     table_templates: &mut TableTemplateCache,
+    global_lowering: &mut GlobalLoweringCounts,
     stop: &AtomicBool,
 ) -> CompileStep<()> {
     if interrupted(stop) {
@@ -1101,7 +1057,7 @@ fn post_constraint(
         }
         Constraint::Selected { selector, constraint } => {
             solver.set_selector(Some(int_variables[selector.0]));
-            let result = post_constraint(solver, int_variables, sets, constraint, table_templates, stop);
+            let result = post_constraint(solver, int_variables, sets, constraint, table_templates, global_lowering, stop);
             solver.set_selector(None);
             if result?.is_none() {
                 return Ok(None);
@@ -1139,7 +1095,7 @@ fn post_constraint(
             }
         }
         Constraint::IntegerGlobal(global) => {
-            if post_global(solver, int_variables, global, table_templates, stop)?.is_none() {
+            if post_global(solver, int_variables, global, table_templates, global_lowering, stop)?.is_none() {
                 return Ok(None);
             }
         }
@@ -1225,6 +1181,7 @@ fn post_global(
     map: &[VarId],
     global: &IntGlobalConstraint,
     table_templates: &mut TableTemplateCache,
+    global_lowering: &mut GlobalLoweringCounts,
     stop: &AtomicBool,
 ) -> CompileStep<()> {
     if interrupted(stop) {
@@ -1243,8 +1200,9 @@ fn post_global(
             let variables = mapped!(ids);
             if except.is_empty() {
                 primitives::all_different(solver, &variables);
-            } else if !flatten::post_all_different_except_interruptible(solver, &variables, except, stop) {
-                return Ok(None);
+            } else {
+                primitives::all_different_except(solver, &variables, except);
+                global_lowering.all_different_except = global_lowering.all_different_except.saturating_add(1);
             }
         }
         IntGlobalConstraint::AllEqual(ids) => primitives::all_equal(solver, &mapped!(ids)),
@@ -1345,6 +1303,7 @@ fn post_global(
         }
         IntGlobalConstraint::Lex { left, right, strict } => {
             lex::lex(solver, &mapped!(left), &mapped!(right), *strict);
+            global_lowering.lex = global_lowering.lex.saturating_add(1);
         }
         IntGlobalConstraint::LexChain { rows, strict } => {
             for pair in rows.windows(2) {
@@ -1352,6 +1311,7 @@ fn post_global(
                     return Ok(None);
                 }
                 lex::lex(solver, &mapped!(&pair[0]), &mapped!(&pair[1]), *strict);
+                global_lowering.lex = global_lowering.lex.saturating_add(1);
             }
         }
         IntGlobalConstraint::Channel { left, right } => {
@@ -1363,8 +1323,25 @@ fn post_global(
             graph::circuit_with(solver, &successors, *cutset);
         }
         IntGlobalConstraint::NoOverlap { starts, durations } => {
-            if !scheduling::no_overlap_interruptible(solver, &mapped!(starts), durations, stop) {
-                return Ok(None);
+            let starts = mapped!(starts);
+            if let Some(native_durations) = durations.iter().map(|&duration| i32::try_from(duration).ok()).collect::<Option<Vec<_>>>() {
+                let mut intervals = Vec::with_capacity(starts.len());
+                for (&start, duration) in starts.iter().zip(native_durations) {
+                    if interrupted(stop) {
+                        return Ok(None);
+                    }
+                    intervals.push(solver.store.register_interval(start, duration, None));
+                }
+                let should_stop = || interrupted(stop);
+                if interval_constraints::mandatory_no_overlap_until(solver, intervals, &should_stop).is_none() {
+                    return Ok(None);
+                }
+                global_lowering.no_overlap = global_lowering.no_overlap.saturating_add(1);
+            } else {
+                if !scheduling::no_overlap_interruptible(solver, &starts, durations, stop) {
+                    return Ok(None);
+                }
+                global_lowering.no_overlap_fallback = global_lowering.no_overlap_fallback.saturating_add(1);
             }
         }
         IntGlobalConstraint::OptionalNoOverlap { starts, durations, presences } => {
@@ -1381,6 +1358,7 @@ fn post_global(
             if interval_constraints::no_overlap_until(solver, intervals, &should_stop).is_none() {
                 return Ok(None);
             }
+            global_lowering.no_overlap = global_lowering.no_overlap.saturating_add(1);
         }
         IntGlobalConstraint::AlternativeChannel { shared_start, starts, durations, presences } => {
             let mut intervals = Vec::with_capacity(starts.len());
@@ -1400,8 +1378,31 @@ fn post_global(
             }
         }
         IntGlobalConstraint::Cumulative { starts, durations, demands, capacity } => {
-            if !scheduling::cumulative_interruptible(solver, &mapped!(starts), durations, demands, *capacity, stop) {
-                return Ok(None);
+            let starts = mapped!(starts);
+            let native_capacity = i32::try_from(*capacity);
+            let native_durations = durations.iter().copied().map(i32::try_from).collect::<Result<Vec<_>, _>>();
+            let native_demands = demands.iter().copied().map(i32::try_from).collect::<Result<Vec<_>, _>>();
+            match (native_capacity, native_durations, native_demands) {
+                (Ok(capacity), Ok(durations), Ok(demands)) => {
+                    let mut intervals = Vec::with_capacity(starts.len());
+                    for (&start, &duration) in starts.iter().zip(&durations) {
+                        if interrupted(stop) {
+                            return Ok(None);
+                        }
+                        intervals.push(solver.store.register_interval(start, duration, None));
+                    }
+                    let should_stop = || interrupted(stop);
+                    if interval_constraints::cumulative_until(solver, intervals, demands, capacity, &should_stop).is_none() {
+                        return Ok(None);
+                    }
+                    global_lowering.cumulative = global_lowering.cumulative.saturating_add(1);
+                }
+                _ => {
+                    if !scheduling::cumulative_interruptible(solver, &starts, durations, demands, *capacity, stop) {
+                        return Ok(None);
+                    }
+                    global_lowering.cumulative_fallback = global_lowering.cumulative_fallback.saturating_add(1);
+                }
             }
         }
         IntGlobalConstraint::CumulativeVar { starts, durations, demands, capacity } => {
@@ -1420,11 +1421,13 @@ fn post_global(
             if !scheduling::bin_packing_interruptible(solver, &mapped!(items), sizes, capacities, stop) {
                 return Ok(None);
             }
+            global_lowering.bin_packing = global_lowering.bin_packing.saturating_add(1);
         }
         IntGlobalConstraint::BinLoads { items, sizes, loads } => {
-            if !flatten::post_bin_loads_interruptible(solver, &mapped!(items), sizes, &mapped!(loads), stop) {
+            if !scheduling::bin_loads_interruptible(solver, &mapped!(items), sizes, &mapped!(loads), stop) {
                 return Ok(None);
             }
+            global_lowering.bin_loads = global_lowering.bin_loads.saturating_add(1);
         }
         IntGlobalConstraint::Knapsack {
             variables: ids,

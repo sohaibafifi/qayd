@@ -1068,6 +1068,14 @@ fn append_compilation_metadata(metadata: &mut Vec<(String, String)>, compiled: &
         ("table_templates".to_string(), stats.table_templates.to_string()),
         ("native_intensions".to_string(), stats.native_intensions.to_string()),
         ("fallback_intensions".to_string(), stats.fallback_intensions.to_string()),
+        ("native_all_different_except".to_string(), stats.native_all_different_except.to_string()),
+        ("native_no_overlap".to_string(), stats.native_no_overlap.to_string()),
+        ("no_overlap_fallback".to_string(), stats.no_overlap_fallback.to_string()),
+        ("native_cumulative".to_string(), stats.native_cumulative.to_string()),
+        ("cumulative_fallback".to_string(), stats.cumulative_fallback.to_string()),
+        ("native_lex".to_string(), stats.native_lex.to_string()),
+        ("native_bin_packing".to_string(), stats.native_bin_packing.to_string()),
+        ("native_bin_loads".to_string(), stats.native_bin_loads.to_string()),
         ("physical_propagators".to_string(), stats.physical_propagators.to_string()),
     ]);
 }

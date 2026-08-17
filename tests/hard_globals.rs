@@ -145,21 +145,24 @@ fn no_overlap_removes_pairwise_unsupported_interior_starts() {
 }
 
 #[test]
-fn no_overlap_adapts_posting_to_pair_domain_work() {
+fn no_overlap_posts_one_global_resource_independent_of_domain_size() {
     let mut small = Solver::new();
     let small_starts = (0..4).map(|_| small.new_var_range(0, 1)).collect::<Vec<_>>();
     no_overlap(&mut small, &small_starts, &[1; 4]);
-    assert_eq!(small.num_propagators(), 6, "four small tasks should post one propagator per pair");
+    assert_eq!(small.num_propagators(), 1);
+    assert_eq!(small.store.disjunctive_pair_count(), 0);
 
     let mut medium = Solver::new();
     let medium_starts = (0..4).map(|_| medium.new_var_range(0, 4_000)).collect::<Vec<_>>();
     no_overlap(&mut medium, &medium_starts, &[1; 4]);
-    assert_eq!(medium.num_propagators(), 6, "bounded pair-domain work should be decomposed independently of domain storage");
+    assert_eq!(medium.num_propagators(), 1);
+    assert_eq!(medium.store.disjunctive_pair_count(), 0);
 
     let mut large = Solver::new();
     let large_starts = (0..33).map(|_| large.new_var_range(0, 64)).collect::<Vec<_>>();
     no_overlap(&mut large, &large_starts, &[1; 33]);
-    assert_eq!(large.num_propagators(), 1, "large pair-domain work should retain one global propagator");
+    assert_eq!(large.num_propagators(), 1);
+    assert_eq!(large.store.disjunctive_pair_count(), 0);
 }
 
 #[test]

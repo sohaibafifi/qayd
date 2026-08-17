@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 
+use crate::constraints::resource_profile::{build_profile, first_overload, ProfileSegment};
 use crate::domains::interval::{IntervalEvent, IntervalPresence};
 use crate::ids::{IntervalId, PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Priority, Propagator};
@@ -132,6 +133,7 @@ pub fn interval_precedence(solver: &mut Solver, before: IntervalId, after: Inter
 #[derive(Clone)]
 pub struct NoOverlap {
     intervals: Vec<IntervalId>,
+    branch_orders: bool,
     /// `(a, b, order index)` for each unordered pair; the order index addresses
     /// the trailed order decision in the store.
     pairs: Vec<(usize, usize, usize)>,
@@ -141,11 +143,12 @@ pub struct NoOverlap {
     /// Reused scratch for detectable precedences (no per-call allocation).
     present: Vec<usize>,
     prec: Vec<usize>,
+    values: Vec<i32>,
 }
 
 #[inline]
-fn interruption_polled(should_stop: Option<&dyn Fn() -> bool>, work: usize) -> bool {
-    should_stop.is_some_and(|stop| work.is_multiple_of(256) && stop())
+fn interruption_polled(should_stop: Option<&dyn Fn() -> bool>, _work: usize) -> bool {
+    should_stop.is_some_and(|stop| stop())
 }
 
 #[inline]
@@ -156,7 +159,7 @@ fn interruption_requested(should_stop: Option<&dyn Fn() -> bool>) -> bool {
 /// Whether group interval `i` is decided to run before group interval `j`.
 fn decided_before(store: &Store, pair_index: &[Vec<usize>], i: usize, j: usize) -> bool {
     let (lo, hi, want) = if i < j { (i, j, 1) } else { (j, i, 2) };
-    let order = pair_index[lo][hi];
+    let order = pair_index.get(lo).and_then(|row| row.get(hi)).copied().unwrap_or(usize::MAX);
     order != usize::MAX && store.disjunctive_order(order) == want
 }
 
@@ -165,7 +168,7 @@ fn decided_before(store: &Store, pair_index: &[Vec<usize>], i: usize, j: usize) 
 /// decided in the `i`-before-`j` direction.
 fn decided_before_premise(store: &Store, pair_index: &[Vec<usize>], i: usize, j: usize) -> Option<Premise> {
     let (lo, hi, want) = if i < j { (i, j, 1) } else { (j, i, 2) };
-    let order = pair_index[lo][hi];
+    let order = pair_index.get(lo).and_then(|row| row.get(hi)).copied().unwrap_or(usize::MAX);
     if order == usize::MAX || store.disjunctive_order(order) != want {
         return None;
     }
@@ -180,8 +183,8 @@ fn enforce_before_because(
     store: &mut Store,
     before: IntervalId,
     after: IntervalId,
-    order_var: VarId,
-    order_value: i32,
+    order: Option<(VarId, i32)>,
+    extra: &[Premise],
 ) -> Result<bool, Inconsistency> {
     let duration = store.interval_duration(before);
     let before_start = store.interval_start_var(before);
@@ -191,14 +194,24 @@ fn enforce_before_because(
 
     // after.start >= before.start_min + duration(before); reason: the order, plus
     // before's lower bound and both presences.
-    let mut why_after = vec![Premise::Eq { var: order_var, val: order_value }, Premise::Ge { var: before_start, bound: before_lb }];
+    let mut why_after = Vec::with_capacity(4);
+    if let Some((order_var, order_value)) = order {
+        why_after.push(Premise::Eq { var: order_var, val: order_value });
+    }
+    why_after.extend_from_slice(extra);
+    why_after.push(Premise::Ge { var: before_start, bound: before_lb });
     why_after.extend(present_premise(store, before));
     why_after.extend(present_premise(store, after));
     let mut changed = store.set_interval_start_min_because(after, before_lb.saturating_add(duration), why_after)?;
 
     // before.start <= after.start_max - duration(before); reason: the order, plus
     // after's upper bound and both presences.
-    let mut why_before = vec![Premise::Eq { var: order_var, val: order_value }, Premise::Le { var: after_start, bound: after_ub }];
+    let mut why_before = Vec::with_capacity(4);
+    if let Some((order_var, order_value)) = order {
+        why_before.push(Premise::Eq { var: order_var, val: order_value });
+    }
+    why_before.extend_from_slice(extra);
+    why_before.push(Premise::Le { var: after_start, bound: after_ub });
     why_before.extend(present_premise(store, before));
     why_before.extend(present_premise(store, after));
     changed |= store.set_interval_start_max_because(before, after_ub.saturating_sub(duration), why_before)?;
@@ -214,6 +227,53 @@ fn both_orders_infeasible(store: &Store, i: IntervalId, j: IntervalId) -> Vec<Pr
         Premise::Ge { var: store.interval_start_var(j), bound: store.interval_start_min(j) },
         Premise::Le { var: store.interval_start_var(i), bound: store.interval_start_max(i) },
     ]
+}
+
+/// Remove start values that have no support in either ordering of a mandatory
+/// interval pair. This preserves the domain consistency of the old binary
+/// decomposition while keeping one resource propagator for the whole scope.
+fn remove_pairwise_unsupported_values(
+    store: &mut Store,
+    first: IntervalId,
+    second: IntervalId,
+    values: &mut Vec<i32>,
+) -> Result<(), Inconsistency> {
+    let first_var = store.interval_start_var(first);
+    let second_var = store.interval_start_var(second);
+    let first_duration = i128::from(store.interval_duration(first));
+    let second_duration = i128::from(store.interval_duration(second));
+    let second_min = store.min(second_var);
+    let second_max = store.max(second_var);
+    let unsupported_low = i128::from(second_max) - first_duration + 1;
+    let unsupported_high = i128::from(second_min) + second_duration - 1;
+    values.clear();
+    values.extend(store.values(first_var).filter(|&value| unsupported_low <= i128::from(value) && i128::from(value) <= unsupported_high));
+    let why = store.explaining().then(|| {
+        let mut why = vec![Premise::Ge { var: second_var, bound: second_min }, Premise::Le { var: second_var, bound: second_max }];
+        why.extend(present_premise(store, first));
+        why.extend(present_premise(store, second));
+        why
+    });
+    for value in values.drain(..) {
+        store.remove_because(first_var, value, why.clone().unwrap_or_default())?;
+    }
+
+    let first_min = store.min(first_var);
+    let first_max = store.max(first_var);
+    let unsupported_low = i128::from(first_max) - second_duration + 1;
+    let unsupported_high = i128::from(first_min) + first_duration - 1;
+    values.clear();
+    values.extend(store.values(second_var).filter(|&value| unsupported_low <= i128::from(value) && i128::from(value) <= unsupported_high));
+    let why = store.explaining().then(|| {
+        let mut why = vec![Premise::Ge { var: first_var, bound: first_min }, Premise::Le { var: first_var, bound: first_max }];
+        why.extend(present_premise(store, first));
+        why.extend(present_premise(store, second));
+        why
+    });
+    for value in values.drain(..) {
+        store.remove_because(second_var, value, why.clone().unwrap_or_default())?;
+    }
+    Ok(())
 }
 
 impl Propagator for NoOverlap {
@@ -251,16 +311,19 @@ impl NoOverlap {
             store.subscribe_interval(interval, me, IntervalEvent::StartBoundChange);
             store.subscribe_interval(interval, me, IntervalEvent::EndBoundChange);
             store.subscribe_interval(interval, me, IntervalEvent::PresenceChange);
+            store.subscribe(store.interval_start_var(interval), me, Event::DomainChange);
         }
         self.pairs.clear();
         let n = self.intervals.len();
         self.pair_index.clear();
-        self.pair_index.reserve(n);
-        for row in 0..n {
-            if interruption_polled(should_stop, row) {
-                return false;
+        if self.branch_orders {
+            self.pair_index.reserve(n);
+            for row in 0..n {
+                if interruption_polled(should_stop, row) {
+                    return false;
+                }
+                self.pair_index.push(vec![usize::MAX; n]);
             }
-            self.pair_index.push(vec![usize::MAX; n]);
         }
         let mut pair_count = 0usize;
         for a in 0..n {
@@ -268,9 +331,12 @@ impl NoOverlap {
                 if interruption_polled(should_stop, pair_count) {
                     return false;
                 }
-                let order = store.register_disjunctive_pair(self.intervals[a], self.intervals[b], me);
+                let order =
+                    if self.branch_orders { store.register_disjunctive_pair(self.intervals[a], self.intervals[b], me) } else { usize::MAX };
                 self.pairs.push((a, b, order));
-                self.pair_index[a][b] = order;
+                if self.branch_orders {
+                    self.pair_index[a][b] = order;
+                }
                 pair_count = pair_count.saturating_add(1);
             }
         }
@@ -300,12 +366,16 @@ impl NoOverlap {
                     continue;
                 }
                 let both_present = pi == IntervalPresence::Present && pj == IntervalPresence::Present;
-                let order_var = store.disjunctive_order_var(order_index);
-                match store.disjunctive_order(order_index) {
+                if both_present && store.interval_duration(i) > 0 && store.interval_duration(j) > 0 {
+                    remove_pairwise_unsupported_values(store, i, j, &mut self.values)?;
+                }
+                let order_var = (order_index != usize::MAX).then(|| store.disjunctive_order_var(order_index));
+                let order = if order_index == usize::MAX { 0 } else { store.disjunctive_order(order_index) };
+                match order {
                     // Order already decided (by the brancher, a deduction, or a
                     // learning-engine branch): durably enforce that precedence.
-                    1 if both_present => changed |= enforce_before_because(store, i, j, order_var, 1)?,
-                    2 if both_present => changed |= enforce_before_because(store, j, i, order_var, 0)?,
+                    1 if both_present => changed |= enforce_before_because(store, i, j, order_var.map(|var| (var, 1)), &[])?,
+                    2 if both_present => changed |= enforce_before_because(store, j, i, order_var.map(|var| (var, 0)), &[])?,
                     1 | 2 => {}
                     // Undecided: weak pairwise feasibility; deduce a forced order
                     // (detectable precedence) or forbid an unschedulable optional.
@@ -343,8 +413,12 @@ impl NoOverlap {
                                 ];
                                 why.extend(present_premise(store, i));
                                 why.extend(present_premise(store, j));
-                                changed |= store.set_disjunctive_order_because(order_index, 1, why)?;
-                                changed |= enforce_before_because(store, i, j, order_var, 1)?;
+                                if order_index != usize::MAX {
+                                    changed |= store.set_disjunctive_order_because(order_index, 1, why)?;
+                                    changed |= enforce_before_because(store, i, j, order_var.map(|var| (var, 1)), &[])?;
+                                } else {
+                                    changed |= enforce_before_because(store, i, j, None, &why)?;
+                                }
                             }
                             (false, true) if both_present => {
                                 // i cannot precede j, so j must run first.
@@ -354,8 +428,12 @@ impl NoOverlap {
                                 ];
                                 why.extend(present_premise(store, i));
                                 why.extend(present_premise(store, j));
-                                changed |= store.set_disjunctive_order_because(order_index, 2, why)?;
-                                changed |= enforce_before_because(store, j, i, order_var, 0)?;
+                                if order_index != usize::MAX {
+                                    changed |= store.set_disjunctive_order_because(order_index, 2, why)?;
+                                    changed |= enforce_before_because(store, j, i, order_var.map(|var| (var, 0)), &[])?;
+                                } else {
+                                    changed |= enforce_before_because(store, j, i, None, &why)?;
+                                }
                             }
                             _ => {}
                         }
@@ -460,10 +538,12 @@ impl NoOverlap {
 pub fn no_overlap(solver: &mut Solver, intervals: &[IntervalId]) -> PropId {
     solver.post(Box::new(NoOverlap {
         intervals: intervals.to_vec(),
+        branch_orders: true,
         pairs: Vec::new(),
         pair_index: Vec::new(),
         present: Vec::new(),
         prec: Vec::new(),
+        values: Vec::new(),
     }))
 }
 
@@ -472,7 +552,48 @@ pub fn no_overlap(solver: &mut Solver, intervals: &[IntervalId]) -> PropId {
 /// partially registering the propagator.
 pub(crate) fn no_overlap_until(solver: &mut Solver, intervals: Vec<IntervalId>, should_stop: &dyn Fn() -> bool) -> Option<PropId> {
     solver.post_until(
-        Box::new(NoOverlap { intervals, pairs: Vec::new(), pair_index: Vec::new(), present: Vec::new(), prec: Vec::new() }),
+        Box::new(NoOverlap {
+            intervals,
+            branch_orders: true,
+            pairs: Vec::new(),
+            pair_index: Vec::new(),
+            present: Vec::new(),
+            prec: Vec::new(),
+            values: Vec::new(),
+        }),
+        should_stop,
+    )
+}
+
+/// Mandatory unary resource without auxiliary pair-order variables. Used when
+/// the semantic model already exposes every start as a primary decision.
+pub(crate) fn mandatory_no_overlap(solver: &mut Solver, intervals: &[IntervalId]) -> PropId {
+    solver.post(Box::new(NoOverlap {
+        intervals: intervals.to_vec(),
+        branch_orders: false,
+        pairs: Vec::new(),
+        pair_index: Vec::new(),
+        present: Vec::new(),
+        prec: Vec::new(),
+        values: Vec::new(),
+    }))
+}
+
+pub(crate) fn mandatory_no_overlap_until(
+    solver: &mut Solver,
+    intervals: Vec<IntervalId>,
+    should_stop: &dyn Fn() -> bool,
+) -> Option<PropId> {
+    solver.post_until(
+        Box::new(NoOverlap {
+            intervals,
+            branch_orders: false,
+            pairs: Vec::new(),
+            pair_index: Vec::new(),
+            present: Vec::new(),
+            prec: Vec::new(),
+            values: Vec::new(),
+        }),
         should_stop,
     )
 }
@@ -542,22 +663,31 @@ pub(crate) fn makespan_bound_until(
     solver.post_until(Box::new(MakespanBound { intervals, durations, upper_bound }), should_stop)
 }
 
-/// Structured cumulative resource by time-tabling.
+/// Structured cumulative resource with energetic reasoning and sparse
+/// mandatory-part time-tabling.
 ///
 /// Each present interval consumes `demand` units of a resource of `capacity`
-/// while it runs; the total at any instant must not exceed the capacity. Weak
-/// time-tabling: build the mandatory-part profile (each interval's compulsory
+/// while it runs; the total at any instant must not exceed the capacity. Build
+/// the mandatory-part profile (each interval's compulsory
 /// region `[start_max, end_min)`), fail on overload, and push each interval's
 /// start past instants where it could not fit beside the others' mandatory
-/// parts. The profile is rebuilt each pass and the propagator iterates to a
-/// fixpoint, so it is idempotent. Pushing only ever uses a lower bound on usage,
-/// so it never over-prunes.
+/// parts. Event-delimited segments keep memory independent of the numeric time
+/// horizon. Mandatory tasks additionally receive energetic overload checks and
+/// edge-finding lower bounds.
 #[derive(Clone)]
 pub struct Cumulative {
     intervals: Vec<IntervalId>,
     demands: Vec<i32>,
     capacity: i32,
-    profile: Vec<i32>,
+    events: Vec<(i128, i128)>,
+    profile: Vec<ProfileSegment>,
+    present: Vec<usize>,
+    est: Vec<i128>,
+    lct: Vec<i128>,
+    energy: Vec<i128>,
+    by_est: Vec<usize>,
+    by_lct: Vec<usize>,
+    lower: Vec<i128>,
 }
 
 impl Propagator for Cumulative {
@@ -588,42 +718,92 @@ impl Propagator for Cumulative {
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
         let n = self.intervals.len();
         loop {
-            // Time window covering every present interval.
-            let mut hmin = i32::MAX;
-            let mut hmax = i32::MIN;
-            for &interval in &self.intervals {
-                if store.interval_presence(interval) == IntervalPresence::Absent {
-                    continue;
+            self.present.clear();
+            for idx in 0..n {
+                if store.interval_presence(self.intervals[idx]) == IntervalPresence::Present
+                    && store.interval_duration(self.intervals[idx]) > 0
+                    && self.demands[idx] > 0
+                {
+                    self.present.push(idx);
                 }
-                hmin = hmin.min(store.interval_start_min(interval));
-                hmax = hmax.max(store.interval_end_max(interval));
+                self.est[idx] = i128::from(store.interval_start_min(self.intervals[idx]));
+                self.lct[idx] = i128::from(store.interval_end_max(self.intervals[idx]));
+                self.energy[idx] = i128::from(store.interval_duration(self.intervals[idx])) * i128::from(self.demands[idx]);
             }
-            if hmin >= hmax {
-                return Ok(()); // nothing present
+
+            // Energetic overload over every window induced by mandatory tasks.
+            self.by_est.clear();
+            self.by_est.extend(self.present.iter().copied());
+            self.by_est.sort_unstable_by(|&a, &b| self.est[b].cmp(&self.est[a]));
+            for &u in &self.present {
+                let upper = self.lct[u];
+                let mut energy = 0i128;
+                for &task in &self.by_est {
+                    if self.lct[task] <= upper {
+                        energy += self.energy[task];
+                        if energy > i128::from(self.capacity) * (upper - self.est[task]) {
+                            return Err(Inconsistency);
+                        }
+                    }
+                }
             }
-            let span = (hmax - hmin) as usize;
+
+            // Edge-finding lower bounds for mandatory tasks.
+            self.by_lct.clear();
+            self.by_lct.extend(self.present.iter().copied());
+            self.by_lct.sort_unstable_by_key(|&task| self.lct[task]);
+            self.lower.copy_from_slice(&self.est);
+            for &task in &self.present {
+                let demand = i128::from(self.demands[task]);
+                let mut energy = 0i128;
+                let mut earliest = i128::MAX;
+                for &other in &self.by_lct {
+                    if other == task {
+                        continue;
+                    }
+                    energy += self.energy[other];
+                    earliest = earliest.min(self.est[other]);
+                    let upper = self.lct[other];
+                    if energy + self.energy[task] > i128::from(self.capacity) * (upper - earliest.min(self.est[task])) {
+                        let rest = energy - (i128::from(self.capacity) - demand) * (upper - earliest);
+                        if rest > 0 {
+                            self.lower[task] = self.lower[task].max(earliest + (rest + demand - 1) / demand);
+                        }
+                    }
+                }
+            }
+            let mut changed = false;
+            for &task in &self.present {
+                if self.lower[task] > self.est[task] {
+                    changed |= store.set_interval_start_min(
+                        self.intervals[task],
+                        self.lower[task].clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32,
+                    )?;
+                }
+            }
 
             // Mandatory-part profile from the compulsory region of every
             // *present* interval. Optional (undecided) intervals do not yet
             // consume the resource, so they are excluded from the profile.
-            self.profile.clear();
-            self.profile.resize(span, 0);
-            for (idx, &interval) in self.intervals.iter().enumerate() {
-                if store.interval_presence(interval) != IntervalPresence::Present {
-                    continue;
-                }
-                let (cp_lo, cp_hi) = (store.interval_start_max(interval), store.interval_end_min(interval));
-                for t in cp_lo..cp_hi {
-                    self.profile[(t - hmin) as usize] += self.demands[idx];
-                }
-            }
-            for (offset, &usage) in self.profile.iter().enumerate() {
-                if usage > self.capacity {
+            build_profile(
+                self.present.iter().map(|&idx| {
+                    let interval = self.intervals[idx];
+                    (
+                        i128::from(store.interval_start_max(interval)),
+                        i128::from(store.interval_end_min(interval)),
+                        i128::from(self.demands[idx]),
+                    )
+                }),
+                &mut self.events,
+                &mut self.profile,
+            );
+            for segment in &self.profile {
+                if segment.usage > i128::from(self.capacity) {
                     // Overload at instant `t`: cite every present interval whose
                     // compulsory region must cover `t` (it is present, its start is
                     // at most `start_max`, and at least `start_min`, which together
                     // force it to run at `t`). Their demands exceed the capacity.
-                    let t = hmin + offset as i32;
+                    let t = segment.start as i32;
                     let mut why = Vec::new();
                     for &interval in &self.intervals {
                         if store.interval_presence(interval) != IntervalPresence::Present {
@@ -640,39 +820,35 @@ impl Propagator for Cumulative {
             }
 
             // Push each present interval's start past instants it cannot cover.
-            let mut changed = false;
             for idx in 0..n {
                 let interval = self.intervals[idx];
                 if store.interval_presence(interval) == IntervalPresence::Absent {
                     continue;
                 }
-                let demand = self.demands[idx];
-                let duration = store.interval_duration(interval);
+                let demand = i128::from(self.demands[idx]);
+                let duration = i128::from(store.interval_duration(interval));
                 if demand == 0 || duration == 0 {
                     continue;
                 }
-                let smin = store.interval_start_min(interval);
-                let smax = store.interval_start_max(interval);
+                let smin = i128::from(store.interval_start_min(interval));
+                let smax = i128::from(store.interval_start_max(interval));
                 // Subtract the interval's own compulsory region only if it is
                 // present (so already in the profile); an optional interval does
                 // not contribute, so nothing to subtract.
                 let in_profile = store.interval_presence(interval) == IntervalPresence::Present;
-                let (own_lo, own_hi) = (smax, smin + duration);
+                let own_part = in_profile.then_some((smax, smin + duration, demand));
 
                 let mut start = smin;
                 let mut feasible = None;
-                'scan: while start <= smax {
-                    let mut t = start;
-                    while t < start + duration {
-                        let own = if in_profile && t >= own_lo && t < own_hi { demand } else { 0 };
-                        if self.profile[(t - hmin) as usize] - own + demand > self.capacity {
-                            start = t + 1; // `interval` cannot cover instant `t`
-                            continue 'scan;
-                        }
-                        t += 1;
+                while start <= smax {
+                    if let Some((_, conflict_end)) =
+                        first_overload(&self.profile, start, start + duration, demand, own_part, i128::from(self.capacity))
+                    {
+                        start = conflict_end;
+                    } else {
+                        feasible = Some(start);
+                        break;
                     }
-                    feasible = Some(start);
-                    break;
                 }
 
                 let present = store.interval_presence(interval) == IntervalPresence::Present;
@@ -684,24 +860,36 @@ impl Propagator for Cumulative {
                                 // interval must start no earlier than `start`. Cite
                                 // its presence, its current lower bound, and the
                                 // present intervals fixing the profile there.
-                                let mut why = cumulative_profile_premises(store, &self.intervals, smin, start + duration, interval);
+                                let mut why = cumulative_profile_premises(
+                                    store,
+                                    &self.intervals,
+                                    smin as i32,
+                                    (start + duration).clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32,
+                                    interval,
+                                );
                                 why.extend(present_premise(store, interval));
-                                why.push(Premise::Ge { var: store.interval_start_var(interval), bound: smin });
-                                changed |= store.set_interval_start_min_because(interval, start, why)?;
+                                why.push(Premise::Ge { var: store.interval_start_var(interval), bound: smin as i32 });
+                                changed |= store.set_interval_start_min_because(interval, start as i32, why)?;
                             } else {
                                 // Optional, undecided: the bound is conditional on a
                                 // presence not yet asserted; keep the loose reason.
-                                changed |= store.set_interval_start_min(interval, start)?;
+                                changed |= store.set_interval_start_min(interval, start as i32)?;
                             }
                         }
                     }
                     None => match store.interval_presence(interval) {
                         IntervalPresence::Present => {
                             // A present interval fits nowhere in its window.
-                            let mut why = cumulative_profile_premises(store, &self.intervals, smin, smax + duration, interval);
+                            let mut why = cumulative_profile_premises(
+                                store,
+                                &self.intervals,
+                                smin as i32,
+                                (smax + duration).clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32,
+                                interval,
+                            );
                             why.extend(present_premise(store, interval));
-                            why.push(Premise::Ge { var: store.interval_start_var(interval), bound: smin });
-                            why.push(Premise::Le { var: store.interval_start_var(interval), bound: smax });
+                            why.push(Premise::Ge { var: store.interval_start_var(interval), bound: smin as i32 });
+                            why.push(Premise::Le { var: store.interval_start_var(interval), bound: smax as i32 });
                             return Err(store.fail_because(why));
                         }
                         IntervalPresence::Optional => changed |= store.forbid_interval_presence(interval)?,
@@ -719,7 +907,21 @@ impl Propagator for Cumulative {
 /// Post a cumulative resource: `intervals[k]` uses `demands[k]` units
 /// of a resource of `capacity` while running.
 pub fn cumulative(solver: &mut Solver, intervals: &[IntervalId], demands: &[i32], capacity: i32) -> PropId {
-    solver.post(Box::new(Cumulative { intervals: intervals.to_vec(), demands: demands.to_vec(), capacity, profile: Vec::new() }))
+    let n = intervals.len();
+    solver.post(Box::new(Cumulative {
+        intervals: intervals.to_vec(),
+        demands: demands.to_vec(),
+        capacity,
+        events: Vec::new(),
+        profile: Vec::new(),
+        present: Vec::new(),
+        est: vec![0; n],
+        lct: vec![0; n],
+        energy: vec![0; n],
+        by_est: Vec::new(),
+        by_lct: Vec::new(),
+        lower: vec![0; n],
+    }))
 }
 
 /// Interruptible owned-input variant used during physical schedule construction.
@@ -730,7 +932,24 @@ pub(crate) fn cumulative_until(
     capacity: i32,
     should_stop: &dyn Fn() -> bool,
 ) -> Option<PropId> {
-    solver.post_until(Box::new(Cumulative { intervals, demands, capacity, profile: Vec::new() }), should_stop)
+    let n = intervals.len();
+    solver.post_until(
+        Box::new(Cumulative {
+            intervals,
+            demands,
+            capacity,
+            events: Vec::new(),
+            profile: Vec::new(),
+            present: Vec::new(),
+            est: vec![0; n],
+            lct: vec![0; n],
+            energy: vec![0; n],
+            by_est: Vec::new(),
+            by_lct: Vec::new(),
+            lower: vec![0; n],
+        }),
+        should_stop,
+    )
 }
 
 /// Exactly one of a set of optional intervals is present (an `alternative`):

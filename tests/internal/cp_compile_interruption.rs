@@ -30,6 +30,32 @@ fn validated_cp_compilation_honors_a_prearmed_stop() {
 }
 
 #[test]
+fn dominant_global_estimates_do_not_scale_with_decomposition_or_time_horizon() {
+    let stop = AtomicBool::new(false);
+
+    let mut all_different = Model::new();
+    let variables = (0..40).map(|_| all_different.int_range(0, 40)).collect::<Vec<_>>();
+    all_different.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::AllDifferent { variables, except: vec![0, 1, 2] }));
+    let compiled = CompiledCp::compile_interruptible(&all_different, &stop).unwrap().unwrap();
+    assert_eq!(compiled.problem().solver.num_propagators(), 1, "allDifferent-except must compile to one global propagator");
+
+    let cumulative_estimate = |upper| {
+        let mut model = Model::new();
+        let starts = (0..8).map(|_| model.int_range(0, upper)).collect::<Vec<_>>();
+        model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Cumulative {
+            starts,
+            durations: vec![3; 8],
+            demands: vec![1; 8],
+            capacity: 2,
+        }));
+        CompiledCp::estimate_semantic_bytes_interruptible(&model, &stop).unwrap()
+    };
+    let compact = cumulative_estimate(100);
+    let wide = cumulative_estimate(1_000_000_000);
+    assert!(wide <= compact.saturating_add(1 << 20), "sparse cumulative estimate grew with the horizon: {compact} -> {wide}");
+}
+
+#[test]
 fn validating_cp_compiler_entry_still_rejects_an_invalid_model() {
     let mut model = Model::new();
     model.int_set(vec![0, 0]);
