@@ -169,8 +169,14 @@ rows, nonzeros, objective coverage, and an explicit construction status such as
 ## Python Examples
 
 The Python examples live under `examples/python/`, grouped by domain: `routing/`,
-`scheduling/`, `packing/`, `optimization/`, and `mus/` (infeasibility analysis).
-Each example has a native and an API version.
+`scheduling/`, `packing/`, `optimization/`, `csplib/`, and `mus/`
+(infeasibility analysis). Routing and scheduling examples have native and API
+versions. The CSPLib collection has a catalog and a common runner:
+
+```bash
+uv run python -m examples.python.csplib list
+uv run python -m examples.python.csplib prob007 --size 12
+```
 
 
 ```python
