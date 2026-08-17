@@ -9,7 +9,19 @@ SCRIPT = Path(__file__).resolve().parents[2] / "bench" / "common" / "compare.py"
 def write_csv(tmp_path, name, rows):
     p = tmp_path / name
     with open(p, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["instance", "status", "obj", "time", "timedout", "dir"])
+        w = csv.DictWriter(
+            f,
+            fieldnames=[
+                "instance",
+                "status",
+                "obj",
+                "time",
+                "timedout",
+                "dir",
+                "valid",
+                "validation_reason",
+            ],
+        )
         w.writeheader()
         for r in rows:
             w.writerow(r)
@@ -33,8 +45,16 @@ def compare_output(tmp_path, a_rows, b_rows, timeout=10):
     ).stdout
 
 
-def row(inst, status, obj, d="min"):
-    return {"instance": inst, "status": status, "obj": obj, "time": "1.0", "timedout": "0", "dir": d}
+def row(inst, status, obj, d="min", valid=""):
+    return {
+        "instance": inst,
+        "status": status,
+        "obj": obj,
+        "time": "1.0",
+        "timedout": "0",
+        "dir": d,
+        "valid": valid,
+    }
 
 
 def test_optimum_differing_obj_is_contradiction(tmp_path):
@@ -119,3 +139,16 @@ def test_maximization_incumbent_quality_prefers_the_higher_value(tmp_path):
     )
 
     assert "objective quality (incumbent by both): same 0 | qayd better 1 | qayd worse 0" in out
+
+
+def test_invalid_assignment_is_not_solved_or_a_contradiction(tmp_path):
+    out = compare_output(
+        tmp_path,
+        [row("decision", "SAT", "", "?", "0")],
+        [row("decision", "UNSAT", "", "?", "")],
+    )
+
+    assert "  qayd solved : 0" in out
+    assert "  baseline solved : 1" in out
+    assert "  invalid assignments: qayd 1 | baseline 0" in out
+    assert "CONTRADICTIONS (soundness bug!) : 0" in out

@@ -33,15 +33,41 @@ python3 csp/fetch.py --year 25 --limit 30
 python3 cop/fetch.py --year 25 --limit 30
 
 # run + compare (10s per instance)
-./sat/pipeline.sh 10 ; ./pb/pipeline.sh 10 ; ./csp/pipeline.sh 10 ; ./cop/pipeline.sh 10
+./sat/pipeline.sh 10 0 1 0 results/baseline-10s
+./pb/pipeline.sh 10 0 1 0 results/baseline-10s
+./csp/pipeline.sh 10
+./cop/pipeline.sh 10
 ```
 
 For CPU-tuned local benchmark binaries, prefix the build command with
 `RUSTFLAGS="-Ctarget-cpu=native"`. The repository does not force that flag so
 release and CI builds stay portable.
 
-`pipeline.sh [TIMEOUT_S] [LIMIT]` - per-instance wall-clock timeout and an
-optional instance cap (0 = all fetched).
+The SAT and PB launchers accept
+`pipeline.sh [TIMEOUT_S] [LIMIT] [JOBS] [MEMORY_MB] [OUTPUT_DIR]`.
+Use one job for clean timing. Parallel jobs are useful for campaign throughput
+when both compared solvers use the same job count. A zero limit selects every
+fetched instance and a zero memory limit disables the address-space cap.
+
+## SAT and PB result validation
+
+The SAT/PB runner independently replays every reported feasible assignment
+against the materialized DIMACS or linear OPB instance. For PB optimization it
+also recomputes the objective instead of trusting the solver's `o` line.
+Invalid assignments are retained in the CSV but never counted as solved or as
+incumbents. Unsupported nonlinear OPB syntax and incomplete solver output are
+reported as inconclusive, not silently accepted or mislabeled invalid.
+
+Each output directory contains the two result CSVs, one provenance JSON per
+solver, and per-instance stdout/stderr logs. Provenance records the command,
+limits, concurrency, host, source revision, instance hashes, runner hash, and
+solver artifact hashes. Relative instance paths are preserved, so same-named
+files in different benchmark families cannot overwrite one another.
+
+All three SAT/PB solvers receive the same internal search deadline. The runner
+allows one additional external second only to finish printing output, then
+terminates the complete process group. This finalization allowance is recorded
+and excluded from the PAR2 search budget.
 
 ## Collection backend policy
 

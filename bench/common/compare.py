@@ -18,7 +18,7 @@ import argparse
 import csv
 
 
-def is_solved(status, d):
+def is_solved(status, d, valid=None):
     """Did the solver fully settle this instance?
 
     For a decision/CSP instance (no objective direction) SATISFIABLE is a full
@@ -27,6 +27,8 @@ def is_solved(status, d):
     the optimization question. Only OPTIMUM (proved optimal) or UNSAT (proved
     infeasible) count as solved there.
     """
+    if valid is False:
+        return False
     if status in ("OPTIMUM", "UNSAT"):
         return True
     if status == "SAT":
@@ -34,21 +36,25 @@ def is_solved(status, d):
     return False
 
 
-def found_incumbent(status):
+def found_incumbent(status, valid=None):
     """Feasible solution in hand (proved optimal or not)."""
-    return status in ("SAT", "OPTIMUM")
+    return valid is not False and status in ("SAT", "OPTIMUM")
 
 
 def load(path):
     rows = {}
     with open(path) as f:
         for r in csv.DictReader(f):
+            raw_valid = r.get("valid", "")
+            valid = None if raw_valid in (None, "") else raw_valid == "1"
             rows[r["instance"]] = {
                 "status": r["status"],
                 "obj": int(r["obj"]) if r.get("obj") not in (None, "") else None,
                 "time": float(r["time"]) if r.get("time") else 0.0,
                 "to": r.get("timedout") == "1",
                 "dir": r.get("dir", "?"),
+                "valid": valid,
+                "validation_reason": r.get("validation_reason", ""),
             }
     return rows
 
@@ -59,7 +65,7 @@ def par2(rows, timeout):
         # COP-aware: an unproved COP incumbent (SATISFIABLE) is charged as
         # unsolved, so a solver that gives up early with an incumbent is not
         # rewarded as if it had proved the optimum.
-        if is_solved(r["status"], r["dir"]) and not r["to"]:
+        if is_solved(r["status"], r["dir"], r["valid"]) and not r["to"]:
             s += r["time"]
         else:
             s += 2 * timeout
@@ -80,6 +86,8 @@ def main():
     ap.add_argument("a", help="qayd CSV")
     ap.add_argument("b", help="baseline CSV")
     ap.add_argument("--timeout", type=int, default=10)
+    ap.add_argument("--finalization-seconds", type=float, default=0.0,
+                    help="allowed post-search output time, excluded from the PAR2 budget")
     ap.add_argument("--name-a", default="qayd")
     ap.add_argument("--name-b", default="baseline")
     ap.add_argument("--details", type=int, default=0, metavar="N",
@@ -94,19 +102,26 @@ def main():
     # PAR2 charges 2*timeout per unsolved instance: a --timeout below the runs'
     # real budget silently skews the ranking, so flag the mismatch loudly.
     max_t = max((r["time"] for r in list(A.values()) + list(B.values())), default=0.0)
-    if max_t > args.timeout * 1.1:
+    expected_wall = args.timeout + args.finalization_seconds
+    if max_t > expected_wall * 1.1:
         print(f"  !! --timeout {args.timeout} looks wrong: recorded times reach "
-              f"{max_t:.0f}s — PAR2 is unreliable; pass the runs' actual timeout")
+              f"{max_t:.0f}s; PAR2 is unreliable; pass the runs' actual timeout")
 
     def cdir(i):
         return A[i]["dir"] if A[i]["dir"] != "?" else B[i]["dir"]
 
     is_cop = any(cdir(i) in ("min", "max") for i in common)
-    solved_a = sum(is_solved(A[i]["status"], cdir(i)) for i in common)
-    solved_b = sum(is_solved(B[i]["status"], cdir(i)) for i in common)
-    vbs = sum(is_solved(A[i]["status"], cdir(i)) or is_solved(B[i]["status"], cdir(i)) for i in common)
-    incumbent_a = sum(found_incumbent(A[i]["status"]) for i in common)
-    incumbent_b = sum(found_incumbent(B[i]["status"]) for i in common)
+    solved_a = sum(is_solved(A[i]["status"], cdir(i), A[i]["valid"]) for i in common)
+    solved_b = sum(is_solved(B[i]["status"], cdir(i), B[i]["valid"]) for i in common)
+    vbs = sum(
+        is_solved(A[i]["status"], cdir(i), A[i]["valid"])
+        or is_solved(B[i]["status"], cdir(i), B[i]["valid"])
+        for i in common
+    )
+    incumbent_a = sum(found_incumbent(A[i]["status"], A[i]["valid"]) for i in common)
+    incumbent_b = sum(found_incumbent(B[i]["status"], B[i]["valid"]) for i in common)
+    invalid_a = sum(A[i]["valid"] is False for i in common)
+    invalid_b = sum(B[i]["valid"] is False for i in common)
 
     contradictions, obj_tie, a_better, a_worse = [], 0, 0, 0
     a_faster = b_faster = 0
@@ -117,17 +132,19 @@ def main():
         oaj, obj = A[i]["obj"], B[i]["obj"]
         d = A[i]["dir"] if A[i]["dir"] != "?" else B[i]["dir"]
         hard = {"SAT", "OPTIMUM"}
-        if (sa in hard and sb == "UNSAT") or (sb in hard and sa == "UNSAT"):
+        claims_valid = A[i]["valid"] is not False and B[i]["valid"] is not False
+        if claims_valid and ((sa in hard and sb == "UNSAT") or (sb in hard and sa == "UNSAT")):
             contradictions.append((i, sa, sb))
-        elif sa == "OPTIMUM" and sb == "OPTIMUM" and oaj is not None and obj is not None and oaj != obj:
+        elif claims_valid and sa == "OPTIMUM" and sb == "OPTIMUM" and oaj is not None and obj is not None and oaj != obj:
             # both claim provable optimum but disagree -> one is unsound
             contradictions.append((i, f"OPTIMUM={oaj}", f"OPTIMUM={obj}"))
-        elif d != "?" and sa == "OPTIMUM" and sb == "SAT" and better(obj, oaj, d) == 1:
+        elif claims_valid and d != "?" and sa == "OPTIMUM" and sb == "SAT" and better(obj, oaj, d) == 1:
             # b has a feasible solution strictly better than a's claimed optimum
             contradictions.append((i, f"OPTIMUM={oaj}", f"SAT={obj}"))
-        elif d != "?" and sb == "OPTIMUM" and sa == "SAT" and better(oaj, obj, d) == 1:
+        elif claims_valid and d != "?" and sb == "OPTIMUM" and sa == "SAT" and better(oaj, obj, d) == 1:
             contradictions.append((i, f"SAT={oaj}", f"OPTIMUM={obj}"))
-        oa, ob = is_solved(sa, d), is_solved(sb, d)
+        oa = is_solved(sa, d, A[i]["valid"])
+        ob = is_solved(sb, d, B[i]["valid"])
         both += oa and ob
         only_a += oa and not ob
         only_b += ob and not oa
@@ -146,7 +163,7 @@ def main():
         # COP that means SATISFIABLE or OPTIMUM, not just proved-by-both, else
         # every unproved-but-improved/regressed incumbent is invisible. `d` is the
         # instance's own min/max direction, so max and min are never mixed.
-        if found_incumbent(sa) and found_incumbent(sb):
+        if found_incumbent(sa, A[i]["valid"]) and found_incumbent(sb, B[i]["valid"]):
             c = better(A[i]["obj"], B[i]["obj"], d)
             if c == 1:
                 a_better += 1
@@ -161,6 +178,8 @@ def main():
         print("  (optimization instances present: 'solved' = proved optimum/infeasible; SATISFIABLE is an incumbent, not a solve)")
     print(f"  {na} solved : {solved_a}")
     print(f"  {nb} solved : {solved_b}")
+    if invalid_a or invalid_b:
+        print(f"  invalid assignments: {na} {invalid_a} | {nb} {invalid_b}")
     if is_cop:
         print(f"  {na} incumbent found : {incumbent_a}")
         print(f"  {nb} incumbent found : {incumbent_b}")
