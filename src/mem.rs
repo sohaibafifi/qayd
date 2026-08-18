@@ -6,7 +6,7 @@
 //! memory so the orchestrator can still enforce a hard limit.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
@@ -17,9 +17,6 @@ static DEALLOCATED: AtomicUsize = AtomicUsize::new(0);
 /// Hard memory budget in bytes; 0 means unlimited (the default everywhere the
 /// tracking allocator is not installed).
 static LIMIT: AtomicUsize = AtomicUsize::new(0);
-/// Whether to emit `c mem ...` degrade notices (mirrors the CLI `-v` flag).
-static VERBOSE: AtomicBool = AtomicBool::new(false);
-static SOFT_NOTICED: AtomicBool = AtomicBool::new(false);
 
 /// Allocator that forwards to [`System`] and accounts live bytes with Relaxed
 /// ordering (the counter is advisory, never a correctness dependency).
@@ -101,19 +98,13 @@ pub fn limit() -> usize {
     LIMIT.load(Relaxed)
 }
 
-/// Install a hard budget of `mb` megabytes (0 = unlimited).
-pub fn set_limit_mb(mb: usize) {
-    set_limit_bytes(mb.saturating_mul(1024 * 1024));
-}
-
-/// Install a hard budget in bytes (0 = unlimited).
-pub fn set_limit_bytes(bytes: usize) {
+/// Install the process-wide hard budget selected by the orchestrator.
+///
+/// Public callers configure memory through
+/// [`SolveRequest`](crate::orchestrator::SolveRequest), so concurrent solves
+/// share one accounting policy instead of mutating this process-global state.
+pub(crate) fn set_limit_bytes(bytes: usize) {
     LIMIT.store(bytes, Relaxed);
-}
-
-/// Enable degrade-notice printing.
-pub fn set_verbose(verbose: bool) {
-    VERBOSE.store(verbose, Relaxed);
 }
 
 /// Minimum learned-clause budget the soft limit will degrade to, so search stays
@@ -158,15 +149,6 @@ pub fn over_hard() -> bool {
 /// Halve a learned-clause budget, never below [`LEARNED_FLOOR`]. Pure.
 pub fn degrade_budget(current: usize) -> usize {
     (current / 2).max(LEARNED_FLOOR)
-}
-
-/// Emit the one-time soft-limit notice (verbose only). Goes to stderr because the
-/// solver holds the stdout lock across the whole run, so a worker thread cannot
-/// write the `w` stream without deadlocking.
-pub fn note_soft() {
-    if VERBOSE.load(Relaxed) && !SOFT_NOTICED.swap(true, Relaxed) {
-        eprintln!("c mem soft limit reached at {} MB; halving learned-clause budget", monitored().unwrap_or(0) / (1024 * 1024));
-    }
 }
 
 #[cfg(target_os = "linux")]

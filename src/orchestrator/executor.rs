@@ -35,6 +35,20 @@ impl WorkerAllocation {
     }
 }
 
+/// Return one worker's share of a common iteration budget.
+///
+/// Finite budgets are divided exactly, with at most one iteration of
+/// difference between workers. `u64::MAX` denotes an unbounded worker budget
+/// and therefore remains unbounded for every worker.
+pub(crate) fn worker_iteration_quota(total: u64, worker: usize, workers: usize) -> u64 {
+    if total == u64::MAX {
+        return u64::MAX;
+    }
+    let workers = u64::try_from(workers).unwrap_or(u64::MAX).max(1);
+    let worker = u64::try_from(worker).unwrap_or(u64::MAX);
+    total / workers + u64::from(worker < total % workers)
+}
+
 /// One coalesced progress event from a worker.
 #[derive(Debug)]
 pub struct WorkerEvent<E> {

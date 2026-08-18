@@ -12,6 +12,8 @@ use crate::engines::ls::schedule_ir::PrecedenceDag;
 use crate::mix64;
 use crate::model::list::{CollectionSolution, Resource, Schedule};
 
+use super::move_acceptance::MinimizingMoveAcceptance;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ScheduleStateInterrupted;
 
@@ -755,23 +757,6 @@ pub(crate) enum CriticalNeighborhood {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MoveAcceptance {
-    Improving,
-    NonWorsening,
-    Always,
-}
-
-impl MoveAcceptance {
-    fn accepts(self, current: i64, candidate: i64) -> bool {
-        match self {
-            Self::Improving => candidate < current,
-            Self::NonWorsening => candidate <= current,
-            Self::Always => true,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MoveRejection {
     Invalid,
     Cycle,
@@ -1099,7 +1084,7 @@ impl JobShopState {
     pub(crate) fn consider_move(
         &mut self,
         movement: ScheduleMove,
-        acceptance: MoveAcceptance,
+        acceptance: MinimizingMoveAcceptance,
         stop: &AtomicBool,
     ) -> Result<MoveOutcome, ScheduleStateInterrupted> {
         checkpoint(stop)?;
@@ -1112,7 +1097,7 @@ impl JobShopState {
     fn consider_move_inner(
         &mut self,
         movement: ScheduleMove,
-        acceptance: MoveAcceptance,
+        acceptance: MinimizingMoveAcceptance,
         stop: &AtomicBool,
     ) -> Result<MoveOutcome, ScheduleStateInterrupted> {
         checkpoint(stop)?;

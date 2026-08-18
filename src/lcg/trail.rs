@@ -589,9 +589,6 @@ impl<'s> Cdcl<'s> {
         if self.num_learned <= self.max_learned && !soft {
             return;
         }
-        if soft {
-            crate::mem::note_soft();
-        }
         debug_assert_eq!(self.decision_level(), 0, "reduction off the root");
         let mut learned: Vec<ClauseRef> = (0..self.clauses.len() as u32)
             .map(ClauseRef)

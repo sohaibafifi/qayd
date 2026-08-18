@@ -81,6 +81,57 @@ fn integer_search_has_one_engine_and_one_control_plane() {
 }
 
 #[test]
+fn orchestrator_public_surface_uses_explicit_exports() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(root.join("src/orchestrator/mod.rs")).expect("orchestrator module");
+
+    for module in ["budget", "diagnostics", "executor", "plan", "session", "solve", "types", "verify"] {
+        let glob = format!("pub use {module}::*");
+        assert!(!source.contains(&glob), "the orchestrator public surface leaks future `{module}` symbols through a glob export");
+    }
+}
+
+#[test]
+fn python_lambda_compiler_has_one_module_boundary() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let binding = fs::read_to_string(root.join("src/frontends/python.rs")).expect("Python binding source");
+    let compiler = fs::read_to_string(root.join("src/frontends/python/lambda_dsl.rs")).expect("lambda compiler source");
+
+    assert!(binding.contains("mod lambda_dsl;"));
+    assert!(binding.contains("use lambda_dsl::compile_callable;"));
+    for owned_symbol in ["enum Node", "fn coerce(", "fn lower("] {
+        assert!(!binding.contains(owned_symbol), "Python binding reintroduced lambda compiler symbol `{owned_symbol}`");
+        assert!(compiler.contains(owned_symbol), "lambda compiler no longer owns `{owned_symbol}`");
+    }
+}
+
+#[test]
+fn process_memory_budget_is_owned_by_the_orchestrator() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let memory = fs::read_to_string(root.join("src/mem.rs")).expect("memory accounting source");
+    let budget = fs::read_to_string(root.join("src/orchestrator/budget.rs")).expect("orchestrator budget source");
+
+    assert!(memory.contains("pub(crate) fn set_limit_bytes"));
+    for bypass in ["pub fn set_limit_", "fn set_verbose(", "fn note_soft("] {
+        assert!(!memory.contains(bypass), "memory accounting exposes the process-global bypass `{bypass}`");
+    }
+    assert!(budget.contains("crate::mem::set_limit_bytes(effective)"));
+}
+
+#[test]
+fn scheduling_move_acceptance_has_one_owner() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let policy = fs::read_to_string(root.join("src/engines/ls/lists/move_acceptance.rs")).expect("move acceptance policy");
+    assert!(policy.contains("enum MinimizingMoveAcceptance"));
+
+    for relative in ["src/engines/ls/lists/schedule_state.rs", "src/engines/ls/lists/resource_schedule.rs"] {
+        let source = fs::read_to_string(root.join(relative)).expect("scheduling state source");
+        assert!(!source.contains("enum MoveAcceptance"), "{relative} reintroduced its own move acceptance policy");
+        assert!(!source.contains("enum ResourceMoveAcceptance"), "{relative} reintroduced its own move acceptance policy");
+    }
+}
+
+#[test]
 fn engines_cannot_construct_the_public_solve_protocol() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut sources = Vec::new();
@@ -106,6 +157,11 @@ fn portfolio_allocation_and_schedule_analysis_have_one_owner() {
     let executor = fs::read_to_string(root.join("src/orchestrator/executor.rs")).expect("worker executor source");
     assert!(solve.contains("WorkerAllocation::portfolio(*workers)"));
     assert!(executor.contains("struct WorkerAllocation"));
+    assert!(executor.contains("fn worker_iteration_quota"));
+    for relative in ["src/orchestrator/integer_search.rs", "src/orchestrator/collection.rs", "src/engines/ls/lists/portfolio.rs"] {
+        let source = fs::read_to_string(root.join(relative)).expect("worker quota consumer");
+        assert!(!source.contains("fn worker_iteration_quota"), "{relative} reintroduced a private worker quota policy");
+    }
 
     for relative in ["src/engines/ls/disjunctive_schedule.rs", "src/engines/ls/scenario_schedule.rs"] {
         let source = fs::read_to_string(root.join(relative)).expect("schedule engine source");

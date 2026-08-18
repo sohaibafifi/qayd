@@ -1,23 +1,28 @@
 //! `qayd`: a constraint-programming solver.
 //!
-//! ## Example: count the solutions of 4-Queens
+//! ## Example
 //!
 //! ```
-//! use qayd::constraints::primitives::not_equal_offset;
-//! use qayd::{count_solutions, Solver, VarId};
+//! use qayd::model::{Constraint, Model, ModelPackage, Relation};
+//! use qayd::orchestrator::{IgnoreEvents, SolveRequest, SolveStatus};
 //!
-//! let n = 4;
-//! let mut solver = Solver::new();
-//! let q: Vec<VarId> = (0..n).map(|_| solver.new_var_range(0, n - 1)).collect();
-//! for i in 0..n as usize {
-//!     for j in (i + 1)..n as usize {
-//!         let (di, dj) = (i as i32, j as i32);
-//!         not_equal_offset(&mut solver, q[i], q[j], 0);
-//!         not_equal_offset(&mut solver, q[i], q[j], di - dj);
-//!         not_equal_offset(&mut solver, q[i], q[j], dj - di);
-//!     }
-//! }
-//! assert_eq!(count_solutions(&mut solver, &q), 2);
+//! let mut model = Model::new();
+//! let value = model.int_range(0, 2);
+//! model.add_constraint(Constraint::Linear {
+//!     terms: vec![(1, value)],
+//!     relation: Relation::Eq,
+//!     rhs: 1,
+//! });
+//!
+//! let package = ModelPackage::new(model);
+//! let result = qayd::solve(
+//!     &package,
+//!     &SolveRequest::default(),
+//!     &mut IgnoreEvents,
+//! ).expect("the model is valid and supported");
+//!
+//! assert_eq!(result.status(), SolveStatus::Satisfiable);
+//! assert_eq!(result.primal().unwrap().assignment().integers[value.0], Some(1));
 //! ```
 
 pub mod constraints;

@@ -19,8 +19,8 @@ use crate::model::{CompiledCp, Model};
 use crate::problem::Objective as PhysicalObjective;
 
 use super::{
-    execute_workers, CandidateSolution, EngineKind, EngineReport, EventControl, EventSink, SolveBudget, SolveError, SolveEvent,
-    SolveRequest, SolveResult, SolveStatus, TerminationReason, VerificationLevel,
+    execute_workers, worker_iteration_quota, CandidateSolution, EngineKind, EngineReport, EventControl, EventSink, SolveBudget, SolveError,
+    SolveEvent, SolveRequest, SolveResult, SolveStatus, TerminationReason, VerificationLevel,
 };
 
 pub(crate) struct IntegerWarmStart {
@@ -630,15 +630,6 @@ fn promote_checkpoint_candidate(candidate: CandidateSolution) -> CandidateSoluti
         candidate.source(),
         VerificationLevel::Final,
     )
-}
-
-fn worker_iteration_quota(total: u64, worker: usize, workers: usize) -> u64 {
-    if total == u64::MAX {
-        return u64::MAX;
-    }
-    let workers = u64::try_from(workers).unwrap_or(u64::MAX).max(1);
-    let worker = u64::try_from(worker).unwrap_or(u64::MAX);
-    total / workers + u64::from(worker < total % workers)
 }
 
 fn repair_candidate(

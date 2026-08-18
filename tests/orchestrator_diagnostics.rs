@@ -1,11 +1,10 @@
-#![cfg(feature = "python")]
-
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use qayd::model::{Model, ModelPackage};
 use qayd::orchestrator::{
-    count_model_solutions_with_external_stop, IgnoreEvents, SemanticSolveSession, SolveError, SolveLimits, SolveRequest, SolveStatus,
+    count_model_solutions_with_external_stop, extract_model_mus_with_external_stop, IgnoreEvents, ModelMusResult, SemanticSolveSession,
+    SolveError, SolveLimits, SolveRequest, SolveStatus,
 };
 
 fn binary_model() -> ModelPackage {
@@ -26,6 +25,14 @@ fn zero_budget_count_is_not_reported_as_complete() {
     let request = SolveRequest { limits: SolveLimits { time: Some(Duration::ZERO), ..SolveLimits::default() }, ..SolveRequest::default() };
     let error = count_model_solutions_with_external_stop(&binary_model(), &[0], &request, &AtomicBool::new(false)).unwrap_err();
     assert!(matches!(error, SolveError::Interrupted(_)), "{error}");
+}
+
+#[test]
+fn satisfiable_mus_diagnostic_does_not_expose_a_physical_assignment() {
+    let result =
+        extract_model_mus_with_external_stop(&binary_model(), &[0], &[], &SolveRequest::default(), &AtomicBool::new(false)).unwrap();
+
+    assert_eq!(result, ModelMusResult::Satisfiable);
 }
 
 #[test]

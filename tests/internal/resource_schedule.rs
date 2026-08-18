@@ -1,9 +1,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use qayd::engines::ls::lists::move_acceptance::MinimizingMoveAcceptance;
 use qayd::engines::ls::lists::resource_schedule::{
-    GenerationScheme, Justification, PriorityRule, PrioritySgs, ResourceAlnsBudget, ResourceMoveAcceptance, ResourceMoveOutcome,
-    ResourceMoveRejection, ResourceScheduleMove, ResourceScheduleProblem, ResourceScheduleState,
+    audit_event_profile_fit, GenerationScheme, Justification, PriorityRule, PrioritySgs, ProfileFit, ResourceAlnsBudget,
+    ResourceMoveOutcome, ResourceMoveRejection, ResourceScheduleMove, ResourceScheduleProblem, ResourceScheduleState,
 };
 use qayd::model::list::{verify_collection_solution, CollectionModel, IntervalVar, Mode, Resource, Schedule};
 
@@ -31,6 +32,124 @@ fn rcpsp() -> Schedule {
 
 fn assert_verified(schedule: Schedule, state: &ResourceScheduleState) {
     assert_eq!(verify_collection_solution(&collection(schedule), &state.to_solution()).unwrap(), vec![state.makespan()]);
+}
+
+fn dense_profile_fit(capacity: i128, bookings: &[(i64, i64, i128)], start: i64, end: i64, demand: i128) -> ProfileFit {
+    if demand == 0 || start == end {
+        return ProfileFit::Fits;
+    }
+    if demand > capacity {
+        return ProfileFit::Impossible;
+    }
+
+    let mut boundaries = bookings.iter().flat_map(|&(booking_start, booking_end, _)| [booking_start, booking_end]).collect::<Vec<_>>();
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    boundaries.retain(|&boundary| {
+        let delta = bookings.iter().fold(0i128, |delta, &(booking_start, booking_end, booking_demand)| {
+            delta + i128::from(booking_start == boundary) * booking_demand - i128::from(booking_end == boundary) * booking_demand
+        });
+        delta != 0
+    });
+
+    for time in start..end {
+        let Some(usage) = bookings
+            .iter()
+            .filter(|&&(booking_start, booking_end, _)| booking_start <= time && time < booking_end)
+            .try_fold(0i128, |usage, &(_, _, booking_demand)| usage.checked_add(booking_demand))
+        else {
+            return ProfileFit::Impossible;
+        };
+        let Some(with_candidate) = usage.checked_add(demand) else {
+            return ProfileFit::Impossible;
+        };
+        if with_candidate > capacity {
+            return boundaries.iter().copied().find(|&boundary| boundary > time).map_or(ProfileFit::Impossible, ProfileFit::RetryAt);
+        }
+    }
+    ProfileFit::Fits
+}
+
+fn assert_profile_fit(
+    capacity: i128,
+    bookings: &[(i64, i64, i128)],
+    start: i64,
+    end: i64,
+    demand: i128,
+    expected: ProfileFit,
+) -> [(u64, u64); 2] {
+    let stop = AtomicBool::new(false);
+    let audit = audit_event_profile_fit(capacity, bookings, start, end, demand, &stop).expect("valid profile bookings");
+    let mut metrics = [(0, 0); 2];
+    for (index, audit) in audit.into_iter().enumerate() {
+        assert_eq!(audit.result.unwrap(), expected, "profile backend {index}");
+        metrics[index] = (audit.profile_checks, audit.event_visits);
+    }
+    assert_eq!(metrics[0], metrics[1]);
+    metrics
+}
+
+#[test]
+fn event_profile_fit_preserves_half_open_boundaries_and_retry_events() {
+    assert_eq!(assert_profile_fit(2, &[(0, 2, 2)], 2, 4, 2, ProfileFit::Fits), [(1, 2), (1, 2)]);
+    assert_eq!(assert_profile_fit(2, &[(2, 4, 2)], 0, 2, 2, ProfileFit::Fits), [(1, 1), (1, 1)]);
+    assert_eq!(assert_profile_fit(2, &[(0, 2, 2)], 1, 3, 1, ProfileFit::RetryAt(2)), [(1, 1), (1, 1)]);
+    let metrics = assert_profile_fit(2, &[(0, 2, 2), (2, 4, 2)], 1, 3, 1, ProfileFit::RetryAt(4));
+    assert_eq!(metrics, [(1, 1), (1, 1)], "the zero net event at the touching boundary must remain absent");
+    assert_eq!(assert_profile_fit(2, &[(0, 2, 2)], 0, 2, 0, ProfileFit::Fits), [(1, 0), (1, 0)]);
+    assert_eq!(assert_profile_fit(2, &[(0, 2, 2)], 1, 1, i128::MAX, ProfileFit::Fits), [(1, 0), (1, 0)]);
+}
+
+#[test]
+fn both_event_profiles_match_a_dense_randomized_fit_oracle() {
+    let mut random = 0x92d6_8ca2_7b31_4f05u64;
+    for case in 0..1_000 {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        let raw_capacity = random % 8;
+        let capacity = i128::from(raw_capacity);
+        let booking_count = usize::try_from((random >> 8) % 9).unwrap();
+        let mut bookings = Vec::with_capacity(booking_count);
+        for _ in 0..booking_count {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            let booking_start = i64::try_from(random % 12).unwrap() - 2;
+            let booking_end = booking_start + i64::try_from(1 + (random >> 8) % 5).unwrap();
+            let booking_demand = i128::from((random >> 16) % (raw_capacity + 2));
+            bookings.push((booking_start, booking_end, booking_demand));
+        }
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        let start = i64::try_from(random % 14).unwrap() - 2;
+        let end = start + i64::try_from((random >> 8) % 6).unwrap();
+        let demand = i128::from((random >> 16) % (raw_capacity + 2));
+        let expected = dense_profile_fit(capacity, &bookings, start, end, demand);
+        let metrics = assert_profile_fit(capacity, &bookings, start, end, demand, expected);
+        assert_eq!(metrics[0].0, 1, "case {case}");
+    }
+}
+
+#[test]
+fn event_profile_fit_preserves_numeric_overflow_as_impossible() {
+    let candidate_overflow = assert_profile_fit(i128::MAX, &[(0, 10, i128::MAX)], 1, 2, 1, ProfileFit::Impossible);
+    assert_eq!(candidate_overflow, [(1, 1), (1, 1)]);
+
+    let usage_overflow = assert_profile_fit(i128::MAX, &[(0, 10, i128::MAX), (1, 9, 1)], 2, 3, 1, ProfileFit::Impossible);
+    assert_eq!(usage_overflow, [(1, 2), (1, 2)]);
+}
+
+#[test]
+fn event_profile_fit_honors_a_prearmed_stop_before_metrics() {
+    let stop = AtomicBool::new(true);
+    let audit = audit_event_profile_fit(2, &[(0, 2, 1)], 0, 2, 1, &stop).expect("valid profile bookings");
+    for audit in audit {
+        assert!(audit.result.is_err());
+        assert_eq!(audit.profile_checks, 0);
+        assert_eq!(audit.event_visits, 0);
+    }
 }
 
 #[test]
@@ -359,7 +478,7 @@ fn bounded_moves_preserve_precedence_and_commit_complete_schedules() {
     for movement in movements {
         let mut state = ResourceScheduleState::serial(&problem, PrioritySgs::stable(&problem), &stop).unwrap().unwrap();
         assert!(matches!(
-            state.consider_move(movement, ResourceMoveAcceptance::Always, &stop).unwrap(),
+            state.consider_move(movement, MinimizingMoveAcceptance::Always, &stop).unwrap(),
             ResourceMoveOutcome::Accepted { .. }
         ));
         assert!(PrioritySgs::compile(&problem, state.priority().order().to_vec(), &stop).unwrap().is_some());
@@ -436,7 +555,7 @@ fn delta_and_parallel_workspace_match_the_full_reconstruction_oracle() {
             let mut state = ResourceScheduleState::construct(&problem, PrioritySgs::stable(&problem), scheme, &stop).unwrap().unwrap();
             let capacities = state.workspace_capacities();
             assert!(matches!(
-                state.consider_move(movement, ResourceMoveAcceptance::Always, &stop).unwrap(),
+                state.consider_move(movement, MinimizingMoveAcceptance::Always, &stop).unwrap(),
                 ResourceMoveOutcome::Accepted { .. }
             ));
             let candidate_priority = PrioritySgs::compile(&problem, state.priority().order().to_vec(), &stop).unwrap().unwrap();
@@ -468,7 +587,9 @@ fn rejected_candidates_reuse_fixed_workspace_capacity_without_oracle_rebuilds() 
     for iteration in 0..1_024 {
         let first_position = iteration % 11;
         assert!(matches!(
-            state.consider_move(ResourceScheduleMove::AdjacentSwap { first_position }, ResourceMoveAcceptance::Improving, &stop).unwrap(),
+            state
+                .consider_move(ResourceScheduleMove::AdjacentSwap { first_position }, MinimizingMoveAcceptance::Improving, &stop,)
+                .unwrap(),
             ResourceMoveOutcome::Rejected(ResourceMoveRejection::NotAccepted { .. })
         ));
         assert_eq!(state.workspace_capacities(), capacities);
@@ -501,7 +622,7 @@ fn a_late_serial_exchange_reschedules_only_its_changed_suffix() {
         state
             .consider_move(
                 ResourceScheduleMove::AdjacentSwap { first_position: activity_count - 2 },
-                ResourceMoveAcceptance::Improving,
+                MinimizingMoveAcceptance::Improving,
                 &stop,
             )
             .unwrap(),
@@ -536,7 +657,7 @@ fn alns_segment_generation_is_budgeted_reproducible_and_precedence_safe() {
     for movement in first {
         let mut state = ResourceScheduleState::serial(&problem, PrioritySgs::stable(&problem), &stop).unwrap().unwrap();
         assert!(matches!(
-            state.consider_move(movement, ResourceMoveAcceptance::Always, &stop).unwrap(),
+            state.consider_move(movement, MinimizingMoveAcceptance::Always, &stop).unwrap(),
             ResourceMoveOutcome::Accepted { .. }
         ));
         assert!(PrioritySgs::compile(&problem, state.priority().order().to_vec(), &stop).unwrap().is_some());
@@ -575,13 +696,13 @@ fn precedence_and_objective_rejections_leave_state_unchanged() {
     let old_starts = state.starts().to_vec();
 
     let precedence =
-        state.consider_move(ResourceScheduleMove::AdjacentSwap { first_position: 0 }, ResourceMoveAcceptance::Always, &stop).unwrap();
+        state.consider_move(ResourceScheduleMove::AdjacentSwap { first_position: 0 }, MinimizingMoveAcceptance::Always, &stop).unwrap();
     assert_eq!(precedence, ResourceMoveOutcome::Rejected(ResourceMoveRejection::Precedence));
     assert_eq!(state.priority().order(), old_order);
     assert_eq!(state.starts(), old_starts);
 
     let objective =
-        state.consider_move(ResourceScheduleMove::AdjacentSwap { first_position: 1 }, ResourceMoveAcceptance::Improving, &stop).unwrap();
+        state.consider_move(ResourceScheduleMove::AdjacentSwap { first_position: 1 }, MinimizingMoveAcceptance::Improving, &stop).unwrap();
     assert!(matches!(objective, ResourceMoveOutcome::Rejected(ResourceMoveRejection::NotAccepted { .. })));
     assert_eq!(state.priority().order(), old_order);
     assert_eq!(state.starts(), old_starts);
@@ -613,7 +734,10 @@ fn a_move_after_right_justification_uses_a_safe_full_suffix_and_matches_the_orac
     let mut state = ResourceScheduleState::serial(&problem, PrioritySgs::stable(&problem), &stop).unwrap().unwrap();
     state.justify(Justification::Right, &stop).unwrap().unwrap();
     let movement = state.bounded_moves(1, &stop).unwrap()[0];
-    assert!(matches!(state.consider_move(movement, ResourceMoveAcceptance::Always, &stop).unwrap(), ResourceMoveOutcome::Accepted { .. }));
+    assert!(matches!(
+        state.consider_move(movement, MinimizingMoveAcceptance::Always, &stop).unwrap(),
+        ResourceMoveOutcome::Accepted { .. }
+    ));
     let priority = PrioritySgs::compile(&problem, state.priority().order().to_vec(), &stop).unwrap().unwrap();
     let oracle = ResourceScheduleState::serial(&problem, priority, &stop).unwrap().unwrap();
     assert_eq!(state.starts(), oracle.starts());
@@ -665,7 +789,7 @@ fn cancellation_during_move_reconstruction_preserves_the_incumbent() {
             std::thread::sleep(Duration::from_millis(1));
             stop.store(true, Ordering::Release);
         });
-        state.consider_move(ResourceScheduleMove::Relocate { from: 0, to: activity_count - 1 }, ResourceMoveAcceptance::Always, &stop)
+        state.consider_move(ResourceScheduleMove::Relocate { from: 0, to: activity_count - 1 }, MinimizingMoveAcceptance::Always, &stop)
     });
 
     assert!(outcome.is_err());
@@ -717,7 +841,7 @@ fn workspace_rebuild_honors_prearmed_and_concurrent_cancellation_without_mutatin
         state
             .consider_move(
                 ResourceScheduleMove::AdjacentSwap { first_position: activity_count - 2 },
-                ResourceMoveAcceptance::Improving,
+                MinimizingMoveAcceptance::Improving,
                 &concurrent,
             )
             .unwrap(),

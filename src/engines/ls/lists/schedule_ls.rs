@@ -5,13 +5,12 @@ use crate::engines::ls::schedule_ir::PrecedenceDag;
 use crate::mix64;
 use crate::model::list::{CollectionSolution, IntervalVar, Resource, Schedule};
 
+use super::move_acceptance::MinimizingMoveAcceptance;
 use super::resource_schedule::{
-    GenerationScheme, Justification, PriorityRule, PrioritySgs, ResourceAlnsBudget, ResourceMoveAcceptance, ResourceMoveOutcome,
-    ResourceScheduleMetrics, ResourceScheduleProblem, ResourceScheduleState,
+    GenerationScheme, Justification, PriorityRule, PrioritySgs, ResourceAlnsBudget, ResourceMoveOutcome, ResourceScheduleMetrics,
+    ResourceScheduleProblem, ResourceScheduleState,
 };
-use super::schedule_state::{
-    CriticalNeighborhood, DispatchRule, JobShopProblem, JobShopState, MoveAcceptance, MoveOutcome, ScheduleStateMetrics,
-};
+use super::schedule_state::{CriticalNeighborhood, DispatchRule, JobShopProblem, JobShopState, MoveOutcome, ScheduleStateMetrics};
 
 /// Scheduling-search measurements shared with the collection profiler.
 pub(crate) struct ScheduleConstructionMetrics {
@@ -1140,7 +1139,7 @@ fn solve_job_shop(
                     break 'attempts;
                 }
                 moves_used = moves_used.saturating_add(1);
-                match state.consider_move(movement, MoveAcceptance::Improving, stop) {
+                match state.consider_move(movement, MinimizingMoveAcceptance::Improving, stop) {
                     Ok(MoveOutcome::Accepted { .. }) => {
                         accepted = true;
                         incumbent_improvements = incumbent_improvements.saturating_add(u64::from(retain_job_shop_incumbent(
@@ -1184,7 +1183,7 @@ fn solve_job_shop(
                     break 'attempts;
                 }
                 moves_used = moves_used.saturating_add(1);
-                match state.consider_move(movement, MoveAcceptance::Always, stop) {
+                match state.consider_move(movement, MinimizingMoveAcceptance::Always, stop) {
                     Ok(MoveOutcome::Accepted { .. }) => {
                         kicked = true;
                         kicks = kicks.saturating_add(1);
@@ -1439,7 +1438,7 @@ fn solve_resource_schedule(
                     break;
                 }
                 search_steps = search_steps.saturating_add(1);
-                match state.consider_move(movement, ResourceMoveAcceptance::Improving, stop) {
+                match state.consider_move(movement, MinimizingMoveAcceptance::Improving, stop) {
                     Ok(ResourceMoveOutcome::Accepted { .. }) => {
                         accepted = true;
                         next_justification = 0;
@@ -1506,7 +1505,7 @@ fn solve_resource_schedule(
                         break;
                     }
                     search_steps = search_steps.saturating_add(1);
-                    match state.consider_move(movement, ResourceMoveAcceptance::Improving, stop) {
+                    match state.consider_move(movement, MinimizingMoveAcceptance::Improving, stop) {
                         Ok(ResourceMoveOutcome::Accepted { .. }) => {
                             accepted = true;
                             next_justification = 0;
@@ -1538,7 +1537,7 @@ fn solve_resource_schedule(
                         break;
                     }
                     search_steps = search_steps.saturating_add(1);
-                    match state.consider_move(movement, ResourceMoveAcceptance::Always, stop) {
+                    match state.consider_move(movement, MinimizingMoveAcceptance::Always, stop) {
                         Ok(ResourceMoveOutcome::Accepted { .. }) => {
                             kicks = kicks.saturating_add(1);
                             next_justification = 0;
@@ -1573,7 +1572,7 @@ fn solve_resource_schedule(
                 break;
             }
             search_steps = search_steps.saturating_add(1);
-            match state.consider_move(movements[0], ResourceMoveAcceptance::Always, stop) {
+            match state.consider_move(movements[0], MinimizingMoveAcceptance::Always, stop) {
                 Ok(ResourceMoveOutcome::Accepted { .. }) => {
                     kicks = kicks.saturating_add(1);
                     next_justification = 0;

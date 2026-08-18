@@ -9,7 +9,6 @@
 //! by an independent full reconstruction before it is committed.
 
 use std::collections::BTreeMap;
-use std::ops::Bound::{Excluded, Unbounded};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -17,6 +16,8 @@ use std::sync::Arc;
 use crate::engines::ls::schedule_ir::PrecedenceDag;
 use crate::mix64;
 use crate::model::list::{CollectionSolution, Resource, Schedule};
+
+use super::move_acceptance::MinimizingMoveAcceptance;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ResourceScheduleInterrupted;
@@ -433,10 +434,72 @@ struct EventProfile {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProfileFit {
+pub(crate) enum ProfileFit {
     Fits,
     RetryAt(i64),
     Impossible,
+}
+
+fn fit_sorted_event_profile<I>(
+    capacity: i128,
+    events: I,
+    start: i64,
+    end: i64,
+    demand: i128,
+    stop: &AtomicBool,
+    stats: &mut ReconstructionStats,
+) -> Result<ProfileFit, ResourceScheduleInterrupted>
+where
+    I: Iterator<Item = (i64, i128)>,
+{
+    checkpoint(stop)?;
+    stats.profile_checks = stats.profile_checks.saturating_add(1);
+    if demand == 0 || start == end {
+        return Ok(ProfileFit::Fits);
+    }
+    if demand > capacity {
+        return Ok(ProfileFit::Impossible);
+    }
+
+    let mut events = events.peekable();
+    let mut usage = 0i128;
+    while events.peek().is_some_and(|(time, _)| *time <= start) {
+        checkpoint(stop)?;
+        stats.event_visits = stats.event_visits.saturating_add(1);
+        let (_, delta) = events.next().expect("a peeked event remains available");
+        let Some(updated) = usage.checked_add(delta) else {
+            return Ok(ProfileFit::Impossible);
+        };
+        usage = updated;
+    }
+
+    let mut cursor = start;
+    loop {
+        checkpoint(stop)?;
+        if cursor >= end {
+            return Ok(ProfileFit::Fits);
+        }
+        let next = events.next();
+        let next_time = next.map(|(time, _)| time);
+        let Some(with_candidate) = usage.checked_add(demand) else {
+            return Ok(ProfileFit::Impossible);
+        };
+        if with_candidate > capacity {
+            return Ok(next_time.map_or(ProfileFit::Impossible, ProfileFit::RetryAt));
+        }
+        let Some((time, delta)) = next else {
+            return Ok(ProfileFit::Fits);
+        };
+        stats.event_visits = stats.event_visits.saturating_add(1);
+        if time >= end {
+            return Ok(ProfileFit::Fits);
+        }
+        let Some(updated) = usage.checked_add(delta) else {
+            return Ok(ProfileFit::Impossible);
+        };
+        usage = updated;
+        cursor = time;
+    }
 }
 
 impl EventProfile {
@@ -481,53 +544,7 @@ impl EventProfile {
         stop: &AtomicBool,
         stats: &mut ReconstructionStats,
     ) -> Result<ProfileFit, ResourceScheduleInterrupted> {
-        checkpoint(stop)?;
-        stats.profile_checks = stats.profile_checks.saturating_add(1);
-        if demand == 0 || start == end {
-            return Ok(ProfileFit::Fits);
-        }
-        if demand > self.capacity {
-            return Ok(ProfileFit::Impossible);
-        }
-
-        let mut usage = 0i128;
-        for (_, &delta) in self.events.range(..=start) {
-            checkpoint(stop)?;
-            stats.event_visits = stats.event_visits.saturating_add(1);
-            let Some(updated) = usage.checked_add(delta) else {
-                return Ok(ProfileFit::Impossible);
-            };
-            usage = updated;
-        }
-
-        let mut cursor = start;
-        let mut future = self.events.range((Excluded(start), Unbounded));
-        loop {
-            checkpoint(stop)?;
-            if cursor >= end {
-                return Ok(ProfileFit::Fits);
-            }
-            let next = future.next();
-            let next_time = next.map(|(&time, _)| time);
-            let Some(with_candidate) = usage.checked_add(demand) else {
-                return Ok(ProfileFit::Impossible);
-            };
-            if with_candidate > self.capacity {
-                return Ok(next_time.map_or(ProfileFit::Impossible, ProfileFit::RetryAt));
-            }
-            let Some((&time, &delta)) = next else {
-                return Ok(ProfileFit::Fits);
-            };
-            stats.event_visits = stats.event_visits.saturating_add(1);
-            if time >= end {
-                return Ok(ProfileFit::Fits);
-            }
-            let Some(updated) = usage.checked_add(delta) else {
-                return Ok(ProfileFit::Impossible);
-            };
-            usage = updated;
-            cursor = time;
-        }
+        fit_sorted_event_profile(self.capacity, self.events.iter().map(|(&time, &delta)| (time, delta)), start, end, demand, stop, stats)
     }
 }
 
@@ -623,54 +640,45 @@ impl ReusableEventProfile {
         stop: &AtomicBool,
         stats: &mut ReconstructionStats,
     ) -> Result<ProfileFit, ResourceScheduleInterrupted> {
-        checkpoint(stop)?;
-        stats.profile_checks = stats.profile_checks.saturating_add(1);
-        if demand == 0 || start == end {
-            return Ok(ProfileFit::Fits);
-        }
-        if demand > self.capacity {
-            return Ok(ProfileFit::Impossible);
-        }
-
-        let first_future = self.events.partition_point(|event| event.time <= start);
-        let mut usage = 0i128;
-        for event in &self.events[..first_future] {
-            checkpoint(stop)?;
-            stats.event_visits = stats.event_visits.saturating_add(1);
-            let Some(updated) = usage.checked_add(event.delta) else {
-                return Ok(ProfileFit::Impossible);
-            };
-            usage = updated;
-        }
-
-        let mut cursor = start;
-        let mut future = self.events[first_future..].iter();
-        loop {
-            checkpoint(stop)?;
-            if cursor >= end {
-                return Ok(ProfileFit::Fits);
-            }
-            let next = future.next();
-            let Some(with_candidate) = usage.checked_add(demand) else {
-                return Ok(ProfileFit::Impossible);
-            };
-            if with_candidate > self.capacity {
-                return Ok(next.map_or(ProfileFit::Impossible, |event| ProfileFit::RetryAt(event.time)));
-            }
-            let Some(event) = next else {
-                return Ok(ProfileFit::Fits);
-            };
-            stats.event_visits = stats.event_visits.saturating_add(1);
-            if event.time >= end {
-                return Ok(ProfileFit::Fits);
-            }
-            let Some(updated) = usage.checked_add(event.delta) else {
-                return Ok(ProfileFit::Impossible);
-            };
-            usage = updated;
-            cursor = event.time;
-        }
+        fit_sorted_event_profile(self.capacity, self.events.iter().map(|event| (event.time, event.delta)), start, end, demand, stop, stats)
     }
+}
+
+#[cfg(test)]
+pub(crate) struct EventProfileFitAudit {
+    pub(crate) result: Result<ProfileFit, ResourceScheduleInterrupted>,
+    pub(crate) profile_checks: u64,
+    pub(crate) event_visits: u64,
+}
+
+#[cfg(test)]
+pub(crate) fn audit_event_profile_fit(
+    capacity: i128,
+    bookings: &[(i64, i64, i128)],
+    start: i64,
+    end: i64,
+    demand: i128,
+    stop: &AtomicBool,
+) -> Option<[EventProfileFitAudit; 2]> {
+    let mut event_profile = EventProfile::new(capacity);
+    let mut reusable_profile = ReusableEventProfile::with_event_capacity(capacity, bookings.len().checked_mul(2)?);
+    for &(booking_start, booking_end, booking_demand) in bookings {
+        event_profile.book(booking_start, booking_end, booking_demand)?;
+        reusable_profile.book(booking_start, booking_end, booking_demand)?;
+    }
+
+    let mut event_stats = ReconstructionStats::default();
+    let event_result = event_profile.fit(start, end, demand, stop, &mut event_stats);
+    let mut reusable_stats = ReconstructionStats::default();
+    let reusable_result = reusable_profile.fit(start, end, demand, stop, &mut reusable_stats);
+    Some([
+        EventProfileFitAudit { result: event_result, profile_checks: event_stats.profile_checks, event_visits: event_stats.event_visits },
+        EventProfileFitAudit {
+            result: reusable_result,
+            profile_checks: reusable_stats.profile_checks,
+            event_visits: reusable_stats.event_visits,
+        },
+    ])
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1569,23 +1577,6 @@ pub(crate) struct ResourceAlnsGeneration {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ResourceMoveAcceptance {
-    Improving,
-    NonWorsening,
-    Always,
-}
-
-impl ResourceMoveAcceptance {
-    fn accepts(self, current: i64, candidate: i64) -> bool {
-        match self {
-            Self::Improving => candidate < current,
-            Self::NonWorsening => candidate <= current,
-            Self::Always => true,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ResourceMoveRejection {
     Invalid,
     Precedence,
@@ -1908,7 +1899,7 @@ impl ResourceScheduleState {
     pub(crate) fn consider_move(
         &mut self,
         movement: ResourceScheduleMove,
-        acceptance: ResourceMoveAcceptance,
+        acceptance: MinimizingMoveAcceptance,
         stop: &AtomicBool,
     ) -> Result<ResourceMoveOutcome, ResourceScheduleInterrupted> {
         checkpoint(stop)?;

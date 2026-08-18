@@ -16,7 +16,7 @@ use super::moves::better;
 use crate::engines::dual;
 use crate::mix64;
 use crate::model::list::{CollectionModel, CollectionSolution, ObjectiveTier};
-use crate::orchestrator::{execute_workers, EventControl};
+use crate::orchestrator::{execute_workers, worker_iteration_quota, EventControl};
 
 const WORKER_SEED_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
 
@@ -334,15 +334,6 @@ fn solve_collection_parallel_internal(
         worker_metrics,
     };
     (solution, metrics)
-}
-
-fn worker_iteration_quota(total: u64, worker: usize, workers: usize) -> u64 {
-    if total == u64::MAX {
-        return u64::MAX;
-    }
-    let workers = u64::try_from(workers).unwrap_or(u64::MAX).max(1);
-    let worker = u64::try_from(worker).unwrap_or(u64::MAX);
-    total / workers + u64::from(worker < total % workers)
 }
 
 fn solution_better(candidate: &CollectionSolution, incumbent: &CollectionSolution, model: &CollectionModel) -> bool {

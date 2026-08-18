@@ -8,7 +8,7 @@ use pyo3::class::basic::CompareOp;
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyTimeoutError, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyIterator, PyModule, PyTuple};
+use pyo3::types::{PyAny, PyDict, PyIterator, PyModule};
 
 use crate::model as shared_model;
 use crate::model::list;
@@ -20,6 +20,10 @@ use crate::orchestrator::{
     SemanticAssumption, SemanticAssumptionOp, SemanticNogoodRelation, SemanticSolveSession, SolveError, SolveEvent, SolveLimits, SolveMode,
     SolveRequest, SolveResult, SolveStatus, VerificationLevel,
 };
+
+mod lambda_dsl;
+
+use lambda_dsl::compile_callable;
 
 mod expr {
     use super::{Expr, IntVarRef};
@@ -3968,7 +3972,7 @@ impl PyModel {
             with_interrupts(py, move || extract_model_mus_with_external_stop(&package, &vars, &selectors, &request, &SIGINT_TRIPPED))?
                 .map_err(integer_solve_error)?;
         match result {
-            ModelMusResult::Sat(_) => Ok(None),
+            ModelMusResult::Satisfiable => Ok(None),
             ModelMusResult::Interrupted => Err(PyTimeoutError::new_err("mus() timed out")),
             ModelMusResult::Mus(core) => Ok(Some(core.into_iter().map(|selector| self.selector_name(IntVarRef(selector))).collect())),
         }
@@ -4027,7 +4031,7 @@ impl PyModel {
                 ModelMusResult::Mus(core) if !core.is_empty() => {
                     explain_model_mus_with_external_stop(&package, &vars, &core, &request, &SIGINT_TRIPPED)
                 }
-                ModelMusResult::Sat(_) | ModelMusResult::Mus(_) | ModelMusResult::Interrupted => Ok(None),
+                ModelMusResult::Satisfiable | ModelMusResult::Mus(_) | ModelMusResult::Interrupted => Ok(None),
             }
         })?
         .map_err(integer_solve_error)?;
@@ -4906,161 +4910,6 @@ fn domain(values: Vec<i64>) -> PyResult<Vec<i32>> {
     values.into_iter().map(|value| checked_i32(value, "domain value")).collect()
 }
 
-/// A node of a lambda body, built by the Python lambda at model-construction
-/// time. Held as an `Arc` tree so subexpressions and constant tables are shared
-/// rather than copied. Never executed as Python during solving; it is lowered
-/// to a [`list::ExprArena`] when the term joins the model.
-enum PyNode {
-    Const(i64),
-    Arg(u8),
-    Array(Arc<Vec<i64>>, Arc<PyNode>),
-    Matrix(Arc<Vec<Vec<i64>>>, Arc<PyNode>, Arc<PyNode>),
-    Add(Arc<PyNode>, Arc<PyNode>),
-    Sub(Arc<PyNode>, Arc<PyNode>),
-    Mul(Arc<PyNode>, Arc<PyNode>),
-    Mod(Arc<PyNode>, Arc<PyNode>),
-    Pow(Arc<PyNode>, u32),
-    MulScaled(Arc<PyNode>, Arc<PyNode>, i64),
-    DivScaled(Arc<PyNode>, Arc<PyNode>, i64),
-    Min(Arc<PyNode>, Arc<PyNode>),
-    Max(Arc<PyNode>, Arc<PyNode>),
-    Div(Arc<PyNode>, Arc<PyNode>),
-    Abs(Arc<PyNode>),
-    Lt(Arc<PyNode>, Arc<PyNode>),
-    Le(Arc<PyNode>, Arc<PyNode>),
-    Eq(Arc<PyNode>, Arc<PyNode>),
-    Ne(Arc<PyNode>, Arc<PyNode>),
-    IfThenElse(Arc<PyNode>, Arc<PyNode>, Arc<PyNode>),
-    PiecewiseLinear(Arc<PyNode>, Arc<Vec<(i64, i64)>>),
-    External(Arc<str>, Arc<Vec<Arc<PyNode>>>),
-}
-
-/// A symbolic lambda-body expression. Arithmetic operators build a bigger tree;
-/// indexing an `Array`/`Matrix` with one of these builds a table lookup.
-#[pyclass(name = "LambdaExpr", module = "qayd", skip_from_py_object)]
-#[derive(Clone)]
-struct PyLambdaExpr {
-    node: Arc<PyNode>,
-}
-
-fn node(n: PyNode) -> PyLambdaExpr {
-    PyLambdaExpr { node: Arc::new(n) }
-}
-
-/// Coerce a Python value used in a lambda body to a node: a lambda expression
-/// stays, an integer becomes a constant.
-fn coerce_node(obj: &Bound<'_, PyAny>) -> PyResult<Arc<PyNode>> {
-    if let Ok(e) = obj.extract::<PyRef<'_, PyLambdaExpr>>() {
-        return Ok(e.node.clone());
-    }
-    if let Ok(v) = obj.extract::<i64>() {
-        return Ok(Arc::new(PyNode::Const(v)));
-    }
-    Err(PyTypeError::new_err("a lambda body may only combine lambda expressions and integers"))
-}
-
-#[pymethods]
-impl PyLambdaExpr {
-    fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-        Ok(node(PyNode::Add(self.node.clone(), coerce_node(other)?)))
-    }
-    fn __radd__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-        Ok(node(PyNode::Add(coerce_node(other)?, self.node.clone())))
-    }
-    fn __sub__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-        Ok(node(PyNode::Sub(self.node.clone(), coerce_node(other)?)))
-    }
-    fn __rsub__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-        Ok(node(PyNode::Sub(coerce_node(other)?, self.node.clone())))
-    }
-    fn __mul__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-        Ok(node(PyNode::Mul(self.node.clone(), coerce_node(other)?)))
-    }
-    fn __rmul__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-        Ok(node(PyNode::Mul(coerce_node(other)?, self.node.clone())))
-    }
-    fn __mod__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-        Ok(node(PyNode::Mod(self.node.clone(), coerce_node(other)?)))
-    }
-    fn __rmod__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-        Ok(node(PyNode::Mod(coerce_node(other)?, self.node.clone())))
-    }
-    fn __pow__(&self, exponent: u32, modulo: Option<&Bound<'_, PyAny>>) -> PyResult<PyLambdaExpr> {
-        if modulo.is_some() {
-            return Err(PyValueError::new_err("modular power is not supported; use (x ** n) % m"));
-        }
-        Ok(node(PyNode::Pow(self.node.clone(), exponent)))
-    }
-    fn __neg__(&self) -> PyLambdaExpr {
-        node(PyNode::Sub(Arc::new(PyNode::Const(0)), self.node.clone()))
-    }
-    fn __floordiv__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-        Ok(node(PyNode::Div(self.node.clone(), coerce_node(other)?)))
-    }
-    fn __rfloordiv__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-        Ok(node(PyNode::Div(coerce_node(other)?, self.node.clone())))
-    }
-    fn __lt__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-        Ok(node(PyNode::Lt(self.node.clone(), coerce_node(other)?)))
-    }
-    fn __le__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-        Ok(node(PyNode::Le(self.node.clone(), coerce_node(other)?)))
-    }
-    fn __gt__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-        // a > b  ==  b < a
-        Ok(node(PyNode::Lt(coerce_node(other)?, self.node.clone())))
-    }
-    fn __ge__(&self, other: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-        Ok(node(PyNode::Le(coerce_node(other)?, self.node.clone())))
-    }
-}
-
-/// A constant integer array; index it with a lambda arg to read `array[i]`.
-#[pyclass(name = "Array", module = "qayd", skip_from_py_object)]
-#[derive(Clone)]
-struct PyArray {
-    data: Arc<Vec<i64>>,
-}
-
-#[pymethods]
-impl PyArray {
-    fn __getitem__(&self, idx: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-        Ok(node(PyNode::Array(self.data.clone(), coerce_node(idx)?)))
-    }
-    fn __len__(&self) -> usize {
-        self.data.len()
-    }
-}
-
-/// A constant integer matrix; `matrix[i][j]` reads a cell.
-#[pyclass(name = "Matrix", module = "qayd", skip_from_py_object)]
-#[derive(Clone)]
-struct PyMatrix {
-    data: Arc<Vec<Vec<i64>>>,
-}
-
-#[pymethods]
-impl PyMatrix {
-    fn __getitem__(&self, row: &Bound<'_, PyAny>) -> PyResult<PyMatrixRow> {
-        Ok(PyMatrixRow { data: self.data.clone(), row: coerce_node(row)? })
-    }
-}
-
-/// The partially indexed `matrix[i]`; index again to get `matrix[i][j]`.
-#[pyclass(name = "MatrixRow", module = "qayd", skip_from_py_object)]
-#[derive(Clone)]
-struct PyMatrixRow {
-    data: Arc<Vec<Vec<i64>>>,
-    row: Arc<PyNode>,
-}
-
-#[pymethods]
-impl PyMatrixRow {
-    fn __getitem__(&self, col: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-        Ok(node(PyNode::Matrix(self.data.clone(), self.row.clone(), coerce_node(col)?)))
-    }
-}
-
 /// A term over one or more list variables: a sum of reductions. Built by the
 /// reduction operators (`sum`, `sum_edges`, ...), added together for an
 /// objective, and compared to an integer for a constraint.
@@ -5290,110 +5139,6 @@ struct PyReified {
     reduction: list::Reduction,
 }
 
-/// Lower a Python lambda-body tree into a reduction's flat expression arena.
-fn lower(n: &PyNode, arena: &mut list::ExprArena) -> list::ExprId {
-    match n {
-        PyNode::Const(c) => arena.constant(*c),
-        PyNode::Arg(k) => arena.arg(*k),
-        PyNode::Array(a, i) => {
-            let ie = lower(i, arena);
-            arena.array(a.clone(), ie)
-        }
-        PyNode::Matrix(m, i, j) => {
-            let ie = lower(i, arena);
-            let je = lower(j, arena);
-            arena.matrix(m.clone(), ie, je)
-        }
-        PyNode::Add(a, b) => {
-            let x = lower(a, arena);
-            let y = lower(b, arena);
-            arena.add(x, y)
-        }
-        PyNode::Sub(a, b) => {
-            let x = lower(a, arena);
-            let y = lower(b, arena);
-            arena.sub(x, y)
-        }
-        PyNode::Mul(a, b) => {
-            let x = lower(a, arena);
-            let y = lower(b, arena);
-            arena.mul(x, y)
-        }
-        PyNode::Mod(a, b) => {
-            let x = lower(a, arena);
-            let y = lower(b, arena);
-            arena.modulo(x, y)
-        }
-        PyNode::Pow(base, exponent) => {
-            let base = lower(base, arena);
-            arena.pow(base, *exponent)
-        }
-        PyNode::MulScaled(a, b, scale) => {
-            let x = lower(a, arena);
-            let y = lower(b, arena);
-            arena.mul_scaled(x, y, *scale)
-        }
-        PyNode::DivScaled(a, b, scale) => {
-            let x = lower(a, arena);
-            let y = lower(b, arena);
-            arena.div_scaled(x, y, *scale)
-        }
-        PyNode::Min(a, b) => {
-            let x = lower(a, arena);
-            let y = lower(b, arena);
-            arena.min(x, y)
-        }
-        PyNode::Max(a, b) => {
-            let x = lower(a, arena);
-            let y = lower(b, arena);
-            arena.max(x, y)
-        }
-        PyNode::Div(a, b) => {
-            let x = lower(a, arena);
-            let y = lower(b, arena);
-            arena.div(x, y)
-        }
-        PyNode::Abs(a) => {
-            let x = lower(a, arena);
-            arena.abs(x)
-        }
-        PyNode::Lt(a, b) => {
-            let x = lower(a, arena);
-            let y = lower(b, arena);
-            arena.lt(x, y)
-        }
-        PyNode::Le(a, b) => {
-            let x = lower(a, arena);
-            let y = lower(b, arena);
-            arena.le(x, y)
-        }
-        PyNode::Eq(a, b) => {
-            let x = lower(a, arena);
-            let y = lower(b, arena);
-            arena.eq(x, y)
-        }
-        PyNode::Ne(a, b) => {
-            let x = lower(a, arena);
-            let y = lower(b, arena);
-            arena.ne(x, y)
-        }
-        PyNode::IfThenElse(c, a, b) => {
-            let cc = lower(c, arena);
-            let x = lower(a, arena);
-            let y = lower(b, arena);
-            arena.if_then_else(cc, x, y)
-        }
-        PyNode::PiecewiseLinear(input, points) => {
-            let input = lower(input, arena);
-            arena.piecewise_linear(input, points.clone())
-        }
-        PyNode::External(name, args) => {
-            let args = args.iter().map(|arg| lower(arg, arena)).collect();
-            arena.external(name.clone(), args)
-        }
-    }
-}
-
 fn single_term(route: &PyListVar, reduction: list::Reduction) -> PyTerm {
     PyTerm { model_id: route.model_id, gen: route.gen, reductions: vec![reduction], max_terms: None, values: Vec::new() }
 }
@@ -5416,9 +5161,8 @@ fn require_ordered(route: &PyListVar, operation: &str) -> PyResult<()> {
 
 /// Build a per-item reduction `op(route, i => body)` from a Python lambda.
 fn build_items_reduction(route: &PyListVar, op: list::ReduceOp, func: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
-    let body = coerce_node(&func.call1((node(PyNode::Arg(0)),))?)?;
     let mut arena = list::ExprArena::default();
-    let body_id = lower(&body, &mut arena);
+    let body_id = compile_callable(func, &[0], &mut arena)?;
     Ok(single_term(route, list::Reduction { op, iterable: item_iterable(route), arena, body: body_id, coeff: 1 }))
 }
 
@@ -5503,18 +5247,17 @@ fn count_reduction(route: &PyListVar, func: Option<&Bound<'_, PyAny>>) -> PyResu
 #[pyo3(signature = (route, func, *, start=0, end=0))]
 fn sum_edges(route: &PyListVar, func: &Bound<'_, PyAny>, start: i32, end: i32) -> PyResult<PyTerm> {
     require_ordered(route, "sum_edges")?;
-    let body = coerce_node(&func.call1((node(PyNode::Arg(0)), node(PyNode::Arg(1))))?)?;
     let mut arena = list::ExprArena::default();
-    let body_id = lower(&body, &mut arena);
+    let body_id = compile_callable(func, &[0, 1], &mut arena)?;
     let iterable = list::Iterable::Edges { list: route.index as usize, start, end };
     Ok(single_term(route, list::Reduction { op: list::ReduceOp::Sum, iterable, arena, body: body_id, coeff: 1 }))
 }
 
-fn pairs_term(route: &PyListVar, body: Arc<PyNode>) -> PyTerm {
+fn pairs_term(route: &PyListVar, func: &Bound<'_, PyAny>, slots: &[u8]) -> PyResult<PyTerm> {
     let mut arena = list::ExprArena::default();
-    let body_id = lower(&body, &mut arena);
+    let body_id = compile_callable(func, slots, &mut arena)?;
     let iterable = list::Iterable::Pairs(route.index as usize);
-    single_term(route, list::Reduction { op: list::ReduceOp::Sum, iterable, arena, body: body_id, coeff: 1 })
+    Ok(single_term(route, list::Reduction { op: list::ReduceOp::Sum, iterable, arena, body: body_id, coeff: 1 }))
 }
 
 /// `item_pairs(route, (a, b) => body)`: sum the body over every ordered pair of
@@ -5523,8 +5266,7 @@ fn pairs_term(route: &PyListVar, body: Arc<PyNode>) -> PyTerm {
 #[pyfunction]
 fn item_pairs(route: &PyListVar, func: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
     require_ordered(route, "item_pairs")?;
-    let body = coerce_node(&func.call1((node(PyNode::Arg(0)), node(PyNode::Arg(1))))?)?;
-    Ok(pairs_term(route, body))
+    pairs_term(route, func, &[0, 1])
 }
 
 /// `pos_pairs(route, (a, b, i, j) => body)`: sum the body over every ordered
@@ -5534,102 +5276,7 @@ fn item_pairs(route: &PyListVar, func: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
 #[pyfunction]
 fn pos_pairs(route: &PyListVar, func: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
     require_ordered(route, "pos_pairs")?;
-    let args = (node(PyNode::Arg(0)), node(PyNode::Arg(1)), node(PyNode::Arg(2)), node(PyNode::Arg(3)));
-    let body = coerce_node(&func.call1(args)?)?;
-    Ok(pairs_term(route, body))
-}
-
-/// `min(a, b)` / `max(a, b)` inside a lambda body (each operand an expression or
-/// integer).
-#[pyfunction(name = "min")]
-fn min_expr(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-    Ok(node(PyNode::Min(coerce_node(a)?, coerce_node(b)?)))
-}
-
-#[pyfunction(name = "max")]
-fn max_expr(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-    Ok(node(PyNode::Max(coerce_node(a)?, coerce_node(b)?)))
-}
-
-/// `abs(x)` inside a lambda body.
-#[pyfunction(name = "abs")]
-fn abs_expr(a: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-    Ok(node(PyNode::Abs(coerce_node(a)?)))
-}
-
-/// `cond != 0 ? a : b` inside a lambda body.
-#[pyfunction(name = "if_")]
-fn if_expr(cond: &Bound<'_, PyAny>, a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-    Ok(node(PyNode::IfThenElse(coerce_node(cond)?, coerce_node(a)?, coerce_node(b)?)))
-}
-
-/// `a == b` / `a != b` (1 or 0) inside a lambda body.
-#[pyfunction(name = "eq")]
-fn eq_expr(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-    Ok(node(PyNode::Eq(coerce_node(a)?, coerce_node(b)?)))
-}
-
-#[pyfunction(name = "ne")]
-fn ne_expr(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<PyLambdaExpr> {
-    Ok(node(PyNode::Ne(coerce_node(a)?, coerce_node(b)?)))
-}
-
-/// Convert a finite Python float into a deterministic fixed-point raw value.
-#[pyfunction]
-#[pyo3(signature = (value, *, scale=1_000_000))]
-fn fixed(value: f64, scale: i64) -> PyResult<i64> {
-    list::FixedPoint::from_f64(value, scale).map(|value| value.raw).map_err(PyValueError::new_err)
-}
-
-/// Fixed-point multiplication with nearest-integer rounding.
-#[pyfunction]
-fn mul_scaled(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>, scale: i64) -> PyResult<PyLambdaExpr> {
-    if scale <= 0 {
-        return Err(PyValueError::new_err("fixed-point scale must be positive"));
-    }
-    Ok(node(PyNode::MulScaled(coerce_node(a)?, coerce_node(b)?, scale)))
-}
-
-/// Fixed-point division with nearest-integer rounding.
-#[pyfunction]
-fn div_scaled(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>, scale: i64) -> PyResult<PyLambdaExpr> {
-    if scale <= 0 {
-        return Err(PyValueError::new_err("fixed-point scale must be positive"));
-    }
-    Ok(node(PyNode::DivScaled(coerce_node(a)?, coerce_node(b)?, scale)))
-}
-
-/// Continuous piecewise-linear interpolation over fixed-point knots.
-#[pyfunction]
-fn piecewise(input: &Bound<'_, PyAny>, points: Vec<(i64, i64)>) -> PyResult<PyLambdaExpr> {
-    if points.is_empty() || points.windows(2).any(|window| window[0].0 >= window[1].0) {
-        return Err(PyValueError::new_err("piecewise points need strictly increasing x coordinates"));
-    }
-    Ok(node(PyNode::PiecewiseLinear(coerce_node(input)?, Arc::new(points))))
-}
-
-/// Register a deterministic Python callback callable from list expressions.
-#[pyfunction]
-fn register_external(name: String, function: Py<PyAny>) -> PyResult<()> {
-    let callback = function;
-    list::register_external_function(name, move |args| {
-        Python::attach(|py| {
-            let tuple = PyTuple::new(py, args).map_err(|error| error.to_string())?;
-            callback.bind(py).call1(tuple).and_then(|value| value.extract::<i64>()).map_err(|error| error.to_string())
-        })
-    })
-    .map_err(PyValueError::new_err)
-}
-
-/// Build a call to a previously registered external function.
-#[pyfunction]
-#[pyo3(signature = (name, *args))]
-fn external(name: String, args: &Bound<'_, PyTuple>) -> PyResult<PyLambdaExpr> {
-    if !list::external_function_registered(&name) {
-        return Err(PyValueError::new_err(format!("external function '{name}' is not registered")));
-    }
-    let args = args.iter().map(|arg| coerce_node(&arg)).collect::<PyResult<Vec<_>>>()?;
-    Ok(node(PyNode::External(name.into(), Arc::new(args))))
+    pairs_term(route, func, &[0, 1, 2, 3])
 }
 
 /// `scan_sum(route, step, emit, init=, boundary=)`: fold an accumulator along
@@ -5654,11 +5301,9 @@ fn scan_sum(
     end: Option<i32>,
 ) -> PyResult<PyTerm> {
     require_ordered(route, "scan_sum")?;
-    let step_body = coerce_node(&step.call1((node(PyNode::Arg(0)), node(PyNode::Arg(1)), node(PyNode::Arg(2))))?)?;
-    let emit_body = coerce_node(&emit.call1((node(PyNode::Arg(0)), node(PyNode::Arg(1)), node(PyNode::Arg(2))))?)?;
     let mut arena = list::ExprArena::default();
-    let step_id = lower(&step_body, &mut arena);
-    let emit_id = lower(&emit_body, &mut arena);
+    let step_id = compile_callable(step, &[0, 1, 2], &mut arena)?;
+    let emit_id = compile_callable(emit, &[0, 1, 2], &mut arena)?;
     let iterable = list::Iterable::Scan { list: route.index as usize, init, boundary, step: step_id, end };
     Ok(single_term(route, list::Reduction { op: list::ReduceOp::Sum, iterable, arena, body: emit_id, coeff: 1 }))
 }
@@ -5674,11 +5319,9 @@ fn scan_sum(
 #[pyo3(signature = (route, k, step, emit, *, init=0, boundary=0))]
 fn select_kth(route: &PyListVar, k: usize, step: &Bound<'_, PyAny>, emit: &Bound<'_, PyAny>, init: i64, boundary: i32) -> PyResult<PyTerm> {
     require_ordered(route, "select_kth")?;
-    let step_body = coerce_node(&step.call1((node(PyNode::Arg(0)), node(PyNode::Arg(1)), node(PyNode::Arg(2))))?)?;
-    let emit_body = coerce_node(&emit.call1((node(PyNode::Arg(0)), node(PyNode::Arg(1)), node(PyNode::Arg(2))))?)?;
     let mut arena = list::ExprArena::default();
-    let step_id = lower(&step_body, &mut arena);
-    let emit_id = lower(&emit_body, &mut arena);
+    let step_id = compile_callable(step, &[0, 1, 2], &mut arena)?;
+    let emit_id = compile_callable(emit, &[0, 1, 2], &mut arena)?;
     let iterable = list::Iterable::Scan { list: route.index as usize, init, boundary, step: step_id, end: None };
     Ok(single_term(route, list::Reduction { op: list::ReduceOp::SelectKth(k), iterable, arena, body: emit_id, coeff: 1 }))
 }
@@ -5690,24 +5333,11 @@ fn select_kth(route: &PyListVar, k: usize, step: &Bound<'_, PyAny>, emit: &Bound
 #[pyfunction]
 fn windows(route: &PyListVar, size: usize, inner: &Bound<'_, PyAny>, emit: &Bound<'_, PyAny>) -> PyResult<PyTerm> {
     require_ordered(route, "windows")?;
-    let inner_body = coerce_node(&inner.call1((node(PyNode::Arg(0)),))?)?;
-    let emit_body = coerce_node(&emit.call1((node(PyNode::Arg(1)),))?)?;
     let mut arena = list::ExprArena::default();
-    let inner_id = lower(&inner_body, &mut arena);
-    let emit_id = lower(&emit_body, &mut arena);
+    let inner_id = compile_callable(inner, &[0], &mut arena)?;
+    let emit_id = compile_callable(emit, &[1], &mut arena)?;
     let iterable = list::Iterable::Windows { list: route.index as usize, size, inner: inner_id };
     Ok(single_term(route, list::Reduction { op: list::ReduceOp::Sum, iterable, arena, body: emit_id, coeff: 1 }))
-}
-
-/// Wrap a constant integer array / matrix for use inside lambdas.
-#[pyfunction]
-fn array(data: Vec<i64>) -> PyArray {
-    PyArray { data: Arc::new(data) }
-}
-
-#[pyfunction]
-fn matrix(data: Vec<Vec<i64>>) -> PyMatrix {
-    PyMatrix { data: Arc::new(data) }
 }
 
 /// `1` if `route` has any item, else `0`. Summed over routes (e.g.
@@ -5741,10 +5371,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ListValue>()?;
     m.add_class::<PyReified>()?;
     m.add_class::<PyExpr>()?;
-    m.add_class::<PyLambdaExpr>()?;
-    m.add_class::<PyArray>()?;
-    m.add_class::<PyMatrix>()?;
-    m.add_class::<PyMatrixRow>()?;
     m.add_class::<PyConstraint>()?;
     m.add_class::<PySoftGroup>()?;
     m.add_class::<PySolution>()?;
@@ -5760,8 +5386,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(max_of, m)?)?;
     m.add_function(wrap_pyfunction!(if_then_else, m)?)?;
     m.add_function(wrap_pyfunction!(domain, m)?)?;
-    m.add_function(wrap_pyfunction!(array, m)?)?;
-    m.add_function(wrap_pyfunction!(matrix, m)?)?;
+    lambda_dsl::register(m)?;
     m.add_function(wrap_pyfunction!(sum, m)?)?;
     m.add_function(wrap_pyfunction!(minimum, m)?)?;
     m.add_function(wrap_pyfunction!(maximum, m)?)?;
@@ -5769,18 +5394,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sum_edges, m)?)?;
     m.add_function(wrap_pyfunction!(item_pairs, m)?)?;
     m.add_function(wrap_pyfunction!(pos_pairs, m)?)?;
-    m.add_function(wrap_pyfunction!(min_expr, m)?)?;
-    m.add_function(wrap_pyfunction!(max_expr, m)?)?;
-    m.add_function(wrap_pyfunction!(abs_expr, m)?)?;
-    m.add_function(wrap_pyfunction!(if_expr, m)?)?;
-    m.add_function(wrap_pyfunction!(eq_expr, m)?)?;
-    m.add_function(wrap_pyfunction!(ne_expr, m)?)?;
-    m.add_function(wrap_pyfunction!(fixed, m)?)?;
-    m.add_function(wrap_pyfunction!(mul_scaled, m)?)?;
-    m.add_function(wrap_pyfunction!(div_scaled, m)?)?;
-    m.add_function(wrap_pyfunction!(piecewise, m)?)?;
-    m.add_function(wrap_pyfunction!(register_external, m)?)?;
-    m.add_function(wrap_pyfunction!(external, m)?)?;
     m.add_function(wrap_pyfunction!(scan_sum, m)?)?;
     m.add_function(wrap_pyfunction!(select_kth, m)?)?;
     m.add_function(wrap_pyfunction!(windows, m)?)?;

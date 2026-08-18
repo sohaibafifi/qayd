@@ -14,7 +14,10 @@ use super::{SolveBudget, SolveError, SolveRequest, TerminationReason};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelMusResult {
-    Sat(Vec<i32>),
+    /// The selected semantic constraints are jointly satisfiable.
+    ///
+    /// A diagnostic never exposes the compiled solver's physical assignment.
+    Satisfiable,
     Mus(Vec<usize>),
     Interrupted,
 }
@@ -141,7 +144,7 @@ pub fn extract_model_mus_with_external_stop(
         let selector_variables = map_variables(&compiled, selectors, "MUS selector set", budget.stop())?;
         let mut solver = compiled.problem().solver.clone();
         Ok(match mus::extract_mus(&mut solver, &variables, &selector_variables, budget.stop()) {
-            MusResult::Sat(values) => ModelMusResult::Sat(values),
+            MusResult::Sat(_) => ModelMusResult::Satisfiable,
             MusResult::Interrupted => ModelMusResult::Interrupted,
             MusResult::Mus(core) => ModelMusResult::Mus(
                 core.into_iter()

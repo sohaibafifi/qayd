@@ -384,7 +384,7 @@ fn write_core<W: Write>(
                 writeln!(w, "c core-constraint #{} {}", group.source, group.label).map_err(io_err)?;
             }
         }
-        Ok(ModelMusResult::Sat(_)) => {
+        Ok(ModelMusResult::Satisfiable) => {
             writeln!(w, "c core unavailable (instrumented model is satisfiable)").map_err(io_err)?;
         }
         Ok(ModelMusResult::Interrupted) => {

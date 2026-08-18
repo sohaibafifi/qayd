@@ -1,10 +1,20 @@
 use std::sync::atomic::AtomicBool;
 
+use qayd::engines::ls::lists::move_acceptance::MinimizingMoveAcceptance;
 use qayd::engines::ls::lists::schedule_state::{
-    CriticalNeighborhood, DispatchRule, JobShopProblem, JobShopState, MoveAcceptance, MoveOutcome, MoveRejection, ScheduleMove,
+    CriticalNeighborhood, DispatchRule, JobShopProblem, JobShopState, MoveOutcome, MoveRejection, ScheduleMove,
 };
 use qayd::engines::ls::lists::solve_schedule;
 use qayd::model::list::{verify_collection_solution, CollectionModel, IntervalVar, Mode, Resource, Schedule};
+
+#[test]
+fn minimizing_move_acceptance_has_the_shared_makespan_semantics() {
+    assert!(MinimizingMoveAcceptance::Improving.accepts(10, 9));
+    assert!(!MinimizingMoveAcceptance::Improving.accepts(10, 10));
+    assert!(MinimizingMoveAcceptance::NonWorsening.accepts(10, 10));
+    assert!(!MinimizingMoveAcceptance::NonWorsening.accepts(10, 11));
+    assert!(MinimizingMoveAcceptance::Always.accepts(10, 11));
+}
 
 fn fixed_job_shop() -> Schedule {
     let durations = [3, 2, 2, 4];
@@ -292,7 +302,8 @@ fn cycle_rejection_rolls_back_the_machine_order_and_schedule() {
     let old_starts = state.starts().to_vec();
     let old_makespan = state.makespan();
 
-    let outcome = state.consider_move(ScheduleMove::AdjacentSwap { machine: 0, first_position: 0 }, MoveAcceptance::Always, &stop).unwrap();
+    let outcome =
+        state.consider_move(ScheduleMove::AdjacentSwap { machine: 0, first_position: 0 }, MinimizingMoveAcceptance::Always, &stop).unwrap();
 
     assert_eq!(outcome, MoveOutcome::Rejected(MoveRejection::Cycle));
     assert_eq!(state.machine_sequences(), old_sequences);
@@ -309,14 +320,15 @@ fn objective_rejection_rolls_back_and_acceptance_commits_atomically() {
     let old_sequences = state.machine_sequences().to_vec();
     let old_starts = state.starts().to_vec();
 
-    let rejected =
-        state.consider_move(ScheduleMove::AdjacentSwap { machine: 1, first_position: 0 }, MoveAcceptance::Improving, &stop).unwrap();
+    let rejected = state
+        .consider_move(ScheduleMove::AdjacentSwap { machine: 1, first_position: 0 }, MinimizingMoveAcceptance::Improving, &stop)
+        .unwrap();
     assert!(matches!(rejected, MoveOutcome::Rejected(MoveRejection::NotAccepted { .. }) | MoveOutcome::Rejected(MoveRejection::Cycle)));
     assert_eq!(state.machine_sequences(), old_sequences);
     assert_eq!(state.starts(), old_starts);
 
     let accepted =
-        state.consider_move(ScheduleMove::AdjacentSwap { machine: 1, first_position: 0 }, MoveAcceptance::Always, &stop).unwrap();
+        state.consider_move(ScheduleMove::AdjacentSwap { machine: 1, first_position: 0 }, MinimizingMoveAcceptance::Always, &stop).unwrap();
     assert!(matches!(accepted, MoveOutcome::Accepted { .. }));
     assert_ne!(state.machine_sequences(), old_sequences);
     assert!(verify_collection_solution(&collection(fixed_job_shop()), &state.to_solution()).is_ok());
@@ -332,7 +344,8 @@ fn prearmed_move_interruption_is_observationally_atomic() {
     let old_metrics = state.metrics();
     let stop = AtomicBool::new(true);
 
-    let outcome = state.consider_move(ScheduleMove::AdjacentSwap { machine: 1, first_position: 0 }, MoveAcceptance::Always, &stop);
+    let outcome =
+        state.consider_move(ScheduleMove::AdjacentSwap { machine: 1, first_position: 0 }, MinimizingMoveAcceptance::Always, &stop);
 
     assert!(outcome.is_err());
     assert_eq!(state.machine_sequences(), old_sequences);
@@ -426,7 +439,7 @@ fn randomized_move_sequence_matches_full_and_independent_oracles() {
             ScheduleMove::Insert { machine, from: first, to: second }
         };
         let old_sequences = state.machine_sequences().to_vec();
-        let outcome = state.consider_move(movement, MoveAcceptance::Always, &stop).unwrap();
+        let outcome = state.consider_move(movement, MinimizingMoveAcceptance::Always, &stop).unwrap();
         match outcome {
             MoveOutcome::Accepted { .. } => {
                 let (oracle_starts, oracle_makespan) =
@@ -473,7 +486,8 @@ fn start_windows_reject_and_rollback_a_disjunctive_move() {
     let mut state = JobShopState::from_machine_sequences(&problem, vec![vec![0, 1]], &stop).unwrap().unwrap();
     let old_starts = state.starts().to_vec();
 
-    let outcome = state.consider_move(ScheduleMove::AdjacentSwap { machine: 0, first_position: 0 }, MoveAcceptance::Always, &stop);
+    let outcome =
+        state.consider_move(ScheduleMove::AdjacentSwap { machine: 0, first_position: 0 }, MinimizingMoveAcceptance::Always, &stop);
 
     assert_eq!(outcome.unwrap(), MoveOutcome::Rejected(MoveRejection::Window));
     assert_eq!(state.machine_sequences(), &[vec![0, 1]]);
@@ -495,17 +509,18 @@ fn insert_moves_in_both_directions_commit_and_rollback_exactly() {
     let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
     let mut state = JobShopState::from_machine_sequences(&problem, vec![vec![0, 1, 2, 3]], &stop).unwrap().unwrap();
 
-    let rejected = state.consider_move(ScheduleMove::Insert { machine: 0, from: 0, to: 3 }, MoveAcceptance::Improving, &stop).unwrap();
+    let rejected =
+        state.consider_move(ScheduleMove::Insert { machine: 0, from: 0, to: 3 }, MinimizingMoveAcceptance::Improving, &stop).unwrap();
     assert!(matches!(rejected, MoveOutcome::Rejected(MoveRejection::NotAccepted { .. })));
     assert_eq!(state.machine_sequences(), &[vec![0, 1, 2, 3]]);
 
     assert!(matches!(
-        state.consider_move(ScheduleMove::Insert { machine: 0, from: 0, to: 3 }, MoveAcceptance::Always, &stop),
+        state.consider_move(ScheduleMove::Insert { machine: 0, from: 0, to: 3 }, MinimizingMoveAcceptance::Always, &stop),
         Ok(MoveOutcome::Accepted { .. })
     ));
     assert_eq!(state.machine_sequences(), &[vec![1, 2, 3, 0]]);
     assert!(matches!(
-        state.consider_move(ScheduleMove::Insert { machine: 0, from: 3, to: 1 }, MoveAcceptance::Always, &stop),
+        state.consider_move(ScheduleMove::Insert { machine: 0, from: 3, to: 1 }, MinimizingMoveAcceptance::Always, &stop),
         Ok(MoveOutcome::Accepted { .. })
     ));
     assert_eq!(state.machine_sequences(), &[vec![1, 0, 2, 3]]);
@@ -534,7 +549,7 @@ fn repeated_rejections_reuse_all_candidate_buffers() {
     let mut state = JobShopState::from_machine_sequences(&problem, vec![sequence.clone()], &stop).unwrap().unwrap();
 
     let warmup = state
-        .consider_move(ScheduleMove::Insert { machine: 0, from: 0, to: operation_count - 1 }, MoveAcceptance::Improving, &stop)
+        .consider_move(ScheduleMove::Insert { machine: 0, from: 0, to: operation_count - 1 }, MinimizingMoveAcceptance::Improving, &stop)
         .unwrap();
     assert!(matches!(warmup, MoveOutcome::Rejected(MoveRejection::NotAccepted { .. })));
     let capacities = state.workspace_capacities();
@@ -546,7 +561,8 @@ fn repeated_rejections_reuse_all_candidate_buffers() {
         if to == from {
             to = (to + 1) % operation_count;
         }
-        let outcome = state.consider_move(ScheduleMove::Insert { machine: 0, from, to }, MoveAcceptance::Improving, &stop).unwrap();
+        let outcome =
+            state.consider_move(ScheduleMove::Insert { machine: 0, from, to }, MinimizingMoveAcceptance::Improving, &stop).unwrap();
         assert!(matches!(outcome, MoveOutcome::Rejected(MoveRejection::NotAccepted { .. })));
         assert_eq!(state.workspace_capacities(), capacities);
     }
@@ -558,7 +574,11 @@ fn repeated_rejections_reuse_all_candidate_buffers() {
 
     let before_local_delta = state.metrics();
     let local = state
-        .consider_move(ScheduleMove::AdjacentSwap { machine: 0, first_position: operation_count - 2 }, MoveAcceptance::Improving, &stop)
+        .consider_move(
+            ScheduleMove::AdjacentSwap { machine: 0, first_position: operation_count - 2 },
+            MinimizingMoveAcceptance::Improving,
+            &stop,
+        )
         .unwrap();
     assert!(matches!(local, MoveOutcome::Rejected(MoveRejection::NotAccepted { .. })));
     assert_eq!(state.metrics().topological_rebuilds, before_local_delta.topological_rebuilds);
@@ -622,7 +642,7 @@ fn cancellation_during_move_reconstruction_preserves_the_incumbent() {
             std::thread::sleep(std::time::Duration::from_millis(1));
             stop.store(true, std::sync::atomic::Ordering::Release);
         });
-        state.consider_move(ScheduleMove::Insert { machine: 0, from: 0, to: operation_count - 1 }, MoveAcceptance::Always, &stop)
+        state.consider_move(ScheduleMove::Insert { machine: 0, from: 0, to: operation_count - 1 }, MinimizingMoveAcceptance::Always, &stop)
     });
 
     assert!(outcome.is_err());

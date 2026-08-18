@@ -1,7 +1,29 @@
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use qayd::orchestrator::{verify_final_supervised_with_budget, SolveBudget, SolveError, TerminationReason};
+use qayd::orchestrator::{verify_final_supervised_with_budget, worker_iteration_quota, SolveBudget, SolveError, TerminationReason};
+
+#[test]
+fn worker_iteration_quotas_preserve_finite_totals() {
+    for workers in [1usize, 2, 4, 9] {
+        for total in [0u64, 1, 2, 7, 31, u64::MAX - 1] {
+            let quotas = (0..workers).map(|worker| worker_iteration_quota(total, worker, workers)).collect::<Vec<_>>();
+            assert_eq!(quotas.iter().map(|&quota| u128::from(quota)).sum::<u128>(), u128::from(total));
+            let smallest = *quotas.iter().min().expect("at least one worker");
+            let largest = *quotas.iter().max().expect("at least one worker");
+            assert!(largest - smallest <= 1, "uneven quota for total {total} across {workers} workers: {quotas:?}");
+        }
+    }
+}
+
+#[test]
+fn unbounded_iteration_quota_remains_unbounded_for_every_worker() {
+    for workers in [1usize, 2, 4, 9] {
+        for worker in 0..workers {
+            assert_eq!(worker_iteration_quota(u64::MAX, worker, workers), u64::MAX);
+        }
+    }
+}
 
 #[test]
 fn finalization_reserve_records_and_enforces_the_deadline() {

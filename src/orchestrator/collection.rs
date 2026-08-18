@@ -16,9 +16,9 @@ use crate::model::{self, CompiledCollection, ListRole, Model};
 use crate::search::SolveStats;
 
 use super::{
-    Assignment, Bound, CandidateSolution, EngineKind, EngineReport, EventControl, EventSink, IntervalValue, ModelFamily, ProofClaim,
-    ProvenConclusion, RoutingControls, SolveBudget, SolveError, SolveEvent, SolveMode, SolveRequest, SolveResult, SolveStatus,
-    TerminationReason, VerificationLevel,
+    worker_iteration_quota, Assignment, Bound, CandidateSolution, EngineKind, EngineReport, EventControl, EventSink, IntervalValue,
+    ModelFamily, ProofClaim, ProvenConclusion, RoutingControls, SolveBudget, SolveError, SolveEvent, SolveMode, SolveRequest, SolveResult,
+    SolveStatus, TerminationReason, VerificationLevel,
 };
 
 const ROUTING_WARM_START_ITERATIONS: u64 = 2_000;
@@ -1384,7 +1384,7 @@ fn result_from_schedule_local_search(
         let restart_work = schedule_restart_work(schedule);
         let finite_work = max_iterations != u64::MAX;
         let mut remaining = (0..allocation.workers())
-            .map(|worker| schedule_worker_iteration_quota(max_iterations, worker, allocation.workers()))
+            .map(|worker| worker_iteration_quota(max_iterations, worker, allocation.workers()))
             .collect::<Vec<_>>();
         let mut retired = vec![false; allocation.workers()];
         let mut zero_progress_rounds = vec![0u8; allocation.workers()];
@@ -1705,15 +1705,6 @@ fn result_from_schedule_local_search(
         ));
     }
     Ok(result)
-}
-
-fn schedule_worker_iteration_quota(total: u64, worker: usize, workers: usize) -> u64 {
-    if total == u64::MAX {
-        return u64::MAX;
-    }
-    let workers = u64::try_from(workers).unwrap_or(u64::MAX).max(1);
-    let worker = u64::try_from(worker).unwrap_or(u64::MAX);
-    total / workers + u64::from(worker < total % workers)
 }
 
 fn append_search_metadata(metadata: &mut Vec<(String, String)>, metrics: &lists::ListSearchMetrics) {

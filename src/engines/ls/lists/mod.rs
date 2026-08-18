@@ -9,6 +9,7 @@ pub(crate) mod eval;
 mod incremental;
 mod local_search;
 mod metrics;
+pub(crate) mod move_acceptance;
 mod moves;
 mod portfolio;
 #[cfg_attr(not(test), allow(dead_code))]
