@@ -401,14 +401,10 @@ fn solve_cp_plan_inner(
     Ok(result)
 }
 
-pub(crate) struct CpSessionOutput {
-    pub(crate) result: SolveResult,
-    pub(crate) next_worker: usize,
-}
-
 /// Execute a reusable compiled CP model through the canonical exact control
 /// plane. Only the engine adapter differs: session assumptions and learned
-/// clauses are supplied to one assumption-aware CDCL worker per tier.
+/// clauses are supplied to a complete assumption-aware CDCL portfolio per
+/// tier. Split, probe, and LNS roles remain outside the persistent session.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve_cp_session_validated(
     model: &Model,
@@ -416,18 +412,19 @@ pub(crate) fn solve_cp_session_validated(
     physical_assumptions: &[Assumption],
     guidance: SearchGuidance,
     clauses: Arc<SharedClausePool>,
-    first_worker: usize,
+    next_worker: &mut usize,
     request: &SolveRequest,
     budget: &SolveBudget,
     sink: &mut dyn EventSink,
-) -> Result<CpSessionOutput, SolveError> {
+) -> Result<SolveResult, SolveError> {
     if budget.expired() {
-        return Ok(CpSessionOutput { result: SolveResult::unknown(), next_worker: first_worker });
+        return Ok(SolveResult::unknown());
     }
     let search_stop = budget.search_stop();
     let engine_stop = search_stop.flag();
     let started = Instant::now();
-    let mut incremental = IncrementalSearch::new(physical_assumptions, clauses, first_worker, guidance.clone());
+    let allocation = super::WorkerAllocation::portfolio(request.threads);
+    let mut incremental = IncrementalSearch::new(physical_assumptions, clauses, next_worker, allocation.workers(), guidance.clone());
     let mut result = if compiled.objectives().is_empty() {
         solve_satisfaction(SatisfactionSolve {
             model,
@@ -438,7 +435,7 @@ pub(crate) fn solve_cp_session_validated(
             engine_stop,
             started,
             incremental: Some(&mut incremental),
-            allocation: super::WorkerAllocation::single(),
+            allocation,
         })?
     } else {
         solve_lexicographic(LexicographicSolve {
@@ -452,7 +449,7 @@ pub(crate) fn solve_cp_session_validated(
             engine_stop,
             sink,
             incremental: Some(&mut incremental),
-            allocation: super::WorkerAllocation::single(),
+            allocation,
         })?
     };
     if let Some(candidate) = &result.primal {
@@ -462,7 +459,7 @@ pub(crate) fn solve_cp_session_validated(
         result.message.get_or_insert_with(|| format!("search stopped: {:?}", budget.termination_reason()));
     }
     result.validate_contract()?;
-    Ok(CpSessionOutput { result, next_worker: incremental.next_worker() })
+    Ok(result)
 }
 
 struct SatisfactionSolve<'a, 'session, 'assumptions> {
@@ -509,6 +506,11 @@ fn solve_satisfaction(context: SatisfactionSolve<'_, '_, '_>) -> Result<SolveRes
     if let Some(first_worker) = first_worker {
         let workers = incremental.as_ref().map_or(0, |search| search.next_worker().saturating_sub(first_worker));
         metadata.push(("clause_session_workers".to_string(), workers.to_string()));
+        metadata.push(("clause_session_first_worker".to_string(), first_worker.to_string()));
+        metadata.push((
+            "clause_session_next_worker".to_string(),
+            incremental.as_ref().map_or(first_worker, |search| search.next_worker()).to_string(),
+        ));
     }
     Ok(SolveResult {
         status,
@@ -600,6 +602,7 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
     let mut lns_stats = None;
     let mut remaining_conflicts = request.limits.conflicts;
     let mut proven_prefix = Vec::with_capacity(objective_count);
+    let mut scoped_physical_prefix = Vec::with_capacity(objective_count.saturating_sub(1));
     let mut bounds = Vec::with_capacity(objective_count);
     let mut complete = false;
     let mut unsatisfiable = false;
@@ -615,16 +618,25 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
         }
 
         let final_tier = tier + 1 == objective_count;
-        let problem_root = problem.get_or_insert_with(|| clone_problem(compiled.problem()));
-        problem_root.objective = Some(objective.clone());
-        let var_objective = problem_root.var_objective().is_some();
-        // Earlier tiers retain a pristine root so their proved value can be
-        // posted for the next tier. The final tier consumes that root directly.
-        let tier_problem = if final_tier {
-            problem.take().expect("the active lexicographic tier has a CP problem")
+        let tier_problem = if incremental.is_some() {
+            // Session prefixes are assumptions, so no mutable root needs to
+            // survive between tiers. Keep only the persistent compiled template
+            // plus the exact worker copies that run this tier.
+            let mut tier_problem = clone_problem(compiled.problem());
+            tier_problem.objective = Some(objective.clone());
+            tier_problem
         } else {
-            clone_problem(problem.as_ref().expect("the active lexicographic tier has a CP problem"))
+            let problem_root = problem.get_or_insert_with(|| clone_problem(compiled.problem()));
+            problem_root.objective = Some(objective.clone());
+            // Ordinary lexicographic solving posts each proved prefix into this
+            // retained root. The final tier consumes it directly.
+            if final_tier {
+                problem.take().expect("the active lexicographic tier has a CP problem")
+            } else {
+                clone_problem(problem.as_ref().expect("the active lexicographic tier has a CP problem"))
+            }
         };
+        let var_objective = tier_problem.var_objective().is_some();
         let mut linear_controls = request.linear;
         if let Some(remaining) = budget.remaining() {
             linear_controls.root_time = linear_controls.root_time.min(remaining.saturating_sub(Duration::from_millis(10)));
@@ -712,10 +724,11 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
             if let Some(search) = incremental.as_deref_mut() {
                 search.solve_cop(
                     tier_problem,
+                    &scoped_physical_prefix,
                     engine_stop,
                     request.seed.wrapping_add(tier as u64),
                     remaining_conflicts,
-                    &relaxation.phase,
+                    &tier_guidance,
                     request.publish_incumbent_assignments,
                     &mut progress,
                 )
@@ -766,6 +779,9 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
             .transpose()?
             .flatten();
         if let (Some(candidate), Some((_, physical_value))) = (&tier_candidate, &outcome.best) {
+            if candidate.objectives().get(..tier) != Some(proven_prefix.as_slice()) {
+                return Err(SolveError::InvalidResult(format!("CP tier {tier} candidate violates the proved lexicographic prefix")));
+            }
             if candidate.objectives().get(tier) != Some(physical_value) {
                 return Err(SolveError::InvalidResult(format!(
                     "CP tier {tier} reported objective {physical_value}, canonical replay produced {:?}",
@@ -800,9 +816,18 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
                     complete = true;
                     break;
                 }
-                compiled
-                    .fix_objective(problem.as_mut().expect("a non-final lexicographic tier retains its CP problem"), tier, *value)
-                    .map_err(|error| SolveError::Engine(error.reason))?;
+                if incremental.is_some() {
+                    let variable = objective.var().ok_or_else(|| {
+                        SolveError::Unsupported("persistent clause sharing requires materialized lexicographic objectives".to_string())
+                    })?;
+                    let value = i32::try_from(*value)
+                        .map_err(|_| SolveError::InvalidResult(format!("materialized objective tier {tier} escaped its i32 domain")))?;
+                    scoped_physical_prefix.push(Assumption { var: variable, op: crate::search::AssumptionOp::Eq, value });
+                } else {
+                    compiled
+                        .fix_objective(problem.as_mut().expect("a non-final lexicographic tier retains its CP problem"), tier, *value)
+                        .map_err(|error| SolveError::Engine(error.reason))?;
+                }
                 if remaining_conflicts == Some(0) {
                     conflict_limit_reached = !budget.expired();
                     stopped_tier = Some(tier + 1);
@@ -838,6 +863,8 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
     }
     if let (Some(first_worker), Some(search)) = (first_incremental_worker, incremental.as_ref()) {
         metadata.push(("clause_session_workers".to_string(), search.next_worker().saturating_sub(first_worker).to_string()));
+        metadata.push(("clause_session_first_worker".to_string(), first_worker.to_string()));
+        metadata.push(("clause_session_next_worker".to_string(), search.next_worker().to_string()));
     }
     reports.push(EngineReport {
         engine: Some(EngineKind::IntegerExact),
@@ -958,7 +985,15 @@ fn decode_candidate(
     values: &[i32],
     stop: &std::sync::atomic::AtomicBool,
 ) -> Result<(Assignment, Vec<i64>), SolveError> {
-    let decoded = compiled.decode(values).map_err(SolveError::InvalidResult)?;
+    let mut decoded = compiled.decode(values).map_err(SolveError::InvalidResult)?;
+    let user_integer_count = model.int_vars().len();
+    if decoded.integers.len() < user_integer_count {
+        return Err(SolveError::InvalidResult(format!(
+            "CP assignment decoded {} integer values for {user_integer_count} user variables",
+            decoded.integers.len()
+        )));
+    }
+    decoded.integers.truncate(user_integer_count);
     let assignment = Assignment { integers: decoded.integers, sets: decoded.sets, lists: Vec::new(), intervals: Vec::new() };
     let objectives = model
         .objectives()

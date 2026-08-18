@@ -3,7 +3,9 @@
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 
-use crate::constraints::resource_profile::{build_profile, first_overload, ProfileSegment};
+use crate::constraints::resource_profile::{
+    build_profile, earliest_feasible_start, EnergeticAnalysis, EnergeticWorkspace, FixedCumulativeTask, ProfileSegment,
+};
 use crate::domains::interval::{IntervalEvent, IntervalPresence};
 use crate::ids::{IntervalId, PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Priority, Propagator};
@@ -101,13 +103,14 @@ fn present_premise(store: &Store, interval: IntervalId) -> Option<Premise> {
 /// window, citing its presence and start bounds. A superset of the minimal cause
 /// is still sound (it only weakens the learned clause), and pinning each start's
 /// bounds pins its compulsory region and hence its contribution to the profile.
-fn cumulative_profile_premises(store: &Store, intervals: &[IntervalId], lo: i32, hi: i32, except: IntervalId) -> Vec<Premise> {
+fn cumulative_profile_premises(store: &Store, intervals: &[IntervalId], lo: i128, hi: i128, except: IntervalId) -> Vec<Premise> {
     let mut why = Vec::new();
     for &iv in intervals {
         if iv == except || store.interval_presence(iv) != IntervalPresence::Present {
             continue;
         }
-        let (cp_lo, cp_hi) = (store.interval_start_max(iv), store.interval_end_min(iv));
+        let cp_lo = i128::from(store.interval_start_max(iv));
+        let cp_hi = i128::from(store.interval_start_min(iv)) + i128::from(store.interval_duration(iv));
         if cp_lo < hi && lo < cp_hi {
             why.extend(present_premise(store, iv));
             why.push(Premise::Ge { var: store.interval_start_var(iv), bound: store.interval_start_min(iv) });
@@ -682,12 +685,183 @@ pub struct Cumulative {
     events: Vec<(i128, i128)>,
     profile: Vec<ProfileSegment>,
     present: Vec<usize>,
-    est: Vec<i128>,
-    lct: Vec<i128>,
-    energy: Vec<i128>,
-    by_est: Vec<usize>,
-    by_lct: Vec<usize>,
-    lower: Vec<i128>,
+    tasks: Vec<FixedCumulativeTask>,
+    energetic: EnergeticWorkspace,
+}
+
+impl Cumulative {
+    fn propagate_core(&mut self, store: &mut Store, should_stop: Option<&dyn Fn() -> bool>) -> Result<(), Inconsistency> {
+        let n = self.intervals.len();
+        loop {
+            if interruption_requested(should_stop) {
+                return Ok(());
+            }
+            self.present.clear();
+            self.tasks.clear();
+            for idx in 0..n {
+                if store.interval_presence(self.intervals[idx]) == IntervalPresence::Present
+                    && store.interval_duration(self.intervals[idx]) > 0
+                    && self.demands[idx] > 0
+                {
+                    self.present.push(idx);
+                    self.tasks.push(FixedCumulativeTask::new(
+                        store.interval_start_min(self.intervals[idx]),
+                        store.interval_start_max(self.intervals[idx]),
+                        i64::from(store.interval_duration(self.intervals[idx])),
+                        i64::from(self.demands[idx]),
+                    ));
+                }
+            }
+
+            // Only present, positive-duration tasks enter the pure fixed-task
+            // kernel. Presence and Store explanations stay in this adapter. No
+            // bound or conflict is consumed from an interrupted analysis.
+            let energetic = match should_stop {
+                Some(stop) => self.energetic.analyse_until(&self.tasks, i128::from(self.capacity), stop),
+                None => self.energetic.analyse(&self.tasks, i128::from(self.capacity)).map(|()| EnergeticAnalysis::Complete),
+            };
+            match energetic {
+                Ok(EnergeticAnalysis::Complete) => {}
+                Ok(EnergeticAnalysis::Interrupted) => return Ok(()),
+                Err(_) if interruption_requested(should_stop) => return Ok(()),
+                Err(_) => return Err(Inconsistency),
+            }
+            let mut changed = false;
+            for (position, &task) in self.present.iter().enumerate() {
+                if interruption_requested(should_stop) {
+                    return Ok(());
+                }
+                let lower_bound = self.energetic.lower_bounds()[position];
+                if lower_bound > self.tasks[position].earliest_start() {
+                    let lower_bound = i32::try_from(lower_bound).map_err(|_| Inconsistency)?;
+                    changed |= store.set_interval_start_min(self.intervals[task], lower_bound)?;
+                }
+            }
+
+            for (position, &task) in self.present.iter().enumerate() {
+                if interruption_requested(should_stop) {
+                    return Ok(());
+                }
+                let interval = self.intervals[task];
+                self.tasks[position] = FixedCumulativeTask::new(
+                    store.interval_start_min(interval),
+                    store.interval_start_max(interval),
+                    i64::from(store.interval_duration(interval)),
+                    i64::from(self.demands[task]),
+                );
+            }
+
+            // Mandatory-part profile from the compulsory region of every
+            // *present* interval. Optional (undecided) intervals do not yet
+            // consume the resource, so they are excluded from the profile.
+            build_profile(self.tasks.iter().copied().map(FixedCumulativeTask::compulsory_part), &mut self.events, &mut self.profile);
+            for segment in &self.profile {
+                if interruption_requested(should_stop) {
+                    return Ok(());
+                }
+                if segment.usage > i128::from(self.capacity) {
+                    // Overload at instant `t`: cite every present interval whose
+                    // compulsory region must cover `t` (it is present, its start is
+                    // at most `start_max`, and at least `start_min`, which together
+                    // force it to run at `t`). Their demands exceed the capacity.
+                    let t = segment.start;
+                    let mut why = Vec::new();
+                    for &interval in &self.intervals {
+                        if interruption_requested(should_stop) {
+                            return Ok(());
+                        }
+                        if store.interval_presence(interval) != IntervalPresence::Present {
+                            continue;
+                        }
+                        let mandatory_start = i128::from(store.interval_start_max(interval));
+                        let mandatory_end = i128::from(store.interval_start_min(interval)) + i128::from(store.interval_duration(interval));
+                        if mandatory_start <= t && t < mandatory_end {
+                            why.extend(present_premise(store, interval));
+                            why.push(Premise::Ge { var: store.interval_start_var(interval), bound: store.interval_start_min(interval) });
+                            why.push(Premise::Le { var: store.interval_start_var(interval), bound: store.interval_start_max(interval) });
+                        }
+                    }
+                    if interruption_requested(should_stop) {
+                        return Ok(());
+                    }
+                    return Err(store.fail_because(why));
+                }
+            }
+
+            // Push each present interval's start past instants it cannot cover.
+            for idx in 0..n {
+                if interruption_requested(should_stop) {
+                    return Ok(());
+                }
+                let interval = self.intervals[idx];
+                if store.interval_presence(interval) == IntervalPresence::Absent {
+                    continue;
+                }
+                let demand = i128::from(self.demands[idx]);
+                let duration = i128::from(store.interval_duration(interval));
+                if demand == 0 || duration == 0 {
+                    continue;
+                }
+                let smin = i128::from(store.interval_start_min(interval));
+                let smax = i128::from(store.interval_start_max(interval));
+                // Subtract the interval's own compulsory region only if it is
+                // present (so already in the profile); an optional interval does
+                // not contribute, so nothing to subtract.
+                let in_profile = store.interval_presence(interval) == IntervalPresence::Present;
+                let own_part = in_profile.then_some((smax, smin + duration, demand));
+
+                let feasible = earliest_feasible_start(&self.profile, smin, smax, duration, demand, own_part, i128::from(self.capacity));
+                if interruption_requested(should_stop) {
+                    return Ok(());
+                }
+
+                let present = store.interval_presence(interval) == IntervalPresence::Present;
+                match feasible {
+                    Some(start) if start > smin && present => {
+                        // Positions `[smin, start)` overload, so a present
+                        // interval must start no earlier than `start`. Cite
+                        // its presence, its current lower bound, and the
+                        // present intervals fixing the profile there.
+                        let mut why = cumulative_profile_premises(store, &self.intervals, smin, start + duration, interval);
+                        if interruption_requested(should_stop) {
+                            return Ok(());
+                        }
+                        why.extend(present_premise(store, interval));
+                        why.push(Premise::Ge { var: store.interval_start_var(interval), bound: smin as i32 });
+                        let start = i32::try_from(start).map_err(|_| Inconsistency)?;
+                        changed |= store.set_interval_start_min_because(interval, start, why)?;
+                    }
+                    // For an undecided optional interval, a start bound is
+                    // conditional on presence. Keep its backing domain unchanged
+                    // until presence is asserted.
+                    Some(_) => {}
+                    None => match store.interval_presence(interval) {
+                        IntervalPresence::Present => {
+                            // A present interval fits nowhere in its window.
+                            let mut why = cumulative_profile_premises(store, &self.intervals, smin, smax + duration, interval);
+                            if interruption_requested(should_stop) {
+                                return Ok(());
+                            }
+                            why.extend(present_premise(store, interval));
+                            why.push(Premise::Ge { var: store.interval_start_var(interval), bound: smin as i32 });
+                            why.push(Premise::Le { var: store.interval_start_var(interval), bound: smax as i32 });
+                            return Err(store.fail_because(why));
+                        }
+                        IntervalPresence::Optional => {
+                            if interruption_requested(should_stop) {
+                                return Ok(());
+                            }
+                            changed |= store.forbid_interval_presence(interval)?;
+                        }
+                        IntervalPresence::Absent => {}
+                    },
+                }
+            }
+            if !changed {
+                return Ok(());
+            }
+        }
+    }
 }
 
 impl Propagator for Cumulative {
@@ -716,191 +890,11 @@ impl Propagator for Cumulative {
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
-        let n = self.intervals.len();
-        loop {
-            self.present.clear();
-            for idx in 0..n {
-                if store.interval_presence(self.intervals[idx]) == IntervalPresence::Present
-                    && store.interval_duration(self.intervals[idx]) > 0
-                    && self.demands[idx] > 0
-                {
-                    self.present.push(idx);
-                }
-                self.est[idx] = i128::from(store.interval_start_min(self.intervals[idx]));
-                self.lct[idx] = i128::from(store.interval_end_max(self.intervals[idx]));
-                self.energy[idx] = i128::from(store.interval_duration(self.intervals[idx])) * i128::from(self.demands[idx]);
-            }
+        self.propagate_core(store, None)
+    }
 
-            // Energetic overload over every window induced by mandatory tasks.
-            self.by_est.clear();
-            self.by_est.extend(self.present.iter().copied());
-            self.by_est.sort_unstable_by(|&a, &b| self.est[b].cmp(&self.est[a]));
-            for &u in &self.present {
-                let upper = self.lct[u];
-                let mut energy = 0i128;
-                for &task in &self.by_est {
-                    if self.lct[task] <= upper {
-                        energy += self.energy[task];
-                        if energy > i128::from(self.capacity) * (upper - self.est[task]) {
-                            return Err(Inconsistency);
-                        }
-                    }
-                }
-            }
-
-            // Edge-finding lower bounds for mandatory tasks.
-            self.by_lct.clear();
-            self.by_lct.extend(self.present.iter().copied());
-            self.by_lct.sort_unstable_by_key(|&task| self.lct[task]);
-            self.lower.copy_from_slice(&self.est);
-            for &task in &self.present {
-                let demand = i128::from(self.demands[task]);
-                let mut energy = 0i128;
-                let mut earliest = i128::MAX;
-                for &other in &self.by_lct {
-                    if other == task {
-                        continue;
-                    }
-                    energy += self.energy[other];
-                    earliest = earliest.min(self.est[other]);
-                    let upper = self.lct[other];
-                    if energy + self.energy[task] > i128::from(self.capacity) * (upper - earliest.min(self.est[task])) {
-                        let rest = energy - (i128::from(self.capacity) - demand) * (upper - earliest);
-                        if rest > 0 {
-                            self.lower[task] = self.lower[task].max(earliest + (rest + demand - 1) / demand);
-                        }
-                    }
-                }
-            }
-            let mut changed = false;
-            for &task in &self.present {
-                if self.lower[task] > self.est[task] {
-                    changed |= store.set_interval_start_min(
-                        self.intervals[task],
-                        self.lower[task].clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32,
-                    )?;
-                }
-            }
-
-            // Mandatory-part profile from the compulsory region of every
-            // *present* interval. Optional (undecided) intervals do not yet
-            // consume the resource, so they are excluded from the profile.
-            build_profile(
-                self.present.iter().map(|&idx| {
-                    let interval = self.intervals[idx];
-                    (
-                        i128::from(store.interval_start_max(interval)),
-                        i128::from(store.interval_end_min(interval)),
-                        i128::from(self.demands[idx]),
-                    )
-                }),
-                &mut self.events,
-                &mut self.profile,
-            );
-            for segment in &self.profile {
-                if segment.usage > i128::from(self.capacity) {
-                    // Overload at instant `t`: cite every present interval whose
-                    // compulsory region must cover `t` (it is present, its start is
-                    // at most `start_max`, and at least `start_min`, which together
-                    // force it to run at `t`). Their demands exceed the capacity.
-                    let t = segment.start as i32;
-                    let mut why = Vec::new();
-                    for &interval in &self.intervals {
-                        if store.interval_presence(interval) != IntervalPresence::Present {
-                            continue;
-                        }
-                        if store.interval_start_max(interval) <= t && t < store.interval_end_min(interval) {
-                            why.extend(present_premise(store, interval));
-                            why.push(Premise::Ge { var: store.interval_start_var(interval), bound: store.interval_start_min(interval) });
-                            why.push(Premise::Le { var: store.interval_start_var(interval), bound: store.interval_start_max(interval) });
-                        }
-                    }
-                    return Err(store.fail_because(why));
-                }
-            }
-
-            // Push each present interval's start past instants it cannot cover.
-            for idx in 0..n {
-                let interval = self.intervals[idx];
-                if store.interval_presence(interval) == IntervalPresence::Absent {
-                    continue;
-                }
-                let demand = i128::from(self.demands[idx]);
-                let duration = i128::from(store.interval_duration(interval));
-                if demand == 0 || duration == 0 {
-                    continue;
-                }
-                let smin = i128::from(store.interval_start_min(interval));
-                let smax = i128::from(store.interval_start_max(interval));
-                // Subtract the interval's own compulsory region only if it is
-                // present (so already in the profile); an optional interval does
-                // not contribute, so nothing to subtract.
-                let in_profile = store.interval_presence(interval) == IntervalPresence::Present;
-                let own_part = in_profile.then_some((smax, smin + duration, demand));
-
-                let mut start = smin;
-                let mut feasible = None;
-                while start <= smax {
-                    if let Some((_, conflict_end)) =
-                        first_overload(&self.profile, start, start + duration, demand, own_part, i128::from(self.capacity))
-                    {
-                        start = conflict_end;
-                    } else {
-                        feasible = Some(start);
-                        break;
-                    }
-                }
-
-                let present = store.interval_presence(interval) == IntervalPresence::Present;
-                match feasible {
-                    Some(start) => {
-                        if start > smin {
-                            if present {
-                                // Positions `[smin, start)` overload, so a present
-                                // interval must start no earlier than `start`. Cite
-                                // its presence, its current lower bound, and the
-                                // present intervals fixing the profile there.
-                                let mut why = cumulative_profile_premises(
-                                    store,
-                                    &self.intervals,
-                                    smin as i32,
-                                    (start + duration).clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32,
-                                    interval,
-                                );
-                                why.extend(present_premise(store, interval));
-                                why.push(Premise::Ge { var: store.interval_start_var(interval), bound: smin as i32 });
-                                changed |= store.set_interval_start_min_because(interval, start as i32, why)?;
-                            } else {
-                                // Optional, undecided: the bound is conditional on a
-                                // presence not yet asserted; keep the loose reason.
-                                changed |= store.set_interval_start_min(interval, start as i32)?;
-                            }
-                        }
-                    }
-                    None => match store.interval_presence(interval) {
-                        IntervalPresence::Present => {
-                            // A present interval fits nowhere in its window.
-                            let mut why = cumulative_profile_premises(
-                                store,
-                                &self.intervals,
-                                smin as i32,
-                                (smax + duration).clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32,
-                                interval,
-                            );
-                            why.extend(present_premise(store, interval));
-                            why.push(Premise::Ge { var: store.interval_start_var(interval), bound: smin as i32 });
-                            why.push(Premise::Le { var: store.interval_start_var(interval), bound: smax as i32 });
-                            return Err(store.fail_because(why));
-                        }
-                        IntervalPresence::Optional => changed |= store.forbid_interval_presence(interval)?,
-                        IntervalPresence::Absent => {}
-                    },
-                }
-            }
-            if !changed {
-                return Ok(());
-            }
-        }
+    fn propagate_until(&mut self, store: &mut Store, should_stop: &dyn Fn() -> bool) -> Result<(), Inconsistency> {
+        self.propagate_core(store, Some(should_stop))
     }
 }
 
@@ -915,12 +909,8 @@ pub fn cumulative(solver: &mut Solver, intervals: &[IntervalId], demands: &[i32]
         events: Vec::new(),
         profile: Vec::new(),
         present: Vec::new(),
-        est: vec![0; n],
-        lct: vec![0; n],
-        energy: vec![0; n],
-        by_est: Vec::new(),
-        by_lct: Vec::new(),
-        lower: vec![0; n],
+        tasks: Vec::with_capacity(n),
+        energetic: EnergeticWorkspace::default(),
     }))
 }
 
@@ -941,12 +931,8 @@ pub(crate) fn cumulative_until(
             events: Vec::new(),
             profile: Vec::new(),
             present: Vec::new(),
-            est: vec![0; n],
-            lct: vec![0; n],
-            energy: vec![0; n],
-            by_est: Vec::new(),
-            by_lct: Vec::new(),
-            lower: vec![0; n],
+            tasks: Vec::with_capacity(n),
+            energetic: EnergeticWorkspace::default(),
         }),
         should_stop,
     )

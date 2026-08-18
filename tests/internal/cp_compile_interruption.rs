@@ -199,21 +199,19 @@ fn integer_warm_start_preflight_counts_table_and_mdd_payloads() {
 #[test]
 fn optional_integer_warm_start_obeys_its_memory_allowance_and_prearmed_stop() {
     let mut model = Model::new();
-    let cell = model.int_range(1, 1);
-    let guard = model.bool_var();
-    let index = model.int_range(0, 0);
-    let letter = model.bool_var();
-    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Element { array: vec![cell], index, value: letter }));
-    model.add_constraint(Constraint::Intension(IntExpr::Or(vec![
-        IntExpr::Eq(Box::new(IntExpr::Variable(guard)), Box::new(IntExpr::Constant(0))),
-        IntExpr::Eq(Box::new(IntExpr::Variable(letter)), Box::new(IntExpr::Constant(1))),
-    ])));
-    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table {
-        variables: vec![index],
-        tuples: vec![vec![0]].into(),
-        positive: true,
-    }));
-    model.add_objective(Objective::IntExpr { minimize: false, expr: IntExpr::Mul(vec![IntExpr::Constant(7), IntExpr::Variable(guard)]) });
+    let left = model.int_set(vec![-1, 1]);
+    let right = model.int_set(vec![-1, 1]);
+    let product = model.int_set(vec![-1, 1]);
+    let aggregate = model.int_set(vec![-1, 1]);
+    model.add_constraint(Constraint::Intension(IntExpr::Eq(
+        Box::new(IntExpr::Variable(product)),
+        Box::new(IntExpr::Mul(vec![IntExpr::Variable(left), IntExpr::Variable(right)])),
+    )));
+    model.add_constraint(Constraint::Linear { terms: vec![(1, product), (-1, aggregate)], relation: Relation::Eq, rhs: 0 });
+    model.add_objective(Objective::IntExpr {
+        minimize: true,
+        expr: IntExpr::Mul(vec![IntExpr::Variable(aggregate), IntExpr::Variable(aggregate)]),
+    });
     let compiled = CompiledCp::compile_interruptible(&model, &AtomicBool::new(false)).unwrap().unwrap();
 
     assert_eq!(audit_integer_warm_start_compile(&model, &compiled, 0, &AtomicBool::new(false)), (false, 0));

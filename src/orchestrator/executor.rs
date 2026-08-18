@@ -89,6 +89,31 @@ enum ExecutionMessage<R> {
     Finished(WorkerReport<R>),
 }
 
+/// Cancels a worker set if its owning execution frame unwinds. Normal exits
+/// disarm the guard after publishing their lossless completion signal.
+struct CancelOnUnwind {
+    cancel: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl CancelOnUnwind {
+    fn new(cancel: Arc<AtomicBool>) -> Self {
+        Self { cancel, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOnUnwind {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancel.store(true, Ordering::Release);
+        }
+    }
+}
+
 /// Context supplied to one engine worker.
 pub struct WorkerContext<E, R> {
     worker: usize,
@@ -212,6 +237,7 @@ where
     let mut handler_error = None;
 
     std::thread::scope(|scope| {
+        let mut scope_cancel = CancelOnUnwind::new(Arc::clone(&cancel));
         let monitor_cancel = Arc::clone(&cancel);
         scope.spawn(move || {
             while !monitor_cancel.load(Ordering::Acquire) {
@@ -226,6 +252,7 @@ where
         let run = &run;
         for (worker, input) in inputs.into_iter().enumerate() {
             let worker_tx = tx.clone();
+            let worker_cancel = Arc::clone(&cancel);
             let context = WorkerContext {
                 worker,
                 seed: base_seed.wrapping_add(worker as u64),
@@ -235,8 +262,10 @@ where
                 tx: worker_tx.clone(),
             };
             scope.spawn(move || {
+                let mut unwind_cancel = CancelOnUnwind::new(worker_cancel);
                 let seed = context.seed();
                 let result = run(context, input);
+                unwind_cancel.disarm();
                 let _ = worker_tx.send(ExecutionMessage::Finished(WorkerReport { worker, seed, result }));
             });
         }
@@ -279,6 +308,7 @@ where
             }
         }
         cancel.store(true, Ordering::Release);
+        scope_cancel.disarm();
     });
 
     if let Some(error) = handler_error {
@@ -319,6 +349,7 @@ where
     let (tx, rx) = mpsc::channel();
     let mut reports = (0..worker_count).map(|_| None).collect::<Vec<Option<WorkerReport<R>>>>();
     std::thread::scope(|scope| {
+        let mut scope_cancel = CancelOnUnwind::new(Arc::clone(&cancel));
         let monitor_cancel = Arc::clone(&cancel);
         scope.spawn(move || {
             while !monitor_cancel.load(Ordering::Acquire) {
@@ -333,10 +364,13 @@ where
         let run = &run;
         for (worker, input) in inputs.into_iter().enumerate() {
             let worker_tx = tx.clone();
+            let worker_cancel = Arc::clone(&cancel);
             let context = SilentWorkerContext { worker, seed: base_seed.wrapping_add(worker as u64), cancel: Arc::clone(&cancel) };
             scope.spawn(move || {
+                let mut unwind_cancel = CancelOnUnwind::new(worker_cancel);
                 let seed = context.seed();
                 let result = run(context, input);
+                unwind_cancel.disarm();
                 let _ = worker_tx.send(WorkerReport { worker, seed, result });
             });
         }
@@ -346,6 +380,7 @@ where
             reports[worker] = Some(report);
         }
         cancel.store(true, Ordering::Release);
+        scope_cancel.disarm();
     });
 
     ExecutionSummary {

@@ -52,3 +52,11 @@ def test_stub_covers_all_public_names():
     defined = _defined_names(stub.read_text())
     missing = set(qayd.__all__) - defined
     assert not missing, f"public names absent from stub: {sorted(missing)}"
+
+
+def test_solve_session_parallel_controls_are_typed():
+    tree = ast.parse(_STUB.read_text())
+    solve_session = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SolveSession")
+    solve = next(node for node in solve_session.body if isinstance(node, ast.FunctionDef) and node.name == "solve")
+    keyword_only = {argument.arg for argument in solve.args.kwonlyargs}
+    assert {"threads", "memory_limit_mb"} <= keyword_only

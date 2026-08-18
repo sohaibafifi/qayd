@@ -407,7 +407,7 @@ fn symbolic_affine_objective_guides_guarded_element_construction() {
         Expr::Eq(Box::new(Expr::Var(guard)), Box::new(Expr::Const(0))),
         Expr::Eq(Box::new(Expr::Var(symbol)), Box::new(Expr::Const(1))),
     ]));
-    // The real AlteredStates models contain extension constraints between sequence
+    // Extension-backed sequence models contain table constraints between sequence
     // positions. This harmless table activates the same constructive path.
     spec.add_extension(vec![index], vec![vec![0], vec![1]], true);
 
@@ -695,4 +695,25 @@ fn guarded_array_materialization_preserves_nonzero_index_domains() {
     let (value, solution) = incumbent.expect("guarded-shared_array fallback did not publish an incumbent");
     assert_eq!(value, 0);
     assert_eq!(solution[3], 1, "materialization wrote an out-of-domain zero to the Element index");
+}
+
+#[test]
+fn generic_extension_without_exact_cover_keeps_constructive_initialization_and_restarts() {
+    let mut solver = Solver::new();
+    let value = solver.new_var_range(0, 1);
+    let problem = Problem { solver, search: vec![value], objective: Some(Objective::Var(true, value)) };
+    let mut spec = LocalSearchSpec::default();
+    spec.add_var(value);
+    spec.add_extension(vec![value], vec![vec![0], vec![1]], true);
+
+    let stop = AtomicBool::new(false);
+    let mut first_source = None;
+    let config = LsConfig { kick_bandit: true, ..LsConfig::default() };
+    let outcome = solve_ls_capped_borrowed(&problem, spec, &stop, 7, config, 201, |_, _, source| {
+        first_source.get_or_insert(source.to_string());
+    });
+
+    assert_eq!(first_source.as_deref(), Some("constructive"));
+    assert_eq!(outcome.restarts, 1, "generic extension models must keep the constructive restart path");
+    assert_eq!(outcome.best.as_ref().map(|(_, objective)| *objective), Some(0));
 }

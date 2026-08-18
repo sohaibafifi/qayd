@@ -1197,6 +1197,45 @@ pub(crate) fn optimize_assuming_seeded_with_scope(
     branch_order: Vec<VarId>,
     on_improve: impl FnMut(i64, &[i32]),
 ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
+    optimize_assuming_seeded_with_scope_and_relaxation(
+        solver,
+        vars,
+        primary_branch_scope,
+        assumptions,
+        objective,
+        minimizing,
+        stop,
+        seed,
+        shared_bound,
+        clause_sharing,
+        conflict_budget,
+        initial_phase,
+        branch_order,
+        None,
+        on_improve,
+    )
+}
+
+/// Optimise under temporary assumptions while retaining the optional certified
+/// node relaxation used by ordinary CP portfolio workers.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn optimize_assuming_seeded_with_scope_and_relaxation(
+    solver: &mut Solver,
+    vars: &[VarId],
+    primary_branch_scope: Option<&[VarId]>,
+    assumptions: &[Assumption],
+    objective: Objective<'_>,
+    minimizing: bool,
+    stop: &AtomicBool,
+    seed: u64,
+    shared_bound: Option<&SharedObjectiveBound>,
+    clause_sharing: Option<ClauseSharing>,
+    conflict_budget: Option<u64>,
+    initial_phase: Vec<Option<i32>>,
+    branch_order: Vec<VarId>,
+    relaxation: Option<SearchRelaxationTemplate>,
+    on_improve: impl FnMut(i64, &[i32]),
+) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
     let lazy_atoms = clause_sharing.as_ref().map(ClauseSharing::lazy_atoms);
     let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, lazy_atoms) else {
         return (None, SolveStats::default(), false);
@@ -1209,7 +1248,23 @@ pub(crate) fn optimize_assuming_seeded_with_scope(
     }
     cdcl.initial_phase = initial_phase;
     cdcl.branch_order = branch_order;
-    cdcl.optimize(vars, primary_branch_scope, objective, minimizing, stop, shared_bound, &cube, conflict_budget, None, on_improve)
+    let mut relaxation: Option<SearchRelaxation> = relaxation.map(|template| template.start());
+    let mut result = cdcl.optimize(
+        vars,
+        primary_branch_scope,
+        objective,
+        minimizing,
+        stop,
+        shared_bound,
+        &cube,
+        conflict_budget,
+        relaxation.as_mut(),
+        on_improve,
+    );
+    if let Some(relaxation) = relaxation {
+        merge_lp_stats(&mut result.1, relaxation.stats());
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]

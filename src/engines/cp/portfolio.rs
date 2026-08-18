@@ -185,7 +185,7 @@ pub(crate) fn normalize_options(has_objective: bool, var_objective: bool, option
     RunOptions { workers, split: options.split && var_objective, probes, lns, ..options }
 }
 
-fn worker_conflict_quota(total: Option<u64>, worker: usize, workers: usize) -> Option<u64> {
+pub(super) fn worker_conflict_quota(total: Option<u64>, worker: usize, workers: usize) -> Option<u64> {
     total.map(|total| {
         let workers = u64::try_from(workers).unwrap_or(u64::MAX).max(1);
         let worker = u64::try_from(worker).unwrap_or(u64::MAX);

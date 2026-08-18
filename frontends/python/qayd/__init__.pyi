@@ -788,7 +788,9 @@ class SolveSession:
     """An incremental solve session that retains learned nogoods across solves."""
 
     @property
-    def learned_nogoods(self) -> int: ...
+    def learned_nogoods(self) -> int:
+        """Total clauses published since the last clear_nogoods() call."""
+        ...
     def clear_nogoods(self) -> None: ...
     def raw_nogoods(self, limit: Optional[int] = ...) -> list[Tuple[int, list[int]]]: ...
     def nogoods(self, limit: Optional[int] = ...) -> list[Tuple[int, list[Tuple[int, str, int]]]]: ...
@@ -803,7 +805,9 @@ class SolveSession:
         verbose: bool = ...,
         time_limit: Optional[int] = ...,
         seed: int = ...,
+        threads: int = ...,
         conflict_budget: Optional[int] = ...,
+        memory_limit_mb: Optional[int] = ...,
         linear_backend: str = ...,
         lp_root_ms: int = ...,
         lp_node_ms: int = ...,

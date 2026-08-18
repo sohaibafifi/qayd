@@ -366,7 +366,7 @@ fn physical_compilers_never_report_a_prearmed_stop_as_unsupported() {
 }
 
 #[test]
-fn guarded_mismatch_cop_uses_a_verified_integer_warm_start() {
+fn guarded_mismatch_constructor_is_not_selected_as_an_automatic_warm_start() {
     let mut model = Model::new();
     let cell = model.int_range(0, 0);
     let guard = model.bool_var();
@@ -396,13 +396,11 @@ fn guarded_mismatch_cop_uses_a_verified_integer_warm_start() {
 
     assert_eq!(result.status(), SolveStatus::Optimal);
     assert_eq!(result.primal().unwrap().objectives(), [7]);
-    assert!(result.reports().iter().any(|report| report.engine == Some(EngineKind::IntegerLocalSearch)
-        && report.metadata.iter().any(|(key, value)| key == "ls_role" && value == "structural_local_search_warm_start")));
+    assert!(!result.reports().iter().any(|report| report.engine == Some(EngineKind::IntegerLocalSearch)));
     assert!(result.reports().iter().any(|report| report.engine == Some(EngineKind::IntegerExact)));
 }
 
-#[test]
-fn direct_guarded_element_cop_uses_a_verified_integer_warm_start() {
+fn guarded_element_objective_model() -> Model {
     let mut model = Model::new();
     let cell = model.int_range(1, 1);
     let guard = model.bool_var();
@@ -419,38 +417,13 @@ fn direct_guarded_element_cop_uses_a_verified_integer_warm_start() {
         positive: true,
     }));
     model.add_objective(Objective::IntExpr { minimize: false, expr: IntExpr::Mul(vec![IntExpr::Constant(7), IntExpr::Variable(guard)]) });
-
-    let request = SolveRequest { mode: SolveMode::Exact, ..SolveRequest::default() };
-    let result = solve_model_silent(&ModelPackage::new(model), &request).unwrap();
-
-    assert_eq!(result.status(), SolveStatus::Optimal);
-    assert_eq!(result.primal().unwrap().objectives(), [7]);
-    assert!(result.reports().iter().any(|report| report.engine == Some(EngineKind::IntegerLocalSearch)
-        && report.metadata.iter().any(|(key, value)| key == "ls_role" && value == "structural_local_search_warm_start")));
+    model
 }
 
 #[test]
-fn disconnected_direct_guarded_element_does_not_enable_the_warm_start() {
-    let mut model = Model::new();
-    let cell = model.int_range(1, 1);
-    let guard = model.bool_var();
-    let index = model.int_range(0, 0);
-    let unrelated_index = model.int_range(0, 0);
-    let symbol = model.bool_var();
-    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Element { array: vec![cell], index, value: symbol }));
-    model.add_constraint(Constraint::Intension(IntExpr::Or(vec![
-        IntExpr::Eq(Box::new(IntExpr::Variable(guard)), Box::new(IntExpr::Constant(0))),
-        IntExpr::Eq(Box::new(IntExpr::Variable(symbol)), Box::new(IntExpr::Constant(1))),
-    ])));
-    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table {
-        variables: vec![unrelated_index],
-        tuples: vec![vec![0]].into(),
-        positive: true,
-    }));
-    model.add_objective(Objective::IntExpr { minimize: false, expr: IntExpr::Mul(vec![IntExpr::Constant(7), IntExpr::Variable(guard)]) });
-
-    let request = SolveRequest { mode: SolveMode::Exact, ..SolveRequest::default() };
-    let result = solve_model_silent(&ModelPackage::new(model), &request).unwrap();
+fn direct_guarded_element_constructor_is_not_selected_as_an_automatic_warm_start() {
+    let request = SolveRequest { mode: SolveMode::Auto, ..SolveRequest::default() };
+    let result = solve_model_silent(&ModelPackage::new(guarded_element_objective_model()), &request).unwrap();
 
     assert_eq!(result.status(), SolveStatus::Optimal);
     assert_eq!(result.primal().unwrap().objectives(), [7]);
@@ -458,38 +431,21 @@ fn disconnected_direct_guarded_element_does_not_enable_the_warm_start() {
 }
 
 #[test]
-fn disconnected_element_does_not_enable_the_structural_warm_start() {
-    let mut model = Model::new();
-    let cell = model.int_range(0, 0);
-    let guard = model.bool_var();
-    let index = model.int_range(0, 0);
-    let element_value = model.bool_var();
-    let unrelated_value = model.bool_var();
-    let mismatch = model.bool_var();
-    let mismatch_count = model.bool_var();
-    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Element { array: vec![cell], index, value: element_value }));
-    model.add_constraint(Constraint::Intension(IntExpr::Eq(
-        Box::new(IntExpr::Variable(mismatch)),
-        Box::new(IntExpr::Ne(Box::new(IntExpr::Variable(unrelated_value)), Box::new(IntExpr::Constant(1)))),
-    )));
-    model.add_constraint(Constraint::Linear { terms: vec![(1, mismatch), (-1, mismatch_count)], relation: Relation::Eq, rhs: 0 });
-    model.add_constraint(Constraint::Intension(IntExpr::Or(vec![
-        IntExpr::Eq(Box::new(IntExpr::Variable(guard)), Box::new(IntExpr::Constant(0))),
-        IntExpr::Le(Box::new(IntExpr::Variable(mismatch_count)), Box::new(IntExpr::Constant(1))),
-    ])));
-    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table {
-        variables: vec![index],
-        tuples: vec![vec![0]].into(),
-        positive: true,
-    }));
-    model.add_objective(Objective::IntExpr { minimize: false, expr: IntExpr::Mul(vec![IntExpr::Constant(7), IntExpr::Variable(guard)]) });
+fn explicit_integer_local_search_keeps_the_guarded_element_constructor() {
+    let package = ModelPackage::new(guarded_element_objective_model());
+    let request = SolveRequest {
+        mode: SolveMode::LocalSearch,
+        limits: SolveLimits { iterations: Some(1), ..SolveLimits::default() },
+        ..SolveRequest::default()
+    };
+    let plan = compile_model_plan(&package, &request, &SolveBudget::new(None)).unwrap();
+    assert!(matches!(plan.description(), ExecutablePlan::Single(stage) if stage.engine() == EngineKind::IntegerLocalSearch));
 
-    let request = SolveRequest { mode: SolveMode::Exact, ..SolveRequest::default() };
-    let result = solve_model_silent(&ModelPackage::new(model), &request).unwrap();
+    let result = solve_model_silent(&package, &request).unwrap();
 
-    assert_eq!(result.status(), SolveStatus::Optimal);
+    assert_eq!(result.status(), SolveStatus::Satisfiable);
     assert_eq!(result.primal().unwrap().objectives(), [7]);
-    assert!(!result.reports().iter().any(|report| report.engine == Some(EngineKind::IntegerLocalSearch)));
+    assert!(result.reports().iter().any(|report| report.engine == Some(EngineKind::IntegerLocalSearch)));
 }
 
 #[test]

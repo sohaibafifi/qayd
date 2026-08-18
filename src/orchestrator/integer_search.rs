@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use crate::engines::ls::cop::{solve_ls_capped, solve_ls_capped_borrowed, LocalSearchOutcome, LocalSearchSpec, LsConfig};
 use crate::engines::ls::disjunctive_schedule::DisjunctiveSchedulePlan;
 use crate::engines::ls::exact_cover::ExactCoverPlan;
-use crate::engines::ls::integer::{IntegerLocalSearchPlan, IntegerWarmStartKind, IntegerWarmStartPlan};
+use crate::engines::ls::integer::{IntegerLocalSearchPlan, IntegerWarmStartPlan};
 use crate::engines::ls::scenario_schedule::{ConstructionLimits, ScenarioSchedulePlan};
 use crate::expr::Expr;
 use crate::ids::VarId;
@@ -37,7 +37,6 @@ struct Improvement {
 }
 
 const INTERNAL_REPLAY_INTERVAL: Duration = Duration::from_millis(25);
-const STRUCTURAL_WARM_START_ITERATIONS: u64 = 160;
 const SIGNED_PRODUCT_SQUARES_WARM_START_ITERATIONS: u64 = 50_000;
 
 struct RepairedCandidate {
@@ -161,18 +160,14 @@ fn local_warm_start(
     search_stop: &AtomicBool,
     transfer_stop: &AtomicBool,
 ) -> Result<Option<IntegerWarmStart>, SolveError> {
-    let Some(warm_start_kind) = plan.warm_start else {
+    if !plan.signed_product_square_warm_start {
         return Ok(None);
-    };
+    }
     if budget.expired() {
         return Ok(None);
     }
 
     let started = Instant::now();
-    let max_iterations = match warm_start_kind {
-        IntegerWarmStartKind::Structural => STRUCTURAL_WARM_START_ITERATIONS,
-        IntegerWarmStartKind::SignedProductSquares => SIGNED_PRODUCT_SQUARES_WARM_START_ITERATIONS,
-    };
     // LocalModel owns one normalized spec copy, covered by estimated_bytes. The
     // much larger physical CP root remains borrowed throughout this warm start.
     let outcome = solve_ls_capped_borrowed(
@@ -181,7 +176,7 @@ fn local_warm_start(
         search_stop,
         request.seed,
         LsConfig { gls: true, min_conflicts: true, kick_bandit: false },
-        max_iterations,
+        SIGNED_PRODUCT_SQUARES_WARM_START_ITERATIONS,
         |_, _, _| {},
     );
     let LocalSearchOutcome {
@@ -241,7 +236,7 @@ fn local_warm_start(
             elapsed: started.elapsed(),
             improvements: 1,
             metadata: vec![
-                ("ls_role".to_string(), warm_start_kind.role().to_string()),
+                ("ls_role".to_string(), "signed_product_squares_warm_start".to_string()),
                 ("ls_moves".to_string(), moves.to_string()),
                 ("ls_constraints".to_string(), constraints.to_string()),
                 ("ls_functionals".to_string(), functionals.to_string()),

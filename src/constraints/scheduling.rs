@@ -6,16 +6,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::constraints::interval as interval_constraints;
 use crate::constraints::linear::{linear, Relation};
 use crate::constraints::resource_profile::{
-    build_profile, earliest_feasible_start, first_overload, latest_feasible_start, mandatory_height_limit, peak_usage, ProfileSegment,
+    build_profile, earliest_feasible_start, first_overload, latest_feasible_start, mandatory_height_limit, peak_usage, EnergeticAnalysis,
+    EnergeticWorkspace, FixedCumulativeTask, ProfileSegment,
 };
 use crate::ids::{PropId, VarId};
 use crate::propagator::{Event, Inconsistency, Priority, Propagator};
 use crate::store::{Premise, Solver, Store};
-
-/// Ceiling of `a / b` for `a >= 0`, `b > 0`.
-fn ceil_div_pos(a: i128, b: i128) -> i128 {
-    (a + b - 1) / b
-}
 
 /// Run `$body` to a local fixpoint. `$measure` is a progress quantity that only
 /// shrinks as domains shrink (typically summed domain size); the loop repeats
@@ -58,6 +54,11 @@ fn register_variables_until(store: &mut Store, me: PropId, variables: &[VarId], 
 
 fn clamp_i128_i32(value: i128) -> i32 {
     value.clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32
+}
+
+#[inline]
+fn interruption_requested(should_stop: Option<&dyn Fn() -> bool>) -> bool {
+    should_stop.is_some_and(|stop| stop())
 }
 
 // ===========================================================================
@@ -235,13 +236,8 @@ struct Cumulative {
     events: Vec<(i128, i128)>,
     profile: Vec<ProfileSegment>,
     buf: Vec<i32>,
-    /// Reused scratch for energetic overload checking.
-    est: Vec<i128>,
-    lct: Vec<i128>,
-    energy: Vec<i128>,
-    by_est: Vec<usize>,
-    by_lct: Vec<usize>,
-    lb: Vec<i128>,
+    tasks: Vec<FixedCumulativeTask>,
+    energetic: EnergeticWorkspace,
 }
 
 impl Cumulative {
@@ -277,6 +273,157 @@ impl Cumulative {
         }
         why
     }
+
+    fn propagate_core(&mut self, store: &mut Store, should_stop: Option<&dyn Fn() -> bool>) -> Result<(), Inconsistency> {
+        let n = self.starts.len();
+        if n == 0 || interruption_requested(should_stop) {
+            return Ok(());
+        }
+
+        // Self-changes don't re-enqueue, so one pass could miss overloads
+        // involving a just-fixed task.
+        loop {
+            if interruption_requested(should_stop) {
+                return Ok(());
+            }
+            let before = (0..n).map(|i| store.size(self.starts[i])).sum::<usize>();
+
+            self.tasks.clear();
+            for i in 0..n {
+                self.tasks.push(FixedCumulativeTask::new(
+                    store.min(self.starts[i]),
+                    store.max(self.starts[i]),
+                    self.dur[i],
+                    self.height[i],
+                ));
+            }
+
+            // The shared pure kernel performs energetic overload checking and
+            // edge finding. No bound or conflict is consumed from an
+            // interrupted analysis.
+            let energetic = match should_stop {
+                Some(stop) => self.energetic.analyse_until(&self.tasks, i128::from(self.capacity), stop),
+                None => self.energetic.analyse(&self.tasks, i128::from(self.capacity)).map(|()| EnergeticAnalysis::Complete),
+            };
+            match energetic {
+                Ok(EnergeticAnalysis::Complete) => {}
+                Ok(EnergeticAnalysis::Interrupted) => return Ok(()),
+                Err(_) if interruption_requested(should_stop) => return Ok(()),
+                Err(_) => return Err(Inconsistency),
+            }
+            for i in 0..n {
+                if interruption_requested(should_stop) {
+                    return Ok(());
+                }
+                let lower_bound = self.energetic.lower_bounds()[i];
+                if lower_bound > self.tasks[i].earliest_start() {
+                    // `analyse` rejects a bound beyond latest_start, which is an
+                    // i32 store bound. Conversion therefore cannot clamp away a
+                    // conflict at the numeric boundary.
+                    let lower_bound = i32::try_from(lower_bound).map_err(|_| Inconsistency)?;
+                    store.remove_below(self.starts[i], lower_bound)?;
+                }
+            }
+
+            // Edge finding may have tightened starts. Refresh the pure task
+            // snapshot once, then let both energetic reasoning and time-tabling
+            // use the same mathematical compulsory-part definition.
+            for i in 0..n {
+                self.tasks[i] = FixedCumulativeTask::new(store.min(self.starts[i]), store.max(self.starts[i]), self.dur[i], self.height[i]);
+            }
+
+            // Sparse time-tabling over mandatory-part events. Memory is O(n),
+            // independent of the numeric horizon.
+            build_profile(self.tasks.iter().copied().map(FixedCumulativeTask::compulsory_part), &mut self.events, &mut self.profile);
+            if interruption_requested(should_stop) {
+                return Ok(());
+            }
+            if let Some(segment) = self.profile.iter().find(|segment| segment.usage > i128::from(self.capacity)) {
+                if interruption_requested(should_stop) {
+                    return Ok(());
+                }
+                if store.explaining() {
+                    return Err(store.fail_because(self.overload_premises(store, segment.start, None, 0)));
+                }
+                return Err(Inconsistency);
+            }
+            for i in 0..n {
+                if interruption_requested(should_stop) {
+                    return Ok(());
+                }
+                let hi = i128::from(self.height[i]);
+                let mand_start = i128::from(store.max(self.starts[i]));
+                let mand_end = i128::from(store.min(self.starts[i])) + i128::from(self.dur[i]);
+                if !store.explaining() {
+                    let earliest = i128::from(store.min(self.starts[i]));
+                    let latest = i128::from(store.max(self.starts[i]));
+                    let duration = i128::from(self.dur[i]);
+                    let own_part = Some((mand_start, mand_end, hi));
+                    let capacity = i128::from(self.capacity);
+                    let Some(new_min) = earliest_feasible_start(&self.profile, earliest, latest, duration, hi, own_part, capacity) else {
+                        if interruption_requested(should_stop) {
+                            return Ok(());
+                        }
+                        return Err(Inconsistency);
+                    };
+                    let Some(new_max) = latest_feasible_start(&self.profile, new_min, latest, duration, hi, own_part, capacity) else {
+                        if interruption_requested(should_stop) {
+                            return Ok(());
+                        }
+                        return Err(Inconsistency);
+                    };
+                    if interruption_requested(should_stop) {
+                        return Ok(());
+                    }
+                    store.remove_below(self.starts[i], clamp_i128_i32(new_min))?;
+                    if interruption_requested(should_stop) {
+                        return Ok(());
+                    }
+                    store.remove_above(self.starts[i], clamp_i128_i32(new_max))?;
+                    continue;
+                }
+                self.buf.clear();
+                self.buf.extend(store.values(self.starts[i]));
+                for &start in &self.buf {
+                    if interruption_requested(should_stop) {
+                        return Ok(());
+                    }
+                    let start_time = i128::from(start);
+                    let conflict = first_overload(
+                        &self.profile,
+                        start_time,
+                        start_time + i128::from(self.dur[i]),
+                        hi,
+                        Some((mand_start, mand_end, hi)),
+                        i128::from(self.capacity),
+                    );
+                    if let Some((t_c, _)) = conflict {
+                        if interruption_requested(should_stop) {
+                            return Ok(());
+                        }
+                        if store.explaining() {
+                            let why = self.overload_premises(store, t_c, Some(i), hi);
+                            if interruption_requested(should_stop) {
+                                return Ok(());
+                            }
+                            if why.is_empty() {
+                                store.remove(self.starts[i], start)?;
+                            } else {
+                                store.remove_because(self.starts[i], start, why)?;
+                            }
+                        } else {
+                            store.remove(self.starts[i], start)?;
+                        }
+                    }
+                }
+            }
+
+            let after = (0..n).map(|i| store.size(self.starts[i])).sum::<usize>();
+            if after == before {
+                return Ok(());
+            }
+        }
+    }
 }
 
 impl Propagator for Cumulative {
@@ -295,137 +442,11 @@ impl Propagator for Cumulative {
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
-        let n = self.starts.len();
-        if n == 0 {
-            return Ok(());
-        }
+        self.propagate_core(store, None)
+    }
 
-        // Self-changes don't re-enqueue, so one pass could miss overloads
-        // involving a just-fixed task.
-        local_fixpoint!((0..n).map(|i| store.size(self.starts[i])).sum::<usize>(), {
-            // Snapshot est, lct, energy.
-            for i in 0..n {
-                self.est[i] = i128::from(store.min(self.starts[i]));
-                self.lct[i] = i128::from(store.max(self.starts[i])) + i128::from(self.dur[i]);
-                self.energy[i] = i128::from(self.height[i]) * i128::from(self.dur[i]);
-            }
-
-            // Energetic overload check: window [L, U) energy > capacity*(U-L) fails.
-            self.by_est.sort_unstable_by(|&a, &b| self.est[b].cmp(&self.est[a]));
-            for u in 0..n {
-                let ub = self.lct[u];
-                let mut e = 0i128;
-                for &k in &self.by_est {
-                    if self.lct[k] <= ub {
-                        e += self.energy[k];
-                        if e > i128::from(self.capacity) * (ub - self.est[k]) {
-                            return Err(Inconsistency);
-                        }
-                    }
-                }
-            }
-
-            // Edge-finding: if Omega ∪ {i} can't fit in [est, U], i ends after Omega,
-            // so it can't start until Omega's non-parallelisable rest energy is done.
-            self.by_lct.sort_unstable_by(|&a, &b| self.lct[a].cmp(&self.lct[b]));
-            self.lb.copy_from_slice(&self.est);
-            #[allow(clippy::needless_range_loop)]
-            for i in 0..n {
-                let hi = i128::from(self.height[i]);
-                if hi == 0 {
-                    continue;
-                }
-                let mut e_omega = 0i128;
-                let mut est_omega = i128::MAX;
-                for &j in &self.by_lct {
-                    if j == i {
-                        continue;
-                    }
-                    e_omega += self.energy[j];
-                    est_omega = est_omega.min(self.est[j]);
-                    let u = self.lct[j];
-                    if e_omega + self.energy[i] > i128::from(self.capacity) * (u - est_omega.min(self.est[i])) {
-                        let rest = e_omega - (i128::from(self.capacity) - hi) * (u - est_omega);
-                        if rest > 0 {
-                            self.lb[i] = self.lb[i].max(est_omega + ceil_div_pos(rest, hi));
-                        }
-                    }
-                }
-            }
-            #[allow(clippy::needless_range_loop)]
-            for i in 0..n {
-                if self.lb[i] > self.est[i] {
-                    store.remove_below(self.starts[i], clamp_i128_i32(self.lb[i]))?;
-                }
-            }
-
-            // Sparse time-tabling over mandatory-part events. Memory is O(n),
-            // independent of the numeric horizon.
-            build_profile(
-                (0..n).map(|i| {
-                    (
-                        i128::from(store.max(self.starts[i])),
-                        i128::from(store.min(self.starts[i])) + i128::from(self.dur[i]),
-                        i128::from(self.height[i]),
-                    )
-                }),
-                &mut self.events,
-                &mut self.profile,
-            );
-            if let Some(segment) = self.profile.iter().find(|segment| segment.usage > i128::from(self.capacity)) {
-                if store.explaining() {
-                    return Err(store.fail_because(self.overload_premises(store, segment.start, None, 0)));
-                }
-                return Err(Inconsistency);
-            }
-            for i in 0..n {
-                let hi = i128::from(self.height[i]);
-                let mand_start = i128::from(store.max(self.starts[i]));
-                let mand_end = i128::from(store.min(self.starts[i])) + i128::from(self.dur[i]);
-                if !store.explaining() {
-                    let earliest = i128::from(store.min(self.starts[i]));
-                    let latest = i128::from(store.max(self.starts[i]));
-                    let duration = i128::from(self.dur[i]);
-                    let own_part = Some((mand_start, mand_end, hi));
-                    let capacity = i128::from(self.capacity);
-                    let Some(new_min) = earliest_feasible_start(&self.profile, earliest, latest, duration, hi, own_part, capacity) else {
-                        return Err(Inconsistency);
-                    };
-                    let Some(new_max) = latest_feasible_start(&self.profile, new_min, latest, duration, hi, own_part, capacity) else {
-                        return Err(Inconsistency);
-                    };
-                    store.remove_below(self.starts[i], clamp_i128_i32(new_min))?;
-                    store.remove_above(self.starts[i], clamp_i128_i32(new_max))?;
-                    continue;
-                }
-                self.buf.clear();
-                self.buf.extend(store.values(self.starts[i]));
-                for &start in &self.buf {
-                    let start_time = i128::from(start);
-                    let conflict = first_overload(
-                        &self.profile,
-                        start_time,
-                        start_time + i128::from(self.dur[i]),
-                        hi,
-                        Some((mand_start, mand_end, hi)),
-                        i128::from(self.capacity),
-                    );
-                    if let Some((t_c, _)) = conflict {
-                        if store.explaining() {
-                            let why = self.overload_premises(store, t_c, Some(i), hi);
-                            if why.is_empty() {
-                                store.remove(self.starts[i], start)?;
-                            } else {
-                                store.remove_because(self.starts[i], start, why)?;
-                            }
-                        } else {
-                            store.remove(self.starts[i], start)?;
-                        }
-                    }
-                }
-            }
-        });
-        Ok(())
+    fn propagate_until(&mut self, store: &mut Store, should_stop: &dyn Fn() -> bool) -> Result<(), Inconsistency> {
+        self.propagate_core(store, Some(should_stop))
     }
 }
 
@@ -442,12 +463,8 @@ pub fn cumulative(solver: &mut Solver, starts: &[VarId], durations: &[i64], heig
         events: Vec::new(),
         profile: Vec::new(),
         buf: Vec::new(),
-        est: vec![0; n],
-        lct: vec![0; n],
-        energy: vec![0; n],
-        by_est: (0..n).collect(),
-        by_lct: (0..n).collect(),
-        lb: vec![0; n],
+        tasks: Vec::with_capacity(n),
+        energetic: EnergeticWorkspace::default(),
     }));
 }
 
@@ -482,12 +499,8 @@ pub(crate) fn cumulative_interruptible(
         events: Vec::new(),
         profile: Vec::new(),
         buf: Vec::new(),
-        est: vec![0; n],
-        lct: vec![0; n],
-        energy: vec![0; n],
-        by_est: (0..n).collect(),
-        by_lct: (0..n).collect(),
-        lb: vec![0; n],
+        tasks: Vec::with_capacity(n),
+        energetic: EnergeticWorkspace::default(),
     };
     let should_stop = || stop.load(Ordering::Acquire);
     solver.post_until(Box::new(propagator), &should_stop).is_some()

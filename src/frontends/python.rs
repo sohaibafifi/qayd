@@ -2710,6 +2710,10 @@ impl PySolution {
 
 #[pymethods]
 impl PySolveSession {
+    /// Total clauses published since the last `clear_nogoods()` call.
+    ///
+    /// The bounded sharing pool may retain fewer live clauses, and
+    /// `nogoods()` omits clauses that mention internal auxiliary variables.
     #[getter]
     fn learned_nogoods(&self) -> usize {
         self.session.learned_nogoods()
@@ -2749,7 +2753,7 @@ impl PySolveSession {
             .collect())
     }
 
-    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, conflict_budget=None, linear_backend="auto", lp_root_ms=50, lp_node_ms=0, lp_node_depth_interval=8, lp_max_variables=2000, lp_max_rows=1000, lp_max_nonzeros=100000, lp_min_coverage_percent=1, lp_phase_max_variables=1000, lp_route_ng_size=8, lp_route_max_labels=2000000, lp_route_dual_stabilization_percent=75))]
+    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, threads=1, conflict_budget=None, memory_limit_mb=None, linear_backend="auto", lp_root_ms=50, lp_node_ms=0, lp_node_depth_interval=8, lp_max_variables=2000, lp_max_rows=1000, lp_max_nonzeros=100000, lp_min_coverage_percent=1, lp_phase_max_variables=1000, lp_route_ng_size=8, lp_route_max_labels=2000000, lp_route_dual_stabilization_percent=75))]
     #[allow(clippy::too_many_arguments)]
     fn solve(
         &mut self,
@@ -2762,7 +2766,9 @@ impl PySolveSession {
         verbose: bool,
         time_limit: Option<u64>,
         seed: u64,
+        threads: usize,
         conflict_budget: Option<u64>,
+        memory_limit_mb: Option<u64>,
         linear_backend: &str,
         lp_root_ms: u64,
         lp_node_ms: u64,
@@ -2776,6 +2782,12 @@ impl PySolveSession {
         lp_route_max_labels: usize,
         lp_route_dual_stabilization_percent: usize,
     ) -> PyResult<PySolution> {
+        if threads == 0 {
+            return Err(PyValueError::new_err("threads must be a positive integer"));
+        }
+        if memory_limit_mb == Some(0) {
+            return Err(PyValueError::new_err("memory_limit_mb must be a positive integer when provided"));
+        }
         if let Some(callback) = on_incumbent {
             if !callback.is_callable() {
                 return Err(PyTypeError::new_err("on_incumbent must be callable"));
@@ -2801,7 +2813,13 @@ impl PySolveSession {
         let request = SolveRequest {
             mode: SolveMode::Exact,
             seed,
-            limits: SolveLimits { time: time_limit.map(Duration::from_secs), conflicts: conflict_budget, ..SolveLimits::default() },
+            threads,
+            limits: SolveLimits {
+                time: time_limit.map(Duration::from_secs),
+                memory_bytes: memory_limit_mb.map(|limit| limit.saturating_mul(1024 * 1024)),
+                conflicts: conflict_budget,
+                ..SolveLimits::default()
+            },
             assumptions,
             hints,
             branch_order: guidance,

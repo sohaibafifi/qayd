@@ -644,6 +644,7 @@ impl Cdcl<'_> {
                 break;
             }
             match self.propagate() {
+                Ok(()) if self.stopped() => break,
                 Ok(()) => match self.select_branch_var(vars, primary_branch_scope, None) {
                     None => {
                         // Full assignment.
@@ -843,7 +844,7 @@ impl Cdcl<'_> {
         if !self.init() || !self.assume_objective_bound(obj, target, minimizing) || !self.sync_shared_clauses() {
             stats.failures = self.conflicts;
             self.copy_inprocessing_stats(&mut stats);
-            return (None, stats, true);
+            return (None, stats, !self.stopped());
         }
         let phase = vec![None; self.solver.store.num_vars()];
         let mut complete = true;
@@ -853,10 +854,17 @@ impl Cdcl<'_> {
                 break None;
             }
             if !self.maybe_restart() {
+                if self.stopped() {
+                    complete = false;
+                }
                 break None;
             }
             match self.select_branch_var(vars, primary_branch_scope, None) {
                 None => {
+                    if self.stopped() {
+                        complete = false;
+                        break None;
+                    }
                     stats.solutions += 1;
                     let value = self.solver.store.value(obj);
                     let assignment = vars.iter().map(|&v| self.solver.store.value(v)).collect();
@@ -867,6 +875,9 @@ impl Cdcl<'_> {
                     let lit = self.decision_lit(v, &phase, None);
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
+                        if self.stopped() {
+                            complete = false;
+                        }
                         break None;
                     }
                 }
@@ -971,17 +982,17 @@ impl Cdcl<'_> {
         if !self.init() {
             stats.failures = self.conflicts;
             self.copy_inprocessing_stats(&mut stats);
-            return (best, stats, !self.conflict_budget_exhausted());
+            return (best, stats, !self.stopped() && !self.conflict_budget_exhausted());
         }
         if cube.is_empty() && conflict_budget.is_none() && !self.root_probe(primary_branch_scope.unwrap_or(vars)) {
             stats.failures = self.conflicts;
             self.copy_inprocessing_stats(&mut stats);
-            return (best, stats, true);
+            return (best, stats, !self.stopped());
         }
         if !self.assume_cube(cube) {
             stats.failures = self.conflicts;
             self.copy_inprocessing_stats(&mut stats);
-            return (best, stats, !self.conflict_budget_exhausted());
+            return (best, stats, !self.stopped() && !self.conflict_budget_exhausted());
         }
         // Seed the saved-phase array with the caller's value-ordering hint (e.g.
         // nearest-neighbour successors) when supplied, else start blank.
@@ -1040,7 +1051,7 @@ impl Cdcl<'_> {
         if !self.sync_shared_clauses() {
             stats.failures = self.conflicts;
             self.copy_inprocessing_stats(&mut stats);
-            return (best, stats, !self.conflict_budget_exhausted());
+            return (best, stats, !self.stopped() && !self.conflict_budget_exhausted());
         }
 
         loop {
@@ -1056,7 +1067,7 @@ impl Cdcl<'_> {
                 if stronger {
                     enforced = Some(value);
                     if !self.tighten_objective(objective, minimizing, value, &mut obj_bound) {
-                        if self.conflict_budget_exhausted() {
+                        if self.stopped() || self.conflict_budget_exhausted() {
                             complete = false;
                         }
                         break;
@@ -1064,7 +1075,7 @@ impl Cdcl<'_> {
                 }
             }
             if !self.maybe_restart() {
-                if self.conflict_budget_exhausted() {
+                if self.stopped() || self.conflict_budget_exhausted() {
                     complete = false;
                 }
                 break;
@@ -1096,6 +1107,10 @@ impl Cdcl<'_> {
                 objective_impact.as_ref().filter(|impact| !impact.defer_until_incumbent || best.is_some() || enforced.is_some());
             match self.select_branch_var(vars, primary_branch_scope, active_objective) {
                 None => {
+                    if self.stopped() {
+                        complete = false;
+                        break;
+                    }
                     // A successful hinted dive consumes the one-shot policy.
                     // Its accepted incumbent becomes the ordinary saved phase
                     // and must not replay as another guarded dive.
@@ -1154,7 +1169,7 @@ impl Cdcl<'_> {
                     let lit = self.decision_lit_with_policy(v, &phase, active_objective, guarded_hint_restart.is_some());
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
-                        if self.conflict_budget_exhausted() {
+                        if self.stopped() || self.conflict_budget_exhausted() {
                             complete = false;
                         }
                         break; // tree exhausted under the bound: optimal
@@ -1180,7 +1195,7 @@ impl Cdcl<'_> {
         if !self.init() || !self.root_probe(primary_branch_scope.unwrap_or(vars)) || !self.sync_shared_clauses() {
             stats.failures = self.conflicts;
             self.copy_inprocessing_stats(&mut stats);
-            return (None, stats, true);
+            return (None, stats, !self.stopped());
         }
         if self.initial_phase.len() == self.solver.store.num_vars() {
             self.saved_phase = self.initial_phase.clone();
@@ -1192,10 +1207,17 @@ impl Cdcl<'_> {
                 break None;
             }
             if !self.maybe_restart() {
+                if self.stopped() {
+                    complete = false;
+                }
                 break None;
             }
             match self.select_branch_var(vars, primary_branch_scope, None) {
                 None => {
+                    if self.stopped() {
+                        complete = false;
+                        break None;
+                    }
                     stats.solutions += 1;
                     break Some(vars.iter().map(|&v| self.solver.store.value(v)).collect());
                 }
@@ -1204,6 +1226,9 @@ impl Cdcl<'_> {
                     let lit = self.decision_lit(v, &self.saved_phase, None);
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
+                        if self.stopped() {
+                            complete = false;
+                        }
                         break None;
                     }
                 }
@@ -1229,7 +1254,7 @@ impl Cdcl<'_> {
         if !self.init() || !self.assume_cube(cube) || !self.sync_shared_clauses() {
             stats.failures = self.conflicts;
             self.copy_inprocessing_stats(&mut stats);
-            return (None, stats, !self.conflict_budget_exhausted());
+            return (None, stats, !self.stopped() && !self.conflict_budget_exhausted());
         }
         if self.initial_phase.len() == self.solver.store.num_vars() {
             self.saved_phase = self.initial_phase.clone();
@@ -1241,11 +1266,15 @@ impl Cdcl<'_> {
                 break None;
             }
             if !self.maybe_restart() {
-                complete = !self.conflict_budget_exhausted();
+                complete = !self.stopped() && !self.conflict_budget_exhausted();
                 break None;
             }
             match self.select_branch_var(vars, primary_branch_scope, None) {
                 None => {
+                    if self.stopped() {
+                        complete = false;
+                        break None;
+                    }
                     stats.solutions += 1;
                     break Some(vars.iter().map(|&v| self.solver.store.value(v)).collect());
                 }
@@ -1254,7 +1283,7 @@ impl Cdcl<'_> {
                     let lit = self.decision_lit(v, &self.saved_phase, None);
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
-                        complete = !self.conflict_budget_exhausted();
+                        complete = !self.stopped() && !self.conflict_budget_exhausted();
                         break None;
                     }
                 }
@@ -1277,7 +1306,7 @@ impl Cdcl<'_> {
     /// restart, which backjumps to the root).
     pub(crate) fn solve_under_assumptions(&mut self, vars: &[VarId], cube: &[Lit], stop: &AtomicBool) -> AssumptionOutcome {
         if !self.init() {
-            return AssumptionOutcome::Unsat(Vec::new()); // root already unsatisfiable
+            return if self.stopped() { AssumptionOutcome::Interrupted } else { AssumptionOutcome::Unsat(Vec::new()) };
         }
         self.resolve_assumptions(vars, cube, stop)
     }
@@ -1293,7 +1322,7 @@ impl Cdcl<'_> {
                 return AssumptionOutcome::Interrupted;
             }
             if !self.maybe_restart() {
-                return AssumptionOutcome::Unsat(Vec::new());
+                return if self.stopped() { AssumptionOutcome::Interrupted } else { AssumptionOutcome::Unsat(Vec::new()) };
             }
             let d = self.decision_level();
             if d < cube.len() {
@@ -1309,6 +1338,10 @@ impl Cdcl<'_> {
                     Tri::Unknown => {
                         self.decide(p).expect("in-domain assumption decision cannot fail");
                         if !self.propagate_and_learn() {
+                            if self.stopped() {
+                                self.backjump_to(0);
+                                return AssumptionOutcome::Interrupted;
+                            }
                             // Level-0 refutation: every learnt clause is root-entailed,
                             // so this means the root alone is unsatisfiable.
                             self.backjump_to(0);
@@ -1322,12 +1355,16 @@ impl Cdcl<'_> {
             // that refutes the cube backjumps below `cube.len()`, re-entering
             // Phase 1 where `analyze_final` catches the now-false assumption.
             match self.select_var(vars, None) {
+                None if self.stopped() => return AssumptionOutcome::Interrupted,
                 None => return AssumptionOutcome::Sat(vars.iter().map(|&v| self.solver.store.value(v)).collect()),
                 Some(v) => {
                     let lit = self.decision_lit(v, &self.saved_phase, None);
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
                         self.backjump_to(0);
+                        if self.stopped() {
+                            return AssumptionOutcome::Interrupted;
+                        }
                         return AssumptionOutcome::Unsat(Vec::new()); // root alone is unsat
                     }
                 }

@@ -1,6 +1,7 @@
 use qayd::constraints::interval::{cumulative, exactly_one_mode, interval_precedence, makespan_bound, no_overlap};
 use qayd::constraints::list::{item_precedence, list_cardinality, list_item_sum, list_len, partition, same_list};
-use qayd::{first_domain_solution, solve_domains, IntervalId, IntervalPresence, SearchControl, Solver, Store, VarId};
+use qayd::constraints::scheduling::cumulative as cumulative_integer;
+use qayd::{first_domain_solution, solve_domains, solve_search, IntervalId, IntervalPresence, SearchControl, Solver, Store, VarId};
 
 #[test]
 fn domain_intervals_are_integer_backed() {
@@ -601,6 +602,182 @@ fn domain_cumulative_forbids_unfittable_optional() {
 }
 
 #[test]
+fn domain_cumulative_does_not_filter_an_undecided_optional_start() {
+    // The compulsory part of `a` excludes starts 0 and 1 for `b` if `b` is
+    // present.  While presence is undecided that inference is conditional: an
+    // absent interval's backing start remains unconstrained by cumulative.
+    let mut solver = Solver::new();
+    let a = solver.store.new_interval(0, 0, 2);
+    let b = solver.store.new_optional_interval(0, 4, 2);
+    cumulative(&mut solver, &[a, b], &[2, 2], 3);
+
+    solver.propagate().unwrap();
+    assert_eq!(solver.store.interval_presence(b), IntervalPresence::Optional);
+    assert_eq!((solver.store.interval_start_min(b), solver.store.interval_start_max(b)), (0, 4));
+
+    solver.store.push_level();
+    solver.store.forbid_interval_presence(b).unwrap();
+    solver.propagate().unwrap();
+    assert_eq!(solver.store.interval_presence(b), IntervalPresence::Absent);
+    assert_eq!((solver.store.interval_start_min(b), solver.store.interval_start_max(b)), (0, 4));
+    solver.store.pop_level();
+
+    solver.store.require_interval_presence(b).unwrap();
+    solver.propagate().unwrap();
+    assert_eq!(solver.store.interval_start_min(b), 2);
+}
+
+#[test]
+fn domain_cumulative_keeps_a_task_ending_after_i32_max_feasible() {
+    // Endpoints are mathematical i128 values inside cumulative. Saturating
+    // `i32::MAX + duration` to `i32::MAX` creates a zero-width energetic
+    // window and used to report this single feasible task as UNSAT.
+    let mut solver = Solver::new();
+    let task = solver.store.new_interval(i32::MAX, i32::MAX, 1);
+    cumulative(&mut solver, &[task], &[1], 1);
+
+    solver.propagate().expect("a single task at i32::MAX is feasible");
+    assert_eq!(solver.store.interval_start_min(task), i32::MAX);
+}
+
+#[test]
+fn fixed_and_interval_cumulative_match_an_exhaustive_oracle() {
+    use std::collections::BTreeSet;
+
+    for capacity in 1..=3i32 {
+        for duration_mask in 0..8u32 {
+            for demand_mask in 0..8u32 {
+                let durations = (0..3).map(|task| 1 + ((duration_mask >> task) & 1) as i32).collect::<Vec<_>>();
+                let demands = (0..3).map(|task| 1 + ((demand_mask >> task) & 1) as i32).collect::<Vec<_>>();
+
+                let mut interval_solver = Solver::new();
+                let intervals = durations.iter().map(|&duration| interval_solver.store.new_interval(0, 2, duration)).collect::<Vec<_>>();
+                cumulative(&mut interval_solver, &intervals, &demands, capacity);
+                let mut interval_solutions = BTreeSet::new();
+                solve_domains(&mut interval_solver, |_, solution| {
+                    interval_solutions.insert(
+                        intervals
+                            .iter()
+                            .map(|interval| solution.interval_starts[interval.index()].expect("mandatory interval"))
+                            .collect::<Vec<_>>(),
+                    );
+                    SearchControl::Continue
+                });
+
+                let mut integer_solver = Solver::new();
+                let starts = (0..3).map(|_| integer_solver.new_var_range(0, 2)).collect::<Vec<_>>();
+                cumulative_integer(
+                    &mut integer_solver,
+                    &starts,
+                    &durations.iter().map(|&value| i64::from(value)).collect::<Vec<_>>(),
+                    &demands.iter().map(|&value| i64::from(value)).collect::<Vec<_>>(),
+                    i64::from(capacity),
+                );
+                let mut integer_solutions = BTreeSet::new();
+                solve_search(&mut integer_solver, &starts, |solver| {
+                    integer_solutions.insert(starts.iter().map(|&start| solver.store.value(start)).collect::<Vec<_>>());
+                    SearchControl::Continue
+                });
+
+                let mut oracle = BTreeSet::new();
+                for first in 0..=2 {
+                    for second in 0..=2 {
+                        for third in 0..=2 {
+                            let assignment = [first, second, third];
+                            let horizon = assignment.iter().enumerate().map(|(task, &start)| start + durations[task]).max().unwrap();
+                            let feasible = (0..horizon).all(|time| {
+                                (0..3)
+                                    .filter(|&task| assignment[task] <= time && time < assignment[task] + durations[task])
+                                    .map(|task| demands[task])
+                                    .sum::<i32>()
+                                    <= capacity
+                            });
+                            if feasible {
+                                oracle.insert(assignment.to_vec());
+                            }
+                        }
+                    }
+                }
+
+                assert_eq!(interval_solutions, oracle, "interval adapter: cap={capacity}, dur={durations:?}, demand={demands:?}");
+                assert_eq!(integer_solutions, oracle, "integer adapter: cap={capacity}, dur={durations:?}, demand={demands:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn fixed_and_interval_cumulative_agree_on_zero_usage_tasks() {
+    use std::collections::BTreeSet;
+
+    let durations = [0, 2, 2];
+    let demands = [3, 0, 2];
+    let expected = (-1..=1).flat_map(|first| (-1..=1).map(move |second| vec![first, second, 0])).collect::<BTreeSet<_>>();
+
+    let mut interval_solver = Solver::new();
+    let intervals = [
+        interval_solver.store.new_interval(-1, 1, durations[0]),
+        interval_solver.store.new_interval(-1, 1, durations[1]),
+        interval_solver.store.new_interval(0, 0, durations[2]),
+    ];
+    cumulative(&mut interval_solver, &intervals, &demands, 2);
+    let mut interval_solutions = BTreeSet::new();
+    solve_domains(&mut interval_solver, |_, solution| {
+        interval_solutions.insert(
+            intervals.iter().map(|interval| solution.interval_starts[interval.index()].expect("mandatory interval")).collect::<Vec<_>>(),
+        );
+        SearchControl::Continue
+    });
+
+    let mut integer_solver = Solver::new();
+    let starts = [integer_solver.new_var_range(-1, 1), integer_solver.new_var_range(-1, 1), integer_solver.new_var_range(0, 0)];
+    cumulative_integer(&mut integer_solver, &starts, &[0, 2, 2], &[3, 0, 2], 2);
+    let mut integer_solutions = BTreeSet::new();
+    solve_search(&mut integer_solver, &starts, |solver| {
+        integer_solutions.insert(starts.iter().map(|&start| solver.store.value(start)).collect::<Vec<_>>());
+        SearchControl::Continue
+    });
+
+    assert_eq!(interval_solutions, expected);
+    assert_eq!(integer_solutions, expected);
+}
+
+#[test]
+fn fixed_and_interval_cumulative_agree_on_negative_touching_windows() {
+    use std::collections::BTreeSet;
+
+    // The first task may start at -2 or -1. Only -2 ends exactly where the
+    // second starts, so half-open intervals make that touching schedule valid.
+    let expected = BTreeSet::from([vec![-2, 0]]);
+
+    let mut interval_solver = Solver::new();
+    let first = interval_solver.store.new_interval(-2, -1, 2);
+    let second = interval_solver.store.new_interval(0, 0, 2);
+    cumulative(&mut interval_solver, &[first, second], &[2, 2], 2);
+    let mut interval_solutions = BTreeSet::new();
+    solve_domains(&mut interval_solver, |_, solution| {
+        interval_solutions.insert(vec![
+            solution.interval_starts[first.index()].expect("mandatory interval"),
+            solution.interval_starts[second.index()].expect("mandatory interval"),
+        ]);
+        SearchControl::Continue
+    });
+
+    let mut integer_solver = Solver::new();
+    let first = integer_solver.new_var_range(-2, -1);
+    let second = integer_solver.new_var_range(0, 0);
+    cumulative_integer(&mut integer_solver, &[first, second], &[2, 2], &[2, 2], 2);
+    let mut integer_solutions = BTreeSet::new();
+    solve_search(&mut integer_solver, &[first, second], |solver| {
+        integer_solutions.insert(vec![solver.store.value(first), solver.store.value(second)]);
+        SearchControl::Continue
+    });
+
+    assert_eq!(interval_solutions, expected);
+    assert_eq!(integer_solutions, expected);
+}
+
+#[test]
 fn domain_cumulative_propagation_is_trailed() {
     let mut solver = Solver::new();
     let a = solver.store.new_interval(0, 0, 2);
@@ -616,6 +793,97 @@ fn domain_cumulative_propagation_is_trailed() {
     solver.store.pop_level();
 
     assert_eq!(solver.store.interval_start_min(b), 2);
+}
+
+#[test]
+fn cumulative_adapters_honor_a_prearmed_stop_without_a_false_conflict() {
+    let mut interval_solver = Solver::new();
+    let interval_a = interval_solver.store.new_interval(0, 0, 2);
+    let interval_b = interval_solver.store.new_interval(0, 0, 2);
+    cumulative(&mut interval_solver, &[interval_a, interval_b], &[1, 1], 1);
+    interval_solver.propagate_until(|| true).expect("a prearmed stop is not an interval cumulative conflict");
+    assert!(interval_solver.fd_at_fixpoint());
+    interval_solver.enqueue_all();
+    assert!(interval_solver.propagate().is_err(), "the real overload remains observable on a complete retry");
+
+    let mut integer_solver = Solver::new();
+    let integer_a = integer_solver.new_var_range(0, 0);
+    let integer_b = integer_solver.new_var_range(0, 0);
+    cumulative_integer(&mut integer_solver, &[integer_a, integer_b], &[2, 2], &[1, 1], 1);
+    integer_solver.propagate_until(|| true).expect("a prearmed stop is not an integer cumulative conflict");
+    assert!(integer_solver.fd_at_fixpoint());
+    integer_solver.enqueue_all();
+    assert!(integer_solver.propagate().is_err(), "the real overload remains observable on a complete retry");
+}
+
+#[test]
+fn interval_cumulative_interruption_preserves_trail_and_retry_state() {
+    use std::cell::Cell;
+
+    let mut solver = Solver::new();
+    let blocker = solver.store.new_interval(0, 0, 10);
+    let target = solver.store.new_interval(0, 20, 10);
+    let mut intervals = vec![blocker, target];
+    intervals.extend((0..128).map(|index| solver.store.new_interval(100 + 2 * index, 100 + 2 * index, 1)));
+    let mut demands = vec![2, 2];
+    demands.extend([1; 128]);
+    cumulative(&mut solver, &intervals, &demands, 3);
+
+    solver.store.push_level();
+    solver.store.set_interval_start_min(target, 1).unwrap();
+    let polls = Cell::new(0usize);
+    solver
+        .propagate_until(|| {
+            let next = polls.get() + 1;
+            polls.set(next);
+            next >= 8
+        })
+        .expect("cancellation inside interval energetic reasoning is not an inconsistency");
+    assert!((8..=9).contains(&polls.get()), "the stop must be observed inside the bounded energetic poll interval");
+    assert_eq!(solver.store.interval_start_min(target), 1, "an incomplete energetic result must not be applied");
+    assert!(solver.fd_at_fixpoint());
+
+    solver.store.pop_level();
+    assert_eq!(solver.store.interval_start_min(target), 0);
+    solver.enqueue_all();
+    solver.propagate().expect("the interrupted propagator must remain reusable after rollback");
+    assert_eq!(solver.store.interval_start_min(target), 10);
+}
+
+#[test]
+fn integer_cumulative_interruption_preserves_trail_and_retry_state() {
+    use std::cell::Cell;
+
+    let mut solver = Solver::new();
+    let blocker = solver.new_var_range(0, 0);
+    let target = solver.new_var_range(0, 20);
+    let mut starts = vec![blocker, target];
+    starts.extend((0..128).map(|index| solver.new_var_range(100 + 2 * index, 100 + 2 * index)));
+    let mut durations = vec![10, 10];
+    durations.extend([1; 128]);
+    let mut heights = vec![2, 2];
+    heights.extend([1; 128]);
+    cumulative_integer(&mut solver, &starts, &durations, &heights, 3);
+
+    solver.store.push_level();
+    solver.store.remove_below(target, 1).unwrap();
+    let polls = Cell::new(0usize);
+    solver
+        .propagate_until(|| {
+            let next = polls.get() + 1;
+            polls.set(next);
+            next >= 8
+        })
+        .expect("cancellation inside integer energetic reasoning is not an inconsistency");
+    assert!((8..=9).contains(&polls.get()), "the stop must be observed inside the bounded energetic poll interval");
+    assert_eq!(solver.store.min(target), 1, "an incomplete energetic result must not be applied");
+    assert!(solver.fd_at_fixpoint());
+
+    solver.store.pop_level();
+    assert_eq!(solver.store.min(target), 0);
+    solver.enqueue_all();
+    solver.propagate().expect("the interrupted propagator must remain reusable after rollback");
+    assert_eq!(solver.store.min(target), 10);
 }
 
 #[test]
@@ -1386,6 +1654,40 @@ fn domain_cumulative_cdcl_mixed_demands_same_solution_set() {
     let chrono = starts_set(false);
     assert!(!cdcl.is_empty(), "feasible schedules exist");
     assert_eq!(cdcl, chrono, "CDCL (overload + push explanations) enumerates the same schedules as chronological");
+}
+
+#[test]
+fn domain_cumulative_energetic_scope_cdcl_same_solution_set() {
+    // There is no compulsory part at the root: each duration-2 task starts in
+    // 0..=3. Energetic conflicts appear only after search narrows windows. The
+    // kernel deliberately leaves those conflicts on the propagator-scope
+    // explanation until an exact Omega witness is threaded through the Store.
+    let schedules = |cdcl: bool| -> std::collections::BTreeSet<Vec<i32>> {
+        let mut solver = Solver::new();
+        let intervals = (0..4).map(|_| solver.store.new_interval(0, 3, 2)).collect::<Vec<_>>();
+        cumulative(&mut solver, &intervals, &[1; 4], 2);
+        let mut schedules = std::collections::BTreeSet::new();
+        if cdcl {
+            let starts = intervals.iter().map(|&interval| solver.store.interval_start_var(interval)).collect::<Vec<_>>();
+            solve_search(&mut solver, &starts, |solver| {
+                schedules.insert(starts.iter().map(|&start| solver.store.value(start)).collect());
+                SearchControl::Continue
+            });
+        } else {
+            solve_domains(&mut solver, |_, solution| {
+                schedules.insert(
+                    intervals.iter().map(|interval| solution.interval_starts[interval.index()].expect("mandatory interval")).collect(),
+                );
+                SearchControl::Continue
+            });
+        }
+        schedules
+    };
+
+    let cdcl = schedules(true);
+    let chronological = schedules(false);
+    assert!(!cdcl.is_empty());
+    assert_eq!(cdcl, chronological, "energetic scope explanations must preserve every feasible schedule");
 }
 
 #[test]

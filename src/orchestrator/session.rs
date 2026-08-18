@@ -44,6 +44,10 @@ impl SemanticSolveSession {
         Ok(Self { package, compiled: None, clauses: Arc::new(SharedClausePool::default()), next_worker: 0 })
     }
 
+    /// Total clauses published by session workers since the last
+    /// [`Self::clear_nogoods`]. The bounded sharing ring may retain fewer live
+    /// clauses, and [`Self::nogoods`] may omit clauses that mention physical
+    /// auxiliary variables.
     pub fn learned_nogoods(&self) -> usize {
         self.clauses.len()
     }
@@ -62,7 +66,7 @@ impl SemanticSolveSession {
     }
 
     pub fn nogoods(&self, limit: Option<usize>) -> Result<Vec<SemanticNogood>, SolveError> {
-        let clauses = self.clauses.snapshot(limit.unwrap_or(0));
+        let clauses = self.clauses.snapshot(0);
         if clauses.is_empty() {
             return Ok(Vec::new());
         }
@@ -71,14 +75,27 @@ impl SemanticSolveSession {
             .as_ref()
             .ok_or_else(|| SolveError::InvalidResult("an uncompiled session contains learned nogoods".to_string()))?;
         let atoms = Self::atom_table(compiled, &self.clauses);
-        clauses
-            .into_iter()
-            .map(|(lbd, literals)| {
-                let literals =
-                    literals.iter().map(|literal| Self::decode_literal(compiled, &atoms, *literal)).collect::<Result<Vec<_>, _>>()?;
-                Ok((lbd, literals))
-            })
-            .collect()
+        let user_variables = self.package.model.int_vars().len();
+        let mut decoded = Vec::new();
+        for (lbd, literals) in clauses {
+            let mut semantic = Vec::with_capacity(literals.len());
+            let mut user_only = true;
+            for &literal in literals.iter() {
+                let Some(literal) = Self::decode_literal(compiled, &atoms, literal, user_variables) else {
+                    user_only = false;
+                    break;
+                };
+                semantic.push(literal);
+            }
+            if user_only {
+                decoded.push((lbd, semantic));
+            }
+        }
+        if let Some(limit) = limit.filter(|&limit| limit > 0) {
+            let keep_from = decoded.len().saturating_sub(limit);
+            decoded.drain(..keep_from);
+        }
+        Ok(decoded)
     }
 
     pub fn solve_with_external_stop(
@@ -103,6 +120,7 @@ impl SemanticSolveSession {
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
             });
+            let _monitor_completion = super::solve::MonitorCompletion::new(&done);
             let (mut result, final_evidence_published) = {
                 let mut monitored_sink = super::ExternalStopEventSink::new(external_stop, &budget, sink);
                 let result = self.solve_with_budget(request, &budget, &mut monitored_sink);
@@ -112,7 +130,6 @@ impl SemanticSolveSession {
                 budget.cancel_with(TerminationReason::ExternalCancellation);
                 result = Err(SolveError::Interrupted("session external cancellation won finalization".to_string()));
             }
-            done.store(true, Ordering::Release);
             result
         });
         let result = match result {
@@ -134,9 +151,6 @@ impl SemanticSolveSession {
         if request.mode == SolveMode::LocalSearch {
             return Err(SolveError::InvalidRequest("semantic solve sessions support exact mode only".to_string()));
         }
-        if request.threads != 1 {
-            return Err(SolveError::InvalidRequest("semantic solve sessions currently use one exact worker".to_string()));
-        }
         if request.list_hint.is_some()
             || request.schedule_cdcl
             || request.routing != super::RoutingControls::default()
@@ -145,14 +159,19 @@ impl SemanticSolveSession {
             || request.limits.iterations.is_some()
         {
             return Err(SolveError::InvalidRequest(
-                "semantic solve sessions do not accept list, scheduling, routing, SAT, portfolio, or iteration controls".to_string(),
+                "semantic solve sessions do not accept list, scheduling, routing, SAT, CP role, or iteration controls".to_string(),
             ));
+        }
+        if self.package.model.objectives().is_empty() && request.linear != super::LinearControls::default() {
+            return Err(SolveError::InvalidRequest("linear relaxation controls require a session optimization objective".to_string()));
         }
         if budget.expired() {
             return Ok(session_stopped_result(budget));
         }
+        Self::validate_user_variable_boundary(request, self.package.model.int_vars().len())?;
         self.prepare(request, budget)?;
         let compiled = self.compiled.as_ref().expect("successful session preparation installs a compiled plan");
+        self.preflight_worker_range(compiled, request)?;
         let Some((initial_phase, branch_order, primary_branch_scope)) = compiled
             .search_guidance_interruptible(&request.hints, &request.branch_order, request.primary_branch_scope.as_deref(), budget.stop())
             .map_err(|error| SolveError::InvalidRequest(error.reason))?
@@ -181,19 +200,17 @@ impl SemanticSolveSession {
             });
         }
         let guidance = SearchGuidance { initial_phase, branch_order, primary_branch_scope, linear: None };
-        let output = solve_cp_session_validated(
+        let result = solve_cp_session_validated(
             &self.package.model,
             compiled,
             &assumptions,
             guidance,
             Arc::clone(&self.clauses),
-            self.next_worker,
+            &mut self.next_worker,
             request,
             budget,
             sink,
         )?;
-        self.next_worker = output.next_worker;
-        let result = output.result;
         if request.proof == ProofRequest::Require && result.proof.is_none() {
             return Err(SolveError::InvalidResult("a required session proof was not produced".to_string()));
         }
@@ -241,18 +258,63 @@ impl SemanticSolveSession {
         let compiled = CompiledCp::compile_with_estimate_interruptible(&prepared, estimated_bytes, budget.stop())
             .map_err(|error| SolveError::Compile(error.reason))?
             .ok_or_else(|| SolveError::Interrupted("session CP compilation was interrupted".to_string()))?;
+        if compiled.objectives().iter().any(|objective| objective.var().is_none()) {
+            return Err(SolveError::Unsupported(
+                "persistent clause sharing requires every session objective to be materialized".to_string(),
+            ));
+        }
 
-        self.package.model = prepared;
         self.compiled = Some(compiled);
         Ok(())
     }
 
+    fn validate_user_variable_boundary(request: &SolveRequest, user_variables: usize) -> Result<(), SolveError> {
+        let check = |variable: usize, source: &str| {
+            if variable < user_variables {
+                Ok(())
+            } else {
+                Err(SolveError::InvalidRequest(format!(
+                    "{source} references integer variable {variable}, but the session has {user_variables} user integer variables"
+                )))
+            }
+        };
+        for assumption in &request.assumptions {
+            check(assumption.variable, "assumption")?;
+        }
+        for &(variable, _) in &request.hints {
+            check(variable, "hint")?;
+        }
+        for &variable in &request.branch_order {
+            check(variable, "branch_order")?;
+        }
+        if let Some(scope) = &request.primary_branch_scope {
+            for &variable in scope {
+                check(variable, "primary_branch_scope")?;
+            }
+        }
+        Ok(())
+    }
+
     fn preflight_memory(estimated_bytes: u64, request: &SolveRequest) -> Result<(), SolveError> {
-        if request.limits.memory_bytes.is_some_and(|limit| estimated_bytes > limit) {
+        let workers = u64::try_from(request.threads).unwrap_or(u64::MAX);
+        let resident_copies = workers.saturating_add(1);
+        let concurrent_bytes = estimated_bytes.saturating_mul(resident_copies);
+        if request.limits.memory_bytes.is_some_and(|limit| concurrent_bytes > limit) {
             return Err(SolveError::Compile(format!(
-                "estimated session CP backend requires {estimated_bytes} bytes, above the memory limit"
+                "estimated session CP backend requires {concurrent_bytes} bytes across {} exact workers and the persistent template, above the memory limit",
+                request.threads
             )));
         }
+        Ok(())
+    }
+
+    fn preflight_worker_range(&self, compiled: &CompiledCp, request: &SolveRequest) -> Result<(), SolveError> {
+        let stages = compiled.objectives().len().max(1);
+        let workers = request
+            .threads
+            .checked_mul(stages)
+            .ok_or_else(|| SolveError::InvalidRequest("session worker count overflows the persistent worker id space".to_string()))?;
+        self.next_worker.checked_add(workers).ok_or_else(|| SolveError::InvalidRequest("session worker ids are exhausted".to_string()))?;
         Ok(())
     }
 
@@ -274,19 +336,18 @@ impl SemanticSolveSession {
         )
     }
 
-    fn decode_literal(compiled: &CompiledCp, atoms: &AtomTable, literal: Lit) -> Result<SemanticNogoodLiteral, SolveError> {
+    fn decode_literal(compiled: &CompiledCp, atoms: &AtomTable, literal: Lit, user_variables: usize) -> Option<SemanticNogoodLiteral> {
         let (variable, relation, value) = match atoms.decode(literal.atom()) {
             AtomKind::Ge { var, k } if literal.is_positive() => (var, SemanticNogoodRelation::Ge, k),
             AtomKind::Ge { var, k } => (var, SemanticNogoodRelation::Lt, k),
             AtomKind::Eq { var, v } if literal.is_positive() => (var, SemanticNogoodRelation::Eq, v),
             AtomKind::Eq { var, v } => (var, SemanticNogoodRelation::Ne, v),
         };
-        let variable = compiled
-            .int_variables()
-            .iter()
-            .position(|candidate| *candidate == variable)
-            .ok_or_else(|| SolveError::InvalidResult("session nogood references a non-semantic variable".to_string()))?;
-        Ok(SemanticNogoodLiteral { variable, relation, value })
+        let variable = compiled.int_variables().iter().position(|candidate| *candidate == variable)?;
+        if variable >= user_variables {
+            return None;
+        }
+        Some(SemanticNogoodLiteral { variable, relation, value })
     }
 }
 

@@ -124,3 +124,60 @@ def test_session_solve_releases_gil_and_reattaches_for_callback():
     assert solution.status in ("SATISFIABLE", "OPTIMAL"), solution.status
     assert incumbents, "the incumbent callback must fire"
     assert len(ticks) > 10, f"background thread starved: {len(ticks)} ticks"
+
+
+def test_session_parallel_epochs_keep_assumptions_and_callbacks_sound():
+    model, xs = build_perm_model(n=7)
+    session = model.session()
+    seen = []
+
+    free = session.solve(threads=4, seed=13, on_incumbent=lambda value, assignment: seen.append((value, assignment)))
+    assert free.status == "OPTIMAL"
+    free_values = check_perm(free, xs)
+    assert seen
+    assert all(assignment is not None for _, assignment in seen)
+
+    pinned = session.solve(threads=4, seed=13, assumptions=[xs[0] == free_values[0]])
+    assert pinned.status == "OPTIMAL"
+    assert pinned.value(xs[0]) == free_values[0]
+    check_perm(pinned, xs)
+
+    clash = session.solve(threads=4, assumptions=[xs[0] == 0, xs[1] == 0])
+    assert clash.status == "UNSATISFIABLE"
+
+
+def test_session_parallel_controls_validate_at_the_python_boundary():
+    model = cp.Model()
+    value = model.int_var(0, 1)
+    session = model.session()
+
+    assert session.solve(threads=2, memory_limit_mb=1).status == "SATISFIABLE"
+    with pytest.raises(ValueError, match="threads must be a positive integer"):
+        session.solve(threads=0)
+    with pytest.raises(ValueError, match="memory_limit_mb must be a positive integer"):
+        session.solve(memory_limit_mb=0)
+
+
+def test_lexicographic_session_layout_regression_finishes_in_a_subprocess():
+    import subprocess
+    import sys
+    import textwrap
+
+    program = textwrap.dedent(
+        """
+        import qayd as cp
+
+        model = cp.Model()
+        xs = [model.int_var(0, 3) for _ in range(4)]
+        model.all_different(xs)
+        model.minimize(xs[0])
+        model.then_minimize(sum((index + 1) * value for index, value in enumerate(xs)))
+        session = model.session()
+        for _ in range(3):
+            solution = session.solve(threads=1, seed=5)
+            assert solution.status == "OPTIMAL", solution.status
+            assert solution.objectives == [0, 16], solution.objectives
+        """
+    )
+    completed = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=20)
+    assert completed.returncode == 0, completed.stderr

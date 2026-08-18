@@ -214,6 +214,9 @@ mod schedule_portfolio_exchange;
 #[path = "../tests/internal/schedule_state.rs"]
 mod schedule_state;
 #[cfg(test)]
+#[path = "../tests/internal/scheduling_kernel.rs"]
+mod scheduling_kernel;
+#[cfg(test)]
 #[path = "../tests/internal/semantic_preparation_interruption.rs"]
 mod semantic_preparation_interruption;
 #[cfg(test)]

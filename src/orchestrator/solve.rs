@@ -1242,6 +1242,23 @@ fn debit_component_quota(remaining: &mut Option<u64>, consumed: u64, name: &str)
     Ok(())
 }
 
+/// Arms a scoped monitor completion flag. The flag is released on ordinary
+/// return and while unwinding, so a panic in model code or an event sink cannot
+/// leave the monitor waiting forever during `thread::scope` teardown.
+pub(super) struct MonitorCompletion<'a>(&'a AtomicBool);
+
+impl<'a> MonitorCompletion<'a> {
+    pub(super) fn new(done: &'a AtomicBool) -> Self {
+        Self(done)
+    }
+}
+
+impl Drop for MonitorCompletion<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Compile and solve with one budget spanning validation, compilation, search,
 /// transfers, and final verification.
 pub fn solve_model(package: &ModelPackage, request: &SolveRequest, sink: &mut dyn EventSink) -> Result<SolveResult, SolveError> {
@@ -1304,6 +1321,7 @@ fn solve_with_monitored_external_stop(
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
         });
+        let _monitor_completion = MonitorCompletion::new(&monitor_done);
         let (mut result, final_evidence_published) = {
             let mut monitored_sink = super::ExternalStopEventSink::new(external_stop, &budget, sink);
             let result = solve_model_with_budget(package, request, &budget, &mut monitored_sink);
@@ -1316,7 +1334,6 @@ fn solve_with_monitored_external_stop(
             budget.cancel_with(TerminationReason::ExternalCancellation);
             result = Ok(stopped_result(&budget, "external cancellation during finalization"));
         }
-        monitor_done.store(true, std::sync::atomic::Ordering::Release);
         result
     });
     // Read shared state only after the scoped monitor has joined. Reading it in
