@@ -414,9 +414,6 @@ fn validate_selected_plan_options(plan: &CollectionSolvePlan, request: &SolveReq
             "list_hint requires list local search or a routing exact plan with warm start enabled".to_string(),
         ));
     }
-    if request.limits.iterations.is_some() && matches!(plan.backend, CollectionBackend::ScheduleLocalSearch) {
-        return Err(SolveError::InvalidRequest("schedule local search does not currently consume iteration limits".to_string()));
-    }
     Ok(())
 }
 
@@ -738,7 +735,20 @@ fn solve_collection_plan_inner(
                 &mut |engine, value| record_progress(sink, budget, &mut event_error, engine, value),
             )?,
             CollectionBackend::ScheduleLocalSearch => result_from_schedule_local_search(
-                ScheduleLocalSearchRun { semantic, model, request, budget, engine_stop, transfer_stop, allocation, started },
+                ScheduleLocalSearchRun {
+                    semantic,
+                    model,
+                    request,
+                    budget,
+                    engine_stop,
+                    transfer_stop,
+                    max_iterations: plan.local_search_iterations.or(request.limits.iterations).unwrap_or(u64::MAX),
+                    repeat_until_stopped: request.limits.time.is_some()
+                        && plan.local_search_iterations.is_none()
+                        && request.limits.iterations.is_none(),
+                    allocation,
+                    started,
+                },
                 &mut |engine, value| record_progress(sink, budget, &mut event_error, engine, value),
             )?,
         })
@@ -1203,82 +1213,472 @@ struct ScheduleLocalSearchRun<'a> {
     budget: &'a SolveBudget,
     engine_stop: &'a AtomicBool,
     transfer_stop: Option<&'a AtomicBool>,
+    max_iterations: u64,
+    repeat_until_stopped: bool,
     allocation: super::WorkerAllocation,
     started: Instant,
+}
+
+struct SharedScheduleIncumbent {
+    solution: CollectionSolution,
+    source_worker: usize,
+    source_round: usize,
+    constructor: &'static str,
+}
+
+#[derive(Default)]
+struct ScheduleMetricsAggregate {
+    construction_candidates: u64,
+    construction_elapsed: Duration,
+    constructor: Option<&'static str>,
+    work_steps: u64,
+    moves_considered: u64,
+    moves_accepted: u64,
+    incumbent_improvements: u64,
+    incumbent_injections: u64,
+    cycle_rejections: u64,
+    window_rejections: u64,
+    objective_rejections: u64,
+    reconstructions: u64,
+    critical_path_updates: u64,
+    delta_evaluations: u64,
+    full_evaluations: u64,
+    full_fallbacks: u64,
+    topological_rebuilds: u64,
+    oracle_validations: u64,
+    oracle_mismatches: u64,
+    dirty_cone_operations: u64,
+    max_dirty_cone: u64,
+    workspace_growths: u64,
+    workspace_rollbacks: u64,
+    alns_generation_attempts: u64,
+    alns_moves_generated: u64,
+    resource_profile_checks: u64,
+    resource_candidate_scheduling_attempts: u64,
+    resource_event_visits: u64,
+    resource_peak_profile_events: usize,
+    precedence_rejections: u64,
+    infeasible_rejections: u64,
+    justification_attempts: u64,
+}
+
+impl ScheduleMetricsAggregate {
+    fn record(&mut self, metrics: lists::ScheduleConstructionMetrics) {
+        self.construction_candidates = self.construction_candidates.saturating_add(metrics.candidates);
+        self.construction_elapsed = self.construction_elapsed.max(metrics.elapsed);
+        self.work_steps = self.work_steps.saturating_add(metrics.work_steps);
+        self.moves_considered = self.moves_considered.saturating_add(metrics.moves_considered);
+        self.moves_accepted = self.moves_accepted.saturating_add(metrics.moves_accepted);
+        self.incumbent_improvements = self.incumbent_improvements.saturating_add(metrics.incumbent_improvements);
+        self.incumbent_injections = self.incumbent_injections.saturating_add(metrics.incumbent_injections);
+        self.cycle_rejections = self.cycle_rejections.saturating_add(metrics.cycle_rejections);
+        self.window_rejections = self.window_rejections.saturating_add(metrics.window_rejections);
+        self.objective_rejections = self.objective_rejections.saturating_add(metrics.objective_rejections);
+        self.reconstructions = self.reconstructions.saturating_add(metrics.reconstructions);
+        self.critical_path_updates = self.critical_path_updates.saturating_add(metrics.critical_path_updates);
+        self.delta_evaluations = self.delta_evaluations.saturating_add(metrics.delta_evaluations);
+        self.full_evaluations = self.full_evaluations.saturating_add(metrics.full_evaluations);
+        self.full_fallbacks = self.full_fallbacks.saturating_add(metrics.full_fallbacks);
+        self.topological_rebuilds = self.topological_rebuilds.saturating_add(metrics.topological_rebuilds);
+        self.oracle_validations = self.oracle_validations.saturating_add(metrics.oracle_validations);
+        self.oracle_mismatches = self.oracle_mismatches.saturating_add(metrics.oracle_mismatches);
+        self.dirty_cone_operations = self.dirty_cone_operations.saturating_add(metrics.dirty_cone_operations);
+        self.max_dirty_cone = self.max_dirty_cone.max(metrics.max_dirty_cone);
+        self.workspace_growths = self.workspace_growths.saturating_add(metrics.workspace_growths);
+        self.workspace_rollbacks = self.workspace_rollbacks.saturating_add(metrics.workspace_rollbacks);
+        self.alns_generation_attempts = self.alns_generation_attempts.saturating_add(metrics.alns_generation_attempts);
+        self.alns_moves_generated = self.alns_moves_generated.saturating_add(metrics.alns_moves_generated);
+        self.resource_profile_checks = self.resource_profile_checks.saturating_add(metrics.resource_profile_checks);
+        self.resource_candidate_scheduling_attempts =
+            self.resource_candidate_scheduling_attempts.saturating_add(metrics.resource_candidate_scheduling_attempts);
+        self.resource_event_visits = self.resource_event_visits.saturating_add(metrics.resource_event_visits);
+        self.resource_peak_profile_events = self.resource_peak_profile_events.max(metrics.resource_peak_profile_events);
+        self.precedence_rejections = self.precedence_rejections.saturating_add(metrics.precedence_rejections);
+        self.infeasible_rejections = self.infeasible_rejections.saturating_add(metrics.infeasible_rejections);
+        self.justification_attempts = self.justification_attempts.saturating_add(metrics.justification_attempts);
+        self.constructor.get_or_insert(metrics.constructor);
+    }
+}
+
+fn schedule_restart_work(schedule: &list::Schedule) -> u64 {
+    u64::try_from(schedule.intervals.len()).unwrap_or(u64::MAX).saturating_mul(256).clamp(2_048, 100_000)
+}
+
+fn schedule_round_seed(seed: u64, round: usize) -> u64 {
+    if round == 0 {
+        seed
+    } else {
+        crate::mix64(seed ^ u64::try_from(round).unwrap_or(u64::MAX).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+    }
+}
+
+fn schedule_candidate_precedes(
+    candidate: &CollectionSolution,
+    source_worker: usize,
+    source_round: usize,
+    incumbent: &SharedScheduleIncumbent,
+) -> bool {
+    candidate.objectives < incumbent.solution.objectives
+        || (candidate.objectives == incumbent.solution.objectives
+            && (source_worker, source_round) < (incumbent.source_worker, incumbent.source_round))
 }
 
 fn result_from_schedule_local_search(
     run: ScheduleLocalSearchRun<'_>,
     improvement: &mut impl FnMut(EngineKind, i64),
 ) -> Result<SolveResult, SolveError> {
-    let ScheduleLocalSearchRun { semantic, model, request, budget, engine_stop, transfer_stop, allocation, started } = run;
+    let ScheduleLocalSearchRun {
+        semantic,
+        model,
+        request,
+        budget,
+        engine_stop,
+        transfer_stop,
+        max_iterations,
+        repeat_until_stopped,
+        allocation,
+        started,
+    } = run;
     let schedule = model
         .schedule
         .as_ref()
         .ok_or_else(|| SolveError::InvalidResult("schedule local-search plan has no physical schedule".to_string()))?;
-    let (summary, structural_bound) = std::thread::scope(|scope| {
+    let mut aggregate = ScheduleMetricsAggregate::default();
+    let (
+        shared_incumbent,
+        structural_bound,
+        progress_publications,
+        incumbent_publications,
+        incumbent_injection_attempts,
+        incumbent_rejections,
+        incumbent_verifications,
+        verification_rejections,
+        verification_interruptions,
+        incomplete_rejections,
+        restart_boundaries,
+        peak_buffered_candidates,
+        first_feasible,
+        stalled_workers,
+        stalled_unused_work_steps,
+        worker_work_min,
+        worker_work_max,
+        work_budget_overruns,
+    ) = std::thread::scope(|scope| {
         let dual_task = scope.spawn(|| dual::compute(model, engine_stop));
-        let summary = super::execute_workers(
-            vec![(); allocation.workers()],
-            engine_stop,
-            Arc::new(AtomicBool::new(false)),
-            request.seed,
-            |context, ()| {
-                let seed = context.seed();
-                lists::solve_schedule(schedule, seed, context.stop(), &mut |value| {
-                    let _ = context.publish_latest(value);
-                })
-            },
-            |event| {
-                improvement(EngineKind::ScheduleLocalSearch, event.payload);
-                Ok::<_, SolveError>(EventControl::Continue)
-            },
-        )?;
-        let structural_bound = dual_task.join().map_err(|_| SolveError::Engine("dual-bound worker panicked".to_string()))?;
-        Ok::<_, SolveError>((summary, structural_bound))
-    })?;
+        let mut shared_incumbent: Option<SharedScheduleIncumbent> = None;
+        let mut published_objective = None;
+        let mut progress_publications = 0u64;
+        let mut incumbent_publications = 0u64;
+        let mut incumbent_injection_attempts = 0u64;
+        let mut incumbent_rejections = 0u64;
+        let mut incumbent_verifications = 0u64;
+        let mut verification_rejections = 0u64;
+        let mut verification_interruptions = 0u64;
+        let mut incomplete_rejections = 0u64;
+        let mut restart_boundaries = 0u64;
+        let mut peak_buffered_candidates = 0usize;
+        let mut first_feasible = None;
+        let mut stalled_workers = 0u64;
+        let mut stalled_unused_work_steps = 0u64;
+        let mut work_budget_overruns = 0u64;
+        let restart_work = schedule_restart_work(schedule);
+        let finite_work = max_iterations != u64::MAX;
+        let mut remaining = (0..allocation.workers())
+            .map(|worker| schedule_worker_iteration_quota(max_iterations, worker, allocation.workers()))
+            .collect::<Vec<_>>();
+        let mut retired = vec![false; allocation.workers()];
+        let mut zero_progress_rounds = vec![0u8; allocation.workers()];
+        let mut worker_work = vec![0u64; allocation.workers()];
+        let mut round = 0usize;
 
-    let mut best: Option<CollectionSolution> = None;
-    let mut construction_candidates = 0u64;
-    let mut construction_elapsed = Duration::ZERO;
-    let mut first_feasible: Option<Duration> = None;
-    for report in summary.reports {
-        let (candidate, metrics): (CollectionSolution, lists::ScheduleConstructionMetrics) = report.result;
-        construction_candidates = construction_candidates.saturating_add(metrics.candidates);
-        construction_elapsed = construction_elapsed.max(metrics.elapsed);
-        first_feasible = match (first_feasible, metrics.first_feasible) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            (None, right) => right,
-            (left, None) => left,
-        };
-        let replace =
-            candidate.feasible && best.as_ref().is_none_or(|incumbent| !incumbent.feasible || candidate.objectives < incumbent.objectives);
-        if replace {
-            best = Some(candidate);
+        loop {
+            if engine_stop.load(Ordering::Acquire) || (!finite_work && !repeat_until_stopped && round > 0) {
+                break;
+            }
+            let inputs = remaining
+                .iter()
+                .enumerate()
+                .filter_map(|(worker, &left)| {
+                    let quota = if finite_work { left.min(restart_work) } else { restart_work };
+                    (!retired[worker] && quota > 0).then_some((worker, quota))
+                })
+                .collect::<Vec<_>>();
+            if inputs.is_empty() {
+                break;
+            }
+            let injected = shared_incumbent.as_ref().map(|incumbent| incumbent.solution.clone());
+            if injected.is_some() {
+                incumbent_injection_attempts = incumbent_injection_attempts.saturating_add(u64::try_from(inputs.len()).unwrap_or(u64::MAX));
+            }
+            let round_seed = schedule_round_seed(request.seed, round);
+            let summary = super::execute_workers_silent(
+                inputs.clone(),
+                engine_stop,
+                Arc::new(AtomicBool::new(false)),
+                round_seed,
+                |context, (source_worker, quota)| {
+                    let seed = round_seed.wrapping_add(u64::try_from(source_worker).unwrap_or(u64::MAX));
+                    let (candidate, metrics) =
+                        lists::solve_schedule_capped(schedule, seed, context.stop(), quota, false, injected.as_ref(), &mut |_| {});
+                    (source_worker, quota, candidate, metrics)
+                },
+            );
+            peak_buffered_candidates = peak_buffered_candidates.max(summary.reports.len());
+            restart_boundaries = restart_boundaries.saturating_add(1);
+
+            for report in summary.reports {
+                let (source_worker, quota, mut candidate, metrics): (usize, u64, CollectionSolution, lists::ScheduleConstructionMetrics) =
+                    report.result;
+                let used = metrics.work_steps;
+                worker_work[source_worker] = worker_work[source_worker].saturating_add(used);
+                if finite_work {
+                    remaining[source_worker] = remaining[source_worker].saturating_sub(used.min(quota));
+                    if used > quota {
+                        work_budget_overruns = work_budget_overruns.saturating_add(1);
+                        remaining[source_worker] = 0;
+                    }
+                }
+                if used == 0 {
+                    zero_progress_rounds[source_worker] = zero_progress_rounds[source_worker].saturating_add(1);
+                    if candidate.feasible || zero_progress_rounds[source_worker] >= 2 {
+                        retired[source_worker] = true;
+                        stalled_workers = stalled_workers.saturating_add(1);
+                        if finite_work {
+                            stalled_unused_work_steps = stalled_unused_work_steps.saturating_add(remaining[source_worker]);
+                            remaining[source_worker] = 0;
+                        }
+                    }
+                } else {
+                    zero_progress_rounds[source_worker] = 0;
+                }
+                if candidate.feasible {
+                    let publication_eligible = shared_incumbent
+                        .as_ref()
+                        .is_none_or(|incumbent| schedule_candidate_precedes(&candidate, source_worker, round, incumbent));
+                    if publication_eligible {
+                        incumbent_verifications = incumbent_verifications.saturating_add(1);
+                        match list::verify_collection_solution_interruptible(model, &candidate, budget.stop()) {
+                            Ok(objectives) => {
+                                candidate.objectives = objectives;
+                                let precedes = shared_incumbent
+                                    .as_ref()
+                                    .is_none_or(|incumbent| schedule_candidate_precedes(&candidate, source_worker, round, incumbent));
+                                if precedes {
+                                    let strict_improvement = shared_incumbent
+                                        .as_ref()
+                                        .is_none_or(|incumbent| candidate.objectives < incumbent.solution.objectives);
+                                    shared_incumbent = Some(SharedScheduleIncumbent {
+                                        solution: candidate.clone(),
+                                        source_worker,
+                                        source_round: round,
+                                        constructor: metrics.constructor,
+                                    });
+                                    incumbent_publications = incumbent_publications.saturating_add(1);
+                                    first_feasible.get_or_insert_with(|| started.elapsed());
+                                    if strict_improvement {
+                                        if let Some(objective) = candidate.objectives.first().copied() {
+                                            if published_objective.is_none_or(|current| objective < current) {
+                                                published_objective = Some(objective);
+                                                progress_publications = progress_publications.saturating_add(1);
+                                                improvement(EngineKind::ScheduleLocalSearch, objective);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    incumbent_rejections = incumbent_rejections.saturating_add(1);
+                                }
+                            }
+                            Err(_) => {
+                                incumbent_rejections = incumbent_rejections.saturating_add(1);
+                                if budget.stop().load(Ordering::Acquire) {
+                                    verification_interruptions = verification_interruptions.saturating_add(1);
+                                } else {
+                                    verification_rejections = verification_rejections.saturating_add(1);
+                                }
+                            }
+                        }
+                    } else {
+                        incumbent_rejections = incumbent_rejections.saturating_add(1);
+                    }
+                } else {
+                    incumbent_rejections = incumbent_rejections.saturating_add(1);
+                    incomplete_rejections = incomplete_rejections.saturating_add(1);
+                }
+                aggregate.record(metrics);
+            }
+            if finite_work && remaining.iter().all(|&left| left == 0) {
+                break;
+            }
+            round = round.saturating_add(1);
         }
+
+        let worker_work_min = worker_work.iter().copied().min().unwrap_or(0);
+        let worker_work_max = worker_work.iter().copied().max().unwrap_or(0);
+        let structural_bound = dual_task.join().map_err(|_| SolveError::Engine("dual-bound worker panicked".to_string()))?;
+        Ok::<_, SolveError>((
+            shared_incumbent,
+            structural_bound,
+            progress_publications,
+            incumbent_publications,
+            incumbent_injection_attempts,
+            incumbent_rejections,
+            incumbent_verifications,
+            verification_rejections,
+            verification_interruptions,
+            incomplete_rejections,
+            restart_boundaries,
+            peak_buffered_candidates,
+            first_feasible,
+            stalled_workers,
+            stalled_unused_work_steps,
+            worker_work_min,
+            worker_work_max,
+            work_budget_overruns,
+        ))
+    })?;
+    if work_budget_overruns > 0 {
+        return Err(SolveError::Engine(format!(
+            "schedule local search exceeded a deterministic round work quota {work_budget_overruns} time(s)"
+        )));
     }
-    let mut solution = best.unwrap_or(CollectionSolution {
-        lists: Vec::new(),
-        objectives: Vec::new(),
-        feasible: false,
-        starts: Vec::new(),
-        presences: Vec::new(),
-        machines: Vec::new(),
-        modes: Vec::new(),
-        bound: None,
-    });
+
+    let ScheduleMetricsAggregate {
+        construction_candidates,
+        construction_elapsed,
+        mut constructor,
+        work_steps,
+        moves_considered,
+        moves_accepted,
+        incumbent_improvements,
+        incumbent_injections,
+        cycle_rejections,
+        window_rejections,
+        objective_rejections,
+        reconstructions,
+        critical_path_updates,
+        delta_evaluations,
+        full_evaluations,
+        full_fallbacks,
+        topological_rebuilds,
+        oracle_validations,
+        oracle_mismatches,
+        dirty_cone_operations,
+        max_dirty_cone,
+        workspace_growths,
+        workspace_rollbacks,
+        alns_generation_attempts,
+        alns_moves_generated,
+        resource_profile_checks,
+        resource_candidate_scheduling_attempts,
+        resource_event_visits,
+        resource_peak_profile_events,
+        precedence_rejections,
+        infeasible_rejections,
+        justification_attempts,
+    } = aggregate;
+    let global_improvements = progress_publications;
+    let elite_pool_size = usize::from(shared_incumbent.is_some());
+    let incumbent_source_worker = shared_incumbent.as_ref().map(|incumbent| incumbent.source_worker);
+    let incumbent_source_round = shared_incumbent.as_ref().map(|incumbent| incumbent.source_round);
+    let mut solution = if let Some(incumbent) = shared_incumbent {
+        constructor = Some(incumbent.constructor);
+        incumbent.solution
+    } else {
+        CollectionSolution {
+            lists: Vec::new(),
+            objectives: Vec::new(),
+            feasible: false,
+            starts: Vec::new(),
+            presences: Vec::new(),
+            machines: Vec::new(),
+            modes: Vec::new(),
+            bound: None,
+        }
+    };
+    let mut search = structural_bound.as_ref().map_or_else(SolveStats::default, |bound| bound.stats);
+    search.nodes = search.nodes.saturating_add(work_steps);
+    search.solutions = search.solutions.saturating_add(global_improvements);
     dual::attach(model, &mut solution, structural_bound);
+    let elapsed = started.elapsed();
+    let candidates_per_second = if elapsed.is_zero() { 0.0 } else { moves_considered as f64 / elapsed.as_secs_f64() };
+    let moves_rejected = moves_considered.saturating_sub(moves_accepted);
+    let full_recompute_percentage = if delta_evaluations == 0 { 0.0 } else { full_fallbacks as f64 * 100.0 / delta_evaluations as f64 };
+    let unused_work_steps = (max_iterations != u64::MAX).then(|| max_iterations.saturating_sub(work_steps));
     let mut metadata = vec![
         ("workers".to_string(), allocation.workers().to_string()),
-        ("constructor".to_string(), "serial-sgs".to_string()),
+        ("constructor".to_string(), constructor.unwrap_or("priority-sgs").to_string()),
         ("construction_seconds".to_string(), construction_elapsed.as_secs_f64().to_string()),
         ("construction_candidates".to_string(), construction_candidates.to_string()),
+        ("candidates_evaluated".to_string(), moves_considered.to_string()),
+        ("candidates_per_second".to_string(), candidates_per_second.to_string()),
+        ("schedule_work_steps".to_string(), work_steps.to_string()),
+        ("schedule_moves_considered".to_string(), moves_considered.to_string()),
+        ("schedule_moves_accepted".to_string(), moves_accepted.to_string()),
+        ("schedule_moves_rejected".to_string(), moves_rejected.to_string()),
+        ("schedule_local_improvements".to_string(), incumbent_improvements.to_string()),
+        ("schedule_global_improvements".to_string(), global_improvements.to_string()),
+        ("schedule_progress_publications".to_string(), progress_publications.to_string()),
+        ("schedule_incumbent_publication_attempts".to_string(), incumbent_publications.saturating_add(incumbent_rejections).to_string()),
+        ("schedule_incumbent_publications".to_string(), incumbent_publications.to_string()),
+        ("schedule_incumbent_injection_attempts".to_string(), incumbent_injection_attempts.to_string()),
+        ("schedule_incumbent_injections".to_string(), incumbent_injections.to_string()),
+        ("schedule_incumbent_rejections".to_string(), incumbent_rejections.to_string()),
+        ("schedule_incumbent_verifications".to_string(), incumbent_verifications.to_string()),
+        ("schedule_incumbent_verification_rejections".to_string(), verification_rejections.to_string()),
+        ("schedule_incumbent_verification_interruptions".to_string(), verification_interruptions.to_string()),
+        ("schedule_incumbent_incomplete_rejections".to_string(), incomplete_rejections.to_string()),
+        ("schedule_restart_boundaries".to_string(), restart_boundaries.to_string()),
+        ("schedule_peak_buffered_candidates".to_string(), peak_buffered_candidates.to_string()),
+        ("schedule_stalled_workers".to_string(), stalled_workers.to_string()),
+        ("schedule_stalled_unused_work_steps".to_string(), stalled_unused_work_steps.to_string()),
+        ("schedule_worker_work_min".to_string(), worker_work_min.to_string()),
+        ("schedule_worker_work_max".to_string(), worker_work_max.to_string()),
+        ("schedule_work_budget_overruns".to_string(), work_budget_overruns.to_string()),
+        ("schedule_elite_pool_size".to_string(), elite_pool_size.to_string()),
+        ("elite_pool_size".to_string(), elite_pool_size.to_string()),
+        (
+            "schedule_incumbent_source_worker".to_string(),
+            incumbent_source_worker.map_or_else(|| "none".to_string(), |worker| worker.to_string()),
+        ),
+        (
+            "schedule_incumbent_source_round".to_string(),
+            incumbent_source_round.map_or_else(|| "none".to_string(), |round| round.to_string()),
+        ),
+        ("schedule_cycle_rejections".to_string(), cycle_rejections.to_string()),
+        ("schedule_window_rejections".to_string(), window_rejections.to_string()),
+        ("schedule_objective_rejections".to_string(), objective_rejections.to_string()),
+        ("schedule_reconstructions".to_string(), reconstructions.to_string()),
+        ("critical_path_updates".to_string(), critical_path_updates.to_string()),
+        ("schedule_delta_evaluations".to_string(), delta_evaluations.to_string()),
+        ("schedule_full_evaluations".to_string(), full_evaluations.to_string()),
+        ("schedule_full_fallbacks".to_string(), full_fallbacks.to_string()),
+        ("schedule_topological_rebuilds".to_string(), topological_rebuilds.to_string()),
+        ("schedule_oracle_validations".to_string(), oracle_validations.to_string()),
+        ("schedule_oracle_mismatches".to_string(), oracle_mismatches.to_string()),
+        ("schedule_dirty_cone_operations".to_string(), dirty_cone_operations.to_string()),
+        ("schedule_max_dirty_cone".to_string(), max_dirty_cone.to_string()),
+        ("schedule_workspace_growths".to_string(), workspace_growths.to_string()),
+        ("schedule_workspace_rollbacks".to_string(), workspace_rollbacks.to_string()),
+        ("schedule_alns_generation_attempts".to_string(), alns_generation_attempts.to_string()),
+        ("schedule_alns_moves_generated".to_string(), alns_moves_generated.to_string()),
+        ("full_recompute_percentage".to_string(), full_recompute_percentage.to_string()),
+        ("resource_profile_checks".to_string(), resource_profile_checks.to_string()),
+        ("resource_candidate_scheduling_attempts".to_string(), resource_candidate_scheduling_attempts.to_string()),
+        ("resource_event_visits".to_string(), resource_event_visits.to_string()),
+        ("resource_peak_profile_events".to_string(), resource_peak_profile_events.to_string()),
+        ("schedule_precedence_rejections".to_string(), precedence_rejections.to_string()),
+        ("schedule_infeasible_rejections".to_string(), infeasible_rejections.to_string()),
+        ("schedule_justification_attempts".to_string(), justification_attempts.to_string()),
+        ("schedule_candidates_per_second".to_string(), candidates_per_second.to_string()),
     ];
     if let Some(first) = first_feasible {
         metadata.push(("time_to_first_feasible".to_string(), first.as_secs_f64().to_string()));
     }
+    if let Some(unused) = unused_work_steps {
+        metadata.push(("schedule_unused_work_steps".to_string(), unused.to_string()));
+    }
     let status = if solution.feasible { SolveStatus::Satisfiable } else { SolveStatus::Unknown };
-    finish_collection_result(
+    let mut result = finish_collection_result(
         semantic,
         model,
         CollectionCompletion {
@@ -1288,15 +1688,32 @@ fn result_from_schedule_local_search(
             proof: None,
             report: EngineReport {
                 engine: Some(EngineKind::ScheduleLocalSearch),
-                search: Default::default(),
-                elapsed: started.elapsed(),
-                improvements: 0,
+                search,
+                elapsed,
+                improvements: global_improvements,
                 metadata,
             },
         },
         budget,
         transfer_stop,
-    )
+    )?;
+    if request.limits.iterations.is_some_and(|limit| work_steps >= limit) && !budget.expired() {
+        result.message = Some("schedule local search reached the shared iteration limit".to_string());
+    } else if stalled_unused_work_steps > 0 && !budget.expired() {
+        result.message = Some(format!(
+            "schedule local search retired {stalled_workers} stalled worker(s) with {stalled_unused_work_steps} unused work step(s)"
+        ));
+    }
+    Ok(result)
+}
+
+fn schedule_worker_iteration_quota(total: u64, worker: usize, workers: usize) -> u64 {
+    if total == u64::MAX {
+        return u64::MAX;
+    }
+    let workers = u64::try_from(workers).unwrap_or(u64::MAX).max(1);
+    let worker = u64::try_from(worker).unwrap_or(u64::MAX);
+    total / workers + u64::from(worker < total % workers)
 }
 
 fn append_search_metadata(metadata: &mut Vec<(String, String)>, metrics: &lists::ListSearchMetrics) {

@@ -418,12 +418,6 @@ fn validate_decomposition_limits(components: &[IndependentComponent], request: &
                 .to_string(),
         ));
     }
-    if request.limits.iterations.is_some() && components.iter().any(|component| component.family == IndependentFamily::Intervals) {
-        return Err(SolveError::InvalidRequest(
-            "an iteration limit cannot be applied to a decomposed interval component because schedule plans do not consume iterations"
-                .to_string(),
-        ));
-    }
     if request.schedule_cdcl && components.iter().any(|component| component.family == IndependentFamily::Intervals) {
         return Err(SolveError::InvalidRequest("schedule_cdcl requires a selected exact scheduling backend".to_string()));
     }

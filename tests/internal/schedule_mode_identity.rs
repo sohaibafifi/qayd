@@ -103,3 +103,20 @@ fn local_search_solution_preserves_stable_mode_identity() {
     assert_eq!(candidate.assignment().intervals[0].machine, Some(3));
     assert_eq!(candidate.assignment().intervals[0].mode, Some(first_fast.0));
 }
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn collection_compilation_rejects_unrepresentable_machine_identity() {
+    let mut model = Model::new();
+    let interval = model.interval(0, 1, 0);
+    model.add_interval_mode(interval, usize::MAX, 1, Some((0, 0))).unwrap();
+    model.add_constraint(Constraint::IntervalResource(Resource::MachineNoOverlap));
+    model.add_objective(Objective::Makespan { minimize: true, intervals: vec![interval] });
+
+    let error = match CompiledCollection::compile(&model) {
+        Ok(_) => panic!("physical machine identities must fit the solution representation"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("machine"));
+    assert!(error.to_string().contains("i64"));
+}

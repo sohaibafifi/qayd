@@ -200,15 +200,22 @@ def command_for(
     if solver.startswith("qayd-"):
         variant = solver.removeprefix("qayd-")
         engine = args.qayd_engine
-        if (variant == "api" and problem in {"jssp", "rcpsp"} and engine == "ls") or (
-            problem == "rcpsp" and item["path"].suffix.lower() == ".mm" and engine == "ls"
-        ):
+        if problem == "rcpsp" and item["path"].suffix.lower() == ".mm" and engine == "ls":
             engine = "auto"
-        command = [sys.executable, str(ROOT / QAYD_SCRIPTS[(variant, problem)]), *common, "--engine", engine]
+        command = [
+            sys.executable,
+            str(ROOT / QAYD_SCRIPTS[(variant, problem)]),
+            *common,
+            "--engine",
+            engine,
+            "--memory-limit-mb",
+            str(args.memory_limit_mb),
+        ]
         list_controls = problem in {"cvrp", "cvrptw"}
-        if args.profile_qayd and engine == "ls" and list_controls:
+        if args.profile_qayd:
             command.append("--profile")
-        if args.max_iterations is not None and engine == "ls" and list_controls:
+        scheduling_ls_controls = problem in {"jssp", "rcpsp"} and engine in {"auto", "ls"} and item["path"].suffix.lower() != ".mm"
+        if args.max_iterations is not None and (engine == "ls" or scheduling_ls_controls):
             command.extend(("--max-iterations", str(args.max_iterations)))
         if problem in {"cvrp", "cvrptw"}:
             command.append("--routing-two-way" if args.routing_two_way else "--no-routing-two-way")
@@ -241,9 +248,7 @@ def effective_threads(solver: str, item: dict[str, Any], args: argparse.Namespac
     if solver in {"hgs", "lkh"}:
         return 1
     if solver.startswith("qayd-"):
-        if args.qayd_engine != "ls":
-            return 1
-        if solver == "qayd-api" and item["problem"] in {"jssp", "rcpsp"}:
+        if args.qayd_engine == "exact":
             return 1
         if item["problem"] == "rcpsp" and item["path"].suffix.lower() == ".mm":
             return 1

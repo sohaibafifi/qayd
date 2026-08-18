@@ -422,6 +422,9 @@ impl CollectionModel {
                         return Err("a moded operation cannot also be optional; make its mode intervals optional instead".to_string());
                     }
                     for mode in &iv.modes {
+                        if i64::try_from(mode.machine).is_err() {
+                            return Err("interval mode machine is outside the representable i64 range".to_string());
+                        }
                         if mode.duration < 0 {
                             return Err("interval mode duration must be non-negative".to_string());
                         }

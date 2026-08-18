@@ -170,6 +170,9 @@ mod phase9_phase10;
 #[path = "../tests/internal/prefix_set_compaction.rs"]
 mod prefix_set_compaction;
 #[cfg(test)]
+#[path = "../tests/internal/resource_schedule.rs"]
+mod resource_schedule;
+#[cfg(test)]
 #[path = "../tests/internal/routing_alns_elite.rs"]
 mod routing_alns_elite;
 #[cfg(test)]
@@ -191,11 +194,20 @@ mod schedule_compile_contract;
 #[path = "../tests/internal/schedule_interruption.rs"]
 mod schedule_interruption;
 #[cfg(test)]
+#[path = "../tests/internal/schedule_iteration_limit.rs"]
+mod schedule_iteration_limit;
+#[cfg(test)]
 #[path = "../tests/internal/schedule_ls_interruption.rs"]
 mod schedule_ls_interruption;
 #[cfg(test)]
 #[path = "../tests/internal/schedule_mode_identity.rs"]
 mod schedule_mode_identity;
+#[cfg(test)]
+#[path = "../tests/internal/schedule_portfolio_exchange.rs"]
+mod schedule_portfolio_exchange;
+#[cfg(test)]
+#[path = "../tests/internal/schedule_state.rs"]
+mod schedule_state;
 #[cfg(test)]
 #[path = "../tests/internal/semantic_preparation_interruption.rs"]
 mod semantic_preparation_interruption;

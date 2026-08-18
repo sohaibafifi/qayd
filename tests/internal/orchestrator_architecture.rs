@@ -747,10 +747,7 @@ fn collection_options_are_rejected_when_the_selected_stage_cannot_consume_them()
         limits: SolveLimits { iterations: Some(10), ..SolveLimits::default() },
         ..SolveRequest::default()
     };
-    assert!(matches!(
-        compile_model_plan(&ModelPackage::new(schedule.clone()), &schedule_iterations, &SolveBudget::new(None)),
-        Err(SolveError::InvalidRequest(message)) if message.contains("iteration")
-    ));
+    assert!(compile_model_plan(&ModelPackage::new(schedule.clone()), &schedule_iterations, &SolveBudget::new(None)).is_ok());
     let schedule_cdcl_iterations = SolveRequest {
         mode: SolveMode::Auto,
         schedule_cdcl: true,

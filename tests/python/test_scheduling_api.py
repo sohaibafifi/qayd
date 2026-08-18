@@ -5,6 +5,26 @@ import pytest
 cp = pytest.importorskip("qayd")
 
 
+@pytest.mark.parametrize("with_modes", [False, True])
+def test_optional_compact_tasks_are_rejected_instead_of_becoming_trivial_or_mandatory(with_modes):
+    model = cp.Model()
+    tasks = model.tasks([0])
+    if with_modes:
+        tasks[0].modes = [(0, 3), (1, 2)]
+    else:
+        tasks[0].duration = 2
+
+    with pytest.raises(ValueError, match="optional tasks are not representable"):
+        model.schedule(tasks, horizon=5, optional=True)
+
+
+def test_optional_low_level_compact_intervals_require_the_native_presence_api():
+    model = cp.Model()
+
+    with pytest.raises(ValueError, match="no presence selector"):
+        model.schedule_intervals([2], 5, optional=True)
+
+
 def test_schedule_resource_lambda_and_makespan():
     model = cp.Model()
     tasks = model.tasks([0, 1])
@@ -72,7 +92,7 @@ def test_fixed_schedule_uses_compact_ir_and_ls_profile():
 
     assert solution.status == "SATISFIABLE"
     assert len(solution.starts) == 300
-    assert solution.constructor == "serial-sgs"
+    assert solution.constructor == "giffler-thompson-critical-path"
     assert solution.time_to_first_feasible is not None
     assert solution.time_to_first_feasible < 1
     assert solution.estimated_backend_bytes is not None

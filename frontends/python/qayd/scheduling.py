@@ -362,6 +362,8 @@ class ScheduleSet:
         self.tasks = tasks
         self.horizon = int(horizon)
         self.optional = bool(optional)
+        if self.optional:
+            raise ValueError("optional tasks are not representable by the compact scheduling API; use Model.interval instead")
         self.moded = self._uses_modes()
         if self.moded:
             modes = [self._task_modes(task) for task in tasks]

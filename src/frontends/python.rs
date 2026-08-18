@@ -490,6 +490,58 @@ struct PySolution {
     alns_iterations: Option<u64>,
     candidates_evaluated: Option<u64>,
     candidates_per_second: Option<f64>,
+    /// Scheduling local-search counters, present only when `profile=True`.
+    schedule_moves_considered: Option<u64>,
+    schedule_moves_accepted: Option<u64>,
+    schedule_moves_rejected: Option<u64>,
+    schedule_work_steps: Option<u64>,
+    schedule_local_improvements: Option<u64>,
+    schedule_global_improvements: Option<u64>,
+    schedule_progress_publications: Option<u64>,
+    schedule_incumbent_publication_attempts: Option<u64>,
+    schedule_incumbent_publications: Option<u64>,
+    schedule_incumbent_injection_attempts: Option<u64>,
+    schedule_incumbent_injections: Option<u64>,
+    schedule_incumbent_rejections: Option<u64>,
+    schedule_incumbent_verifications: Option<u64>,
+    schedule_incumbent_verification_rejections: Option<u64>,
+    schedule_incumbent_verification_interruptions: Option<u64>,
+    schedule_incumbent_incomplete_rejections: Option<u64>,
+    schedule_restart_boundaries: Option<u64>,
+    schedule_peak_buffered_candidates: Option<u64>,
+    schedule_stalled_workers: Option<u64>,
+    schedule_stalled_unused_work_steps: Option<u64>,
+    schedule_worker_work_min: Option<u64>,
+    schedule_worker_work_max: Option<u64>,
+    schedule_work_budget_overruns: Option<u64>,
+    schedule_elite_pool_size: Option<u64>,
+    schedule_unused_work_steps: Option<u64>,
+    schedule_incumbent_source_worker: Option<u64>,
+    schedule_incumbent_source_round: Option<u64>,
+    schedule_cycle_rejections: Option<u64>,
+    schedule_reconstructions: Option<u64>,
+    critical_path_updates: Option<u64>,
+    schedule_window_rejections: Option<u64>,
+    schedule_objective_rejections: Option<u64>,
+    resource_profile_checks: Option<u64>,
+    resource_candidate_scheduling_attempts: Option<u64>,
+    resource_event_visits: Option<u64>,
+    resource_peak_profile_events: Option<u64>,
+    schedule_precedence_rejections: Option<u64>,
+    schedule_infeasible_rejections: Option<u64>,
+    schedule_justification_attempts: Option<u64>,
+    schedule_delta_evaluations: Option<u64>,
+    schedule_full_evaluations: Option<u64>,
+    schedule_full_fallbacks: Option<u64>,
+    schedule_topological_rebuilds: Option<u64>,
+    schedule_oracle_validations: Option<u64>,
+    schedule_oracle_mismatches: Option<u64>,
+    schedule_dirty_cone_operations: Option<u64>,
+    schedule_max_dirty_cone: Option<u64>,
+    schedule_workspace_growths: Option<u64>,
+    schedule_workspace_rollbacks: Option<u64>,
+    schedule_alns_generation_attempts: Option<u64>,
+    schedule_alns_moves_generated: Option<u64>,
     full_recompute_percentage: Option<f64>,
     backend_build_seconds: Option<f64>,
     construction_seconds: Option<f64>,
@@ -946,6 +998,57 @@ fn make_solution(
         alns_iterations: None,
         candidates_evaluated: None,
         candidates_per_second: None,
+        schedule_moves_considered: None,
+        schedule_moves_accepted: None,
+        schedule_moves_rejected: None,
+        schedule_work_steps: None,
+        schedule_local_improvements: None,
+        schedule_global_improvements: None,
+        schedule_progress_publications: None,
+        schedule_incumbent_publication_attempts: None,
+        schedule_incumbent_publications: None,
+        schedule_incumbent_injection_attempts: None,
+        schedule_incumbent_injections: None,
+        schedule_incumbent_rejections: None,
+        schedule_incumbent_verifications: None,
+        schedule_incumbent_verification_rejections: None,
+        schedule_incumbent_verification_interruptions: None,
+        schedule_incumbent_incomplete_rejections: None,
+        schedule_restart_boundaries: None,
+        schedule_peak_buffered_candidates: None,
+        schedule_stalled_workers: None,
+        schedule_stalled_unused_work_steps: None,
+        schedule_worker_work_min: None,
+        schedule_worker_work_max: None,
+        schedule_work_budget_overruns: None,
+        schedule_elite_pool_size: None,
+        schedule_unused_work_steps: None,
+        schedule_incumbent_source_worker: None,
+        schedule_incumbent_source_round: None,
+        schedule_cycle_rejections: None,
+        schedule_reconstructions: None,
+        critical_path_updates: None,
+        schedule_window_rejections: None,
+        schedule_objective_rejections: None,
+        resource_profile_checks: None,
+        resource_candidate_scheduling_attempts: None,
+        resource_event_visits: None,
+        resource_peak_profile_events: None,
+        schedule_precedence_rejections: None,
+        schedule_infeasible_rejections: None,
+        schedule_justification_attempts: None,
+        schedule_delta_evaluations: None,
+        schedule_full_evaluations: None,
+        schedule_full_fallbacks: None,
+        schedule_topological_rebuilds: None,
+        schedule_oracle_validations: None,
+        schedule_oracle_mismatches: None,
+        schedule_dirty_cone_operations: None,
+        schedule_max_dirty_cone: None,
+        schedule_workspace_growths: None,
+        schedule_workspace_rollbacks: None,
+        schedule_alns_generation_attempts: None,
+        schedule_alns_moves_generated: None,
         full_recompute_percentage: None,
         backend_build_seconds: None,
         construction_seconds: None,
@@ -1387,6 +1490,80 @@ fn verbose_collection_finish(solution: &PySolution, run: &CollectionRun, profile
                 println!("  ALNS iterations: {}", solution.alns_iterations.unwrap_or(0));
                 println!("  candidates: {}", solution.candidates_evaluated.unwrap_or(0));
                 println!("  candidates/s: {:.1}", solution.candidates_per_second.unwrap_or(0.0));
+                if run.engine == EngineKind::ScheduleLocalSearch {
+                    println!("  schedule moves considered: {}", solution.schedule_moves_considered.unwrap_or(0));
+                    println!("  schedule moves accepted: {}", solution.schedule_moves_accepted.unwrap_or(0));
+                    println!("  schedule moves rejected: {}", solution.schedule_moves_rejected.unwrap_or(0));
+                    println!("  schedule work steps: {}", solution.schedule_work_steps.unwrap_or(0));
+                    println!("  schedule local improvements: {}", solution.schedule_local_improvements.unwrap_or(0));
+                    println!("  schedule global improvements: {}", solution.schedule_global_improvements.unwrap_or(0));
+                    println!("  schedule progress publications: {}", solution.schedule_progress_publications.unwrap_or(0));
+                    println!(
+                        "  schedule incumbent publication attempts: {}",
+                        solution.schedule_incumbent_publication_attempts.unwrap_or(0)
+                    );
+                    println!("  schedule incumbent publications: {}", solution.schedule_incumbent_publications.unwrap_or(0));
+                    println!("  schedule incumbent injection attempts: {}", solution.schedule_incumbent_injection_attempts.unwrap_or(0));
+                    println!("  schedule incumbent injections: {}", solution.schedule_incumbent_injections.unwrap_or(0));
+                    println!("  schedule incumbent rejections: {}", solution.schedule_incumbent_rejections.unwrap_or(0));
+                    println!("  schedule incumbent verifications: {}", solution.schedule_incumbent_verifications.unwrap_or(0));
+                    println!(
+                        "  schedule incumbent verification rejections: {}",
+                        solution.schedule_incumbent_verification_rejections.unwrap_or(0)
+                    );
+                    println!(
+                        "  schedule incumbent verification interruptions: {}",
+                        solution.schedule_incumbent_verification_interruptions.unwrap_or(0)
+                    );
+                    println!(
+                        "  schedule incumbent incomplete rejections: {}",
+                        solution.schedule_incumbent_incomplete_rejections.unwrap_or(0)
+                    );
+                    println!("  schedule restart boundaries: {}", solution.schedule_restart_boundaries.unwrap_or(0));
+                    println!("  schedule peak buffered candidates: {}", solution.schedule_peak_buffered_candidates.unwrap_or(0));
+                    println!("  schedule stalled workers: {}", solution.schedule_stalled_workers.unwrap_or(0));
+                    println!("  schedule stalled unused work steps: {}", solution.schedule_stalled_unused_work_steps.unwrap_or(0));
+                    println!("  schedule worker work min: {}", solution.schedule_worker_work_min.unwrap_or(0));
+                    println!("  schedule worker work max: {}", solution.schedule_worker_work_max.unwrap_or(0));
+                    println!("  schedule work budget overruns: {}", solution.schedule_work_budget_overruns.unwrap_or(0));
+                    println!("  schedule elite pool size: {}", solution.schedule_elite_pool_size.unwrap_or(0));
+                    println!(
+                        "  schedule unused work steps: {}",
+                        solution.schedule_unused_work_steps.map_or_else(|| "none".to_string(), |value| value.to_string())
+                    );
+                    println!(
+                        "  schedule incumbent source worker: {}",
+                        solution.schedule_incumbent_source_worker.map_or_else(|| "none".to_string(), |value| value.to_string())
+                    );
+                    println!(
+                        "  schedule incumbent source round: {}",
+                        solution.schedule_incumbent_source_round.map_or_else(|| "none".to_string(), |value| value.to_string())
+                    );
+                    println!("  schedule cycle rejections: {}", solution.schedule_cycle_rejections.unwrap_or(0));
+                    println!("  schedule reconstructions: {}", solution.schedule_reconstructions.unwrap_or(0));
+                    println!("  critical path updates: {}", solution.critical_path_updates.unwrap_or(0));
+                    println!("  schedule window rejections: {}", solution.schedule_window_rejections.unwrap_or(0));
+                    println!("  schedule objective rejections: {}", solution.schedule_objective_rejections.unwrap_or(0));
+                    println!("  resource profile checks: {}", solution.resource_profile_checks.unwrap_or(0));
+                    println!("  resource candidate scheduling attempts: {}", solution.resource_candidate_scheduling_attempts.unwrap_or(0));
+                    println!("  resource event visits: {}", solution.resource_event_visits.unwrap_or(0));
+                    println!("  resource peak profile events: {}", solution.resource_peak_profile_events.unwrap_or(0));
+                    println!("  schedule precedence rejections: {}", solution.schedule_precedence_rejections.unwrap_or(0));
+                    println!("  schedule infeasible rejections: {}", solution.schedule_infeasible_rejections.unwrap_or(0));
+                    println!("  schedule justification attempts: {}", solution.schedule_justification_attempts.unwrap_or(0));
+                    println!("  schedule delta evaluations: {}", solution.schedule_delta_evaluations.unwrap_or(0));
+                    println!("  schedule full evaluations: {}", solution.schedule_full_evaluations.unwrap_or(0));
+                    println!("  schedule full fallbacks: {}", solution.schedule_full_fallbacks.unwrap_or(0));
+                    println!("  schedule topological rebuilds: {}", solution.schedule_topological_rebuilds.unwrap_or(0));
+                    println!("  schedule oracle validations: {}", solution.schedule_oracle_validations.unwrap_or(0));
+                    println!("  schedule oracle mismatches: {}", solution.schedule_oracle_mismatches.unwrap_or(0));
+                    println!("  schedule dirty cone operations: {}", solution.schedule_dirty_cone_operations.unwrap_or(0));
+                    println!("  schedule max dirty cone: {}", solution.schedule_max_dirty_cone.unwrap_or(0));
+                    println!("  schedule workspace growths: {}", solution.schedule_workspace_growths.unwrap_or(0));
+                    println!("  schedule workspace rollbacks: {}", solution.schedule_workspace_rollbacks.unwrap_or(0));
+                    println!("  schedule ALNS generation attempts: {}", solution.schedule_alns_generation_attempts.unwrap_or(0));
+                    println!("  schedule ALNS moves generated: {}", solution.schedule_alns_moves_generated.unwrap_or(0));
+                }
                 println!("  full recomputations: {:.2}%", solution.full_recompute_percentage.unwrap_or(0.0));
             }
         }
@@ -2099,6 +2276,261 @@ impl PySolution {
     }
 
     #[getter]
+    fn schedule_moves_considered(&self) -> Option<u64> {
+        self.schedule_moves_considered
+    }
+
+    #[getter]
+    fn schedule_moves_accepted(&self) -> Option<u64> {
+        self.schedule_moves_accepted
+    }
+
+    #[getter]
+    fn schedule_moves_rejected(&self) -> Option<u64> {
+        self.schedule_moves_rejected
+    }
+
+    #[getter]
+    fn schedule_work_steps(&self) -> Option<u64> {
+        self.schedule_work_steps
+    }
+
+    #[getter]
+    fn schedule_local_improvements(&self) -> Option<u64> {
+        self.schedule_local_improvements
+    }
+
+    #[getter]
+    fn schedule_global_improvements(&self) -> Option<u64> {
+        self.schedule_global_improvements
+    }
+
+    #[getter]
+    fn schedule_progress_publications(&self) -> Option<u64> {
+        self.schedule_progress_publications
+    }
+
+    #[getter]
+    fn schedule_incumbent_publication_attempts(&self) -> Option<u64> {
+        self.schedule_incumbent_publication_attempts
+    }
+
+    #[getter]
+    fn schedule_incumbent_publications(&self) -> Option<u64> {
+        self.schedule_incumbent_publications
+    }
+
+    #[getter]
+    fn schedule_incumbent_injection_attempts(&self) -> Option<u64> {
+        self.schedule_incumbent_injection_attempts
+    }
+
+    #[getter]
+    fn schedule_incumbent_injections(&self) -> Option<u64> {
+        self.schedule_incumbent_injections
+    }
+
+    #[getter]
+    fn schedule_incumbent_rejections(&self) -> Option<u64> {
+        self.schedule_incumbent_rejections
+    }
+
+    #[getter]
+    fn schedule_incumbent_verifications(&self) -> Option<u64> {
+        self.schedule_incumbent_verifications
+    }
+
+    #[getter]
+    fn schedule_incumbent_verification_rejections(&self) -> Option<u64> {
+        self.schedule_incumbent_verification_rejections
+    }
+
+    #[getter]
+    fn schedule_incumbent_verification_interruptions(&self) -> Option<u64> {
+        self.schedule_incumbent_verification_interruptions
+    }
+
+    #[getter]
+    fn schedule_incumbent_incomplete_rejections(&self) -> Option<u64> {
+        self.schedule_incumbent_incomplete_rejections
+    }
+
+    #[getter]
+    fn schedule_restart_boundaries(&self) -> Option<u64> {
+        self.schedule_restart_boundaries
+    }
+
+    #[getter]
+    fn schedule_peak_buffered_candidates(&self) -> Option<u64> {
+        self.schedule_peak_buffered_candidates
+    }
+
+    #[getter]
+    fn schedule_stalled_workers(&self) -> Option<u64> {
+        self.schedule_stalled_workers
+    }
+
+    #[getter]
+    fn schedule_stalled_unused_work_steps(&self) -> Option<u64> {
+        self.schedule_stalled_unused_work_steps
+    }
+
+    #[getter]
+    fn schedule_worker_work_min(&self) -> Option<u64> {
+        self.schedule_worker_work_min
+    }
+
+    #[getter]
+    fn schedule_worker_work_max(&self) -> Option<u64> {
+        self.schedule_worker_work_max
+    }
+
+    #[getter]
+    fn schedule_work_budget_overruns(&self) -> Option<u64> {
+        self.schedule_work_budget_overruns
+    }
+
+    #[getter]
+    fn schedule_elite_pool_size(&self) -> Option<u64> {
+        self.schedule_elite_pool_size
+    }
+
+    #[getter]
+    fn schedule_unused_work_steps(&self) -> Option<u64> {
+        self.schedule_unused_work_steps
+    }
+
+    #[getter]
+    fn schedule_incumbent_source_worker(&self) -> Option<u64> {
+        self.schedule_incumbent_source_worker
+    }
+
+    #[getter]
+    fn schedule_incumbent_source_round(&self) -> Option<u64> {
+        self.schedule_incumbent_source_round
+    }
+
+    #[getter]
+    fn schedule_cycle_rejections(&self) -> Option<u64> {
+        self.schedule_cycle_rejections
+    }
+
+    #[getter]
+    fn schedule_reconstructions(&self) -> Option<u64> {
+        self.schedule_reconstructions
+    }
+
+    #[getter]
+    fn critical_path_updates(&self) -> Option<u64> {
+        self.critical_path_updates
+    }
+
+    #[getter]
+    fn schedule_window_rejections(&self) -> Option<u64> {
+        self.schedule_window_rejections
+    }
+
+    #[getter]
+    fn schedule_objective_rejections(&self) -> Option<u64> {
+        self.schedule_objective_rejections
+    }
+
+    #[getter]
+    fn resource_profile_checks(&self) -> Option<u64> {
+        self.resource_profile_checks
+    }
+
+    #[getter]
+    fn resource_candidate_scheduling_attempts(&self) -> Option<u64> {
+        self.resource_candidate_scheduling_attempts
+    }
+
+    #[getter]
+    fn resource_event_visits(&self) -> Option<u64> {
+        self.resource_event_visits
+    }
+
+    #[getter]
+    fn resource_peak_profile_events(&self) -> Option<u64> {
+        self.resource_peak_profile_events
+    }
+
+    #[getter]
+    fn schedule_precedence_rejections(&self) -> Option<u64> {
+        self.schedule_precedence_rejections
+    }
+
+    #[getter]
+    fn schedule_infeasible_rejections(&self) -> Option<u64> {
+        self.schedule_infeasible_rejections
+    }
+
+    #[getter]
+    fn schedule_justification_attempts(&self) -> Option<u64> {
+        self.schedule_justification_attempts
+    }
+
+    #[getter]
+    fn schedule_delta_evaluations(&self) -> Option<u64> {
+        self.schedule_delta_evaluations
+    }
+
+    #[getter]
+    fn schedule_full_evaluations(&self) -> Option<u64> {
+        self.schedule_full_evaluations
+    }
+
+    #[getter]
+    fn schedule_full_fallbacks(&self) -> Option<u64> {
+        self.schedule_full_fallbacks
+    }
+
+    #[getter]
+    fn schedule_topological_rebuilds(&self) -> Option<u64> {
+        self.schedule_topological_rebuilds
+    }
+
+    #[getter]
+    fn schedule_oracle_validations(&self) -> Option<u64> {
+        self.schedule_oracle_validations
+    }
+
+    #[getter]
+    fn schedule_oracle_mismatches(&self) -> Option<u64> {
+        self.schedule_oracle_mismatches
+    }
+
+    #[getter]
+    fn schedule_dirty_cone_operations(&self) -> Option<u64> {
+        self.schedule_dirty_cone_operations
+    }
+
+    #[getter]
+    fn schedule_max_dirty_cone(&self) -> Option<u64> {
+        self.schedule_max_dirty_cone
+    }
+
+    #[getter]
+    fn schedule_workspace_growths(&self) -> Option<u64> {
+        self.schedule_workspace_growths
+    }
+
+    #[getter]
+    fn schedule_workspace_rollbacks(&self) -> Option<u64> {
+        self.schedule_workspace_rollbacks
+    }
+
+    #[getter]
+    fn schedule_alns_generation_attempts(&self) -> Option<u64> {
+        self.schedule_alns_generation_attempts
+    }
+
+    #[getter]
+    fn schedule_alns_moves_generated(&self) -> Option<u64> {
+        self.schedule_alns_moves_generated
+    }
+
+    #[getter]
     fn full_recompute_percentage(&self) -> Option<f64> {
         self.full_recompute_percentage
     }
@@ -2761,6 +3193,11 @@ impl PyModel {
         if intervals.is_empty() {
             return Err(PyValueError::new_err("sequence needs at least one interval"));
         }
+        if intervals.iter().any(|interval| interval.kind != PyIntervalKind::Native) {
+            return Err(PyValueError::new_err(
+                "sequence setups require native Model.interval handles and the exact engine; compact schedule intervals are not supported",
+            ));
+        }
         if transitions.len() != intervals.len() || transitions.iter().any(|row| row.len() != intervals.len()) {
             return Err(PyValueError::new_err("sequence transition matrix must be square and match the interval count"));
         }
@@ -3117,6 +3554,9 @@ impl PyModel {
         if durations.is_empty() {
             return Err(PyValueError::new_err("a schedule needs at least one interval"));
         }
+        if optional {
+            return Err(PyValueError::new_err("optional compact schedule intervals have no presence selector; use Model.interval instead"));
+        }
         for &duration in &durations {
             checked_interval_start_max(horizon, duration)?;
         }
@@ -3127,11 +3567,7 @@ impl PyModel {
             .iter()
             .map(|&duration| {
                 let start_max = horizon - duration;
-                if optional {
-                    model.optional_interval(0, start_max, duration)
-                } else {
-                    model.interval(0, start_max, duration)
-                }
+                model.interval(0, start_max, duration)
             })
             .collect::<Vec<_>>();
         self.semantic.objectives.retain(|objective| !matches!(objective, shared_model::Objective::Makespan { .. }));
@@ -3227,6 +3663,11 @@ impl PyModel {
         default_capacity: i64,
         calendar: Vec<(i64, i64, i64)>,
     ) -> PyResult<()> {
+        if demands.iter().any(|(interval, _)| interval.kind != PyIntervalKind::Native) {
+            return Err(PyValueError::new_err(
+                "resource calendars require native Model.interval handles and the exact engine; compact schedule intervals are not supported",
+            ));
+        }
         let default_capacity = checked_nonnegative_i32(default_capacity, "default cumulative capacity")?;
         let mut calendar = calendar
             .into_iter()
@@ -3284,6 +3725,11 @@ impl PyModel {
     /// State/resource function. Equal-state intervals may overlap. Intervals
     /// requiring different states are ordered with transition-dependent setup.
     fn state_function(&mut self, states: Vec<(PyIntervalVar, usize)>, transitions: Vec<Vec<i64>>) -> PyResult<()> {
+        if states.iter().any(|(interval, _)| interval.kind != PyIntervalKind::Native) {
+            return Err(PyValueError::new_err(
+                "state functions require native Model.interval handles and the exact engine; compact schedule intervals are not supported",
+            ));
+        }
         let state_count = transitions.len();
         if state_count == 0 || transitions.iter().any(|row| row.len() != state_count) {
             return Err(PyValueError::new_err("state transition matrix must be non-empty and square"));
@@ -4140,6 +4586,79 @@ impl PyModel {
         let candidates_evaluated = expose_search_profile.then(|| parse_report_metadata(report, "candidates_evaluated").unwrap_or_default());
         let candidates_per_second =
             expose_search_profile.then(|| parse_report_metadata(report, "candidates_per_second").unwrap_or_default());
+        let expose_schedule_profile = profile && run.engine == EngineKind::ScheduleLocalSearch;
+        let schedule_moves_considered =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_moves_considered")).flatten();
+        let schedule_moves_accepted = expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_moves_accepted")).flatten();
+        let schedule_moves_rejected = expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_moves_rejected")).flatten();
+        let schedule_work_steps = expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_work_steps")).flatten();
+        let schedule_counter =
+            |key: &str| -> Option<u64> { expose_schedule_profile.then(|| parse_report_metadata::<u64>(report, key)).flatten() };
+        let schedule_local_improvements = schedule_counter("schedule_local_improvements");
+        let schedule_global_improvements = schedule_counter("schedule_global_improvements");
+        let schedule_progress_publications = schedule_counter("schedule_progress_publications");
+        let schedule_incumbent_publication_attempts = schedule_counter("schedule_incumbent_publication_attempts");
+        let schedule_incumbent_publications = schedule_counter("schedule_incumbent_publications");
+        let schedule_incumbent_injection_attempts = schedule_counter("schedule_incumbent_injection_attempts");
+        let schedule_incumbent_injections = schedule_counter("schedule_incumbent_injections");
+        let schedule_incumbent_rejections = schedule_counter("schedule_incumbent_rejections");
+        let schedule_incumbent_verifications = schedule_counter("schedule_incumbent_verifications");
+        let schedule_incumbent_verification_rejections = schedule_counter("schedule_incumbent_verification_rejections");
+        let schedule_incumbent_verification_interruptions = schedule_counter("schedule_incumbent_verification_interruptions");
+        let schedule_incumbent_incomplete_rejections = schedule_counter("schedule_incumbent_incomplete_rejections");
+        let schedule_restart_boundaries = schedule_counter("schedule_restart_boundaries");
+        let schedule_peak_buffered_candidates = schedule_counter("schedule_peak_buffered_candidates");
+        let schedule_stalled_workers = schedule_counter("schedule_stalled_workers");
+        let schedule_stalled_unused_work_steps = schedule_counter("schedule_stalled_unused_work_steps");
+        let schedule_worker_work_min = schedule_counter("schedule_worker_work_min");
+        let schedule_worker_work_max = schedule_counter("schedule_worker_work_max");
+        let schedule_work_budget_overruns = schedule_counter("schedule_work_budget_overruns");
+        let schedule_elite_pool_size = schedule_counter("schedule_elite_pool_size");
+        let schedule_unused_work_steps = schedule_counter("schedule_unused_work_steps");
+        let schedule_incumbent_source_worker = schedule_counter("schedule_incumbent_source_worker");
+        let schedule_incumbent_source_round = schedule_counter("schedule_incumbent_source_round");
+        let schedule_cycle_rejections =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_cycle_rejections")).flatten();
+        let schedule_reconstructions = expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_reconstructions")).flatten();
+        let critical_path_updates = expose_schedule_profile.then(|| parse_report_metadata(report, "critical_path_updates")).flatten();
+        let schedule_window_rejections =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_window_rejections")).flatten();
+        let schedule_objective_rejections =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_objective_rejections")).flatten();
+        let resource_profile_checks = expose_schedule_profile.then(|| parse_report_metadata(report, "resource_profile_checks")).flatten();
+        let resource_candidate_scheduling_attempts =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "resource_candidate_scheduling_attempts")).flatten();
+        let resource_event_visits = expose_schedule_profile.then(|| parse_report_metadata(report, "resource_event_visits")).flatten();
+        let resource_peak_profile_events =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "resource_peak_profile_events")).flatten();
+        let schedule_precedence_rejections =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_precedence_rejections")).flatten();
+        let schedule_infeasible_rejections =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_infeasible_rejections")).flatten();
+        let schedule_justification_attempts =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_justification_attempts")).flatten();
+        let schedule_delta_evaluations =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_delta_evaluations")).flatten();
+        let schedule_full_evaluations =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_full_evaluations")).flatten();
+        let schedule_full_fallbacks = expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_full_fallbacks")).flatten();
+        let schedule_topological_rebuilds =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_topological_rebuilds")).flatten();
+        let schedule_oracle_validations =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_oracle_validations")).flatten();
+        let schedule_oracle_mismatches =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_oracle_mismatches")).flatten();
+        let schedule_dirty_cone_operations =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_dirty_cone_operations")).flatten();
+        let schedule_max_dirty_cone = expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_max_dirty_cone")).flatten();
+        let schedule_workspace_growths =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_workspace_growths")).flatten();
+        let schedule_workspace_rollbacks =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_workspace_rollbacks")).flatten();
+        let schedule_alns_generation_attempts =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_alns_generation_attempts")).flatten();
+        let schedule_alns_moves_generated =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_alns_moves_generated")).flatten();
         let full_recompute_percentage =
             expose_search_profile.then(|| parse_report_metadata(report, "full_recompute_percentage").unwrap_or_default());
         let construction_seconds = expose_search_profile.then(|| parse_report_metadata(report, "construction_seconds").unwrap_or_default());
@@ -4183,6 +4702,57 @@ impl PyModel {
             alns_iterations,
             candidates_evaluated,
             candidates_per_second,
+            schedule_moves_considered,
+            schedule_moves_accepted,
+            schedule_moves_rejected,
+            schedule_work_steps,
+            schedule_local_improvements,
+            schedule_global_improvements,
+            schedule_progress_publications,
+            schedule_incumbent_publication_attempts,
+            schedule_incumbent_publications,
+            schedule_incumbent_injection_attempts,
+            schedule_incumbent_injections,
+            schedule_incumbent_rejections,
+            schedule_incumbent_verifications,
+            schedule_incumbent_verification_rejections,
+            schedule_incumbent_verification_interruptions,
+            schedule_incumbent_incomplete_rejections,
+            schedule_restart_boundaries,
+            schedule_peak_buffered_candidates,
+            schedule_stalled_workers,
+            schedule_stalled_unused_work_steps,
+            schedule_worker_work_min,
+            schedule_worker_work_max,
+            schedule_work_budget_overruns,
+            schedule_elite_pool_size,
+            schedule_unused_work_steps,
+            schedule_incumbent_source_worker,
+            schedule_incumbent_source_round,
+            schedule_cycle_rejections,
+            schedule_reconstructions,
+            critical_path_updates,
+            schedule_window_rejections,
+            schedule_objective_rejections,
+            resource_profile_checks,
+            resource_candidate_scheduling_attempts,
+            resource_event_visits,
+            resource_peak_profile_events,
+            schedule_precedence_rejections,
+            schedule_infeasible_rejections,
+            schedule_justification_attempts,
+            schedule_delta_evaluations,
+            schedule_full_evaluations,
+            schedule_full_fallbacks,
+            schedule_topological_rebuilds,
+            schedule_oracle_validations,
+            schedule_oracle_mismatches,
+            schedule_dirty_cone_operations,
+            schedule_max_dirty_cone,
+            schedule_workspace_growths,
+            schedule_workspace_rollbacks,
+            schedule_alns_generation_attempts,
+            schedule_alns_moves_generated,
             full_recompute_percentage,
             backend_build_seconds: profile.then_some(backend_build_seconds).flatten(),
             construction_seconds,

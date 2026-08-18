@@ -1,16 +1,53 @@
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::engines::ls::schedule_ir::PrecedenceDag;
 use crate::mix64;
 use crate::model::list::{CollectionSolution, IntervalVar, Resource, Schedule};
 
-/// Construction-only measurements shared with the collection profiler.
+use super::resource_schedule::{
+    GenerationScheme, Justification, PriorityRule, PrioritySgs, ResourceAlnsBudget, ResourceMoveAcceptance, ResourceMoveOutcome,
+    ResourceScheduleMetrics, ResourceScheduleProblem, ResourceScheduleState,
+};
+use super::schedule_state::{
+    CriticalNeighborhood, DispatchRule, JobShopProblem, JobShopState, MoveAcceptance, MoveOutcome, ScheduleStateMetrics,
+};
+
+/// Scheduling-search measurements shared with the collection profiler.
 pub(crate) struct ScheduleConstructionMetrics {
     pub(crate) elapsed: Duration,
     pub(crate) first_feasible: Option<Duration>,
     pub(crate) candidates: u64,
+    pub(crate) work_steps: u64,
+    pub(crate) constructor: &'static str,
+    pub(crate) moves_considered: u64,
+    pub(crate) moves_accepted: u64,
+    pub(crate) incumbent_improvements: u64,
+    pub(crate) incumbent_injections: u64,
+    pub(crate) cycle_rejections: u64,
+    pub(crate) window_rejections: u64,
+    pub(crate) objective_rejections: u64,
+    pub(crate) reconstructions: u64,
+    pub(crate) critical_path_updates: u64,
+    pub(crate) delta_evaluations: u64,
+    pub(crate) full_evaluations: u64,
+    pub(crate) full_fallbacks: u64,
+    pub(crate) topological_rebuilds: u64,
+    pub(crate) oracle_validations: u64,
+    pub(crate) oracle_mismatches: u64,
+    pub(crate) dirty_cone_operations: u64,
+    pub(crate) max_dirty_cone: u64,
+    pub(crate) workspace_growths: u64,
+    pub(crate) workspace_rollbacks: u64,
+    pub(crate) alns_generation_attempts: u64,
+    pub(crate) alns_moves_generated: u64,
+    pub(crate) resource_profile_checks: u64,
+    pub(crate) resource_candidate_scheduling_attempts: u64,
+    pub(crate) resource_event_visits: u64,
+    pub(crate) resource_peak_profile_events: usize,
+    pub(crate) precedence_rejections: u64,
+    pub(crate) infeasible_rejections: u64,
+    pub(crate) justification_attempts: u64,
 }
 
 struct ConstructedSchedule {
@@ -18,6 +55,32 @@ struct ConstructedSchedule {
     chosen: Vec<usize>,
     present: Vec<bool>,
 }
+
+struct ConstructedIncumbent {
+    schedule: ConstructedSchedule,
+    durations: Vec<i64>,
+    machines: Vec<i64>,
+    score: (i64, i64),
+    solution: CollectionSolution,
+}
+
+#[derive(Clone, Copy)]
+enum SgsRule {
+    Stable,
+    LongestRemainingPath,
+    ShortestProcessingTime,
+    LongestProcessingTime,
+    MostSuccessors,
+    Seeded,
+}
+
+const SGS_RULES: [SgsRule; 5] = [
+    SgsRule::Stable,
+    SgsRule::LongestRemainingPath,
+    SgsRule::ShortestProcessingTime,
+    SgsRule::LongestProcessingTime,
+    SgsRule::MostSuccessors,
+];
 
 #[derive(Clone, Copy)]
 struct Interrupted;
@@ -110,8 +173,21 @@ fn iv_machine(iv: &IntervalVar, mode: usize) -> i64 {
     if iv.modes.is_empty() {
         -1
     } else {
-        iv.modes[mode].machine as i64
+        i64::try_from(iv.modes[mode].machine).expect("validated schedule mode machine fits i64")
     }
+}
+
+fn machines_are_representable(sched: &Schedule, stop: &AtomicBool) -> Interruptible<bool> {
+    for interval in &sched.intervals {
+        checkpoint(stop)?;
+        for mode in &interval.modes {
+            checkpoint(stop)?;
+            if i64::try_from(mode.machine).is_err() {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Inclusive start bounds implied by the selected mode.
@@ -301,10 +377,51 @@ fn earliest_resource_start(
     Ok(None)
 }
 
-/// Serial schedule generation scheme. Eligible operations are taken in stable
-/// topological order and placed at their earliest resource-feasible event. For
-/// flexible operations, the mode with the earliest completion is selected.
-fn serial_schedule(sched: &Schedule, stop: &AtomicBool) -> (Interruptible<Option<ConstructedSchedule>>, u64) {
+fn ready_priority(
+    rule: SgsRule,
+    operation: usize,
+    durations: &[i64],
+    bottom: &[i64],
+    successors: &[Vec<usize>],
+    seed: u64,
+) -> (i128, i128, u64, usize) {
+    let duration = durations[operation];
+    let successor_count = successors[operation].len();
+    match rule {
+        SgsRule::Stable => (0, 0, 0, operation),
+        SgsRule::LongestRemainingPath => (-i128::from(bottom[operation]), i128::from(duration), 0, operation),
+        SgsRule::ShortestProcessingTime => (i128::from(duration), -i128::from(bottom[operation]), 0, operation),
+        SgsRule::LongestProcessingTime => (-i128::from(duration), -i128::from(bottom[operation]), 0, operation),
+        SgsRule::MostSuccessors => (-i128::try_from(successor_count).unwrap_or(i128::MAX), -i128::from(bottom[operation]), 0, operation),
+        SgsRule::Seeded => (0, 0, mix64(seed ^ u64::try_from(operation).unwrap_or(u64::MAX)), operation),
+    }
+}
+
+fn select_ready(
+    ready: &[usize],
+    rule: SgsRule,
+    durations: &[i64],
+    bottom: &[i64],
+    successors: &[Vec<usize>],
+    seed: u64,
+    stop: &AtomicBool,
+) -> Interruptible<usize> {
+    let mut selected = 0usize;
+    for position in 1..ready.len() {
+        checkpoint(stop)?;
+        if ready_priority(rule, ready[position], durations, bottom, successors, seed)
+            < ready_priority(rule, ready[selected], durations, bottom, successors, seed)
+        {
+            selected = position;
+        }
+    }
+    Ok(selected)
+}
+
+/// Serial schedule generation scheme. Eligible operations are selected by one
+/// generic priority rule and placed at their earliest resource-feasible event.
+/// For flexible operations, the mode with the earliest completion is selected.
+fn serial_schedule(sched: &Schedule, rule: SgsRule, seed: u64, stop: &AtomicBool) -> (Interruptible<Option<ConstructedSchedule>>, u64) {
     if let Err(interrupted) = checkpoint(stop) {
         return (Err(interrupted), 0);
     }
@@ -326,17 +443,38 @@ fn serial_schedule(sched: &Schedule, stop: &AtomicBool) -> (Interruptible<Option
             return (Err(interrupted), 0);
         }
         if present[before] && present[after] {
-            indegree[after] = indegree[after].saturating_add(1);
             successors[before].push(after);
         }
     }
-    let mut ready = BinaryHeap::new();
+    for list in &mut successors {
+        if let Err(interrupted) = checkpoint(stop) {
+            return (Err(interrupted), 0);
+        }
+        list.sort_unstable();
+        list.dedup();
+        for &successor in list.iter() {
+            indegree[successor] = indegree[successor].saturating_add(1);
+        }
+    }
+    let base_durations = match collect_interruptible(
+        sched.intervals.iter().map(|interval| interval.modes.iter().map(|mode| mode.duration).min().unwrap_or(interval.duration)),
+        stop,
+    ) {
+        Ok(durations) => durations,
+        Err(interrupted) => return (Err(interrupted), 0),
+    };
+    let bottom = match PrecedenceDag::compile(successors.clone(), stop).and_then(|dag| dag.remaining_paths(&base_durations, stop)) {
+        Some(bottom) => bottom,
+        None if stop.load(Ordering::Acquire) => return (Err(Interrupted), 0),
+        None => return (Ok(None), 0),
+    };
+    let mut ready = Vec::new();
     for index in 0..n {
         if let Err(interrupted) = checkpoint(stop) {
             return (Err(interrupted), 0);
         }
         if present[index] && indegree[index] == 0 {
-            ready.push(Reverse(index));
+            ready.push(index);
         }
     }
     let mut chosen = match collect_interruptible(std::iter::repeat_n(0usize, n), stop) {
@@ -357,10 +495,15 @@ fn serial_schedule(sched: &Schedule, stop: &AtomicBool) -> (Interruptible<Option
     };
     let mut scheduled_count = 0usize;
     let mut candidates = 0u64;
-    while let Some(Reverse(index)) = ready.pop() {
+    while !ready.is_empty() {
         if let Err(interrupted) = checkpoint(stop) {
             return (Err(interrupted), candidates);
         }
+        let ready_position = match select_ready(&ready, rule, &base_durations, &bottom, &successors, seed, stop) {
+            Ok(position) => position,
+            Err(interrupted) => return (Err(interrupted), candidates),
+        };
+        let index = ready.swap_remove(ready_position);
         let mut earliest = 0;
         for &(before, after) in &sched.precedences {
             if let Err(interrupted) = checkpoint(stop) {
@@ -423,7 +566,7 @@ fn serial_schedule(sched: &Schedule, stop: &AtomicBool) -> (Interruptible<Option
             }
             indegree[successor] -= 1;
             if indegree[successor] == 0 {
-                ready.push(Reverse(successor));
+                ready.push(successor);
             }
         }
     }
@@ -441,6 +584,64 @@ fn serial_schedule(sched: &Schedule, stop: &AtomicBool) -> (Interruptible<Option
         return (Err(interrupted), candidates);
     }
     (Ok(Some(ConstructedSchedule { starts, chosen, present })), candidates)
+}
+
+fn construct_schedule(
+    sched: &Schedule,
+    seed: u64,
+    stop: &AtomicBool,
+    report: &mut dyn FnMut(i64),
+) -> (Interruptible<Option<ConstructedIncumbent>>, u64, Option<Duration>) {
+    let started = Instant::now();
+    let mut candidates = 0u64;
+    let mut first_feasible = None;
+    let mut best: Option<ConstructedIncumbent> = None;
+    let attempts = SGS_RULES
+        .iter()
+        .copied()
+        .map(|rule| (rule, 0))
+        .chain((0..3u64).map(|lane| (SgsRule::Seeded, mix64(seed ^ lane.wrapping_mul(0x9e37_79b9_7f4a_7c15)))));
+
+    let interrupted_result = |best: Option<ConstructedIncumbent>, interrupted, candidates, first_feasible| {
+        if let Some(incumbent) = best {
+            (Ok(Some(incumbent)), candidates, first_feasible)
+        } else {
+            (Err(interrupted), candidates, first_feasible)
+        }
+    };
+
+    for (rule, rule_seed) in attempts {
+        if let Err(interrupted) = checkpoint(stop) {
+            return interrupted_result(best, interrupted, candidates, first_feasible);
+        }
+        let (constructed, evaluated) = serial_schedule(sched, rule, rule_seed, stop);
+        candidates = candidates.saturating_add(evaluated);
+        let schedule = match constructed {
+            Ok(Some(schedule)) => schedule,
+            Ok(None) => continue,
+            Err(interrupted) => return interrupted_result(best, interrupted, candidates, first_feasible),
+        };
+        let (durations, machines) = match mode_view(sched, &schedule.chosen, stop) {
+            Ok(view) => view,
+            Err(interrupted) => return interrupted_result(best, interrupted, candidates, first_feasible),
+        };
+        let score = match schedule_score(sched, &schedule.chosen, &durations, &machines, &schedule.starts, &schedule.present, stop) {
+            Ok(score) if score.0 == 0 => score,
+            Ok(_) => continue,
+            Err(interrupted) => return interrupted_result(best, interrupted, candidates, first_feasible),
+        };
+        let solution = match snapshot_solution(sched, &schedule.chosen, &schedule.starts, &schedule.present, score, stop) {
+            Ok(solution) => solution,
+            Err(interrupted) => return interrupted_result(best, interrupted, candidates, first_feasible),
+        };
+        first_feasible.get_or_insert_with(|| started.elapsed());
+        if best.as_ref().is_none_or(|incumbent| score < incumbent.score) {
+            best = Some(ConstructedIncumbent { schedule, durations, machines, score, solution });
+            report(score.1);
+        }
+    }
+
+    (Ok(best), candidates, first_feasible)
 }
 
 /// Overlap (>= 0) of two intervals' time spans.
@@ -670,6 +871,742 @@ fn snapshot_solution(
     Ok(CollectionSolution { lists: Vec::new(), objectives, feasible: true, starts, presences, machines, modes, bound: None })
 }
 
+fn add_state_metrics(total: &mut ScheduleStateMetrics, metrics: ScheduleStateMetrics) {
+    total.construction_candidates = total.construction_candidates.saturating_add(metrics.construction_candidates);
+    total.reconstructions = total.reconstructions.saturating_add(metrics.reconstructions);
+    total.moves_considered = total.moves_considered.saturating_add(metrics.moves_considered);
+    total.moves_accepted = total.moves_accepted.saturating_add(metrics.moves_accepted);
+    total.cycle_rejections = total.cycle_rejections.saturating_add(metrics.cycle_rejections);
+    total.window_rejections = total.window_rejections.saturating_add(metrics.window_rejections);
+    total.objective_rejections = total.objective_rejections.saturating_add(metrics.objective_rejections);
+    total.critical_path_updates = total.critical_path_updates.saturating_add(metrics.critical_path_updates);
+    total.delta_evaluations = total.delta_evaluations.saturating_add(metrics.delta_evaluations);
+    total.full_evaluations = total.full_evaluations.saturating_add(metrics.full_evaluations);
+    total.full_fallbacks = total.full_fallbacks.saturating_add(metrics.full_fallbacks);
+    total.topological_rebuilds = total.topological_rebuilds.saturating_add(metrics.topological_rebuilds);
+    total.oracle_validations = total.oracle_validations.saturating_add(metrics.oracle_validations);
+    total.oracle_mismatches = total.oracle_mismatches.saturating_add(metrics.oracle_mismatches);
+    total.dirty_cone_operations = total.dirty_cone_operations.saturating_add(metrics.dirty_cone_operations);
+    total.max_dirty_cone = total.max_dirty_cone.max(metrics.max_dirty_cone);
+    total.workspace_growths = total.workspace_growths.saturating_add(metrics.workspace_growths);
+}
+
+fn job_shop_result(
+    best: Option<CollectionSolution>,
+    construction_elapsed: Duration,
+    first_feasible: Option<Duration>,
+    metrics: ScheduleStateMetrics,
+    incumbent_improvements: u64,
+    incumbent_injections: u64,
+) -> (CollectionSolution, ScheduleConstructionMetrics) {
+    (
+        best.unwrap_or_else(unknown_solution),
+        ScheduleConstructionMetrics {
+            elapsed: construction_elapsed,
+            first_feasible,
+            candidates: metrics.construction_candidates,
+            work_steps: metrics.moves_considered,
+            constructor: "giffler-thompson-critical-path",
+            moves_considered: metrics.moves_considered,
+            moves_accepted: metrics.moves_accepted,
+            incumbent_improvements,
+            incumbent_injections,
+            cycle_rejections: metrics.cycle_rejections,
+            window_rejections: metrics.window_rejections,
+            objective_rejections: metrics.objective_rejections,
+            reconstructions: metrics.reconstructions,
+            critical_path_updates: metrics.critical_path_updates,
+            delta_evaluations: metrics.delta_evaluations,
+            full_evaluations: metrics.full_evaluations,
+            full_fallbacks: metrics.full_fallbacks,
+            topological_rebuilds: metrics.topological_rebuilds,
+            oracle_validations: metrics.oracle_validations,
+            oracle_mismatches: metrics.oracle_mismatches,
+            dirty_cone_operations: metrics.dirty_cone_operations,
+            max_dirty_cone: metrics.max_dirty_cone,
+            workspace_growths: metrics.workspace_growths,
+            workspace_rollbacks: 0,
+            alns_generation_attempts: 0,
+            alns_moves_generated: 0,
+            resource_profile_checks: 0,
+            resource_candidate_scheduling_attempts: 0,
+            resource_event_visits: 0,
+            resource_peak_profile_events: 0,
+            precedence_rejections: 0,
+            infeasible_rejections: 0,
+            justification_attempts: 0,
+        },
+    )
+}
+
+fn generic_schedule_metrics(
+    elapsed: Duration,
+    first_feasible: Option<Duration>,
+    construction_candidates: u64,
+    moves_considered: u64,
+    moves_accepted: u64,
+    incumbent_improvements: u64,
+) -> ScheduleConstructionMetrics {
+    ScheduleConstructionMetrics {
+        elapsed,
+        first_feasible,
+        candidates: construction_candidates,
+        work_steps: moves_considered,
+        constructor: "priority-sgs",
+        moves_considered,
+        moves_accepted,
+        incumbent_improvements,
+        incumbent_injections: 0,
+        cycle_rejections: 0,
+        window_rejections: 0,
+        objective_rejections: 0,
+        reconstructions: 0,
+        critical_path_updates: 0,
+        delta_evaluations: 0,
+        full_evaluations: 0,
+        full_fallbacks: 0,
+        topological_rebuilds: 0,
+        oracle_validations: 0,
+        oracle_mismatches: 0,
+        dirty_cone_operations: 0,
+        max_dirty_cone: 0,
+        workspace_growths: 0,
+        workspace_rollbacks: 0,
+        alns_generation_attempts: 0,
+        alns_moves_generated: 0,
+        resource_profile_checks: 0,
+        resource_candidate_scheduling_attempts: 0,
+        resource_event_visits: 0,
+        resource_peak_profile_events: 0,
+        precedence_rejections: 0,
+        infeasible_rejections: 0,
+        justification_attempts: 0,
+    }
+}
+
+fn retain_job_shop_incumbent(
+    state: &JobShopState,
+    best_objective: &mut Option<i64>,
+    best: &mut Option<CollectionSolution>,
+    first_feasible: &mut Option<Duration>,
+    started: Instant,
+    report: &mut dyn FnMut(i64),
+) -> bool {
+    let objective = state.makespan();
+    if best_objective.is_none_or(|current| objective < current) {
+        *best_objective = Some(objective);
+        *best = Some(state.to_solution());
+        first_feasible.get_or_insert_with(|| started.elapsed());
+        report(objective);
+        true
+    } else {
+        false
+    }
+}
+
+fn complete_schedule_incumbent(sched: &Schedule, incumbent: Option<&CollectionSolution>) -> Option<CollectionSolution> {
+    incumbent
+        .filter(|solution| {
+            solution.feasible
+                && solution.starts.len() == sched.intervals.len()
+                && solution.presences.len() == sched.intervals.len()
+                && solution.machines.len() == sched.intervals.len()
+                && solution.modes.len() == sched.intervals.len()
+                && (!sched.minimize_makespan || solution.objectives.len() == 1)
+        })
+        .cloned()
+}
+
+/// Structured search for mandatory fixed-assignment job shops. Recognition is
+/// deliberately conservative; every unsupported schedule remains on the
+/// generic SGS and interval-move fallback below.
+fn solve_job_shop(
+    sched: &Schedule,
+    seed: u64,
+    stop: &AtomicBool,
+    max_iterations: u64,
+    repeat_until_stopped: bool,
+    initial_incumbent: Option<&CollectionSolution>,
+    report: &mut dyn FnMut(i64),
+) -> Option<(CollectionSolution, ScheduleConstructionMetrics)> {
+    let started = Instant::now();
+    let problem = match JobShopProblem::recognize(sched, stop) {
+        Ok(Some(problem)) => problem,
+        Ok(None) => return None,
+        Err(_) => {
+            return Some(job_shop_result(None, started.elapsed(), None, ScheduleStateMetrics::default(), 0, 0));
+        }
+    };
+    let operation_count = problem.operation_count();
+    let max_attempts = (operation_count / 8).clamp(8, 32);
+    let default_moves = u64::try_from(operation_count).unwrap_or(u64::MAX).saturating_mul(256).clamp(2_048, 100_000);
+    let max_moves = if max_iterations != u64::MAX {
+        max_iterations
+    } else if repeat_until_stopped {
+        u64::MAX
+    } else {
+        default_moves
+    };
+    let mut construction_elapsed = Duration::ZERO;
+    let mut total = ScheduleStateMetrics::default();
+    let mut best = complete_schedule_incumbent(sched, initial_incumbent);
+    let mut best_objective = best.as_ref().and_then(|solution| solution.objectives.first().copied());
+    let mut first_feasible = None;
+    let mut incumbent_improvements = 0u64;
+    let mut incumbent_injections = 0u64;
+    let mut moves_used = 0u64;
+    let mut attempt = 0usize;
+    let mut injected_machine_sequences = best.as_ref().map(|incumbent| {
+        let mut sequences = vec![Vec::new(); problem.machine_count()];
+        for operation in 0..problem.operation_count() {
+            sequences[problem.machine(operation)].push(operation);
+        }
+        for sequence in &mut sequences {
+            sequence.sort_by_key(|&operation| (incumbent.starts[operation], operation));
+        }
+        sequences
+    });
+
+    'attempts: loop {
+        if checkpoint(stop).is_err() || moves_used >= max_moves || (attempt >= max_attempts && !repeat_until_stopped) {
+            break;
+        }
+        let current_attempt = attempt;
+        attempt = attempt.saturating_add(1);
+        let rule = DispatchRule::ALL.get(current_attempt).copied().unwrap_or(DispatchRule::Randomized);
+        let attempt_seed = mix64(seed ^ u64::try_from(current_attempt).unwrap_or(u64::MAX).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let construction_started = Instant::now();
+        let injection_attempt = injected_machine_sequences.is_some();
+        let (constructed, partial_metrics) = if let Some(machine_sequences) = injected_machine_sequences.take() {
+            (JobShopState::from_machine_sequences(&problem, machine_sequences, stop), ScheduleStateMetrics::default())
+        } else {
+            JobShopState::giffler_thompson_profiled(&problem, attempt_seed, rule, stop)
+        };
+        let mut state = match constructed {
+            Ok(Some(state)) => {
+                incumbent_injections = incumbent_injections.saturating_add(u64::from(injection_attempt));
+                state
+            }
+            Ok(None) => {
+                construction_elapsed = construction_elapsed.saturating_add(construction_started.elapsed());
+                add_state_metrics(&mut total, partial_metrics);
+                continue;
+            }
+            Err(_) => {
+                construction_elapsed = construction_elapsed.saturating_add(construction_started.elapsed());
+                add_state_metrics(&mut total, partial_metrics);
+                break;
+            }
+        };
+        construction_elapsed = construction_elapsed.saturating_add(construction_started.elapsed());
+        incumbent_improvements = incumbent_improvements.saturating_add(u64::from(retain_job_shop_incumbent(
+            &state,
+            &mut best_objective,
+            &mut best,
+            &mut first_feasible,
+            started,
+            report,
+        )));
+        if checkpoint(stop).is_err() {
+            add_state_metrics(&mut total, state.metrics());
+            break;
+        }
+
+        let neighborhoods = match current_attempt % 3 {
+            0 => [CriticalNeighborhood::N5, CriticalNeighborhood::N1, CriticalNeighborhood::N6],
+            1 => [CriticalNeighborhood::N6, CriticalNeighborhood::N5, CriticalNeighborhood::N1],
+            _ => [CriticalNeighborhood::N1, CriticalNeighborhood::N6, CriticalNeighborhood::N5],
+        };
+        let mut kicks = 0u64;
+        let move_capacity = operation_count.saturating_mul(3);
+        let mut movements = Vec::with_capacity(move_capacity);
+        loop {
+            if checkpoint(stop).is_err() || moves_used >= max_moves {
+                add_state_metrics(&mut total, state.metrics());
+                break 'attempts;
+            }
+            let mut accepted = false;
+            if state.fill_critical_move_union(&neighborhoods, &mut movements, stop).is_err() {
+                add_state_metrics(&mut total, state.metrics());
+                break 'attempts;
+            }
+            if !movements.is_empty() {
+                let offset = usize::try_from(mix64(attempt_seed ^ moves_used)).unwrap_or(usize::MAX) % movements.len();
+                movements.rotate_left(offset);
+            }
+            for &movement in &movements {
+                if checkpoint(stop).is_err() || moves_used >= max_moves {
+                    add_state_metrics(&mut total, state.metrics());
+                    break 'attempts;
+                }
+                moves_used = moves_used.saturating_add(1);
+                match state.consider_move(movement, MoveAcceptance::Improving, stop) {
+                    Ok(MoveOutcome::Accepted { .. }) => {
+                        accepted = true;
+                        incumbent_improvements = incumbent_improvements.saturating_add(u64::from(retain_job_shop_incumbent(
+                            &state,
+                            &mut best_objective,
+                            &mut best,
+                            &mut first_feasible,
+                            started,
+                            report,
+                        )));
+                        break;
+                    }
+                    Ok(MoveOutcome::Rejected(_)) => {}
+                    Err(_) => {
+                        add_state_metrics(&mut total, state.metrics());
+                        break 'attempts;
+                    }
+                }
+            }
+            if accepted {
+                continue;
+            }
+            if kicks >= 3 {
+                break;
+            }
+
+            if state.fill_critical_moves(CriticalNeighborhood::N6, &mut movements, stop).is_err() {
+                add_state_metrics(&mut total, state.metrics());
+                break 'attempts;
+            }
+            if movements.is_empty() {
+                break;
+            }
+            let offset =
+                usize::try_from(mix64(attempt_seed ^ kicks.wrapping_mul(0xd1b5_4a32_d192_ed03))).unwrap_or(usize::MAX) % movements.len();
+            movements.rotate_left(offset);
+            let mut kicked = false;
+            for &movement in &movements {
+                if checkpoint(stop).is_err() || moves_used >= max_moves {
+                    add_state_metrics(&mut total, state.metrics());
+                    break 'attempts;
+                }
+                moves_used = moves_used.saturating_add(1);
+                match state.consider_move(movement, MoveAcceptance::Always, stop) {
+                    Ok(MoveOutcome::Accepted { .. }) => {
+                        kicked = true;
+                        kicks = kicks.saturating_add(1);
+                        incumbent_improvements = incumbent_improvements.saturating_add(u64::from(retain_job_shop_incumbent(
+                            &state,
+                            &mut best_objective,
+                            &mut best,
+                            &mut first_feasible,
+                            started,
+                            report,
+                        )));
+                        break;
+                    }
+                    Ok(MoveOutcome::Rejected(_)) => {}
+                    Err(_) => {
+                        add_state_metrics(&mut total, state.metrics());
+                        break 'attempts;
+                    }
+                }
+            }
+            if !kicked {
+                break;
+            }
+        }
+        add_state_metrics(&mut total, state.metrics());
+    }
+
+    Some(job_shop_result(best, construction_elapsed, first_feasible, total, incumbent_improvements, incumbent_injections))
+}
+
+fn add_resource_metrics(total: &mut ResourceScheduleMetrics, metrics: ResourceScheduleMetrics) {
+    total.serial_constructions = total.serial_constructions.saturating_add(metrics.serial_constructions);
+    total.parallel_constructions = total.parallel_constructions.saturating_add(metrics.parallel_constructions);
+    total.reconstructions = total.reconstructions.saturating_add(metrics.reconstructions);
+    total.construction_candidates = total.construction_candidates.saturating_add(metrics.construction_candidates);
+    total.candidate_scheduling_attempts = total.candidate_scheduling_attempts.saturating_add(metrics.candidate_scheduling_attempts);
+    total.profile_checks = total.profile_checks.saturating_add(metrics.profile_checks);
+    total.event_visits = total.event_visits.saturating_add(metrics.event_visits);
+    total.peak_profile_events = total.peak_profile_events.max(metrics.peak_profile_events);
+    total.moves_considered = total.moves_considered.saturating_add(metrics.moves_considered);
+    total.moves_accepted = total.moves_accepted.saturating_add(metrics.moves_accepted);
+    total.precedence_rejections = total.precedence_rejections.saturating_add(metrics.precedence_rejections);
+    total.infeasible_rejections = total.infeasible_rejections.saturating_add(metrics.infeasible_rejections);
+    total.objective_rejections = total.objective_rejections.saturating_add(metrics.objective_rejections);
+    total.left_justifications = total.left_justifications.saturating_add(metrics.left_justifications);
+    total.right_justifications = total.right_justifications.saturating_add(metrics.right_justifications);
+    total.double_justifications = total.double_justifications.saturating_add(metrics.double_justifications);
+    total.delta_evaluations = total.delta_evaluations.saturating_add(metrics.delta_evaluations);
+    total.full_workspace_evaluations = total.full_workspace_evaluations.saturating_add(metrics.full_workspace_evaluations);
+    total.delta_activities_rescheduled = total.delta_activities_rescheduled.saturating_add(metrics.delta_activities_rescheduled);
+    total.workspace_rollbacks = total.workspace_rollbacks.saturating_add(metrics.workspace_rollbacks);
+    total.oracle_validations = total.oracle_validations.saturating_add(metrics.oracle_validations);
+    total.oracle_mismatches = total.oracle_mismatches.saturating_add(metrics.oracle_mismatches);
+    total.alns_generation_attempts = total.alns_generation_attempts.saturating_add(metrics.alns_generation_attempts);
+    total.alns_moves_generated = total.alns_moves_generated.saturating_add(metrics.alns_moves_generated);
+    total.workspace_growths = total.workspace_growths.saturating_add(metrics.workspace_growths);
+}
+
+fn retain_resource_incumbent(
+    state: &ResourceScheduleState,
+    best_objective: &mut Option<i64>,
+    best: &mut Option<CollectionSolution>,
+    first_feasible: &mut Option<Duration>,
+    started: Instant,
+    report: &mut dyn FnMut(i64),
+) -> bool {
+    let objective = state.makespan();
+    if best_objective.is_none_or(|current| objective < current) {
+        *best_objective = Some(objective);
+        *best = Some(state.to_solution());
+        first_feasible.get_or_insert_with(|| started.elapsed());
+        report(objective);
+        true
+    } else {
+        false
+    }
+}
+
+#[derive(Default)]
+struct ResourceSearchSummary {
+    metrics: ResourceScheduleMetrics,
+    steps: u64,
+    incumbent_improvements: u64,
+    incumbent_injections: u64,
+    justification_attempts: u64,
+}
+
+fn resource_schedule_result(
+    best: Option<CollectionSolution>,
+    construction_elapsed: Duration,
+    first_feasible: Option<Duration>,
+    summary: ResourceSearchSummary,
+) -> (CollectionSolution, ScheduleConstructionMetrics) {
+    let ResourceSearchSummary { metrics, steps, incumbent_improvements, incumbent_injections, justification_attempts } = summary;
+    (
+        best.unwrap_or_else(unknown_solution),
+        ScheduleConstructionMetrics {
+            elapsed: construction_elapsed,
+            first_feasible,
+            candidates: metrics.construction_candidates,
+            work_steps: steps,
+            constructor: "resource-priority-sgs",
+            moves_considered: metrics.moves_considered,
+            moves_accepted: metrics.moves_accepted,
+            incumbent_improvements,
+            incumbent_injections,
+            cycle_rejections: 0,
+            window_rejections: 0,
+            objective_rejections: metrics.objective_rejections,
+            reconstructions: metrics.reconstructions,
+            critical_path_updates: 0,
+            delta_evaluations: metrics.delta_evaluations,
+            full_evaluations: metrics.full_workspace_evaluations.saturating_add(metrics.oracle_validations),
+            full_fallbacks: metrics.full_workspace_evaluations,
+            topological_rebuilds: 0,
+            oracle_validations: metrics.oracle_validations,
+            oracle_mismatches: metrics.oracle_mismatches,
+            dirty_cone_operations: metrics.delta_activities_rescheduled,
+            max_dirty_cone: 0,
+            workspace_growths: metrics.workspace_growths,
+            workspace_rollbacks: metrics.workspace_rollbacks,
+            alns_generation_attempts: metrics.alns_generation_attempts,
+            alns_moves_generated: metrics.alns_moves_generated,
+            resource_profile_checks: metrics.profile_checks,
+            resource_candidate_scheduling_attempts: metrics.candidate_scheduling_attempts,
+            resource_event_visits: metrics.event_visits,
+            resource_peak_profile_events: metrics.peak_profile_events,
+            precedence_rejections: metrics.precedence_rejections,
+            infeasible_rejections: metrics.infeasible_rejections,
+            justification_attempts,
+        },
+    )
+}
+
+/// Structured search for mandatory fixed-duration RCPSP schedules. Every
+/// priority move is decoded into a complete schedule before it can replace the
+/// incumbent. Unsupported interval shapes continue through the generic path.
+fn solve_resource_schedule(
+    sched: &Schedule,
+    seed: u64,
+    stop: &AtomicBool,
+    max_iterations: u64,
+    repeat_until_stopped: bool,
+    initial_incumbent: Option<&CollectionSolution>,
+    report: &mut dyn FnMut(i64),
+) -> Option<(CollectionSolution, ScheduleConstructionMetrics)> {
+    let started = Instant::now();
+    let problem = match ResourceScheduleProblem::recognize(sched, stop) {
+        Ok(Some(problem)) => problem,
+        Ok(None) => return None,
+        Err(_) => {
+            return Some(resource_schedule_result(None, started.elapsed(), None, ResourceSearchSummary::default()));
+        }
+    };
+    let activity_count = problem.activity_count();
+    let default_steps = u64::try_from(activity_count).unwrap_or(u64::MAX).saturating_mul(256).clamp(2_048, 100_000);
+    let internal_limit = if max_iterations != u64::MAX {
+        max_iterations
+    } else if repeat_until_stopped {
+        u64::MAX
+    } else {
+        default_steps
+    };
+    let max_attempts = PriorityRule::ALL.len().saturating_mul(2).saturating_add(6);
+    let movement_batch = activity_count.saturating_mul(8).clamp(32, 1_024);
+    let mut construction_elapsed = Duration::ZERO;
+    let mut total = ResourceScheduleMetrics::default();
+    let mut best = complete_schedule_incumbent(sched, initial_incumbent);
+    let mut best_objective = best.as_ref().and_then(|solution| solution.objectives.first().copied());
+    let mut first_feasible = None;
+    let mut search_steps = 0u64;
+    let mut incumbent_improvements = 0u64;
+    let mut incumbent_injections = 0u64;
+    let mut justification_attempts = 0u64;
+    let mut attempt = 0usize;
+    let mut injected_priority = best.as_ref().map(|incumbent| {
+        let mut order = (0..problem.activity_count()).collect::<Vec<_>>();
+        order.sort_by_key(|&activity| (incumbent.starts[activity], activity));
+        order
+    });
+
+    'attempts: loop {
+        if checkpoint(stop).is_err() || search_steps >= internal_limit || (attempt >= max_attempts && !repeat_until_stopped) {
+            break;
+        }
+        let current_attempt = attempt;
+        attempt = attempt.saturating_add(1);
+        let rule = PriorityRule::ALL.get(current_attempt % PriorityRule::ALL.len()).copied().unwrap_or(PriorityRule::Randomized);
+        let attempt_seed = mix64(seed ^ u64::try_from(current_attempt).unwrap_or(u64::MAX).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let construction_started = Instant::now();
+        let injection_attempt = injected_priority.is_some();
+        let priority_result = if let Some(order) = injected_priority.take() {
+            PrioritySgs::compile(&problem, order, stop)
+        } else {
+            PrioritySgs::dispatch(&problem, attempt_seed, rule, stop)
+        };
+        let priority = match priority_result {
+            Ok(Some(priority)) => priority,
+            Ok(None) => {
+                construction_elapsed = construction_elapsed.saturating_add(construction_started.elapsed());
+                continue;
+            }
+            Err(_) => break,
+        };
+        let scheme = if current_attempt.is_multiple_of(2) { GenerationScheme::Serial } else { GenerationScheme::Parallel };
+        let mut state = match ResourceScheduleState::construct(&problem, priority, scheme, stop) {
+            Ok(Some(state)) => {
+                incumbent_injections = incumbent_injections.saturating_add(u64::from(injection_attempt));
+                state
+            }
+            Ok(None) => {
+                construction_elapsed = construction_elapsed.saturating_add(construction_started.elapsed());
+                continue;
+            }
+            Err(_) => break,
+        };
+        construction_elapsed = construction_elapsed.saturating_add(construction_started.elapsed());
+        incumbent_improvements = incumbent_improvements.saturating_add(u64::from(retain_resource_incumbent(
+            &state,
+            &mut best_objective,
+            &mut best,
+            &mut first_feasible,
+            started,
+            report,
+        )));
+
+        let justifications = match current_attempt % 3 {
+            0 => [Justification::Double, Justification::Left, Justification::Right],
+            1 => [Justification::Right, Justification::Double, Justification::Left],
+            _ => [Justification::Left, Justification::Right, Justification::Double],
+        };
+        let mut next_justification = 0usize;
+        let mut kicks = 0u64;
+        let alns_budget = ResourceAlnsBudget::bounded(activity_count);
+        let mut movements = Vec::with_capacity(movement_batch);
+        let mut alns_movements = Vec::with_capacity(alns_budget.max_moves);
+        let mut stop_all = false;
+        loop {
+            if checkpoint(stop).is_err() || search_steps >= internal_limit {
+                stop_all = true;
+                break;
+            }
+            let neighborhood_offset = usize::try_from(mix64(attempt_seed ^ search_steps)).unwrap_or(usize::MAX);
+            if state.fill_bounded_moves_from(neighborhood_offset, movement_batch, &mut movements, stop).is_err() {
+                stop_all = true;
+                break;
+            }
+            let mut accepted = false;
+            for &movement in &movements {
+                if checkpoint(stop).is_err() || search_steps >= internal_limit {
+                    stop_all = true;
+                    break;
+                }
+                search_steps = search_steps.saturating_add(1);
+                match state.consider_move(movement, ResourceMoveAcceptance::Improving, stop) {
+                    Ok(ResourceMoveOutcome::Accepted { .. }) => {
+                        accepted = true;
+                        next_justification = 0;
+                        incumbent_improvements = incumbent_improvements.saturating_add(u64::from(retain_resource_incumbent(
+                            &state,
+                            &mut best_objective,
+                            &mut best,
+                            &mut first_feasible,
+                            started,
+                            report,
+                        )));
+                        break;
+                    }
+                    Ok(ResourceMoveOutcome::Rejected(_)) => {}
+                    Err(_) => {
+                        stop_all = true;
+                        break;
+                    }
+                }
+            }
+            if stop_all {
+                break;
+            }
+            if accepted {
+                continue;
+            }
+
+            if next_justification < justifications.len() && search_steps < internal_limit {
+                let kind = justifications[next_justification];
+                next_justification += 1;
+                search_steps = search_steps.saturating_add(1);
+                justification_attempts = justification_attempts.saturating_add(1);
+                match state.justify(kind, stop) {
+                    Ok(Some(outcome)) => {
+                        if outcome.changed {
+                            incumbent_improvements = incumbent_improvements.saturating_add(u64::from(retain_resource_incumbent(
+                                &state,
+                                &mut best_objective,
+                                &mut best,
+                                &mut first_feasible,
+                                started,
+                                report,
+                            )));
+                            continue;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        stop_all = true;
+                        break;
+                    }
+                }
+            }
+
+            if kicks < 2 && search_steps < internal_limit {
+                let alns_seed = mix64(attempt_seed ^ search_steps ^ kicks.wrapping_mul(0xa076_1d64_78bd_642f));
+                if state.fill_alns_segment_moves(alns_seed, alns_budget, &mut alns_movements, stop).is_err() {
+                    stop_all = true;
+                    break;
+                }
+                for &movement in &alns_movements {
+                    if checkpoint(stop).is_err() || search_steps >= internal_limit {
+                        stop_all = true;
+                        break;
+                    }
+                    search_steps = search_steps.saturating_add(1);
+                    match state.consider_move(movement, ResourceMoveAcceptance::Improving, stop) {
+                        Ok(ResourceMoveOutcome::Accepted { .. }) => {
+                            accepted = true;
+                            next_justification = 0;
+                            incumbent_improvements = incumbent_improvements.saturating_add(u64::from(retain_resource_incumbent(
+                                &state,
+                                &mut best_objective,
+                                &mut best,
+                                &mut first_feasible,
+                                started,
+                                report,
+                            )));
+                            break;
+                        }
+                        Ok(ResourceMoveOutcome::Rejected(_)) => {}
+                        Err(_) => {
+                            stop_all = true;
+                            break;
+                        }
+                    }
+                }
+                if stop_all {
+                    break;
+                }
+                if accepted {
+                    continue;
+                }
+                if let Some(&movement) = alns_movements.first() {
+                    if search_steps >= internal_limit {
+                        break;
+                    }
+                    search_steps = search_steps.saturating_add(1);
+                    match state.consider_move(movement, ResourceMoveAcceptance::Always, stop) {
+                        Ok(ResourceMoveOutcome::Accepted { .. }) => {
+                            kicks = kicks.saturating_add(1);
+                            next_justification = 0;
+                            incumbent_improvements = incumbent_improvements.saturating_add(u64::from(retain_resource_incumbent(
+                                &state,
+                                &mut best_objective,
+                                &mut best,
+                                &mut first_feasible,
+                                started,
+                                report,
+                            )));
+                            continue;
+                        }
+                        Ok(ResourceMoveOutcome::Rejected(_)) => {}
+                        Err(_) => {
+                            stop_all = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if kicks >= 2 || search_steps >= internal_limit {
+                break;
+            }
+            let kick_offset = usize::try_from(mix64(attempt_seed ^ kicks.wrapping_mul(0xd1b5_4a32_d192_ed03))).unwrap_or(usize::MAX);
+            if state.fill_bounded_moves_from(kick_offset, movement_batch, &mut movements, stop).is_err() {
+                stop_all = true;
+                break;
+            }
+            if movements.is_empty() {
+                break;
+            }
+            search_steps = search_steps.saturating_add(1);
+            match state.consider_move(movements[0], ResourceMoveAcceptance::Always, stop) {
+                Ok(ResourceMoveOutcome::Accepted { .. }) => {
+                    kicks = kicks.saturating_add(1);
+                    next_justification = 0;
+                    incumbent_improvements = incumbent_improvements.saturating_add(u64::from(retain_resource_incumbent(
+                        &state,
+                        &mut best_objective,
+                        &mut best,
+                        &mut first_feasible,
+                        started,
+                        report,
+                    )));
+                }
+                Ok(ResourceMoveOutcome::Rejected(_)) => break,
+                Err(_) => {
+                    stop_all = true;
+                    break;
+                }
+            }
+        }
+        add_resource_metrics(&mut total, state.metrics());
+        if stop_all {
+            break 'attempts;
+        }
+    }
+
+    Some(resource_schedule_result(
+        best,
+        construction_elapsed,
+        first_feasible,
+        ResourceSearchSummary { metrics: total, steps: search_steps, incumbent_improvements, incumbent_injections, justification_attempts },
+    ))
+}
+
 /// Solve an interval-scheduling subproblem by local search. The decisions are
 /// each interval's start time and, for flexible (moded) intervals, its mode
 /// (which sets the duration and machine). Moves shift a start or switch a mode.
@@ -679,37 +1616,71 @@ pub(crate) fn solve_schedule(
     stop: &AtomicBool,
     report: &mut dyn FnMut(i64),
 ) -> (CollectionSolution, ScheduleConstructionMetrics) {
+    solve_schedule_capped(sched, seed, stop, u64::MAX, false, None, report)
+}
+
+pub(crate) fn solve_schedule_capped(
+    sched: &Schedule,
+    seed: u64,
+    stop: &AtomicBool,
+    max_iterations: u64,
+    repeat_until_stopped: bool,
+    initial_incumbent: Option<&CollectionSolution>,
+    report: &mut dyn FnMut(i64),
+) -> (CollectionSolution, ScheduleConstructionMetrics) {
+    if !matches!(machines_are_representable(sched, stop), Ok(true)) {
+        return (unknown_solution(), generic_schedule_metrics(Duration::ZERO, None, 0, 0, 0, 0));
+    }
+    if let Some(result) = solve_job_shop(sched, seed, stop, max_iterations, repeat_until_stopped, initial_incumbent, report) {
+        return result;
+    }
+    if let Some(result) = solve_resource_schedule(sched, seed, stop, max_iterations, repeat_until_stopped, initial_incumbent, report) {
+        return result;
+    }
+
     let construction_started = Instant::now();
     let n = sched.intervals.len();
-    let (constructed, candidates) = serial_schedule(sched, stop);
+    let injected = complete_schedule_incumbent(sched, initial_incumbent);
+    let (constructed, candidates, constructed_first_feasible) = construct_schedule(sched, seed, stop, report);
     let construction_elapsed = construction_started.elapsed();
-    let metrics = |first_feasible| ScheduleConstructionMetrics { elapsed: construction_elapsed, first_feasible, candidates };
-    let Ok(Some(ConstructedSchedule { mut starts, mut chosen, mut present })) = constructed else {
-        return (unknown_solution(), metrics(None));
+    let Ok(Some(ConstructedIncumbent {
+        schedule: ConstructedSchedule { mut starts, mut chosen, mut present },
+        durations: mut dur,
+        machines: mut mach,
+        score: mut cur,
+        solution: mut best_solution,
+    })) = constructed
+    else {
+        return (injected.unwrap_or_else(unknown_solution), generic_schedule_metrics(construction_elapsed, None, candidates, 0, 0, 0));
     };
-    let (mut dur, mut mach) = match mode_view(sched, &chosen, stop) {
-        Ok(view) => view,
-        Err(_) => return (unknown_solution(), metrics(None)),
-    };
-    let mut cur = match schedule_score(sched, &chosen, &dur, &mach, &starts, &present, stop) {
-        Ok(score) => score,
-        Err(_) => return (unknown_solution(), metrics(None)),
-    };
-    let mut best_solution = match snapshot_solution(sched, &chosen, &starts, &present, cur, stop) {
-        Ok(solution) => solution,
-        Err(_) => return (unknown_solution(), metrics(None)),
-    };
-    let first_feasible = best_solution.feasible.then_some(construction_elapsed);
-    if best_solution.feasible && checkpoint(stop).is_ok() {
-        report(cur.1);
-    }
+    let first_feasible = best_solution.feasible.then_some(constructed_first_feasible.unwrap_or(construction_elapsed));
+    let mut moves_considered = 0u64;
+    let mut moves_accepted = 0u64;
+    let mut incumbent_improvements = u64::from(first_feasible.is_some());
     let mut incumbent_score = cur;
+    if let Some(injected) = injected {
+        let injected_score = (0, injected.objectives.first().copied().unwrap_or_default());
+        if injected_score < incumbent_score {
+            incumbent_score = injected_score;
+            best_solution = injected;
+        }
+    }
 
     // Large schedules stay on the compact constructor. The pairwise shift
     // engine is retained only for small instances until the critical-path
     // neighbourhoods replace it.
     if n > 48 || checkpoint(stop).is_err() {
-        return (best_solution, metrics(first_feasible));
+        return (
+            best_solution,
+            generic_schedule_metrics(
+                construction_elapsed,
+                first_feasible,
+                candidates,
+                moves_considered,
+                moves_accepted,
+                incumbent_improvements,
+            ),
+        );
     }
 
     const RESTART_AFTER: u64 = 25;
@@ -718,7 +1689,7 @@ pub(crate) fn solve_schedule(
     let mut iter = 0u64;
 
     'search: loop {
-        if checkpoint(stop).is_err() {
+        if checkpoint(stop).is_err() || moves_considered >= max_iterations {
             break;
         }
         iter += 1;
@@ -740,6 +1711,10 @@ pub(crate) fn solve_schedule(
                 if t == starts[i] {
                     continue;
                 }
+                if moves_considered >= max_iterations {
+                    break 'search;
+                }
+                moves_considered = moves_considered.saturating_add(1);
                 let old = starts[i];
                 starts[i] = t;
                 let trial = match schedule_score(sched, &chosen, &dur, &mach, &starts, &present, stop) {
@@ -760,8 +1735,10 @@ pub(crate) fn solve_schedule(
                         };
                         incumbent_score = trial;
                         best_solution = snapshot;
+                        incumbent_improvements = incumbent_improvements.saturating_add(1);
                     }
                     cur = trial;
+                    moves_accepted = moves_accepted.saturating_add(1);
                     moved = true;
                     break 'scan;
                 }
@@ -777,6 +1754,10 @@ pub(crate) fn solve_schedule(
                 if m == chosen[i] {
                     continue;
                 }
+                if moves_considered >= max_iterations {
+                    break 'search;
+                }
+                moves_considered = moves_considered.saturating_add(1);
                 let (old_mode, old_duration, old_machine, old_start) = (chosen[i], dur[i], mach[i], starts[i]);
                 chosen[i] = m;
                 dur[i] = iv_duration(&sched.intervals[i], m);
@@ -807,8 +1788,10 @@ pub(crate) fn solve_schedule(
                         };
                         incumbent_score = trial;
                         best_solution = snapshot;
+                        incumbent_improvements = incumbent_improvements.saturating_add(1);
                     }
                     cur = trial;
+                    moves_accepted = moves_accepted.saturating_add(1);
                     moved = true;
                     break 'scan;
                 }
@@ -819,9 +1802,10 @@ pub(crate) fn solve_schedule(
             }
 
             if sched.intervals[i].optional {
-                if checkpoint(stop).is_err() {
+                if checkpoint(stop).is_err() || moves_considered >= max_iterations {
                     break 'search;
                 }
+                moves_considered = moves_considered.saturating_add(1);
                 present[i] = !present[i];
                 let trial = match schedule_score(sched, &chosen, &dur, &mach, &starts, &present, stop) {
                     Ok(trial) => trial,
@@ -841,8 +1825,10 @@ pub(crate) fn solve_schedule(
                         };
                         incumbent_score = trial;
                         best_solution = snapshot;
+                        incumbent_improvements = incumbent_improvements.saturating_add(1);
                     }
                     cur = trial;
+                    moves_accepted = moves_accepted.saturating_add(1);
                     moved = true;
                     break 'scan;
                 }
@@ -863,6 +1849,10 @@ pub(crate) fn solve_schedule(
         } else {
             since_improve += 1;
         }
+        if moves_considered >= max_iterations {
+            break;
+        }
+        moves_considered = moves_considered.saturating_add(1);
         if since_improve >= RESTART_AFTER {
             // Random modes, then precedence-earliest starts with jitter.
             for (i, selected) in chosen.iter_mut().enumerate() {
@@ -905,6 +1895,7 @@ pub(crate) fn solve_schedule(
             Ok(score) => score,
             Err(_) => break,
         };
+        moves_accepted = moves_accepted.saturating_add(1);
         if cur < incumbent_score {
             let snapshot = match snapshot_solution(sched, &chosen, &starts, &present, cur, stop) {
                 Ok(snapshot) => snapshot,
@@ -912,8 +1903,19 @@ pub(crate) fn solve_schedule(
             };
             incumbent_score = cur;
             best_solution = snapshot;
+            incumbent_improvements = incumbent_improvements.saturating_add(1);
         }
     }
 
-    (best_solution, metrics(first_feasible))
+    (
+        best_solution,
+        generic_schedule_metrics(
+            construction_elapsed,
+            first_feasible,
+            candidates,
+            moves_considered,
+            moves_accepted,
+            incumbent_improvements,
+        ),
+    )
 }

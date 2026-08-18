@@ -11,8 +11,12 @@ mod local_search;
 mod metrics;
 mod moves;
 mod portfolio;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod resource_schedule;
 mod routing_search;
 mod schedule_ls;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod schedule_state;
 
 #[doc(hidden)]
 #[cfg(test)]
@@ -53,4 +57,6 @@ pub(crate) use routing_search::{
     audit_routing_activity_counters, audit_scheduler_prefix, audit_timing_independent_cost_learning, audit_unproductive_cost_balance,
     SliceKind,
 };
-pub(crate) use schedule_ls::{solve_schedule, ScheduleConstructionMetrics};
+#[cfg(test)]
+pub(crate) use schedule_ls::solve_schedule;
+pub(crate) use schedule_ls::{solve_schedule_capped, ScheduleConstructionMetrics};

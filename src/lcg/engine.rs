@@ -31,7 +31,7 @@ const MAX_EXPR_SINGLETON_PROBE_WORK: usize = 32_768;
 /// Small objectives benefit from directed branching on the first dive. Large
 /// objectives first need a cheap feasible assignment before their decisions
 /// can safely dominate the feasibility heuristic.
-const MAX_IMMEDIATE_OBJECTIVE_VARIABLES: usize = 32;
+const MAX_IMMEDIATE_OBJECTIVE_VARIABLES: usize = 8;
 
 /// Literal evaluations reserved for a one-shot guarded-objective phase hint.
 /// The first incumbent is published before this bounded local search starts.

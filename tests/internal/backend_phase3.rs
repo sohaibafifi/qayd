@@ -1,5 +1,8 @@
-use qayd::model::list::{CollectionModel, Constraint, ExprArena, IntervalVar, Iterable, Op, ReduceOp, Reduction, Schedule};
-use qayd::model::{estimated_exact_backend_bytes, estimated_local_search_backend_bytes, Model, ModelPackage};
+use qayd::model::list::{CollectionModel, Constraint, ExprArena, IntervalVar, Iterable, Op, ReduceOp, Reduction, Resource, Schedule};
+use qayd::model::{
+    estimated_exact_backend_bytes, estimated_local_search_backend_bytes, estimated_semantic_collection_bytes_interruptible, Model,
+    ModelPackage,
+};
 use qayd::orchestrator::{compile_model_plan, EngineKind, ExecutablePlan, SolveBudget, SolveLimits, SolveMode, SolveRequest};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -32,6 +35,18 @@ fn schedule(intervals: usize) -> CollectionModel {
             minimize_makespan: true,
         }),
     }
+}
+
+fn cumulative_schedule(intervals: usize, resources: usize, demands_per_resource: usize) -> CollectionModel {
+    let mut model = schedule(intervals);
+    let schedule = model.schedule.as_mut().unwrap();
+    schedule.resources = (0..resources)
+        .map(|resource| Resource::Cumulative {
+            demands: (0..demands_per_resource).map(|offset| ((resource + offset) % intervals, 1)).collect(),
+            capacity: i64::try_from(demands_per_resource.max(1)).unwrap(),
+        })
+        .collect();
+    model
 }
 
 fn scan_model(items: usize) -> CollectionModel {
@@ -151,6 +166,26 @@ fn local_search_memory_cost_is_separate_from_exact_lowering_cost() {
 
     let large_schedule = schedule(60);
     assert!(estimated_local_search_backend_bytes(&large_schedule) < estimated_exact_backend_bytes(&large_schedule));
+}
+
+#[test]
+fn scheduling_memory_estimates_count_sparse_demands_profiles_and_resources_monotonically() {
+    let sparse = cumulative_schedule(256, 1, 1);
+    let more_demands = cumulative_schedule(256, 1, 128);
+    let more_resources = cumulative_schedule(256, 8, 128);
+
+    let sparse_physical = estimated_local_search_backend_bytes(&sparse);
+    let demand_physical = estimated_local_search_backend_bytes(&more_demands);
+    let resource_physical = estimated_local_search_backend_bytes(&more_resources);
+    assert!(demand_physical >= sparse_physical.saturating_add(127 * 512));
+    assert!(resource_physical > demand_physical);
+
+    let stop = AtomicBool::new(false);
+    let sparse_semantic = estimated_semantic_collection_bytes_interruptible(&Model::from_collection(&sparse), &stop).unwrap();
+    let demand_semantic = estimated_semantic_collection_bytes_interruptible(&Model::from_collection(&more_demands), &stop).unwrap();
+    let resource_semantic = estimated_semantic_collection_bytes_interruptible(&Model::from_collection(&more_resources), &stop).unwrap();
+    assert!(demand_semantic.local_search >= sparse_semantic.local_search.saturating_add(127 * 512));
+    assert!(resource_semantic.local_search > demand_semantic.local_search);
 }
 
 #[test]

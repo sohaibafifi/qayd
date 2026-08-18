@@ -177,6 +177,34 @@ fn wide_affine_search_separates_feasibility_and_bounded_dive_policies() {
 }
 
 #[test]
+fn constrained_multi_term_objective_finds_feasibility_before_exact_directions() {
+    let mut solver = Solver::new();
+    let variables = (0..9).map(|_| solver.new_var_range(0, 1)).collect::<Vec<_>>();
+    let coefficients = vec![1; variables.len()];
+    linear(&mut solver, &coefficients, &variables, Relation::Le, 1);
+    let mut incumbents = Vec::new();
+
+    let _ = optimize_seeded(
+        &mut solver,
+        &variables,
+        Objective::Linear { coeffs: &coefficients, vars: &variables },
+        false,
+        &AtomicBool::new(false),
+        0,
+        None,
+        None,
+        &[],
+        None,
+        Vec::new(),
+        Vec::new(),
+        |value, _| incumbents.push(value),
+    );
+
+    assert_eq!(incumbents.first(), Some(&0));
+    assert_eq!(incumbents.last(), Some(&1));
+}
+
+#[test]
 fn variable_objective_uses_its_improving_endpoint() {
     for (minimizing, expected) in [(true, 0), (false, 4)] {
         let mut solver = Solver::new();

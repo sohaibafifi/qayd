@@ -25,14 +25,21 @@ parser.add_argument("--time-limit", type=int, default=8)
 parser.add_argument("--memory-limit-mb", type=int, default=256)
 parser.add_argument("--threads", type=int, default=1)
 parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--max-iterations", type=int)
 parser.add_argument("--engine", choices=("auto", "exact", "ls"))
 parser.add_argument("--verbose", action="store_true")
 parser.add_argument("--profile", action="store_true")
 parser.add_argument("--json", action="store_true", help="emit one machine-readable result")
 args = parser.parse_args()
 
-if args.threads <= 0 or args.time_limit < 0 or args.seed < 0 or args.memory_limit_mb <= 0:
-    raise SystemExit("threads and memory limit must be positive; time limit and seed must be non-negative")
+if (
+    args.threads <= 0
+    or args.time_limit < 0
+    or args.seed < 0
+    or args.memory_limit_mb < 0
+    or (args.max_iterations is not None and args.max_iterations < 0)
+):
+    raise SystemExit("threads must be positive; time, memory and iteration limits and seed must be non-negative")
 engine = args.engine or ("ls" if args.threads > 1 else "auto")
 
 instance = read_jsplib(args.instance) if args.instance else None
@@ -76,7 +83,8 @@ with output:
         seed=args.seed,
         verbose=args.verbose,
         profile=args.profile,
-        memory_limit_mb=args.memory_limit_mb,
+        memory_limit_mb=args.memory_limit_mb or None,
+        max_iterations=args.max_iterations,
     )
 elapsed = time.perf_counter() - started
 profile_record = {
@@ -84,6 +92,60 @@ profile_record = {
     "construction_seconds": solution.construction_seconds,
     "time_to_first_feasible": solution.time_to_first_feasible,
     "construction_candidates": solution.construction_candidates,
+    "candidates_evaluated": solution.candidates_evaluated,
+    "candidates_per_second": solution.candidates_per_second,
+    "schedule_moves_considered": solution.schedule_moves_considered,
+    "schedule_moves_accepted": solution.schedule_moves_accepted,
+    "schedule_moves_rejected": solution.schedule_moves_rejected,
+    "schedule_work_steps": solution.schedule_work_steps,
+    "schedule_local_improvements": solution.schedule_local_improvements,
+    "schedule_global_improvements": solution.schedule_global_improvements,
+    "schedule_progress_publications": solution.schedule_progress_publications,
+    "schedule_incumbent_publication_attempts": solution.schedule_incumbent_publication_attempts,
+    "schedule_incumbent_publications": solution.schedule_incumbent_publications,
+    "schedule_incumbent_injection_attempts": solution.schedule_incumbent_injection_attempts,
+    "schedule_incumbent_injections": solution.schedule_incumbent_injections,
+    "schedule_incumbent_rejections": solution.schedule_incumbent_rejections,
+    "schedule_incumbent_verifications": solution.schedule_incumbent_verifications,
+    "schedule_incumbent_verification_rejections": solution.schedule_incumbent_verification_rejections,
+    "schedule_incumbent_verification_interruptions": solution.schedule_incumbent_verification_interruptions,
+    "schedule_incumbent_incomplete_rejections": solution.schedule_incumbent_incomplete_rejections,
+    "schedule_restart_boundaries": solution.schedule_restart_boundaries,
+    "schedule_peak_buffered_candidates": solution.schedule_peak_buffered_candidates,
+    "schedule_stalled_workers": solution.schedule_stalled_workers,
+    "schedule_stalled_unused_work_steps": solution.schedule_stalled_unused_work_steps,
+    "schedule_worker_work_min": solution.schedule_worker_work_min,
+    "schedule_worker_work_max": solution.schedule_worker_work_max,
+    "schedule_work_budget_overruns": solution.schedule_work_budget_overruns,
+    "schedule_elite_pool_size": solution.schedule_elite_pool_size,
+    "schedule_unused_work_steps": solution.schedule_unused_work_steps,
+    "schedule_incumbent_source_worker": solution.schedule_incumbent_source_worker,
+    "schedule_incumbent_source_round": solution.schedule_incumbent_source_round,
+    "schedule_cycle_rejections": solution.schedule_cycle_rejections,
+    "schedule_reconstructions": solution.schedule_reconstructions,
+    "critical_path_updates": solution.critical_path_updates,
+    "full_recompute_percentage": solution.full_recompute_percentage,
+    "schedule_window_rejections": solution.schedule_window_rejections,
+    "schedule_objective_rejections": solution.schedule_objective_rejections,
+    "resource_profile_checks": solution.resource_profile_checks,
+    "resource_candidate_scheduling_attempts": solution.resource_candidate_scheduling_attempts,
+    "resource_event_visits": solution.resource_event_visits,
+    "resource_peak_profile_events": solution.resource_peak_profile_events,
+    "schedule_precedence_rejections": solution.schedule_precedence_rejections,
+    "schedule_infeasible_rejections": solution.schedule_infeasible_rejections,
+    "schedule_justification_attempts": solution.schedule_justification_attempts,
+    "schedule_delta_evaluations": solution.schedule_delta_evaluations,
+    "schedule_full_evaluations": solution.schedule_full_evaluations,
+    "schedule_full_fallbacks": solution.schedule_full_fallbacks,
+    "schedule_topological_rebuilds": solution.schedule_topological_rebuilds,
+    "schedule_oracle_validations": solution.schedule_oracle_validations,
+    "schedule_oracle_mismatches": solution.schedule_oracle_mismatches,
+    "schedule_dirty_cone_operations": solution.schedule_dirty_cone_operations,
+    "schedule_max_dirty_cone": solution.schedule_max_dirty_cone,
+    "schedule_workspace_growths": solution.schedule_workspace_growths,
+    "schedule_workspace_rollbacks": solution.schedule_workspace_rollbacks,
+    "schedule_alns_generation_attempts": solution.schedule_alns_generation_attempts,
+    "schedule_alns_moves_generated": solution.schedule_alns_moves_generated,
     "estimated_backend_bytes": solution.estimated_backend_bytes,
     "constructor": solution.constructor,
     "memory_limit_mb": args.memory_limit_mb,

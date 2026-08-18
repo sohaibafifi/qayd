@@ -479,7 +479,7 @@ fn malformed_source_ranges_are_rejected_before_compilation() {
 }
 
 #[test]
-fn decomposition_rejects_limits_that_a_component_family_cannot_consume() {
+fn decomposition_rejects_only_limits_that_a_component_family_cannot_consume() {
     let mut mixed_list = Model::new();
     mixed_list.int_range(0, 1);
     let list = mixed_list.list(vec![1]);
@@ -499,11 +499,8 @@ fn decomposition_rejects_limits_that_a_component_family_cannot_consume() {
         limits: SolveLimits { iterations: Some(1), ..SolveLimits::default() },
         ..SolveRequest::default()
     };
-    let iteration_error = match compile_model_plan(&ModelPackage::new(mixed_schedule), &iteration_request, &SolveBudget::new(None)) {
-        Ok(_) => panic!("an interval component silently discarded the iteration limit"),
-        Err(error) => error,
-    };
-    assert!(matches!(iteration_error, SolveError::InvalidRequest(message) if message.contains("do not consume iterations")));
+    compile_model_plan(&ModelPackage::new(mixed_schedule), &iteration_request, &SolveBudget::new(None))
+        .expect("interval local search consumes the shared iteration limit");
 }
 
 #[test]

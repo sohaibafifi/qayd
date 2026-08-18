@@ -101,6 +101,8 @@ fn estimated_semantic_schedule_bytes(model: &Model, stop: &AtomicBool) -> Option
     let mut local_search = (64u128 * 1024).saturating_add(intervals.saturating_mul(1024)).saturating_add(modes.saturating_mul(512));
     let mut precedences = 0u128;
     let mut resources = 0u128;
+    let mut resource_memberships = 0u128;
+    let mut cumulative_demands = 0u128;
     for constraint in &model.constraints {
         if stop.load(Ordering::Acquire) {
             return None;
@@ -112,6 +114,7 @@ fn estimated_semantic_schedule_bytes(model: &Model, stop: &AtomicBool) -> Option
                 match resource {
                     list::Resource::NoOverlap(group) => {
                         let size = group.len() as u128;
+                        resource_memberships = resource_memberships.saturating_add(size);
                         exact = exact.saturating_add(size.saturating_mul(size.saturating_sub(1)) / 2 * (8 * 1024));
                     }
                     list::Resource::MachineNoOverlap => {
@@ -130,7 +133,9 @@ fn estimated_semantic_schedule_bytes(model: &Model, stop: &AtomicBool) -> Option
                         }
                     }
                     list::Resource::Cumulative { demands, .. } => {
-                        exact = exact.saturating_add((demands.len() as u128).saturating_mul(4 * 1024));
+                        let count = demands.len() as u128;
+                        cumulative_demands = cumulative_demands.saturating_add(count);
+                        exact = exact.saturating_add(count.saturating_mul(4 * 1024));
                     }
                 }
             }
@@ -138,7 +143,15 @@ fn estimated_semantic_schedule_bytes(model: &Model, stop: &AtomicBool) -> Option
         }
     }
     exact = exact.saturating_add(precedences.saturating_mul(2 * 1024));
-    local_search = local_search.saturating_add(precedences.saturating_mul(128)).saturating_add(resources.saturating_mul(512));
+    // Per trajectory: sparse demand tuples, two reusable event-profile banks,
+    // an independent reconstruction oracle, and mutable scheduling buffers.
+    // The orchestrator multiplies this one-worker estimate by the requested
+    // concurrency before accepting a memory-limited plan.
+    local_search = local_search
+        .saturating_add(precedences.saturating_mul(128))
+        .saturating_add(resources.saturating_mul(1024))
+        .saturating_add(resource_memberships.saturating_mul(64))
+        .saturating_add(cumulative_demands.saturating_mul(512));
     Some(CollectionMemoryEstimates {
         exact: u64::try_from(exact).unwrap_or(u64::MAX),
         local_search: u64::try_from(local_search).unwrap_or(u64::MAX),
@@ -267,11 +280,28 @@ pub(crate) fn estimated_local_search_backend_bytes(model: &list::CollectionModel
     if let Some(schedule) = &model.schedule {
         let intervals = schedule.intervals.len() as u128;
         let modes = schedule.intervals.iter().map(|interval| interval.modes.len().max(1) as u128).sum::<u128>();
+        let mut resource_memberships = 0u128;
+        let mut cumulative_demands = 0u128;
+        for resource in &schedule.resources {
+            match resource {
+                list::Resource::NoOverlap(group) => {
+                    resource_memberships = resource_memberships.saturating_add(group.len() as u128);
+                }
+                list::Resource::MachineNoOverlap => {
+                    resource_memberships = resource_memberships.saturating_add(modes);
+                }
+                list::Resource::Cumulative { demands, .. } => {
+                    cumulative_demands = cumulative_demands.saturating_add(demands.len() as u128);
+                }
+            }
+        }
         bytes = bytes
             .saturating_add(intervals.saturating_mul(1024))
             .saturating_add(modes.saturating_mul(512))
             .saturating_add((schedule.precedences.len() as u128).saturating_mul(128))
-            .saturating_add((schedule.resources.len() as u128).saturating_mul(512));
+            .saturating_add((schedule.resources.len() as u128).saturating_mul(1024))
+            .saturating_add(resource_memberships.saturating_mul(64))
+            .saturating_add(cumulative_demands.saturating_mul(512));
     } else {
         let items = model.items.len() as u128;
         let lists = model.lists.max(1) as u128;
