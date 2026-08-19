@@ -32,6 +32,20 @@ pub struct SemanticNogoodLiteral {
 pub type SemanticRawNogood = (u32, Vec<u32>);
 pub type SemanticNogood = (u32, Vec<SemanticNogoodLiteral>);
 
+fn session_concurrent_bytes(compiled_bytes: u64, guidance_bytes: u64, workers: usize) -> u64 {
+    let workers = u64::try_from(workers).unwrap_or(u64::MAX);
+    compiled_bytes
+        .saturating_mul(workers.saturating_add(1))
+        // The request guidance, the incremental adapter clone and one phase
+        // vector per exact worker coexist during an epoch.
+        .saturating_add(guidance_bytes.saturating_mul(workers.saturating_add(2)))
+}
+
+#[cfg(test)]
+pub(crate) fn audit_session_concurrent_bytes(compiled_bytes: u64, guidance_bytes: u64, workers: usize) -> u64 {
+    session_concurrent_bytes(compiled_bytes, guidance_bytes, workers)
+}
+
 pub struct SemanticSolveSession {
     package: ModelPackage,
     compiled: Option<CompiledCp>,
@@ -172,8 +186,14 @@ impl SemanticSolveSession {
         self.prepare(request, budget)?;
         let compiled = self.compiled.as_ref().expect("successful session preparation installs a compiled plan");
         self.preflight_worker_range(compiled, request)?;
-        let Some((initial_phase, branch_order, primary_branch_scope)) = compiled
-            .search_guidance_interruptible(&request.hints, &request.branch_order, request.primary_branch_scope.as_deref(), budget.stop())
+        let Some((initial_phase, branch_order, primary_branch_scope, search_phases)) = compiled
+            .search_guidance_interruptible(
+                &request.hints,
+                &request.branch_order,
+                request.primary_branch_scope.as_deref(),
+                &request.search_policy,
+                budget.stop(),
+            )
             .map_err(|error| SolveError::InvalidRequest(error.reason))?
         else {
             return Err(SolveError::Interrupted("session search guidance construction was interrupted".to_string()));
@@ -199,7 +219,8 @@ impl SemanticSolveSession {
                 value: assumption.value,
             });
         }
-        let guidance = SearchGuidance { initial_phase, branch_order, primary_branch_scope, linear: None };
+        let guidance = SearchGuidance { initial_phase, branch_order, primary_branch_scope, search_phases, linear: None };
+        Self::preflight_memory(compiled.estimated_bytes(), guidance.estimated_bytes(), request)?;
         let result = solve_cp_session_validated(
             &self.package.model,
             compiled,
@@ -221,7 +242,7 @@ impl SemanticSolveSession {
 
     fn prepare(&mut self, request: &SolveRequest, budget: &SolveBudget) -> Result<(), SolveError> {
         if let Some(compiled) = &self.compiled {
-            Self::preflight_memory(compiled.estimated_bytes(), request)?;
+            Self::preflight_memory(compiled.estimated_bytes(), 0, request)?;
             super::budget::apply_memory_limit(request.limits.memory_bytes, budget);
             if budget.expired() {
                 return Err(SolveError::Interrupted("session solve budget expired during request setup".to_string()));
@@ -239,7 +260,7 @@ impl SemanticSolveSession {
         }
         let semantic_estimate = CompiledCp::estimate_semantic_bytes_interruptible(&self.package.model, budget.stop())
             .ok_or_else(|| SolveError::Interrupted("session preliminary CP memory estimation was interrupted".to_string()))?;
-        Self::preflight_memory(semantic_estimate, request)?;
+        Self::preflight_memory(semantic_estimate, 0, request)?;
 
         let mut prepared = self.package.model.clone();
         if budget.expired() {
@@ -250,7 +271,7 @@ impl SemanticSolveSession {
         }
         let estimated_bytes = CompiledCp::estimate_semantic_bytes_interruptible(&prepared, budget.stop())
             .ok_or_else(|| SolveError::Interrupted("session CP memory estimation was interrupted".to_string()))?;
-        Self::preflight_memory(estimated_bytes, request)?;
+        Self::preflight_memory(estimated_bytes, 0, request)?;
         super::budget::apply_memory_limit(request.limits.memory_bytes, budget);
         if budget.expired() {
             return Err(SolveError::Interrupted("session solve budget expired after CP memory preflight".to_string()));
@@ -287,6 +308,11 @@ impl SemanticSolveSession {
         for &variable in &request.branch_order {
             check(variable, "branch_order")?;
         }
+        for phase in request.search_policy.phases() {
+            for &variable in phase.scope() {
+                check(variable, "search_policy")?;
+            }
+        }
         if let Some(scope) = &request.primary_branch_scope {
             for &variable in scope {
                 check(variable, "primary_branch_scope")?;
@@ -295,13 +321,11 @@ impl SemanticSolveSession {
         Ok(())
     }
 
-    fn preflight_memory(estimated_bytes: u64, request: &SolveRequest) -> Result<(), SolveError> {
-        let workers = u64::try_from(request.threads).unwrap_or(u64::MAX);
-        let resident_copies = workers.saturating_add(1);
-        let concurrent_bytes = estimated_bytes.saturating_mul(resident_copies);
+    fn preflight_memory(compiled_bytes: u64, guidance_bytes: u64, request: &SolveRequest) -> Result<(), SolveError> {
+        let concurrent_bytes = session_concurrent_bytes(compiled_bytes, guidance_bytes, request.threads);
         if request.limits.memory_bytes.is_some_and(|limit| concurrent_bytes > limit) {
             return Err(SolveError::Compile(format!(
-                "estimated session CP backend requires {concurrent_bytes} bytes across {} exact workers and the persistent template, above the memory limit",
+                "estimated session CP footprint requires {concurrent_bytes} bytes across {} exact workers and the persistent template, including search guidance, above the memory limit",
                 request.threads
             )));
         }

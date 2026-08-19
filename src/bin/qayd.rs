@@ -27,7 +27,13 @@ fn read_instance(path: &str) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|e| e.to_string())
 }
 
-fn run_instance(path: &str, verbose: bool, stop: &AtomicBool, options: qayd::frontends::xcsp::RunOptions) {
+fn run_instance(
+    path: &str,
+    verbose: bool,
+    stop: &AtomicBool,
+    options: qayd::frontends::xcsp::RunOptions,
+    search_policy: qayd::orchestrator::SearchPolicy,
+) {
     let xml = match read_instance(path) {
         Ok(x) => x,
         Err(e) => {
@@ -37,7 +43,7 @@ fn run_instance(path: &str, verbose: bool, stop: &AtomicBool, options: qayd::fro
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    if let Err(e) = qayd::frontends::xcsp::run_to_with_options(&xml, verbose, stop, &mut lock, options) {
+    if let Err(e) = qayd::frontends::xcsp::run_to_with_options_and_search_policy(&xml, verbose, stop, &mut lock, options, search_policy) {
         eprintln!("error: {e}");
         std::process::exit(2);
     }
@@ -48,7 +54,7 @@ fn is_instance(arg: &str) -> bool {
 }
 
 const USAGE: &str =
-    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--mem-limit MB] [--ls] [--split] [--probe N] [--lns N] [--no-learn-csp] [--semantic-branching] [--force-scope-reasons] [--shared-pool-cap N] [--core] [--linear-backend auto|native|amthal] [--lp-root-ms N] [--lp-node-ms N] [--lp-node-depth N] [--lp-max-vars N] [--lp-max-rows N] [--lp-max-nonzeros N] [--lp-min-coverage N] [--lp-phase-max-vars N] [--lp-route-ng-size N] [--lp-route-max-labels N] [--lp-route-dual-stabilization-percent N] <instance.xml[.lzma|.xz]>";
+    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--mem-limit MB] [--ls] [--split] [--probe N] [--lns N] [--no-learn-csp] [--semantic-branching] [--search-phase VARS:VARIABLE:VALUE] [--force-scope-reasons] [--shared-pool-cap N] [--core] [--linear-backend auto|native|amthal] [--lp-root-ms N] [--lp-node-ms N] [--lp-node-depth N] [--lp-max-vars N] [--lp-max-rows N] [--lp-max-nonzeros N] [--lp-min-coverage N] [--lp-phase-max-vars N] [--lp-route-ng-size N] [--lp-route-max-labels N] [--lp-route-dual-stabilization-percent N] <instance.xml[.lzma|.xz]>\n\n--search-phase is repeatable; VARS is a comma-separated list of zero-based semantic integer indices, VARIABLE is auto|input-order|first-fail|dom-wdeg|activity, and VALUE is auto|min|max|median|random-seeded|hint.";
 
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
@@ -84,6 +90,23 @@ fn linear_backend(value: Option<&str>) -> qayd::orchestrator::LinearBackendMode 
     }
 }
 
+fn search_phase(value: Option<&str>) -> qayd::orchestrator::SearchPhase {
+    let value = value.unwrap_or_else(|| fail("--search-phase needs VARS:VARIABLE:VALUE"));
+    let parts = value.split(':').collect::<Vec<_>>();
+    if parts.len() != 3 || parts[0].is_empty() {
+        fail("--search-phase needs VARS:VARIABLE:VALUE with a non-empty comma-separated VARS scope");
+    }
+    let scope = parts[0]
+        .split(',')
+        .map(|variable| {
+            variable.parse::<usize>().unwrap_or_else(|_| fail("--search-phase VARS must contain zero-based non-negative integer indices"))
+        })
+        .collect();
+    let variable = qayd::orchestrator::VariableSelector::from_str(parts[1]).unwrap_or_else(|error| fail(&error));
+    let value = qayd::orchestrator::ValueSelector::from_str(parts[2]).unwrap_or_else(|error| fail(&error));
+    qayd::orchestrator::SearchPhase::new(scope, variable, value)
+}
+
 fn usage() -> ! {
     fail(USAGE)
 }
@@ -110,6 +133,7 @@ fn main() {
     let mut shared_pool_capacity = 1 << 14;
     let mut mem_limit: Option<usize> = None;
     let mut linear = qayd::orchestrator::LinearControls::default();
+    let mut search_phases = Vec::new();
     let mut path: Option<String> = None;
 
     let mut it = args.iter();
@@ -127,6 +151,7 @@ fn main() {
             "--no-learn-csp" => no_learn_csp = true,
             "--core" => core = true,
             "--semantic-branching" => semantic_branching = true,
+            "--search-phase" => search_phases.push(search_phase(it.next().map(String::as_str))),
             "--force-scope-reasons" => force_scope_reasons = true,
             "--shared-pool-cap" => {
                 shared_pool_capacity = positive(it.next().map(String::as_str), "--shared-pool-cap needs a positive integer")
@@ -194,6 +219,7 @@ fn main() {
     }
 
     let mode = if ls { qayd::frontends::xcsp::Mode::Ls } else { qayd::frontends::xcsp::Mode::Default };
+    let search_policy = qayd::orchestrator::SearchPolicy::new(search_phases);
     run_instance(
         &path,
         verbose,
@@ -214,5 +240,6 @@ fn main() {
             linear,
             core,
         },
+        search_policy,
     );
 }

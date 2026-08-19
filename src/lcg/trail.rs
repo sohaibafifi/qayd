@@ -13,6 +13,7 @@ use crate::lcg::clause::{ClauseDb, ClauseRef, ClauseSharing, SharedClause};
 use crate::lcg::lit::{Atom, AtomKind, AtomTable, LazyAtomRegistry, Lit, LitOrConst};
 use crate::lcg::view::{self, Tri};
 use crate::propagator::Inconsistency;
+use crate::search_policy::CompiledSearchPhase;
 use crate::store::{Cause, DomEvent, Premise, ScopeVar, Solver, StepOutcome};
 
 /// Stop flag that is never set; default until [`Cdcl::set_stop`] supplies the real one.
@@ -323,6 +324,9 @@ pub struct Cdcl<'s> {
     /// Optional user-supplied variable priority. When non-empty, branching picks
     /// the first unfixed variable in this list before using the default heuristic.
     pub(crate) branch_order: Vec<VarId>,
+    /// Ordered physical phases compiled from semantic exact-search policy.
+    /// Empty preserves the legacy branching path bit-for-bit.
+    pub(crate) search_phases: Vec<CompiledSearchPhase>,
     /// Live (non-tombstone) deletable learned clauses.
     num_learned: usize,
     /// Soft cap on live learned clauses; grows after each reduction.
@@ -463,6 +467,7 @@ impl<'s> Cdcl<'s> {
             seed: 0,
             initial_phase: Vec::new(),
             branch_order: Vec::new(),
+            search_phases: Vec::new(),
             num_learned: 0,
             max_learned: 2000,
             conflicts: 0,

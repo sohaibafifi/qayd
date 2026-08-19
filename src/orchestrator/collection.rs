@@ -336,6 +336,11 @@ fn validate_collection_request(semantic: &Model, model: &list::CollectionModel, 
     if request.cp != super::CpControls::default() {
         return Err(SolveError::InvalidRequest("CP portfolio controls require a semantic integer model".to_string()));
     }
+    if !request.search_policy.is_auto() {
+        return Err(SolveError::InvalidRequest(
+            "collection plans do not support an integer search_policy; use an exact integer CP model".to_string(),
+        ));
+    }
     if !request.assumptions.is_empty()
         || !request.hints.is_empty()
         || request.primary_branch_scope.is_some()

@@ -4,7 +4,8 @@
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use qayd::frontends::xcsp::{run, run_to_with_options, Mode, RunOptions};
+use qayd::frontends::xcsp::{run, run_to_with_options, run_to_with_options_and_search_policy, Mode, RunOptions};
+use qayd::orchestrator::{SearchPhase, SearchPolicy, ValueSelector, VariableSelector};
 
 #[test]
 fn execution_is_routed_through_the_orchestrator() {
@@ -49,6 +50,48 @@ fn zero_workers_is_rejected_by_the_canonical_request_validator() {
         run_to_with_options(xml, false, &AtomicBool::new(false), &mut Vec::new(), RunOptions { workers: 0, ..RunOptions::default() })
             .unwrap_err();
     assert!(error.contains("threads must be positive"), "{error}");
+}
+
+#[test]
+fn explicit_search_phases_reach_the_canonical_exact_engine() {
+    let xml = r#"
+      <instance format="XCSP3" type="CSP">
+        <variables>
+          <var id="wide"> 0..2 </var>
+          <var id="narrow"> 0..1 </var>
+        </variables>
+        <constraints><intension> ne(wide,narrow) </intension></constraints>
+      </instance>"#;
+    let policy = SearchPolicy::new(vec![SearchPhase::new(vec![0, 1], VariableSelector::InputOrder, ValueSelector::Min)]);
+    let mut output = Vec::new();
+
+    run_to_with_options_and_search_policy(xml, true, &AtomicBool::new(false), &mut output, RunOptions::default(), policy).unwrap();
+
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("c search phases 1"), "{output}");
+    assert!(output.contains("v 0 1"), "{output}");
+    assert!(output.contains("s SATISFIABLE"), "{output}");
+}
+
+#[test]
+fn explicit_search_phases_reject_legacy_semantic_branching() {
+    let xml = r#"
+      <instance format="XCSP3" type="CSP">
+        <variables><var id="x"> 0..1 </var></variables>
+        <constraints></constraints>
+      </instance>"#;
+    let policy = SearchPolicy::new(vec![SearchPhase::new(vec![0], VariableSelector::Auto, ValueSelector::Auto)]);
+    let error = run_to_with_options_and_search_policy(
+        xml,
+        false,
+        &AtomicBool::new(false),
+        &mut Vec::new(),
+        RunOptions { semantic_branching: true, ..RunOptions::default() },
+        policy,
+    )
+    .unwrap_err();
+
+    assert!(error.contains("cannot be combined"), "{error}");
 }
 
 #[test]

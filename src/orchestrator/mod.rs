@@ -17,6 +17,7 @@ mod solve;
 mod types;
 mod verify;
 
+pub use crate::search_policy::{SearchPhase, SearchPolicy, ValueSelector, VariableSelector};
 pub(crate) use budget::WarmStartStops;
 pub use budget::{SolveBudget, TerminationReason};
 pub(crate) use collection::*;
@@ -33,6 +34,8 @@ pub(crate) use executor::{worker_iteration_quota, WorkerAllocation};
 pub(crate) use finalize::*;
 pub use plan::{DecompositionMerge, EnginePlan, ExecutablePlan};
 pub(crate) use sat::*;
+#[cfg(test)]
+pub(crate) use session::audit_session_concurrent_bytes;
 pub use session::{SemanticNogood, SemanticNogoodLiteral, SemanticNogoodRelation, SemanticRawNogood, SemanticSolveSession};
 #[cfg(test)]
 pub(crate) use solve::{audit_interrupt_next_transfer_replay, execute_specialized, solve_model_with_budget};

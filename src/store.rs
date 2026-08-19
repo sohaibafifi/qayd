@@ -471,6 +471,11 @@ impl Store {
         self.domains[var.index()].values(&self.trail)
     }
 
+    /// Least currently supported value greater than or equal to `target`.
+    pub(crate) fn ceiling_value(&self, var: VarId, target: i32) -> Option<i32> {
+        self.domains[var.index()].ceiling(target, &self.trail)
+    }
+
     /// Immutable universe of a list.
     pub fn list_universe(&self, list: ListId) -> &[i32] {
         self.list_domains[list.index()].universe()

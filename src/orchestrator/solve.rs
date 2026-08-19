@@ -10,8 +10,8 @@ use super::{
     compile_collection_plan, compile_cp_plan_validated, compile_sat_plan, preflight_collection_memory, solve_collection_plan_with_stop,
     solve_cp_plan_validated, solve_sat_plan, Assignment, Bound, CandidateSolution, CollectionSolvePlan, CpSolvePlan, DecompositionMerge,
     EngineKind, EnginePlan, EventControl, EventSink, ExecutablePlan, IgnoreEvents, ProofClaim, ProofRequest, ProvenConclusion,
-    SatSolvePlan, SolveBudget, SolveError, SolveEvent, SolveRequest, SolveResult, SolveStatus, TerminationReason, VerificationLevel,
-    WorkerAllocation,
+    SatSolvePlan, SearchPhase, SearchPolicy, SolveBudget, SolveError, SolveEvent, SolveRequest, SolveResult, SolveStatus,
+    TerminationReason, VerificationLevel, WorkerAllocation,
 };
 
 #[cfg(test)]
@@ -116,11 +116,49 @@ impl PreparedSolvePlan {
             // backend retained during a warm-start stage.
             PreparedNode::Sequential(stages) => stages.iter().map(PreparedStage::estimated_backend_bytes).fold(0, u64::saturating_add),
             PreparedNode::Portfolio { workers, engine } => {
-                estimated_engine_bytes(engine).saturating_mul(u64::try_from(*workers).unwrap_or(u64::MAX))
+                match engine.as_ref() {
+                    // CP compilation already accounts for its persistent
+                    // template, every worker Problem, search guidance, and a
+                    // retained lexicographic root when one exists.
+                    PreparedEngine::Cp(plan) => plan.estimated_backend_bytes(),
+                    PreparedEngine::Collection(_) | PreparedEngine::Sat(_) => {
+                        estimated_engine_bytes(engine).saturating_mul(u64::try_from(*workers).unwrap_or(u64::MAX))
+                    }
+                }
             }
             PreparedNode::Decomposed(components) => {
-                components.iter().map(|component| component.plan.estimated_backend_bytes()).fold(0, u64::saturating_add)
+                let retained = components.iter().map(|component| component.plan.estimated_resident_bytes()).fold(0, u64::saturating_add);
+                let active =
+                    components.iter().map(|component| component.plan.additional_decomposition_execution_bytes()).max().unwrap_or(0);
+                // Component plans remain resident, but decomposition executes
+                // one cloned component plan at a time. CP separates these two
+                // costs, so add only its largest sequential execution peak;
+                // other backends keep their prior conservative total.
+                retained.saturating_add(active)
             }
+        }
+    }
+
+    fn estimated_resident_bytes(&self) -> u64 {
+        match &self.node {
+            PreparedNode::Single(engine) => estimated_engine_resident_bytes(engine),
+            PreparedNode::Portfolio { engine, .. } => estimated_engine_resident_bytes(engine),
+            PreparedNode::Sequential(stages) => {
+                stages.iter().map(|stage| estimated_engine_resident_bytes(&stage.engine)).fold(0, u64::saturating_add)
+            }
+            PreparedNode::Decomposed(components) => {
+                components.iter().map(|component| component.plan.estimated_resident_bytes()).fold(0, u64::saturating_add)
+            }
+        }
+    }
+
+    fn additional_decomposition_execution_bytes(&self) -> u64 {
+        match &self.node {
+            PreparedNode::Single(engine) | PreparedNode::Portfolio { engine, .. } => cp_engine_execution_bytes(engine),
+            PreparedNode::Sequential(stages) => {
+                stages.iter().map(|stage| cp_engine_execution_bytes(&stage.engine)).fold(0, u64::saturating_add)
+            }
+            PreparedNode::Decomposed(_) => 0,
         }
     }
 
@@ -160,6 +198,23 @@ fn estimated_engine_bytes(engine: &PreparedEngine) -> u64 {
         PreparedEngine::Cp(plan) => plan.estimated_backend_bytes(),
         PreparedEngine::Collection(plan) => plan.estimated_backend_bytes(),
         PreparedEngine::Sat(plan) => plan.estimated_backend_bytes(),
+    }
+}
+
+fn estimated_engine_resident_bytes(engine: &PreparedEngine) -> u64 {
+    match engine {
+        PreparedEngine::Cp(plan) => plan.estimated_resident_bytes(),
+        // Collection and SAT do not yet separate their retained blueprint from
+        // execution scratch, so keep their existing conservative estimate.
+        PreparedEngine::Collection(plan) => plan.estimated_backend_bytes(),
+        PreparedEngine::Sat(plan) => plan.estimated_backend_bytes(),
+    }
+}
+
+fn cp_engine_execution_bytes(engine: &PreparedEngine) -> u64 {
+    match engine {
+        PreparedEngine::Cp(plan) => plan.estimated_backend_bytes(),
+        PreparedEngine::Collection(_) | PreparedEngine::Sat(_) => 0,
     }
 }
 
@@ -208,6 +263,7 @@ fn compile_model_plan_inner(
         return Err(SolveError::Interrupted("solve budget expired during semantic validation".to_string()));
     }
     let model = &package.model;
+    validate_request_references(model, request)?;
     if request.sat.backend.is_some() {
         return compile_sat_plan(model, request, budget).and_then(|plan| prepared_plan(sat_node(plan), request));
     }
@@ -237,10 +293,11 @@ fn compile_model_plan_inner(
                     }
                 }
                 validate_decomposition_coverage(&components, model)?;
+                validate_decomposition_control_applicability(&components, request)?;
                 validate_decomposition_limits(&components, request)?;
-                validate_decomposition_request_references(model, request)?;
                 let mut prepared = Vec::with_capacity(components.len());
-                let mut retained_backend_bytes = 0u64;
+                let mut retained_resident_bytes = 0u64;
+                let mut largest_component_execution = 0u64;
                 for component in components {
                     if budget.expired() {
                         return Err(SolveError::Interrupted("solve budget expired while preparing a decomposition component".to_string()));
@@ -248,9 +305,9 @@ fn compile_model_plan_inner(
                     let interval_mode_originals = dense_local_to_original(&component.interval_modes, "interval mode")?;
                     let mut component_request = project_component_request(&component, !component.model.objectives().is_empty(), request)?;
                     if let Some(limit) = request.limits.memory_bytes {
-                        let remaining = limit.checked_sub(retained_backend_bytes).ok_or_else(|| {
+                        let remaining = limit.checked_sub(retained_resident_bytes).ok_or_else(|| {
                             SolveError::Compile(format!(
-                                "prepared decomposition components already require an estimated {retained_backend_bytes} bytes, above the memory limit"
+                                "prepared decomposition components already retain an estimated {retained_resident_bytes} bytes, above the memory limit"
                             ))
                         })?;
                         if remaining == 0 {
@@ -264,7 +321,14 @@ fn compile_model_plan_inner(
                         .project_interruptible(component.model, &component.objects, budget.stop())
                         .ok_or_else(|| SolveError::Interrupted("solve budget expired during component metadata projection".to_string()))?;
                     let plan = compile_model_plan_inner(&package, &component_request, budget, false)?;
-                    retained_backend_bytes = retained_backend_bytes.saturating_add(plan.estimated_backend_bytes());
+                    retained_resident_bytes = retained_resident_bytes.saturating_add(plan.estimated_resident_bytes());
+                    largest_component_execution = largest_component_execution.max(plan.additional_decomposition_execution_bytes());
+                    let aggregate_peak = retained_resident_bytes.saturating_add(largest_component_execution);
+                    if request.limits.memory_bytes.is_some_and(|limit| aggregate_peak > limit) {
+                        return Err(SolveError::Compile(format!(
+                            "prepared decomposition templates and largest component execution require an estimated {aggregate_peak} bytes at peak, above the memory limit"
+                        )));
+                    }
                     prepared.push(PreparedComponent {
                         family: component.family,
                         package,
@@ -424,7 +488,42 @@ fn validate_decomposition_limits(components: &[IndependentComponent], request: &
     Ok(())
 }
 
-fn validate_decomposition_request_references(model: &Model, request: &SolveRequest) -> Result<(), SolveError> {
+fn validate_decomposition_control_applicability(components: &[IndependentComponent], request: &SolveRequest) -> Result<(), SolveError> {
+    let has_integer = components.iter().any(|component| component.family == IndependentFamily::IntegerSet);
+    let has_lists = components.iter().any(|component| component.family == IndependentFamily::Lists);
+    let has_intervals = components.iter().any(|component| component.family == IndependentFamily::Intervals);
+    let has_integer_objective =
+        components.iter().any(|component| component.family == IndependentFamily::IntegerSet && !component.model.objectives().is_empty());
+
+    if request.routing != super::RoutingControls::default() && !has_lists {
+        return Err(SolveError::InvalidRequest("routing controls are only valid for a semantic routing model".to_string()));
+    }
+    if request.schedule_cdcl && !has_intervals {
+        return Err(SolveError::InvalidRequest("schedule_cdcl is only valid for a semantic schedule model".to_string()));
+    }
+    if request.cp != super::CpControls::default() && !has_integer {
+        return Err(SolveError::InvalidRequest("CP portfolio controls require a semantic integer model".to_string()));
+    }
+    if (request.cp.split || request.cp.probes > 0 || request.cp.lns > 0) && !has_integer_objective {
+        return Err(SolveError::InvalidRequest("split, probes, and LNS require an optimization objective".to_string()));
+    }
+    if request.cp.no_learn_csp && has_integer_objective {
+        return Err(SolveError::InvalidRequest("no_learn_csp applies only to satisfaction models without an objective".to_string()));
+    }
+    if request.linear != super::LinearControls::default() {
+        if !request.linear.node_time.is_zero() && !has_integer_objective {
+            return Err(SolveError::InvalidRequest(
+                "in-search linear relaxations require an exact integer CP objective; collection plans support root bounds only".to_string(),
+            ));
+        }
+        if !has_integer_objective && !has_lists && !has_intervals {
+            return Err(SolveError::InvalidRequest("linear relaxation controls require an integer optimization objective".to_string()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_request_references(model: &Model, request: &SolveRequest) -> Result<(), SolveError> {
     for assumption in &request.assumptions {
         if assumption.variable >= model.int_vars().len() {
             return Err(SolveError::InvalidRequest(format!("assumption references unknown integer variable {}", assumption.variable)));
@@ -444,6 +543,15 @@ fn validate_decomposition_request_references(model: &Model, request: &SolveReque
         for &variable in scope {
             if variable >= model.int_vars().len() {
                 return Err(SolveError::InvalidRequest(format!("primary_branch_scope references unknown integer variable {variable}")));
+            }
+        }
+    }
+    for (phase_index, phase) in request.search_policy.phases().iter().enumerate() {
+        for &variable in phase.scope() {
+            if variable >= model.int_vars().len() {
+                return Err(SolveError::InvalidRequest(format!(
+                    "search policy phase {phase_index} references unknown integer variable {variable}"
+                )));
             }
         }
     }
@@ -474,6 +582,7 @@ fn project_component_request(
     let mut projected = request.clone();
     match component.family {
         IndependentFamily::IntegerSet => {
+            let local_by_original = component.integers.iter().copied().collect::<BTreeMap<_, _>>();
             projected.list_hint = None;
             projected.schedule_cdcl = false;
             projected.routing = super::RoutingControls::default();
@@ -499,15 +608,35 @@ fn project_component_request(
                         .map(|variable| (variable, value))
                 })
                 .collect();
-            projected.primary_branch_scope = request.primary_branch_scope.as_ref().map(|scope| {
-                let local_by_original = component.integers.iter().copied().collect::<BTreeMap<_, _>>();
-                scope.iter().filter_map(|variable| local_by_original.get(variable).copied()).collect()
-            });
+            projected.primary_branch_scope = request
+                .primary_branch_scope
+                .as_ref()
+                .map(|scope| scope.iter().filter_map(|variable| local_by_original.get(variable).copied()).collect());
             projected.branch_order = request
                 .branch_order
                 .iter()
                 .filter_map(|&variable| component.integers.iter().find_map(|&(original, local)| (original == variable).then_some(local)))
                 .collect();
+            projected.search_policy = SearchPolicy::new(
+                request
+                    .search_policy
+                    .phases()
+                    .iter()
+                    .filter_map(|phase| {
+                        let (scope, semantic_keys): (Vec<_>, Vec<_>) = phase
+                            .scope()
+                            .iter()
+                            .copied()
+                            .zip(phase.semantic_keys().iter().copied())
+                            .filter_map(|(variable, semantic_key)| {
+                                local_by_original.get(&variable).copied().map(|local| (local, semantic_key))
+                            })
+                            .unzip();
+                        (!scope.is_empty())
+                            .then(|| SearchPhase::projected(scope, semantic_keys, phase.variable_selector(), phase.value_selector()))
+                    })
+                    .collect(),
+            );
             if !has_objectives {
                 projected.cp.split = false;
                 projected.cp.probes = 0;
@@ -520,10 +649,11 @@ fn project_component_request(
             projected.hints.clear();
             projected.primary_branch_scope = None;
             projected.branch_order.clear();
+            projected.search_policy = SearchPolicy::default();
             projected.limits.conflicts = None;
             projected.schedule_cdcl = false;
             projected.cp = super::CpControls::default();
-            projected.linear = super::LinearControls::default();
+            projected.linear.node_time = Duration::ZERO;
             projected.list_hint = match &request.list_hint {
                 Some(hint) => {
                     let mut local = vec![Vec::new(); component.model.lists().len()];
@@ -549,10 +679,11 @@ fn project_component_request(
             projected.list_hint = None;
             projected.primary_branch_scope = None;
             projected.branch_order.clear();
+            projected.search_policy = SearchPolicy::default();
             projected.limits.conflicts = None;
             projected.routing = super::RoutingControls::default();
             projected.cp = super::CpControls::default();
-            projected.linear = super::LinearControls::default();
+            projected.linear.node_time = Duration::ZERO;
         }
     }
     Ok(projected)

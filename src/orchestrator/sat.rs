@@ -66,6 +66,11 @@ pub(crate) fn compile_sat_plan(model: &Model, request: &SolveRequest, budget: &S
             "the specialized SAT plan does not accept scheduling, routing, CP portfolio, or linear relaxation controls".to_string(),
         ));
     }
+    if !request.search_policy.is_auto() {
+        return Err(SolveError::InvalidRequest(
+            "the specialized SAT plan does not support search_policy; use the exact CP plan for phased integer search".to_string(),
+        ));
+    }
     if !request.assumptions.is_empty()
         || !request.hints.is_empty()
         || request.primary_branch_scope.is_some()

@@ -2,6 +2,8 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::time::Duration;
 
+use crate::search_policy::SearchPolicy;
+
 pub use crate::search::SolveStats as SearchStats;
 
 /// User-visible solving policy.
@@ -248,6 +250,9 @@ pub struct SolveRequest {
     /// primary scope is explicit, every entry must belong to that scope and no
     /// entry can promote a completion variable ahead of it.
     pub branch_order: Vec<usize>,
+    /// Ordered semantic exact-search phases. The compiled engine always adds
+    /// an `Auto` fallback over every remaining physical variable.
+    pub search_policy: SearchPolicy,
     /// Request verified assignment snapshots for improving incumbents. This is
     /// intentionally opt-in because replaying every improvement is unsuitable
     /// for high-frequency heuristic loops.
@@ -273,6 +278,7 @@ impl Default for SolveRequest {
             list_hint: None,
             primary_branch_scope: None,
             branch_order: Vec::new(),
+            search_policy: SearchPolicy::default(),
             publish_incumbent_assignments: false,
             proof: ProofRequest::None,
         }
@@ -310,6 +316,17 @@ impl SolveRequest {
         }
         if self.proof == ProofRequest::Require && self.mode == SolveMode::LocalSearch {
             return Err(SolveError::InvalidRequest("proof=Require cannot be combined with a local-search-only request".to_string()));
+        }
+        self.search_policy.validate().map_err(SolveError::InvalidRequest)?;
+        if !self.search_policy.is_auto() {
+            if self.mode == SolveMode::LocalSearch {
+                return Err(SolveError::InvalidRequest("search_policy requires an exact CP search".to_string()));
+            }
+            if self.primary_branch_scope.is_some() || !self.branch_order.is_empty() || !self.hints.is_empty() {
+                return Err(SolveError::InvalidRequest(
+                    "search_policy cannot be combined with hints, primary_branch_scope, or branch_order".to_string(),
+                ));
+            }
         }
         if let Some(scope) = &self.primary_branch_scope {
             let mut seen = BTreeSet::new();
@@ -458,6 +475,9 @@ pub struct OptimalityGap {
 pub enum ProofKind {
     /// The named exact engine exhausted its complete search space.
     CompleteSearch { engine: EngineKind, objective_tiers: usize },
+    /// Exact tier closure used one or more independently certified dual
+    /// bounds. `methods` contains one honest evidence description per tier.
+    CertifiedBounds { engine: EngineKind, methods: Vec<String>, objective_tiers: usize },
     /// A proof artifact was checked by the named verifier.
     VerifiedArtifact { format: String, verifier: String },
     /// Independent submodels were proved separately and combined by the
@@ -479,6 +499,19 @@ pub struct ProofClaim {
 impl ProofClaim {
     pub(super) fn complete_search(engine: EngineKind, conclusion: ProvenConclusion, objective_tiers: usize) -> Self {
         Self { kind: ProofKind::CompleteSearch { engine, objective_tiers }, conclusion }
+    }
+
+    pub(super) fn certified_bounds(engine: EngineKind, methods: Vec<String>, objective_tiers: usize) -> Result<Self, SolveError> {
+        if objective_tiers == 0 || methods.len() != objective_tiers {
+            return Err(SolveError::InvalidResult(format!(
+                "certified-bound proof has {} methods for {objective_tiers} objective tiers",
+                methods.len()
+            )));
+        }
+        if methods.iter().any(String::is_empty) {
+            return Err(SolveError::InvalidResult("certified-bound proof contains an empty method".to_string()));
+        }
+        Ok(Self { kind: ProofKind::CertifiedBounds { engine, methods, objective_tiers }, conclusion: ProvenConclusion::Optimal })
     }
 
     pub(super) fn decomposed(components: Vec<Self>, conclusion: ProvenConclusion, objective_tiers: usize) -> Result<Self, SolveError> {
@@ -528,14 +561,16 @@ impl ProofClaim {
 
     pub fn engine(&self) -> Option<EngineKind> {
         match &self.kind {
-            ProofKind::CompleteSearch { engine, .. } => Some(*engine),
+            ProofKind::CompleteSearch { engine, .. } | ProofKind::CertifiedBounds { engine, .. } => Some(*engine),
             ProofKind::VerifiedArtifact { .. } | ProofKind::Decomposed { .. } => None,
         }
     }
 
     pub fn objective_tiers(&self) -> Option<usize> {
         match &self.kind {
-            ProofKind::CompleteSearch { objective_tiers, .. } | ProofKind::Decomposed { objective_tiers, .. } => Some(*objective_tiers),
+            ProofKind::CompleteSearch { objective_tiers, .. }
+            | ProofKind::CertifiedBounds { objective_tiers, .. }
+            | ProofKind::Decomposed { objective_tiers, .. } => Some(*objective_tiers),
             ProofKind::VerifiedArtifact { .. } => None,
         }
     }
@@ -548,6 +583,21 @@ impl ProofClaim {
                         "engine {} is not authorized to issue complete-search proofs",
                         engine.name()
                     )));
+                }
+            }
+            ProofKind::CertifiedBounds { engine, methods, objective_tiers } => {
+                if !engine.can_prove_complete() {
+                    return Err(SolveError::InvalidResult(format!(
+                        "engine {} is not authorized to issue certified-bound proofs",
+                        engine.name()
+                    )));
+                }
+                if self.conclusion != ProvenConclusion::Optimal
+                    || *objective_tiers == 0
+                    || methods.len() != *objective_tiers
+                    || methods.iter().any(String::is_empty)
+                {
+                    return Err(SolveError::InvalidResult("malformed certified-bound proof".to_string()));
                 }
             }
             ProofKind::VerifiedArtifact { .. } => {}

@@ -41,6 +41,7 @@ pub mod orchestrator;
 mod problem;
 pub mod propagator;
 pub mod search;
+mod search_policy;
 /// Parser-facing SAT data types. Search implementation remains under the
 /// engine layer and is selected only by the orchestrator.
 pub mod sat {

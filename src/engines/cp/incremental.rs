@@ -53,6 +53,11 @@ impl<'a> IncrementalSearch<'a> {
             };
         }
         let worker_count = self.workers;
+        // Reserve the whole epoch before any fallible preparation. Once an
+        // epoch has started, abandoned worker ids are never reused, keeping
+        // persistent clause ownership monotone across errors, panics and
+        // interrupted preparation. A pre-armed stop returns above and
+        // deliberately consumes no ids.
         let first_worker = self.take_workers(worker_count);
         let Some(models) = clone_worker_models(problem, worker_count, stop) else {
             return CspOutcome {
@@ -90,6 +95,7 @@ impl<'a> IncrementalSearch<'a> {
                     conflict_budget,
                     guidance.initial_phase.clone(),
                     guidance.branch_order.clone(),
+                    guidance.search_phases.clone(),
                 );
                 if let Some(solution) = &solution {
                     let mut slot = shared.solution.lock().unwrap();
@@ -139,6 +145,8 @@ impl<'a> IncrementalSearch<'a> {
             return empty_cop_outcome(false, SolveStats::default());
         }
         let worker_count = self.workers;
+        // Keep the same monotone reservation contract as satisfaction epochs:
+        // only a stop observed before the epoch starts preserves the range.
         let first_worker = self.take_workers(worker_count);
         let Some(models) = clone_worker_models(problem, worker_count, stop) else {
             return empty_cop_outcome(false, SolveStats::default());
@@ -190,6 +198,7 @@ impl<'a> IncrementalSearch<'a> {
                         conflict_budget,
                         guidance.initial_phase.clone(),
                         guidance.branch_order.clone(),
+                        guidance.search_phases.clone(),
                         guidance.linear.clone(),
                         |value, solution| shared.report_improvement(&context, worker, value, solution),
                     );
@@ -217,6 +226,7 @@ impl<'a> IncrementalSearch<'a> {
             best,
             stats,
             proved: shared.proved.load(Ordering::Acquire),
+            certified_bound: false,
             shared_clauses: self.clauses.len().saturating_sub(before_clauses),
             imported_clauses: self.clauses.imported().saturating_sub(before_imported),
             split_jobs: None,
@@ -303,6 +313,7 @@ fn empty_cop_outcome(proved: bool, stats: SolveStats) -> ParallelOutcome {
         best: None,
         stats,
         proved,
+        certified_bound: false,
         shared_clauses: 0,
         imported_clauses: 0,
         split_jobs: None,

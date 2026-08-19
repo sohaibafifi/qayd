@@ -19,9 +19,11 @@ use crate::lns::{fix_neighborhood, LnsState};
 use crate::orchestrator::{execute_workers, execute_workers_silent, merge_search_stats, EventControl, WorkerContext};
 use crate::problem::{Objective, Problem};
 use crate::search::{
-    decide_sat_assuming_seeded_with_scope, decide_sat_shared_seeded, find_one_seeded_with_scope, optimize_seeded_with_scope_and_relaxation,
-    probe_seeded_with_scope, split_cube_seeded_with_scope, SharedObjectiveBound, SolveStats,
+    decide_sat_assuming_seeded_with_scope, decide_sat_shared_seeded, find_one_seeded_with_scope_and_phases,
+    optimize_seeded_with_scope_and_relaxation, probe_seeded_with_scope, split_cube_seeded_with_scope, SharedObjectiveBound, SolveStats,
 };
+use crate::search_policy::CompiledSearchPhase;
+use crate::search_policy::VariableSelector;
 use crate::store::Solver;
 
 const GUARDED_SUM_DIVE_CONFLICTS: u64 = 4_096;
@@ -59,16 +61,37 @@ pub(crate) struct SearchGuidance {
     pub initial_phase: Vec<Option<i32>>,
     pub branch_order: Vec<VarId>,
     pub primary_branch_scope: Option<Vec<VarId>>,
+    pub search_phases: Vec<CompiledSearchPhase>,
     pub linear: Option<SearchRelaxationTemplate>,
 }
 
 impl SearchGuidance {
+    pub(crate) fn estimated_bytes(&self) -> u64 {
+        let width =
+            |count: usize, bytes: usize| u64::try_from(count).unwrap_or(u64::MAX).saturating_mul(u64::try_from(bytes).unwrap_or(u64::MAX));
+        let phase_scopes = self.search_phases.iter().fold(0u64, |total, phase| {
+            total
+                .saturating_add(u64::try_from(std::mem::size_of::<CompiledSearchPhase>()).unwrap_or(u64::MAX))
+                .saturating_add(width(phase.scope.len(), std::mem::size_of::<VarId>()))
+                .saturating_add(width(phase.semantic_salts.len(), std::mem::size_of::<u64>()))
+        });
+        width(self.initial_phase.len(), std::mem::size_of::<Option<i32>>())
+            .saturating_add(width(self.branch_order.len(), std::mem::size_of::<VarId>()))
+            .saturating_add(self.primary_branch_scope.as_ref().map_or(0, |scope| width(scope.len(), std::mem::size_of::<VarId>())))
+            .saturating_add(phase_scopes)
+    }
+
     fn is_empty(&self) -> bool {
-        self.initial_phase.iter().all(Option::is_none) && self.branch_order.is_empty() && self.primary_branch_scope.is_none()
+        self.initial_phase.iter().all(Option::is_none)
+            && self.branch_order.is_empty()
+            && self.primary_branch_scope.is_none()
+            && self.search_phases.is_empty()
     }
 
     fn is_chronological_dfs_compatible(&self) -> bool {
-        self.initial_phase.iter().all(Option::is_none) && self.branch_order.is_empty()
+        self.initial_phase.iter().all(Option::is_none)
+            && self.branch_order.is_empty()
+            && self.search_phases.iter().all(|phase| phase.variable != VariableSelector::Activity)
     }
 }
 
@@ -136,6 +159,7 @@ pub(crate) struct ParallelOutcome {
     pub(crate) best: Option<(Vec<i32>, i64)>,
     pub(crate) stats: SolveStats,
     pub(crate) proved: bool,
+    pub(crate) certified_bound: bool,
     pub(crate) shared_clauses: usize,
     pub(crate) imported_clauses: u64,
     pub(crate) split_jobs: Option<(u64, u64)>,
@@ -352,7 +376,7 @@ impl CopShared {
         self.probe_unsat.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn finish_if_probed(&self) -> bool {
+    fn finish_if_probed(&self, publish_proof: bool) -> bool {
         let best = self.best.load();
         let lower = self.probe_lower.load(Ordering::Acquire);
         let upper = self.probe_upper.load(Ordering::Acquire);
@@ -361,7 +385,7 @@ impl CopShared {
             (false, Some(best)) => upper <= best,
             (true, None) | (false, None) => lower > upper,
         };
-        if proved {
+        if proved && publish_proof {
             self.proved.store(true, Ordering::Release);
             self.stop();
         }
@@ -384,8 +408,9 @@ fn run_probe_worker(
     let vars = &model.search;
     let mut stats = SolveStats::default();
     let mut attempt = 0;
+    let publish_probe_proof = auxiliary_search_may_publish_proof(!guidance.search_phases.is_empty());
     while !context.is_cancelled() {
-        if shared.finish_if_probed() {
+        if shared.finish_if_probed(publish_probe_proof) {
             break;
         }
         let Some(target) = shared.next_probe() else {
@@ -403,6 +428,8 @@ fn run_probe_worker(
             context.stop(),
             context.seed().wrapping_add(attempt),
             Some(ClauseSharing::new(Arc::clone(&shared.clauses), context.worker())),
+            if guidance.search_phases.is_empty() { Vec::new() } else { guidance.initial_phase.clone() },
+            guidance.search_phases.clone(),
         );
         attempt += 1;
         merge_search_stats(&mut stats, part);
@@ -416,7 +443,7 @@ fn run_probe_worker(
             None => shared.record_probe_unsat(target),
         }
     }
-    shared.finish_if_probed();
+    shared.finish_if_probed(publish_probe_proof);
     CopWorkerResult { stats }
 }
 
@@ -455,6 +482,7 @@ fn optimize_worker(
         conflict_budget,
         guidance.initial_phase.clone(),
         guidance.branch_order.clone(),
+        guidance.search_phases.clone(),
         guidance.linear.clone(),
         |value, solution| improved |= shared.report_improvement(context, value, solution, source),
     );
@@ -555,8 +583,9 @@ fn optimize_worker_with_seed(
         sharing,
         &[],
         conflict_budget,
+        if guidance.search_phases.is_empty() { Vec::new() } else { guidance.initial_phase.clone() },
         Vec::new(),
-        Vec::new(),
+        guidance.search_phases.clone(),
         guidance.linear.clone(),
         |value, solution| improved |= shared.report_improvement(context, value, solution, source),
     );
@@ -606,6 +635,55 @@ pub(super) fn prepare_root(problem: &mut Problem, stop: &AtomicBool) -> RootPrep
     }
 }
 
+fn clone_worker_models<T>(root: T, workers: usize, stop: &AtomicBool, mut clone_root: impl FnMut(&T) -> T) -> Option<Vec<T>> {
+    if stop.load(Ordering::Acquire) {
+        return None;
+    }
+    let mut models = Vec::with_capacity(workers);
+    models.push(root);
+    for _ in 1..workers {
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        let model = clone_root(&models[0]);
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        models.push(model);
+    }
+    Some(models)
+}
+
+#[cfg(test)]
+pub(crate) fn audit_worker_model_fanout(workers: usize, stop_after_clone: Option<usize>) -> (bool, usize) {
+    let stop = AtomicBool::new(false);
+    let mut clones = 0usize;
+    let models = clone_worker_models(0usize, workers, &stop, |root| {
+        clones += 1;
+        if stop_after_clone == Some(clones) {
+            stop.store(true, Ordering::Release);
+        }
+        *root
+    });
+    (models.is_some(), clones)
+}
+
+fn runs_complete_optimization_worker(split: bool, explicit_search_policy: bool, worker: usize) -> bool {
+    !split || (explicit_search_policy && worker == 0)
+}
+
+fn auxiliary_search_may_publish_proof(explicit_search_policy: bool) -> bool {
+    !explicit_search_policy
+}
+
+#[cfg(test)]
+pub(crate) fn audit_explicit_policy_proof_roles(workers: usize) -> (Vec<bool>, bool, bool) {
+    let complete_workers = (0..workers).map(|worker| runs_complete_optimization_worker(true, true, worker)).collect();
+    let split_may_publish_proof = auxiliary_search_may_publish_proof(true);
+    let probes_may_publish_proof = auxiliary_search_may_publish_proof(true);
+    (complete_workers, split_may_publish_proof, probes_may_publish_proof)
+}
+
 /// Race diversified find-one workers on the same CSP.
 pub(crate) fn solve_csp(mut problem: Problem, stop: &AtomicBool, options: RunOptions, guidance: SearchGuidance) -> CspOutcome {
     problem.solver.set_force_scope_reasons(options.force_scope_reasons);
@@ -647,14 +725,16 @@ pub(crate) fn solve_csp(mut problem: Problem, stop: &AtomicBool, options: RunOpt
         decided: AtomicBool::new(false),
         clauses: Arc::new(SharedClausePool::with_capacity(options.shared_pool_capacity)),
     });
-    let mut models = Vec::with_capacity(options.workers);
-    models.push(problem);
-    for _ in 1..options.workers {
-        if stop.load(Ordering::Acquire) {
-            break;
-        }
-        models.push(models[0].clone());
-    }
+    let Some(models) = clone_worker_models(problem, options.workers, stop, Clone::clone) else {
+        return CspOutcome {
+            solution: None,
+            stats: SolveStats::default(),
+            decided: false,
+            shared_clauses: 0,
+            imported_clauses: 0,
+            search_kind,
+        };
+    };
 
     let execution = execute_workers_silent(models, stop, cancel, options.seed, {
         let shared = Arc::clone(&shared);
@@ -663,7 +743,14 @@ pub(crate) fn solve_csp(mut problem: Problem, stop: &AtomicBool, options: RunOpt
             let vars = &search;
             let use_chronological_dfs = scoped_no_learn || (context.worker() == 0 && chronological_compatible);
             let (solution, stats, complete) = if use_chronological_dfs {
-                find_one_seeded_with_scope(&mut solver, vars, guidance.primary_branch_scope.as_deref(), context.stop(), context.seed())
+                find_one_seeded_with_scope_and_phases(
+                    &mut solver,
+                    vars,
+                    guidance.primary_branch_scope.as_deref(),
+                    guidance.search_phases.clone(),
+                    context.stop(),
+                    context.seed(),
+                )
             } else {
                 let sharing = ClauseSharing::new(Arc::clone(&shared.clauses), context.worker());
                 if guidance.is_empty() && options.conflict_limit.is_none() {
@@ -680,6 +767,7 @@ pub(crate) fn solve_csp(mut problem: Problem, stop: &AtomicBool, options: RunOpt
                         worker_conflict_quota(options.conflict_limit, context.worker(), options.workers),
                         guidance.initial_phase.clone(),
                         guidance.branch_order.clone(),
+                        guidance.search_phases.clone(),
                     )
                 }
             };
@@ -740,6 +828,7 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
                 best: None,
                 stats: SolveStats { failures: 1, ..SolveStats::default() },
                 proved: true,
+                certified_bound: false,
                 shared_clauses: 0,
                 imported_clauses: 0,
                 split_jobs: options.split.then_some((0, 0)),
@@ -752,6 +841,7 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
                 best: initial_incumbent.as_ref().map(|initial| (initial.solution.clone(), initial.value)),
                 stats: SolveStats::default(),
                 proved: false,
+                certified_bound: false,
                 shared_clauses: 0,
                 imported_clauses: 0,
                 split_jobs: options.split.then_some((0, 0)),
@@ -790,6 +880,7 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
             best: shared.solution.lock().unwrap().clone(),
             stats: SolveStats::default(),
             proved: true,
+            certified_bound: true,
             shared_clauses: 0,
             imported_clauses: 0,
             split_jobs: options.split.then_some((0, 0)),
@@ -797,13 +888,22 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
             lns_stats: (options.lns > 0).then_some((0, 0)),
         });
     }
-    let mut models = Vec::with_capacity(options.workers);
-    models.push(problem);
-    for _ in 1..options.workers {
-        models.push(models[0].clone());
-    }
+    let Some(models) = clone_worker_models(problem, options.workers, stop, Clone::clone) else {
+        return Ok(ParallelOutcome {
+            best: shared.solution.lock().unwrap().clone(),
+            stats: SolveStats::default(),
+            proved: false,
+            certified_bound: false,
+            shared_clauses: 0,
+            imported_clauses: 0,
+            split_jobs: options.split.then_some((0, 0)),
+            probe_stats: (options.probes > 0).then_some((0, 0)),
+            lns_stats: (options.lns > 0).then_some((0, 0)),
+        });
+    };
     let regular_workers = options.workers - options.probes - options.lns;
     let lns_end = regular_workers + options.lns;
+    let explicit_search_policy = !guidance.search_phases.is_empty();
     // The caller already published the verified warm start. Seed the progress
     // filter so the portfolio only reports strict improvements over it.
     let mut printed = initial_value;
@@ -824,7 +924,7 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
                     return run_lns_worker(model, &shared, &context, &guidance);
                 }
                 let vars = &model.search;
-                if !options.split {
+                if runs_complete_optimization_worker(options.split, explicit_search_policy, context.worker()) {
                     let bounded_objective_dive = !has_initial_incumbent && uses_bounded_objective_dive(&model, options, &guidance);
                     let mut stats = SolveStats::default();
                     if bounded_objective_dive {
@@ -891,6 +991,8 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
                             context.stop(),
                             context.seed(),
                             Some(shared.clauses.lazy_atoms()),
+                            if guidance.search_phases.is_empty() { Vec::new() } else { guidance.initial_phase.clone() },
+                            guidance.search_phases.clone(),
                         ) else {
                             break;
                         };
@@ -920,6 +1022,7 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
                             worker_conflict_quota(options.conflict_limit, context.worker(), regular_workers),
                             guidance.initial_phase.clone(),
                             guidance.branch_order.clone(),
+                            guidance.search_phases.clone(),
                             guidance.linear.clone(),
                             |value, solution| {
                                 shared.report_improvement(
@@ -933,7 +1036,7 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
                         (job_stats, complete)
                     };
                     merge_search_stats(&mut stats, job_stats);
-                    if shared.work.finish(complete) {
+                    if shared.work.finish(complete) && auxiliary_search_may_publish_proof(explicit_search_policy) {
                         shared.proved.store(true, Ordering::Release);
                         shared.stop();
                     }
@@ -977,10 +1080,13 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
         (options.probes > 0).then(|| (shared.probe_attempts.load(Ordering::Relaxed), shared.probe_unsat.load(Ordering::Relaxed)));
     let lns_stats = (options.lns > 0).then(|| (shared.lns_attempts.load(Ordering::Relaxed), shared.lns_improved.load(Ordering::Relaxed)));
     let best = shared.solution.lock().unwrap().clone();
+    let proved = shared.proved.load(Ordering::Acquire);
+    let certified_bound = proved && best.as_ref().is_some_and(|(_, value)| reaches_certified_bound(*value, certified_bound, minimizing));
     Ok(ParallelOutcome {
         best,
         stats,
-        proved: shared.proved.load(Ordering::Acquire),
+        proved,
+        certified_bound,
         shared_clauses: shared.clauses.len(),
         imported_clauses: shared.clauses.imported(),
         split_jobs,

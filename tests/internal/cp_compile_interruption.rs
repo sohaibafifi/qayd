@@ -3,10 +3,12 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use crate::constraints::table;
+use crate::engines::cp::portfolio::{audit_explicit_policy_proof_roles, audit_worker_model_fanout};
 use crate::model::{Automaton, CompiledCp, Constraint, IntExpr, IntGlobalConstraint, Mdd, MddArc, Model, Objective, Relation};
 use crate::orchestrator::{
-    audit_cp_root_problem_clones, audit_integer_warm_start_compile, audit_integer_warm_start_preflight, compile_cp_plan, solve_cp_plan,
-    IgnoreEvents, SolveBudget, SolveError, SolveLimits, SolveRequest, SolveStatus,
+    audit_cp_concurrent_bytes, audit_cp_root_problem_clones, audit_integer_warm_start_compile, audit_integer_warm_start_preflight,
+    audit_session_concurrent_bytes, compile_cp_plan, solve_cp_plan, CpControls, IgnoreEvents, SearchPhase, SearchPolicy, SolveBudget,
+    SolveError, SolveLimits, SolveMode, SolveRequest, SolveStatus, ValueSelector, VariableSelector,
 };
 use crate::problem::Objective as PhysicalObjective;
 use crate::Solver;
@@ -113,11 +115,70 @@ fn absent_search_guidance_stays_allocation_free() {
     let stop = AtomicBool::new(false);
     let compiled = CompiledCp::compile_interruptible(&model, &stop).unwrap().unwrap();
 
-    let (phase, branch_order, primary_branch_scope) = compiled.search_guidance_interruptible(&[], &[], None, &stop).unwrap().unwrap();
+    let (phase, branch_order, primary_branch_scope, search_phases) =
+        compiled.search_guidance_interruptible(&[], &[], None, &SearchPolicy::default(), &stop).unwrap().unwrap();
 
     assert!(phase.is_empty());
     assert!(branch_order.is_empty());
     assert!(primary_branch_scope.is_none());
+    assert!(search_phases.is_empty());
+}
+
+#[test]
+fn worker_problem_fanout_aborts_instead_of_launching_a_partial_portfolio() {
+    assert_eq!(audit_worker_model_fanout(4, None), (true, 3));
+    assert_eq!(audit_worker_model_fanout(4, Some(2)), (false, 2));
+    assert_eq!(audit_worker_model_fanout(4, Some(1)), (false, 1));
+}
+
+#[test]
+fn explicit_policy_split_keeps_worker_zero_as_the_complete_proof_authority() {
+    let (complete_workers, split_may_prove, probes_may_prove) = audit_explicit_policy_proof_roles(4);
+    assert_eq!(complete_workers, [true, false, false, false]);
+    assert!(!split_may_prove);
+    assert!(!probes_may_prove);
+
+    let mut model = Model::new();
+    let objective = model.int_range(0, 12);
+    model.add_objective(Objective::IntExpr { minimize: true, expr: IntExpr::Variable(objective) });
+    let request = SolveRequest {
+        mode: SolveMode::Exact,
+        threads: 2,
+        cp: CpControls { split: true, ..CpControls::default() },
+        search_policy: SearchPolicy::new(vec![SearchPhase::new(vec![objective.0], VariableSelector::FirstFail, ValueSelector::Max)]),
+        ..SolveRequest::default()
+    };
+    let budget = SolveBudget::new(None);
+    let plan = compile_cp_plan(&model, &request, &budget).unwrap();
+    let result = solve_cp_plan(&model, &plan, &request, &budget, &mut IgnoreEvents).unwrap();
+
+    assert_eq!(result.status(), SolveStatus::Optimal);
+    assert!(result.proof().is_some());
+    assert_eq!(result.primal().unwrap().objectives(), [0]);
+}
+
+#[test]
+fn cp_memory_counts_the_template_every_worker_and_the_retained_lexicographic_root() {
+    assert_eq!(audit_cp_concurrent_bytes(1_000, 37, SolveMode::Exact, 0, 4), 5_222);
+    assert_eq!(audit_cp_concurrent_bytes(1_000, 37, SolveMode::Exact, 2, 4), 6_222);
+    assert_eq!(audit_cp_concurrent_bytes(1_000, 37, SolveMode::LocalSearch, 2, 4), 5_222);
+    assert_eq!(audit_session_concurrent_bytes(1_000, 37, 4), 5_222);
+
+    let mut model = Model::new();
+    model.int_range(0, 10);
+    let compiled_bytes = CompiledCp::estimate_semantic_bytes_interruptible(&model, &AtomicBool::new(false)).unwrap();
+    let request = SolveRequest { mode: SolveMode::Exact, threads: 4, ..SolveRequest::default() };
+    let plan = compile_cp_plan(&model, &request, &SolveBudget::new(None)).unwrap();
+    let exact_limit = audit_cp_concurrent_bytes(compiled_bytes, 0, SolveMode::Exact, 0, 4);
+    assert_eq!(plan.estimated_backend_bytes(), exact_limit);
+
+    let accepted = SolveRequest { limits: SolveLimits { memory_bytes: Some(exact_limit), ..SolveLimits::default() }, ..request.clone() };
+    assert_eq!(compile_cp_plan(&model, &accepted, &SolveBudget::new(None)).unwrap().estimated_backend_bytes(), exact_limit);
+    let rejected = SolveRequest { limits: SolveLimits { memory_bytes: Some(exact_limit - 1), ..SolveLimits::default() }, ..request };
+    assert!(matches!(
+        compile_cp_plan(&model, &rejected, &SolveBudget::new(None)),
+        Err(SolveError::Compile(message)) if message.contains("memory limit")
+    ));
 }
 
 #[test]
@@ -230,10 +291,11 @@ fn optional_integer_warm_start_obeys_its_memory_allowance_and_prearmed_stop() {
     let cp_bytes = CompiledCp::estimate_semantic_bytes_interruptible(&model, &AtomicBool::new(false)).unwrap();
     let unlimited = compile_cp_plan(&model, &SolveRequest::default(), &SolveBudget::new(None)).unwrap();
     assert!(unlimited.estimated_backend_bytes() > cp_bytes, "the resident warm-start plan was not added to the CP estimate");
+    let exact_bytes = audit_cp_concurrent_bytes(cp_bytes, 0, SolveMode::Auto, 1, 1);
     let limited_request =
-        SolveRequest { limits: SolveLimits { memory_bytes: Some(cp_bytes), ..SolveLimits::default() }, ..SolveRequest::default() };
+        SolveRequest { limits: SolveLimits { memory_bytes: Some(exact_bytes), ..SolveLimits::default() }, ..SolveRequest::default() };
     let limited = compile_cp_plan(&model, &limited_request, &SolveBudget::new(None)).unwrap();
-    assert_eq!(limited.estimated_backend_bytes(), cp_bytes, "an optional warm start must be omitted when no memory remains");
+    assert_eq!(limited.estimated_backend_bytes(), exact_bytes, "an optional warm start must be omitted when no memory remains");
 }
 
 #[test]

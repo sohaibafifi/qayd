@@ -59,4 +59,15 @@ def test_solve_session_parallel_controls_are_typed():
     solve_session = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SolveSession")
     solve = next(node for node in solve_session.body if isinstance(node, ast.FunctionDef) and node.name == "solve")
     keyword_only = {argument.arg for argument in solve.args.kwonlyargs}
-    assert {"threads", "memory_limit_mb"} <= keyword_only
+    assert {"threads", "memory_limit_mb", "search_policy"} <= keyword_only
+
+
+def test_search_policy_symbols_are_exported_and_typed():
+    source = _STUB.read_text()
+    tree = ast.parse(source)
+    classes = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+    assert {"SearchPhase", "SearchPolicy"} <= classes
+
+    model = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Model")
+    solve = next(node for node in model.body if isinstance(node, ast.FunctionDef) and node.name == "solve")
+    assert "search_policy" in {argument.arg for argument in solve.args.kwonlyargs}

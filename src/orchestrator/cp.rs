@@ -72,17 +72,23 @@ pub(crate) struct CpSolvePlan {
     local_search: Option<integer::IntegerLocalSearchPlan>,
     integer_warm_start: Option<integer::IntegerWarmStartPlan>,
     estimated_backend_bytes: u64,
+    estimated_resident_bytes: u64,
     mode: SolveMode,
     guidance: SearchGuidance,
     assumptions: Vec<super::SemanticAssumption>,
     hints: Vec<(usize, i32)>,
     primary_branch_scope: Option<Vec<usize>>,
     branch_order: Vec<usize>,
+    search_policy: crate::search_policy::SearchPolicy,
 }
 
 impl CpSolvePlan {
     pub(crate) fn estimated_backend_bytes(&self) -> u64 {
         self.estimated_backend_bytes
+    }
+
+    pub(crate) fn estimated_resident_bytes(&self) -> u64 {
+        self.estimated_resident_bytes
     }
 
     pub(crate) fn engine(&self) -> EngineKind {
@@ -105,6 +111,45 @@ pub(crate) fn compile_cp_plan(model: &Model, request: &SolveRequest, budget: &So
 /// checked integer references, so they preserve the validated model invariants.
 pub(crate) fn compile_cp_plan_validated(model: &Model, request: &SolveRequest, budget: &SolveBudget) -> Result<CpSolvePlan, SolveError> {
     compile_cp_plan_inner(model, request, budget, true)
+}
+
+fn scaled_bytes(bytes: u64, copies: usize) -> u64 {
+    bytes.saturating_mul(u64::try_from(copies).unwrap_or(u64::MAX))
+}
+
+fn cp_problem_copies(mode: SolveMode, objective_tiers: usize, workers: usize) -> usize {
+    // The compiled template stays resident while one physical Problem is owned
+    // by every worker. A non-final lexicographic tier also retains the mutable
+    // prefix root used to prepare the next tier.
+    1usize.saturating_add(workers).saturating_add(usize::from(mode != SolveMode::LocalSearch && objective_tiers > 1))
+}
+
+fn cp_concurrent_bytes(
+    compiled_bytes: u64,
+    guidance_bytes: u64,
+    worker_plan_bytes: u64,
+    resident_plan_bytes: u64,
+    mode: SolveMode,
+    objective_tiers: usize,
+    workers: usize,
+) -> u64 {
+    scaled_bytes(compiled_bytes, cp_problem_copies(mode, objective_tiers, workers))
+        // CpSolvePlan retains the compiled guidance, the active portfolio owns
+        // one clone, and every search driver owns its phase vectors.
+        .saturating_add(scaled_bytes(guidance_bytes, workers.saturating_add(2)))
+        .saturating_add(scaled_bytes(worker_plan_bytes, workers))
+        .saturating_add(resident_plan_bytes)
+}
+
+#[cfg(test)]
+pub(crate) fn audit_cp_concurrent_bytes(
+    compiled_bytes: u64,
+    guidance_bytes: u64,
+    mode: SolveMode,
+    objective_tiers: usize,
+    workers: usize,
+) -> u64 {
+    cp_concurrent_bytes(compiled_bytes, guidance_bytes, 0, 0, mode, objective_tiers, workers)
 }
 
 fn compile_cp_plan_inner(
@@ -164,11 +209,18 @@ fn compile_cp_plan_inner(
     } else {
         0
     };
-    let estimated_per_worker_bytes = estimated_backend_bytes.saturating_add(estimated_local_search_bytes);
-    let estimated_concurrent_bytes = estimated_per_worker_bytes.saturating_mul(u64::try_from(request.threads).unwrap_or(u64::MAX));
+    let estimated_concurrent_bytes = cp_concurrent_bytes(
+        estimated_backend_bytes,
+        0,
+        estimated_local_search_bytes,
+        0,
+        request.mode,
+        model.objectives().len(),
+        request.threads,
+    );
     if request.limits.memory_bytes.is_some_and(|memory| estimated_concurrent_bytes > memory) {
         return Err(SolveError::Compile(format!(
-            "estimated CP backend and local-search plan require {estimated_concurrent_bytes} bytes across concurrent workers, above the memory limit"
+            "estimated CP backend template, worker problems, and local-search plans require {estimated_concurrent_bytes} bytes at peak, above the memory limit"
         )));
     }
     if budget.expired() {
@@ -201,11 +253,28 @@ fn compile_cp_plan_inner(
     .map_err(|error| SolveError::Compile(error.reason))?
     .ok_or_else(|| SolveError::Interrupted("solve budget expired during CP compilation".to_string()))?;
     validate_cp_controls(&compiled, request)?;
-    let thread_count = u64::try_from(request.threads).unwrap_or(u64::MAX).max(1);
-    let per_worker_memory = request.limits.memory_bytes.map_or(u64::MAX, |memory| memory / thread_count);
-    let mut resident_bytes = compiled.estimated_bytes();
+    let (initial_phase, branch_order, primary_branch_scope, search_phases) = compiled
+        .search_guidance_interruptible(
+            &request.hints,
+            &request.branch_order,
+            request.primary_branch_scope.as_deref(),
+            &request.search_policy,
+            budget.stop(),
+        )
+        .map_err(|error| SolveError::InvalidRequest(error.reason))?
+        .ok_or_else(|| SolveError::Interrupted("solve budget expired during CP search-guidance compilation".to_string()))?;
+    let guidance = SearchGuidance { initial_phase, branch_order, primary_branch_scope, search_phases, linear: None };
+    let guidance_bytes = guidance.estimated_bytes();
+    let base_bytes =
+        cp_concurrent_bytes(compiled.estimated_bytes(), guidance_bytes, 0, 0, request.mode, compiled.objectives().len(), request.threads);
+    if request.limits.memory_bytes.is_some_and(|memory| base_bytes > memory) {
+        return Err(SolveError::Compile(format!(
+            "estimated CP backend template, worker problems, retained lexicographic root, and search guidance require {base_bytes} bytes at peak, above the memory limit"
+        )));
+    }
     let local_search = if request.mode == SolveMode::LocalSearch {
-        let allowance = per_worker_memory.saturating_sub(resident_bytes);
+        let remaining = request.limits.memory_bytes.map_or(u64::MAX, |memory| memory.saturating_sub(base_bytes));
+        let allowance = remaining / u64::try_from(request.threads).unwrap_or(u64::MAX).max(1);
         let Some(plan) = integer::compile_interruptible(effective, &compiled, budget.stop(), allowance)? else {
             if budget.expired() {
                 return Err(SolveError::Interrupted("solve budget expired during integer local-search compilation".to_string()));
@@ -214,7 +283,6 @@ fn compile_cp_plan_inner(
                 "estimated integer local-search plan exceeds the remaining per-worker memory allowance".to_string(),
             ));
         };
-        resident_bytes = resident_bytes.saturating_add(plan.estimated_bytes);
         Some(plan)
     } else {
         None
@@ -226,37 +294,70 @@ fn compile_cp_plan_inner(
         && request.assumptions.is_empty()
         && request.hints.is_empty()
         && request.primary_branch_scope.is_none()
-        && request.branch_order.is_empty();
+        && request.branch_order.is_empty()
+        && request.search_policy.is_auto();
+    let worker_plan_bytes = local_search.as_ref().map_or(0, |plan| plan.estimated_bytes);
+    let bytes_before_warm_start = cp_concurrent_bytes(
+        compiled.estimated_bytes(),
+        guidance_bytes,
+        worker_plan_bytes,
+        0,
+        request.mode,
+        compiled.objectives().len(),
+        request.threads,
+    );
     let integer_warm_start = if warm_start_eligible {
-        let allowance = per_worker_memory.saturating_sub(resident_bytes);
+        let allowance = request.limits.memory_bytes.map_or(u64::MAX, |memory| memory.saturating_sub(bytes_before_warm_start));
         budget.warm_start_stop().and_then(|warm_stop| {
             let warm = integer::compile_warm_start(effective, &compiled, allowance, warm_stop.flag());
-            resident_bytes = resident_bytes.saturating_add(warm.estimated_bytes);
-            warm.plan
+            warm.plan.map(|plan| (plan, warm.estimated_bytes))
         })
     } else {
         None
     };
-    let (initial_phase, branch_order, primary_branch_scope) = compiled
-        .search_guidance_interruptible(&request.hints, &request.branch_order, request.primary_branch_scope.as_deref(), budget.stop())
-        .map_err(|error| SolveError::InvalidRequest(error.reason))?
-        .ok_or_else(|| SolveError::Interrupted("solve budget expired during CP search-guidance compilation".to_string()))?;
+    let resident_plan_bytes = integer_warm_start.as_ref().map_or(0, |(_, bytes)| *bytes);
+    let estimated_backend_bytes = cp_concurrent_bytes(
+        compiled.estimated_bytes(),
+        guidance_bytes,
+        worker_plan_bytes,
+        resident_plan_bytes,
+        request.mode,
+        compiled.objectives().len(),
+        request.threads,
+    );
+    if request.limits.memory_bytes.is_some_and(|memory| estimated_backend_bytes > memory) {
+        return Err(SolveError::Compile(format!(
+            "estimated CP backend template, worker problems, retained lexicographic root, and compiled plans require {estimated_backend_bytes} bytes at peak, above the memory limit"
+        )));
+    }
+    let estimated_resident_bytes =
+        compiled.estimated_bytes().saturating_add(guidance_bytes).saturating_add(worker_plan_bytes).saturating_add(resident_plan_bytes);
     Ok(CpSolvePlan {
         compiled,
         local_search,
-        integer_warm_start,
-        estimated_backend_bytes: resident_bytes,
+        integer_warm_start: integer_warm_start.map(|(plan, _)| plan),
+        estimated_backend_bytes,
+        estimated_resident_bytes,
         mode: request.mode,
-        guidance: SearchGuidance { initial_phase, branch_order, primary_branch_scope, linear: None },
+        guidance,
         assumptions: request.assumptions.clone(),
         hints: request.hints.clone(),
         primary_branch_scope: request.primary_branch_scope.clone(),
         branch_order: request.branch_order.clone(),
+        search_policy: request.search_policy.clone(),
     })
 }
 
 fn validate_cp_controls(compiled: &CompiledCp, request: &SolveRequest) -> Result<(), SolveError> {
     let controls = request.cp;
+    if controls.no_learn_csp
+        && request.search_policy.phases().iter().any(|phase| phase.variable_selector() == crate::search_policy::VariableSelector::Activity)
+    {
+        return Err(SolveError::InvalidRequest(
+            "an Activity search phase cannot be combined with no_learn_csp because variable activity requires the exact CDCL driver"
+                .to_string(),
+        ));
+    }
     let cooperative_roles = controls.split || controls.probes > 0 || controls.lns > 0;
     if request.limits.conflicts.is_some() && cooperative_roles {
         return Err(SolveError::InvalidRequest("a total conflict limit cannot be combined with split, probe, or LNS workers".to_string()));
@@ -327,9 +428,11 @@ fn solve_cp_plan_inner(
         || request.hints != plan.hints
         || request.primary_branch_scope != plan.primary_branch_scope
         || request.branch_order != plan.branch_order
+        || request.search_policy != plan.search_policy
     {
         return Err(SolveError::InvalidRequest(
-            "assumptions, hints, primary_branch_scope, and branch_order must match the request used to compile the CP plan".to_string(),
+            "assumptions, hints, primary_branch_scope, branch_order, and search_policy must match the request used to compile the CP plan"
+                .to_string(),
         ));
     }
     if request.mode != plan.mode {
@@ -609,6 +712,8 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
     let mut stopped_tier = None;
     let mut conflict_limit_reached = false;
     let mut linear_backends = std::collections::BTreeSet::new();
+    let mut proof_methods = Vec::with_capacity(objective_count);
+    let mut used_certified_bound = false;
 
     for (tier, objective) in compiled.objectives().iter().enumerate() {
         if engine_stop.load(std::sync::atomic::Ordering::Acquire) || remaining_conflicts == Some(0) {
@@ -759,6 +864,7 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
         if let (Some((_, value)), Some(bound)) = (&outcome.best, relaxation.bound) {
             let reaches_bound = if objective.minimizing() { *value <= bound } else { *value >= bound };
             outcome.proved |= reaches_bound;
+            outcome.certified_bound |= reaches_bound;
         }
 
         merge_search_stats(&mut total_stats, relaxation.stats);
@@ -808,10 +914,18 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
             }
             (Some((_, value)), true) if tier_candidate.is_some() => {
                 proven_prefix.push(*value);
-                upsert_bound(
-                    &mut bounds,
-                    Bound { tier, value: *value, method: format!("complete CP search for lexicographic tier {tier}") },
-                );
+                let method = if outcome.certified_bound {
+                    used_certified_bound = true;
+                    bounds
+                        .iter()
+                        .find(|bound| bound.tier == tier && bound.value == *value)
+                        .map(|bound| bound.method.clone())
+                        .unwrap_or_else(|| format!("certified dual bound for lexicographic tier {tier}"))
+                } else {
+                    format!("complete CP search for lexicographic tier {tier}")
+                };
+                proof_methods.push(method.clone());
+                upsert_bound(&mut bounds, Bound { tier, value: *value, method });
                 if final_tier {
                     complete = true;
                     break;
@@ -851,7 +965,11 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
     } else {
         SolveStatus::Unknown
     };
-    let proof = completion_proof(status, objective_count, complete);
+    let proof = if complete && used_certified_bound {
+        Some(ProofClaim::certified_bounds(EngineKind::IntegerExact, proof_methods, objective_count)?)
+    } else {
+        completion_proof(status, objective_count, complete)
+    };
     let message = stopped_tier.map(|tier| {
         let reason = if conflict_limit_reached { TerminationReason::ConflictLimit } else { budget.termination_reason() };
         format!("CP lexicographic search stopped before proving tier {tier}: {reason:?}")

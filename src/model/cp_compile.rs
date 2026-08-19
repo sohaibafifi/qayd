@@ -10,12 +10,13 @@ use crate::constraints::{
 use crate::expr::Expr;
 use crate::ids::VarId;
 use crate::problem::{Objective as PhysicalObjective, Problem};
+use crate::search_policy::{CompiledSearchPhase, SearchPolicy};
 use crate::Solver;
 
 use super::{Constraint, IntDomain, IntExpr, IntGlobalConstraint, IntVarRef, Model, Objective, Relation, SetVarRef};
 
 type CompileStep<T> = Result<Option<T>, CpCompileError>;
-type SearchGuidanceParts = (Vec<Option<i32>>, Vec<VarId>, Option<Vec<VarId>>);
+type SearchGuidanceParts = (Vec<Option<i32>>, Vec<VarId>, Option<Vec<VarId>>, Vec<CompiledSearchPhase>);
 type DivisibilityKey = (IntVarRef, IntVarRef);
 type DivisibilityGroups = BTreeMap<DivisibilityKey, BTreeSet<i64>>;
 type PrefixSetKey = (IntVarRef, Vec<i32>);
@@ -612,13 +613,14 @@ impl CompiledCp {
         hints: &[(usize, i32)],
         branch_order: &[usize],
         primary_branch_scope: Option<&[usize]>,
+        search_policy: &SearchPolicy,
         stop: &AtomicBool,
     ) -> CompileStep<SearchGuidanceParts> {
         if interrupted(stop) {
             return Ok(None);
         }
-        if hints.is_empty() && branch_order.is_empty() && primary_branch_scope.is_none() {
-            return Ok(Some((Vec::new(), Vec::new(), None)));
+        if hints.is_empty() && branch_order.is_empty() && primary_branch_scope.is_none() && search_policy.is_auto() {
+            return Ok(Some((Vec::new(), Vec::new(), None, Vec::new())));
         }
         let mut phase = if hints.is_empty() { Vec::new() } else { vec![None; self.problem.solver.store.num_vars()] };
         let mut seen_hints = BTreeSet::new();
@@ -680,7 +682,44 @@ impl CompiledCp {
                     .ok_or_else(|| CpCompileError::new(format!("branch_order references unknown integer variable {index}")))?,
             );
         }
-        Ok(Some((phase, order, primary_scope)))
+        let mut policy_variables = BTreeSet::new();
+        let mut physical_phases = Vec::with_capacity(search_policy.phases().len());
+        if !search_policy.is_auto() {
+            for (phase_index, search_phase) in search_policy.phases().iter().enumerate() {
+                if interrupted(stop) {
+                    return Ok(None);
+                }
+                if search_phase.scope().is_empty() {
+                    return Err(CpCompileError::new(format!("search policy phase {phase_index} has an empty variable scope")));
+                }
+                let mut scope = Vec::with_capacity(search_phase.scope().len());
+                let mut semantic_salts = Vec::with_capacity(search_phase.scope().len());
+                for (&index, &semantic_key) in search_phase.scope().iter().zip(search_phase.semantic_keys()) {
+                    if interrupted(stop) {
+                        return Ok(None);
+                    }
+                    if !policy_variables.insert(index) {
+                        return Err(CpCompileError::new(format!(
+                            "search policy variable {index} appears in more than one phase or more than once in one phase"
+                        )));
+                    }
+                    scope.push(
+                        self.int_variables
+                            .get(index)
+                            .copied()
+                            .ok_or_else(|| CpCompileError::new(format!("search policy references unknown integer variable {index}")))?,
+                    );
+                    semantic_salts.push(u64::try_from(semantic_key).unwrap_or(u64::MAX));
+                }
+                physical_phases.push(CompiledSearchPhase {
+                    scope,
+                    semantic_salts,
+                    variable: search_phase.variable_selector(),
+                    value: search_phase.value_selector(),
+                });
+            }
+        }
+        Ok(Some((phase, order, primary_scope, physical_phases)))
     }
 
     pub(crate) fn decode(&self, values: &[i32]) -> Result<DecodedCpAssignment, String> {

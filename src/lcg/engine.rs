@@ -17,6 +17,7 @@ use crate::lcg::trail::{Cdcl, Reason};
 use crate::lcg::view::Tri;
 use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::search::{Objective, SearchControl, SharedObjectiveBound, SolveStats};
+use crate::search_policy::{ValueSelector, VariableSelector};
 use crate::store::{Premise, Solver, Store};
 
 /// One in every `REPHASE_PERIOD` restart segments rephases (ignores saved phases
@@ -448,6 +449,13 @@ pub(crate) enum AssumptionOutcome {
     Interrupted,
 }
 
+#[derive(Clone, Copy)]
+struct SearchDecision {
+    variable: VarId,
+    value: ValueSelector,
+    semantic_salt: u64,
+}
+
 impl Cdcl<'_> {
     /// Branching heuristic: unfixed variable minimising `size / (wdeg + activity)`
     /// (dom/wdeg combined with VSIDS activity), or `None` if all fixed.
@@ -484,6 +492,53 @@ impl Cdcl<'_> {
         best_objective.or(best)
     }
 
+    fn select_var_with(&self, vars: &[VarId], selector: VariableSelector, objective: Option<&ObjectiveImpact>) -> Option<VarId> {
+        match selector {
+            VariableSelector::Auto => self.select_var(vars, objective),
+            VariableSelector::InputOrder => vars.iter().copied().find(|&variable| self.solver.store.size(variable) > 1),
+            VariableSelector::FirstFail => vars
+                .iter()
+                .copied()
+                .filter(|&variable| self.solver.store.size(variable) > 1)
+                .min_by_key(|&variable| self.solver.store.size(variable)),
+            VariableSelector::DomWdeg => {
+                let mut best = None;
+                let mut best_size = 0usize;
+                let mut best_weight = 1u64;
+                for &variable in vars {
+                    let size = self.solver.store.size(variable);
+                    if size <= 1 {
+                        continue;
+                    }
+                    let weight = self.solver.store.var_weight_cached(variable);
+                    let improves = best.is_none()
+                        || (size as u128).saturating_mul(best_weight as u128) < (best_size as u128).saturating_mul(weight as u128);
+                    if improves {
+                        best = Some(variable);
+                        best_size = size;
+                        best_weight = weight;
+                    }
+                }
+                best
+            }
+            VariableSelector::Activity => {
+                let mut best = None;
+                let mut best_activity = f64::NEG_INFINITY;
+                for &variable in vars {
+                    if self.solver.store.size(variable) <= 1 {
+                        continue;
+                    }
+                    let activity = self.activity[variable.index()];
+                    if best.is_none() || activity > best_activity {
+                        best = Some(variable);
+                        best_activity = activity;
+                    }
+                }
+                best
+            }
+        }
+    }
+
     /// Select from the semantic primary scope until it is exhausted, then
     /// complete the full assignment. Explicit branch order is evaluated only
     /// inside the active phase, so it cannot pull a completion variable ahead
@@ -500,6 +555,40 @@ impl Cdcl<'_> {
             }
         }
         self.select_var(vars, objective)
+    }
+
+    /// Select from every explicit phase in order, then fall back to the legacy
+    /// policy over the complete physical assignment. Returning `None` therefore
+    /// means that every physical search variable is fixed, never merely that a
+    /// semantic phase is exhausted.
+    fn select_search_decision(
+        &self,
+        vars: &[VarId],
+        primary_branch_scope: Option<&[VarId]>,
+        objective: Option<&ObjectiveImpact>,
+    ) -> Option<SearchDecision> {
+        if !self.search_phases.is_empty() {
+            for phase in &self.search_phases {
+                if let Some(variable) = self.select_var_with(&phase.scope, phase.variable, objective) {
+                    let position = phase
+                        .scope
+                        .iter()
+                        .position(|&candidate| candidate == variable)
+                        .expect("a selected phase variable belongs to that phase");
+                    return Some(SearchDecision { variable, value: phase.value, semantic_salt: phase.semantic_salts[position] });
+                }
+            }
+            return self.select_var(vars, objective).map(|variable| SearchDecision {
+                variable,
+                value: ValueSelector::Auto,
+                semantic_salt: 0,
+            });
+        }
+        self.select_branch_var(vars, primary_branch_scope, objective).map(|variable| SearchDecision {
+            variable,
+            value: ValueSelector::Auto,
+            semantic_salt: 0,
+        })
     }
 
     /// The decision literal for `v`: `[v = p]` toward the saved phase `p` when it
@@ -532,6 +621,61 @@ impl Cdcl<'_> {
                 unreachable!("an unfixed variable has a real equality atom for an in-domain value")
             }
         }
+    }
+
+    fn selected_decision_lit(
+        &self,
+        decision: SearchDecision,
+        phase: &[Option<i32>],
+        objective: Option<&ObjectiveImpact>,
+        honor_directionless_phase: bool,
+    ) -> Lit {
+        let variable = decision.variable;
+        let value = match decision.value {
+            ValueSelector::Auto => {
+                return self.decision_lit_with_policy(variable, phase, objective, honor_directionless_phase);
+            }
+            ValueSelector::Min => self.solver.store.min(variable),
+            ValueSelector::Max => self.solver.store.max(variable),
+            ValueSelector::Median => {
+                let min = i64::from(self.solver.store.min(variable));
+                let max = i64::from(self.solver.store.max(variable));
+                let midpoint = (min + (max - min + 1) / 2) as i32;
+                self.solver.store.ceiling_value(variable, midpoint).unwrap_or_else(|| self.solver.store.max(variable))
+            }
+            ValueSelector::RandomSeeded => self.seeded_domain_value(variable, decision.semantic_salt),
+            ValueSelector::Hint => phase
+                .get(variable.index())
+                .copied()
+                .flatten()
+                .filter(|&hint| self.solver.store.contains(variable, hint))
+                .unwrap_or_else(|| self.rephase_value(variable, objective)),
+        };
+        match self.atoms.eq(variable, value) {
+            LitOrConst::Lit(literal) => literal,
+            LitOrConst::True | LitOrConst::False => {
+                unreachable!("an unfixed variable has a real equality atom for an in-domain selected value")
+            }
+        }
+    }
+
+    fn seeded_domain_value(&self, variable: VarId, semantic_salt: u64) -> i32 {
+        let variable_salt = semantic_salt.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let random = mix64(self.seed ^ variable_salt);
+        let size = self.solver.store.size(variable);
+        if size <= MAX_ENUMERATED_RANDOM_DOMAIN {
+            return self
+                .solver
+                .store
+                .values(variable)
+                .nth((random % size as u64) as usize)
+                .expect("seeded branch value index is inside the domain");
+        }
+        let min = self.solver.store.min(variable);
+        let max = self.solver.store.max(variable);
+        let span = (i64::from(max) - i64::from(min) + 1) as u64;
+        let target = (i64::from(min) + (random % span) as i64) as i32;
+        self.solver.store.ceiling_value(variable, target).unwrap_or(min)
     }
 
     /// The domain endpoint to branch to when no saved phase applies: the
@@ -633,7 +777,14 @@ impl Cdcl<'_> {
         F: FnMut(&Solver) -> SearchControl,
     {
         let mut stats = SolveStats::default();
-        if !self.init() || !self.root_probe(primary_branch_scope.unwrap_or(vars)) {
+        if !self.init() {
+            stats.failures = self.conflicts;
+            self.copy_inprocessing_stats(&mut stats);
+            return stats;
+        }
+        let policy_probe_scope = self.search_phases.first().map(|phase| phase.scope.clone());
+        let probe_scope = policy_probe_scope.as_deref().or(primary_branch_scope).unwrap_or(vars);
+        if !self.root_probe(probe_scope) {
             stats.failures = self.conflicts;
             self.copy_inprocessing_stats(&mut stats);
             return stats; // root unsatisfiable
@@ -645,7 +796,7 @@ impl Cdcl<'_> {
             }
             match self.propagate() {
                 Ok(()) if self.stopped() => break,
-                Ok(()) => match self.select_branch_var(vars, primary_branch_scope, None) {
+                Ok(()) => match self.select_search_decision(vars, primary_branch_scope, None) {
                     None => {
                         // Full assignment.
                         for &v in vars {
@@ -659,9 +810,9 @@ impl Cdcl<'_> {
                             break; // whole search space explored
                         }
                     }
-                    Some(v) => {
+                    Some(decision) => {
                         stats.nodes += 1;
-                        let lit = self.decision_lit(v, &phase, None);
+                        let lit = self.selected_decision_lit(decision, &phase, None, false);
                         self.decide(lit).expect("in-domain decision cannot fail");
                     }
                 },
@@ -825,9 +976,16 @@ impl Cdcl<'_> {
         if self.stopped() || !self.init() || !self.assume_cube(cube) || self.stopped() {
             return None;
         }
-        let phase = vec![None; self.solver.store.num_vars()];
-        let split_scope = primary_branch_scope.unwrap_or(vars);
-        self.select_var(split_scope, None).map(|v| self.decision_lit(v, &phase, None))
+        let phase = if self.initial_phase.len() == self.solver.store.num_vars() {
+            self.initial_phase.clone()
+        } else {
+            vec![None; self.solver.store.num_vars()]
+        };
+        if self.search_phases.is_empty() {
+            return self.select_var(primary_branch_scope.unwrap_or(vars), None).map(|variable| self.decision_lit(variable, &phase, None));
+        }
+        self.select_search_decision(vars, primary_branch_scope, None)
+            .map(|decision| self.selected_decision_lit(decision, &phase, None, false))
     }
 
     /// Find one solution under an optimistic objective bound.
@@ -846,7 +1004,11 @@ impl Cdcl<'_> {
             self.copy_inprocessing_stats(&mut stats);
             return (None, stats, !self.stopped());
         }
-        let phase = vec![None; self.solver.store.num_vars()];
+        let phase = if self.initial_phase.len() == self.solver.store.num_vars() {
+            self.initial_phase.clone()
+        } else {
+            vec![None; self.solver.store.num_vars()]
+        };
         let mut complete = true;
         let found = loop {
             if stop.load(Ordering::Relaxed) {
@@ -859,7 +1021,7 @@ impl Cdcl<'_> {
                 }
                 break None;
             }
-            match self.select_branch_var(vars, primary_branch_scope, None) {
+            match self.select_search_decision(vars, primary_branch_scope, None) {
                 None => {
                     if self.stopped() {
                         complete = false;
@@ -870,9 +1032,9 @@ impl Cdcl<'_> {
                     let assignment = vars.iter().map(|&v| self.solver.store.value(v)).collect();
                     break Some((assignment, value));
                 }
-                Some(v) => {
+                Some(decision) => {
                     stats.nodes += 1;
-                    let lit = self.decision_lit(v, &phase, None);
+                    let lit = self.selected_decision_lit(decision, &phase, None, false);
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
                         if self.stopped() {
@@ -1105,7 +1267,7 @@ impl Cdcl<'_> {
             // supplied an incumbent and therefore a useful objective bound.
             let active_objective =
                 objective_impact.as_ref().filter(|impact| !impact.defer_until_incumbent || best.is_some() || enforced.is_some());
-            match self.select_branch_var(vars, primary_branch_scope, active_objective) {
+            match self.select_search_decision(vars, primary_branch_scope, active_objective) {
                 None => {
                     if self.stopped() {
                         complete = false;
@@ -1164,9 +1326,9 @@ impl Cdcl<'_> {
                         }
                     }
                 }
-                Some(v) => {
+                Some(decision) => {
                     stats.nodes += 1;
-                    let lit = self.decision_lit_with_policy(v, &phase, active_objective, guarded_hint_restart.is_some());
+                    let lit = self.selected_decision_lit(decision, &phase, active_objective, guarded_hint_restart.is_some());
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
                         if self.stopped() || self.conflict_budget_exhausted() {
@@ -1192,7 +1354,14 @@ impl Cdcl<'_> {
         stop: &AtomicBool,
     ) -> (Option<Vec<i32>>, SolveStats, bool) {
         let mut stats = SolveStats::default();
-        if !self.init() || !self.root_probe(primary_branch_scope.unwrap_or(vars)) || !self.sync_shared_clauses() {
+        if !self.init() {
+            stats.failures = self.conflicts;
+            self.copy_inprocessing_stats(&mut stats);
+            return (None, stats, !self.stopped());
+        }
+        let policy_probe_scope = self.search_phases.first().map(|phase| phase.scope.clone());
+        let probe_scope = policy_probe_scope.as_deref().or(primary_branch_scope).unwrap_or(vars);
+        if !self.root_probe(probe_scope) || !self.sync_shared_clauses() {
             stats.failures = self.conflicts;
             self.copy_inprocessing_stats(&mut stats);
             return (None, stats, !self.stopped());
@@ -1212,7 +1381,7 @@ impl Cdcl<'_> {
                 }
                 break None;
             }
-            match self.select_branch_var(vars, primary_branch_scope, None) {
+            match self.select_search_decision(vars, primary_branch_scope, None) {
                 None => {
                     if self.stopped() {
                         complete = false;
@@ -1221,9 +1390,9 @@ impl Cdcl<'_> {
                     stats.solutions += 1;
                     break Some(vars.iter().map(|&v| self.solver.store.value(v)).collect());
                 }
-                Some(v) => {
+                Some(decision) => {
                     stats.nodes += 1;
-                    let lit = self.decision_lit(v, &self.saved_phase, None);
+                    let lit = self.selected_decision_lit(decision, &self.saved_phase, None, false);
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
                         if self.stopped() {
@@ -1269,7 +1438,7 @@ impl Cdcl<'_> {
                 complete = !self.stopped() && !self.conflict_budget_exhausted();
                 break None;
             }
-            match self.select_branch_var(vars, primary_branch_scope, None) {
+            match self.select_search_decision(vars, primary_branch_scope, None) {
                 None => {
                     if self.stopped() {
                         complete = false;
@@ -1278,9 +1447,9 @@ impl Cdcl<'_> {
                     stats.solutions += 1;
                     break Some(vars.iter().map(|&v| self.solver.store.value(v)).collect());
                 }
-                Some(v) => {
+                Some(decision) => {
                     stats.nodes += 1;
-                    let lit = self.decision_lit(v, &self.saved_phase, None);
+                    let lit = self.selected_decision_lit(decision, &self.saved_phase, None, false);
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
                         complete = !self.stopped() && !self.conflict_budget_exhausted();
@@ -1354,11 +1523,11 @@ impl Cdcl<'_> {
             // Phase 2: assumptions all satisfied, branch for a model. A conflict
             // that refutes the cube backjumps below `cube.len()`, re-entering
             // Phase 1 where `analyze_final` catches the now-false assumption.
-            match self.select_var(vars, None) {
+            match self.select_search_decision(vars, None, None) {
                 None if self.stopped() => return AssumptionOutcome::Interrupted,
                 None => return AssumptionOutcome::Sat(vars.iter().map(|&v| self.solver.store.value(v)).collect()),
-                Some(v) => {
-                    let lit = self.decision_lit(v, &self.saved_phase, None);
+                Some(decision) => {
+                    let lit = self.selected_decision_lit(decision, &self.saved_phase, None, false);
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
                         self.backjump_to(0);

@@ -17,6 +17,7 @@ use crate::lcg::lit::{AtomKind, LazyAtomRegistry, Lit, LitOrConst};
 use crate::lcg::trail::Cdcl;
 use crate::lcg::view::Tri;
 use crate::propagator::Inconsistency;
+use crate::search_policy::CompiledSearchPhase;
 use crate::store::{Solver, Store};
 
 /// A stop flag that is never set; used by the non-interruptible entry points.
@@ -419,9 +420,25 @@ pub(crate) fn solve_interruptible_seeded_with_scope<F>(
 where
     F: FnMut(&Solver) -> SearchControl,
 {
+    solve_interruptible_seeded_with_scope_and_phases(solver, vars, primary_branch_scope, Vec::new(), on_solution, stop, seed)
+}
+
+pub(crate) fn solve_interruptible_seeded_with_scope_and_phases<F>(
+    solver: &mut Solver,
+    vars: &[VarId],
+    primary_branch_scope: Option<&[VarId]>,
+    search_phases: Vec<CompiledSearchPhase>,
+    on_solution: F,
+    stop: &AtomicBool,
+    seed: u64,
+) -> SolveStats
+where
+    F: FnMut(&Solver) -> SearchControl,
+{
     let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, None) else {
         return SolveStats::default();
     };
+    cdcl.search_phases = search_phases;
     cdcl.enumerate(vars, primary_branch_scope, on_solution, stop)
 }
 
@@ -439,6 +456,7 @@ pub(crate) fn decide_sat_assuming_seeded_with_scope(
     conflict_budget: Option<u64>,
     initial_phase: Vec<Option<i32>>,
     branch_order: Vec<VarId>,
+    search_phases: Vec<CompiledSearchPhase>,
 ) -> (Option<Vec<i32>>, SolveStats, bool) {
     let lazy_atoms = clause_sharing.as_ref().map(ClauseSharing::lazy_atoms);
     let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, lazy_atoms) else {
@@ -452,6 +470,7 @@ pub(crate) fn decide_sat_assuming_seeded_with_scope(
     }
     cdcl.initial_phase = initial_phase;
     cdcl.branch_order = branch_order;
+    cdcl.search_phases = search_phases;
     cdcl.decide_sat_assuming(vars, primary_branch_scope, &cube, conflict_budget, stop)
 }
 
@@ -478,6 +497,7 @@ pub(crate) fn decide_sat_assuming_seeded(
         conflict_budget,
         initial_phase,
         branch_order,
+        Vec::new(),
     )
 }
 
@@ -786,24 +806,21 @@ fn lit_is_logically_positive(cdcl: &Cdcl<'_>, lit: Lit) -> bool {
 }
 
 /// Find one solution by non-learning chronological DFS, or report exhaustion.
-/// Returns `(solution, stats, complete)`, where `complete` is `true` unless the
-/// search was interrupted. Run as a diversified portfolio worker alongside the
-/// learning [`decide_sat_shared_seeded`]: plain DFS wins on instances (e.g.
-/// highly symmetric ones, such as graph colouring) where clause learning thrashes.
-/// Exhaust `primary_branch_scope`, when present, before the remaining
-/// completion variables while retaining chronological DFS.
-pub(crate) fn find_one_seeded_with_scope(
+/// Ordered phases are exhausted before the mandatory complete fallback.
+pub(crate) fn find_one_seeded_with_scope_and_phases(
     solver: &mut Solver,
     vars: &[VarId],
     primary_branch_scope: Option<&[VarId]>,
+    search_phases: Vec<CompiledSearchPhase>,
     stop: &AtomicBool,
     seed: u64,
 ) -> (Option<Vec<i32>>, SolveStats, bool) {
     let mut found = None;
-    let stats = solve_interruptible_seeded_with_scope(
+    let stats = solve_interruptible_seeded_with_scope_and_phases(
         solver,
         vars,
         primary_branch_scope,
+        search_phases,
         |s| {
             found = Some(vars.iter().map(|&v| s.store.value(v)).collect::<Vec<_>>());
             SearchControl::Stop
@@ -1083,6 +1100,7 @@ pub(crate) fn optimize_seeded_with_scope(
         conflict_budget,
         initial_phase,
         branch_order,
+        Vec::new(),
         None,
         on_improve,
     )
@@ -1103,6 +1121,7 @@ pub(crate) fn optimize_seeded_with_scope_and_relaxation(
     conflict_budget: Option<u64>,
     initial_phase: Vec<Option<i32>>,
     branch_order: Vec<VarId>,
+    search_phases: Vec<CompiledSearchPhase>,
     relaxation: Option<SearchRelaxationTemplate>,
     on_improve: impl FnMut(i64, &[i32]),
 ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
@@ -1115,6 +1134,7 @@ pub(crate) fn optimize_seeded_with_scope_and_relaxation(
     }
     cdcl.initial_phase = initial_phase;
     cdcl.branch_order = branch_order;
+    cdcl.search_phases = search_phases;
     let mut relaxation: Option<SearchRelaxation> = relaxation.map(|template| template.start());
     let mut result = cdcl.optimize(
         vars,
@@ -1211,6 +1231,7 @@ pub(crate) fn optimize_assuming_seeded_with_scope(
         conflict_budget,
         initial_phase,
         branch_order,
+        Vec::new(),
         None,
         on_improve,
     )
@@ -1233,6 +1254,7 @@ pub(crate) fn optimize_assuming_seeded_with_scope_and_relaxation(
     conflict_budget: Option<u64>,
     initial_phase: Vec<Option<i32>>,
     branch_order: Vec<VarId>,
+    search_phases: Vec<CompiledSearchPhase>,
     relaxation: Option<SearchRelaxationTemplate>,
     on_improve: impl FnMut(i64, &[i32]),
 ) -> (Option<(Vec<i32>, i64)>, SolveStats, bool) {
@@ -1248,6 +1270,7 @@ pub(crate) fn optimize_assuming_seeded_with_scope_and_relaxation(
     }
     cdcl.initial_phase = initial_phase;
     cdcl.branch_order = branch_order;
+    cdcl.search_phases = search_phases;
     let mut relaxation: Option<SearchRelaxation> = relaxation.map(|template| template.start());
     let mut result = cdcl.optimize(
         vars,
@@ -1329,6 +1352,7 @@ pub fn optimize_var_assuming(
 }
 
 /// Pick a binary split for one root cube.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn split_cube_seeded_with_scope(
     solver: &mut Solver,
     vars: &[VarId],
@@ -1337,8 +1361,12 @@ pub(crate) fn split_cube_seeded_with_scope(
     stop: &AtomicBool,
     seed: u64,
     lazy_atoms: Option<Arc<LazyAtomRegistry>>,
+    initial_phase: Vec<Option<i32>>,
+    search_phases: Vec<CompiledSearchPhase>,
 ) -> Option<Lit> {
     let mut cdcl = seeded_cdcl(solver, vars, stop, seed, lazy_atoms)?;
+    cdcl.initial_phase = initial_phase;
+    cdcl.search_phases = search_phases;
     cdcl.split_cube(vars, primary_branch_scope, cube)
 }
 
@@ -1354,6 +1382,8 @@ pub(crate) fn probe_seeded_with_scope(
     stop: &AtomicBool,
     seed: u64,
     clause_sharing: Option<ClauseSharing>,
+    initial_phase: Vec<Option<i32>>,
+    search_phases: Vec<CompiledSearchPhase>,
 ) -> (Option<(Vec<i32>, i32)>, SolveStats, bool) {
     let lazy_atoms = clause_sharing.as_ref().map(ClauseSharing::lazy_atoms);
     let Some(mut cdcl) = seeded_cdcl(solver, vars, stop, seed, lazy_atoms) else {
@@ -1362,6 +1392,8 @@ pub(crate) fn probe_seeded_with_scope(
     if let Some(sharing) = clause_sharing {
         cdcl.set_clause_sharing(sharing);
     }
+    cdcl.initial_phase = initial_phase;
+    cdcl.search_phases = search_phases;
     cdcl.probe(vars, primary_branch_scope, obj, minimizing, target, stop)
 }
 

@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,14 +7,15 @@ use qayd::model::list::{
     CollectionModel, CollectionSolution, Constraint as ListConstraint, ExprArena, Iterable, ObjectiveTier, Op, ReduceOp, Reduction,
 };
 use qayd::model::{
-    CompiledCollection, Constraint, IntExpr, IntGlobalConstraint, IntVarRef, ListOrdering, Model, ModelObject, ModelPackage, Objective,
-    Relation,
+    CompiledCollection, CompiledCp, Constraint, IntExpr, IntGlobalConstraint, IntVarRef, ListOrdering, Model, ModelObject, ModelPackage,
+    Objective, Relation,
 };
 use qayd::orchestrator::{
-    audit_cp_repair_completion, audit_interrupt_next_transfer_replay, audit_partial_cp_repair_search_rejection,
+    audit_cp_concurrent_bytes, audit_cp_repair_completion, audit_interrupt_next_transfer_replay, audit_partial_cp_repair_search_rejection,
     audit_prearmed_cp_repair_interruption, compile_collection_plan, compile_model_plan, solve_collection_plan, solve_model_silent,
-    solve_model_with_budget, EngineKind, EventControl, EventSink, ExecutablePlan, RoutingControls, SolveBudget, SolveError, SolveEvent,
-    SolveLimits, SolveMode, SolveRequest, SolveResult, SolveStatus, VerificationLevel,
+    solve_model_with_budget, EngineKind, EventControl, EventSink, ExecutablePlan, RoutingControls, SearchPhase, SearchPolicy, SolveBudget,
+    SolveError, SolveEvent, SolveLimits, SolveMode, SolveRequest, SolveResult, SolveStatus, ValueSelector, VariableSelector,
+    VerificationLevel,
 };
 fn count(list: usize) -> Reduction {
     let mut arena = ExprArena::default();
@@ -244,13 +246,15 @@ fn zero_budget_and_empty_composites_are_rejected_early() {
 fn portfolio_memory_estimate_accounts_for_every_concurrent_worker() {
     let mut model = Model::new();
     model.int_range(0, 10);
+    let compiled_bytes = CompiledCp::estimate_semantic_bytes_interruptible(&model, &AtomicBool::new(false)).unwrap();
     let package = ModelPackage::new(model);
     let single_request = SolveRequest { mode: SolveMode::Exact, threads: 1, ..SolveRequest::default() };
     let portfolio_request = SolveRequest { mode: SolveMode::Exact, threads: 4, ..SolveRequest::default() };
     let single = compile_model_plan(&package, &single_request, &SolveBudget::new(None)).unwrap();
     let portfolio = compile_model_plan(&package, &portfolio_request, &SolveBudget::new(None)).unwrap();
 
-    assert_eq!(portfolio.estimated_backend_bytes(), single.estimated_backend_bytes().saturating_mul(4));
+    assert_eq!(single.estimated_backend_bytes(), audit_cp_concurrent_bytes(compiled_bytes, 0, SolveMode::Exact, 0, 1));
+    assert_eq!(portfolio.estimated_backend_bytes(), audit_cp_concurrent_bytes(compiled_bytes, 0, SolveMode::Exact, 0, 4));
 }
 
 #[test]
@@ -776,6 +780,39 @@ fn collection_options_are_rejected_when_the_selected_stage_cannot_consume_them()
         ),
         Err(SolveError::InvalidRequest(message)) if message.contains("selected exact routing backend")
     ));
+}
+
+#[test]
+fn collection_compilers_reject_integer_search_phases_instead_of_erasing_them() {
+    let policy = SearchPolicy::new(vec![SearchPhase::new(vec![0], VariableSelector::FirstFail, ValueSelector::Min)]);
+    let request = SolveRequest { mode: SolveMode::Exact, search_policy: policy, ..SolveRequest::default() };
+
+    let assignment = CollectionModel {
+        items: vec![1, 2],
+        lists: 1,
+        objectives: Vec::new(),
+        constraints: Vec::new(),
+        globals: Vec::new(),
+        schedule: None,
+    };
+    let list_model = Model::from_collection(&assignment);
+    let list_error = match compile_collection_plan(&list_model, &request, &SolveBudget::new(None)) {
+        Ok(_) => panic!("list compiler erased an integer search policy"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(list_error, SolveError::InvalidRequest(message) if message.contains("collection plans") && message.contains("search_policy"))
+    );
+
+    let mut schedule_model = Model::new();
+    schedule_model.interval(0, 4, 1);
+    let schedule_error = match compile_collection_plan(&schedule_model, &request, &SolveBudget::new(None)) {
+        Ok(_) => panic!("schedule compiler erased an integer search policy"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(schedule_error, SolveError::InvalidRequest(message) if message.contains("collection plans") && message.contains("search_policy"))
+    );
 }
 
 #[test]

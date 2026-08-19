@@ -2,7 +2,8 @@ use std::fs;
 
 use qayd::model::{BoolLiteral, Constraint, Model, ModelPackage};
 use qayd::orchestrator::{
-    solve_model_silent, EngineKind, SatBackendMode, SatControls, SatPreprocess, SolveLimits, SolveMode, SolveRequest, SolveStatus,
+    solve_model_silent, EngineKind, SatBackendMode, SatControls, SatPreprocess, SearchPhase, SearchPolicy, SolveError, SolveLimits,
+    SolveMode, SolveRequest, SolveStatus, ValueSelector, VariableSelector,
 };
 
 fn package(clauses: &[&[i32]], variable_count: usize) -> ModelPackage {
@@ -71,4 +72,16 @@ fn native_sat_plan_owns_requested_drat_output() {
     assert_eq!(result.status(), SolveStatus::Unsatisfiable);
     assert!(proof.lines().any(|line| line == "0"));
     assert!(result.reports()[0].metadata.contains(&("proof_format".to_string(), "drat".to_string())));
+}
+
+#[test]
+fn specialized_sat_plan_rejects_an_integer_search_policy() {
+    let package = package(&[&[1, 2]], 2);
+    let mut request = request(SatBackendMode::Native);
+    request.search_policy = SearchPolicy::new(vec![SearchPhase::new(vec![0, 1], VariableSelector::InputOrder, ValueSelector::Min)]);
+
+    let error = solve_model_silent(&package, &request).unwrap_err();
+    assert!(
+        matches!(error, SolveError::InvalidRequest(message) if message.contains("specialized SAT plan") && message.contains("search_policy"))
+    );
 }

@@ -6,8 +6,8 @@ use qayd::model::{
 };
 use qayd::orchestrator::{
     compile_model_plan, solve_model, solve_model_silent, CpControls, EngineKind, EventCallback, EventControl, ExecutablePlan,
-    LinearControls, ProofKind, SemanticAssumption, SemanticAssumptionOp, SolveBudget, SolveError, SolveEvent, SolveLimits, SolveMode,
-    SolveRequest, SolveStatus, VerificationLevel,
+    LinearControls, ProofKind, SearchPhase, SearchPolicy, SemanticAssumption, SemanticAssumptionOp, SolveBudget, SolveError, SolveEvent,
+    SolveLimits, SolveMode, SolveRequest, SolveStatus, ValueSelector, VariableSelector, VerificationLevel,
 };
 
 fn list_count(list: usize) -> Reduction {
@@ -367,21 +367,105 @@ fn integer_component_controls_are_remapped_to_local_indices() {
     assert_eq!(integers[right_peer.0], Some(0));
 }
 
+fn phased_integer_package(connect_components: bool) -> (ModelPackage, [IntVarRef; 4]) {
+    let mut model = Model::new();
+    let left = model.bool_var();
+    let left_peer = model.bool_var();
+    let right = model.bool_var();
+    let right_peer = model.bool_var();
+    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::AllDifferent {
+        variables: vec![left, left_peer],
+        except: Vec::new(),
+    }));
+    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::AllDifferent {
+        variables: vec![right, right_peer],
+        except: Vec::new(),
+    }));
+    if connect_components {
+        model.add_constraint(Constraint::Linear { terms: vec![(1, left), (1, right)], relation: Relation::Ge, rhs: 0 });
+    }
+    (ModelPackage::new(model), [left, left_peer, right, right_peer])
+}
+
+#[test]
+fn semantic_search_phases_project_across_integer_components_without_changing_the_solution() {
+    let (decomposed, [left, left_peer, right, right_peer]) = phased_integer_package(false);
+    let request = SolveRequest {
+        mode: SolveMode::Exact,
+        search_policy: SearchPolicy::new(vec![
+            SearchPhase::new(vec![left.0, right.0], VariableSelector::InputOrder, ValueSelector::Min),
+            SearchPhase::new(vec![left_peer.0], VariableSelector::InputOrder, ValueSelector::Min),
+            SearchPhase::new(vec![right_peer.0], VariableSelector::InputOrder, ValueSelector::Min),
+        ]),
+        ..SolveRequest::default()
+    };
+
+    let plan = compile_model_plan(&decomposed, &request, &SolveBudget::new(None)).unwrap();
+    assert!(matches!(plan.description(), ExecutablePlan::Decomposed { components, .. } if components.len() == 2));
+    let decomposed_result = solve_model_silent(&decomposed, &request).unwrap();
+
+    let (direct, _) = phased_integer_package(true);
+    let direct_plan = compile_model_plan(&direct, &request, &SolveBudget::new(None)).unwrap();
+    assert!(matches!(direct_plan.description(), ExecutablePlan::Single(_)));
+    let direct_result = solve_model_silent(&direct, &request).unwrap();
+
+    assert_eq!(decomposed_result.status(), SolveStatus::Satisfiable);
+    assert_eq!(direct_result.status(), SolveStatus::Satisfiable);
+    assert_eq!(decomposed_result.primal().unwrap().assignment().integers, direct_result.primal().unwrap().assignment().integers);
+    assert_eq!(decomposed_result.primal().unwrap().assignment().integers, vec![Some(0), Some(1), Some(0), Some(1)]);
+}
+
+#[test]
+fn decomposition_rejects_a_search_phase_with_a_foreign_semantic_variable() {
+    let (package, [left, _, right, _]) = phased_integer_package(false);
+    let request = SolveRequest {
+        mode: SolveMode::Exact,
+        search_policy: SearchPolicy::new(vec![SearchPhase::new(
+            vec![left.0, right.0, 99],
+            VariableSelector::FirstFail,
+            ValueSelector::Max,
+        )]),
+        ..SolveRequest::default()
+    };
+
+    let error = match compile_model_plan(&package, &request, &SolveBudget::new(None)) {
+        Ok(_) => panic!("decomposition accepted a foreign search-policy variable"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, SolveError::InvalidRequest(message) if message.contains("search policy phase 0") && message.contains("99")));
+}
+
 #[test]
 fn compact_integer_components_pass_an_aggregate_memory_preflight() {
     let mut model = Model::new();
     for _ in 0..64 {
         model.bool_var();
     }
+    let package = ModelPackage::new(model);
+    let unlimited = SolveRequest { mode: SolveMode::Exact, ..SolveRequest::default() };
+    let exact_peak = compile_model_plan(&package, &unlimited, &SolveBudget::new(None)).unwrap().estimated_backend_bytes();
+    assert!(exact_peak < 5 * 1024 * 1024);
+
     let request = SolveRequest {
         mode: SolveMode::Exact,
         limits: SolveLimits { memory_bytes: Some(5 * 1024 * 1024), ..SolveLimits::default() },
         ..SolveRequest::default()
     };
-
-    let plan = compile_model_plan(&ModelPackage::new(model), &request, &SolveBudget::new(None)).unwrap();
+    let plan = compile_model_plan(&package, &request, &SolveBudget::new(None)).unwrap();
 
     assert!(matches!(plan.description(), ExecutablePlan::Decomposed { components, .. } if components.len() == 64));
+
+    let exact_limit = SolveRequest {
+        mode: SolveMode::Exact,
+        limits: SolveLimits { memory_bytes: Some(exact_peak), ..SolveLimits::default() },
+        ..SolveRequest::default()
+    };
+    assert_eq!(compile_model_plan(&package, &exact_limit, &SolveBudget::new(None)).unwrap().estimated_backend_bytes(), exact_peak);
+    let below_peak = SolveRequest { limits: SolveLimits { memory_bytes: Some(exact_peak - 1), ..SolveLimits::default() }, ..exact_limit };
+    assert!(matches!(
+        compile_model_plan(&package, &below_peak, &SolveBudget::new(None)),
+        Err(SolveError::Compile(message)) if message.contains("prepared decomposition templates") && message.contains("memory limit")
+    ));
 }
 
 #[test]

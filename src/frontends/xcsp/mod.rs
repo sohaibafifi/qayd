@@ -15,7 +15,7 @@ use xcsp3_rust_parser::xcsp_runner::XcspRunner;
 use crate::model::{Constraint, ModelPackage};
 use crate::orchestrator::{
     extract_model_mus_with_external_stop, solve_model_with_external_stop, CpControls, EventCallback, EventControl, LinearControls,
-    ModelMusResult, SolveError, SolveEvent, SolveLimits, SolveMode, SolveRequest, SolveResult, SolveStatus,
+    ModelMusResult, SearchPolicy, SolveError, SolveEvent, SolveLimits, SolveMode, SolveRequest, SolveResult, SolveStatus,
 };
 
 /// Search strategy selected by the XCSP command line.
@@ -284,8 +284,28 @@ pub fn run_to<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool, w: &mut W) 
 
 /// Like [`run_to`], with explicit seed and portfolio-worker settings.
 pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool, w: &mut W, options: RunOptions) -> Result<(), String> {
+    run_to_with_options_and_search_policy(xml, verbose, stop, w, options, SearchPolicy::default())
+}
+
+/// Like [`run_to_with_options`], with an explicit semantic exact-search
+/// policy. Keeping this owned policy outside [`RunOptions`] preserves that
+/// compact, copyable compatibility surface.
+pub fn run_to_with_options_and_search_policy<W: Write>(
+    xml: &str,
+    verbose: bool,
+    stop: &AtomicBool,
+    w: &mut W,
+    options: RunOptions,
+    search_policy: SearchPolicy,
+) -> Result<(), String> {
     if options.local_search() && options.semantic_branching {
         return Err("semantic branching requires exact mode".to_string());
+    }
+    if options.local_search() && !search_policy.is_auto() {
+        return Err("search policy requires exact mode".to_string());
+    }
+    if options.semantic_branching && !search_policy.is_auto() {
+        return Err("--semantic-branching cannot be combined with an explicit search policy".to_string());
     }
     let path = stage_xml(xml)?;
     let parse_started = Instant::now();
@@ -313,12 +333,15 @@ pub fn run_to_with_options<W: Write>(xml: &str, verbose: bool, stop: &AtomicBool
             writeln!(w, "c csp learning {}", !options.no_learn_csp).map_err(io_err)?;
         }
         writeln!(w, "c semantic branching {}", options.semantic_branching).map_err(io_err)?;
+        if !search_policy.is_auto() {
+            writeln!(w, "c search phases {}", search_policy.phases().len()).map_err(io_err)?;
+        }
         writeln!(w, "c split {}", options.split).map_err(io_err)?;
     }
 
     // The optional semantic scope never changes the output projection or the
     // requirement that the engine complete every lowering auxiliary.
-    let request = solve_request(options, search);
+    let request = solve_request(options, search, search_policy);
     let result = {
         let mut events = EventCallback(|event| {
             if let SolveEvent::Progress { engine, objectives, .. } = event {
@@ -397,7 +420,7 @@ fn write_core<W: Write>(
     Ok(())
 }
 
-fn solve_request(options: RunOptions, primary_branch_scope: Vec<usize>) -> SolveRequest {
+fn solve_request(options: RunOptions, primary_branch_scope: Vec<usize>, search_policy: SearchPolicy) -> SolveRequest {
     let memory_bytes = options.mem_limit.map(|megabytes| u64::try_from(megabytes).unwrap_or(u64::MAX).saturating_mul(1024 * 1024));
     SolveRequest {
         mode: if options.local_search() { SolveMode::LocalSearch } else { SolveMode::Exact },
@@ -414,6 +437,7 @@ fn solve_request(options: RunOptions, primary_branch_scope: Vec<usize>) -> Solve
             shared_pool_capacity: options.shared_pool_capacity,
         },
         primary_branch_scope: (!options.local_search() && options.semantic_branching).then_some(primary_branch_scope),
+        search_policy,
         ..SolveRequest::default()
     }
 }

@@ -22,8 +22,10 @@ use crate::orchestrator::{
 };
 
 mod lambda_dsl;
+mod search_policy;
 
 use lambda_dsl::compile_callable;
+use search_policy::{from_py as search_policy_from_py, PySearchPhase, PySearchPolicy};
 
 mod expr {
     use super::{Expr, IntVarRef};
@@ -468,6 +470,7 @@ impl PyMusEnumeration {
 
 #[pyclass(name = "Solution", module = "qayd")]
 struct PySolution {
+    model_id: u64,
     status: String,
     objective: Option<i64>,
     objective_sense: Option<String>,
@@ -965,6 +968,7 @@ fn checked_interval_start_max(horizon: i64, duration: i64) -> PyResult<i32> {
 
 #[allow(clippy::too_many_arguments)]
 fn make_solution(
+    model_id: u64,
     status: &str,
     vars: &[IntVarRef],
     assignment: Option<&[i32]>,
@@ -984,6 +988,7 @@ fn make_solution(
     }
     let exact_bound = (status == "OPTIMAL").then_some(objective).flatten();
     PySolution {
+        model_id,
         status: status.to_string(),
         objective,
         objective_sense: objective_sense.map(str::to_string),
@@ -2002,6 +2007,7 @@ fn visible_integer_values(result: &SolveResult, num_vars: usize) -> PyResult<Vec
 }
 
 fn integer_solution_from_result(
+    model_id: u64,
     result: &SolveResult,
     objectives: &[ObjectiveSpec],
     num_vars: usize,
@@ -2014,7 +2020,7 @@ fn integer_solution_from_result(
     let sense = primary.map(|objective| if objective.minimizing { "min" } else { "max" });
     let text = primary.map(|objective| objective.expr.text.as_str());
     let mut solution =
-        make_solution(result.status().as_str(), &[], None, objective, sense, text, result_search_stats(result, engine), num_vars);
+        make_solution(model_id, result.status().as_str(), &[], None, objective, sense, text, result_search_stats(result, engine), num_vars);
     solution.values = visible_integer_values(result, num_vars)?;
     solution.objectives = objective_values;
     if let Some(primary) = primary.filter(|_| engine == EngineKind::IntegerExact) {
@@ -2685,6 +2691,9 @@ impl PySolution {
     }
 
     fn value(&self, var: &PyIntVar) -> PyResult<i32> {
+        if var.model_id != self.model_id {
+            return Err(PyValueError::new_err("variable belongs to a different model than this solution"));
+        }
         self.values
             .get(var.index as usize)
             .copied()
@@ -2753,12 +2762,13 @@ impl PySolveSession {
             .collect())
     }
 
-    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, threads=1, conflict_budget=None, memory_limit_mb=None, linear_backend="auto", lp_root_ms=50, lp_node_ms=0, lp_node_depth_interval=8, lp_max_variables=2000, lp_max_rows=1000, lp_max_nonzeros=100000, lp_min_coverage_percent=1, lp_phase_max_variables=1000, lp_route_ng_size=8, lp_route_max_labels=2000000, lp_route_dual_stabilization_percent=75))]
+    #[pyo3(signature = (*, search=None, search_policy=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, threads=1, conflict_budget=None, memory_limit_mb=None, linear_backend="auto", lp_root_ms=50, lp_node_ms=0, lp_node_depth_interval=8, lp_max_variables=2000, lp_max_rows=1000, lp_max_nonzeros=100000, lp_min_coverage_percent=1, lp_phase_max_variables=1000, lp_route_ng_size=8, lp_route_max_labels=2000000, lp_route_dual_stabilization_percent=75))]
     #[allow(clippy::too_many_arguments)]
     fn solve(
         &mut self,
         py: Python<'_>,
         search: Option<&Bound<'_, PyAny>>,
+        search_policy: Option<&Bound<'_, PyAny>>,
         assumptions: Option<&Bound<'_, PyAny>>,
         hints: Option<&Bound<'_, PyAny>>,
         branch_order: Option<&Bound<'_, PyAny>>,
@@ -2793,21 +2803,31 @@ impl PySolveSession {
                 return Err(PyTypeError::new_err("on_incumbent must be callable"));
             }
         }
+        let explicit_search_policy = search_policy.is_some_and(|policy| !policy.is_none());
+        if explicit_search_policy && [search, hints, branch_order].into_iter().flatten().any(|value| !value.is_none()) {
+            return Err(PyValueError::new_err(
+                "search_policy cannot be combined with search, hints, or branch_order, even when a legacy argument is empty",
+            ));
+        }
+        let search_policy = search_policy_from_py(self.id, search_policy)?;
         if verbose {
             verbose_start(self.names.len(), 0, !self.objectives.is_empty());
         }
         let assumptions = assumptions_from_py(self.id, assumptions)?;
         let hints = hint_pairs_from_py(self.id, hints)?;
-        let mut guidance = branch_order_from_py(self.id, branch_order)?;
-        let search_vars = match search {
-            Some(obj) if !obj.is_none() => {
-                search_ids_for(self.id, self.names.len(), Some(obj), None)?.into_iter().map(|variable| variable.0).collect()
-            }
-            _ => self.search.clone(),
-        };
-        for variable in search_vars {
-            if !guidance.contains(&variable) {
-                guidance.push(variable);
+        let mut guidance = Vec::new();
+        if !explicit_search_policy {
+            guidance = branch_order_from_py(self.id, branch_order)?;
+            let search_vars = match search {
+                Some(obj) if !obj.is_none() => {
+                    search_ids_for(self.id, self.names.len(), Some(obj), None)?.into_iter().map(|variable| variable.0).collect()
+                }
+                _ => self.search.clone(),
+            };
+            for variable in search_vars {
+                if !guidance.contains(&variable) {
+                    guidance.push(variable);
+                }
             }
         }
         let request = SolveRequest {
@@ -2823,6 +2843,7 @@ impl PySolveSession {
             assumptions,
             hints,
             branch_order: guidance,
+            search_policy: search_policy.unwrap_or_default(),
             publish_incumbent_assignments: on_incumbent.is_some(),
             linear: linear_controls(
                 linear_backend,
@@ -2850,7 +2871,7 @@ impl PySolveSession {
             }
             result.map_err(integer_solve_error)
         })??;
-        let mut solution = integer_solution_from_result(&result, &objectives, num_vars, EngineKind::IntegerExact, false)?;
+        let mut solution = integer_solution_from_result(self.id, &result, &objectives, num_vars, EngineKind::IntegerExact, false)?;
         attach_native_interval_solution(&mut solution, &self.native_intervals);
         if verbose {
             verbose_finish(&solution);
@@ -3799,12 +3820,13 @@ impl PyModel {
         Ok(())
     }
 
-    #[pyo3(signature = (*, search=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, threads=1, engine="auto", conflict_budget=None, list_hint=None, max_iterations=None, profile=false, memory_limit_mb=None, schedule_cdcl=false, routing_two_way=true, routing_nearest_neighbor=true, routing_warm_start=true, linear_backend="auto", lp_root_ms=50, lp_node_ms=0, lp_node_depth_interval=8, lp_max_variables=2000, lp_max_rows=1000, lp_max_nonzeros=100000, lp_min_coverage_percent=1, lp_phase_max_variables=1000, lp_route_ng_size=8, lp_route_max_labels=2000000, lp_route_dual_stabilization_percent=75))]
+    #[pyo3(signature = (*, search=None, search_policy=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, threads=1, engine="auto", conflict_budget=None, list_hint=None, max_iterations=None, profile=false, memory_limit_mb=None, schedule_cdcl=false, routing_two_way=true, routing_nearest_neighbor=true, routing_warm_start=true, linear_backend="auto", lp_root_ms=50, lp_node_ms=0, lp_node_depth_interval=8, lp_max_variables=2000, lp_max_rows=1000, lp_max_nonzeros=100000, lp_min_coverage_percent=1, lp_phase_max_variables=1000, lp_route_ng_size=8, lp_route_max_labels=2000000, lp_route_dual_stabilization_percent=75))]
     #[allow(clippy::too_many_arguments)]
     fn solve(
         &self,
         py: Python<'_>,
         search: Option<&Bound<'_, PyAny>>,
+        search_policy: Option<&Bound<'_, PyAny>>,
         assumptions: Option<&Bound<'_, PyAny>>,
         hints: Option<&Bound<'_, PyAny>>,
         branch_order: Option<&Bound<'_, PyAny>>,
@@ -3843,6 +3865,13 @@ impl PyModel {
             return Err(PyValueError::new_err("memory_limit_mb must be a positive integer when provided"));
         }
         let engine = parse_engine(engine)?;
+        let explicit_search_policy = search_policy.is_some_and(|policy| !policy.is_none());
+        if explicit_search_policy && [search, hints, branch_order].into_iter().flatten().any(|value| !value.is_none()) {
+            return Err(PyValueError::new_err(
+                "search_policy cannot be combined with search, hints, or branch_order, even when a legacy argument is empty",
+            ));
+        }
+        let search_policy = search_policy_from_py(self.id, search_policy)?;
         let list_hint = list_hint.filter(|obj| !obj.is_none()).map(|obj| self.parse_list_hint(obj)).transpose()?;
         let objective_specs = objective_specs(&self.objective, &self.then_objectives);
         if let Some(callback) = on_incumbent {
@@ -3887,6 +3916,7 @@ impl PyModel {
             hints,
             list_hint,
             branch_order: guidance,
+            search_policy: search_policy.unwrap_or_default(),
             publish_incumbent_assignments: on_incumbent.is_some(),
             schedule_cdcl,
             routing: RoutingControls {
@@ -3946,7 +3976,7 @@ impl PyModel {
             Ok(solution)
         } else {
             let result_engine = if engine == PythonEngine::Ls { EngineKind::IntegerLocalSearch } else { EngineKind::IntegerExact };
-            let mut solution = integer_solution_from_result(&run.result, &objective_specs, num_vars, result_engine, profile)?;
+            let mut solution = integer_solution_from_result(self.id, &run.result, &objective_specs, num_vars, result_engine, profile)?;
             attach_native_interval_solution(&mut solution, &self.native_intervals);
             if verbose {
                 verbose_finish(&solution);
@@ -4706,6 +4736,7 @@ impl PyModel {
         });
 
         Ok(PySolution {
+            model_id: self.id,
             status: result.status().as_str().to_string(),
             objective,
             objective_sense,
@@ -5395,6 +5426,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySolveStats>()?;
     m.add_class::<PyMusEnumeration>()?;
     m.add_class::<PySolveSession>()?;
+    m.add_class::<PySearchPhase>()?;
+    m.add_class::<PySearchPolicy>()?;
     m.add_function(wrap_pyfunction!(expr_fn, m)?)?;
     m.add_function(wrap_pyfunction!(all_fn, m)?)?;
     m.add_function(wrap_pyfunction!(any_fn, m)?)?;

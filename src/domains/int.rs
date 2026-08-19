@@ -221,6 +221,36 @@ impl Domain {
         }
     }
 
+    /// Least currently supported value greater than or equal to `target`.
+    /// This scans only active explicit values, or at most the active holes for
+    /// a bounds domain, and allocates nothing.
+    pub(crate) fn ceiling(&self, target: i32, trail: &Trail) -> Option<i32> {
+        if self.size(trail) == 0 {
+            return None;
+        }
+        let target = target.max(self.min(trail));
+        if target > self.max(trail) {
+            return None;
+        }
+        match &self.values {
+            ValueMap::Bounds { .. } => {
+                let mut value = target;
+                loop {
+                    if self.contains(value, trail) {
+                        return Some(value);
+                    }
+                    value = value.checked_add(1)?;
+                    if value > self.max(trail) {
+                        return None;
+                    }
+                }
+            }
+            ValueMap::Dense { .. } | ValueMap::Sparse { .. } => {
+                self.dense[..self.size(trail)].iter().map(|&index| self.value_of(index as usize)).filter(|&value| value >= target).min()
+            }
+        }
+    }
+
     /// Append absent root-supported values inside the current bounds.
     pub(crate) fn append_removed_values(&self, trail: &Trail, out: &mut Vec<i32>) {
         let min = self.min(trail);

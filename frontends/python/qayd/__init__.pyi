@@ -3,7 +3,7 @@
 These stubs mirror the ``qayd._core`` API defined in
 ``src/frontends/python.rs`` and re-exported by ``qayd/__init__.py``.
 """
-from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple, Union, overload
+from typing import Any, Callable, Dict, Iterable, Literal, Optional, Sequence, Tuple, Union, overload
 
 __all__: list[str]
 
@@ -24,6 +24,8 @@ _Incumbent = Callable[[int, Dict[int, int]], Any]
 _AnytimeCheckpoint = Tuple[int, int, bool, list[int], Optional[int], int]
 _NeighborhoodProfile = Tuple[str, int, int, int, int, int, int, int, float]
 _RoutingCounter = Tuple[str, int]
+_VariableSelector = Literal["auto", "input-order", "first-fail", "dom-wdeg", "activity"]
+_ValueSelector = Literal["auto", "min", "max", "median", "random-seeded", "hint"]
 
 # A relation string such as "==", "!=", "<=", "<", ">=", ">".
 STAR: int
@@ -99,6 +101,33 @@ class Constraint:
     def __or__(self, rhs: _IntoBool) -> Constraint: ...
     def implies(self, rhs: _IntoBool) -> Constraint: ...
     def iff(self, rhs: _IntoBool) -> Constraint: ...
+
+
+class SearchPhase:
+    """One ordered phase over semantic integer variables."""
+
+    def __init__(
+        self,
+        variables: Iterable[IntVar],
+        variable_selector: _VariableSelector = ...,
+        value_selector: _ValueSelector = ...,
+    ) -> None: ...
+    @property
+    def variables(self) -> list[IntVar]: ...
+    @property
+    def variable_selector(self) -> str: ...
+    @property
+    def value_selector(self) -> str: ...
+    def __repr__(self) -> str: ...
+
+
+class SearchPolicy:
+    """Ordered search phases followed by Qayd's exhaustive automatic fallback."""
+
+    def __init__(self, phases: Iterable[SearchPhase]) -> None: ...
+    @property
+    def phases(self) -> list[SearchPhase]: ...
+    def __repr__(self) -> str: ...
 
 
 class ListVar:
@@ -798,6 +827,7 @@ class SolveSession:
         self,
         *,
         search: Optional[Iterable[IntVar]] = ...,
+        search_policy: Optional[SearchPolicy] = ...,
         assumptions: Optional[Iterable[_Assumption]] = ...,
         hints: Optional[Iterable[Tuple[IntVar, int]]] = ...,
         branch_order: Optional[Iterable[IntVar]] = ...,
@@ -991,6 +1021,7 @@ class Model:
         self,
         *,
         search: Optional[Iterable[IntVar]] = ...,
+        search_policy: Optional[SearchPolicy] = ...,
         assumptions: Optional[Iterable[_Assumption]] = ...,
         hints: Optional[Iterable[Tuple[IntVar, int]]] = ...,
         branch_order: Optional[Iterable[IntVar]] = ...,

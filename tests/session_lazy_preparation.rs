@@ -56,14 +56,14 @@ fn memory_preflight_applies_before_first_compile_and_to_reused_plans() {
 
     let first_error = solve(&mut session, &below_estimate).unwrap_err();
     assert!(
-        matches!(first_error, SolveError::Compile(ref message) if message.contains("estimated session CP backend") && message.contains("memory limit")),
+        matches!(&first_error, SolveError::Compile(message) if message.contains("estimated session CP footprint") && message.contains("memory limit")),
         "{first_error}"
     );
     assert_eq!(solve(&mut session, &SolveRequest::default()).unwrap().status(), SolveStatus::Satisfiable);
 
     let reused_error = solve(&mut session, &below_estimate).unwrap_err();
     assert!(
-        matches!(reused_error, SolveError::Compile(ref message) if message.contains("estimated session CP backend") && message.contains("memory limit")),
+        matches!(reused_error, SolveError::Compile(ref message) if message.contains("estimated session CP footprint") && message.contains("memory limit")),
         "{reused_error}"
     );
 }
