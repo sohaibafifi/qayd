@@ -53,8 +53,72 @@ fn is_instance(arg: &str) -> bool {
     Path::new(arg).is_file() || arg.ends_with(".xml") || arg.ends_with(".lzma") || arg.ends_with(".xz")
 }
 
-const USAGE: &str =
-    "usage: qayd [-h] [-v] [-t SECONDS] [--seed SEED] [-p THREADS] [--mem-limit MB] [--ls] [--split] [--probe N] [--lns N] [--no-learn-csp] [--semantic-branching] [--search-phase VARS:VARIABLE:VALUE] [--force-scope-reasons] [--shared-pool-cap N] [--core] [--linear-backend auto|native|amthal] [--lp-root-ms N] [--lp-node-ms N] [--lp-node-depth N] [--lp-max-vars N] [--lp-max-rows N] [--lp-max-nonzeros N] [--lp-min-coverage N] [--lp-phase-max-vars N] [--lp-route-ng-size N] [--lp-route-max-labels N] [--lp-route-dual-stabilization-percent N] <instance.xml[.lzma|.xz]>\n\n--search-phase is repeatable; VARS is a comma-separated list of zero-based semantic integer indices, VARIABLE is auto|input-order|first-fail|dom-wdeg|activity, and VALUE is auto|min|max|median|random-seeded|hint.";
+const USAGE: &str = r#"Qayd XCSP3 solver
+
+Usage:
+  qayd [OPTIONS] <INSTANCE>
+
+Arguments:
+  <INSTANCE>                         XCSP3 file (.xml, .xml.lzma, or .xml.xz)
+
+General options:
+  -h, --help                         Show this help and exit
+  -v, --verbose                      Print progress and search statistics
+  -t, --time <SECONDS>               Set the wall-clock time limit
+                                     [default: unlimited; --ls: 240]
+      --seed <SEED>                  Set the reproducible search seed [default: 0]
+  -p, --threads <N>                  Set the worker count [default: 1; N >= 1]
+      --mem-limit <MiB>              Set the process memory limit [MiB >= 1]
+      --core                         Print an exact source-constraint MUS after UNSAT
+
+Search options:
+      --ls                           Run incumbent-only local search
+                                     Uses a 240-second limit when --time is omitted
+      --split                        Enable split workers (COP, threads > 1)
+      --probe <N>                    Reserve N probing workers [N >= 1]
+      --lns <N>                      Reserve N LNS workers [N >= 1]
+      --no-learn-csp                 Use chronological DFS for compatible CSPs
+      --semantic-branching           Branch first on XCSP semantic variables
+      --search-phase <SPEC>          Add an ordered exact-search phase; repeatable
+      --force-scope-reasons          Use whole-scope LCG reasons (ablation)
+      --shared-pool-cap <N>          Set the shared learned-clause capacity
+                                     [default: 16384; N >= 1]
+
+  Split and probing require materialized COP objectives.
+  Split, probing, and LNS require exact mode and multiple threads.
+  Probing and LNS roles must leave at least one complete worker.
+  A parallel COP may allocate probing and LNS roles when counts are omitted.
+
+Search phase format:
+  SPEC      VARS:VARIABLE:VALUE
+  VARS      Comma-separated zero-based semantic integer indices
+  VARIABLE  auto | input-order | first-fail | max-regret | dom-wdeg | activity
+  VALUE     auto | min | max | median | random-seeded | hint
+
+  Unscoped variables are completed by the automatic fallback.
+  Explicit search phases cannot be combined with --ls or --semantic-branching.
+  Semantic branching requires exact mode; activity phases cannot use --no-learn-csp.
+
+Linear relaxation options:
+      --linear-backend <MODE>        Select auto, native, or amthal [default: auto]
+      --lp-root-ms <MS>              Limit the root relaxation [default: 50; 0 disables]
+      --lp-node-ms <MS>              Limit in-search LP reoptimization
+                                     [default: 0, disabled]
+      --lp-node-depth <N>            Set the minimum depth interval [default: 8; N >= 1]
+      --lp-max-vars <N>              Limit active LP columns [default: 2000; N >= 1]
+      --lp-max-rows <N>              Limit retained LP rows [default: 1000; N >= 1]
+      --lp-max-nonzeros <N>          Limit retained LP nonzeros [default: 100000; N >= 1]
+      --lp-min-coverage <PERCENT>    Require objective coverage [default: 1; 0..100]
+      --lp-phase-max-vars <N>        Limit CP size for LP phase guidance
+                                     [default: 1000; 0 disables]
+      --lp-route-ng-size <N>         Set routing ng-neighborhood size [default: 8; 1..16]
+      --lp-route-max-labels <N>      Set the routing pricing label limit
+                                     [default: 2000000; N >= 1]
+      --lp-route-dual-stabilization-percent <PERCENT>
+                                     Set the restricted-master dual weight
+                                     [default: 75; 1..100]
+
+  The amthal backend requires a build with the lp-relaxation feature."#;
 
 fn fail(message: &str) -> ! {
     eprintln!("{message}");

@@ -23,6 +23,9 @@ pub enum VariableSelector {
     InputOrder,
     /// Select a variable with the smallest current domain.
     FirstFail,
+    /// Select the variable whose two smallest supported values have the
+    /// greatest difference.
+    MaxRegret,
     /// Minimize current domain size divided by weighted degree.
     DomWdeg,
     /// Select the variable with the greatest learned-clause activity.
@@ -35,6 +38,7 @@ impl VariableSelector {
             Self::Auto => "auto",
             Self::InputOrder => "input-order",
             Self::FirstFail => "first-fail",
+            Self::MaxRegret => "max-regret",
             Self::DomWdeg => "dom-wdeg",
             Self::Activity => "activity",
         }
@@ -55,9 +59,12 @@ impl FromStr for VariableSelector {
             "auto" => Ok(Self::Auto),
             "input-order" => Ok(Self::InputOrder),
             "first-fail" => Ok(Self::FirstFail),
+            "max-regret" => Ok(Self::MaxRegret),
             "dom-wdeg" => Ok(Self::DomWdeg),
             "activity" => Ok(Self::Activity),
-            _ => Err(format!("unknown variable selector '{value}'; expected auto, input-order, first-fail, dom-wdeg, or activity")),
+            _ => Err(format!(
+                "unknown variable selector '{value}'; expected auto, input-order, first-fail, max-regret, dom-wdeg, or activity"
+            )),
         }
     }
 }

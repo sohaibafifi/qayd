@@ -501,6 +501,27 @@ impl Cdcl<'_> {
                 .copied()
                 .filter(|&variable| self.solver.store.size(variable) > 1)
                 .min_by_key(|&variable| self.solver.store.size(variable)),
+            VariableSelector::MaxRegret => {
+                let mut best = None;
+                let mut best_regret = i64::MIN;
+                for &variable in vars {
+                    if self.solver.store.size(variable) <= 1 {
+                        continue;
+                    }
+                    let minimum = self.solver.store.min(variable);
+                    let second = self
+                        .solver
+                        .store
+                        .ceiling_value(variable, minimum.saturating_add(1))
+                        .expect("a non-singleton finite domain has a second supported value");
+                    let regret = i64::from(second) - i64::from(minimum);
+                    if best.is_none() || regret > best_regret {
+                        best = Some(variable);
+                        best_regret = regret;
+                    }
+                }
+                best
+            }
             VariableSelector::DomWdeg => {
                 let mut best = None;
                 let mut best_size = 0usize;

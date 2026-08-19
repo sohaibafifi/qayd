@@ -103,7 +103,7 @@ def test_none_search_policy_preserves_legacy_guidance():
     assert solution.value(x) == 1
 
 
-@pytest.mark.parametrize("variable_selector", ["auto", "input-order", "first-fail", "dom-wdeg", "activity"])
+@pytest.mark.parametrize("variable_selector", ["auto", "input-order", "first-fail", "max-regret", "dom-wdeg", "activity"])
 @pytest.mark.parametrize("value_selector", ["auto", "min", "max", "median", "random-seeded", "hint"])
 def test_all_selectors_are_accepted(variable_selector, value_selector):
     model = cp.Model()
@@ -112,6 +112,18 @@ def test_all_selectors_are_accepted(variable_selector, value_selector):
 
     assert solution.status == "SATISFIABLE"
     assert solution.value(x) in (0, 1, 2)
+
+
+def test_max_regret_uses_the_second_supported_value():
+    model = cp.Model()
+    first = model.int_var(values=[0, 2, 100])
+    second = model.int_var(values=[0, 10, 11])
+    model.add(first != second)
+
+    solution = model.solve(search_policy=policy([first, second], "max-regret", "min"))
+
+    assert solution.status == "SATISFIABLE"
+    assert (solution.value(first), solution.value(second)) == (2, 0)
 
 
 def test_ordered_phases_and_auto_fallback_assign_every_variable():

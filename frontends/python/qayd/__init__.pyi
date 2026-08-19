@@ -24,7 +24,7 @@ _Incumbent = Callable[[int, Dict[int, int]], Any]
 _AnytimeCheckpoint = Tuple[int, int, bool, list[int], Optional[int], int]
 _NeighborhoodProfile = Tuple[str, int, int, int, int, int, int, int, float]
 _RoutingCounter = Tuple[str, int]
-_VariableSelector = Literal["auto", "input-order", "first-fail", "dom-wdeg", "activity"]
+_VariableSelector = Literal["auto", "input-order", "first-fail", "max-regret", "dom-wdeg", "activity"]
 _ValueSelector = Literal["auto", "min", "max", "median", "random-seeded", "hint"]
 
 # A relation string such as "==", "!=", "<=", "<", ">=", ">".

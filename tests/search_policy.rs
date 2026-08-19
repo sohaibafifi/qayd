@@ -20,6 +20,7 @@ fn selector_spellings_are_canonical_and_diagnostic() {
         ("auto", VariableSelector::Auto),
         ("input-order", VariableSelector::InputOrder),
         ("first-fail", VariableSelector::FirstFail),
+        ("max-regret", VariableSelector::MaxRegret),
         ("dom-wdeg", VariableSelector::DomWdeg),
         ("activity", VariableSelector::Activity),
     ] {
@@ -39,6 +40,7 @@ fn selector_spellings_are_canonical_and_diagnostic() {
     }
     assert!(VariableSelector::from_str("firstfail").unwrap_err().contains("unknown variable selector"));
     assert!(VariableSelector::from_str("first_fail").unwrap_err().contains("unknown variable selector"));
+    assert!(VariableSelector::from_str("max_regret").unwrap_err().contains("unknown variable selector"));
     assert!(ValueSelector::from_str("random").unwrap_err().contains("unknown value selector"));
     assert!(ValueSelector::from_str("random_seeded").unwrap_err().contains("unknown value selector"));
 }
@@ -81,6 +83,7 @@ fn ordered_variable_selectors_control_the_first_decision() {
     let cases = [
         (VariableSelector::InputOrder, vec![Some(0), Some(1)]),
         (VariableSelector::FirstFail, vec![Some(1), Some(0)]),
+        (VariableSelector::MaxRegret, vec![Some(0), Some(1)]),
         (VariableSelector::DomWdeg, vec![Some(1), Some(0)]),
         (VariableSelector::Activity, vec![Some(0), Some(1)]),
     ];
@@ -94,6 +97,62 @@ fn ordered_variable_selectors_control_the_first_decision() {
         assert_eq!(result.status(), SolveStatus::Satisfiable, "selector={selector}");
         assert_eq!(result.primal().unwrap().assignment().integers, expected, "selector={selector}");
     }
+}
+
+fn solve_max_regret_pair(first_values: Vec<i32>, second_values: Vec<i32>) -> Vec<Option<i64>> {
+    let mut model = Model::new();
+    let first = model.int_set(first_values);
+    let second = model.int_set(second_values);
+    model.add_constraint(Constraint::Intension(IntExpr::Ne(Box::new(IntExpr::Variable(first)), Box::new(IntExpr::Variable(second)))));
+    let result = solve(
+        SolveRequest {
+            mode: SolveMode::Exact,
+            search_policy: policy(vec![first.0, second.0], VariableSelector::MaxRegret, ValueSelector::Min),
+            ..SolveRequest::default()
+        },
+        model,
+    );
+    assert_eq!(result.status(), SolveStatus::Satisfiable);
+    result.primal().unwrap().assignment().integers.clone()
+}
+
+#[test]
+fn max_regret_uses_the_second_supported_value_on_holey_domains() {
+    assert_eq!(solve_max_regret_pair(vec![0, 2, 100], vec![0, 10, 11]), [Some(2), Some(0)]);
+}
+
+#[test]
+fn max_regret_keeps_the_first_scope_variable_on_ties() {
+    assert_eq!(solve_max_regret_pair(vec![0, 10, 100], vec![0, 10, 11]), [Some(0), Some(10)]);
+}
+
+#[test]
+fn max_regret_widens_the_difference_at_i32_boundaries() {
+    assert_eq!(
+        solve_max_regret_pair(vec![i32::MIN, i32::MAX], vec![i32::MIN, i32::MAX - 1]),
+        [Some(i64::from(i32::MIN)), Some(i64::from(i32::MAX - 1))]
+    );
+}
+
+#[test]
+fn max_regret_ignores_singleton_variables() {
+    let mut model = Model::new();
+    let fixed = model.int_set(vec![0]);
+    let greatest = model.int_set(vec![0, 10, 100]);
+    let other = model.int_set(vec![0, 5, 6]);
+    model.add_constraint(Constraint::Intension(IntExpr::Ne(Box::new(IntExpr::Variable(greatest)), Box::new(IntExpr::Variable(other)))));
+
+    let result = solve(
+        SolveRequest {
+            mode: SolveMode::Exact,
+            search_policy: policy(vec![fixed.0, greatest.0, other.0], VariableSelector::MaxRegret, ValueSelector::Min),
+            ..SolveRequest::default()
+        },
+        model,
+    );
+
+    assert_eq!(result.status(), SolveStatus::Satisfiable);
+    assert_eq!(result.primal().unwrap().assignment().integers, [Some(0), Some(0), Some(5)]);
 }
 
 fn single_variable_model() -> Model {
