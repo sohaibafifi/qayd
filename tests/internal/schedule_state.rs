@@ -454,10 +454,49 @@ fn randomized_move_sequence_matches_full_and_independent_oracles() {
     }
     let metrics = state.metrics();
     assert!(metrics.delta_evaluations > 0);
-    assert!(metrics.topological_rebuilds > 0);
+    assert_eq!(metrics.topological_rebuilds, 0);
     assert!(metrics.dirty_cone_operations >= metrics.delta_evaluations);
     assert!(metrics.oracle_validations >= metrics.moves_accepted);
     assert_eq!(metrics.oracle_mismatches, 0);
+}
+
+#[test]
+fn large_dirty_cone_deduplicates_coincident_arcs_and_rejects_a_real_cycle() {
+    let stop = AtomicBool::new(false);
+    let operation_count = 65;
+    let schedule = Schedule {
+        intervals: (0..operation_count)
+            .map(|_| IntervalVar { duration: 1, horizon: operation_count as i64, modes: Vec::new(), optional: false })
+            .collect(),
+        precedences: (0..operation_count - 1).step_by(2).map(|operation| (operation, operation + 1)).collect(),
+        resources: vec![Resource::NoOverlap((0..operation_count).collect())],
+        minimize_makespan: true,
+    };
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let mut state = JobShopState::from_machine_sequences(&problem, vec![(0..operation_count).collect()], &stop).unwrap().unwrap();
+
+    let accepted = state
+        .consider_move(ScheduleMove::Insert { machine: 0, from: operation_count - 1, to: 0 }, MinimizingMoveAcceptance::Always, &stop)
+        .unwrap();
+    assert!(matches!(accepted, MoveOutcome::Accepted { .. }));
+    let (oracle_starts, oracle_makespan) = independent_fixed_oracle(&schedule, state.machine_sequences()).unwrap();
+    assert_eq!(state.starts(), oracle_starts);
+    assert_eq!(state.makespan(), oracle_makespan);
+    assert!(state.matches_full_oracle(&stop).unwrap());
+    assert_eq!(state.metrics().max_dirty_cone, operation_count as u64);
+    assert_eq!(state.metrics().topological_rebuilds, 0);
+    assert_eq!(state.metrics().oracle_mismatches, 0);
+
+    let old_sequences = state.machine_sequences().to_vec();
+    let old_starts = state.starts().to_vec();
+    let cycle =
+        state.consider_move(ScheduleMove::AdjacentSwap { machine: 0, first_position: 1 }, MinimizingMoveAcceptance::Always, &stop).unwrap();
+    assert_eq!(cycle, MoveOutcome::Rejected(MoveRejection::Cycle));
+    assert_eq!(state.machine_sequences(), old_sequences);
+    assert_eq!(state.starts(), old_starts);
+    assert!(state.matches_full_oracle(&stop).unwrap());
+    assert_eq!(state.metrics().cycle_rejections, 1);
+    assert_eq!(state.metrics().topological_rebuilds, 0);
 }
 
 #[test]

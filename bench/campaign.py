@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import subprocess
@@ -107,6 +108,99 @@ def discover_instances(
                 "best_known": adjacent_best_known(path),
             })
     return found
+
+
+def preflight_expected_instances(
+    suite: dict[str, Any], instances: list[dict[str, Any]],
+) -> None:
+    """Validate a manifest-pinned instance set before any solver is built or run."""
+    expected = suite.get("expected_instances")
+    if expected is None:
+        return
+    if not isinstance(expected, dict) or not expected:
+        raise SystemExit("suite expected_instances must be a non-empty JSON object")
+
+    expected_by_name: dict[str, str] = {}
+    malformed = []
+    duplicate_expected = []
+    for raw_name, raw_digest in expected.items():
+        if not isinstance(raw_name, str) or not raw_name:
+            malformed.append(repr(raw_name))
+            continue
+        name = raw_name.replace("\\", "/").rsplit("/", 1)[-1]
+        if name in expected_by_name:
+            duplicate_expected.append(name)
+            continue
+        if (
+            not isinstance(raw_digest, str)
+            or len(raw_digest) != 64
+            or any(character not in "0123456789abcdefABCDEF" for character in raw_digest)
+        ):
+            malformed.append(name)
+            continue
+        expected_by_name[name] = raw_digest.lower()
+
+    discovered_by_name: dict[str, list[dict[str, Any]]] = {}
+    for item in instances:
+        discovered_by_name.setdefault(item["path"].name, []).append(item)
+
+    errors = []
+    if malformed:
+        errors.append("invalid expected instance entries: " + ", ".join(sorted(malformed)))
+    if duplicate_expected:
+        errors.append(
+            "duplicate expected basenames: " + ", ".join(sorted(set(duplicate_expected)))
+        )
+    duplicate_discovered = sorted(
+        name for name, matches in discovered_by_name.items() if len(matches) != 1
+    )
+    if duplicate_discovered:
+        errors.append("duplicate discovered basenames: " + ", ".join(duplicate_discovered))
+
+    expected_names = set(expected_by_name)
+    discovered_names = set(discovered_by_name)
+    missing = sorted(expected_names - discovered_names)
+    extra = sorted(discovered_names - expected_names)
+    if missing:
+        errors.append("missing instances: " + ", ".join(missing))
+    if extra:
+        errors.append("unexpected instances: " + ", ".join(extra))
+
+    mismatches = sorted(
+        name
+        for name in expected_names & discovered_names
+        if len(discovered_by_name[name]) == 1
+        and discovered_by_name[name][0].get("instance_sha256") != expected_by_name[name]
+    )
+    if mismatches:
+        errors.append("SHA-256 mismatches: " + ", ".join(mismatches))
+    if errors:
+        raise SystemExit("suite instance preflight failed: " + "; ".join(errors))
+
+
+def minimum_external_grace_seconds(suite: dict[str, Any]) -> float:
+    raw_value = suite.get("minimum_external_grace_seconds", 0)
+    if (
+        isinstance(raw_value, bool)
+        or not isinstance(raw_value, (int, float))
+        or not math.isfinite(float(raw_value))
+        or float(raw_value) < 0
+    ):
+        raise SystemExit(
+            "suite minimum_external_grace_seconds must be a finite non-negative number"
+        )
+    return float(raw_value)
+
+
+def enforce_minimum_external_grace_seconds(
+    suite: dict[str, Any], configured_grace_seconds: float,
+) -> None:
+    minimum_grace = minimum_external_grace_seconds(suite)
+    if configured_grace_seconds < minimum_grace:
+        raise SystemExit(
+            f"suite requires --grace-seconds >= {minimum_grace:g}; "
+            f"received {configured_grace_seconds:g}"
+        )
 
 
 def adjacent_best_known(path: Path) -> float | None:
@@ -221,6 +315,8 @@ def command_for(
             command.append("--routing-two-way" if args.routing_two_way else "--no-routing-two-way")
             command.append("--routing-nearest-neighbor" if args.routing_nearest_neighbor else "--no-routing-nearest-neighbor")
             command.append("--routing-warm-start" if args.routing_warm_start else "--no-routing-warm-start")
+        if problem == "jssp":
+            command.append("--compact-json")
         return command
     if solver == "ortools-cp-sat":
         return [sys.executable, str(ADAPTERS / "ortools_cp_sat.py"), problem, *common]
@@ -265,6 +361,7 @@ def run_key(solver: str, item: dict[str, Any], budget: int, seed: int, args: arg
             budget,
             seed,
             args.threads,
+            args.grace_seconds,
             args.qayd_engine if solver.startswith("qayd-") else None,
             args.max_iterations if solver.startswith("qayd-") else None,
             args.profile_qayd if solver.startswith("qayd-") else None,
@@ -306,7 +403,7 @@ def check_solver_arguments(solvers: list[str], args: argparse.Namespace) -> None
 def prepare_qayd_extension() -> None:
     try:
         subprocess.run(
-            ["maturin", "develop", "--features", "python"], cwd=ROOT,
+            ["maturin", "develop", "--profile", "pyext", "--features", "python"], cwd=ROOT,
             check=True,
         )
     except (OSError, subprocess.SubprocessError) as error:
@@ -370,6 +467,7 @@ def main() -> None:
         args.threads <= 0
         or args.limit_per_family < 0
         or args.memory_limit_mb < 0
+        or not math.isfinite(args.grace_seconds)
         or args.grace_seconds < 0
         or (args.max_iterations is not None and args.max_iterations < 0)
     ):
@@ -378,14 +476,17 @@ def main() -> None:
     seeds = number_list(args.seed or ["0,1,2,3,4"], positive=False)
     solvers = list(dict.fromkeys(args.solver))
     check_solver_arguments(solvers, args)
+    suite_path, suite = load_suite(args.suite)
+    instances = discover_instances(suite, set(args.family), args.limit_per_family)
+    preflight_expected_instances(suite, instances)
+    enforce_minimum_external_grace_seconds(suite, args.grace_seconds)
+    if not instances:
+        raise SystemExit("no matching instances; run bench/fetch_collections.py for the competitive suite")
+
     has_qayd = any(solver.startswith("qayd-") for solver in solvers)
     if has_qayd and args.prepare_qayd:
         prepare_qayd_extension()
     qayd_artifact = qayd_artifact_provenance() if has_qayd else None
-    suite_path, suite = load_suite(args.suite)
-    instances = discover_instances(suite, set(args.family), args.limit_per_family)
-    if not instances:
-        raise SystemExit("no matching instances; run bench/fetch_collections.py for the competitive suite")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     completed = set() if args.restart else existing_keys(args.out)
@@ -401,6 +502,7 @@ def main() -> None:
         "seeds": seeds,
         "threads": args.threads,
         "memory_limit_mb": args.memory_limit_mb,
+        "grace_seconds": args.grace_seconds,
         "qayd_engine": args.qayd_engine,
         "max_iterations": args.max_iterations,
         "profile_qayd": args.profile_qayd,
@@ -413,7 +515,7 @@ def main() -> None:
     }
     compatibility_fields = (
         "suite", "suite_file", "solvers", "budgets", "seeds", "threads",
-        "memory_limit_mb", "qayd_engine", "max_iterations", "profile_qayd",
+        "memory_limit_mb", "grace_seconds", "qayd_engine", "max_iterations", "profile_qayd",
         "qayd_prepared", "qayd_artifact",
         "routing_two_way", "routing_nearest_neighbor", "routing_warm_start",
     )
@@ -472,6 +574,8 @@ def main() -> None:
                 "instance_path": item["instance_path"],
                 "instance_sha256": item["instance_sha256"],
                 "checkpoint_seconds": budget,
+                "grace_seconds": args.grace_seconds,
+                "external_timeout_seconds": budget + args.grace_seconds,
                 "seed": seed,
                 "requested_threads": args.threads,
                 "threads": effective_threads(solver, item, args),

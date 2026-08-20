@@ -20,6 +20,8 @@ mod verify;
 pub use crate::search_policy::{SearchPhase, SearchPolicy, ValueSelector, VariableSelector};
 pub(crate) use budget::WarmStartStops;
 pub use budget::{SolveBudget, TerminationReason};
+#[cfg(test)]
+pub(crate) use collection::schedule_restart_work;
 pub(crate) use collection::*;
 pub(crate) use cp::*;
 pub use diagnostics::{

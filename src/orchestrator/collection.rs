@@ -810,6 +810,7 @@ fn result_from_routing(
         model,
         CollectionCompletion {
             solution: outcome.solution,
+            verified_primal: None,
             status,
             source: EngineKind::RoutingExact,
             proof: completion_proof(EngineKind::RoutingExact, status, model.objectives.len(), outcome.complete),
@@ -861,6 +862,7 @@ fn result_from_list_exact(
         model,
         CollectionCompletion {
             solution,
+            verified_primal: None,
             status,
             source: EngineKind::ListExact,
             proof,
@@ -912,6 +914,7 @@ fn result_from_schedule(
         model,
         CollectionCompletion {
             solution,
+            verified_primal: None,
             status,
             source: EngineKind::ScheduleExact,
             proof,
@@ -1197,6 +1200,7 @@ fn result_from_local_search(run: ListLocalSearchRun<'_>, improvement: &mut impl 
         model,
         CollectionCompletion {
             solution,
+            verified_primal: None,
             status,
             source: engine,
             proof: None,
@@ -1226,6 +1230,7 @@ struct ScheduleLocalSearchRun<'a> {
 
 struct SharedScheduleIncumbent {
     solution: CollectionSolution,
+    candidate: CandidateSolution,
     source_worker: usize,
     source_round: usize,
     constructor: &'static str,
@@ -1305,8 +1310,13 @@ impl ScheduleMetricsAggregate {
     }
 }
 
-fn schedule_restart_work(schedule: &list::Schedule) -> u64 {
-    u64::try_from(schedule.intervals.len()).unwrap_or(u64::MAX).saturating_mul(256).clamp(2_048, 100_000)
+pub(crate) fn schedule_restart_work(interval_count: usize, quota: u64) -> u64 {
+    const TARGET_INTERVAL_WORK_PER_BOUNDARY: u128 = 256 * 1_000_000;
+
+    let interval_count_u128 = u128::try_from(interval_count.max(1)).unwrap_or(u128::MAX);
+    let legacy = u64::try_from(interval_count).unwrap_or(u64::MAX).saturating_mul(256).clamp(2_048, 100_000);
+    let adaptive_cap = u64::try_from(TARGET_INTERVAL_WORK_PER_BOUNDARY / interval_count_u128).unwrap_or(u64::MAX).clamp(256, 100_000);
+    quota.min(legacy.min(adaptive_cap))
 }
 
 fn schedule_round_seed(seed: u64, round: usize) -> u64 {
@@ -1348,6 +1358,7 @@ fn result_from_schedule_local_search(
         .schedule
         .as_ref()
         .ok_or_else(|| SolveError::InvalidResult("schedule local-search plan has no physical schedule".to_string()))?;
+    let restart_work_cap = schedule_restart_work(schedule.intervals.len(), u64::MAX);
     let mut aggregate = ScheduleMetricsAggregate::default();
     let (
         shared_incumbent,
@@ -1386,7 +1397,6 @@ fn result_from_schedule_local_search(
         let mut stalled_workers = 0u64;
         let mut stalled_unused_work_steps = 0u64;
         let mut work_budget_overruns = 0u64;
-        let restart_work = schedule_restart_work(schedule);
         let finite_work = max_iterations != u64::MAX;
         let mut remaining = (0..allocation.workers())
             .map(|worker| worker_iteration_quota(max_iterations, worker, allocation.workers()))
@@ -1404,7 +1414,8 @@ fn result_from_schedule_local_search(
                 .iter()
                 .enumerate()
                 .filter_map(|(worker, &left)| {
-                    let quota = if finite_work { left.min(restart_work) } else { restart_work };
+                    let worker_quota = if finite_work { left } else { u64::MAX };
+                    let quota = schedule_restart_work(schedule.intervals.len(), worker_quota);
                     (!retired[worker] && quota > 0).then_some((worker, quota))
                 })
                 .collect::<Vec<_>>();
@@ -1462,9 +1473,16 @@ fn result_from_schedule_local_search(
                         .is_none_or(|incumbent| schedule_candidate_precedes(&candidate, source_worker, round, incumbent));
                     if publication_eligible {
                         incumbent_verifications = incumbent_verifications.saturating_add(1);
-                        match list::verify_collection_solution_interruptible(model, &candidate, budget.stop()) {
-                            Ok(objectives) => {
-                                candidate.objectives = objectives;
+                        match verified_candidate(
+                            semantic,
+                            model,
+                            &candidate,
+                            EngineKind::ScheduleLocalSearch,
+                            VerificationLevel::Transfer,
+                            budget.stop(),
+                        ) {
+                            Ok(verified) => {
+                                candidate = schedule_solution_from_verified(&verified)?;
                                 let precedes = shared_incumbent
                                     .as_ref()
                                     .is_none_or(|incumbent| schedule_candidate_precedes(&candidate, source_worker, round, incumbent));
@@ -1474,6 +1492,7 @@ fn result_from_schedule_local_search(
                                         .is_none_or(|incumbent| candidate.objectives < incumbent.solution.objectives);
                                     shared_incumbent = Some(SharedScheduleIncumbent {
                                         solution: candidate.clone(),
+                                        candidate: verified,
                                         source_worker,
                                         source_round: round,
                                         constructor: metrics.constructor,
@@ -1585,6 +1604,7 @@ fn result_from_schedule_local_search(
     let elite_pool_size = usize::from(shared_incumbent.is_some());
     let incumbent_source_worker = shared_incumbent.as_ref().map(|incumbent| incumbent.source_worker);
     let incumbent_source_round = shared_incumbent.as_ref().map(|incumbent| incumbent.source_round);
+    let verified_primal = shared_incumbent.as_ref().map(|incumbent| incumbent.candidate.clone());
     let mut solution = if let Some(incumbent) = shared_incumbent {
         constructor = Some(incumbent.constructor);
         incumbent.solution
@@ -1634,6 +1654,7 @@ fn result_from_schedule_local_search(
         ("schedule_incumbent_incomplete_rejections".to_string(), incomplete_rejections.to_string()),
         ("schedule_restart_boundaries".to_string(), restart_boundaries.to_string()),
         ("schedule_peak_buffered_candidates".to_string(), peak_buffered_candidates.to_string()),
+        ("schedule_restart_work".to_string(), restart_work_cap.to_string()),
         ("schedule_stalled_workers".to_string(), stalled_workers.to_string()),
         ("schedule_stalled_unused_work_steps".to_string(), stalled_unused_work_steps.to_string()),
         ("schedule_worker_work_min".to_string(), worker_work_min.to_string()),
@@ -1688,6 +1709,7 @@ fn result_from_schedule_local_search(
         model,
         CollectionCompletion {
             solution,
+            verified_primal,
             status,
             source: EngineKind::ScheduleLocalSearch,
             proof: None,
@@ -1802,6 +1824,7 @@ fn warm_solution_from_verified(candidate: &CandidateSolution) -> Result<Collecti
 
 struct CollectionCompletion {
     solution: CollectionSolution,
+    verified_primal: Option<CandidateSolution>,
     status: SolveStatus,
     source: EngineKind,
     proof: Option<ProofClaim>,
@@ -1815,8 +1838,12 @@ fn finish_collection_result(
     budget: &SolveBudget,
     transfer_stop: Option<&AtomicBool>,
 ) -> Result<SolveResult, SolveError> {
-    let CollectionCompletion { solution, status, source, proof, report } = completion;
-    let primal = if solution.feasible {
+    let CollectionCompletion { solution, verified_primal, status, source, proof, report } = completion;
+    let primal = if let Some(candidate) = verified_primal {
+        #[cfg(test)]
+        list::audit_record_final_verification_boundary();
+        Some(promote_verified_collection_candidate(candidate, budget, transfer_stop)?)
+    } else if solution.feasible {
         #[cfg(test)]
         list::audit_record_final_verification_boundary();
         apply_final_replay_audit_before_first_pass(budget);
@@ -1877,6 +1904,58 @@ fn verified_candidate(
     // here would perform the same O(n) to O(n²) work twice at the deadline.
     let objectives = super::verify_semantic_assignment_validated_interruptible(semantic, &assignment, &solution.objectives, stop)?;
     Ok(CandidateSolution::verified(assignment, objectives, source, verification))
+}
+
+fn schedule_solution_from_verified(candidate: &CandidateSolution) -> Result<CollectionSolution, SolveError> {
+    if !candidate.transferable() {
+        return Err(SolveError::InvalidResult(
+            "schedule local search received an incumbent that was not verified for transfer".to_string(),
+        ));
+    }
+    if !candidate.assignment().integers.is_empty() || !candidate.assignment().sets.is_empty() || !candidate.assignment().lists.is_empty() {
+        return Err(SolveError::InvalidResult(
+            "schedule local search received a transferred incumbent from a different model family".to_string(),
+        ));
+    }
+    Ok(CollectionSolution {
+        lists: Vec::new(),
+        objectives: candidate.objectives().to_vec(),
+        feasible: true,
+        starts: candidate.assignment().intervals.iter().map(|interval| interval.start.unwrap_or_default()).collect(),
+        presences: candidate.assignment().intervals.iter().map(|interval| interval.present).collect(),
+        machines: candidate
+            .assignment()
+            .intervals
+            .iter()
+            .map(|interval| interval.machine.and_then(|value| i64::try_from(value).ok()).unwrap_or(-1))
+            .collect(),
+        modes: candidate.assignment().intervals.iter().map(|interval| interval.mode).collect(),
+        bound: None,
+    })
+}
+
+fn promote_verified_collection_candidate(
+    candidate: CandidateSolution,
+    budget: &SolveBudget,
+    transfer_stop: Option<&AtomicBool>,
+) -> Result<CandidateSolution, SolveError> {
+    if candidate.verification() != VerificationLevel::Transfer {
+        return Err(SolveError::InvalidResult("collection result candidate was not verified for transfer".to_string()));
+    }
+    apply_final_replay_audit_before_first_pass(budget);
+    apply_final_replay_audit_after_interrupt(budget);
+    if transfer_stop.is_some_and(|stop| stop.load(Ordering::Acquire)) || budget.hard_cancelled() {
+        return Err(SolveError::Interrupted(format!(
+            "canonical final replay exceeded its grace or was cancelled: {:?}",
+            budget.termination_reason()
+        )));
+    }
+    Ok(CandidateSolution::verified(
+        candidate.assignment().clone(),
+        candidate.objectives().to_vec(),
+        candidate.source(),
+        VerificationLevel::Final,
+    ))
 }
 
 fn completion_proof(engine: EngineKind, status: SolveStatus, objective_tiers: usize, complete: bool) -> Option<ProofClaim> {

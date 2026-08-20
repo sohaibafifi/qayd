@@ -1,0 +1,69 @@
+{
+  "name": "hexaly-jssp-1000x1000",
+  "description": "The ten Large-TA 1000 x 1000 JSSP instances used in the Hexaly 15.0 comparison table.",
+  "minimum_external_grace_seconds": 600,
+  "source": {
+    "paper": "Large-Scale Benchmarks for the Job Shop Scheduling Problem",
+    "paper_url": "https://arxiv.org/abs/2102.08778v2",
+    "instance_url_template": "https://arxiv.org/src/2102.08778v2/anc/Large-TA%20benchmark/tai_j1000_m1000_N.data",
+    "comparison_url": "https://www.hexaly.com/benchmarks/hexaly-vs-cp-optimizer-vs-or-tools-on-the-job-shop-scheduling-problem-jssp"
+  },
+  "reference_protocol": {
+    "objective": "minimize makespan",
+    "hexaly": {
+      "version": "15.0",
+      "time_limit_seconds": 600,
+      "hardware": "AMD Ryzen 7 7700, 8 cores, 3.8 GHz, 32 GB RAM",
+      "reference_kind": "incumbent, not a certified optimum or BKS",
+      "reference_incumbent_10m": {
+        "tai_j1000_m1000_1": 877026,
+        "tai_j1000_m1000_2": 877019,
+        "tai_j1000_m1000_3": 878218,
+        "tai_j1000_m1000_4": 876055,
+        "tai_j1000_m1000_5": 877564,
+        "tai_j1000_m1000_6": 875973,
+        "tai_j1000_m1000_7": 875881,
+        "tai_j1000_m1000_8": 876503,
+        "tai_j1000_m1000_9": 875431,
+        "tai_j1000_m1000_10": 875028
+      }
+    },
+    "cp_optimizer": {
+      "version": "12.10.0",
+      "time_limit_seconds": 21600,
+      "hardware": "AMD EPYC 7551P, 32 cores, 2 GHz, 256 GB RAM",
+      "reference_kind": "incumbent, not a certified optimum or BKS",
+      "reference_incumbent_6h": {
+        "tai_j1000_m1000_1": 959945,
+        "tai_j1000_m1000_2": 961924,
+        "tai_j1000_m1000_3": 957455,
+        "tai_j1000_m1000_4": 961039,
+        "tai_j1000_m1000_5": 964267,
+        "tai_j1000_m1000_6": 957143,
+        "tai_j1000_m1000_7": 956978,
+        "tai_j1000_m1000_8": 955338,
+        "tai_j1000_m1000_9": 956860,
+        "tai_j1000_m1000_10": 955693
+      }
+    }
+  },
+  "expected_instances": {
+    "tai_j1000_m1000_1.data": "909519206227c1916cc246ddde718f875ab2c24227b66206df77f7e41a6e1c01",
+    "tai_j1000_m1000_2.data": "25d44d6b5b114001bf21951c9518208d58f95afab0ea1413087e882134fd3b1f",
+    "tai_j1000_m1000_3.data": "ae2bc36a2ed28ac480df1436b7082ad4c794e1a77c1f8019280d3316ae901907",
+    "tai_j1000_m1000_4.data": "ec75b7c3f3423382a4a3e9bd5257209546ff411dd077143dbfb8aee40d9b9841",
+    "tai_j1000_m1000_5.data": "5c9ab9902e5e9b92d561a8dd405df9e55a01094a265afc51a71422d1265bc490",
+    "tai_j1000_m1000_6.data": "1b1c7a15c55c183226339b02c3a60b2f988d3432807e225658ca7592e1aee747",
+    "tai_j1000_m1000_7.data": "cb323f784be0cd08fbc7ee5d10b8ad921506f4bdbb26dd5b75463a44afd2e313",
+    "tai_j1000_m1000_8.data": "e5bea522a5f9fef649ed274ec7f16b93401c967caae6f033a5d96e1b004abba3",
+    "tai_j1000_m1000_9.data": "03e2034919737117fca6d0a4c03bbda3bc3c1790f83222e754f5073d85f443c1",
+    "tai_j1000_m1000_10.data": "6e3bc03b25d0f77fab17d376824938d0bc6f846dfa44ed251b64f0104f363aaf"
+  },
+  "datasets": [
+    {
+      "family": "large-ta-1000x1000",
+      "problem": "jssp",
+      "glob": "data/jssp/large-ta/tai_j1000_m1000_*.data"
+    }
+  ]
+}

@@ -493,37 +493,31 @@ impl EvaluationWorkspace {
     fn rebuild_dirty_topology(
         &mut self,
         problem: &JobShopProblem,
-        machine_predecessors: &[usize],
         machine_successors: &[usize],
         epoch: u32,
         stop: &AtomicBool,
     ) -> Result<(), ReconstructionFailure> {
+        // `evaluate_delta` populated the induced indegrees while building the
+        // forward closure. A FIFO Kahn traversal is sufficient because dates
+        // depend on precedence, not on the tie order among ready operations.
         self.ready.clear();
         self.dirty_topological.clear();
-        for index in 0..self.dirty_queue.len() {
+        for &operation in &self.dirty_queue {
             checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
-            let operation = self.dirty_queue[index];
-            let mut indegree =
-                problem.precedences.predecessors(operation).iter().filter(|&&predecessor| self.dirty_marks[predecessor] == epoch).count();
-            let machine_predecessor = machine_predecessors[operation];
-            if machine_predecessor != NO_OPERATION
-                && self.dirty_marks[machine_predecessor] == epoch
-                && !problem.precedences.predecessors(operation).contains(&machine_predecessor)
-            {
-                indegree = indegree.checked_add(1).ok_or(ReconstructionFailure::Numeric)?;
-            }
-            self.indegrees[operation] = indegree;
-            if indegree == 0 {
-                heap_push(&mut self.ready, operation);
+            if self.indegrees[operation] == 0 {
+                self.ready.push(operation);
             }
         }
 
-        while let Some(operation) = heap_pop(&mut self.ready) {
+        let mut cursor = 0usize;
+        while cursor < self.ready.len() {
             checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
+            let operation = self.ready[cursor];
+            cursor += 1;
             self.dirty_topological.push(operation);
             for &successor in problem.precedences.successors(operation) {
                 if self.dirty_marks[successor] == epoch {
-                    release_topological_successor(&mut self.indegrees, &mut self.ready, successor)?;
+                    release_fifo_successor(&mut self.indegrees, &mut self.ready, successor)?;
                 }
             }
             let machine_successor = machine_successors[operation];
@@ -531,7 +525,7 @@ impl EvaluationWorkspace {
                 && self.dirty_marks[machine_successor] == epoch
                 && !problem.precedences.successors(operation).contains(&machine_successor)
             {
-                release_topological_successor(&mut self.indegrees, &mut self.ready, machine_successor)?;
+                release_fifo_successor(&mut self.indegrees, &mut self.ready, machine_successor)?;
             }
         }
         if self.dirty_topological.len() != self.dirty_queue.len() {
@@ -677,6 +671,15 @@ fn release_topological_successor(indegrees: &mut [usize], ready: &mut Vec<usize>
     *degree = degree.checked_sub(1).ok_or(ReconstructionFailure::Cycle)?;
     if *degree == 0 {
         heap_push(ready, successor);
+    }
+    Ok(())
+}
+
+fn release_fifo_successor(indegrees: &mut [usize], ready: &mut Vec<usize>, successor: usize) -> Result<(), ReconstructionFailure> {
+    let degree = indegrees.get_mut(successor).ok_or(ReconstructionFailure::Cycle)?;
+    *degree = degree.checked_sub(1).ok_or(ReconstructionFailure::Cycle)?;
+    if *degree == 0 {
+        ready.push(successor);
     }
     Ok(())
 }
@@ -1203,8 +1206,10 @@ impl JobShopState {
         self.clear_date_patch();
         let epoch = self.workspace.next_dirty_epoch();
         self.workspace.dirty_queue.clear();
+        // Build the forward dirty closure and its induced indegrees together.
+        // Coincident job and machine arcs count once in both directions.
         for &operation in &self.workspace.changed_roots {
-            mark_dirty(&mut self.workspace.dirty_marks, &mut self.workspace.dirty_queue, epoch, operation);
+            mark_dirty(&mut self.workspace.dirty_marks, &mut self.workspace.dirty_queue, &mut self.workspace.indegrees, epoch, operation);
         }
         let mut cursor = 0usize;
         while cursor < self.workspace.dirty_queue.len() {
@@ -1212,38 +1217,41 @@ impl JobShopState {
             let operation = self.workspace.dirty_queue[cursor];
             cursor += 1;
             for &successor in self.problem.precedences.successors(operation) {
-                mark_dirty(&mut self.workspace.dirty_marks, &mut self.workspace.dirty_queue, epoch, successor);
+                mark_dirty(
+                    &mut self.workspace.dirty_marks,
+                    &mut self.workspace.dirty_queue,
+                    &mut self.workspace.indegrees,
+                    epoch,
+                    successor,
+                );
+                self.workspace.indegrees[successor] =
+                    self.workspace.indegrees[successor].checked_add(1).ok_or(ReconstructionFailure::Numeric)?;
             }
             let machine_successor = self.machine_successors[operation];
-            if machine_successor != NO_OPERATION {
-                mark_dirty(&mut self.workspace.dirty_marks, &mut self.workspace.dirty_queue, epoch, machine_successor);
+            if machine_successor != NO_OPERATION && !self.problem.precedences.successors(operation).contains(&machine_successor) {
+                mark_dirty(
+                    &mut self.workspace.dirty_marks,
+                    &mut self.workspace.dirty_queue,
+                    &mut self.workspace.indegrees,
+                    epoch,
+                    machine_successor,
+                );
+                self.workspace.indegrees[machine_successor] =
+                    self.workspace.indegrees[machine_successor].checked_add(1).ok_or(ReconstructionFailure::Numeric)?;
             }
         }
         let dirty = u64::try_from(self.workspace.dirty_queue.len()).unwrap_or(u64::MAX);
         self.metrics.dirty_cone_operations = self.metrics.dirty_cone_operations.saturating_add(dirty);
         self.metrics.max_dirty_cone = self.metrics.max_dirty_cone.max(dirty);
 
-        let operation_count = self.problem.operation_count();
-        if self.workspace.dirty_queue.len() == operation_count {
+        if self.workspace.dirty_queue.len() == self.problem.operation_count() {
             self.metrics.full_fallbacks = self.metrics.full_fallbacks.saturating_add(1);
         }
-        let rebuild_full_topology = self.workspace.dirty_queue.len().saturating_mul(4) >= operation_count.saturating_mul(3);
-        if rebuild_full_topology {
-            self.metrics.topological_rebuilds = self.metrics.topological_rebuilds.saturating_add(1);
-            self.workspace.rebuild_topology(&self.problem, &self.machine_predecessors, &self.machine_successors, stop)?;
-        } else {
-            self.workspace.rebuild_dirty_topology(&self.problem, &self.machine_predecessors, &self.machine_successors, epoch, stop)?;
-        }
+        self.workspace.rebuild_dirty_topology(&self.problem, &self.machine_successors, epoch, stop)?;
 
-        let topological_len =
-            if rebuild_full_topology { self.workspace.trial_topological.len() } else { self.workspace.dirty_topological.len() };
-        for index in 0..topological_len {
+        for index in 0..self.workspace.dirty_topological.len() {
             checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
-            let operation =
-                if rebuild_full_topology { self.workspace.trial_topological[index] } else { self.workspace.dirty_topological[index] };
-            if self.workspace.dirty_marks[operation] != epoch {
-                continue;
-            }
+            let operation = self.workspace.dirty_topological[index];
             let (start, end) = earliest_dates(&self.problem, &self.machine_predecessors, &self.reconstruction.ends, operation)?;
             if start != self.reconstruction.starts[operation] || end != self.reconstruction.ends[operation] {
                 self.workspace.patched_operations.push(operation);
@@ -1445,9 +1453,10 @@ fn refresh_machine_links(
     }
 }
 
-fn mark_dirty(marks: &mut [u32], queue: &mut Vec<usize>, epoch: u32, operation: usize) {
+fn mark_dirty(marks: &mut [u32], queue: &mut Vec<usize>, indegrees: &mut [usize], epoch: u32, operation: usize) {
     if marks[operation] != epoch {
         marks[operation] = epoch;
+        indegrees[operation] = 0;
         queue.push(operation);
     }
 }

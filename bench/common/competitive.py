@@ -22,6 +22,7 @@ from typing import Any, Iterable, Optional, Sequence
 
 SCHEMA_VERSION = 1
 FEASIBLE_STATUSES = {"SAT", "SATISFIABLE", "FEASIBLE", "OPTIMAL", "OPTIMUM"}
+_RSS_SAMPLE_INTERVAL_SECONDS = 0.5
 
 
 def sha256_file(path: Path) -> str:
@@ -195,7 +196,9 @@ def run_measured(
 
     The external timeout includes model parsing and result verification.  The
     solver's internal budget is normally smaller and is passed separately in
-    ``argv`` by the campaign driver.
+    ``argv`` by the campaign driver.  Process-tree RSS is sampled immediately,
+    every 500 ms, and once after exit.  Waiting is clipped to the wall deadline
+    so the lower-overhead RSS cadence does not reduce timeout precision.
     """
     preexec_fn = None
     if memory_limit_mb and os.name == "posix":
@@ -230,11 +233,13 @@ def run_measured(
     ]
     for reader in readers:
         reader.start()
-    peak_rss = 0
+    peak_rss = process_tree_rss_kib(process.pid)
     timed_out = False
+    deadline = started + timeout
+    next_rss_sample = time.perf_counter() + _RSS_SAMPLE_INTERVAL_SECONDS
     while process.poll() is None:
-        peak_rss = max(peak_rss, process_tree_rss_kib(process.pid))
-        if time.perf_counter() - started > timeout:
+        now = time.perf_counter()
+        if now >= deadline:
             timed_out = True
             if os.name == "posix":
                 import signal
@@ -245,7 +250,17 @@ def run_measured(
             else:
                 process.kill()
             break
-        time.sleep(0.01)
+        wait_seconds = min(deadline, next_rss_sample) - now
+        try:
+            process.wait(timeout=max(0.0, wait_seconds))
+        except subprocess.TimeoutExpired:
+            pass
+        if process.poll() is not None:
+            break
+        now = time.perf_counter()
+        if now < deadline:
+            peak_rss = max(peak_rss, process_tree_rss_kib(process.pid))
+            next_rss_sample = now + _RSS_SAMPLE_INTERVAL_SECONDS
     process.wait()
     for reader in readers:
         reader.join()

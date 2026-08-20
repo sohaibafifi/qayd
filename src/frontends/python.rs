@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pyo3::class::basic::CompareOp;
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyTimeoutError, PyTypeError, PyValueError};
@@ -515,6 +515,7 @@ struct PySolution {
     schedule_incumbent_verification_interruptions: Option<u64>,
     schedule_incumbent_incomplete_rejections: Option<u64>,
     schedule_restart_boundaries: Option<u64>,
+    schedule_restart_work: Option<u64>,
     schedule_peak_buffered_candidates: Option<u64>,
     schedule_stalled_workers: Option<u64>,
     schedule_stalled_unused_work_steps: Option<u64>,
@@ -648,11 +649,12 @@ impl SemanticConstruction {
 fn populate_python_metadata(package: &mut shared_model::ModelPackage) {
     use shared_model::ModelObject;
 
+    let mut outputs = package.metadata.outputs.iter().copied().collect::<HashSet<_>>();
     for index in 0..package.model.int_vars().len() {
         let object = ModelObject::IntVar(shared_model::IntVarRef(index));
         package.metadata.names.entry(object).or_insert_with(|| format!("int[{index}]"));
         package.metadata.frontend_ids.entry(("python".to_string(), format!("int:{index}"))).or_insert(object);
-        if !package.metadata.outputs.contains(&object) {
+        if outputs.insert(object) {
             package.metadata.outputs.push(object);
         }
     }
@@ -660,7 +662,7 @@ fn populate_python_metadata(package: &mut shared_model::ModelPackage) {
         let object = ModelObject::SetVar(shared_model::SetVarRef(index));
         package.metadata.names.entry(object).or_insert_with(|| format!("set[{index}]"));
         package.metadata.frontend_ids.entry(("python".to_string(), format!("set:{index}"))).or_insert(object);
-        if !package.metadata.outputs.contains(&object) {
+        if outputs.insert(object) {
             package.metadata.outputs.push(object);
         }
     }
@@ -668,7 +670,7 @@ fn populate_python_metadata(package: &mut shared_model::ModelPackage) {
         let object = ModelObject::ListVar(shared_model::ListVarRef(index));
         package.metadata.names.entry(object).or_insert_with(|| format!("list[{index}]"));
         package.metadata.frontend_ids.entry(("python".to_string(), format!("list:{index}"))).or_insert(object);
-        if declaration.role == shared_model::ListRole::Decision && !package.metadata.outputs.contains(&object) {
+        if declaration.role == shared_model::ListRole::Decision && outputs.insert(object) {
             package.metadata.outputs.push(object);
         }
     }
@@ -676,7 +678,7 @@ fn populate_python_metadata(package: &mut shared_model::ModelPackage) {
         let object = ModelObject::IntervalVar(shared_model::IntervalVarRef(index));
         package.metadata.names.entry(object).or_insert_with(|| format!("interval[{index}]"));
         package.metadata.frontend_ids.entry(("python".to_string(), format!("interval:{index}"))).or_insert(object);
-        if !package.metadata.outputs.contains(&object) {
+        if outputs.insert(object) {
             package.metadata.outputs.push(object);
         }
     }
@@ -753,27 +755,33 @@ impl PyModel {
         self.semantic.model_mut().add_constraint(constraint);
     }
 
-    fn integer_package(&self) -> shared_model::ModelPackage {
-        let mut package = self.semantic.package.clone();
+    fn populate_integer_metadata_and_objectives(&self, package: &mut shared_model::ModelPackage) {
         for objective in objective_specs(&self.objective, &self.then_objectives) {
             package.model.add_objective(shared_model::Objective::IntExpr { minimize: objective.minimizing, expr: objective.expr.expr });
         }
+        let mut outputs = package.metadata.outputs.iter().copied().collect::<HashSet<_>>();
         for (index, name) in self.names.iter().enumerate() {
             let object = ModelObject::IntVar(IntVarRef(index));
             if let Some(name) = name {
                 package.metadata.names.insert(object, name.clone());
             }
             package.metadata.frontend_ids.insert(("python".to_string(), format!("int:{index}")), object);
-            if !self.is_selector(index as u32) && !package.metadata.outputs.contains(&object) {
+            if !self.is_selector(index as u32) && outputs.insert(object) {
                 package.metadata.outputs.push(object);
             }
         }
+    }
+
+    fn integer_package(&self) -> shared_model::ModelPackage {
+        let mut package = self.semantic.package.clone();
+        self.populate_integer_metadata_and_objectives(&mut package);
         populate_python_metadata(&mut package);
         package
     }
 
     fn solve_package(&self) -> shared_model::ModelPackage {
-        let mut package = self.integer_package();
+        let mut package = self.semantic.package.clone();
+        self.populate_integer_metadata_and_objectives(&mut package);
         for objective in &self.semantic.objectives {
             package.model.add_objective(objective.clone());
         }
@@ -1024,6 +1032,7 @@ fn make_solution(
         schedule_incumbent_verification_interruptions: None,
         schedule_incumbent_incomplete_rejections: None,
         schedule_restart_boundaries: None,
+        schedule_restart_work: None,
         schedule_peak_buffered_candidates: None,
         schedule_stalled_workers: None,
         schedule_stalled_unused_work_steps: None,
@@ -1529,6 +1538,7 @@ fn verbose_collection_finish(solution: &PySolution, run: &CollectionRun, profile
                         solution.schedule_incumbent_incomplete_rejections.unwrap_or(0)
                     );
                     println!("  schedule restart boundaries: {}", solution.schedule_restart_boundaries.unwrap_or(0));
+                    println!("  schedule restart work: {}", solution.schedule_restart_work.unwrap_or(0));
                     println!("  schedule peak buffered candidates: {}", solution.schedule_peak_buffered_candidates.unwrap_or(0));
                     println!("  schedule stalled workers: {}", solution.schedule_stalled_workers.unwrap_or(0));
                     println!("  schedule stalled unused work steps: {}", solution.schedule_stalled_unused_work_steps.unwrap_or(0));
@@ -2368,6 +2378,11 @@ impl PySolution {
     #[getter]
     fn schedule_restart_boundaries(&self) -> Option<u64> {
         self.schedule_restart_boundaries
+    }
+
+    #[getter]
+    fn schedule_restart_work(&self) -> Option<u64> {
+        self.schedule_restart_work
     }
 
     #[getter]
@@ -3900,6 +3915,7 @@ impl PyModel {
                 }
             }
         }
+        let solve_started = Instant::now();
         let package = self.solve_package();
         let request = SolveRequest {
             mode: engine.solve_mode(),
@@ -3947,6 +3963,8 @@ impl PyModel {
         let num_vars = self.names.len();
         let primary_sense = if self.semantic.primary_list_sense().unwrap_or(true) { "min" } else { "max" };
         let run = with_interrupts(py, move || {
+            let mut request = request;
+            request.limits.time = request.limits.time.map(|limit| limit.saturating_sub(solve_started.elapsed()));
             let mut sink = PythonSolveEventSink::new(verbose, on_incumbent, primary_sense);
             let result = solve_model_with_external_stop(&package, &request, &SIGINT_TRIPPED, &mut sink);
             if let Some(error) = sink.integer.callback_error {
@@ -4659,6 +4677,7 @@ impl PyModel {
         let schedule_incumbent_verification_interruptions = schedule_counter("schedule_incumbent_verification_interruptions");
         let schedule_incumbent_incomplete_rejections = schedule_counter("schedule_incumbent_incomplete_rejections");
         let schedule_restart_boundaries = schedule_counter("schedule_restart_boundaries");
+        let schedule_restart_work = schedule_counter("schedule_restart_work");
         let schedule_peak_buffered_candidates = schedule_counter("schedule_peak_buffered_candidates");
         let schedule_stalled_workers = schedule_counter("schedule_stalled_workers");
         let schedule_stalled_unused_work_steps = schedule_counter("schedule_stalled_unused_work_steps");
@@ -4772,6 +4791,7 @@ impl PyModel {
             schedule_incumbent_verification_interruptions,
             schedule_incumbent_incomplete_rejections,
             schedule_restart_boundaries,
+            schedule_restart_work,
             schedule_peak_buffered_candidates,
             schedule_stalled_workers,
             schedule_stalled_unused_work_steps,

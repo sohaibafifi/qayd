@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use qayd::engines::ls::lists::solve_collection;
 use qayd::model::list::{
-    CollectionModel, CollectionSolution, Constraint, ExprArena, GlobalConstraint, IntervalVar, Iterable, Mode, ObjectiveTier, Op, ReduceOp,
-    Reduction, Resource, Schedule,
+    verify_collection_solution, CollectionModel, CollectionSolution, Constraint, ExprArena, GlobalConstraint, IntervalVar, Iterable, Mode,
+    ObjectiveTier, Op, ReduceOp, Reduction, Resource, Schedule,
 };
 use qayd::model::{Model, ModelPackage};
 use qayd::orchestrator::{solve_model_silent, SolveLimits, SolveMode, SolveRequest, SolveStatus};
@@ -70,6 +70,51 @@ fn run(model: &CollectionModel, millis: u64) -> CollectionSolution {
         flag.store(true, Ordering::SeqCst);
     });
     solve_collection(model, 0, &stop, &mut |_| {})
+}
+
+fn machine_no_overlap_model(spec: &[(usize, i64, bool)], horizon: i64) -> CollectionModel {
+    let intervals = spec
+        .iter()
+        .enumerate()
+        .map(|(index, &(machine, duration, optional))| IntervalVar {
+            duration: 0,
+            horizon,
+            modes: vec![Mode { reference: Some(index), machine, duration, start_window: (0, horizon - duration) }],
+            optional,
+        })
+        .collect();
+    schedule_model(Schedule { intervals, precedences: Vec::new(), resources: vec![Resource::MachineNoOverlap], minimize_makespan: true })
+}
+
+fn machine_solution(starts: &[i64], presences: &[bool], machines: &[i64], modes: &[Option<usize>], objective: i64) -> CollectionSolution {
+    CollectionSolution {
+        lists: Vec::new(),
+        objectives: vec![objective],
+        feasible: true,
+        starts: starts.to_vec(),
+        presences: presences.to_vec(),
+        machines: machines.to_vec(),
+        modes: modes.to_vec(),
+        bound: None,
+    }
+}
+
+fn quadratic_machine_no_overlap_ok(starts: &[i64], durations: &[i64], horizon: i64) -> bool {
+    for (&start, &duration) in starts.iter().zip(durations) {
+        if start < 0 || start.checked_add(duration).is_none_or(|end| end > horizon) {
+            return false;
+        }
+    }
+    for left in 0..starts.len() {
+        let left_end = starts[left].saturating_add(durations[left]);
+        for right in (left + 1)..starts.len() {
+            let right_end = starts[right].saturating_add(durations[right]);
+            if starts[left] < right_end && starts[right] < left_end {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// `sum_edges(list, (i, j) => dist[i][j])` with the depot (node 0) at both ends.
@@ -1310,6 +1355,94 @@ fn fjsp_interval_optimum() {
 
 fn intervals_horizon() -> [i64; 4] {
     [12, 12, 12, 12]
+}
+
+#[test]
+fn machine_no_overlap_replay_accepts_touching_blocks_after_grouped_sort() {
+    let model = machine_no_overlap_model(&[(1, 2, false), (0, 2, false), (1, 1, false), (0, 2, false)], 8);
+    let solution = machine_solution(&[2, 0, 4, 2], &[true; 4], &[1, 0, 1, 0], &[Some(0), Some(1), Some(2), Some(3)], 5);
+
+    assert_eq!(verify_collection_solution(&model, &solution).unwrap(), vec![5]);
+}
+
+#[test]
+fn machine_no_overlap_replay_rejects_overlap_after_grouped_sort() {
+    let model = machine_no_overlap_model(&[(1, 3, false), (0, 2, false), (1, 2, false), (1, 1, false)], 8);
+    let solution = machine_solution(&[1, 0, 2, 5], &[true; 4], &[1, 0, 1, 1], &[Some(0), Some(1), Some(2), Some(3)], 6);
+
+    let error = verify_collection_solution(&model, &solution).unwrap_err();
+    assert!(error.contains("intervals 0 and 2 overlap"));
+}
+
+#[test]
+fn machine_no_overlap_replay_ignores_absent_intervals() {
+    let model = schedule_model(Schedule {
+        intervals: vec![
+            IntervalVar {
+                duration: 0,
+                horizon: 8,
+                modes: vec![Mode { reference: Some(0), machine: 0, duration: 3, start_window: (0, 5) }],
+                optional: false,
+            },
+            IntervalVar { duration: 4, horizon: 8, modes: Vec::new(), optional: true },
+            IntervalVar {
+                duration: 0,
+                horizon: 8,
+                modes: vec![Mode { reference: Some(2), machine: 0, duration: 2, start_window: (0, 6) }],
+                optional: false,
+            },
+        ],
+        precedences: Vec::new(),
+        resources: vec![Resource::MachineNoOverlap],
+        minimize_makespan: true,
+    });
+    let solution = machine_solution(&[0, 1, 3], &[true, false, true], &[0, -1, 0], &[Some(0), None, Some(2)], 5);
+
+    assert_eq!(verify_collection_solution(&model, &solution).unwrap(), vec![5]);
+}
+
+#[test]
+fn machine_no_overlap_replay_rejects_equal_starts_on_one_machine_deterministically() {
+    let model = machine_no_overlap_model(&[(2, 2, false), (2, 1, false), (0, 1, false)], 6);
+    let solution = machine_solution(&[1, 1, 0], &[true; 3], &[2, 2, 0], &[Some(0), Some(1), Some(2)], 3);
+
+    let error = verify_collection_solution(&model, &solution).unwrap_err();
+    assert!(error.contains("intervals 0 and 1 overlap"));
+}
+
+#[test]
+fn machine_no_overlap_replay_does_not_let_zero_length_peers_mask_later_overlap() {
+    let model = machine_no_overlap_model(&[(0, 10, false), (0, 0, false), (0, 1, false)], 12);
+    let solution = machine_solution(&[0, 0, 5], &[true; 3], &[0, 0, 0], &[Some(0), Some(1), Some(2)], 10);
+
+    let error = verify_collection_solution(&model, &solution).unwrap_err();
+    assert!(error.contains("intervals 0 and 2 overlap"));
+}
+
+#[test]
+fn machine_no_overlap_replay_matches_the_quadratic_oracle_on_small_cases() {
+    for durations in [[0, 0, 1], [0, 1, 0], [2, 0, 1], [2, 1, 3]] {
+        let horizon = 6;
+        let spec = durations.into_iter().map(|duration| (0usize, duration, false)).collect::<Vec<_>>();
+        let model = machine_no_overlap_model(&spec, horizon);
+
+        for s0 in 0..=4 {
+            for s1 in 0..=4 {
+                for s2 in 0..=4 {
+                    let starts = [s0, s1, s2];
+                    let makespan = starts.into_iter().zip(durations).map(|(start, duration)| start + duration).max().unwrap();
+                    let solution = machine_solution(&starts, &[true; 3], &[0, 0, 0], &[Some(0), Some(1), Some(2)], makespan);
+                    let oracle_ok = quadratic_machine_no_overlap_ok(&starts, &durations, horizon);
+                    let replay = verify_collection_solution(&model, &solution);
+
+                    assert_eq!(replay.is_ok(), oracle_ok, "durations={durations:?}, starts={starts:?}");
+                    if oracle_ok {
+                        assert_eq!(replay.unwrap(), vec![makespan], "durations={durations:?}, starts={starts:?}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// In-place lexicographic next permutation; false when the sequence is the last.

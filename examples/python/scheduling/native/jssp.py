@@ -8,6 +8,7 @@ a standard JSPLIB pair-format file to solve it:
 
 import argparse
 import contextlib
+import hashlib
 import json
 import sys
 import time
@@ -15,6 +16,20 @@ from random import Random
 
 import qayd as cp
 from qayd.datasets import read_jsplib
+
+
+def start_vector_sha256(starts):
+    """Hash the canonical compact-JSON encoding without materializing it."""
+    digest = hashlib.sha256()
+    digest.update(b"[")
+    chunk_size = 4096
+    for begin in range(0, len(starts), chunk_size):
+        if begin:
+            digest.update(b",")
+        chunk = ",".join(str(value) for value in starts[begin : begin + chunk_size])
+        digest.update(chunk.encode("ascii"))
+    digest.update(b"]")
+    return digest.hexdigest()
 
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -30,6 +45,11 @@ parser.add_argument("--engine", choices=("auto", "exact", "ls"))
 parser.add_argument("--verbose", action="store_true")
 parser.add_argument("--profile", action="store_true")
 parser.add_argument("--json", action="store_true", help="emit one machine-readable result")
+parser.add_argument(
+    "--compact-json",
+    action="store_true",
+    help="omit the detailed schedule and emit a SHA-256 start-vector commitment",
+)
 args = parser.parse_args()
 
 if (
@@ -42,6 +62,7 @@ if (
     raise SystemExit("threads must be positive; time, memory and iteration limits and seed must be non-negative")
 engine = args.engine or ("ls" if args.threads > 1 else "auto")
 
+parse_started = time.perf_counter()
 instance = read_jsplib(args.instance) if args.instance else None
 if instance is None:
     jobs, machines = args.jobs, args.machines
@@ -54,7 +75,9 @@ else:
     machine_order = [list(row) for row in instance.machines]
     processing = [list(row) for row in instance.durations]
     name = instance.name
+parse_seconds = time.perf_counter() - parse_started
 
+model_build_started = time.perf_counter()
 durations = [processing[job][operation] for job in range(jobs) for operation in range(len(processing[job]))]
 machine_of = [machine_order[job][operation] for job in range(jobs) for operation in range(len(machine_order[job]))]
 job_operations = []
@@ -72,8 +95,9 @@ for operations in job_operations:
         model.precedence(intervals[before], intervals[after])
 model.no_overlap_by_machine()
 model.minimize_makespan(intervals)
+model_build_seconds = time.perf_counter() - model_build_started
 
-started = time.perf_counter()
+solve_started = time.perf_counter()
 output = contextlib.redirect_stdout(sys.stderr) if args.json else contextlib.nullcontext()
 with output:
     solution = model.solve(
@@ -86,7 +110,8 @@ with output:
         memory_limit_mb=args.memory_limit_mb or None,
         max_iterations=args.max_iterations,
     )
-elapsed = time.perf_counter() - started
+solve_seconds = time.perf_counter() - solve_started
+elapsed = solve_seconds
 profile_record = {
     "backend_build_seconds": solution.backend_build_seconds,
     "construction_seconds": solution.construction_seconds,
@@ -111,6 +136,7 @@ profile_record = {
     "schedule_incumbent_verification_interruptions": solution.schedule_incumbent_verification_interruptions,
     "schedule_incumbent_incomplete_rejections": solution.schedule_incumbent_incomplete_rejections,
     "schedule_restart_boundaries": solution.schedule_restart_boundaries,
+    "schedule_restart_work": solution.schedule_restart_work,
     "schedule_peak_buffered_candidates": solution.schedule_peak_buffered_candidates,
     "schedule_stalled_workers": solution.schedule_stalled_workers,
     "schedule_stalled_unused_work_steps": solution.schedule_stalled_unused_work_steps,
@@ -157,6 +183,17 @@ if not solution.starts:
         "instance": name,
         "status": solution.status,
         "elapsed_seconds": elapsed,
+        "elapsed_seconds_scope": "model.solve",
+        "parse_seconds": parse_seconds,
+        "model_build_seconds": model_build_seconds,
+        "solve_seconds": solve_seconds,
+        "replay_seconds": 0.0,
+        "verification_counts": {
+            "starts": 0,
+            "job_precedence_pairs": 0,
+            "machine_non_overlap_pairs": 0,
+            "objective_checks": 0,
+        },
         "objectives": [],
         "objective_convention": "makespan",
         "dual_bound": solution.dual_bound,
@@ -164,28 +201,51 @@ if not solution.starts:
         "relative_gap": solution.relative_gap,
         "bound_method": solution.bound_method,
     }
+    if args.compact_json:
+        record.update({
+            "start_vector_length": 0,
+            "start_vector_sha256": start_vector_sha256([]),
+            "start_vector_sha256_encoding": "canonical-json-array-v1",
+        })
     print(json.dumps(record, sort_keys=True) if args.json else f"instance: {name}  status: {solution.status}")
     raise SystemExit(0)
 
+replay_started = time.perf_counter()
 starts = [int(start) for start in solution.starts]
+if len(starts) != len(durations):
+    raise AssertionError("solver returned an incomplete start vector")
+if any(start < 0 for start in starts):
+    raise AssertionError("solver returned a negative start time")
 ends = [start + duration for start, duration in zip(starts, durations)]
+job_precedence_pairs = 0
 for operations in job_operations:
     for before, after in zip(operations, operations[1:]):
-        assert ends[before] <= starts[after], "job order respected"
-for machine in range(machines):
-    operations = sorted((index for index, owner in enumerate(machine_of) if owner == machine), key=starts.__getitem__)
+        job_precedence_pairs += 1
+        if ends[before] > starts[after]:
+            raise AssertionError(
+                f"job precedence violated: operation {before} ends at {ends[before]} "
+                f"after operation {after} starts at {starts[after]}"
+            )
+machine_operations = [[] for _ in range(machines)]
+for index, machine in enumerate(machine_of):
+    machine_operations[machine].append(index)
+machine_non_overlap_pairs = 0
+for machine, operations in enumerate(machine_operations):
+    operations.sort(key=starts.__getitem__)
     for before, after in zip(operations, operations[1:]):
-        assert ends[before] <= starts[after], f"machine {machine} has no overlap"
+        machine_non_overlap_pairs += 1
+        if ends[before] > starts[after]:
+            raise AssertionError(
+                f"machine {machine} overlap: operation {before} ends at {ends[before]} "
+                f"after operation {after} starts at {starts[after]}"
+            )
 makespan = max(ends, default=0)
-assert list(solution.objectives) == [makespan], "reported makespan matches replay"
-
-schedule = [
-    [
-        {"machine": machine_of[index], "start": starts[index], "duration": durations[index]}
-        for index in operations
-    ]
-    for operations in job_operations
-]
+reported_objectives = list(solution.objectives)
+if reported_objectives != [makespan]:
+    raise AssertionError(
+        f"reported objectives {reported_objectives} do not match replayed makespan {makespan}"
+    )
+replay_seconds = time.perf_counter() - replay_started
 record = {
     **profile_record,
     "instance": name,
@@ -200,12 +260,38 @@ record = {
     "relative_gap": solution.relative_gap,
     "bound_method": solution.bound_method,
     "elapsed_seconds": elapsed,
+    "elapsed_seconds_scope": "model.solve",
+    "parse_seconds": parse_seconds,
+    "model_build_seconds": model_build_seconds,
+    "solve_seconds": solve_seconds,
+    "replay_seconds": replay_seconds,
     "seed": args.seed,
     "threads": args.threads,
     "engine": engine,
-    "schedule": schedule,
     "verified": True,
+    "verification_counts": {
+        "starts": len(starts),
+        "job_precedence_pairs": job_precedence_pairs,
+        "machine_non_overlap_pairs": machine_non_overlap_pairs,
+        "objective_checks": 1,
+    },
 }
+if args.compact_json:
+    commitment_started = time.perf_counter()
+    record.update({
+        "start_vector_length": len(starts),
+        "start_vector_sha256": start_vector_sha256(starts),
+        "start_vector_sha256_encoding": "canonical-json-array-v1",
+        "commitment_seconds": time.perf_counter() - commitment_started,
+    })
+else:
+    record["schedule"] = [
+        [
+            {"machine": machine_of[index], "start": starts[index], "duration": durations[index]}
+            for index in operations
+        ]
+        for operations in job_operations
+    ]
 if args.json:
     print(json.dumps(record, sort_keys=True))
 else:

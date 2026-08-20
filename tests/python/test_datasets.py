@@ -1,11 +1,15 @@
 import gzip
+import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import runpy
 import subprocess
 import sys
 
 import pytest
+import qayd as cp
 from qayd.datasets import (
     DatasetParseError,
     load_instance,
@@ -277,10 +281,14 @@ def test_python_examples_use_arguments_instead_of_qayd_environment_variables():
         assert "QAYD_" not in source, script
 
 
-def _run_example(script: str, *arguments: str):
+def _run_example(script: str, *arguments: str, python_optimize: bool = False):
+    environment = None
+    if python_optimize:
+        environment = {**os.environ, "PYTHONOPTIMIZE": "1"}
     result = subprocess.run(
         [sys.executable, str(ROOT / script), *arguments, "--time-limit", "1", "--json"],
         cwd=ROOT,
+        env=environment,
         text=True,
         capture_output=True,
         check=False,
@@ -427,3 +435,113 @@ def test_vrp_launchers_accept_compact_solution_warm_starts(script):
 def test_api_and_native_examples_solve_standard_instance_files(script, instance, expected_name):
     record = _run_example(script, instance)
     assert record["instance"] == expected_name
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "examples/python/scheduling/api/jssp.py",
+        "examples/python/scheduling/native/jssp.py",
+    ],
+)
+def test_jssp_compact_json_commits_to_starts_without_materializing_schedule(script):
+    instance = "examples/instances/scheduling/tiny-jssp.txt"
+    detailed = _run_example(script, instance)
+    compact = _run_example(script, instance, "--compact-json")
+
+    starts = [operation["start"] for job in detailed["schedule"] for operation in job]
+    encoded_starts = json.dumps(starts, separators=(",", ":")).encode("ascii")
+    assert "schedule" not in compact
+    assert compact["start_vector_length"] == len(starts) == compact["operations"]
+    assert compact["start_vector_sha256"] == hashlib.sha256(encoded_starts).hexdigest()
+    assert compact["start_vector_sha256_encoding"] == "canonical-json-array-v1"
+    assert compact["elapsed_seconds_scope"] == "model.solve"
+    assert compact["elapsed_seconds"] == compact["solve_seconds"]
+    for field in (
+        "parse_seconds",
+        "model_build_seconds",
+        "solve_seconds",
+        "replay_seconds",
+        "commitment_seconds",
+    ):
+        assert compact[field] >= 0
+    assert compact["verification_counts"] == {
+        "starts": 9,
+        "job_precedence_pairs": 6,
+        "machine_non_overlap_pairs": 6,
+        "objective_checks": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "examples/python/scheduling/api/jssp.py",
+        "examples/python/scheduling/native/jssp.py",
+    ],
+)
+def test_jssp_compact_json_keeps_verification_under_python_optimize(script):
+    record = _run_example(
+        script,
+        "examples/instances/scheduling/tiny-jssp.txt",
+        "--compact-json",
+        python_optimize=True,
+    )
+
+    assert record["verified"] is True
+    assert "schedule" not in record
+    assert record["verification_counts"] == {
+        "starts": 9,
+        "job_precedence_pairs": 6,
+        "machine_non_overlap_pairs": 6,
+        "objective_checks": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "examples/python/scheduling/api/jssp.py",
+        "examples/python/scheduling/native/jssp.py",
+    ],
+)
+@pytest.mark.parametrize(
+    ("arguments", "starts", "objectives", "message"),
+    [
+        (("--jobs", "1", "--machines", "2"), [0], [0], "incomplete start vector"),
+        (("--jobs", "1", "--machines", "2"), [-1, 20], [0], "negative start time"),
+        (("--jobs", "1", "--machines", "2"), [0, 0], [0], "job precedence violated"),
+        (("--jobs", "2", "--machines", "1"), [0, 0], [0], "machine 0 overlap"),
+        (
+            ("--jobs", "1", "--machines", "2"),
+            [0, 100],
+            [0],
+            "do not match replayed makespan",
+        ),
+    ],
+)
+def test_jssp_replay_explicitly_rejects_invalid_schedule(
+    monkeypatch, script, arguments, starts, objectives, message
+):
+    class InvalidSolution:
+        status = "SATISFIABLE"
+        dual_bound = None
+        absolute_gap = None
+        relative_gap = None
+        bound_method = None
+
+        def __getattr__(self, _name):
+            return 0
+
+    invalid_solution = InvalidSolution()
+    invalid_solution.starts = starts
+    invalid_solution.objectives = objectives
+    monkeypatch.setattr(cp.Model, "solve", lambda _model, **_kwargs: invalid_solution)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [script, *arguments, "--compact-json", "--json"],
+    )
+
+    with pytest.raises(AssertionError, match=message):
+        runpy.run_path(ROOT / script, run_name="__main__")

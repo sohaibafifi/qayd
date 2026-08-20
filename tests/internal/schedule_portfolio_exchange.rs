@@ -1,11 +1,13 @@
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+use crate::orchestrator::schedule_restart_work;
 use qayd::engines::ls::lists::{solve_schedule, solve_schedule_capped};
 use qayd::model::list::{CollectionModel, IntervalVar, Resource, Schedule};
 use qayd::model::{Model, ModelPackage};
 use qayd::orchestrator::{
-    EventCallback, EventControl, IgnoreEvents, SolveEvent, SolveLimits, SolveMode, SolveRequest, SolveResult, SolveStatus,
+    audit_interrupt_next_collection_final_replay, EventCallback, EventControl, IgnoreEvents, SolveEvent, SolveLimits, SolveMode,
+    SolveRequest, SolveResult, SolveStatus,
 };
 
 fn job_shop_schedule(operation_count: usize) -> Schedule {
@@ -130,6 +132,7 @@ fn scheduling_portfolio_exchanges_only_at_reproducible_restart_boundaries() {
     assert_eq!(metadata(&first, "schedule_incumbent_source_worker"), "0");
     assert_eq!(metadata(&first, "schedule_incumbent_source_round"), "0");
     assert_eq!(metadata(&first, "schedule_work_steps"), "8192");
+    assert_eq!(metadata(&first, "schedule_restart_work"), "2048");
     assert_eq!(metadata(&first, "schedule_worker_work_min"), "4096");
     assert_eq!(metadata(&first, "schedule_worker_work_max"), "4096");
     assert_eq!(metadata(&first, "schedule_unused_work_steps"), "0");
@@ -166,6 +169,7 @@ fn resource_portfolio_reconstructs_the_verified_shared_incumbent() {
     assert_eq!(metadata(&first, "schedule_incumbent_verification_rejections"), "0");
     assert_eq!(metadata(&first, "schedule_elite_pool_size"), "1");
     assert_eq!(metadata(&first, "schedule_work_steps"), "8192");
+    assert_eq!(metadata(&first, "schedule_restart_work"), "2048");
     assert_eq!(metadata(&first, "schedule_worker_work_min"), "4096");
     assert_eq!(metadata(&first, "schedule_worker_work_max"), "4096");
     assert_eq!(metadata(&first, "schedule_unused_work_steps"), "0");
@@ -246,4 +250,55 @@ fn structured_worker_counts_only_a_reconstructed_injected_incumbent() {
     let prearmed = AtomicBool::new(true);
     let (_, interrupted) = solve_schedule_capped(&schedule, 107, &prearmed, 128, false, Some(&incumbent), &mut |_| {});
     assert_eq!(interrupted.incumbent_injections, 0);
+}
+
+#[test]
+fn adaptive_schedule_restart_work_is_pure_and_caps_large_batches() {
+    assert_eq!(schedule_restart_work(8, 100_000), 2_048);
+    assert_eq!(schedule_restart_work(64, 100_000), 16_384);
+    assert_eq!(schedule_restart_work(2_560, 100_000), 100_000);
+    assert_eq!(schedule_restart_work(1_000_000, 100_000), 256);
+    assert_eq!(schedule_restart_work(2_000_000, 100_000), 256);
+    assert_eq!(schedule_restart_work(2_000_000, 200), 200);
+}
+
+#[test]
+fn schedule_soft_deadline_after_a_verified_boundary_promotes_without_replay() {
+    let package = deterministic_job_shop(16);
+    let request = SolveRequest {
+        mode: SolveMode::LocalSearch,
+        threads: 2,
+        seed: 71,
+        limits: SolveLimits { iterations: Some(8_192), ..SolveLimits::default() },
+        profile: true,
+        ..SolveRequest::default()
+    };
+    audit_interrupt_next_collection_final_replay(false);
+
+    let result = qayd::solve(&package, &request, &mut IgnoreEvents).expect("soft final publication deadline keeps the verified incumbent");
+
+    assert_eq!(result.status(), SolveStatus::Satisfiable);
+    assert_eq!(result.primal().expect("verified schedule survives final publication").objectives(), [16]);
+    assert_eq!(metadata(&result, "schedule_incumbent_verification_rejections"), "0");
+    assert!(metric(&result, "schedule_incumbent_verifications") > 0);
+}
+
+#[test]
+fn schedule_hard_cancel_after_a_verified_boundary_still_blocks_publication() {
+    let package = deterministic_job_shop(16);
+    let request = SolveRequest {
+        mode: SolveMode::LocalSearch,
+        threads: 2,
+        seed: 71,
+        limits: SolveLimits { iterations: Some(8_192), ..SolveLimits::default() },
+        profile: true,
+        ..SolveRequest::default()
+    };
+    audit_interrupt_next_collection_final_replay(true);
+
+    let result = qayd::solve(&package, &request, &mut IgnoreEvents).expect("hard cancellation still returns a normal solve result");
+
+    assert_eq!(result.status(), SolveStatus::Unknown);
+    assert!(result.primal().is_none());
+    assert!(result.message().is_some_and(|message| message.contains("ExternalCancellation")));
 }

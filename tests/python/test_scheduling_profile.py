@@ -101,6 +101,7 @@ def test_schedule_profile_is_present_only_when_requested():
     assert plain.candidates_evaluated is None
     assert plain.candidates_per_second is None
     assert plain.full_recompute_percentage is None
+    assert plain.schedule_restart_work is None
     assert all(getattr(plain, field) is None for field in SCHEDULE_COUNTERS)
 
     assert profiled.candidates_evaluated == profiled.schedule_moves_considered
@@ -123,6 +124,7 @@ def test_schedule_profile_is_present_only_when_requested():
     assert profiled.schedule_incumbent_verification_interruptions <= profiled.schedule_incumbent_rejections
     assert profiled.schedule_incumbent_incomplete_rejections <= profiled.schedule_incumbent_rejections
     assert profiled.schedule_restart_boundaries > 0
+    assert profiled.schedule_restart_work == 2_048
     assert 1 <= profiled.schedule_peak_buffered_candidates <= 2
     assert profiled.schedule_worker_work_min <= profiled.schedule_worker_work_max
     assert profiled.schedule_work_budget_overruns == 0
@@ -175,6 +177,8 @@ def test_scheduling_launchers_emit_search_profile(launcher, shape_args):
         record["schedule_incumbent_publications"] + record["schedule_incumbent_rejections"]
     )
     assert record["schedule_incumbent_injections"] <= record["schedule_incumbent_injection_attempts"]
+    if launcher.endswith("/jssp.py"):
+        assert record["schedule_restart_work"] == 2_048
     assert record["schedule_worker_work_min"] <= record["schedule_worker_work_max"]
     assert record["schedule_work_budget_overruns"] == 0
     assert record["schedule_elite_pool_size"] == 1
@@ -216,3 +220,4 @@ def test_scheduling_verbose_output_includes_search_profile():
     assert "schedule delta evaluations:" in completed.stdout
     assert "schedule oracle mismatches:" in completed.stdout
     assert "schedule max dirty cone:" in completed.stdout
+    assert "schedule restart work: 2048" in completed.stdout

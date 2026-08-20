@@ -280,16 +280,7 @@ fn verify_schedule(schedule: &super::Schedule, solution: &CollectionSolution, st
         check_stop(stop)?;
         match resource {
             Resource::NoOverlap(intervals) => verify_no_overlap(intervals, solution, &durations, stop)?,
-            Resource::MachineNoOverlap => {
-                for left in 0..n {
-                    check_stop(stop)?;
-                    for right in (left + 1)..n {
-                        if solution.machines[left] >= 0 && solution.machines[left] == solution.machines[right] {
-                            verify_pair(left, right, solution, &durations)?;
-                        }
-                    }
-                }
-            }
+            Resource::MachineNoOverlap => verify_machine_no_overlap(solution, &durations, stop)?,
             Resource::Cumulative { demands, capacity } => verify_cumulative(demands, *capacity, solution, &durations, stop)?,
         }
     }
@@ -336,6 +327,64 @@ fn verify_no_overlap(intervals: &[usize], solution: &CollectionSolution, duratio
         for right in (left + 1)..intervals.len() {
             verify_pair(intervals[left], intervals[right], solution, durations)?;
         }
+    }
+    Ok(())
+}
+
+fn verify_machine_no_overlap(solution: &CollectionSolution, durations: &[i64], stop: &AtomicBool) -> Result<(), String> {
+    let mut assigned = Vec::new();
+    for (index, (&present, &machine)) in solution.presences.iter().zip(&solution.machines).enumerate() {
+        check_stop(stop)?;
+        if present && machine >= 0 {
+            let end = solution.starts[index].saturating_add(durations[index]);
+            assigned.push((machine, solution.starts[index], end, index));
+        }
+    }
+    assigned.sort_unstable_by_key(|&(machine, start, _, index)| (machine, start, index));
+
+    let mut group_start = 0usize;
+    while group_start < assigned.len() {
+        check_stop(stop)?;
+        let machine = assigned[group_start].0;
+        let mut group_end = group_start + 1;
+        while group_end < assigned.len() && assigned[group_end].0 == machine {
+            group_end += 1;
+        }
+
+        let mut best_from_earlier: Option<(i64, usize)> = None;
+        let mut bucket_start = group_start;
+        while bucket_start < group_end {
+            check_stop(stop)?;
+            let start = assigned[bucket_start].1;
+            let mut bucket_end = bucket_start + 1;
+            while bucket_end < group_end && assigned[bucket_end].1 == start {
+                bucket_end += 1;
+            }
+
+            let mut best_in_bucket: Option<(i64, usize)> = None;
+            for &(_, _, end, index) in &assigned[bucket_start..bucket_end] {
+                check_stop(stop)?;
+                if let Some((_, previous)) = best_from_earlier {
+                    verify_pair(previous, index, solution, durations)?;
+                }
+                if durations[index] > 0 {
+                    if let Some((_, previous)) = best_in_bucket {
+                        verify_pair(previous, index, solution, durations)?;
+                    }
+                }
+                if best_in_bucket.is_none_or(|(best_end, _)| end > best_end) {
+                    best_in_bucket = Some((end, index));
+                }
+            }
+
+            if let Some(candidate) = best_in_bucket {
+                if best_from_earlier.is_none_or(|(best_end, _)| candidate.0 > best_end) {
+                    best_from_earlier = Some(candidate);
+                }
+            }
+            bucket_start = bucket_end;
+        }
+        group_start = group_end;
     }
     Ok(())
 }
