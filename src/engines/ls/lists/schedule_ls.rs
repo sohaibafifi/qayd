@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -10,7 +11,10 @@ use super::resource_schedule::{
     GenerationScheme, Justification, PriorityRule, PrioritySgs, ResourceAlnsBudget, ResourceMoveOutcome, ResourceScheduleMetrics,
     ResourceScheduleProblem, ResourceScheduleState,
 };
-use super::schedule_state::{CriticalNeighborhood, DispatchRule, JobShopProblem, JobShopState, MoveOutcome, ScheduleStateMetrics};
+use super::schedule_state::{
+    CriticalNeighborhood, DispatchRule, JobShopProblem, JobShopState, MachineArc, MoveOutcome, MoveProbe, ScheduleMove, ScheduleMoveArcs,
+    ScheduleStateMetrics,
+};
 
 /// Scheduling-search measurements shared with the collection profiler.
 pub(crate) struct ScheduleConstructionMetrics {
@@ -47,6 +51,58 @@ pub(crate) struct ScheduleConstructionMetrics {
     pub(crate) precedence_rejections: u64,
     pub(crate) infeasible_rejections: u64,
     pub(crate) justification_attempts: u64,
+    pub(crate) tabu_steps: u64,
+    pub(crate) tabu_hits: u64,
+    pub(crate) tabu_aspirations: u64,
+    pub(crate) tabu_forced_moves: u64,
+    pub(crate) session_initializations: u64,
+    pub(crate) session_resumes: u64,
+    pub(crate) session_rebases: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProbedScheduleCandidate {
+    movement: ScheduleMove,
+    arcs: ScheduleMoveArcs,
+    objective: i64,
+    aspiration: bool,
+}
+
+#[derive(Default)]
+struct PersistentScheduleScan {
+    movements: Vec<ScheduleMove>,
+    cursor: usize,
+    end: usize,
+    best_admissible: Option<ProbedScheduleCandidate>,
+    best_any: Option<ProbedScheduleCandidate>,
+}
+
+/// Persistent tabu trajectory owned by one schedule-search worker.
+///
+/// The current state may move away from the best known schedule. Only the
+/// state-validated elite is returned to the orchestrator.
+pub(crate) struct ScheduleSearchSession {
+    seed: u64,
+    state: JobShopState,
+    elite_solution: CollectionSolution,
+    elite_objective: i64,
+    tabu_until: BTreeMap<MachineArc, u64>,
+    accepted_step: u64,
+    last_improvement_step: u64,
+    scan_epoch: u64,
+    tenure_base: u64,
+    scan: PersistentScheduleScan,
+}
+
+#[derive(Default)]
+struct PersistentScheduleSliceMetrics {
+    tabu_steps: u64,
+    tabu_hits: u64,
+    tabu_aspirations: u64,
+    tabu_forced_moves: u64,
+    session_initializations: u64,
+    session_resumes: u64,
+    session_rebases: u64,
 }
 
 struct ConstructedSchedule {
@@ -934,6 +990,13 @@ fn job_shop_result(
             precedence_rejections: 0,
             infeasible_rejections: 0,
             justification_attempts: 0,
+            tabu_steps: 0,
+            tabu_hits: 0,
+            tabu_aspirations: 0,
+            tabu_forced_moves: 0,
+            session_initializations: 0,
+            session_resumes: 0,
+            session_rebases: 0,
         },
     )
 }
@@ -980,6 +1043,13 @@ fn generic_schedule_metrics(
         precedence_rejections: 0,
         infeasible_rejections: 0,
         justification_attempts: 0,
+        tabu_steps: 0,
+        tabu_hits: 0,
+        tabu_aspirations: 0,
+        tabu_forced_moves: 0,
+        session_initializations: 0,
+        session_resumes: 0,
+        session_rebases: 0,
     }
 }
 
@@ -1314,6 +1384,13 @@ fn resource_schedule_result(
             precedence_rejections: metrics.precedence_rejections,
             infeasible_rejections: metrics.infeasible_rejections,
             justification_attempts,
+            tabu_steps: 0,
+            tabu_hits: 0,
+            tabu_aspirations: 0,
+            tabu_forced_moves: 0,
+            session_initializations: 0,
+            session_resumes: 0,
+            session_rebases: 0,
         },
     )
 }
@@ -1604,6 +1681,356 @@ fn solve_resource_schedule(
         first_feasible,
         ResourceSearchSummary { metrics: total, steps: search_steps, incumbent_improvements, incumbent_injections, justification_attempts },
     ))
+}
+
+fn complete_schedule_incumbent_ref<'a>(sched: &Schedule, incumbent: Option<&'a CollectionSolution>) -> Option<&'a CollectionSolution> {
+    incumbent.filter(|solution| {
+        solution.feasible
+            && solution.starts.len() == sched.intervals.len()
+            && solution.presences.len() == sched.intervals.len()
+            && solution.machines.len() == sched.intervals.len()
+            && solution.modes.len() == sched.intervals.len()
+            && (!sched.minimize_makespan || solution.objectives.len() == 1)
+    })
+}
+
+fn incumbent_machine_sequences(
+    operation_count: usize,
+    machine_count: usize,
+    mut machine: impl FnMut(usize) -> usize,
+    incumbent: &CollectionSolution,
+    stop: &AtomicBool,
+) -> Interruptible<Vec<Vec<usize>>> {
+    checkpoint(stop)?;
+    let mut sequences = vec![Vec::new(); machine_count];
+    for operation in 0..operation_count {
+        checkpoint(stop)?;
+        sequences[machine(operation)].push(operation);
+    }
+    for sequence in &mut sequences {
+        checkpoint(stop)?;
+        sequence.sort_by_key(|&operation| (incumbent.starts[operation], operation));
+    }
+    checkpoint(stop)?;
+    Ok(sequences)
+}
+
+fn candidate_better(candidate: ProbedScheduleCandidate, incumbent: ProbedScheduleCandidate) -> bool {
+    (candidate.objective, candidate.movement) < (incumbent.objective, incumbent.movement)
+}
+
+fn prepare_persistent_scan(session: &mut ScheduleSearchSession, stop: &AtomicBool) -> Interruptible<bool> {
+    let stagnation = session.accepted_step.saturating_sub(session.last_improvement_step);
+    let neighborhood = if stagnation >= session.tenure_base.saturating_mul(2) || session.scan_epoch % 4 == 3 {
+        CriticalNeighborhood::N6
+    } else {
+        CriticalNeighborhood::N5
+    };
+    session.state.fill_critical_moves(neighborhood, &mut session.scan.movements, stop).map_err(|_| Interrupted)?;
+    if session.scan.movements.is_empty() {
+        session.scan.cursor = 0;
+        session.scan.end = 0;
+        return Ok(false);
+    }
+    let offset = usize::try_from(mix64(
+        session.seed ^ session.accepted_step.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ session.scan_epoch.wrapping_mul(0xd1b5_4a32_d192_ed03),
+    ))
+    .unwrap_or(usize::MAX)
+        % session.scan.movements.len();
+    session.scan.movements.rotate_left(offset);
+    session.scan.cursor = 0;
+    session.scan.end = session.scan.movements.len().min(32);
+    session.scan.best_admissible = None;
+    session.scan.best_any = None;
+    session.scan_epoch = session.scan_epoch.saturating_add(1);
+    Ok(true)
+}
+
+fn arc_tenure(session: &ScheduleSearchSession, arc: MachineArc) -> u64 {
+    let identity = u64::try_from(arc.machine).unwrap_or(u64::MAX).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ u64::try_from(arc.before).unwrap_or(u64::MAX).wrapping_mul(0xd1b5_4a32_d192_ed03)
+        ^ u64::try_from(arc.after).unwrap_or(u64::MAX).wrapping_mul(0x94d0_49bb_1331_11eb);
+    let width = session.tenure_base.saturating_add(1);
+    session.tenure_base.saturating_add(mix64(session.seed ^ session.accepted_step ^ identity) % width)
+}
+
+fn clear_persistent_scan(session: &mut ScheduleSearchSession) {
+    session.scan.movements.clear();
+    session.scan.cursor = 0;
+    session.scan.end = 0;
+    session.scan.best_admissible = None;
+    session.scan.best_any = None;
+}
+
+/// Advance one persistent JSSP tabu trajectory by a bounded number of probes.
+/// Unsupported schedules retain the existing stateless scheduling behavior.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn solve_schedule_capped_persistent(
+    sched: &Schedule,
+    seed: u64,
+    fallback_seed: u64,
+    stop: &AtomicBool,
+    max_iterations: u64,
+    initial_incumbent: Option<&CollectionSolution>,
+    previous_session: Option<ScheduleSearchSession>,
+    allow_rebase: bool,
+    report: &mut dyn FnMut(i64),
+) -> (CollectionSolution, ScheduleConstructionMetrics, Option<ScheduleSearchSession>) {
+    let started = Instant::now();
+    let mut slice = PersistentScheduleSliceMetrics::default();
+    let mut total = ScheduleStateMetrics::default();
+    let mut construction_elapsed = Duration::ZERO;
+    let mut first_feasible = None;
+    let mut incumbent_improvements = 0u64;
+    let mut incumbent_injections = 0u64;
+
+    let mut session = if let Some(session) = previous_session {
+        slice.session_resumes = 1;
+        session
+    } else {
+        let problem = match JobShopProblem::recognize(sched, stop) {
+            Ok(Some(problem)) => problem,
+            Ok(None) | Err(_) => {
+                let (solution, metrics) =
+                    solve_schedule_capped(sched, fallback_seed, stop, max_iterations, false, initial_incumbent, report);
+                return (solution, metrics, None);
+            }
+        };
+        let complete_incumbent = complete_schedule_incumbent_ref(sched, initial_incumbent);
+        let mut injected = false;
+        let mut state = None;
+        if let Some(incumbent) = complete_incumbent {
+            if let Ok(sequences) = incumbent_machine_sequences(
+                problem.operation_count(),
+                problem.machine_count(),
+                |operation| problem.machine(operation),
+                incumbent,
+                stop,
+            ) {
+                if let Ok(rebuilt) = JobShopState::from_machine_sequences(&problem, sequences, stop) {
+                    state = rebuilt;
+                    injected = state.is_some();
+                }
+            }
+        }
+        let state = if let Some(state) = state {
+            state
+        } else {
+            let (constructed, _) = JobShopState::giffler_thompson_profiled(&problem, seed, DispatchRule::EarliestStart, stop);
+            let Ok(Some(state)) = constructed else {
+                let (solution, metrics) =
+                    solve_schedule_capped(sched, fallback_seed, stop, max_iterations, false, initial_incumbent, report);
+                return (solution, metrics, None);
+            };
+            state
+        };
+        let objective = state.makespan();
+        let elite_solution = state.to_solution();
+        construction_elapsed = started.elapsed();
+        first_feasible = Some(construction_elapsed);
+        incumbent_injections = u64::from(injected);
+        if !injected {
+            incumbent_improvements = 1;
+            report(objective);
+        }
+        let ratio = u64::try_from(problem.operation_count() / problem.machine_count().max(1)).unwrap_or(u64::MAX);
+        slice.session_initializations = 1;
+        ScheduleSearchSession {
+            seed,
+            state,
+            elite_solution,
+            elite_objective: objective,
+            tabu_until: BTreeMap::new(),
+            accepted_step: 0,
+            last_improvement_step: 0,
+            scan_epoch: 0,
+            tenure_base: ratio.isqrt().clamp(5, 32),
+            scan: PersistentScheduleScan::default(),
+        }
+    };
+
+    if allow_rebase && slice.session_resumes != 0 {
+        if let Some(incumbent) = complete_schedule_incumbent_ref(sched, initial_incumbent) {
+            let declared = incumbent.objectives.first().copied().unwrap_or(i64::MAX);
+            if declared < session.elite_objective {
+                let rebase_started = Instant::now();
+                let sequences = incumbent_machine_sequences(
+                    session.state.operation_count(),
+                    session.state.machine_count(),
+                    |operation| session.state.machine(operation),
+                    incumbent,
+                    stop,
+                );
+                if let Ok(sequences) = sequences {
+                    if let Ok(Some(rebuilt)) = session.state.rebuilt_from_machine_sequences(sequences, stop) {
+                        if rebuilt.makespan() < session.elite_objective {
+                            add_state_metrics(&mut total, session.state.take_metrics());
+                            session.elite_objective = rebuilt.makespan();
+                            session.elite_solution = rebuilt.to_solution();
+                            session.state = rebuilt;
+                            session.tabu_until.clear();
+                            clear_persistent_scan(&mut session);
+                            session.last_improvement_step = session.accepted_step;
+                            slice.session_rebases = 1;
+                            incumbent_injections = 1;
+                        }
+                    }
+                }
+                construction_elapsed = construction_elapsed.saturating_add(rebase_started.elapsed());
+            }
+        }
+    }
+
+    let default_moves = u64::try_from(session.state.operation_count()).unwrap_or(u64::MAX).saturating_mul(256).clamp(2_048, 100_000);
+    let probe_limit = if max_iterations == u64::MAX { default_moves } else { max_iterations };
+    let mut probes = 0u64;
+    'search: while probes < probe_limit && checkpoint(stop).is_ok() {
+        if session.scan.end == 0 && !matches!(prepare_persistent_scan(&mut session, stop), Ok(true)) {
+            break;
+        }
+        while session.scan.cursor < session.scan.end && probes < probe_limit {
+            if checkpoint(stop).is_err() {
+                break 'search;
+            }
+            let movement = session.scan.movements[session.scan.cursor];
+            let Some(arcs) = session.state.move_arcs(movement) else {
+                session.scan.cursor += 1;
+                continue;
+            };
+            let tabu = arcs
+                .added
+                .into_iter()
+                .flatten()
+                .any(|arc| session.tabu_until.get(&arc).is_some_and(|&expiration| session.accepted_step < expiration));
+            probes = probes.saturating_add(1);
+            let probe = session.state.probe_move(movement, stop);
+            let Ok(MoveProbe::Feasible { candidate, .. }) = probe else {
+                if probe.is_err() {
+                    break 'search;
+                }
+                session.scan.cursor += 1;
+                continue;
+            };
+            session.scan.cursor += 1;
+            if tabu {
+                slice.tabu_hits = slice.tabu_hits.saturating_add(1);
+            }
+            let aspiration = tabu && candidate < session.elite_objective;
+            let candidate = ProbedScheduleCandidate { movement, arcs, objective: candidate, aspiration };
+            if session.scan.best_any.is_none_or(|incumbent| candidate_better(candidate, incumbent)) {
+                session.scan.best_any = Some(candidate);
+            }
+            if (!tabu || aspiration) && session.scan.best_admissible.is_none_or(|incumbent| candidate_better(candidate, incumbent)) {
+                session.scan.best_admissible = Some(candidate);
+            }
+        }
+        if session.scan.cursor < session.scan.end {
+            break;
+        }
+        let forced = session.scan.best_admissible.is_none() && session.scan.best_any.is_some();
+        let Some(selected) = session.scan.best_admissible.or(session.scan.best_any) else {
+            clear_persistent_scan(&mut session);
+            continue;
+        };
+        let acceptance = if selected.aspiration {
+            MinimizingMoveAcceptance::StrictlyBelow(session.elite_objective)
+        } else {
+            MinimizingMoveAcceptance::Always
+        };
+        let outcome = session.state.commit_probed_move(selected.movement, acceptance, stop);
+        let Ok(MoveOutcome::Accepted { current, .. }) = outcome else {
+            if outcome.is_err() {
+                break;
+            }
+            clear_persistent_scan(&mut session);
+            continue;
+        };
+        session.accepted_step = session.accepted_step.saturating_add(1);
+        slice.tabu_steps = slice.tabu_steps.saturating_add(1);
+        slice.tabu_forced_moves = slice.tabu_forced_moves.saturating_add(u64::from(forced));
+        slice.tabu_aspirations = slice.tabu_aspirations.saturating_add(u64::from(selected.aspiration));
+        for arc in selected.arcs.removed.into_iter().flatten() {
+            let expiration = session.accepted_step.saturating_add(arc_tenure(&session, arc));
+            session.tabu_until.entry(arc).and_modify(|value| *value = (*value).max(expiration)).or_insert(expiration);
+        }
+        session.tabu_until.retain(|_, expiration| session.accepted_step < *expiration);
+        if current < session.elite_objective {
+            session.elite_objective = current;
+            session.elite_solution = session.state.to_solution();
+            session.last_improvement_step = session.accepted_step;
+            incumbent_improvements = incumbent_improvements.saturating_add(1);
+            report(current);
+        }
+        clear_persistent_scan(&mut session);
+    }
+
+    add_state_metrics(&mut total, session.state.take_metrics());
+    let elite = session.elite_solution.clone();
+    let (solution, mut metrics) =
+        job_shop_result(Some(elite), construction_elapsed, first_feasible, total, incumbent_improvements, incumbent_injections);
+    metrics.tabu_steps = slice.tabu_steps;
+    metrics.tabu_hits = slice.tabu_hits;
+    metrics.tabu_aspirations = slice.tabu_aspirations;
+    metrics.tabu_forced_moves = slice.tabu_forced_moves;
+    metrics.session_initializations = slice.session_initializations;
+    metrics.session_resumes = slice.session_resumes;
+    metrics.session_rebases = slice.session_rebases;
+    (solution, metrics, Some(session))
+}
+
+#[cfg(test)]
+pub(crate) fn audit_persistent_schedule_split(schedule: &Schedule, seed: u64, first: u64, second: u64) -> bool {
+    let stop = AtomicBool::new(false);
+    let mut monolithic_reports = Vec::new();
+    let (monolithic_solution, monolithic_metrics, monolithic_session) =
+        solve_schedule_capped_persistent(schedule, seed, seed, &stop, first.saturating_add(second), None, None, true, &mut |objective| {
+            monolithic_reports.push(objective)
+        });
+    let mut split_reports = Vec::new();
+    let (_, first_metrics, first_session) =
+        solve_schedule_capped_persistent(schedule, seed, seed, &stop, first, None, None, true, &mut |objective| {
+            split_reports.push(objective)
+        });
+    let (split_solution, second_metrics, split_session) =
+        solve_schedule_capped_persistent(schedule, seed, seed, &stop, second, None, first_session, true, &mut |objective| {
+            split_reports.push(objective)
+        });
+    let (Some(monolithic_session), Some(split_session)) = (monolithic_session, split_session) else {
+        return false;
+    };
+
+    let same_solution = monolithic_solution.objectives == split_solution.objectives
+        && monolithic_solution.starts == split_solution.starts
+        && monolithic_solution.presences == split_solution.presences
+        && monolithic_solution.machines == split_solution.machines
+        && monolithic_solution.modes == split_solution.modes;
+    let same_session = monolithic_session.state.machine_sequences() == split_session.state.machine_sequences()
+        && monolithic_session.elite_objective == split_session.elite_objective
+        && monolithic_session.elite_solution.starts == split_session.elite_solution.starts
+        && monolithic_session.tabu_until == split_session.tabu_until
+        && monolithic_session.accepted_step == split_session.accepted_step
+        && monolithic_session.last_improvement_step == split_session.last_improvement_step
+        && monolithic_session.scan_epoch == split_session.scan_epoch
+        && monolithic_session.scan.movements == split_session.scan.movements
+        && monolithic_session.scan.cursor == split_session.scan.cursor
+        && monolithic_session.scan.end == split_session.scan.end
+        && monolithic_session.scan.best_admissible == split_session.scan.best_admissible
+        && monolithic_session.scan.best_any == split_session.scan.best_any;
+    let same_search_metrics = monolithic_metrics.moves_considered
+        == first_metrics.moves_considered.saturating_add(second_metrics.moves_considered)
+        && monolithic_metrics.moves_accepted == first_metrics.moves_accepted.saturating_add(second_metrics.moves_accepted)
+        && monolithic_metrics.tabu_steps == first_metrics.tabu_steps.saturating_add(second_metrics.tabu_steps)
+        && monolithic_metrics.tabu_hits == first_metrics.tabu_hits.saturating_add(second_metrics.tabu_hits)
+        && monolithic_metrics.tabu_aspirations == first_metrics.tabu_aspirations.saturating_add(second_metrics.tabu_aspirations)
+        && monolithic_metrics.tabu_forced_moves == first_metrics.tabu_forced_moves.saturating_add(second_metrics.tabu_forced_moves)
+        && monolithic_metrics.session_initializations == 1
+        && first_metrics.session_initializations == 1
+        && second_metrics.session_initializations == 0
+        && monolithic_metrics.session_resumes == 0
+        && first_metrics.session_resumes == 0
+        && second_metrics.session_resumes == 1;
+
+    same_solution && same_session && same_search_metrics && monolithic_reports == split_reports
 }
 
 /// Solve an interval-scheduling subproblem by local search. The decisions are

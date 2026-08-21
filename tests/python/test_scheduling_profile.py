@@ -65,6 +65,15 @@ SCHEDULE_COUNTERS = (
     "schedule_alns_generation_attempts",
     "schedule_alns_moves_generated",
 )
+JSSP_STRATEGY_COUNTERS = (
+    "schedule_tabu_steps",
+    "schedule_tabu_hits",
+    "schedule_tabu_aspirations",
+    "schedule_tabu_forced_moves",
+    "schedule_session_initializations",
+    "schedule_session_resumes",
+    "schedule_session_rebases",
+)
 
 
 def _solve_job_shop(*, profile):
@@ -103,6 +112,7 @@ def test_schedule_profile_is_present_only_when_requested():
     assert plain.full_recompute_percentage is None
     assert plain.schedule_restart_work is None
     assert all(getattr(plain, field) is None for field in SCHEDULE_COUNTERS)
+    assert all(getattr(plain, field) is None for field in JSSP_STRATEGY_COUNTERS)
 
     assert profiled.candidates_evaluated == profiled.schedule_moves_considered
     assert profiled.schedule_moves_considered >= 0
@@ -113,6 +123,11 @@ def test_schedule_profile_is_present_only_when_requested():
     assert profiled.schedule_reconstructions >= 0
     assert profiled.critical_path_updates >= 0
     assert all(getattr(profiled, field) is not None and getattr(profiled, field) >= 0 for field in SCHEDULE_COUNTERS)
+    assert all(getattr(profiled, field) is not None and getattr(profiled, field) >= 0 for field in JSSP_STRATEGY_COUNTERS)
+    assert profiled.schedule_session_initializations == 2
+    if profiled.schedule_restart_boundaries > 1:
+        assert profiled.schedule_session_resumes > 0
+    assert profiled.schedule_tabu_steps > 0
     assert profiled.schedule_global_improvements == profiled.schedule_progress_publications
     assert profiled.schedule_local_improvements >= profiled.schedule_global_improvements
     assert profiled.schedule_incumbent_publication_attempts == (
@@ -179,6 +194,11 @@ def test_scheduling_launchers_emit_search_profile(launcher, shape_args):
     assert record["schedule_incumbent_injections"] <= record["schedule_incumbent_injection_attempts"]
     if launcher.endswith("/jssp.py"):
         assert record["schedule_restart_work"] == 2_048
+        assert all(record[field] is not None and record[field] >= 0 for field in JSSP_STRATEGY_COUNTERS)
+        assert record["schedule_session_initializations"] == 2
+        if record["schedule_restart_boundaries"] > 1:
+            assert record["schedule_session_resumes"] > 0
+        assert record["schedule_tabu_steps"] > 0
     assert record["schedule_worker_work_min"] <= record["schedule_worker_work_max"]
     assert record["schedule_work_budget_overruns"] == 0
     assert record["schedule_elite_pool_size"] == 1
@@ -221,3 +241,10 @@ def test_scheduling_verbose_output_includes_search_profile():
     assert "schedule oracle mismatches:" in completed.stdout
     assert "schedule max dirty cone:" in completed.stdout
     assert "schedule restart work: 2048" in completed.stdout
+    assert "schedule tabu steps:" in completed.stdout
+    assert "schedule tabu hits:" in completed.stdout
+    assert "schedule tabu aspirations:" in completed.stdout
+    assert "schedule tabu forced moves:" in completed.stdout
+    assert "schedule session initializations:" in completed.stdout
+    assert "schedule session resumes:" in completed.stdout
+    assert "schedule session rebases:" in completed.stdout

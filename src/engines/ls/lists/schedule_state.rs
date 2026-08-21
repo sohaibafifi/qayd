@@ -749,6 +749,26 @@ impl ScheduleMove {
     }
 }
 
+/// An immediate precedence induced by one unary-machine sequence.
+///
+/// Operation identities make tabu attributes stable when an insertion changes
+/// the positions of every operation between its source and destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct MachineArc {
+    pub(crate) machine: usize,
+    pub(crate) before: usize,
+    pub(crate) after: usize,
+}
+
+/// Machine arcs removed and added by one valid structured move.
+///
+/// Adjacent swaps and insertions change at most three immediate machine arcs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScheduleMoveArcs {
+    pub(crate) removed: [Option<MachineArc>; 3],
+    pub(crate) added: [Option<MachineArc>; 3],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CriticalNeighborhood {
     /// Every adjacent exchange inside a critical block.
@@ -771,6 +791,13 @@ pub(crate) enum MoveRejection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MoveOutcome {
     Accepted { previous: i64, current: i64 },
+    Rejected(MoveRejection),
+}
+
+/// Transactional evaluation of a move without changing the accepted state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MoveProbe {
+    Feasible { current: i64, candidate: i64 },
     Rejected(MoveRejection),
 }
 
@@ -976,6 +1003,18 @@ impl JobShopState {
         self.reconstruction.makespan
     }
 
+    pub(crate) fn operation_count(&self) -> usize {
+        self.problem.operation_count()
+    }
+
+    pub(crate) fn machine_count(&self) -> usize {
+        self.problem.machine_count()
+    }
+
+    pub(crate) fn machine(&self, operation: usize) -> usize {
+        self.problem.machine(operation)
+    }
+
     pub(crate) fn starts(&self) -> &[i64] {
         &self.reconstruction.starts
     }
@@ -1006,8 +1045,54 @@ impl JobShopState {
         metrics
     }
 
+    /// Return the counters accumulated since the previous take and reset them.
+    /// Workspace capacity observations remain anchored at their current values,
+    /// so a later take reports only genuine subsequent allocation growth.
+    pub(crate) fn take_metrics(&mut self) -> ScheduleStateMetrics {
+        self.workspace.observe_growths();
+        self.metrics.workspace_growths = self.workspace.growths;
+        let metrics = self.metrics;
+        self.metrics = ScheduleStateMetrics::default();
+        self.workspace.growths = 0;
+        metrics
+    }
+
     pub(crate) fn workspace_capacities(&self) -> ScheduleWorkspaceCapacities {
         self.workspace.capacities()
+    }
+
+    /// Rebuild a replacement state against this state's validated problem.
+    /// The accepted state is never mutated; callers replace it only after a
+    /// successful reconstruction.
+    pub(crate) fn rebuilt_from_machine_sequences(
+        &self,
+        machine_sequences: Vec<Vec<usize>>,
+        stop: &AtomicBool,
+    ) -> Result<Option<Self>, ScheduleStateInterrupted> {
+        Self::from_machine_sequences(&self.problem, machine_sequences, stop)
+    }
+
+    /// Return the operation-identity machine arcs changed by a valid move.
+    pub(crate) fn move_arcs(&self, movement: ScheduleMove) -> Option<ScheduleMoveArcs> {
+        if !move_is_valid(&self.machine_sequences, movement) {
+            return None;
+        }
+        let machine = movement.machine();
+        let sequence = &self.machine_sequences[machine];
+        let (old_indices, new_indices) = changed_arc_indices(movement);
+        let mut old_arcs = [None; 3];
+        let mut new_arcs = [None; 3];
+        for index in old_indices.into_iter().flatten() {
+            if let Some(arc) = sequence_arc(sequence, machine, index) {
+                push_unique_arc(&mut old_arcs, arc);
+            }
+        }
+        for index in new_indices.into_iter().flatten() {
+            if let Some(arc) = moved_sequence_arc(sequence, movement, machine, index) {
+                push_unique_arc(&mut new_arcs, arc);
+            }
+        }
+        Some(ScheduleMoveArcs { removed: arc_difference(old_arcs, &new_arcs), added: arc_difference(new_arcs, &old_arcs) })
     }
 
     pub(crate) fn critical_moves(
@@ -1091,10 +1176,63 @@ impl JobShopState {
         stop: &AtomicBool,
     ) -> Result<MoveOutcome, ScheduleStateInterrupted> {
         checkpoint(stop)?;
-        let result = self.consider_move_inner(movement, acceptance, stop);
+        let result = self.consider_move_inner(movement, acceptance, stop, true);
         self.workspace.observe_growths();
         self.metrics.workspace_growths = self.workspace.growths;
         result
+    }
+
+    /// Evaluate a candidate with the incremental kernel and restore the
+    /// accepted state before returning. A selected candidate is independently
+    /// oracle-validated by `commit_probed_move` before it can be committed.
+    pub(crate) fn probe_move(&mut self, movement: ScheduleMove, stop: &AtomicBool) -> Result<MoveProbe, ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        let result = self.probe_move_inner(movement, stop);
+        self.workspace.observe_growths();
+        self.metrics.workspace_growths = self.workspace.growths;
+        result
+    }
+
+    /// Commit a previously selected move without counting the same candidate a
+    /// second time. Validation is deliberately repeated against current state.
+    pub(crate) fn commit_probed_move(
+        &mut self,
+        movement: ScheduleMove,
+        acceptance: MinimizingMoveAcceptance,
+        stop: &AtomicBool,
+    ) -> Result<MoveOutcome, ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        let result = self.consider_move_inner(movement, acceptance, stop, false);
+        self.workspace.observe_growths();
+        self.metrics.workspace_growths = self.workspace.growths;
+        result
+    }
+
+    fn probe_move_inner(&mut self, movement: ScheduleMove, stop: &AtomicBool) -> Result<MoveProbe, ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        self.metrics.moves_considered = self.metrics.moves_considered.saturating_add(1);
+        if !move_is_valid(&self.machine_sequences, movement) {
+            return Ok(MoveProbe::Rejected(MoveRejection::Invalid));
+        }
+        self.apply_graph_patch(movement);
+        if stop.load(Ordering::Acquire) {
+            self.rollback_graph_patch(movement);
+            return Err(ScheduleStateInterrupted);
+        }
+
+        let current = self.makespan();
+        self.metrics.delta_evaluations = self.metrics.delta_evaluations.saturating_add(1);
+        let candidate = match self.evaluate_delta(stop) {
+            Ok(candidate) => candidate,
+            Err(failure) => {
+                self.rollback_dates();
+                self.rollback_graph_patch(movement);
+                return self.record_failure(failure).map(MoveProbe::Rejected);
+            }
+        };
+        self.rollback_dates();
+        self.rollback_graph_patch(movement);
+        Ok(MoveProbe::Feasible { current, candidate })
     }
 
     fn consider_move_inner(
@@ -1102,9 +1240,12 @@ impl JobShopState {
         movement: ScheduleMove,
         acceptance: MinimizingMoveAcceptance,
         stop: &AtomicBool,
+        count_considered: bool,
     ) -> Result<MoveOutcome, ScheduleStateInterrupted> {
         checkpoint(stop)?;
-        self.metrics.moves_considered = self.metrics.moves_considered.saturating_add(1);
+        if count_considered {
+            self.metrics.moves_considered = self.metrics.moves_considered.saturating_add(1);
+        }
         if !move_is_valid(&self.machine_sequences, movement) {
             return Ok(MoveOutcome::Rejected(MoveRejection::Invalid));
         }
@@ -1286,17 +1427,21 @@ impl JobShopState {
     }
 
     fn rejected_failure(&mut self, failure: ReconstructionFailure) -> Result<MoveOutcome, ScheduleStateInterrupted> {
+        self.record_failure(failure).map(MoveOutcome::Rejected)
+    }
+
+    fn record_failure(&mut self, failure: ReconstructionFailure) -> Result<MoveRejection, ScheduleStateInterrupted> {
         match failure {
             ReconstructionFailure::Interrupted => Err(ScheduleStateInterrupted),
             ReconstructionFailure::Cycle => {
                 self.metrics.cycle_rejections = self.metrics.cycle_rejections.saturating_add(1);
-                Ok(MoveOutcome::Rejected(MoveRejection::Cycle))
+                Ok(MoveRejection::Cycle)
             }
             ReconstructionFailure::Window => {
                 self.metrics.window_rejections = self.metrics.window_rejections.saturating_add(1);
-                Ok(MoveOutcome::Rejected(MoveRejection::Window))
+                Ok(MoveRejection::Window)
             }
-            ReconstructionFailure::Numeric => Ok(MoveOutcome::Rejected(MoveRejection::Numeric)),
+            ReconstructionFailure::Numeric => Ok(MoveRejection::Numeric),
         }
     }
 
@@ -1471,6 +1616,92 @@ fn move_is_valid(machine_sequences: &[Vec<usize>], movement: ScheduleMove) -> bo
             machine_sequences.get(machine).is_some_and(|sequence| from < sequence.len() && to < sequence.len() && from != to)
         }
     }
+}
+
+fn changed_arc_indices(movement: ScheduleMove) -> ([Option<usize>; 3], [Option<usize>; 3]) {
+    match movement {
+        ScheduleMove::AdjacentSwap { first_position, .. } => {
+            let indices = [first_position.checked_sub(1), Some(first_position), first_position.checked_add(1)];
+            (indices, indices)
+        }
+        ScheduleMove::Insert { from, to, .. } if from < to => {
+            ([from.checked_sub(1), Some(from), Some(to)], [from.checked_sub(1), to.checked_sub(1), Some(to)])
+        }
+        ScheduleMove::Insert { from, to, .. } => {
+            ([to.checked_sub(1), from.checked_sub(1), Some(from)], [to.checked_sub(1), Some(to), Some(from)])
+        }
+    }
+}
+
+fn sequence_arc(sequence: &[usize], machine: usize, first_position: usize) -> Option<MachineArc> {
+    let second_position = first_position.checked_add(1)?;
+    Some(MachineArc { machine, before: *sequence.get(first_position)?, after: *sequence.get(second_position)? })
+}
+
+fn moved_sequence_arc(sequence: &[usize], movement: ScheduleMove, machine: usize, first_position: usize) -> Option<MachineArc> {
+    let second_position = first_position.checked_add(1)?;
+    Some(MachineArc {
+        machine,
+        before: moved_operation_at(sequence, movement, first_position)?,
+        after: moved_operation_at(sequence, movement, second_position)?,
+    })
+}
+
+fn moved_operation_at(sequence: &[usize], movement: ScheduleMove, position: usize) -> Option<usize> {
+    if position >= sequence.len() {
+        return None;
+    }
+    match movement {
+        ScheduleMove::AdjacentSwap { first_position, .. } => {
+            let second_position = first_position.checked_add(1)?;
+            if position == first_position {
+                sequence.get(second_position).copied()
+            } else if position == second_position {
+                sequence.get(first_position).copied()
+            } else {
+                sequence.get(position).copied()
+            }
+        }
+        ScheduleMove::Insert { from, to, .. } if from < to => {
+            if position < from || position > to {
+                sequence.get(position).copied()
+            } else if position == to {
+                sequence.get(from).copied()
+            } else {
+                sequence.get(position + 1).copied()
+            }
+        }
+        ScheduleMove::Insert { from, to, .. } => {
+            if position < to || position > from {
+                sequence.get(position).copied()
+            } else if position == to {
+                sequence.get(from).copied()
+            } else {
+                sequence.get(position - 1).copied()
+            }
+        }
+    }
+}
+
+fn push_unique_arc(arcs: &mut [Option<MachineArc>; 3], arc: MachineArc) {
+    if arcs.contains(&Some(arc)) {
+        return;
+    }
+    if let Some(slot) = arcs.iter_mut().find(|slot| slot.is_none()) {
+        *slot = Some(arc);
+    } else {
+        debug_assert!(false, "a structured schedule move changed more than three machine arcs");
+    }
+}
+
+fn arc_difference(arcs: [Option<MachineArc>; 3], other: &[Option<MachineArc>; 3]) -> [Option<MachineArc>; 3] {
+    let mut difference = [None; 3];
+    for arc in arcs.into_iter().flatten() {
+        if !other.contains(&Some(arc)) {
+            push_unique_arc(&mut difference, arc);
+        }
+    }
+    difference
 }
 
 fn apply_sequence_move(machine_sequences: &mut [Vec<usize>], movement: ScheduleMove) -> bool {

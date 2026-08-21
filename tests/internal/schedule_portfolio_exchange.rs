@@ -2,7 +2,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::orchestrator::schedule_restart_work;
-use qayd::engines::ls::lists::{solve_schedule, solve_schedule_capped};
+use qayd::engines::ls::lists::{audit_persistent_schedule_split, solve_schedule, solve_schedule_capped};
 use qayd::model::list::{CollectionModel, IntervalVar, Resource, Schedule};
 use qayd::model::{Model, ModelPackage};
 use qayd::orchestrator::{
@@ -124,8 +124,8 @@ fn scheduling_portfolio_exchanges_only_at_reproducible_restart_boundaries() {
     assert_eq!(first.primal(), second.primal());
     assert_eq!(first_progress, second_progress);
     assert!(metric(&first, "schedule_restart_boundaries") > 1);
-    assert!(metric(&first, "schedule_incumbent_injections") >= 2);
-    assert_eq!(metadata(&first, "schedule_incumbent_injections"), metadata(&first, "schedule_incumbent_injection_attempts"));
+    assert!(metric(&first, "schedule_incumbent_injection_attempts") >= 2);
+    assert!(metric(&first, "schedule_incumbent_injections") <= metric(&first, "schedule_incumbent_injection_attempts"));
     assert_eq!(metadata(&first, "schedule_incumbent_verification_rejections"), "0");
     assert_eq!(metadata(&first, "schedule_elite_pool_size"), "1");
     assert_eq!(metadata(&first, "elite_pool_size"), "1");
@@ -139,6 +139,10 @@ fn scheduling_portfolio_exchanges_only_at_reproducible_restart_boundaries() {
     assert_eq!(metadata(&first, "schedule_stalled_unused_work_steps"), "0");
     assert_eq!(metadata(&first, "schedule_work_budget_overruns"), "0");
     assert_eq!(metadata(&first, "schedule_peak_buffered_candidates"), "2");
+    assert_eq!(metadata(&first, "schedule_session_initializations"), "2");
+    assert!(metric(&first, "schedule_session_resumes") > 0);
+    assert!(metric(&first, "schedule_tabu_steps") > 0);
+    assert!(metric(&first, "schedule_moves_accepted") > metric(&first, "schedule_local_improvements").saturating_sub(2));
 
     for name in [
         "schedule_incumbent_publications",
@@ -147,6 +151,13 @@ fn scheduling_portfolio_exchanges_only_at_reproducible_restart_boundaries() {
         "schedule_incumbent_rejections",
         "schedule_restart_boundaries",
         "schedule_global_improvements",
+        "schedule_tabu_steps",
+        "schedule_tabu_hits",
+        "schedule_tabu_aspirations",
+        "schedule_tabu_forced_moves",
+        "schedule_session_initializations",
+        "schedule_session_resumes",
+        "schedule_session_rebases",
         "schedule_work_steps",
     ] {
         assert_eq!(metadata(&first, name), metadata(&second, name), "metric {name} must be reproducible");
@@ -176,6 +187,10 @@ fn resource_portfolio_reconstructs_the_verified_shared_incumbent() {
     assert_eq!(metadata(&first, "schedule_stalled_unused_work_steps"), "0");
     assert_eq!(metadata(&first, "schedule_work_budget_overruns"), "0");
     assert_eq!(metadata(&first, "schedule_peak_buffered_candidates"), "2");
+    assert_eq!(metadata(&first, "schedule_tabu_steps"), "0");
+    assert_eq!(metadata(&first, "schedule_session_initializations"), "0");
+    assert_eq!(metadata(&first, "schedule_session_resumes"), "0");
+    assert_eq!(metadata(&first, "schedule_session_rebases"), "0");
 
     for name in [
         "schedule_incumbent_publications",
@@ -186,6 +201,13 @@ fn resource_portfolio_reconstructs_the_verified_shared_incumbent() {
         "schedule_incumbent_source_round",
         "schedule_restart_boundaries",
         "schedule_global_improvements",
+        "schedule_tabu_steps",
+        "schedule_tabu_hits",
+        "schedule_tabu_aspirations",
+        "schedule_tabu_forced_moves",
+        "schedule_session_initializations",
+        "schedule_session_resumes",
+        "schedule_session_rebases",
         "schedule_work_steps",
     ] {
         assert_eq!(metadata(&first, name), metadata(&second, name), "metric {name} must be reproducible");
@@ -260,6 +282,11 @@ fn adaptive_schedule_restart_work_is_pure_and_caps_large_batches() {
     assert_eq!(schedule_restart_work(1_000_000, 100_000), 256);
     assert_eq!(schedule_restart_work(2_000_000, 100_000), 256);
     assert_eq!(schedule_restart_work(2_000_000, 200), 200);
+}
+
+#[test]
+fn persistent_tabu_trajectory_is_invariant_to_a_mid_scan_boundary() {
+    assert!(audit_persistent_schedule_split(&job_shop_schedule(8), 109, 37, 63));
 }
 
 #[test]

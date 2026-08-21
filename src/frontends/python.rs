@@ -550,6 +550,13 @@ struct PySolution {
     schedule_workspace_rollbacks: Option<u64>,
     schedule_alns_generation_attempts: Option<u64>,
     schedule_alns_moves_generated: Option<u64>,
+    schedule_tabu_steps: Option<u64>,
+    schedule_tabu_hits: Option<u64>,
+    schedule_tabu_aspirations: Option<u64>,
+    schedule_tabu_forced_moves: Option<u64>,
+    schedule_session_initializations: Option<u64>,
+    schedule_session_resumes: Option<u64>,
+    schedule_session_rebases: Option<u64>,
     full_recompute_percentage: Option<f64>,
     backend_build_seconds: Option<f64>,
     construction_seconds: Option<f64>,
@@ -1067,6 +1074,13 @@ fn make_solution(
         schedule_workspace_rollbacks: None,
         schedule_alns_generation_attempts: None,
         schedule_alns_moves_generated: None,
+        schedule_tabu_steps: None,
+        schedule_tabu_hits: None,
+        schedule_tabu_aspirations: None,
+        schedule_tabu_forced_moves: None,
+        schedule_session_initializations: None,
+        schedule_session_resumes: None,
+        schedule_session_rebases: None,
         full_recompute_percentage: None,
         backend_build_seconds: None,
         construction_seconds: None,
@@ -1582,6 +1596,13 @@ fn verbose_collection_finish(solution: &PySolution, run: &CollectionRun, profile
                     println!("  schedule workspace rollbacks: {}", solution.schedule_workspace_rollbacks.unwrap_or(0));
                     println!("  schedule ALNS generation attempts: {}", solution.schedule_alns_generation_attempts.unwrap_or(0));
                     println!("  schedule ALNS moves generated: {}", solution.schedule_alns_moves_generated.unwrap_or(0));
+                    println!("  schedule tabu steps: {}", solution.schedule_tabu_steps.unwrap_or(0));
+                    println!("  schedule tabu hits: {}", solution.schedule_tabu_hits.unwrap_or(0));
+                    println!("  schedule tabu aspirations: {}", solution.schedule_tabu_aspirations.unwrap_or(0));
+                    println!("  schedule tabu forced moves: {}", solution.schedule_tabu_forced_moves.unwrap_or(0));
+                    println!("  schedule session initializations: {}", solution.schedule_session_initializations.unwrap_or(0));
+                    println!("  schedule session resumes: {}", solution.schedule_session_resumes.unwrap_or(0));
+                    println!("  schedule session rebases: {}", solution.schedule_session_rebases.unwrap_or(0));
                 }
                 println!("  full recomputations: {:.2}%", solution.full_recompute_percentage.unwrap_or(0.0));
             }
@@ -2553,6 +2574,41 @@ impl PySolution {
     #[getter]
     fn schedule_alns_moves_generated(&self) -> Option<u64> {
         self.schedule_alns_moves_generated
+    }
+
+    #[getter]
+    fn schedule_tabu_steps(&self) -> Option<u64> {
+        self.schedule_tabu_steps
+    }
+
+    #[getter]
+    fn schedule_tabu_hits(&self) -> Option<u64> {
+        self.schedule_tabu_hits
+    }
+
+    #[getter]
+    fn schedule_tabu_aspirations(&self) -> Option<u64> {
+        self.schedule_tabu_aspirations
+    }
+
+    #[getter]
+    fn schedule_tabu_forced_moves(&self) -> Option<u64> {
+        self.schedule_tabu_forced_moves
+    }
+
+    #[getter]
+    fn schedule_session_initializations(&self) -> Option<u64> {
+        self.schedule_session_initializations
+    }
+
+    #[getter]
+    fn schedule_session_resumes(&self) -> Option<u64> {
+        self.schedule_session_resumes
+    }
+
+    #[getter]
+    fn schedule_session_rebases(&self) -> Option<u64> {
+        self.schedule_session_rebases
     }
 
     #[getter]
@@ -4730,6 +4786,13 @@ impl PyModel {
             expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_alns_generation_attempts")).flatten();
         let schedule_alns_moves_generated =
             expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_alns_moves_generated")).flatten();
+        let schedule_tabu_steps = schedule_counter("schedule_tabu_steps");
+        let schedule_tabu_hits = schedule_counter("schedule_tabu_hits");
+        let schedule_tabu_aspirations = schedule_counter("schedule_tabu_aspirations");
+        let schedule_tabu_forced_moves = schedule_counter("schedule_tabu_forced_moves");
+        let schedule_session_initializations = schedule_counter("schedule_session_initializations");
+        let schedule_session_resumes = schedule_counter("schedule_session_resumes");
+        let schedule_session_rebases = schedule_counter("schedule_session_rebases");
         let full_recompute_percentage =
             expose_search_profile.then(|| parse_report_metadata(report, "full_recompute_percentage").unwrap_or_default());
         let construction_seconds = expose_search_profile.then(|| parse_report_metadata(report, "construction_seconds").unwrap_or_default());
@@ -4826,6 +4889,13 @@ impl PyModel {
             schedule_workspace_rollbacks,
             schedule_alns_generation_attempts,
             schedule_alns_moves_generated,
+            schedule_tabu_steps,
+            schedule_tabu_hits,
+            schedule_tabu_aspirations,
+            schedule_tabu_forced_moves,
+            schedule_session_initializations,
+            schedule_session_resumes,
+            schedule_session_rebases,
             full_recompute_percentage,
             backend_build_seconds: profile.then_some(backend_build_seconds).flatten(),
             construction_seconds,

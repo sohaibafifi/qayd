@@ -1270,6 +1270,13 @@ struct ScheduleMetricsAggregate {
     precedence_rejections: u64,
     infeasible_rejections: u64,
     justification_attempts: u64,
+    tabu_steps: u64,
+    tabu_hits: u64,
+    tabu_aspirations: u64,
+    tabu_forced_moves: u64,
+    session_initializations: u64,
+    session_resumes: u64,
+    session_rebases: u64,
 }
 
 impl ScheduleMetricsAggregate {
@@ -1306,6 +1313,13 @@ impl ScheduleMetricsAggregate {
         self.precedence_rejections = self.precedence_rejections.saturating_add(metrics.precedence_rejections);
         self.infeasible_rejections = self.infeasible_rejections.saturating_add(metrics.infeasible_rejections);
         self.justification_attempts = self.justification_attempts.saturating_add(metrics.justification_attempts);
+        self.tabu_steps = self.tabu_steps.saturating_add(metrics.tabu_steps);
+        self.tabu_hits = self.tabu_hits.saturating_add(metrics.tabu_hits);
+        self.tabu_aspirations = self.tabu_aspirations.saturating_add(metrics.tabu_aspirations);
+        self.tabu_forced_moves = self.tabu_forced_moves.saturating_add(metrics.tabu_forced_moves);
+        self.session_initializations = self.session_initializations.saturating_add(metrics.session_initializations);
+        self.session_resumes = self.session_resumes.saturating_add(metrics.session_resumes);
+        self.session_rebases = self.session_rebases.saturating_add(metrics.session_rebases);
         self.constructor.get_or_insert(metrics.constructor);
     }
 }
@@ -1404,6 +1418,7 @@ fn result_from_schedule_local_search(
         let mut retired = vec![false; allocation.workers()];
         let mut zero_progress_rounds = vec![0u8; allocation.workers()];
         let mut worker_work = vec![0u64; allocation.workers()];
+        let mut worker_sessions = (0..allocation.workers()).map(|_| None::<lists::ScheduleSearchSession>).collect::<Vec<_>>();
         let mut round = 0usize;
 
         loop {
@@ -1426,25 +1441,46 @@ fn result_from_schedule_local_search(
             if injected.is_some() {
                 incumbent_injection_attempts = incumbent_injection_attempts.saturating_add(u64::try_from(inputs.len()).unwrap_or(u64::MAX));
             }
+            let mut prepared_inputs = Vec::with_capacity(inputs.len());
+            for (source_worker, quota) in inputs {
+                prepared_inputs.push((source_worker, quota, worker_sessions[source_worker].take()));
+            }
             let round_seed = schedule_round_seed(request.seed, round);
             let summary = super::execute_workers_silent(
-                inputs.clone(),
+                prepared_inputs,
                 engine_stop,
                 Arc::new(AtomicBool::new(false)),
                 round_seed,
-                |context, (source_worker, quota)| {
-                    let seed = round_seed.wrapping_add(u64::try_from(source_worker).unwrap_or(u64::MAX));
-                    let (candidate, metrics) =
-                        lists::solve_schedule_capped(schedule, seed, context.stop(), quota, false, injected.as_ref(), &mut |_| {});
-                    (source_worker, quota, candidate, metrics)
+                |context, (source_worker, quota, session)| {
+                    let worker = u64::try_from(source_worker).unwrap_or(u64::MAX);
+                    let stable_seed = crate::mix64(request.seed ^ worker.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+                    let fallback_seed = round_seed.wrapping_add(worker);
+                    let (candidate, metrics, session) = lists::solve_schedule_capped_persistent(
+                        schedule,
+                        stable_seed,
+                        fallback_seed,
+                        context.stop(),
+                        quota,
+                        injected.as_ref(),
+                        session,
+                        source_worker == 0,
+                        &mut |_| {},
+                    );
+                    (source_worker, quota, candidate, metrics, session)
                 },
             );
             peak_buffered_candidates = peak_buffered_candidates.max(summary.reports.len());
             restart_boundaries = restart_boundaries.saturating_add(1);
 
             for report in summary.reports {
-                let (source_worker, quota, mut candidate, metrics): (usize, u64, CollectionSolution, lists::ScheduleConstructionMetrics) =
-                    report.result;
+                let (source_worker, quota, mut candidate, metrics, returned_session): (
+                    usize,
+                    u64,
+                    CollectionSolution,
+                    lists::ScheduleConstructionMetrics,
+                    Option<lists::ScheduleSearchSession>,
+                ) = report.result;
+                let mut discard_session = false;
                 let used = metrics.work_steps;
                 worker_work[source_worker] = worker_work[source_worker].saturating_add(used);
                 if finite_work {
@@ -1513,6 +1549,7 @@ fn result_from_schedule_local_search(
                                 }
                             }
                             Err(_) => {
+                                discard_session = true;
                                 incumbent_rejections = incumbent_rejections.saturating_add(1);
                                 if budget.stop().load(Ordering::Acquire) {
                                     verification_interruptions = verification_interruptions.saturating_add(1);
@@ -1529,6 +1566,9 @@ fn result_from_schedule_local_search(
                     incomplete_rejections = incomplete_rejections.saturating_add(1);
                 }
                 aggregate.record(metrics);
+                if !discard_session {
+                    worker_sessions[source_worker] = returned_session;
+                }
             }
             if finite_work && remaining.iter().all(|&left| left == 0) {
                 break;
@@ -1599,6 +1639,13 @@ fn result_from_schedule_local_search(
         precedence_rejections,
         infeasible_rejections,
         justification_attempts,
+        tabu_steps,
+        tabu_hits,
+        tabu_aspirations,
+        tabu_forced_moves,
+        session_initializations,
+        session_resumes,
+        session_rebases,
     } = aggregate;
     let global_improvements = progress_publications;
     let elite_pool_size = usize::from(shared_incumbent.is_some());
@@ -1660,6 +1707,13 @@ fn result_from_schedule_local_search(
         ("schedule_worker_work_min".to_string(), worker_work_min.to_string()),
         ("schedule_worker_work_max".to_string(), worker_work_max.to_string()),
         ("schedule_work_budget_overruns".to_string(), work_budget_overruns.to_string()),
+        ("schedule_tabu_steps".to_string(), tabu_steps.to_string()),
+        ("schedule_tabu_hits".to_string(), tabu_hits.to_string()),
+        ("schedule_tabu_aspirations".to_string(), tabu_aspirations.to_string()),
+        ("schedule_tabu_forced_moves".to_string(), tabu_forced_moves.to_string()),
+        ("schedule_session_initializations".to_string(), session_initializations.to_string()),
+        ("schedule_session_resumes".to_string(), session_resumes.to_string()),
+        ("schedule_session_rebases".to_string(), session_rebases.to_string()),
         ("schedule_elite_pool_size".to_string(), elite_pool_size.to_string()),
         ("elite_pool_size".to_string(), elite_pool_size.to_string()),
         (

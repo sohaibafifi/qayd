@@ -7,6 +7,8 @@
 pub(crate) enum MinimizingMoveAcceptance {
     Improving,
     NonWorsening,
+    /// Accept only candidates below an absolute objective threshold.
+    StrictlyBelow(i64),
     Always,
 }
 
@@ -15,6 +17,7 @@ impl MinimizingMoveAcceptance {
         match self {
             Self::Improving => candidate < current,
             Self::NonWorsening => candidate <= current,
+            Self::StrictlyBelow(limit) => candidate < limit,
             Self::Always => true,
         }
     }

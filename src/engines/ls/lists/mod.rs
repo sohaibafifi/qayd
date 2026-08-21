@@ -59,5 +59,7 @@ pub(crate) use routing_search::{
     SliceKind,
 };
 #[cfg(test)]
-pub(crate) use schedule_ls::solve_schedule;
-pub(crate) use schedule_ls::{solve_schedule_capped, ScheduleConstructionMetrics};
+pub(crate) use schedule_ls::solve_schedule_capped;
+#[cfg(test)]
+pub(crate) use schedule_ls::{audit_persistent_schedule_split, solve_schedule};
+pub(crate) use schedule_ls::{solve_schedule_capped_persistent, ScheduleConstructionMetrics, ScheduleSearchSession};

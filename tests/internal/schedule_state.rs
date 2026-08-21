@@ -1,8 +1,9 @@
+use std::collections::BTreeSet;
 use std::sync::atomic::AtomicBool;
 
 use qayd::engines::ls::lists::move_acceptance::MinimizingMoveAcceptance;
 use qayd::engines::ls::lists::schedule_state::{
-    CriticalNeighborhood, DispatchRule, JobShopProblem, JobShopState, MoveOutcome, MoveRejection, ScheduleMove,
+    CriticalNeighborhood, DispatchRule, JobShopProblem, JobShopState, MachineArc, MoveOutcome, MoveProbe, MoveRejection, ScheduleMove,
 };
 use qayd::engines::ls::lists::solve_schedule;
 use qayd::model::list::{verify_collection_solution, CollectionModel, IntervalVar, Mode, Resource, Schedule};
@@ -13,6 +14,8 @@ fn minimizing_move_acceptance_has_the_shared_makespan_semantics() {
     assert!(!MinimizingMoveAcceptance::Improving.accepts(10, 10));
     assert!(MinimizingMoveAcceptance::NonWorsening.accepts(10, 10));
     assert!(!MinimizingMoveAcceptance::NonWorsening.accepts(10, 11));
+    assert!(MinimizingMoveAcceptance::StrictlyBelow(11).accepts(100, 10));
+    assert!(!MinimizingMoveAcceptance::StrictlyBelow(10).accepts(0, 10));
     assert!(MinimizingMoveAcceptance::Always.accepts(10, 11));
 }
 
@@ -113,6 +116,36 @@ fn permutations(values: &[usize]) -> Vec<Vec<usize>> {
     let mut result = Vec::new();
     visit(&mut working, 0, &mut result);
     result
+}
+
+fn machine_arcs(sequence: &[usize]) -> BTreeSet<MachineArc> {
+    sequence.windows(2).map(|pair| MachineArc { machine: 0, before: pair[0], after: pair[1] }).collect()
+}
+
+fn apply_test_move(sequence: &mut Vec<usize>, movement: ScheduleMove) {
+    match movement {
+        ScheduleMove::AdjacentSwap { first_position, .. } => sequence.swap(first_position, first_position + 1),
+        ScheduleMove::Insert { from, to, .. } => {
+            let operation = sequence.remove(from);
+            sequence.insert(to, operation);
+        }
+    }
+}
+
+fn single_machine_schedule(operation_count: usize) -> Schedule {
+    Schedule {
+        intervals: (0..operation_count)
+            .map(|operation| IntervalVar {
+                duration: 1 + i64::try_from(operation % 3).unwrap(),
+                horizon: i64::try_from(operation_count * 3).unwrap(),
+                modes: Vec::new(),
+                optional: false,
+            })
+            .collect(),
+        precedences: Vec::new(),
+        resources: vec![Resource::NoOverlap((0..operation_count).collect())],
+        minimize_makespan: true,
+    }
 }
 
 #[test]
@@ -289,6 +322,178 @@ fn reconstruction_matches_an_independent_longest_path_oracle() {
             }
         }
     }
+}
+
+#[test]
+fn exhaustive_small_moves_report_exact_operation_identity_arc_differences() {
+    let stop = AtomicBool::new(false);
+    for operation_count in 2..=5 {
+        let schedule = single_machine_schedule(operation_count);
+        let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+        let operations = (0..operation_count).collect::<Vec<_>>();
+        for sequence in permutations(&operations) {
+            let state = JobShopState::from_machine_sequences(&problem, vec![sequence.clone()], &stop).unwrap().unwrap();
+            let mut movements = (0..operation_count - 1)
+                .map(|first_position| ScheduleMove::AdjacentSwap { machine: 0, first_position })
+                .collect::<Vec<_>>();
+            movements.extend((0..operation_count).flat_map(|from| {
+                (0..operation_count).filter(move |&to| to != from).map(move |to| ScheduleMove::Insert { machine: 0, from, to })
+            }));
+
+            for movement in movements {
+                let reported = state.move_arcs(movement).expect("enumerated move is valid");
+                let old_arcs = machine_arcs(&sequence);
+                let mut candidate = sequence.clone();
+                apply_test_move(&mut candidate, movement);
+                let new_arcs = machine_arcs(&candidate);
+                let expected_removed = old_arcs.difference(&new_arcs).copied().collect::<BTreeSet<_>>();
+                let expected_added = new_arcs.difference(&old_arcs).copied().collect::<BTreeSet<_>>();
+                let actual_removed = reported.removed.into_iter().flatten().collect::<BTreeSet<_>>();
+                let actual_added = reported.added.into_iter().flatten().collect::<BTreeSet<_>>();
+                assert_eq!(actual_removed, expected_removed, "removed arcs for {movement:?} on {sequence:?}");
+                assert_eq!(actual_added, expected_added, "added arcs for {movement:?} on {sequence:?}");
+            }
+            assert!(state.move_arcs(ScheduleMove::AdjacentSwap { machine: 0, first_position: operation_count - 1 }).is_none());
+        }
+    }
+}
+
+#[test]
+fn inverse_insert_reintroduces_removed_arcs_after_positions_shift() {
+    let stop = AtomicBool::new(false);
+    let schedule = single_machine_schedule(5);
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let mut state = JobShopState::from_machine_sequences(&problem, vec![vec![0, 1, 2, 3, 4]], &stop).unwrap().unwrap();
+    let forward = ScheduleMove::Insert { machine: 0, from: 1, to: 4 };
+    let forward_arcs = state.move_arcs(forward).unwrap();
+    assert!(matches!(state.consider_move(forward, MinimizingMoveAcceptance::Always, &stop), Ok(MoveOutcome::Accepted { .. })));
+    let inverse = ScheduleMove::Insert { machine: 0, from: 4, to: 1 };
+    let inverse_arcs = state.move_arcs(inverse).unwrap();
+
+    let removed = forward_arcs.removed.into_iter().flatten().collect::<BTreeSet<_>>();
+    let reintroduced = inverse_arcs.added.into_iter().flatten().collect::<BTreeSet<_>>();
+    let added = forward_arcs.added.into_iter().flatten().collect::<BTreeSet<_>>();
+    let removed_by_inverse = inverse_arcs.removed.into_iter().flatten().collect::<BTreeSet<_>>();
+    assert_eq!(reintroduced, removed);
+    assert_eq!(removed_by_inverse, added);
+}
+
+#[test]
+fn move_probe_is_atomic_for_feasible_and_rejected_candidates() {
+    let stop = AtomicBool::new(false);
+    let schedule = fixed_job_shop();
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let mut feasible_state = JobShopState::from_machine_sequences(&problem, vec![vec![0, 3], vec![2, 1]], &stop).unwrap().unwrap();
+    let feasible_sequences = feasible_state.machine_sequences().to_vec();
+    let feasible_starts = feasible_state.starts().to_vec();
+    let feasible_latest = feasible_state.latest_starts().to_vec();
+    let feasible_topological = feasible_state.topological_order().to_vec();
+    let feasible_critical_path = feasible_state.critical_path().to_vec();
+    let feasible_makespan = feasible_state.makespan();
+    let feasible = feasible_state.probe_move(ScheduleMove::AdjacentSwap { machine: 1, first_position: 0 }, &stop).unwrap();
+    assert!(matches!(feasible, MoveProbe::Feasible { .. }));
+    assert_eq!(feasible_state.machine_sequences(), feasible_sequences);
+    assert_eq!(feasible_state.starts(), feasible_starts);
+    assert_eq!(feasible_state.latest_starts(), feasible_latest);
+    assert_eq!(feasible_state.topological_order(), feasible_topological);
+    assert_eq!(feasible_state.critical_path(), feasible_critical_path);
+    assert_eq!(feasible_state.makespan(), feasible_makespan);
+
+    let mut rejected_state = JobShopState::from_machine_sequences(&problem, vec![vec![0, 3], vec![1, 2]], &stop).unwrap().unwrap();
+    let rejected_sequences = rejected_state.machine_sequences().to_vec();
+    let rejected_starts = rejected_state.starts().to_vec();
+    let rejected_latest = rejected_state.latest_starts().to_vec();
+    let rejected_topological = rejected_state.topological_order().to_vec();
+    let rejected_critical_path = rejected_state.critical_path().to_vec();
+    let rejected_makespan = rejected_state.makespan();
+    let rejected = rejected_state.probe_move(ScheduleMove::AdjacentSwap { machine: 0, first_position: 0 }, &stop).unwrap();
+    assert_eq!(rejected, MoveProbe::Rejected(MoveRejection::Cycle));
+    assert_eq!(rejected_state.machine_sequences(), rejected_sequences);
+    assert_eq!(rejected_state.starts(), rejected_starts);
+    assert_eq!(rejected_state.latest_starts(), rejected_latest);
+    assert_eq!(rejected_state.topological_order(), rejected_topological);
+    assert_eq!(rejected_state.critical_path(), rejected_critical_path);
+    assert_eq!(rejected_state.makespan(), rejected_makespan);
+}
+
+#[test]
+fn committing_a_probed_move_does_not_count_the_candidate_twice() {
+    let stop = AtomicBool::new(false);
+    let schedule = single_machine_schedule(4);
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let mut state = JobShopState::from_machine_sequences(&problem, vec![vec![0, 1, 2, 3]], &stop).unwrap().unwrap();
+    let _ = state.take_metrics();
+    let movement = ScheduleMove::Insert { machine: 0, from: 0, to: 3 };
+
+    let candidate = match state.probe_move(movement, &stop).unwrap() {
+        MoveProbe::Feasible { candidate, .. } => candidate,
+        rejected => panic!("expected feasible probe, got {rejected:?}"),
+    };
+    assert_eq!(state.metrics().moves_considered, 1);
+    let committed = state.commit_probed_move(movement, MinimizingMoveAcceptance::Always, &stop).unwrap();
+    assert_eq!(committed, MoveOutcome::Accepted { previous: candidate, current: candidate });
+    assert_eq!(state.metrics().moves_considered, 1);
+    assert_eq!(state.metrics().moves_accepted, 1);
+}
+
+#[test]
+fn strictly_below_is_applied_to_the_committed_candidate() {
+    let stop = AtomicBool::new(false);
+    let schedule = single_machine_schedule(4);
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let mut state = JobShopState::from_machine_sequences(&problem, vec![vec![0, 1, 2, 3]], &stop).unwrap().unwrap();
+    let makespan = state.makespan();
+
+    let accepted = state
+        .consider_move(ScheduleMove::Insert { machine: 0, from: 0, to: 3 }, MinimizingMoveAcceptance::StrictlyBelow(makespan + 1), &stop)
+        .unwrap();
+    assert!(matches!(accepted, MoveOutcome::Accepted { .. }));
+    let retained_sequences = state.machine_sequences().to_vec();
+    let rejected = state
+        .consider_move(ScheduleMove::Insert { machine: 0, from: 3, to: 0 }, MinimizingMoveAcceptance::StrictlyBelow(makespan), &stop)
+        .unwrap();
+    assert!(matches!(rejected, MoveOutcome::Rejected(MoveRejection::NotAccepted { .. })));
+    assert_eq!(state.machine_sequences(), retained_sequences);
+}
+
+#[test]
+fn replacement_rebuild_uses_the_owned_problem_without_mutating_the_state() {
+    let stop = AtomicBool::new(false);
+    let schedule = fixed_job_shop();
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let state = JobShopState::from_machine_sequences(&problem, vec![vec![0, 3], vec![2, 1]], &stop).unwrap().unwrap();
+    let old_sequences = state.machine_sequences().to_vec();
+    let old_starts = state.starts().to_vec();
+    let old_makespan = state.makespan();
+
+    let rebuilt = state.rebuilt_from_machine_sequences(vec![vec![0, 3], vec![1, 2]], &stop).unwrap().unwrap();
+    assert_eq!(state.machine_sequences(), old_sequences);
+    assert_eq!(state.starts(), old_starts);
+    assert_eq!(state.makespan(), old_makespan);
+    assert_eq!(rebuilt.machine_sequences(), &[vec![0, 3], vec![1, 2]]);
+    assert_eq!(verify_collection_solution(&collection(schedule), &rebuilt.to_solution()).unwrap(), vec![rebuilt.makespan()]);
+}
+
+#[test]
+fn taking_metrics_returns_deltas_and_preserves_workspace_observations() {
+    let stop = AtomicBool::new(false);
+    let schedule = single_machine_schedule(8);
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let mut state = JobShopState::from_machine_sequences(&problem, vec![(0..8).collect()], &stop).unwrap().unwrap();
+    let capacities = state.workspace_capacities();
+
+    let construction = state.take_metrics();
+    assert_eq!(construction.reconstructions, 1);
+    assert_eq!(state.metrics(), Default::default());
+    assert!(matches!(state.probe_move(ScheduleMove::Insert { machine: 0, from: 0, to: 7 }, &stop), Ok(MoveProbe::Feasible { .. })));
+    let probe = state.take_metrics();
+    assert_eq!(probe.moves_considered, 1);
+    assert_eq!(probe.delta_evaluations, 1);
+    assert_eq!(probe.full_evaluations, 0);
+    assert_eq!(probe.oracle_validations, 0);
+    assert_eq!(state.workspace_capacities(), capacities);
+    assert_eq!(state.take_metrics(), Default::default());
+    assert_eq!(state.workspace_capacities(), capacities);
 }
 
 #[test]
@@ -659,7 +864,7 @@ fn critical_move_buffer_is_reused_and_duplicate_free() {
 }
 
 #[test]
-fn cancellation_during_move_reconstruction_preserves_the_incumbent() {
+fn cancellation_during_move_probe_and_commit_preserves_the_incumbent() {
     let stop = AtomicBool::new(false);
     let operation_count = 20_000;
     let schedule = Schedule {
@@ -676,15 +881,27 @@ fn cancellation_during_move_reconstruction_preserves_the_incumbent() {
     let old_sequences = state.machine_sequences().to_vec();
     let old_starts = state.starts().to_vec();
 
-    let outcome = std::thread::scope(|scope| {
+    let probe = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            stop.store(true, std::sync::atomic::Ordering::Release);
+        });
+        state.probe_move(ScheduleMove::Insert { machine: 0, from: 0, to: operation_count - 1 }, &stop)
+    });
+
+    assert!(probe.is_err());
+    assert_eq!(state.machine_sequences(), old_sequences);
+    assert_eq!(state.starts(), old_starts);
+
+    stop.store(false, std::sync::atomic::Ordering::Release);
+    let commit = std::thread::scope(|scope| {
         scope.spawn(|| {
             std::thread::sleep(std::time::Duration::from_millis(1));
             stop.store(true, std::sync::atomic::Ordering::Release);
         });
         state.consider_move(ScheduleMove::Insert { machine: 0, from: 0, to: operation_count - 1 }, MinimizingMoveAcceptance::Always, &stop)
     });
-
-    assert!(outcome.is_err());
+    assert!(commit.is_err());
     assert_eq!(state.machine_sequences(), old_sequences);
     assert_eq!(state.starts(), old_starts);
 }
