@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Hexaly adapter with the same normalized models and output as qayd launchers.
 
-The installation is explicit through ``--hexaly-home``.  No license or runtime
-path is taken from an environment variable.
+The runtime is selected either through ``--hexaly-home`` or from an importable
+``hexaly`` Python distribution.  The license file is selected explicitly, with
+``HEXALY_HOME/license.dat`` retained as the backward-compatible home default;
+no license or runtime path is taken from an environment variable.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
 import math
@@ -22,19 +25,70 @@ from qayd.datasets import read_cvrplib, read_jsplib, read_psplib, read_solomon
 
 
 _HEXALY_RUNTIME: tempfile.TemporaryDirectory[str] | None = None
+_HEXALY_NATIVE_LIBRARY: Path | None = None
+_HEXALY_MODULE_SOURCE: Path | None = None
+_HEXALY_RUNTIME_SOURCE: str | None = None
 
 
-def load_hexaly(home: Path) -> Any:
+def _native_library_candidates(directory: Path) -> list[Path]:
+    return sorted({
+        *directory.glob("libhexaly*.dylib"),
+        *directory.glob("libhexaly*.so"),
+        *directory.glob("hexaly*.dll"),
+    })
+
+
+def locate_native_library(module: Any) -> Path:
+    module_path = Path(module.__file__).resolve(strict=True)
+    loaded = getattr(module, "_loaded_library", None)
+    if loaded:
+        candidate = Path(loaded)
+        if not candidate.is_absolute():
+            package_candidate = module_path.parent / candidate
+            if package_candidate.is_file():
+                candidate = package_candidate
+        if candidate.is_file():
+            return candidate.resolve(strict=True)
+    candidates = _native_library_candidates(module_path.parent)
+    if candidates:
+        return candidates[0].resolve(strict=True)
+    raise SystemExit(
+        f"Hexaly native library loaded by {module_path} could not be located for provenance"
+    )
+
+
+def import_hexaly_distribution() -> Any:
+    # When this file is executed directly, its directory is sys.path[0] and
+    # ``hexaly.py`` would shadow the installed ``hexaly`` package.
+    adapter_dir = Path(__file__).resolve().parent
+    original_path = list(sys.path)
+    sys.path[:] = [
+        entry for entry in sys.path
+        if Path(entry or ".").resolve() != adapter_dir
+    ]
+    try:
+        return importlib.import_module("hexaly.optimizer")
+    finally:
+        sys.path[:] = original_path
+
+
+def load_hexaly(home: Path | None = None) -> Any:
+    global _HEXALY_MODULE_SOURCE
+    global _HEXALY_NATIVE_LIBRARY
     global _HEXALY_RUNTIME
+    global _HEXALY_RUNTIME_SOURCE
+    if home is None:
+        module = import_hexaly_distribution()
+        _HEXALY_MODULE_SOURCE = Path(module.__file__).resolve(strict=True)
+        _HEXALY_NATIVE_LIBRARY = locate_native_library(module)
+        _HEXALY_RUNTIME_SOURCE = "python-distribution"
+        return module
+
     python_dir = home / "bin" / "python"
     library = home / "bin"
     if not python_dir.is_dir() or not library.is_dir():
         raise SystemExit(f"invalid Hexaly installation: {home}")
-    native_candidates = [
-        *library.glob("libhexaly*.dylib"),
-        *library.glob("libhexaly*.so"),
-        *library.glob("hexaly*.dll"),
-    ]
+    native_candidates = _native_library_candidates(library)
     if not native_candidates:
         raise SystemExit(f"Hexaly native library not found under {library}")
     # The distributed Python package only probes its own directory and the
@@ -46,7 +100,43 @@ def load_hexaly(home: Path) -> Any:
     shutil.copytree(python_dir / "hexaly", package)
     (package / native_candidates[0].name).symlink_to(native_candidates[0])
     sys.path.insert(0, str(runtime))
-    return importlib.import_module("hexaly.optimizer")
+    module = importlib.import_module("hexaly.optimizer")
+    _HEXALY_MODULE_SOURCE = (python_dir / "hexaly" / "optimizer.py").resolve(strict=True)
+    _HEXALY_NATIVE_LIBRARY = locate_native_library(module)
+    _HEXALY_RUNTIME_SOURCE = "hexaly-home"
+    return module
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def runtime_provenance(module: Any) -> dict[str, str]:
+    native = _HEXALY_NATIVE_LIBRARY or locate_native_library(module)
+    module_source = _HEXALY_MODULE_SOURCE or Path(module.__file__).resolve(strict=True)
+    return {
+        "runtime_source": _HEXALY_RUNTIME_SOURCE or "python-distribution",
+        "hx_version": str(module.HxVersion.version),
+        "python_api_version": str(getattr(module, "__version__", "unknown")),
+        "module_path": str(module_source),
+        "native_library_path": str(native),
+        "native_library_sha256": sha256_file(native),
+    }
+
+
+def configure_license(module: Any, license_path: Path) -> Path:
+    resolved = license_path.expanduser().resolve()
+    if not resolved.is_file():
+        raise SystemExit(f"Hexaly license file not found: {resolved}")
+    # License content has priority over license_path in Hexaly. Clear any
+    # ambient content so this process uses exactly the requested file.
+    module.HxVersion.license_content = ""
+    module.HxVersion.license_path = str(resolved)
+    return resolved
 
 
 def configure(optimizer: Any, args: argparse.Namespace) -> None:
@@ -461,19 +551,38 @@ def solve_rcpsp(args: argparse.Namespace, hx: Any) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("problem", choices=("cvrp", "cvrptw", "jssp", "rcpsp"))
-    parser.add_argument("instance")
+    parser.add_argument("problem", nargs="?", choices=("cvrp", "cvrptw", "jssp", "rcpsp"))
+    parser.add_argument("instance", nargs="?")
     parser.add_argument("--time-limit", type=int, default=60)
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--hexaly-home", type=Path, required=True)
+    parser.add_argument("--hexaly-home", type=Path)
+    parser.add_argument("--hexaly-license-path", type=Path)
+    parser.add_argument(
+        "--runtime-info", action="store_true",
+        help="print import and native-library provenance without taking a license token",
+    )
     parser.add_argument("--distance-scale", type=int, default=10)
     parser.add_argument("--rounding", choices=("truncate", "nearest", "ceil"), default="truncate")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     if args.time_limit < 0 or args.threads <= 0 or args.seed < 0 or args.distance_scale <= 0:
         raise SystemExit("time limit and seed must be non-negative; threads and scale must be positive")
-    hx = load_hexaly(args.hexaly_home.resolve())
+    home = args.hexaly_home.expanduser().resolve() if args.hexaly_home else None
+    hx = load_hexaly(home)
+    if args.runtime_info:
+        if args.problem is not None or args.instance is not None:
+            parser.error("--runtime-info does not accept a problem or instance")
+        print(json.dumps(runtime_provenance(hx), sort_keys=True))
+        return
+    if args.problem is None or args.instance is None:
+        parser.error("problem and instance are required unless --runtime-info is used")
+    license_path = args.hexaly_license_path
+    if license_path is None and home is not None:
+        license_path = home / "license.dat"
+    if license_path is None:
+        parser.error("--hexaly-license-path is required without --hexaly-home")
+    configure_license(hx, license_path)
     solve = {
         "cvrp": solve_cvrp,
         "cvrptw": solve_cvrptw,

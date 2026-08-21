@@ -10,6 +10,7 @@ Examples:
       --solver qayd-native --solver hexaly --solver hgs --solver lkh \
       --solver ortools-cp-sat --budget 1,10,60,600 --seed 0,1,2,3,4 \
       --threads 4 --hexaly-home /opt/hexaly_14_5 \
+      --hexaly-license-path /opt/hexaly_14_5/license.dat \
       --hgs-binary bench/solvers/HGS-CVRP/build/hgs \
       --lkh-binary bench/solvers/LKH-3.0.13/LKH \
       --out bench/results/competitive.jsonl
@@ -250,6 +251,7 @@ def binary_version(path: Path) -> str:
 def solver_version(
     name: str, args: argparse.Namespace, provenance: dict[str, Any],
     qayd_artifact: dict[str, str] | None,
+    hexaly_artifact: dict[str, str] | None = None,
 ) -> str:
     if name.startswith("qayd-"):
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
@@ -267,15 +269,14 @@ def solver_version(
         except ImportError:
             return "OR-Tools missing"
     if name == "hexaly":
-        binary = Path(args.hexaly_home) / "bin" / "hexaly" if args.hexaly_home else Path("missing")
-        if binary.is_file():
-            try:
-                result = subprocess.run([str(binary)], text=True, capture_output=True, timeout=5)
-                first = (result.stdout + result.stderr).splitlines()[0]
-                return f"{first.strip()} [{binary_version(binary)}]"
-            except (OSError, subprocess.SubprocessError, IndexError):
-                pass
-        return binary_version(binary)
+        if hexaly_artifact is None:
+            return "Hexaly runtime not inspected"
+        return (
+            f"Hexaly Optimizer {hexaly_artifact['hx_version']} "
+            f"(Python API {hexaly_artifact['python_api_version']}, "
+            f"{hexaly_artifact['runtime_source']}, libhexaly "
+            f"sha256:{hexaly_artifact['native_library_sha256']})"
+        )
     if name == "hgs":
         return f"HGS-CVRP {binary_version(Path(args.hgs_binary or 'missing'))}"
     if name == "lkh":
@@ -321,10 +322,15 @@ def command_for(
     if solver == "ortools-cp-sat":
         return [sys.executable, str(ADAPTERS / "ortools_cp_sat.py"), problem, *common]
     if solver == "hexaly":
-        return [
+        command = [
             sys.executable, str(ADAPTERS / "hexaly.py"), problem, *common,
-            "--hexaly-home", str(Path(args.hexaly_home).resolve()),
+            "--hexaly-license-path", str(Path(args.hexaly_license_path).expanduser().resolve()),
         ]
+        if args.hexaly_home:
+            command.extend((
+                "--hexaly-home", str(Path(args.hexaly_home).expanduser().resolve()),
+            ))
+        return command
     if solver == "hgs":
         return [
             sys.executable, str(ADAPTERS / "hgs.py"), instance,
@@ -391,13 +397,57 @@ def existing_keys(path: Path) -> set[str]:
 
 def check_solver_arguments(solvers: list[str], args: argparse.Namespace) -> None:
     requirements = {
-        "hexaly": (args.hexaly_home, "--hexaly-home"),
         "hgs": (args.hgs_binary, "--hgs-binary"),
         "lkh": (args.lkh_binary, "--lkh-binary"),
     }
     for solver, (value, flag) in requirements.items():
         if solver in solvers and not value:
             raise SystemExit(f"{solver} requires {flag}")
+    if "hexaly" in solvers:
+        if not args.hexaly_license_path:
+            if not args.hexaly_home:
+                raise SystemExit("hexaly requires --hexaly-license-path without --hexaly-home")
+            args.hexaly_license_path = (
+                Path(args.hexaly_home).expanduser().resolve() / "license.dat"
+            )
+        license_path = Path(args.hexaly_license_path).expanduser().resolve()
+        if not license_path.is_file():
+            raise SystemExit(f"Hexaly license file not found: {license_path}")
+
+
+def hexaly_runtime_provenance(args: argparse.Namespace) -> dict[str, str]:
+    """Inspect the imported runtime without constructing a HexalyOptimizer."""
+    command = [sys.executable, str(ADAPTERS / "hexaly.py"), "--runtime-info"]
+    if args.hexaly_home:
+        command.extend((
+            "--hexaly-home", str(Path(args.hexaly_home).expanduser().resolve()),
+        ))
+    try:
+        completed = subprocess.run(
+            command, cwd=ROOT, text=True, capture_output=True, check=True, timeout=30,
+        )
+        artifact = json_record_from_output(completed.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        diagnostic = ""
+        if isinstance(error, subprocess.CalledProcessError):
+            diagnostic = (error.stderr or error.stdout or "").strip()
+        suffix = f": {diagnostic}" if diagnostic else f": {error}"
+        raise SystemExit(f"cannot inspect the Hexaly runtime{suffix}") from error
+    required = {
+        "runtime_source", "hx_version", "python_api_version", "module_path",
+        "native_library_path", "native_library_sha256",
+    }
+    missing = sorted(required - artifact.keys())
+    digest = artifact.get("native_library_sha256")
+    if missing or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        detail = f"missing {', '.join(missing)}" if missing else "invalid native library SHA-256"
+        raise SystemExit(f"invalid Hexaly runtime provenance: {detail}")
+    return {key: str(artifact[key]) for key in sorted(required)}
+
+
+def hexaly_artifact_unchanged(artifact: dict[str, str]) -> bool:
+    path = Path(artifact.get("native_library_path", ""))
+    return path.is_file() and sha256_file(path) == artifact.get("native_library_sha256")
 
 
 def prepare_qayd_extension() -> None:
@@ -432,6 +482,19 @@ def qayd_artifact_unchanged(artifact: dict[str, str]) -> bool:
     return path.is_file() and sha256_file(path) == artifact.get("sha256")
 
 
+def ensure_campaign_artifacts_unchanged(
+    provenance: dict[str, Any],
+    qayd_artifact: dict[str, str] | None,
+    hexaly_artifact: dict[str, str] | None,
+) -> None:
+    if source_tree_sha256(ROOT) != provenance.get("source_tree_sha256"):
+        raise SystemExit("source tree changed during the campaign; restart with a new output")
+    if qayd_artifact is not None and not qayd_artifact_unchanged(qayd_artifact):
+        raise SystemExit("qayd extension changed during the campaign; restart with a new output")
+    if hexaly_artifact is not None and not hexaly_artifact_unchanged(hexaly_artifact):
+        raise SystemExit("Hexaly native library changed during the campaign; restart with a new output")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", default="smoke", help="suite name or JSON file")
@@ -456,7 +519,14 @@ def main() -> None:
     parser.add_argument("--routing-two-way", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--routing-nearest-neighbor", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--routing-warm-start", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--hexaly-home", help="Hexaly installation root, for example /opt/hexaly_14_5")
+    parser.add_argument(
+        "--hexaly-home",
+        help="optional Hexaly installation root; omit for an importable Python distribution",
+    )
+    parser.add_argument(
+        "--hexaly-license-path",
+        help="explicit Hexaly license file used by the adapter",
+    )
     parser.add_argument("--hgs-binary", help="compiled HGS-CVRP executable")
     parser.add_argument("--lkh-binary", help="compiled LKH-3 executable")
     parser.add_argument("--out", type=Path, required=True)
@@ -491,7 +561,13 @@ def main() -> None:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     completed = set() if args.restart else existing_keys(args.out)
     provenance = machine_provenance(ROOT)
-    versions = {solver: solver_version(solver, args, provenance, qayd_artifact) for solver in solvers}
+    hexaly_artifact = hexaly_runtime_provenance(args) if "hexaly" in solvers else None
+    versions = {
+        solver: solver_version(
+            solver, args, provenance, qayd_artifact, hexaly_artifact,
+        )
+        for solver in solvers
+    }
     sidecar = args.out.with_suffix(args.out.suffix + ".provenance.json")
     sidecar_payload = {
         "schema_version": 1,
@@ -508,6 +584,11 @@ def main() -> None:
         "profile_qayd": args.profile_qayd,
         "qayd_prepared": args.prepare_qayd,
         "qayd_artifact": qayd_artifact,
+        "hexaly_artifact": hexaly_artifact,
+        "hexaly_license_path": (
+            str(Path(args.hexaly_license_path).expanduser().resolve())
+            if args.hexaly_license_path else None
+        ),
         "routing_two_way": args.routing_two_way,
         "routing_nearest_neighbor": args.routing_nearest_neighbor,
         "routing_warm_start": args.routing_warm_start,
@@ -517,6 +598,7 @@ def main() -> None:
         "suite", "suite_file", "solvers", "budgets", "seeds", "threads",
         "memory_limit_mb", "grace_seconds", "qayd_engine", "max_iterations", "profile_qayd",
         "qayd_prepared", "qayd_artifact",
+        "hexaly_artifact", "hexaly_license_path",
         "routing_two_way", "routing_nearest_neighbor", "routing_warm_start",
     )
     if args.out.exists() and not args.restart:
@@ -547,19 +629,17 @@ def main() -> None:
     mode = "w" if args.restart else "a"
     with args.out.open(mode, encoding="utf-8") as output:
         for index, (solver, item, budget, seed) in enumerate(pending, 1):
-            source_changed = (
-                has_qayd
-                and source_tree_sha256(ROOT) != provenance.get("source_tree_sha256")
+            ensure_campaign_artifacts_unchanged(
+                provenance, qayd_artifact, hexaly_artifact,
             )
-            if source_changed:
-                raise SystemExit("qayd source tree changed during the campaign; restart with a new output")
-            if qayd_artifact is not None and not qayd_artifact_unchanged(qayd_artifact):
-                raise SystemExit("qayd extension changed during the campaign; restart with a new output")
             identifier = run_key(solver, item, budget, seed, args)
             argv = command_for(solver, item, budget, seed, args)
             measured = run_measured(
                 argv, timeout=budget + args.grace_seconds, cwd=ROOT,
                 memory_limit_mb=args.memory_limit_mb,
+            )
+            ensure_campaign_artifacts_unchanged(
+                provenance, qayd_artifact, hexaly_artifact,
             )
             try:
                 record = json_record_from_output(measured["stdout"])
