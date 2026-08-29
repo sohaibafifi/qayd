@@ -15,6 +15,16 @@ pub enum SolveMode {
     LocalSearch,
 }
 
+/// JSSP local-search strategy selected by an explicit solve request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScheduleJsspSearch {
+    /// Preserve the established persistent tabu implementation.
+    #[default]
+    Legacy,
+    /// Run the bounded TSAB-inspired candidate-ranked N5 pilot.
+    TsabCandidate,
+}
+
 /// Stable engine identity used by events and diagnostics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EngineKind {
@@ -233,6 +243,20 @@ pub struct SolveRequest {
     pub limits: SolveLimits,
     pub profile: bool,
     pub schedule_cdcl: bool,
+    /// Enable bounded guide-directed path relinking for scheduling profile 6.
+    /// The feature remains inactive without profiling, seven workers, and a
+    /// validated global schedule archive containing at least two entries.
+    pub schedule_path_relink: bool,
+    /// Run bounded exact JSSP repairs in measurement-only shadow mode. The
+    /// orchestrator activates this only for wall-clock searches without a
+    /// deterministic iteration limit; repairs never publish an incumbent.
+    pub schedule_lns_shadow: bool,
+    /// Reserve the final scheduling worker for deterministic multi-start
+    /// construction. The initial C1 experiment supports exactly one reserved
+    /// worker in a seven-worker JSSP local-search portfolio.
+    pub schedule_constructor_workers: usize,
+    /// Select the JSSP local-search candidate-ranking strategy.
+    pub schedule_jssp_search: ScheduleJsspSearch,
     pub routing: RoutingControls,
     pub linear: LinearControls,
     pub cp: CpControls,
@@ -269,6 +293,10 @@ impl Default for SolveRequest {
             limits: SolveLimits::default(),
             profile: false,
             schedule_cdcl: false,
+            schedule_path_relink: false,
+            schedule_lns_shadow: false,
+            schedule_constructor_workers: 0,
+            schedule_jssp_search: ScheduleJsspSearch::Legacy,
             routing: RoutingControls::default(),
             linear: LinearControls::default(),
             cp: CpControls::default(),
@@ -289,6 +317,28 @@ impl SolveRequest {
     pub fn validate(&self) -> Result<(), SolveError> {
         if self.threads == 0 {
             return Err(SolveError::InvalidRequest("threads must be positive".to_string()));
+        }
+        if self.schedule_constructor_workers > 1 {
+            return Err(SolveError::InvalidRequest("schedule_constructor_workers currently supports only 0 or 1".to_string()));
+        }
+        if self.schedule_constructor_workers == 1 && self.threads != 7 {
+            return Err(SolveError::InvalidRequest("schedule_constructor_workers=1 currently requires threads=7".to_string()));
+        }
+        if self.schedule_constructor_workers != 0 && (self.schedule_path_relink || self.schedule_lns_shadow) {
+            return Err(SolveError::InvalidRequest(
+                "schedule_constructor_workers cannot yet be combined with schedule_path_relink or schedule_lns_shadow".to_string(),
+            ));
+        }
+        if self.schedule_jssp_search == ScheduleJsspSearch::TsabCandidate
+            && (self.schedule_constructor_workers != 0 || self.schedule_path_relink || self.schedule_lns_shadow)
+        {
+            return Err(SolveError::InvalidRequest(
+                "schedule_jssp_search='tsab-candidate' cannot yet be combined with schedule_constructor_workers, schedule_path_relink, or schedule_lns_shadow"
+                    .to_string(),
+            ));
+        }
+        if self.schedule_jssp_search == ScheduleJsspSearch::TsabCandidate && self.threads != 7 {
+            return Err(SolveError::InvalidRequest("schedule_jssp_search='tsab-candidate' currently requires threads=7".to_string()));
         }
         if self.limits.memory_bytes == Some(0) {
             return Err(SolveError::InvalidRequest("memory limit must be positive when provided".to_string()));

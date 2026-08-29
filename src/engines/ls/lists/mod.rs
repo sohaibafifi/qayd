@@ -15,7 +15,13 @@ mod portfolio;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod resource_schedule;
 mod routing_search;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod schedule_elite;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod schedule_lns;
 mod schedule_ls;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod schedule_relink;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod schedule_state;
 
@@ -61,5 +67,21 @@ pub(crate) use routing_search::{
 #[cfg(test)]
 pub(crate) use schedule_ls::solve_schedule_capped;
 #[cfg(test)]
-pub(crate) use schedule_ls::{audit_persistent_schedule_split, solve_schedule};
-pub(crate) use schedule_ls::{solve_schedule_capped_persistent, ScheduleConstructionMetrics, ScheduleSearchSession};
+pub(crate) use schedule_ls::solve_schedule_capped_persistent;
+#[cfg(test)]
+pub(crate) use schedule_ls::solve_schedule_capped_persistent_shadow;
+#[cfg(test)]
+pub(crate) use schedule_ls::{
+    audit_direct_oracle_scan_layout, audit_direct_oracle_slot_split, audit_persistent_schedule_baseline_reference,
+    audit_persistent_schedule_profile_split, audit_persistent_schedule_split, audit_schedule_island_profile,
+    audit_schedule_lns_shadow_policy, audit_tsab_elite_restart_policy, audit_tsab_n6_restart_streaming_reference, audit_tsab_owner_mask,
+    audit_tsab_phase_policy, audit_tsab_selection_policy, audit_tsab_shortlist_policy, audit_tsab_streaming_reference, solve_schedule,
+    solve_schedule_capped_persistent_tsab,
+};
+#[allow(unused_imports)]
+pub(crate) use schedule_ls::{
+    schedule_constructor_multistart_supported, solve_schedule_capped_persistent_hybrid,
+    solve_schedule_capped_persistent_hybrid_with_strategy, solve_schedule_capped_persistent_relink,
+    solve_schedule_capped_persistent_relink_with_lns_shadow, ScheduleConstructionMetrics, ScheduleJsspSearchStrategy,
+    ScheduleSearchSession, ScheduleTsabMetrics,
+};

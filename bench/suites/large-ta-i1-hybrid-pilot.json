@@ -1,0 +1,71 @@
+{
+  "name": "large-ta-i1-hybrid-pilot",
+  "description": "Staged autonomous Qayd search pilot on Large-TA instance 1.",
+  "minimum_external_grace_seconds": 600,
+  "source": {
+    "paper": "Large-Scale Benchmarks for the Job Shop Scheduling Problem",
+    "paper_url": "https://arxiv.org/abs/2102.08778v2",
+    "instance_url": "https://arxiv.org/src/2102.08778v2/anc/Large-TA%20benchmark/tai_j1000_m1000_1.data"
+  },
+  "reference_protocol": {
+    "objective": "minimize makespan",
+    "target_kind": "verified local Hexaly 15.0 incumbent, not a certified optimum",
+    "target_makespan": 876334,
+    "target_time_limit_seconds": 600,
+    "baseline_kind": "verified autonomous Qayd persistent-tabu incumbent",
+    "baseline_makespan": 943011,
+    "shadow_gate": {
+      "quality_neutral": true,
+      "maximum_peak_memory_mb_exclusive": 12288,
+      "minimum_search_elite_pool_size": 2,
+      "requires_clean_archive_trace": true,
+      "batches_skipped_after_stop_is_error": false
+    },
+        "path_relink_gate": {
+      "requires_explicit_campaign_flag": true,
+      "minimum_oracle_attempts": 1,
+      "maximum_workspace_bytes_exclusive": 16777216,
+      "requires_zero_guide_incompatibilities": true,
+            "requires_zero_guide_interruptions": true
+        },
+        "lns_shadow_gate": {
+            "requires_explicit_campaign_flag": true,
+            "owner_worker_mask": 1,
+            "minimum_attempts": 1,
+            "minimum_selected_operations": 1,
+            "maximum_workspace_bytes_exclusive": 536870912,
+            "requires_zero_interruptions": true,
+            "requires_zero_oracle_rejections": true,
+            "quality_neutral": true
+        },
+        "constructor_multistart_c1_gate": {
+            "requires_explicit_campaign_workers": 1,
+            "owner_worker_mask": 64,
+            "work_units_per_attempt": 64,
+            "maximum_peak_memory_mb_exclusive": 11264,
+            "maximum_workspace_bytes_exclusive": 536870912,
+            "minimum_ls_profile_retention_when_measurable": 0.9,
+            "final_objective_limit_inclusive": 943065,
+            "constructor_best_objective_limit_exclusive": 943228,
+            "requires_zero_interruptions_rejections_and_overruns": true
+        },
+    "stage_thresholds": {
+            "first-signal": 936343,
+      "portfolio": 926341,
+      "lns": 909672,
+            "hybrid-strong": 893003,
+            "pre-target": 883001,
+      "target": 876334
+    }
+  },
+  "expected_instances": {
+    "tai_j1000_m1000_1.data": "909519206227c1916cc246ddde718f875ab2c24227b66206df77f7e41a6e1c01"
+  },
+  "datasets": [
+    {
+      "family": "large-ta-1000x1000",
+      "problem": "jssp",
+      "glob": "data/jssp/large-ta/tai_j1000_m1000_1.data"
+    }
+  ]
+}

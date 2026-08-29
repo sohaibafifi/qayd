@@ -5,7 +5,9 @@
 //! explicit operation order, and reconstructs a complete schedule by longest
 //! path. Unsupported schedules stay on the general scheduling fallback.
 
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap};
+use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::engines::ls::schedule_ir::PrecedenceDag;
@@ -44,11 +46,15 @@ impl DispatchRule {
 #[derive(Clone)]
 pub(crate) struct JobShopProblem {
     durations: Vec<i64>,
+    all_durations_positive: bool,
+    n8_classical_chain_model: bool,
     horizons: Vec<i64>,
     start_windows: Vec<(i64, i64)>,
+    raw_machines: Vec<usize>,
     operation_machines: Vec<usize>,
     machine_count: usize,
     precedences: PrecedenceDag,
+    precedence_sinks: Vec<usize>,
     remaining_work: Vec<i64>,
     solution_machines: Vec<i64>,
     solution_modes: Vec<Option<usize>>,
@@ -93,7 +99,7 @@ impl JobShopProblem {
             let mut start_windows = Vec::with_capacity(operation_count);
             for interval in &schedule.intervals {
                 checkpoint(stop)?;
-                if interval.duration <= 0 || interval.horizon < interval.duration {
+                if interval.duration < 0 || interval.horizon < interval.duration {
                     return Ok(None);
                 }
                 durations.push(interval.duration);
@@ -124,7 +130,7 @@ impl JobShopProblem {
                 let Ok(machine) = i64::try_from(mode.machine) else {
                     return Ok(None);
                 };
-                if mode.duration <= 0 || start_min < 0 || start_min > start_max || start_max > last_start {
+                if mode.duration < 0 || start_min < 0 || start_min > start_max || start_max > last_start {
                     return Ok(None);
                 }
                 raw_machines.push(mode.machine);
@@ -145,16 +151,21 @@ impl JobShopProblem {
             }
             successors[before].push(after);
         }
-        for list in &mut successors {
+        let mut precedence_sinks = Vec::new();
+        for (operation, list) in successors.iter_mut().enumerate() {
             checkpoint(stop)?;
             list.sort_unstable();
             checkpoint(stop)?;
             list.dedup();
+            if list.is_empty() {
+                precedence_sinks.push(operation);
+            }
         }
         let Some(precedences) = PrecedenceDag::compile(successors, stop) else {
             checkpoint(stop)?;
             return Ok(None);
         };
+        let n8_classical_chain_model = recognizes_classical_n8_chains(&precedences, &operation_machines, machine_count, stop)?;
         let Some(remaining_work) = precedences.remaining_paths(&durations, stop) else {
             checkpoint(stop)?;
             return Ok(None);
@@ -165,13 +176,18 @@ impl JobShopProblem {
             checkpoint(stop)?;
             horizons.push(interval.horizon);
         }
+        let all_durations_positive = durations.iter().all(|&duration| duration > 0);
         Ok(Some(Self {
             durations,
+            all_durations_positive,
+            n8_classical_chain_model,
             horizons,
             start_windows,
+            raw_machines,
             operation_machines,
             machine_count,
             precedences,
+            precedence_sinks,
             remaining_work,
             solution_machines,
             solution_modes,
@@ -190,9 +206,96 @@ impl JobShopProblem {
         self.durations[operation]
     }
 
+    pub(crate) fn start_window(&self, operation: usize) -> (i64, i64) {
+        self.start_windows[operation]
+    }
+
+    pub(crate) fn horizon(&self, operation: usize) -> i64 {
+        self.horizons[operation]
+    }
+
+    pub(crate) fn job_predecessors(&self, operation: usize) -> &[usize] {
+        self.precedences.predecessors(operation)
+    }
+
+    pub(crate) fn job_successors(&self, operation: usize) -> &[usize] {
+        self.precedences.successors(operation)
+    }
+
     pub(crate) fn machine(&self, operation: usize) -> usize {
         self.operation_machines[operation]
     }
+
+    pub(crate) fn raw_machine(&self, operation: usize) -> Option<usize> {
+        self.raw_machines.get(operation).copied()
+    }
+
+    pub(crate) fn solution_machine(&self, operation: usize) -> Option<i64> {
+        self.solution_machines.get(operation).copied()
+    }
+
+    pub(crate) fn solution_mode(&self, operation: usize) -> Option<Option<usize>> {
+        self.solution_modes.get(operation).copied()
+    }
+
+    fn solution_from_starts(&self, starts: Vec<i64>, objective: i64) -> CollectionSolution {
+        CollectionSolution {
+            lists: Vec::new(),
+            objectives: vec![objective],
+            feasible: true,
+            starts,
+            presences: vec![true; self.operation_count()],
+            machines: self.solution_machines.clone(),
+            modes: self.solution_modes.clone(),
+            bound: None,
+        }
+    }
+
+    fn supports_strict_n5_fast_path(&self) -> bool {
+        self.n8_classical_chain_model
+            && self.all_durations_positive
+            && self.start_windows.iter().enumerate().all(|(operation, &(start_min, start_max))| {
+                start_min == 0 && self.horizons[operation].checked_sub(self.durations[operation]) == Some(start_max)
+            })
+    }
+}
+
+fn recognizes_classical_n8_chains(
+    precedences: &PrecedenceDag,
+    operation_machines: &[usize],
+    machine_count: usize,
+    stop: &AtomicBool,
+) -> Result<bool, ScheduleStateInterrupted> {
+    for operation in 0..operation_machines.len() {
+        checkpoint(stop)?;
+        if precedences.predecessors(operation).len() > 1 || precedences.successors(operation).len() > 1 {
+            return Ok(false);
+        }
+    }
+
+    let mut machine_chain_owner = vec![NO_OPERATION; machine_count];
+    let mut visited = 0usize;
+    for source in 0..operation_machines.len() {
+        checkpoint(stop)?;
+        if !precedences.predecessors(source).is_empty() {
+            continue;
+        }
+        let mut operation = source;
+        loop {
+            checkpoint(stop)?;
+            let machine = operation_machines[operation];
+            if machine_chain_owner[machine] == source {
+                return Ok(false);
+            }
+            machine_chain_owner[machine] = source;
+            visited = visited.saturating_add(1);
+            let Some(&successor) = precedences.successors(operation).first() else {
+                break;
+            };
+            operation = successor;
+        }
+    }
+    Ok(visited == operation_machines.len())
 }
 
 fn recognize_fixed_machines(schedule: &Schedule, stop: &AtomicBool) -> Result<Option<Vec<usize>>, ScheduleStateInterrupted> {
@@ -246,7 +349,12 @@ fn compact_machines(raw_machines: &[usize], stop: &AtomicBool) -> Result<(Vec<us
     Ok((machines, compact.len()))
 }
 
-/// A maximal contiguous machine segment on the selected critical path.
+/// A maximal contiguous machine segment belonging to at least one critical
+/// path.
+///
+/// Blocks are not limited to the deterministic canonical path exposed by
+/// [`JobShopState::critical_path`]. Every operation in a block has zero
+/// head-tail slack and every internal machine arc is tight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CriticalBlock {
     machine: usize,
@@ -287,9 +395,12 @@ struct Reconstruction {
     starts: Vec<i64>,
     ends: Vec<i64>,
     latest_starts: Vec<i64>,
+    tails: Vec<i64>,
     topological: Vec<usize>,
+    topological_rank: Vec<usize>,
     makespan: i64,
     critical_path: Vec<usize>,
+    canonical_critical_blocks: Vec<CriticalBlock>,
     critical_blocks: Vec<CriticalBlock>,
 }
 
@@ -299,9 +410,12 @@ impl Reconstruction {
             starts: vec![0; operation_count],
             ends: vec![0; operation_count],
             latest_starts: vec![0; operation_count],
+            tails: vec![0; operation_count],
             topological: Vec::with_capacity(operation_count),
+            topological_rank: vec![0; operation_count],
             makespan: 0,
             critical_path: Vec::with_capacity(operation_count),
+            canonical_critical_blocks: Vec::with_capacity(operation_count),
             critical_blocks: Vec::with_capacity(operation_count),
         }
     }
@@ -310,11 +424,15 @@ impl Reconstruction {
         self.starts.copy_from_slice(&workspace.trial_starts);
         self.ends.copy_from_slice(&workspace.trial_ends);
         self.latest_starts.copy_from_slice(&workspace.trial_latest_starts);
+        self.tails.copy_from_slice(&workspace.trial_tails);
         self.topological.clear();
         self.topological.extend_from_slice(&workspace.trial_topological);
+        self.topological_rank.copy_from_slice(&workspace.trial_topological_rank);
         self.makespan = workspace.trial_makespan;
         self.critical_path.clear();
         self.critical_path.extend_from_slice(&workspace.trial_critical_path);
+        self.canonical_critical_blocks.clear();
+        self.canonical_critical_blocks.extend_from_slice(&workspace.trial_canonical_critical_blocks);
         self.critical_blocks.clear();
         self.critical_blocks.extend_from_slice(&workspace.trial_critical_blocks);
     }
@@ -329,6 +447,7 @@ pub(crate) struct ScheduleWorkspaceCapacities {
     pub(crate) date_patch: usize,
     pub(crate) topological: usize,
     pub(crate) critical_path: usize,
+    pub(crate) canonical_critical_blocks: usize,
     pub(crate) critical_blocks: usize,
 }
 
@@ -338,9 +457,12 @@ struct EvaluationWorkspace {
     trial_starts: Vec<i64>,
     trial_ends: Vec<i64>,
     trial_latest_starts: Vec<i64>,
+    trial_tails: Vec<i64>,
     trial_topological: Vec<usize>,
+    trial_topological_rank: Vec<usize>,
     trial_makespan: i64,
     trial_critical_path: Vec<usize>,
+    trial_canonical_critical_blocks: Vec<CriticalBlock>,
     trial_critical_blocks: Vec<CriticalBlock>,
     changed_roots: Vec<usize>,
     dirty_marks: Vec<u32>,
@@ -350,7 +472,17 @@ struct EvaluationWorkspace {
     patched_operations: Vec<usize>,
     patched_starts: Vec<i64>,
     patched_ends: Vec<i64>,
-    observed_capacities: [usize; 10],
+    fast_patch_marks: Vec<u32>,
+    fast_patch_epoch: u32,
+    fast_patched_operations: Vec<usize>,
+    fast_patched_starts: Vec<i64>,
+    fast_patched_ends: Vec<i64>,
+    fast_patched_tails: Vec<i64>,
+    fast_queue_marks: Vec<u32>,
+    local_span_operations: Vec<usize>,
+    local_heads: Vec<i128>,
+    local_tails: Vec<i128>,
+    observed_capacities: [usize; 14],
     growths: u64,
 }
 
@@ -362,9 +494,12 @@ impl EvaluationWorkspace {
             trial_starts: vec![0; operation_count],
             trial_ends: vec![0; operation_count],
             trial_latest_starts: vec![0; operation_count],
+            trial_tails: vec![0; operation_count],
             trial_topological: Vec::with_capacity(operation_count),
+            trial_topological_rank: vec![0; operation_count],
             trial_makespan: 0,
             trial_critical_path: Vec::with_capacity(operation_count),
+            trial_canonical_critical_blocks: Vec::with_capacity(operation_count),
             trial_critical_blocks: Vec::with_capacity(operation_count),
             changed_roots: Vec::with_capacity(operation_count),
             dirty_marks: vec![0; operation_count],
@@ -374,7 +509,17 @@ impl EvaluationWorkspace {
             patched_operations: Vec::with_capacity(operation_count),
             patched_starts: Vec::with_capacity(operation_count),
             patched_ends: Vec::with_capacity(operation_count),
-            observed_capacities: [0; 10],
+            fast_patch_marks: vec![0; operation_count],
+            fast_patch_epoch: 0,
+            fast_patched_operations: Vec::with_capacity(operation_count.min(65_536)),
+            fast_patched_starts: Vec::with_capacity(operation_count.min(65_536)),
+            fast_patched_ends: Vec::with_capacity(operation_count.min(65_536)),
+            fast_patched_tails: Vec::with_capacity(operation_count.min(65_536)),
+            fast_queue_marks: vec![0; operation_count],
+            local_span_operations: Vec::with_capacity(operation_count.min(4_096)),
+            local_heads: Vec::with_capacity(operation_count.min(4_096)),
+            local_tails: Vec::with_capacity(operation_count.min(4_096)),
+            observed_capacities: [0; 14],
             growths: 0,
         };
         workspace.observed_capacities = workspace.capacity_snapshot();
@@ -390,15 +535,17 @@ impl EvaluationWorkspace {
             date_patch: self.patched_operations.capacity().min(self.patched_starts.capacity()).min(self.patched_ends.capacity()),
             topological: self.trial_topological.capacity(),
             critical_path: self.trial_critical_path.capacity(),
+            canonical_critical_blocks: self.trial_canonical_critical_blocks.capacity(),
             critical_blocks: self.trial_critical_blocks.capacity(),
         }
     }
 
-    fn capacity_snapshot(&self) -> [usize; 10] {
+    fn capacity_snapshot(&self) -> [usize; 14] {
         [
             self.ready.capacity(),
             self.trial_topological.capacity(),
             self.trial_critical_path.capacity(),
+            self.trial_canonical_critical_blocks.capacity(),
             self.trial_critical_blocks.capacity(),
             self.changed_roots.capacity(),
             self.dirty_queue.capacity(),
@@ -406,6 +553,9 @@ impl EvaluationWorkspace {
             self.patched_operations.capacity(),
             self.patched_starts.capacity(),
             self.patched_ends.capacity(),
+            self.local_span_operations.capacity(),
+            self.local_heads.capacity(),
+            self.local_tails.capacity(),
         ]
     }
 
@@ -423,9 +573,23 @@ impl EvaluationWorkspace {
         self.dirty_epoch = self.dirty_epoch.wrapping_add(1);
         if self.dirty_epoch == 0 {
             self.dirty_marks.fill(0);
+            self.fast_queue_marks.fill(0);
             self.dirty_epoch = 1;
         }
         self.dirty_epoch
+    }
+
+    fn begin_fast_patch(&mut self) -> u32 {
+        self.fast_patch_epoch = self.fast_patch_epoch.wrapping_add(1);
+        if self.fast_patch_epoch == 0 {
+            self.fast_patch_marks.fill(0);
+            self.fast_patch_epoch = 1;
+        }
+        self.fast_patched_operations.clear();
+        self.fast_patched_starts.clear();
+        self.fast_patched_ends.clear();
+        self.fast_patched_tails.clear();
+        self.fast_patch_epoch
     }
 
     fn full_rebuild(
@@ -534,31 +698,87 @@ impl EvaluationWorkspace {
         Ok(())
     }
 
+    fn rebuild_reverse_dirty_topology(
+        &mut self,
+        problem: &JobShopProblem,
+        machine_predecessors: &[usize],
+        epoch: u32,
+        stop: &AtomicBool,
+    ) -> Result<(), ReconstructionFailure> {
+        // The reverse closure stores induced outdegrees in `indegrees`.
+        // Starting from its sinks and releasing predecessors yields the exact
+        // order needed to recompute tails once per affected operation.
+        self.ready.clear();
+        self.dirty_topological.clear();
+        for &operation in &self.dirty_queue {
+            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
+            if self.indegrees[operation] == 0 {
+                self.ready.push(operation);
+            }
+        }
+
+        let mut cursor = 0usize;
+        while cursor < self.ready.len() {
+            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
+            let operation = self.ready[cursor];
+            cursor += 1;
+            self.dirty_topological.push(operation);
+            for &predecessor in problem.precedences.predecessors(operation) {
+                if self.dirty_marks[predecessor] == epoch {
+                    release_fifo_successor(&mut self.indegrees, &mut self.ready, predecessor)?;
+                }
+            }
+            let machine_predecessor = machine_predecessors[operation];
+            if machine_predecessor != NO_OPERATION
+                && self.dirty_marks[machine_predecessor] == epoch
+                && !problem.precedences.predecessors(operation).contains(&machine_predecessor)
+            {
+                release_fifo_successor(&mut self.indegrees, &mut self.ready, machine_predecessor)?;
+            }
+        }
+        if self.dirty_topological.len() != self.dirty_queue.len() {
+            return Err(ReconstructionFailure::Cycle);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn build_analysis(
         &mut self,
         problem: &JobShopProblem,
         machine_predecessors: &[usize],
         machine_successors: &[usize],
         positions: &[usize],
+        machine_sequences: &[Vec<usize>],
+        collect_all_critical_blocks: bool,
         stop: &AtomicBool,
     ) -> Result<(), ReconstructionFailure> {
+        for (rank, &operation) in self.trial_topological.iter().enumerate() {
+            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
+            self.trial_topological_rank[operation] = rank;
+        }
         for &operation in self.trial_topological.iter().rev() {
             checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
             let Some(makespan_latest) = self.trial_makespan.checked_sub(problem.duration(operation)) else {
                 return Err(ReconstructionFailure::Numeric);
             };
             let mut latest = problem.start_windows[operation].1.min(makespan_latest);
+            let duration = problem.duration(operation);
+            let mut tail = duration;
             for &successor in problem.precedences.successors(operation) {
                 latest = latest_before_successor(latest, problem.duration(operation), self.trial_latest_starts[successor])?;
+                tail = tail.max(duration.checked_add(self.trial_tails[successor]).ok_or(ReconstructionFailure::Numeric)?);
             }
             let machine_successor = machine_successors[operation];
             if machine_successor != NO_OPERATION && !problem.precedences.successors(operation).contains(&machine_successor) {
                 latest = latest_before_successor(latest, problem.duration(operation), self.trial_latest_starts[machine_successor])?;
+                tail = tail.max(duration.checked_add(self.trial_tails[machine_successor]).ok_or(ReconstructionFailure::Numeric)?);
             }
             if latest < self.trial_starts[operation] {
                 return Err(ReconstructionFailure::Window);
             }
             self.trial_latest_starts[operation] = latest;
+            self.trial_tails[operation] = tail;
         }
 
         self.trial_critical_path.clear();
@@ -610,7 +830,10 @@ impl EvaluationWorkspace {
             self.trial_critical_path.reverse();
         }
 
-        self.trial_critical_blocks.clear();
+        // Preserve the historical deterministic-path blocks alongside the
+        // broader zero-slack block set. Baseline islands consume this list so
+        // the experimental scoring kernel cannot change their probe stream.
+        self.trial_canonical_critical_blocks.clear();
         let mut path_start = 0usize;
         while path_start < self.trial_critical_path.len() {
             checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
@@ -625,7 +848,7 @@ impl EvaluationWorkspace {
                 path_end += 1;
             }
             if path_end > path_start {
-                self.trial_critical_blocks.push(CriticalBlock {
+                self.trial_canonical_critical_blocks.push(CriticalBlock {
                     machine,
                     first_position,
                     last_position: positions[self.trial_critical_path[path_end]],
@@ -633,7 +856,80 @@ impl EvaluationWorkspace {
             }
             path_start = path_end + 1;
         }
+
+        self.trial_critical_blocks.clear();
+        if !collect_all_critical_blocks {
+            return Ok(());
+        }
+        for (machine, sequence) in machine_sequences.iter().enumerate() {
+            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
+            let mut block_start = None;
+            for position in 0..sequence.len() {
+                checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
+                let operation = sequence[position];
+                let critical = self.trial_starts[operation]
+                    .checked_add(self.trial_tails[operation])
+                    .is_some_and(|critical_end| critical_end == self.trial_makespan);
+                let extends_block = position > 0
+                    && critical
+                    && block_start.is_some()
+                    && self.trial_ends[sequence[position - 1]] == self.trial_starts[operation];
+                if extends_block {
+                    continue;
+                }
+                if let Some(first_position) = block_start.take() {
+                    if position - first_position >= 2 {
+                        self.trial_critical_blocks.push(CriticalBlock { machine, first_position, last_position: position - 1 });
+                    }
+                }
+                if critical {
+                    block_start = Some(position);
+                }
+            }
+            if let Some(first_position) = block_start {
+                if sequence.len() - first_position >= 2 {
+                    self.trial_critical_blocks.push(CriticalBlock { machine, first_position, last_position: sequence.len() - 1 });
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Return the exact maximum end over a deterministic superset of all sinks
+    /// in the combined precedence and machine DAG.
+    ///
+    /// With non-negative durations, every non-sink has a successor whose end
+    /// is no smaller. Therefore some combined sink attains the global maximum.
+    /// Every combined sink is both a precedence sink and a machine tail, so the
+    /// union scanned here is a safe superset. It is much smaller than all
+    /// operations on a conventional job shop.
+    fn makespan_from_sink_union(
+        &mut self,
+        problem: &JobShopProblem,
+        machine_sequences: &[Vec<usize>],
+        ends: &[i64],
+        stop: &AtomicBool,
+    ) -> Result<i64, ReconstructionFailure> {
+        let epoch = self.next_dirty_epoch();
+        let mut makespan = None;
+        for &operation in &problem.precedence_sinks {
+            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
+            if self.dirty_marks[operation] != epoch {
+                self.dirty_marks[operation] = epoch;
+                makespan = Some(makespan.map_or(ends[operation], |current: i64| current.max(ends[operation])));
+            }
+        }
+        for sequence in machine_sequences {
+            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
+            let Some(&operation) = sequence.last() else {
+                continue;
+            };
+            if self.dirty_marks[operation] != epoch {
+                self.dirty_marks[operation] = epoch;
+                makespan = Some(makespan.map_or(ends[operation], |current: i64| current.max(ends[operation])));
+            }
+        }
+        Ok(makespan.unwrap_or(0))
     }
 }
 
@@ -769,6 +1065,56 @@ pub(crate) struct ScheduleMoveArcs {
     pub(crate) added: [Option<MachineArc>; 3],
 }
 
+/// Deterministic, constant-work guidance computed from the accepted state's
+/// heads and tails.
+///
+/// These values are deliberately heuristic. In particular,
+/// `max_added_arc_path` is not a certified makespan bound because a move can
+/// remove arcs used by an endpoint's current head or tail. The score may rank
+/// cyclic or otherwise infeasible moves. Only [`JobShopState::probe_move`] may
+/// decide feasibility and only the full oracle in
+/// [`JobShopState::commit_probed_move`] may commit a selected move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeadTailMoveScore {
+    /// Maximum old-head plus old-tail path induced by one newly added arc.
+    pub(crate) max_added_arc_path: i128,
+    /// Sum used only as a deterministic secondary ranking signal.
+    pub(crate) total_added_arc_path: i128,
+    /// Tight zero-slack machine arcs removed from the accepted state.
+    pub(crate) critical_arcs_removed: u8,
+    /// Added arcs whose endpoints happen to be tight in the accepted dates.
+    pub(crate) tight_arcs_added: u8,
+}
+
+impl HeadTailMoveScore {
+    pub(crate) fn ranking_key(self) -> (i128, i128, u8, Reverse<u8>) {
+        (self.max_added_arc_path, self.total_added_arc_path, self.tight_arcs_added, Reverse(self.critical_arcs_removed))
+    }
+}
+
+/// One structured move paired with advisory head-tail guidance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScoredScheduleMove {
+    pub(crate) movement: ScheduleMove,
+    pub(crate) score: HeadTailMoveScore,
+}
+
+/// Advisory local head-tail propagation over the machine span changed by a
+/// structured move.
+///
+/// `estimated_makespan` is only a ranking signal. It deliberately keeps job
+/// heads and tails outside the changed span at their accepted-state values, so
+/// it is neither a feasibility test nor an objective bound. The acyclicity bit
+/// is different: it is a sufficient certificate obtained when every added
+/// machine arc goes forward in one accepted topological order. `false` means
+/// unknown, never cyclic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LocalMoveEstimate {
+    pub(crate) estimated_makespan: i128,
+    pub(crate) acyclicity_certified: bool,
+    pub(crate) span_operations: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CriticalNeighborhood {
     /// Every adjacent exchange inside a critical block.
@@ -801,9 +1147,55 @@ pub(crate) enum MoveProbe {
     Rejected(MoveRejection),
 }
 
+/// Result of the default-off strict N5 micro-kernel.
+///
+/// `used_fast_path` is false when the structural gate failed or the bounded
+/// value-change propagation fell back to the complete transactional kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FastN5FallbackReason {
+    Unsupported,
+    WorkCap,
+    Cycle,
+    Window,
+    Numeric,
+    Analysis,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FastN5Outcome {
+    pub(crate) outcome: MoveOutcome,
+    pub(crate) used_fast_path: bool,
+    pub(crate) fell_back: bool,
+    pub(crate) fallback_reason: Option<FastN5FallbackReason>,
+    pub(crate) used_topological_recovery: bool,
+    pub(crate) forward_date_changes: u64,
+    pub(crate) reverse_tail_changes: u64,
+    pub(crate) queue_pops: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FastN5PropagationFailureKind {
+    Interrupted,
+    WorkCap,
+    Reconstruction(ReconstructionFailure),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FastN5PropagationFailure {
+    kind: FastN5PropagationFailureKind,
+    forward_date_changes: u64,
+    reverse_tail_changes: u64,
+    queue_pops: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ScheduleStateMetrics {
     pub(crate) construction_candidates: u64,
+    pub(crate) construction_bucket_visits: u64,
+    pub(crate) construction_heap_pushes: u64,
+    pub(crate) construction_stale_pops: u64,
+    pub(crate) construction_heap_rebuilds: u64,
+    pub(crate) construction_heap_peak: u64,
     pub(crate) reconstructions: u64,
     pub(crate) delta_evaluations: u64,
     pub(crate) full_evaluations: u64,
@@ -821,16 +1213,27 @@ pub(crate) struct ScheduleStateMetrics {
     pub(crate) window_rejections: u64,
     pub(crate) objective_rejections: u64,
     pub(crate) critical_path_updates: u64,
+    pub(crate) local_move_estimates: u64,
+    pub(crate) local_move_certified: u64,
+    pub(crate) local_move_unknown: u64,
+    pub(crate) direct_oracle_attempts: u64,
+    pub(crate) direct_oracle_accepts: u64,
+    pub(crate) direct_oracle_cycles: u64,
+    pub(crate) direct_oracle_windows: u64,
+    pub(crate) direct_oracle_objective_rejections: u64,
 }
 
-/// Complete compact state. Machine orders are authoritative and every accepted
-/// order has a matching, fully reconstructed schedule.
+/// Complete compact state. Machine orders are authoritative. The default path
+/// fully reconstructs every accepted order; the gated strict-N5 path keeps
+/// exact dates, tails and canonical critical analysis incrementally, then
+/// refreshes auxiliary topological/latest-date buffers at full checkpoints.
 pub(crate) struct JobShopState {
     problem: JobShopProblem,
     machine_sequences: Vec<Vec<usize>>,
     machine_predecessors: Vec<usize>,
     machine_successors: Vec<usize>,
     positions: Vec<usize>,
+    collect_all_critical_blocks: bool,
     reconstruction: Reconstruction,
     workspace: EvaluationWorkspace,
     metrics: ScheduleStateMetrics,
@@ -861,6 +1264,78 @@ impl JobShopState {
     }
 
     fn giffler_thompson_inner(
+        problem: &JobShopProblem,
+        seed: u64,
+        rule: DispatchRule,
+        stop: &AtomicBool,
+        metrics: &mut ScheduleStateMetrics,
+    ) -> Result<Option<Self>, ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        let operation_count = problem.operation_count();
+        let mut machine_sequences = vec![Vec::new(); problem.machine_count()];
+        let mut completion = vec![0i64; operation_count];
+        let mut indegrees = (0..operation_count).map(|operation| problem.precedences.predecessors(operation).len()).collect::<Vec<_>>();
+        let mut ready = GifflerReadySet::new(problem);
+        for (operation, &indegree) in indegrees.iter().enumerate() {
+            checkpoint(stop)?;
+            if indegree == 0 && !ready.activate(problem, operation, 0, stop, metrics)? {
+                return Ok(None);
+            }
+        }
+
+        for step in 0..operation_count {
+            checkpoint(stop)?;
+            ready.maybe_rebuild(problem, stop, metrics)?;
+            let Some((pivot, pivot_machine, cutoff)) = ready.pop_pivot(stop, metrics)? else {
+                return Ok(None);
+            };
+            let Some(selected) = ready.select(problem, pivot, pivot_machine, cutoff, rule, seed, step, stop, metrics)? else {
+                return Ok(None);
+            };
+            let operation = selected.operation;
+            if !ready.remove(problem, operation) {
+                return Ok(None);
+            }
+            let machine = problem.machine(operation);
+            machine_sequences[machine].push(operation);
+            completion[operation] = selected.end;
+            if !ready.refresh_machine(problem, machine, selected.end, stop, metrics)? {
+                return Ok(None);
+            }
+            for &successor in problem.precedences.successors(operation) {
+                checkpoint(stop)?;
+                let Some(value) = indegrees[successor].checked_sub(1) else {
+                    return Ok(None);
+                };
+                indegrees[successor] = value;
+                if value == 0 {
+                    let release =
+                        problem.precedences.predecessors(successor).iter().map(|&predecessor| completion[predecessor]).max().unwrap_or(0);
+                    if !ready.activate(problem, successor, release, stop, metrics)? {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+
+        Self::initialize(problem, machine_sequences, stop, metrics)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn giffler_thompson_reference(
+        problem: &JobShopProblem,
+        seed: u64,
+        rule: DispatchRule,
+        stop: &AtomicBool,
+    ) -> Result<Option<Self>, ScheduleStateInterrupted> {
+        let mut metrics = ScheduleStateMetrics::default();
+        Self::giffler_thompson_reference_inner(problem, seed, rule, stop, &mut metrics)
+    }
+
+    /// Frozen scan-based constructor used only as an equivalence oracle for the
+    /// bucketed implementation above.
+    #[cfg(test)]
+    fn giffler_thompson_reference_inner(
         problem: &JobShopProblem,
         seed: u64,
         rule: DispatchRule,
@@ -907,7 +1382,7 @@ impl JobShopState {
             let mut selected = None;
             for &(operation, start, end) in &eligible {
                 checkpoint(stop)?;
-                if problem.machine(operation) != pivot_machine || start >= cutoff {
+                if problem.machine(operation) != pivot_machine || (operation != pivot && start >= cutoff) {
                     continue;
                 }
                 let candidate = DispatchCandidate { operation, start, end };
@@ -977,7 +1452,7 @@ impl JobShopState {
             Err(ReconstructionFailure::Interrupted) => return Err(ScheduleStateInterrupted),
             Err(_) => return Ok(None),
         }
-        match workspace.build_analysis(problem, &machine_predecessors, &machine_successors, &positions, stop) {
+        match workspace.build_analysis(problem, &machine_predecessors, &machine_successors, &positions, &machine_sequences, true, stop) {
             Ok(()) => {}
             Err(ReconstructionFailure::Interrupted) => return Err(ScheduleStateInterrupted),
             Err(_) => return Ok(None),
@@ -993,6 +1468,7 @@ impl JobShopState {
             machine_predecessors,
             machine_successors,
             positions,
+            collect_all_critical_blocks: true,
             reconstruction,
             workspace,
             metrics: *metrics,
@@ -1007,16 +1483,56 @@ impl JobShopState {
         self.problem.operation_count()
     }
 
+    pub(crate) fn start_window(&self, operation: usize) -> (i64, i64) {
+        self.problem.start_window(operation)
+    }
+
+    pub(crate) fn horizon(&self, operation: usize) -> i64 {
+        self.problem.horizon(operation)
+    }
+
     pub(crate) fn machine_count(&self) -> usize {
         self.problem.machine_count()
+    }
+
+    pub(crate) fn problem(&self) -> &JobShopProblem {
+        &self.problem
     }
 
     pub(crate) fn machine(&self, operation: usize) -> usize {
         self.problem.machine(operation)
     }
 
+    pub(crate) fn raw_machine(&self, operation: usize) -> Option<usize> {
+        self.problem.raw_machine(operation)
+    }
+
+    pub(crate) fn solution_machine(&self, operation: usize) -> Option<i64> {
+        self.problem.solution_machine(operation)
+    }
+
+    pub(crate) fn solution_mode(&self, operation: usize) -> Option<Option<usize>> {
+        self.problem.solution_mode(operation)
+    }
+
     pub(crate) fn starts(&self) -> &[i64] {
         &self.reconstruction.starts
+    }
+
+    pub(crate) fn ends(&self) -> &[i64] {
+        &self.reconstruction.ends
+    }
+
+    pub(crate) fn duration(&self, operation: usize) -> i64 {
+        self.problem.duration(operation)
+    }
+
+    pub(crate) fn job_predecessors(&self, operation: usize) -> &[usize] {
+        self.problem.job_predecessors(operation)
+    }
+
+    pub(crate) fn job_successors(&self, operation: usize) -> &[usize] {
+        self.problem.job_successors(operation)
     }
 
     pub(crate) fn latest_starts(&self) -> &[i64] {
@@ -1025,6 +1541,16 @@ impl JobShopState {
 
     pub(crate) fn machine_sequences(&self) -> &[Vec<usize>] {
         &self.machine_sequences
+    }
+
+    pub(crate) fn position(&self, operation: usize) -> Option<usize> {
+        self.positions.get(operation).copied()
+    }
+
+    /// Recover owned machine-order buffers from a state that is no longer
+    /// needed, so bounded repair can reuse their capacity on the next attempt.
+    pub(crate) fn into_machine_sequences(self) -> Vec<Vec<usize>> {
+        self.machine_sequences
     }
 
     pub(crate) fn topological_order(&self) -> &[usize] {
@@ -1037,6 +1563,12 @@ impl JobShopState {
 
     pub(crate) fn critical_blocks(&self) -> &[CriticalBlock] {
         &self.reconstruction.critical_blocks
+    }
+
+    /// Critical blocks from the single deterministic path used by the
+    /// historical persistent JSSP search.
+    pub(crate) fn canonical_critical_blocks(&self) -> &[CriticalBlock] {
+        &self.reconstruction.canonical_critical_blocks
     }
 
     pub(crate) fn metrics(&self) -> ScheduleStateMetrics {
@@ -1061,6 +1593,18 @@ impl JobShopState {
         self.workspace.capacities()
     }
 
+    pub(crate) fn fast_n5_workspace_lower_bound_bytes(&self) -> usize {
+        self.workspace
+            .fast_patched_operations
+            .capacity()
+            .saturating_mul(size_of::<usize>())
+            .saturating_add(self.workspace.fast_patched_starts.capacity().saturating_mul(size_of::<i64>()))
+            .saturating_add(self.workspace.fast_patched_ends.capacity().saturating_mul(size_of::<i64>()))
+            .saturating_add(self.workspace.fast_patched_tails.capacity().saturating_mul(size_of::<i64>()))
+            .saturating_add(self.workspace.fast_patch_marks.len().saturating_mul(size_of::<u32>()))
+            .saturating_add(self.workspace.fast_queue_marks.len().saturating_mul(size_of::<u32>()))
+    }
+
     /// Rebuild a replacement state against this state's validated problem.
     /// The accepted state is never mutated; callers replace it only after a
     /// successful reconstruction.
@@ -1069,7 +1613,21 @@ impl JobShopState {
         machine_sequences: Vec<Vec<usize>>,
         stop: &AtomicBool,
     ) -> Result<Option<Self>, ScheduleStateInterrupted> {
-        Self::from_machine_sequences(&self.problem, machine_sequences, stop)
+        let rebuilt = Self::from_machine_sequences(&self.problem, machine_sequences, stop)?;
+        Ok(rebuilt.map(|mut state| {
+            if !self.collect_all_critical_blocks {
+                state.retain_canonical_critical_blocks_only();
+            }
+            state
+        }))
+    }
+
+    /// Stop materializing the broader zero-slack block set on future commits.
+    /// Baseline islands retain only the canonical historical path blocks.
+    pub(crate) fn retain_canonical_critical_blocks_only(&mut self) {
+        self.collect_all_critical_blocks = false;
+        self.reconstruction.critical_blocks.clear();
+        self.workspace.trial_critical_blocks.clear();
     }
 
     /// Return the operation-identity machine arcs changed by a valid move.
@@ -1095,12 +1653,335 @@ impl JobShopState {
         Some(ScheduleMoveArcs { removed: arc_difference(old_arcs, &new_arcs), added: arc_difference(new_arcs, &old_arcs) })
     }
 
+    /// Compute advisory move guidance without patching the graph or changing
+    /// any accepted date. Work is bounded by the six changed arc slots.
+    pub(crate) fn score_move_head_tail(
+        &self,
+        movement: ScheduleMove,
+        stop: &AtomicBool,
+    ) -> Result<Option<HeadTailMoveScore>, ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        let Some(arcs) = self.move_arcs(movement) else {
+            return Ok(None);
+        };
+        let mut max_added_arc_path = i128::MIN;
+        let mut total_added_arc_path = 0i128;
+        let mut critical_arcs_removed = 0u8;
+        let mut tight_arcs_added = 0u8;
+        for arc in arcs.removed.into_iter().flatten() {
+            checkpoint(stop)?;
+            critical_arcs_removed = critical_arcs_removed.saturating_add(u8::from(self.is_critical_machine_arc(arc)));
+        }
+        for arc in arcs.added.into_iter().flatten() {
+            checkpoint(stop)?;
+            let path = i128::from(self.reconstruction.ends[arc.before]) + i128::from(self.reconstruction.tails[arc.after]);
+            max_added_arc_path = max_added_arc_path.max(path);
+            total_added_arc_path += path;
+            tight_arcs_added =
+                tight_arcs_added.saturating_add(u8::from(self.reconstruction.ends[arc.before] == self.reconstruction.starts[arc.after]));
+        }
+        if max_added_arc_path == i128::MIN {
+            max_added_arc_path = i128::from(self.makespan());
+        }
+        Ok(Some(HeadTailMoveScore { max_added_arc_path, total_added_arc_path, critical_arcs_removed, tight_arcs_added }))
+    }
+
+    /// Generate the union of critical neighborhoods and rank it by advisory
+    /// head-tail guidance. Equal scores use [`ScheduleMove`] identity, making
+    /// the output deterministic. The returned score never replaces an exact
+    /// probe.
+    pub(crate) fn fill_scored_critical_moves(
+        &self,
+        neighborhoods: &[CriticalNeighborhood],
+        movements: &mut Vec<ScoredScheduleMove>,
+        stop: &AtomicBool,
+    ) -> Result<(), ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        movements.clear();
+        let capacity_hint = Self::critical_move_capacity_hint(neighborhoods, &self.reconstruction.critical_blocks).min(4_096);
+        if movements.capacity() < capacity_hint {
+            movements.reserve(capacity_hint);
+        }
+        Self::visit_critical_move_union(neighborhoods, &self.reconstruction.critical_blocks, stop, |movement| {
+            let score = self.score_move_head_tail(movement, stop)?.expect("critical-block movements are structurally valid");
+            movements.push(ScoredScheduleMove { movement, score });
+            Ok(())
+        })?;
+        movements.sort_unstable_by_key(|candidate| (candidate.score.ranking_key(), candidate.movement));
+        movements.dedup_by_key(|candidate| candidate.movement);
+        Ok(())
+    }
+
+    /// Rank moves from only the deterministic critical path used by the
+    /// historical schedule-search kernel. Scores remain advisory: every
+    /// shortlisted move must still pass an exact probe and oracle commit.
+    pub(crate) fn fill_scored_canonical_critical_moves(
+        &self,
+        neighborhood: CriticalNeighborhood,
+        movements: &mut Vec<ScoredScheduleMove>,
+        stop: &AtomicBool,
+    ) -> Result<(), ScheduleStateInterrupted> {
+        movements.clear();
+        self.visit_scored_canonical_critical_moves(neighborhood, stop, |candidate, _| {
+            movements.push(candidate);
+            Ok(())
+        })?;
+        movements.sort_unstable_by_key(|candidate| (candidate.score.ranking_key(), candidate.movement));
+        movements.dedup_by_key(|candidate| candidate.movement);
+        Ok(())
+    }
+
+    /// Stream every scored move from the canonical critical path without
+    /// materializing the neighborhood. This lets large-instance callers keep
+    /// a fixed-size top-k shortlist while still accounting for all generated
+    /// N5 moves.
+    pub(crate) fn visit_scored_canonical_critical_moves(
+        &self,
+        neighborhood: CriticalNeighborhood,
+        stop: &AtomicBool,
+        mut visit: impl FnMut(ScoredScheduleMove, ScheduleMoveArcs) -> Result<(), ScheduleStateInterrupted>,
+    ) -> Result<usize, ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        let mut generated = 0usize;
+        let emit = |movement| {
+            let score = self.score_move_head_tail(movement, stop)?.expect("canonical critical-block movements are structurally valid");
+            let arcs = self.move_arcs(movement).expect("canonical critical-block movements have changed arcs");
+            generated = generated.saturating_add(1);
+            visit(ScoredScheduleMove { movement, score }, arcs)
+        };
+        if neighborhood != CriticalNeighborhood::N5 {
+            Self::visit_critical_move_union(&[neighborhood], &self.reconstruction.canonical_critical_blocks, stop, emit)?;
+            return Ok(generated);
+        }
+
+        Self::visit_strict_n5_moves(&self.reconstruction.canonical_critical_blocks, stop, emit)?;
+        Ok(generated)
+    }
+
+    /// Stream the strict canonical N5 neighborhood without scores or heap
+    /// materialization. This is the only neighborhood accepted by the
+    /// default-off fast micro-kernel.
+    pub(crate) fn visit_strict_n5_canonical_moves(
+        &self,
+        stop: &AtomicBool,
+        mut visit: impl FnMut(ScheduleMove, ScheduleMoveArcs) -> Result<(), ScheduleStateInterrupted>,
+    ) -> Result<usize, ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        let mut generated = 0usize;
+        Self::visit_strict_n5_moves(&self.reconstruction.canonical_critical_blocks, stop, |movement| {
+            let arcs = self.move_arcs(movement).expect("strict canonical N5 movements are structurally valid");
+            generated = generated.saturating_add(1);
+            visit(movement, arcs)
+        })?;
+        Ok(generated)
+    }
+
+    pub(crate) fn supports_strict_n5_fast_path(&self) -> bool {
+        self.problem.supports_strict_n5_fast_path()
+    }
+
+    fn is_current_strict_n5_move(&self, movement: ScheduleMove) -> bool {
+        let ScheduleMove::AdjacentSwap { machine, first_position } = movement else {
+            return false;
+        };
+        self.reconstruction.canonical_critical_blocks.iter().enumerate().any(|(block_index, block)| {
+            (block_index > 0 && block.machine == machine && block.first_position == first_position)
+                || (block_index + 1 < self.reconstruction.canonical_critical_blocks.len()
+                    && block.machine == machine
+                    && block.last_position > block.first_position
+                    && block.last_position - 1 == first_position)
+        })
+    }
+
+    fn visit_strict_n5_moves(
+        blocks: &[CriticalBlock],
+        stop: &AtomicBool,
+        mut visit: impl FnMut(ScheduleMove) -> Result<(), ScheduleStateInterrupted>,
+    ) -> Result<(), ScheduleStateInterrupted> {
+        for (block_index, block) in blocks.iter().enumerate() {
+            checkpoint(stop)?;
+            let mut first_move = None;
+            if block_index > 0 {
+                let movement = ScheduleMove::AdjacentSwap { machine: block.machine, first_position: block.first_position };
+                visit(movement)?;
+                first_move = Some(movement);
+            }
+            if block_index + 1 < blocks.len() && block.last_position > block.first_position {
+                let movement = ScheduleMove::AdjacentSwap { machine: block.machine, first_position: block.last_position - 1 };
+                if first_move != Some(movement) {
+                    visit(movement)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Certify that one insertion preserves acyclicity without mutating the
+    /// accepted graph.
+    ///
+    /// The first certificate keeps the existing accepted topological order.
+    /// The second applies Propositions 1 and 2 of the N8 neighborhood to the
+    /// operation immediately left or right of the moved operation. The paper's
+    /// non-strict inequalities apply only when the precedence graph is a union
+    /// of job chains, no chain revisits a machine, and every duration is
+    /// positive. If such a classical chain model contains a zero duration,
+    /// equality is not enough to exclude a zero-length return path, so the
+    /// certificate requires a strict inequality. Non-classical precedence
+    /// graphs may still pass the first topological-order certificate, but the
+    /// N8 propositions are not applied. `false` means unknown, never cyclic.
+    pub(crate) fn certifies_insert_acyclicity(&self, movement: ScheduleMove, stop: &AtomicBool) -> Result<bool, ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        let ScheduleMove::Insert { machine, from, to } = movement else {
+            return Ok(false);
+        };
+        if !move_is_valid(&self.machine_sequences, movement) {
+            return Ok(false);
+        }
+        let arcs = self.move_arcs(movement).expect("a validated insertion has changed arcs");
+        if arcs
+            .added
+            .into_iter()
+            .flatten()
+            .all(|arc| self.reconstruction.topological_rank[arc.before] < self.reconstruction.topological_rank[arc.after])
+        {
+            return Ok(true);
+        }
+        if !self.problem.n8_classical_chain_model {
+            return Ok(false);
+        }
+
+        let sequence = &self.machine_sequences[machine];
+        let moved = sequence[from];
+        let anchor = sequence[to];
+        if from < to {
+            let anchor_tail = self.reconstruction.tails[anchor];
+            for &successor in self.problem.precedences.successors(moved) {
+                checkpoint(stop)?;
+                let tail_after_successor = self.reconstruction.tails[successor]
+                    .checked_sub(self.problem.duration(successor))
+                    .expect("non-negative durations make an operation tail at least its duration");
+                if anchor_tail < tail_after_successor || (anchor_tail == tail_after_successor && !self.problem.all_durations_positive) {
+                    return Ok(false);
+                }
+            }
+        } else {
+            let anchor_end = self.reconstruction.ends[anchor];
+            for &predecessor in self.problem.precedences.predecessors(moved) {
+                checkpoint(stop)?;
+                let predecessor_head = self.reconstruction.starts[predecessor];
+                if anchor_end < predecessor_head || (anchor_end == predecessor_head && !self.problem.all_durations_positive) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Refine one structured move with local head-tail propagation on its
+    /// changed machine span. This routine never patches the graph and its
+    /// result is advisory even when acyclicity is certified.
+    pub(crate) fn estimate_move_local(
+        &mut self,
+        movement: ScheduleMove,
+        stop: &AtomicBool,
+    ) -> Result<Option<LocalMoveEstimate>, ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        if !move_is_valid(&self.machine_sequences, movement) {
+            return Ok(None);
+        }
+        let arcs = self.move_arcs(movement).expect("a validated move has changed arcs");
+        let acyclicity_certified = arcs
+            .added
+            .into_iter()
+            .flatten()
+            .all(|arc| self.reconstruction.topological_rank[arc.before] < self.reconstruction.topological_rank[arc.after]);
+        let machine = movement.machine();
+        let sequence = &self.machine_sequences[machine];
+        let (first_position, last_position) = movement.position_bounds();
+        let external_predecessor = first_position.checked_sub(1).and_then(|position| moved_operation_at(sequence, movement, position));
+        let external_successor = last_position.checked_add(1).and_then(|position| moved_operation_at(sequence, movement, position));
+
+        self.workspace.local_span_operations.clear();
+        self.workspace.local_heads.clear();
+        self.workspace.local_tails.clear();
+        for position in first_position..=last_position {
+            checkpoint(stop)?;
+            self.workspace
+                .local_span_operations
+                .push(moved_operation_at(sequence, movement, position).expect("a valid move preserves the sequence length"));
+        }
+
+        for index in 0..self.workspace.local_span_operations.len() {
+            checkpoint(stop)?;
+            let operation = self.workspace.local_span_operations[index];
+            let mut head = i128::from(self.problem.start_windows[operation].0);
+            for &predecessor in self.problem.precedences.predecessors(operation) {
+                head = head.max(i128::from(self.reconstruction.ends[predecessor]));
+            }
+            let machine_head = if index == 0 {
+                external_predecessor.map_or(0, |predecessor| i128::from(self.reconstruction.ends[predecessor]))
+            } else {
+                let predecessor = self.workspace.local_span_operations[index - 1];
+                self.workspace.local_heads[index - 1] + i128::from(self.problem.duration(predecessor))
+            };
+            self.workspace.local_heads.push(head.max(machine_head));
+        }
+
+        self.workspace.local_tails.resize(self.workspace.local_span_operations.len(), 0);
+        for index in (0..self.workspace.local_span_operations.len()).rev() {
+            checkpoint(stop)?;
+            let operation = self.workspace.local_span_operations[index];
+            let mut job_tail = 0i128;
+            for &successor in self.problem.precedences.successors(operation) {
+                job_tail = job_tail.max(i128::from(self.reconstruction.tails[successor]));
+            }
+            let machine_tail = if index + 1 == self.workspace.local_span_operations.len() {
+                external_successor.map_or(0, |successor| i128::from(self.reconstruction.tails[successor]))
+            } else {
+                self.workspace.local_tails[index + 1]
+            };
+            self.workspace.local_tails[index] = i128::from(self.problem.duration(operation)) + job_tail.max(machine_tail);
+        }
+        let estimated_makespan = self
+            .workspace
+            .local_heads
+            .iter()
+            .zip(&self.workspace.local_tails)
+            .map(|(head, tail)| head + tail)
+            .max()
+            .unwrap_or(i128::from(self.makespan()));
+        self.metrics.local_move_estimates = self.metrics.local_move_estimates.saturating_add(1);
+        if acyclicity_certified {
+            self.metrics.local_move_certified = self.metrics.local_move_certified.saturating_add(1);
+        } else {
+            self.metrics.local_move_unknown = self.metrics.local_move_unknown.saturating_add(1);
+        }
+        self.workspace.observe_growths();
+        self.metrics.workspace_growths = self.workspace.growths;
+        Ok(Some(LocalMoveEstimate {
+            estimated_makespan,
+            acyclicity_certified,
+            span_operations: self.workspace.local_span_operations.len(),
+        }))
+    }
+
+    fn is_critical_machine_arc(&self, arc: MachineArc) -> bool {
+        self.machine_successors[arc.before] == arc.after
+            && self.reconstruction.ends[arc.before] == self.reconstruction.starts[arc.after]
+            && self.reconstruction.starts[arc.before]
+                .checked_add(self.reconstruction.tails[arc.before])
+                .is_some_and(|critical_end| critical_end == self.reconstruction.makespan)
+            && self.reconstruction.starts[arc.after]
+                .checked_add(self.reconstruction.tails[arc.after])
+                .is_some_and(|critical_end| critical_end == self.reconstruction.makespan)
+    }
+
     pub(crate) fn critical_moves(
         &self,
         neighborhood: CriticalNeighborhood,
         stop: &AtomicBool,
     ) -> Result<Vec<ScheduleMove>, ScheduleStateInterrupted> {
-        let mut movements = Vec::with_capacity(self.problem.operation_count().saturating_mul(2));
+        let mut movements = Vec::new();
         self.fill_critical_moves(neighborhood, &mut movements, stop)?;
         Ok(movements)
     }
@@ -1116,6 +1997,19 @@ impl JobShopState {
         self.fill_critical_move_union(&[neighborhood], movements, stop)
     }
 
+    /// Fill moves from only the historical deterministic critical path.
+    ///
+    /// This intentionally preserves the old sort/dedup order. Baseline
+    /// portfolio islands rotate this exact vector before probing it.
+    pub(crate) fn fill_canonical_critical_moves(
+        &self,
+        neighborhood: CriticalNeighborhood,
+        movements: &mut Vec<ScheduleMove>,
+        stop: &AtomicBool,
+    ) -> Result<(), ScheduleStateInterrupted> {
+        self.fill_critical_moves_from_blocks(&[neighborhood], &self.reconstruction.canonical_critical_blocks, movements, stop)
+    }
+
     /// Build a duplicate-free union when several nested neighborhoods are
     /// scanned at the same incumbent.
     pub(crate) fn fill_critical_move_union(
@@ -1124,36 +2018,76 @@ impl JobShopState {
         movements: &mut Vec<ScheduleMove>,
         stop: &AtomicBool,
     ) -> Result<(), ScheduleStateInterrupted> {
+        self.fill_critical_moves_from_blocks(neighborhoods, &self.reconstruction.critical_blocks, movements, stop)
+    }
+
+    fn fill_critical_moves_from_blocks(
+        &self,
+        neighborhoods: &[CriticalNeighborhood],
+        blocks: &[CriticalBlock],
+        movements: &mut Vec<ScheduleMove>,
+        stop: &AtomicBool,
+    ) -> Result<(), ScheduleStateInterrupted> {
         checkpoint(stop)?;
         movements.clear();
-        let capacity_factor = if neighborhoods.len() > 1 { 3 } else { 2 };
-        let target_capacity = self.problem.operation_count().saturating_mul(capacity_factor);
-        if movements.capacity() < target_capacity {
-            movements.reserve(target_capacity);
+        let capacity_hint = Self::critical_move_capacity_hint(neighborhoods, blocks).min(4_096);
+        if movements.capacity() < capacity_hint {
+            movements.reserve(capacity_hint);
         }
+        Self::visit_critical_move_union(neighborhoods, blocks, stop, |movement| {
+            movements.push(movement);
+            Ok(())
+        })?;
+        movements.sort_unstable();
+        movements.dedup();
+        Ok(())
+    }
+
+    fn critical_move_capacity_hint(neighborhoods: &[CriticalNeighborhood], blocks: &[CriticalBlock]) -> usize {
+        neighborhoods.iter().fold(0usize, |total, neighborhood| {
+            blocks.iter().fold(total, |total, block| {
+                let block_moves = match neighborhood {
+                    CriticalNeighborhood::N1 => block.len().saturating_sub(1),
+                    CriticalNeighborhood::N5 => usize::from(block.len() >= 2) + usize::from(block.len() >= 3),
+                    CriticalNeighborhood::N6 => {
+                        let n5 = usize::from(block.len() >= 2) + usize::from(block.len() >= 3);
+                        n5.saturating_add(block.len().saturating_sub(3).saturating_mul(2))
+                    }
+                };
+                total.saturating_add(block_moves)
+            })
+        })
+    }
+
+    fn visit_critical_move_union(
+        neighborhoods: &[CriticalNeighborhood],
+        blocks: &[CriticalBlock],
+        stop: &AtomicBool,
+        mut visit: impl FnMut(ScheduleMove) -> Result<(), ScheduleStateInterrupted>,
+    ) -> Result<(), ScheduleStateInterrupted> {
         for &neighborhood in neighborhoods {
-            for &block in &self.reconstruction.critical_blocks {
+            for &block in blocks {
                 checkpoint(stop)?;
                 match neighborhood {
                     CriticalNeighborhood::N1 => {
                         for first_position in block.first_position..block.last_position {
                             checkpoint(stop)?;
-                            movements.push(ScheduleMove::AdjacentSwap { machine: block.machine, first_position });
+                            visit(ScheduleMove::AdjacentSwap { machine: block.machine, first_position })?;
                         }
                     }
                     CriticalNeighborhood::N5 | CriticalNeighborhood::N6 => {
-                        movements.push(ScheduleMove::AdjacentSwap { machine: block.machine, first_position: block.first_position });
+                        visit(ScheduleMove::AdjacentSwap { machine: block.machine, first_position: block.first_position })?;
                         if block.last_position > block.first_position + 1 {
-                            movements.push(ScheduleMove::AdjacentSwap { machine: block.machine, first_position: block.last_position - 1 });
+                            visit(ScheduleMove::AdjacentSwap { machine: block.machine, first_position: block.last_position - 1 })?;
                         }
                         if neighborhood == CriticalNeighborhood::N6 && block.len() >= 3 {
                             for from in (block.first_position + 1)..block.last_position {
                                 checkpoint(stop)?;
                                 if from > block.first_position + 1 {
-                                    movements.push(ScheduleMove::Insert { machine: block.machine, from, to: block.first_position });
+                                    visit(ScheduleMove::Insert { machine: block.machine, from, to: block.first_position })?;
                                 }
                                 if from + 1 < block.last_position {
-                                    movements.push(ScheduleMove::Insert { machine: block.machine, from, to: block.last_position });
+                                    visit(ScheduleMove::Insert { machine: block.machine, from, to: block.last_position })?;
                                 }
                             }
                         }
@@ -1161,8 +2095,391 @@ impl JobShopState {
                 }
             }
         }
-        movements.sort_unstable();
-        movements.dedup();
+        Ok(())
+    }
+
+    /// Apply one strict canonical N5 swap with bounded value-change
+    /// propagation. A wide value-change cone switches to one exact forward and
+    /// reverse Kahn pass. Unsupported or semantically invalid cases fall back
+    /// to the existing complete transactional path after exact restoration.
+    pub(crate) fn consider_strict_n5_fast(
+        &mut self,
+        movement: ScheduleMove,
+        acceptance: MinimizingMoveAcceptance,
+        stop: &AtomicBool,
+    ) -> Result<FastN5Outcome, ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        if !self.supports_strict_n5_fast_path() || !self.is_current_strict_n5_move(movement) {
+            let outcome = self.consider_move(movement, acceptance, stop)?;
+            return Ok(FastN5Outcome {
+                outcome,
+                used_fast_path: false,
+                fell_back: true,
+                fallback_reason: Some(FastN5FallbackReason::Unsupported),
+                used_topological_recovery: false,
+                forward_date_changes: 0,
+                reverse_tail_changes: 0,
+                queue_pops: 0,
+            });
+        }
+
+        let arcs = self.move_arcs(movement).expect("a strict N5 movement has changed arcs");
+        self.metrics.moves_considered = self.metrics.moves_considered.saturating_add(1);
+        self.metrics.delta_evaluations = self.metrics.delta_evaluations.saturating_add(1);
+        self.workspace.begin_fast_patch();
+        self.apply_graph_patch(movement);
+        if stop.load(Ordering::Acquire) {
+            self.rollback_fast_dates();
+            self.rollback_graph_patch(movement);
+            return Err(ScheduleStateInterrupted);
+        }
+
+        let previous = self.makespan();
+        let propagated = self.evaluate_strict_n5_value_changes(arcs, stop);
+        let mut used_topological_recovery = false;
+        let (candidate, forward_date_changes, reverse_tail_changes, queue_pops) = match propagated {
+            Ok(result) => result,
+            Err(FastN5PropagationFailure { kind: FastN5PropagationFailureKind::Interrupted, .. }) => {
+                self.rollback_fast_dates();
+                self.rollback_graph_patch(movement);
+                return Err(ScheduleStateInterrupted);
+            }
+            Err(FastN5PropagationFailure {
+                kind: FastN5PropagationFailureKind::WorkCap,
+                queue_pops: streaming_queue_pops,
+                ..
+            }) => {
+                self.rollback_fast_dates();
+                self.workspace.begin_fast_patch();
+                used_topological_recovery = true;
+                match self.evaluate_strict_n5_topologically(arcs, streaming_queue_pops, stop) {
+                    Ok(result) => result,
+                    Err(ReconstructionFailure::Interrupted) => {
+                        self.rollback_fast_dates();
+                        self.rollback_graph_patch(movement);
+                        return Err(ScheduleStateInterrupted);
+                    }
+                    Err(failure) => {
+                        self.rollback_fast_dates();
+                        self.rollback_graph_patch(movement);
+                        let outcome = self.consider_move_inner(movement, acceptance, stop, false)?;
+                        return Ok(FastN5Outcome {
+                            outcome,
+                            used_fast_path: false,
+                            fell_back: true,
+                            fallback_reason: Some(Self::fast_n5_fallback_reason(failure)),
+                            used_topological_recovery: true,
+                            forward_date_changes: 0,
+                            reverse_tail_changes: 0,
+                            queue_pops: u64::try_from(streaming_queue_pops).unwrap_or(u64::MAX),
+                        });
+                    }
+                }
+            }
+            Err(FastN5PropagationFailure {
+                kind: FastN5PropagationFailureKind::Reconstruction(failure),
+                forward_date_changes,
+                reverse_tail_changes,
+                queue_pops,
+            }) => {
+                self.rollback_fast_dates();
+                self.rollback_graph_patch(movement);
+                let outcome = self.consider_move_inner(movement, acceptance, stop, false)?;
+                return Ok(FastN5Outcome {
+                    outcome,
+                    used_fast_path: false,
+                    fell_back: true,
+                    fallback_reason: Some(Self::fast_n5_fallback_reason(failure)),
+                    used_topological_recovery: false,
+                    forward_date_changes,
+                    reverse_tail_changes,
+                    queue_pops,
+                });
+            }
+        };
+
+        if !acceptance.accepts(previous, candidate) {
+            self.rollback_fast_dates();
+            self.rollback_graph_patch(movement);
+            self.metrics.objective_rejections = self.metrics.objective_rejections.saturating_add(1);
+            return Ok(FastN5Outcome {
+                outcome: MoveOutcome::Rejected(MoveRejection::NotAccepted { current: previous, candidate }),
+                used_fast_path: true,
+                fell_back: false,
+                fallback_reason: None,
+                used_topological_recovery,
+                forward_date_changes,
+                reverse_tail_changes,
+                queue_pops,
+            });
+        }
+
+        match self.build_fast_canonical_analysis(candidate, stop) {
+            Ok(()) => {}
+            Err(ReconstructionFailure::Interrupted) => {
+                self.rollback_fast_dates();
+                self.rollback_graph_patch(movement);
+                return Err(ScheduleStateInterrupted);
+            }
+            Err(_) => {
+                self.rollback_fast_dates();
+                self.rollback_graph_patch(movement);
+                let outcome = self.consider_move_inner(movement, acceptance, stop, false)?;
+                return Ok(FastN5Outcome {
+                    outcome,
+                    used_fast_path: false,
+                    fell_back: true,
+                    fallback_reason: Some(FastN5FallbackReason::Analysis),
+                    used_topological_recovery,
+                    forward_date_changes,
+                    reverse_tail_changes,
+                    queue_pops,
+                });
+            }
+        }
+
+        self.reconstruction.makespan = candidate;
+        self.reconstruction.critical_path.clear();
+        self.reconstruction.critical_path.extend_from_slice(&self.workspace.trial_critical_path);
+        self.reconstruction.canonical_critical_blocks.clear();
+        self.reconstruction.canonical_critical_blocks.extend_from_slice(&self.workspace.trial_canonical_critical_blocks);
+        self.reconstruction.critical_blocks.clear();
+        self.clear_fast_patch();
+        self.metrics.moves_accepted = self.metrics.moves_accepted.saturating_add(1);
+        self.metrics.critical_path_updates = self.metrics.critical_path_updates.saturating_add(1);
+        self.metrics.dirty_cone_operations = self.metrics.dirty_cone_operations.saturating_add(queue_pops);
+        self.metrics.max_dirty_cone = self.metrics.max_dirty_cone.max(queue_pops);
+        self.workspace.observe_growths();
+        self.metrics.workspace_growths = self.workspace.growths;
+        Ok(FastN5Outcome {
+            outcome: MoveOutcome::Accepted { previous, current: candidate },
+            used_fast_path: true,
+            fell_back: false,
+            fallback_reason: None,
+            used_topological_recovery,
+            forward_date_changes,
+            reverse_tail_changes,
+            queue_pops,
+        })
+    }
+
+    fn evaluate_strict_n5_value_changes(
+        &mut self,
+        arcs: ScheduleMoveArcs,
+        stop: &AtomicBool,
+    ) -> Result<(i64, u64, u64, u64), ReconstructionFailure> {
+        let operation_count = self.problem.operation_count();
+        let pop_cap = operation_count.saturating_mul(8).clamp(4_096, 131_072);
+        let mut queue_pops = 0usize;
+        let mut forward_date_changes = 0u64;
+        let mut reverse_tail_changes = 0u64;
+
+        let epoch = self.workspace.next_dirty_epoch();
+        self.workspace.dirty_queue.clear();
+        for index in 0..self.workspace.changed_roots.len() {
+            let operation = self.workspace.changed_roots[index];
+            self.enqueue_fast_value_change(epoch, operation);
+        }
+        let mut cursor = 0usize;
+        while cursor < self.workspace.dirty_queue.len() {
+            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
+            if queue_pops >= pop_cap {
+                return Err(ReconstructionFailure::Cycle);
+            }
+            let operation = self.workspace.dirty_queue[cursor];
+            cursor += 1;
+            queue_pops = queue_pops.saturating_add(1);
+            self.workspace.fast_queue_marks[operation] = 0;
+            let (start, end) = earliest_dates(&self.problem, &self.machine_predecessors, &self.reconstruction.ends, operation)?;
+            if start == self.reconstruction.starts[operation] && end == self.reconstruction.ends[operation] {
+                continue;
+            }
+            self.record_fast_patch(operation);
+            self.reconstruction.starts[operation] = start;
+            self.reconstruction.ends[operation] = end;
+            forward_date_changes = forward_date_changes.saturating_add(1);
+            for successor_index in 0..self.problem.precedences.successors(operation).len() {
+                let successor = self.problem.precedences.successors(operation)[successor_index];
+                self.enqueue_fast_value_change(epoch, successor);
+            }
+            let machine_successor = self.machine_successors[operation];
+            if machine_successor != NO_OPERATION {
+                self.enqueue_fast_value_change(epoch, machine_successor);
+            }
+        }
+
+        let epoch = self.workspace.next_dirty_epoch();
+        self.workspace.dirty_queue.clear();
+        for arc in arcs.removed.into_iter().flatten().chain(arcs.added.into_iter().flatten()) {
+            self.enqueue_fast_value_change(epoch, arc.before);
+        }
+        cursor = 0;
+        while cursor < self.workspace.dirty_queue.len() {
+            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
+            if queue_pops >= pop_cap {
+                return Err(ReconstructionFailure::Cycle);
+            }
+            let operation = self.workspace.dirty_queue[cursor];
+            cursor += 1;
+            queue_pops = queue_pops.saturating_add(1);
+            self.workspace.fast_queue_marks[operation] = 0;
+            let duration = self.problem.duration(operation);
+            let mut tail = duration;
+            for &successor in self.problem.precedences.successors(operation) {
+                tail = tail.max(duration.checked_add(self.reconstruction.tails[successor]).ok_or(ReconstructionFailure::Numeric)?);
+            }
+            let machine_successor = self.machine_successors[operation];
+            if machine_successor != NO_OPERATION && !self.problem.precedences.successors(operation).contains(&machine_successor) {
+                tail = tail.max(duration.checked_add(self.reconstruction.tails[machine_successor]).ok_or(ReconstructionFailure::Numeric)?);
+            }
+            if tail == self.reconstruction.tails[operation] {
+                continue;
+            }
+            self.record_fast_patch(operation);
+            self.reconstruction.tails[operation] = tail;
+            reverse_tail_changes = reverse_tail_changes.saturating_add(1);
+            for predecessor_index in 0..self.problem.precedences.predecessors(operation).len() {
+                let predecessor = self.problem.precedences.predecessors(operation)[predecessor_index];
+                self.enqueue_fast_value_change(epoch, predecessor);
+            }
+            let machine_predecessor = self.machine_predecessors[operation];
+            if machine_predecessor != NO_OPERATION {
+                self.enqueue_fast_value_change(epoch, machine_predecessor);
+            }
+        }
+
+        let makespan = self.workspace.makespan_from_sink_union(&self.problem, &self.machine_sequences, &self.reconstruction.ends, stop)?;
+        Ok((makespan, forward_date_changes, reverse_tail_changes, u64::try_from(queue_pops).unwrap_or(u64::MAX)))
+    }
+
+    fn enqueue_fast_value_change(&mut self, epoch: u32, operation: usize) {
+        if self.workspace.fast_queue_marks[operation] != epoch {
+            self.workspace.fast_queue_marks[operation] = epoch;
+            self.workspace.dirty_queue.push(operation);
+        }
+    }
+
+    fn record_fast_patch(&mut self, operation: usize) {
+        let epoch = self.workspace.fast_patch_epoch;
+        if self.workspace.fast_patch_marks[operation] == epoch {
+            return;
+        }
+        self.workspace.fast_patch_marks[operation] = epoch;
+        self.workspace.fast_patched_operations.push(operation);
+        self.workspace.fast_patched_starts.push(self.reconstruction.starts[operation]);
+        self.workspace.fast_patched_ends.push(self.reconstruction.ends[operation]);
+        self.workspace.fast_patched_tails.push(self.reconstruction.tails[operation]);
+    }
+
+    fn rollback_fast_dates(&mut self) {
+        for index in (0..self.workspace.fast_patched_operations.len()).rev() {
+            let operation = self.workspace.fast_patched_operations[index];
+            self.reconstruction.starts[operation] = self.workspace.fast_patched_starts[index];
+            self.reconstruction.ends[operation] = self.workspace.fast_patched_ends[index];
+            self.reconstruction.tails[operation] = self.workspace.fast_patched_tails[index];
+        }
+        self.clear_fast_patch();
+    }
+
+    fn clear_fast_patch(&mut self) {
+        self.workspace.fast_patched_operations.clear();
+        self.workspace.fast_patched_starts.clear();
+        self.workspace.fast_patched_ends.clear();
+        self.workspace.fast_patched_tails.clear();
+    }
+
+    fn build_fast_canonical_analysis(&mut self, makespan: i64, stop: &AtomicBool) -> Result<(), ReconstructionFailure> {
+        self.workspace.trial_critical_path.clear();
+        self.workspace.trial_canonical_critical_blocks.clear();
+        let mut terminal = None;
+        for &operation in &self.problem.precedence_sinks {
+            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
+            if self.reconstruction.ends[operation] == makespan {
+                let machine_predecessor = self.machine_predecessors[operation];
+                let key = (
+                    machine_predecessor != NO_OPERATION
+                        && self.reconstruction.ends[machine_predecessor] == self.reconstruction.starts[operation],
+                    operation,
+                );
+                if terminal.is_none_or(|old| key > old) {
+                    terminal = Some(key);
+                }
+            }
+        }
+        for sequence in &self.machine_sequences {
+            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
+            let Some(&operation) = sequence.last() else {
+                continue;
+            };
+            if self.reconstruction.ends[operation] == makespan {
+                let machine_predecessor = self.machine_predecessors[operation];
+                let key = (
+                    machine_predecessor != NO_OPERATION
+                        && self.reconstruction.ends[machine_predecessor] == self.reconstruction.starts[operation],
+                    operation,
+                );
+                if terminal.is_none_or(|old| key > old) {
+                    terminal = Some(key);
+                }
+            }
+        }
+        let Some((_, mut operation)) = terminal else {
+            return Err(ReconstructionFailure::Cycle);
+        };
+        loop {
+            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
+            self.workspace.trial_critical_path.push(operation);
+            let machine_predecessor = self.machine_predecessors[operation];
+            let mut predecessor_choice = None;
+            for &predecessor in self.problem.precedences.predecessors(operation) {
+                if self.reconstruction.ends[predecessor] == self.reconstruction.starts[operation] {
+                    let key = (predecessor == machine_predecessor, predecessor);
+                    if predecessor_choice.is_none_or(|old| key > old) {
+                        predecessor_choice = Some(key);
+                    }
+                }
+            }
+            if machine_predecessor != NO_OPERATION
+                && !self.problem.precedences.predecessors(operation).contains(&machine_predecessor)
+                && self.reconstruction.ends[machine_predecessor] == self.reconstruction.starts[operation]
+            {
+                let key = (true, machine_predecessor);
+                if predecessor_choice.is_none_or(|old| key > old) {
+                    predecessor_choice = Some(key);
+                }
+            }
+            let Some((_, predecessor)) = predecessor_choice else {
+                break;
+            };
+            operation = predecessor;
+            if self.workspace.trial_critical_path.len() > self.problem.operation_count() {
+                return Err(ReconstructionFailure::Cycle);
+            }
+        }
+        self.workspace.trial_critical_path.reverse();
+
+        let mut path_start = 0usize;
+        while path_start < self.workspace.trial_critical_path.len() {
+            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
+            let machine = self.problem.machine(self.workspace.trial_critical_path[path_start]);
+            let first_position = self.positions[self.workspace.trial_critical_path[path_start]];
+            let mut path_end = path_start;
+            while path_end + 1 < self.workspace.trial_critical_path.len()
+                && self.problem.machine(self.workspace.trial_critical_path[path_end + 1]) == machine
+                && self.positions[self.workspace.trial_critical_path[path_end + 1]]
+                    == self.positions[self.workspace.trial_critical_path[path_end]] + 1
+            {
+                path_end += 1;
+            }
+            if path_end > path_start {
+                self.workspace.trial_canonical_critical_blocks.push(CriticalBlock {
+                    machine,
+                    first_position,
+                    last_position: self.positions[self.workspace.trial_critical_path[path_end]],
+                });
+            }
+            path_start = path_end + 1;
+        }
         Ok(())
     }
 
@@ -1206,6 +2523,65 @@ impl JobShopState {
         self.workspace.observe_growths();
         self.metrics.workspace_growths = self.workspace.growths;
         result
+    }
+
+    /// Apply a move and send it directly through the complete reconstruction
+    /// oracle. The accepted state changes only after feasibility, objective
+    /// acceptance, and analysis all succeed. No incremental delta evaluation
+    /// is performed.
+    pub(crate) fn consider_move_full_oracle(
+        &mut self,
+        movement: ScheduleMove,
+        acceptance: MinimizingMoveAcceptance,
+        stop: &AtomicBool,
+    ) -> Result<MoveOutcome, ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        self.metrics.moves_considered = self.metrics.moves_considered.saturating_add(1);
+        self.metrics.direct_oracle_attempts = self.metrics.direct_oracle_attempts.saturating_add(1);
+        if !move_is_valid(&self.machine_sequences, movement) {
+            return Ok(MoveOutcome::Rejected(MoveRejection::Invalid));
+        }
+        self.apply_graph_patch(movement);
+        if stop.load(Ordering::Acquire) {
+            self.rollback_graph_patch(movement);
+            return Err(ScheduleStateInterrupted);
+        }
+
+        let previous = self.makespan();
+        let candidate = match self.run_full_evaluation(stop) {
+            Ok(candidate) => candidate,
+            Err(failure) => {
+                self.rollback_graph_patch(movement);
+                return self.direct_oracle_failure(failure);
+            }
+        };
+        self.metrics.oracle_validations = self.metrics.oracle_validations.saturating_add(1);
+        if !acceptance.accepts(previous, candidate) {
+            self.rollback_graph_patch(movement);
+            self.metrics.objective_rejections = self.metrics.objective_rejections.saturating_add(1);
+            self.metrics.direct_oracle_objective_rejections = self.metrics.direct_oracle_objective_rejections.saturating_add(1);
+            return Ok(MoveOutcome::Rejected(MoveRejection::NotAccepted { current: previous, candidate }));
+        }
+        if let Err(failure) = self.workspace.build_analysis(
+            &self.problem,
+            &self.machine_predecessors,
+            &self.machine_successors,
+            &self.positions,
+            &self.machine_sequences,
+            self.collect_all_critical_blocks,
+            stop,
+        ) {
+            self.rollback_graph_patch(movement);
+            return self.direct_oracle_failure(failure);
+        }
+        self.reconstruction.commit(&self.workspace);
+        self.clear_date_patch();
+        self.metrics.moves_accepted = self.metrics.moves_accepted.saturating_add(1);
+        self.metrics.direct_oracle_accepts = self.metrics.direct_oracle_accepts.saturating_add(1);
+        self.metrics.critical_path_updates = self.metrics.critical_path_updates.saturating_add(1);
+        self.workspace.observe_growths();
+        self.metrics.workspace_growths = self.workspace.growths;
+        Ok(MoveOutcome::Accepted { previous, current: candidate })
     }
 
     fn probe_move_inner(&mut self, movement: ScheduleMove, stop: &AtomicBool) -> Result<MoveProbe, ScheduleStateInterrupted> {
@@ -1297,9 +2673,15 @@ impl JobShopState {
             return Ok(MoveOutcome::Rejected(MoveRejection::NotAccepted { current: previous, candidate }));
         }
 
-        if let Err(failure) =
-            self.workspace.build_analysis(&self.problem, &self.machine_predecessors, &self.machine_successors, &self.positions, stop)
-        {
+        if let Err(failure) = self.workspace.build_analysis(
+            &self.problem,
+            &self.machine_predecessors,
+            &self.machine_successors,
+            &self.positions,
+            &self.machine_sequences,
+            self.collect_all_critical_blocks,
+            stop,
+        ) {
             self.rollback_dates();
             self.rollback_graph_patch(movement);
             return self.rejected_failure(failure);
@@ -1402,7 +2784,7 @@ impl JobShopState {
                 self.reconstruction.ends[operation] = end;
             }
         }
-        Ok(self.reconstruction.ends.iter().copied().max().unwrap_or(0))
+        self.workspace.makespan_from_sink_union(&self.problem, &self.machine_sequences, &self.reconstruction.ends, stop)
     }
 
     fn run_full_evaluation(&mut self, stop: &AtomicBool) -> Result<i64, ReconstructionFailure> {
@@ -1430,6 +2812,19 @@ impl JobShopState {
         self.record_failure(failure).map(MoveOutcome::Rejected)
     }
 
+    fn direct_oracle_failure(&mut self, failure: ReconstructionFailure) -> Result<MoveOutcome, ScheduleStateInterrupted> {
+        match failure {
+            ReconstructionFailure::Cycle => {
+                self.metrics.direct_oracle_cycles = self.metrics.direct_oracle_cycles.saturating_add(1);
+            }
+            ReconstructionFailure::Window => {
+                self.metrics.direct_oracle_windows = self.metrics.direct_oracle_windows.saturating_add(1);
+            }
+            ReconstructionFailure::Interrupted | ReconstructionFailure::Numeric => {}
+        }
+        self.rejected_failure(failure)
+    }
+
     fn record_failure(&mut self, failure: ReconstructionFailure) -> Result<MoveRejection, ScheduleStateInterrupted> {
         match failure {
             ReconstructionFailure::Interrupted => Err(ScheduleStateInterrupted),
@@ -1453,6 +2848,55 @@ impl JobShopState {
         result
     }
 
+    /// Differentially validate semantic dates produced by the strict N5
+    /// micro-kernel, then refresh every derived analysis buffer from the full
+    /// oracle. A mismatch is repaired before returning `false`.
+    pub(crate) fn refresh_from_full_oracle(&mut self, stop: &AtomicBool) -> Result<bool, ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        let makespan = match self.run_full_evaluation(stop) {
+            Ok(makespan) => makespan,
+            Err(ReconstructionFailure::Interrupted) => return Err(ScheduleStateInterrupted),
+            Err(_) => {
+                self.metrics.oracle_validations = self.metrics.oracle_validations.saturating_add(1);
+                self.metrics.oracle_mismatches = self.metrics.oracle_mismatches.saturating_add(1);
+                return Ok(false);
+            }
+        };
+        self.metrics.oracle_validations = self.metrics.oracle_validations.saturating_add(1);
+        if let Err(failure) = self.workspace.build_analysis(
+            &self.problem,
+            &self.machine_predecessors,
+            &self.machine_successors,
+            &self.positions,
+            &self.machine_sequences,
+            self.collect_all_critical_blocks,
+            stop,
+        ) {
+            return match failure {
+                ReconstructionFailure::Interrupted => Err(ScheduleStateInterrupted),
+                _ => {
+                    self.metrics.oracle_mismatches = self.metrics.oracle_mismatches.saturating_add(1);
+                    Ok(false)
+                }
+            };
+        }
+        let exact = makespan == self.reconstruction.makespan
+            && self.workspace.trial_starts == self.reconstruction.starts
+            && self.workspace.trial_ends == self.reconstruction.ends
+            && self.workspace.trial_tails == self.reconstruction.tails
+            && self.workspace.trial_critical_path == self.reconstruction.critical_path
+            && self.workspace.trial_canonical_critical_blocks == self.reconstruction.canonical_critical_blocks;
+        if !exact {
+            self.metrics.oracle_mismatches = self.metrics.oracle_mismatches.saturating_add(1);
+        }
+        self.reconstruction.commit(&self.workspace);
+        self.clear_fast_patch();
+        self.metrics.critical_path_updates = self.metrics.critical_path_updates.saturating_add(1);
+        self.workspace.observe_growths();
+        self.metrics.workspace_growths = self.workspace.growths;
+        Ok(exact)
+    }
+
     fn matches_full_oracle_inner(&mut self, stop: &AtomicBool) -> Result<bool, ScheduleStateInterrupted> {
         let result = self.run_full_evaluation(stop);
         let makespan = match result {
@@ -1461,7 +2905,15 @@ impl JobShopState {
             Err(_) => return Ok(false),
         };
         self.metrics.oracle_validations = self.metrics.oracle_validations.saturating_add(1);
-        match self.workspace.build_analysis(&self.problem, &self.machine_predecessors, &self.machine_successors, &self.positions, stop) {
+        match self.workspace.build_analysis(
+            &self.problem,
+            &self.machine_predecessors,
+            &self.machine_successors,
+            &self.positions,
+            &self.machine_sequences,
+            self.collect_all_critical_blocks,
+            stop,
+        ) {
             Ok(()) => {}
             Err(ReconstructionFailure::Interrupted) => return Err(ScheduleStateInterrupted),
             Err(_) => return Ok(false),
@@ -1470,8 +2922,11 @@ impl JobShopState {
             && self.workspace.trial_starts == self.reconstruction.starts
             && self.workspace.trial_ends == self.reconstruction.ends
             && self.workspace.trial_latest_starts == self.reconstruction.latest_starts
+            && self.workspace.trial_tails == self.reconstruction.tails
             && self.workspace.trial_topological == self.reconstruction.topological
+            && self.workspace.trial_topological_rank == self.reconstruction.topological_rank
             && self.workspace.trial_critical_path == self.reconstruction.critical_path
+            && self.workspace.trial_canonical_critical_blocks == self.reconstruction.canonical_critical_blocks
             && self.workspace.trial_critical_blocks == self.reconstruction.critical_blocks)
     }
 
@@ -1486,6 +2941,400 @@ impl JobShopState {
             modes: self.problem.solution_modes.clone(),
             bound: None,
         }
+    }
+}
+
+/// Reusable compact scratch for repeated Giffler-Thompson starts.
+///
+/// It deliberately retains neither reconstructed states nor past orders.  The
+/// owner can materialize a complete semantic solution only after deciding that
+/// the most recent construction improves its incumbent.
+pub(crate) struct GifflerThompsonWorkspace {
+    starts: Vec<i64>,
+    completion: Vec<i64>,
+    indegrees: Vec<usize>,
+    machine_sequences: Vec<Vec<usize>>,
+    ready: GifflerReadySet,
+}
+
+impl GifflerThompsonWorkspace {
+    pub(crate) fn new(problem: &JobShopProblem) -> Self {
+        Self {
+            starts: vec![0; problem.operation_count()],
+            completion: vec![0; problem.operation_count()],
+            indegrees: vec![0; problem.operation_count()],
+            machine_sequences: vec![Vec::new(); problem.machine_count()],
+            ready: GifflerReadySet::new(problem),
+        }
+    }
+
+    pub(crate) fn construct(
+        &mut self,
+        problem: &JobShopProblem,
+        seed: u64,
+        stop: &AtomicBool,
+        metrics: &mut ScheduleStateMetrics,
+    ) -> Result<Option<(i64, u64)>, ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        if self.starts.len() != problem.operation_count() || self.ready.positions.len() != problem.operation_count() {
+            return Ok(None);
+        }
+        self.starts.fill(0);
+        self.completion.fill(0);
+        for sequence in &mut self.machine_sequences {
+            sequence.clear();
+        }
+        self.ready.reset();
+        for operation in 0..problem.operation_count() {
+            checkpoint(stop)?;
+            self.indegrees[operation] = problem.precedences.predecessors(operation).len();
+            if self.indegrees[operation] == 0 && !self.ready.activate(problem, operation, 0, stop, metrics)? {
+                return Ok(None);
+            }
+        }
+
+        let mut objective = 0i64;
+        for step in 0..problem.operation_count() {
+            checkpoint(stop)?;
+            self.ready.maybe_rebuild(problem, stop, metrics)?;
+            let Some((pivot, pivot_machine, cutoff)) = self.ready.pop_pivot(stop, metrics)? else {
+                return Ok(None);
+            };
+            let Some(selected) =
+                self.ready.select(problem, pivot, pivot_machine, cutoff, DispatchRule::EarliestStart, seed, step, stop, metrics)?
+            else {
+                return Ok(None);
+            };
+            let operation = selected.operation;
+            if !self.ready.remove(problem, operation) {
+                return Ok(None);
+            }
+            self.starts[operation] = selected.start;
+            self.completion[operation] = selected.end;
+            objective = objective.max(selected.end);
+            let machine = problem.machine(operation);
+            self.machine_sequences[machine].push(operation);
+            if !self.ready.refresh_machine(problem, machine, selected.end, stop, metrics)? {
+                return Ok(None);
+            }
+            for &successor in problem.precedences.successors(operation) {
+                checkpoint(stop)?;
+                let Some(value) = self.indegrees[successor].checked_sub(1) else {
+                    return Ok(None);
+                };
+                self.indegrees[successor] = value;
+                if value == 0 {
+                    let release = problem
+                        .precedences
+                        .predecessors(successor)
+                        .iter()
+                        .map(|&predecessor| self.completion[predecessor])
+                        .max()
+                        .unwrap_or(0);
+                    if !self.ready.activate(problem, successor, release, stop, metrics)? {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        let fingerprint = machine_sequence_fingerprint(&self.machine_sequences);
+        Ok(Some((objective, fingerprint)))
+    }
+
+    pub(crate) fn to_solution(&self, problem: &JobShopProblem, objective: i64) -> CollectionSolution {
+        problem.solution_from_starts(self.starts.clone(), objective)
+    }
+
+    pub(crate) fn heap_lower_bound_bytes(&self) -> usize {
+        self.starts
+            .capacity()
+            .saturating_mul(size_of::<i64>())
+            .saturating_add(self.completion.capacity().saturating_mul(size_of::<i64>()))
+            .saturating_add(self.indegrees.capacity().saturating_mul(size_of::<usize>()))
+            .saturating_add(self.machine_sequences.capacity().saturating_mul(size_of::<Vec<usize>>()))
+            .saturating_add(
+                self.machine_sequences
+                    .iter()
+                    .fold(0usize, |total, sequence| total.saturating_add(sequence.capacity().saturating_mul(size_of::<usize>()))),
+            )
+            .saturating_add(self.ready.heap_lower_bound_bytes())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn audit_strict_n5_layout(block_lengths: &[usize]) -> Vec<ScheduleMove> {
+    let stop = AtomicBool::new(false);
+    let mut first_position = 0usize;
+    let blocks: Vec<CriticalBlock> = block_lengths
+        .iter()
+        .enumerate()
+        .map(|(machine, &length)| {
+            let block = CriticalBlock { machine, first_position, last_position: first_position.saturating_add(length.saturating_sub(1)) };
+            first_position = first_position.saturating_add(length);
+            block
+        })
+        .collect();
+    let mut movements = Vec::new();
+    JobShopState::visit_strict_n5_moves(&blocks, &stop, |movement| {
+        movements.push(movement);
+        Ok(())
+    })
+    .expect("non-interrupted synthetic N5 layout");
+    movements
+}
+
+fn machine_sequence_fingerprint(sequences: &[Vec<usize>]) -> u64 {
+    let mut fingerprint = mix64(u64::try_from(sequences.len()).unwrap_or(u64::MAX));
+    for (machine, sequence) in sequences.iter().enumerate() {
+        fingerprint = mix64(
+            fingerprint
+                ^ u64::try_from(machine).unwrap_or(u64::MAX).wrapping_mul(0xa076_1d64_78bd_642f)
+                ^ u64::try_from(sequence.len()).unwrap_or(u64::MAX),
+        );
+        for (position, &operation) in sequence.iter().enumerate() {
+            fingerprint = mix64(
+                fingerprint
+                    ^ u64::try_from(operation).unwrap_or(u64::MAX)
+                    ^ u64::try_from(position).unwrap_or(u64::MAX).wrapping_mul(0xe703_7ed1_a0b4_28db),
+            );
+        }
+    }
+    fingerprint
+}
+
+type GifflerHeapEntry = Reverse<(i64, usize, usize, u64)>;
+
+/// Ready operations indexed by machine for the Giffler-Thompson constructor.
+///
+/// A machine readiness change invalidates only entries for that machine. Heap
+/// generations make those invalidations lazy, while the position vector keeps
+/// activation and removal constant time. Cached releases never change after an
+/// operation becomes precedence-ready.
+struct GifflerReadySet {
+    buckets: Vec<Vec<usize>>,
+    positions: Vec<usize>,
+    machine_ready: Vec<i64>,
+    releases: Vec<i64>,
+    starts: Vec<i64>,
+    ends: Vec<i64>,
+    generations: Vec<u64>,
+    heap: BinaryHeap<GifflerHeapEntry>,
+    active: usize,
+}
+
+impl GifflerReadySet {
+    fn new(problem: &JobShopProblem) -> Self {
+        Self {
+            buckets: vec![Vec::new(); problem.machine_count()],
+            positions: vec![NO_OPERATION; problem.operation_count()],
+            machine_ready: vec![0; problem.machine_count()],
+            releases: vec![0; problem.operation_count()],
+            starts: vec![0; problem.operation_count()],
+            ends: vec![0; problem.operation_count()],
+            generations: vec![0; problem.machine_count()],
+            heap: BinaryHeap::new(),
+            active: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        for bucket in &mut self.buckets {
+            bucket.clear();
+        }
+        self.positions.fill(NO_OPERATION);
+        self.machine_ready.fill(0);
+        self.releases.fill(0);
+        self.starts.fill(0);
+        self.ends.fill(0);
+        self.generations.fill(0);
+        self.heap.clear();
+        self.active = 0;
+    }
+
+    fn heap_lower_bound_bytes(&self) -> usize {
+        let bucket_items =
+            self.buckets.iter().fold(0usize, |total, bucket| total.saturating_add(bucket.capacity().saturating_mul(size_of::<usize>())));
+        self.buckets
+            .capacity()
+            .saturating_mul(size_of::<Vec<usize>>())
+            .saturating_add(bucket_items)
+            .saturating_add(self.positions.capacity().saturating_mul(size_of::<usize>()))
+            .saturating_add(self.machine_ready.capacity().saturating_mul(size_of::<i64>()))
+            .saturating_add(self.releases.capacity().saturating_mul(size_of::<i64>()))
+            .saturating_add(self.starts.capacity().saturating_mul(size_of::<i64>()))
+            .saturating_add(self.ends.capacity().saturating_mul(size_of::<i64>()))
+            .saturating_add(self.generations.capacity().saturating_mul(size_of::<u64>()))
+            .saturating_add(self.heap.capacity().saturating_mul(size_of::<GifflerHeapEntry>()))
+    }
+
+    fn activate(
+        &mut self,
+        problem: &JobShopProblem,
+        operation: usize,
+        release: i64,
+        stop: &AtomicBool,
+        metrics: &mut ScheduleStateMetrics,
+    ) -> Result<bool, ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        if operation >= self.positions.len() || self.positions[operation] != NO_OPERATION {
+            return Ok(false);
+        }
+        let machine = problem.machine(operation);
+        let position = self.buckets[machine].len();
+        self.buckets[machine].push(operation);
+        self.positions[operation] = position;
+        self.releases[operation] = release;
+        self.active = self.active.saturating_add(1);
+        if !self.refresh_operation(problem, operation, metrics) {
+            return Ok(false);
+        }
+        self.push(operation, machine, metrics);
+        Ok(true)
+    }
+
+    fn refresh_machine(
+        &mut self,
+        problem: &JobShopProblem,
+        machine: usize,
+        ready_at: i64,
+        stop: &AtomicBool,
+        metrics: &mut ScheduleStateMetrics,
+    ) -> Result<bool, ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        self.machine_ready[machine] = ready_at;
+        let wrapped = self.generations[machine] == u64::MAX;
+        self.generations[machine] = self.generations[machine].wrapping_add(1);
+        for index in 0..self.buckets[machine].len() {
+            checkpoint(stop)?;
+            metrics.construction_bucket_visits = metrics.construction_bucket_visits.saturating_add(1);
+            let operation = self.buckets[machine][index];
+            if !self.refresh_operation(problem, operation, metrics) {
+                return Ok(false);
+            }
+            if !wrapped {
+                self.push(operation, machine, metrics);
+            }
+        }
+        if wrapped {
+            self.rebuild(stop, metrics)?;
+        }
+        Ok(true)
+    }
+
+    fn refresh_operation(&mut self, problem: &JobShopProblem, operation: usize, metrics: &mut ScheduleStateMetrics) -> bool {
+        metrics.construction_candidates = metrics.construction_candidates.saturating_add(1);
+        let machine = problem.machine(operation);
+        let start = self.releases[operation].max(self.machine_ready[machine]).max(problem.start_windows[operation].0);
+        let Some(end) = start.checked_add(problem.duration(operation)) else {
+            return false;
+        };
+        if start > problem.start_windows[operation].1 || end > problem.horizons[operation] {
+            return false;
+        }
+        self.starts[operation] = start;
+        self.ends[operation] = end;
+        true
+    }
+
+    fn push(&mut self, operation: usize, machine: usize, metrics: &mut ScheduleStateMetrics) {
+        self.heap.push(Reverse((self.ends[operation], operation, machine, self.generations[machine])));
+        metrics.construction_heap_pushes = metrics.construction_heap_pushes.saturating_add(1);
+        metrics.construction_heap_peak = metrics.construction_heap_peak.max(u64::try_from(self.heap.len()).unwrap_or(u64::MAX));
+    }
+
+    fn pop_pivot(
+        &mut self,
+        stop: &AtomicBool,
+        metrics: &mut ScheduleStateMetrics,
+    ) -> Result<Option<(usize, usize, i64)>, ScheduleStateInterrupted> {
+        while let Some(Reverse((end, operation, machine, generation))) = self.heap.pop() {
+            checkpoint(stop)?;
+            let valid = operation < self.positions.len()
+                && self.positions[operation] != NO_OPERATION
+                && self.generations[machine] == generation
+                && self.ends[operation] == end;
+            if valid {
+                return Ok(Some((operation, machine, end)));
+            }
+            metrics.construction_stale_pops = metrics.construction_stale_pops.saturating_add(1);
+        }
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn select(
+        &self,
+        problem: &JobShopProblem,
+        pivot: usize,
+        machine: usize,
+        cutoff: i64,
+        rule: DispatchRule,
+        seed: u64,
+        step: usize,
+        stop: &AtomicBool,
+        metrics: &mut ScheduleStateMetrics,
+    ) -> Result<Option<DispatchCandidate>, ScheduleStateInterrupted> {
+        let mut selected = None;
+        for &operation in &self.buckets[machine] {
+            checkpoint(stop)?;
+            metrics.construction_bucket_visits = metrics.construction_bucket_visits.saturating_add(1);
+            let start = self.starts[operation];
+            if operation != pivot && start >= cutoff {
+                continue;
+            }
+            let candidate = DispatchCandidate { operation, start, end: self.ends[operation] };
+            if selected.is_none_or(|current| dispatch_better(problem, rule, seed, step, candidate, current)) {
+                selected = Some(candidate);
+            }
+        }
+        Ok(selected)
+    }
+
+    fn remove(&mut self, problem: &JobShopProblem, operation: usize) -> bool {
+        let Some(position) = self.positions.get(operation).copied().filter(|&position| position != NO_OPERATION) else {
+            return false;
+        };
+        let machine = problem.machine(operation);
+        let bucket = &mut self.buckets[machine];
+        if position >= bucket.len() || bucket[position] != operation {
+            return false;
+        }
+        bucket.swap_remove(position);
+        if let Some(&replacement) = bucket.get(position) {
+            self.positions[replacement] = position;
+        }
+        self.positions[operation] = NO_OPERATION;
+        self.active = self.active.saturating_sub(1);
+        true
+    }
+
+    fn maybe_rebuild(
+        &mut self,
+        problem: &JobShopProblem,
+        stop: &AtomicBool,
+        metrics: &mut ScheduleStateMetrics,
+    ) -> Result<(), ScheduleStateInterrupted> {
+        let bound = self.active.saturating_mul(4).saturating_add(problem.machine_count()).max(64);
+        if self.heap.len() > bound {
+            self.rebuild(stop, metrics)?;
+        }
+        Ok(())
+    }
+
+    fn rebuild(&mut self, stop: &AtomicBool, metrics: &mut ScheduleStateMetrics) -> Result<(), ScheduleStateInterrupted> {
+        self.heap.clear();
+        metrics.construction_heap_rebuilds = metrics.construction_heap_rebuilds.saturating_add(1);
+        for machine in 0..self.buckets.len() {
+            checkpoint(stop)?;
+            for index in 0..self.buckets[machine].len() {
+                checkpoint(stop)?;
+                metrics.construction_bucket_visits = metrics.construction_bucket_visits.saturating_add(1);
+                let operation = self.buckets[machine][index];
+                self.push(operation, machine, metrics);
+            }
+        }
+        debug_assert_eq!(self.heap.len(), self.active);
+        Ok(())
     }
 }
 

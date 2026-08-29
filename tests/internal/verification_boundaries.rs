@@ -6,8 +6,9 @@ use qayd::constraints::table::STAR;
 use qayd::model::list::{register_external_function, ExprArena, Iterable, ReduceOp, Reduction};
 use qayd::model::{Constraint, IntGlobalConstraint, Model, ModelPackage, Objective, Relation};
 use qayd::orchestrator::{
-    audit_interrupt_next_collection_final_replay, verify_semantic_assignment, verify_semantic_assignment_validated_interruptible,
-    Assignment, EventCallback, EventControl, SolveError, SolveEvent, SolveLimits, SolveMode, SolveRequest, SolveStatus,
+    audit_interrupt_next_collection_final_replay, audit_no_overlap_holds, verify_semantic_assignment,
+    verify_semantic_assignment_validated_interruptible, Assignment, EventCallback, EventControl, SolveError, SolveEvent, SolveLimits,
+    SolveMode, SolveRequest, SolveStatus,
 };
 
 fn list_assignment_model(items: usize) -> ModelPackage {
@@ -139,6 +140,88 @@ fn validated_verification_still_replays_constraints_and_honors_interruption() {
     assert!(matches!(error, SolveError::InvalidResult(message) if message.contains("constraint 0")));
 
     let interrupted = verify_semantic_assignment_validated_interruptible(&model, &assignment, &[], &AtomicBool::new(true)).unwrap_err();
+    assert!(matches!(interrupted, SolveError::Interrupted(_)));
+}
+
+fn quadratic_no_overlap(starts: &[i64], durations: &[i64]) -> bool {
+    let length = starts.len().min(durations.len());
+    for left in 0..length {
+        for right in left + 1..length {
+            if i128::from(starts[left]) + i128::from(durations[left]) > i128::from(starts[right])
+                && i128::from(starts[right]) + i128::from(durations[right]) > i128::from(starts[left])
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[test]
+fn no_overlap_sweep_matches_the_pairwise_oracle_exhaustively() {
+    let running = AtomicBool::new(false);
+    let starts_domain = [-1, 0, 1, 2];
+    let durations_domain = [0, 1, 2, 4];
+
+    for &s0 in &starts_domain {
+        for &s1 in &starts_domain {
+            for &s2 in &starts_domain {
+                let starts = [s0, s1, s2];
+                for &d0 in &durations_domain {
+                    for &d1 in &durations_domain {
+                        for &d2 in &durations_domain {
+                            let durations = [d0, d1, d2];
+                            let expected = quadratic_no_overlap(&starts, &durations);
+                            let actual = audit_no_overlap_holds(&starts, &durations, &running).unwrap();
+                            assert_eq!(actual, expected, "starts={starts:?}, durations={durations:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn no_overlap_sweep_preserves_zero_equal_start_and_nesting_semantics() {
+    let running = AtomicBool::new(false);
+    for (starts, durations, expected) in [
+        ([0, 0, 0], [0, 0, 3], true),
+        ([0, 0, 0], [0, 2, 3], false),
+        ([0, 1, 3], [4, 0, 1], false),
+        ([0, 0, 4], [4, 0, 2], true),
+        ([0, 1, 2], [6, 4, 1], false),
+    ] {
+        assert_eq!(audit_no_overlap_holds(&starts, &durations, &running).unwrap(), expected);
+        assert_eq!(quadratic_no_overlap(&starts, &durations), expected);
+    }
+}
+
+#[test]
+fn no_overlap_negative_duration_fallback_is_exact_and_interruptible() {
+    let running = AtomicBool::new(false);
+    let starts_domain = [-1, 0, 1];
+    let durations_domain = [-2, -1, 0, 2];
+    for &s0 in &starts_domain {
+        for &s1 in &starts_domain {
+            for &s2 in &starts_domain {
+                let starts = [s0, s1, s2];
+                for &d0 in &durations_domain {
+                    for &d1 in &durations_domain {
+                        for &d2 in &durations_domain {
+                            let durations = [d0, d1, d2];
+                            let expected = quadratic_no_overlap(&starts, &durations);
+                            let actual = audit_no_overlap_holds(&starts, &durations, &running).unwrap();
+                            assert_eq!(actual, expected, "starts={starts:?}, durations={durations:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let stopped = AtomicBool::new(true);
+    let interrupted = audit_no_overlap_holds(&[0, 1, 2], &[1, 1, 1], &stopped).unwrap_err();
     assert!(matches!(interrupted, SolveError::Interrupted(_)));
 }
 

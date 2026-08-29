@@ -31,6 +31,10 @@ def arguments(**overrides):
         "grace_seconds": 20.0,
         "qayd_engine": "ls",
         "profile_qayd": True,
+        "qayd_schedule_path_relink": False,
+        "qayd_schedule_lns_shadow": False,
+        "qayd_schedule_constructor_workers": 0,
+        "qayd_schedule_jssp_search": "legacy",
         "max_iterations": 123,
         "routing_two_way": True,
         "routing_nearest_neighbor": True,
@@ -110,6 +114,66 @@ def test_both_qayd_jssp_launchers_request_compact_json():
         command = campaign.command_for(solver, instance, 30, 19, args)
         assert "--json" in command
         assert "--compact-json" in command
+        assert command[command.index("--schedule-jssp-search") + 1] == "legacy"
+
+
+def test_tsab_candidate_control_is_explicit_and_jssp_only():
+    campaign = load_campaign()
+    enabled = arguments(threads=7, qayd_schedule_jssp_search="tsab-candidate")
+
+    for solver in ("qayd-api", "qayd-native"):
+        jssp = campaign.command_for(solver, item("jssp", ".txt"), 60, 37, enabled)
+        rcpsp = campaign.command_for(solver, item("rcpsp", ".sm"), 60, 37, enabled)
+
+        assert jssp[jssp.index("--schedule-jssp-search") + 1] == "tsab-candidate"
+        assert "--schedule-jssp-search" not in rcpsp
+
+
+def test_tsab_candidate_control_participates_in_jssp_run_identity_only():
+    campaign = load_campaign()
+    jssp = {
+        **item("jssp", ".txt"),
+        "instance_path": "data/jssp/instance.txt",
+        "instance_sha256": "abc123",
+    }
+    rcpsp = {
+        **item("rcpsp", ".sm"),
+        "instance_path": "data/rcpsp/instance.sm",
+        "instance_sha256": "def456",
+    }
+
+    for instance, must_change in ((jssp, True), (rcpsp, False)):
+        legacy = campaign.run_key(
+            "qayd-native", instance, 60, 0, arguments(qayd_schedule_jssp_search="legacy")
+        )
+        candidate = campaign.run_key(
+            "qayd-native",
+            instance,
+            60,
+            0,
+            arguments(qayd_schedule_jssp_search="tsab-candidate"),
+        )
+        assert (legacy != candidate) is must_change
+
+
+def test_path_relink_control_is_explicit_and_jssp_only():
+    campaign = load_campaign()
+    enabled = arguments(qayd_schedule_path_relink=True)
+
+    for solver in ("qayd-api", "qayd-native"):
+        jssp = campaign.command_for(solver, item("jssp", ".txt"), 30, 23, enabled)
+        rcpsp = campaign.command_for(solver, item("rcpsp", ".sm"), 30, 23, enabled)
+        disabled = campaign.command_for(
+            solver,
+            item("jssp", ".txt"),
+            30,
+            23,
+            arguments(qayd_schedule_path_relink=False),
+        )
+
+        assert "--schedule-path-relink" in jssp
+        assert "--schedule-path-relink" not in rcpsp
+        assert "--schedule-path-relink" not in disabled
 
 
 def test_grace_seconds_participates_in_run_identity():
@@ -128,6 +192,116 @@ def test_grace_seconds_participates_in_run_identity():
     )
 
     assert short_guard != long_guard
+
+
+def test_path_relink_control_participates_in_run_identity():
+    campaign = load_campaign()
+    instance = {
+        **item("jssp", ".txt"),
+        "instance_path": "data/jssp/instance.txt",
+        "instance_sha256": "abc123",
+    }
+
+    disabled = campaign.run_key(
+        "qayd-api",
+        instance,
+        600,
+        0,
+        arguments(qayd_schedule_path_relink=False),
+    )
+    enabled = campaign.run_key(
+        "qayd-api",
+        instance,
+        600,
+        0,
+        arguments(qayd_schedule_path_relink=True),
+    )
+
+    assert disabled != enabled
+
+
+def test_lns_shadow_control_is_explicit_and_jssp_only():
+    campaign = load_campaign()
+    enabled = arguments(qayd_schedule_lns_shadow=True)
+
+    for solver in ("qayd-api", "qayd-native"):
+        jssp = campaign.command_for(solver, item("jssp", ".txt"), 30, 29, enabled)
+        rcpsp = campaign.command_for(solver, item("rcpsp", ".sm"), 30, 29, enabled)
+        disabled = campaign.command_for(
+            solver,
+            item("jssp", ".txt"),
+            30,
+            29,
+            arguments(qayd_schedule_lns_shadow=False),
+        )
+
+        assert "--schedule-lns-shadow" in jssp
+        assert "--schedule-lns-shadow" not in rcpsp
+        assert "--schedule-lns-shadow" not in disabled
+
+
+def test_lns_shadow_control_participates_in_jssp_run_identity_only():
+    campaign = load_campaign()
+    jssp = {
+        **item("jssp", ".txt"),
+        "instance_path": "data/jssp/instance.txt",
+        "instance_sha256": "abc123",
+    }
+    rcpsp = {
+        **item("rcpsp", ".sm"),
+        "instance_path": "data/rcpsp/instance.sm",
+        "instance_sha256": "def456",
+    }
+
+    for instance, must_change in ((jssp, True), (rcpsp, False)):
+        disabled = campaign.run_key(
+            "qayd-api", instance, 600, 0, arguments(qayd_schedule_lns_shadow=False)
+        )
+        enabled = campaign.run_key(
+            "qayd-api", instance, 600, 0, arguments(qayd_schedule_lns_shadow=True)
+        )
+        assert (disabled != enabled) is must_change
+
+
+def test_constructor_worker_control_is_explicit_and_jssp_only():
+    campaign = load_campaign()
+    enabled = arguments(threads=7, qayd_schedule_constructor_workers=1)
+
+    for solver in ("qayd-api", "qayd-native"):
+        jssp = campaign.command_for(solver, item("jssp", ".txt"), 60, 31, enabled)
+        rcpsp = campaign.command_for(solver, item("rcpsp", ".sm"), 60, 31, enabled)
+        disabled = campaign.command_for(solver, item("jssp", ".txt"), 60, 31, arguments(threads=7))
+
+        assert jssp[jssp.index("--schedule-constructor-workers") + 1] == "1"
+        assert "--schedule-constructor-workers" not in rcpsp
+        assert "--schedule-constructor-workers" not in disabled
+
+
+def test_constructor_worker_control_participates_in_jssp_run_identity_only():
+    campaign = load_campaign()
+    jssp = {
+        **item("jssp", ".txt"),
+        "instance_path": "data/jssp/instance.txt",
+        "instance_sha256": "abc123",
+    }
+    rcpsp = {
+        **item("rcpsp", ".sm"),
+        "instance_path": "data/rcpsp/instance.sm",
+        "instance_sha256": "def456",
+    }
+
+    for instance, must_change in ((jssp, True), (rcpsp, False)):
+        disabled = campaign.run_key(
+            "qayd-native", instance, 60, 0, arguments(threads=7)
+        )
+        enabled = campaign.run_key(
+            "qayd-native",
+            instance,
+            60,
+            0,
+            arguments(threads=7, qayd_schedule_constructor_workers=1),
+        )
+        assert (disabled != enabled) is must_change
 
 
 def test_prepare_qayd_uses_optimized_pyext_profile(monkeypatch):

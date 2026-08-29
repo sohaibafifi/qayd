@@ -197,11 +197,17 @@ mod scenario_schedule;
 #[path = "../tests/internal/schedule_compile_contract.rs"]
 mod schedule_compile_contract;
 #[cfg(test)]
+#[path = "../tests/internal/schedule_elite.rs"]
+mod schedule_elite;
+#[cfg(test)]
 #[path = "../tests/internal/schedule_interruption.rs"]
 mod schedule_interruption;
 #[cfg(test)]
 #[path = "../tests/internal/schedule_iteration_limit.rs"]
 mod schedule_iteration_limit;
+#[cfg(test)]
+#[path = "../tests/internal/schedule_lns.rs"]
+mod schedule_lns;
 #[cfg(test)]
 #[path = "../tests/internal/schedule_ls_interruption.rs"]
 mod schedule_ls_interruption;
@@ -211,6 +217,9 @@ mod schedule_mode_identity;
 #[cfg(test)]
 #[path = "../tests/internal/schedule_portfolio_exchange.rs"]
 mod schedule_portfolio_exchange;
+#[cfg(test)]
+#[path = "../tests/internal/schedule_relink.rs"]
+mod schedule_relink;
 #[cfg(test)]
 #[path = "../tests/internal/schedule_state.rs"]
 mod schedule_state;

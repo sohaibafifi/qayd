@@ -16,9 +16,9 @@ use crate::model::{Constraint, IntDomain, IntExpr as Expr, IntGlobalConstraint, 
 use crate::orchestrator::{
     count_model_solutions_with_external_stop, enumerate_model_mus_with_external_stop, explain_model_mus_with_external_stop,
     extract_model_mus_with_external_stop, solve_model_with_external_stop, EngineKind, EngineReport, EventControl, EventSink,
-    LinearBackendMode, LinearControls, ModelMusEnumeration, ModelMusResult, MusAtomRelation, RoutingControls, SearchStats,
-    SemanticAssumption, SemanticAssumptionOp, SemanticNogoodRelation, SemanticSolveSession, SolveError, SolveEvent, SolveLimits, SolveMode,
-    SolveRequest, SolveResult, SolveStatus, VerificationLevel,
+    LinearBackendMode, LinearControls, ModelMusEnumeration, ModelMusResult, MusAtomRelation, RoutingControls, ScheduleJsspSearch,
+    SearchStats, SemanticAssumption, SemanticAssumptionOp, SemanticNogoodRelation, SemanticSolveSession, SolveError, SolveEvent,
+    SolveLimits, SolveMode, SolveRequest, SolveResult, SolveStatus, VerificationLevel,
 };
 
 mod lambda_dsl;
@@ -513,6 +513,8 @@ struct PySolution {
     schedule_incumbent_verifications: Option<u64>,
     schedule_incumbent_verification_rejections: Option<u64>,
     schedule_incumbent_verification_interruptions: Option<u64>,
+    schedule_incumbent_verification_seconds: Option<f64>,
+    schedule_incumbent_verification_max_seconds: Option<f64>,
     schedule_incumbent_incomplete_rejections: Option<u64>,
     schedule_restart_boundaries: Option<u64>,
     schedule_restart_work: Option<u64>,
@@ -554,9 +556,197 @@ struct PySolution {
     schedule_tabu_hits: Option<u64>,
     schedule_tabu_aspirations: Option<u64>,
     schedule_tabu_forced_moves: Option<u64>,
+    schedule_tsab_owner_worker_mask: Option<u64>,
+    schedule_tsab_n5_generated: Option<u64>,
+    schedule_tsab_ranked: Option<u64>,
+    schedule_tsab_shortlists: Option<u64>,
+    schedule_tsab_delta_probes: Option<u64>,
+    schedule_tsab_additional_delta_probes: Option<u64>,
+    schedule_tsab_full_oracle_commits: Option<u64>,
+    schedule_tsab_selected_shortlist_rank_sum: Option<u64>,
+    schedule_tsab_selections: Option<u64>,
+    schedule_tsab_aspirations: Option<u64>,
+    schedule_tsab_tabu_rejections: Option<u64>,
+    schedule_tsab_tabu_resets: Option<u64>,
+    schedule_tsab_fingerprint_repeats: Option<u64>,
+    schedule_tsab_escape_signals: Option<u64>,
+    schedule_tsab_n1_kicks: Option<u64>,
+    schedule_tsab_kick_moves: Option<u64>,
+    schedule_tsab_elite_restarts: Option<u64>,
+    schedule_tsab_n6_kicks: Option<u64>,
+    schedule_tsab_restart_attempts: Option<u64>,
+    schedule_tsab_restart_global_rebases: Option<u64>,
+    schedule_tsab_restart_n6_generated: Option<u64>,
+    schedule_tsab_restart_delta_probes: Option<u64>,
+    schedule_tsab_restart_oracle_commits: Option<u64>,
+    schedule_tsab_restart_rejections: Option<u64>,
+    schedule_tsab_restart_interruptions: Option<u64>,
+    schedule_tsab_restart_work_units: Option<u64>,
+    schedule_tsab_restart_best_base_objective: Option<i64>,
+    schedule_tsab_restart_best_kicked_objective: Option<i64>,
+    schedule_tsab_post_restart_improvements: Option<u64>,
+    schedule_tsab_restart_shortlist_peak_bytes: Option<u64>,
+    schedule_tsab_ranking_audits: Option<u64>,
+    schedule_tsab_exact_best_matches: Option<u64>,
+    schedule_tsab_regret_sum: Option<u64>,
+    schedule_tsab_regret_max: Option<u64>,
+    schedule_tsab_workspace_peak_bytes: Option<u64>,
+    schedule_tsab_activations: Option<u64>,
+    schedule_tsab_activation_boundary: Option<u64>,
+    schedule_tsab_legacy_warmup_work_steps: Option<u64>,
+    schedule_tsab_activation_rebases: Option<u64>,
+    schedule_tsab_activation_objective: Option<i64>,
+    schedule_tsab_active_boundaries: Option<u64>,
+    schedule_tsab_burst_work_limit: Option<u64>,
+    schedule_tsab_burst_work_units: Option<u64>,
+    schedule_tsab_improving_commits: Option<u64>,
+    schedule_tsab_best_committed_objective: Option<i64>,
+    schedule_tsab_fast_enabled: Option<u64>,
+    schedule_tsab_fast_eligible: Option<u64>,
+    schedule_tsab_fast_disabled: Option<u64>,
+    schedule_tsab_fast_attempts: Option<u64>,
+    schedule_tsab_fast_commits: Option<u64>,
+    schedule_tsab_fast_fallbacks: Option<u64>,
+    schedule_tsab_fast_date_changes: Option<u64>,
+    schedule_tsab_fast_queue_pops: Option<u64>,
+    schedule_tsab_fast_full_validations: Option<u64>,
+    schedule_tsab_fast_oracle_mismatches: Option<u64>,
+    schedule_tsab_fast_pending_promotions: Option<u64>,
+    schedule_tsab_fast_pending_discards: Option<u64>,
+    schedule_tsab_fast_transitions: Option<u64>,
+    schedule_tsab_fast_work_units: Option<u64>,
+    schedule_tsab_fast_elapsed_seconds: Option<f64>,
+    schedule_tsab_fast_workspace_peak_bytes: Option<u64>,
     schedule_session_initializations: Option<u64>,
     schedule_session_resumes: Option<u64>,
     schedule_session_rebases: Option<u64>,
+    schedule_island_profile_mask: Option<u64>,
+    schedule_baseline_island_profile_mask: Option<u64>,
+    schedule_scored_island_profile_mask: Option<u64>,
+    schedule_island_profile_count: Option<u64>,
+    schedule_profile_construction_seconds: Option<String>,
+    schedule_profile_initial_objectives: Option<String>,
+    schedule_profile_initial_dispatch_rules: Option<String>,
+    schedule_profile_best_objectives: Option<String>,
+    schedule_profile_work_steps: Option<String>,
+    schedule_construction_bucket_visits: Option<u64>,
+    schedule_construction_heap_pushes: Option<u64>,
+    schedule_construction_stale_pops: Option<u64>,
+    schedule_construction_heap_rebuilds: Option<u64>,
+    schedule_construction_heap_peak: Option<u64>,
+    schedule_reactive_restarts: Option<u64>,
+    schedule_reactive_restart_dispatches: Option<u64>,
+    schedule_reactive_restart_perturbations: Option<u64>,
+    schedule_reactive_restart_rebuild_failures: Option<u64>,
+    schedule_island_scored_candidates: Option<u64>,
+    schedule_island_shortlisted_candidates: Option<u64>,
+    schedule_approximate_candidates_generated: Option<u64>,
+    schedule_approximate_candidates_refined: Option<u64>,
+    schedule_approximate_candidates_certified: Option<u64>,
+    schedule_approximate_candidates_unknown: Option<u64>,
+    schedule_approximation_score_items: Option<u64>,
+    schedule_approximation_sort_items: Option<u64>,
+    schedule_approximation_local_span_items: Option<u64>,
+    schedule_approximation_elapsed_seconds: Option<f64>,
+    schedule_approximation_work_units: Option<u64>,
+    schedule_direct_oracle_attempts: Option<u64>,
+    schedule_direct_oracle_accepts: Option<u64>,
+    schedule_direct_oracle_cycles: Option<u64>,
+    schedule_direct_oracle_windows: Option<u64>,
+    schedule_direct_oracle_objective_rejections: Option<u64>,
+    schedule_exact_probes_avoided: Option<u64>,
+    schedule_search_elite_pool_size: Option<u64>,
+    schedule_search_elite_batches: Option<u64>,
+    schedule_search_elite_batches_skipped_after_stop: Option<u64>,
+    schedule_search_elite_candidates: Option<u64>,
+    schedule_search_elite_insertions: Option<u64>,
+    schedule_search_elite_duplicates: Option<u64>,
+    schedule_search_elite_dominated: Option<u64>,
+    schedule_search_elite_evictions: Option<u64>,
+    schedule_search_elite_interruptions: Option<u64>,
+    schedule_search_elite_merge_errors: Option<u64>,
+    schedule_search_elite_snapshot_captures: Option<u64>,
+    schedule_search_elite_snapshot_interruptions: Option<u64>,
+    schedule_search_elite_snapshot_errors: Option<u64>,
+    schedule_search_elite_objectives: Option<String>,
+    schedule_search_elite_pairwise_distances_ppm: Option<String>,
+    schedule_search_elite_min_distance_ppm: Option<u64>,
+    schedule_search_elite_mean_distance_ppm: Option<u64>,
+    schedule_search_elite_max_distance_ppm: Option<u64>,
+    schedule_search_elite_capture_worker_seconds_sum: Option<f64>,
+    schedule_search_elite_merge_wall_seconds: Option<f64>,
+    schedule_search_elite_heap_lower_bound_bytes: Option<u64>,
+    schedule_search_elite_peak_heap_lower_bound_bytes: Option<u64>,
+    schedule_lns_shadow_enabled: Option<u64>,
+    schedule_lns_shadow_active: Option<u64>,
+    schedule_lns_shadow_owner_worker_mask: Option<u64>,
+    schedule_lns_attempts: Option<u64>,
+    schedule_lns_selected_operations: Option<u64>,
+    schedule_lns_feasible: Option<u64>,
+    schedule_lns_reconstructed: Option<u64>,
+    schedule_lns_improvements: Option<u64>,
+    schedule_lns_shadow_improvements: Option<u64>,
+    schedule_lns_shadow_improvement_sum: Option<u64>,
+    schedule_lns_shadow_best_improvement: Option<u64>,
+    schedule_lns_timeouts: Option<u64>,
+    schedule_lns_interruptions: Option<u64>,
+    schedule_lns_infeasible: Option<u64>,
+    schedule_lns_non_improving: Option<u64>,
+    schedule_lns_reconstruction_rejections: Option<u64>,
+    schedule_lns_oracle_rejections: Option<u64>,
+    schedule_lns_exact_rejections: Option<u64>,
+    schedule_lns_worker_seconds_sum: Option<f64>,
+    schedule_lns_workspace_peak_bytes: Option<u64>,
+    schedule_constructor_workers_requested: Option<u64>,
+    schedule_constructor_multistart_enabled: Option<u64>,
+    schedule_constructor_multistart_active: Option<u64>,
+    schedule_constructor_multistart_owner_worker_mask: Option<u64>,
+    schedule_constructor_multistart_attempts: Option<u64>,
+    schedule_constructor_multistart_constructions: Option<u64>,
+    schedule_constructor_multistart_interruptions: Option<u64>,
+    schedule_constructor_multistart_failures: Option<u64>,
+    schedule_constructor_multistart_feasible: Option<u64>,
+    schedule_constructor_multistart_distinct_fingerprints: Option<u64>,
+    schedule_constructor_multistart_other_fingerprint_observations: Option<u64>,
+    schedule_constructor_multistart_initial_objective: Option<i64>,
+    schedule_constructor_multistart_best_objective: Option<i64>,
+    schedule_constructor_multistart_improvements: Option<u64>,
+    schedule_constructor_multistart_work_units: Option<u64>,
+    schedule_constructor_multistart_worker_seconds_sum: Option<f64>,
+    schedule_constructor_multistart_workspace_peak_bytes: Option<u64>,
+    schedule_constructor_multistart_best_ordinal: Option<u64>,
+    schedule_constructor_multistart_best_seed: Option<u64>,
+    schedule_constructor_multistart_best_fingerprint: Option<u64>,
+    schedule_constructor_multistart_next_ordinal: Option<u64>,
+    schedule_path_relink_enabled: Option<u64>,
+    schedule_path_relink_active: Option<u64>,
+    schedule_path_relink_guide_requests: Option<u64>,
+    schedule_path_relink_best_guides: Option<u64>,
+    schedule_path_relink_diverse_guides: Option<u64>,
+    schedule_path_relink_guide_loads: Option<u64>,
+    schedule_path_relink_guide_incompatible: Option<u64>,
+    schedule_path_relink_guide_interruptions: Option<u64>,
+    schedule_path_relink_critical_operations_scanned: Option<u64>,
+    schedule_path_relink_candidates_generated: Option<u64>,
+    schedule_path_relink_candidates_positive_gain: Option<u64>,
+    schedule_path_relink_acyclicity_certified: Option<u64>,
+    schedule_path_relink_acyclicity_unknown: Option<u64>,
+    schedule_path_relink_prefilter_rejections: Option<u64>,
+    schedule_path_relink_candidates_retained: Option<u64>,
+    schedule_path_relink_candidates_refined: Option<u64>,
+    schedule_path_relink_candidates_shortlisted: Option<u64>,
+    schedule_path_relink_no_move: Option<u64>,
+    schedule_path_relink_guide_arc_gain_shortlisted: Option<u64>,
+    schedule_path_relink_oracle_attempts: Option<u64>,
+    schedule_path_relink_oracle_accepts: Option<u64>,
+    schedule_path_relink_cycle_rejections: Option<u64>,
+    schedule_path_relink_window_rejections: Option<u64>,
+    schedule_path_relink_other_rejections: Option<u64>,
+    schedule_path_relink_rollbacks: Option<u64>,
+    schedule_path_relink_elite_improvements: Option<u64>,
+    schedule_path_relink_guide_arc_gain_accepted: Option<u64>,
+    schedule_path_relink_worker_seconds_sum: Option<f64>,
+    schedule_path_relink_workspace_peak_bytes: Option<u64>,
     full_recompute_percentage: Option<f64>,
     backend_build_seconds: Option<f64>,
     construction_seconds: Option<f64>,
@@ -1037,6 +1227,8 @@ fn make_solution(
         schedule_incumbent_verifications: None,
         schedule_incumbent_verification_rejections: None,
         schedule_incumbent_verification_interruptions: None,
+        schedule_incumbent_verification_seconds: None,
+        schedule_incumbent_verification_max_seconds: None,
         schedule_incumbent_incomplete_rejections: None,
         schedule_restart_boundaries: None,
         schedule_restart_work: None,
@@ -1078,9 +1270,197 @@ fn make_solution(
         schedule_tabu_hits: None,
         schedule_tabu_aspirations: None,
         schedule_tabu_forced_moves: None,
+        schedule_tsab_owner_worker_mask: None,
+        schedule_tsab_n5_generated: None,
+        schedule_tsab_ranked: None,
+        schedule_tsab_shortlists: None,
+        schedule_tsab_delta_probes: None,
+        schedule_tsab_additional_delta_probes: None,
+        schedule_tsab_full_oracle_commits: None,
+        schedule_tsab_selected_shortlist_rank_sum: None,
+        schedule_tsab_selections: None,
+        schedule_tsab_aspirations: None,
+        schedule_tsab_tabu_rejections: None,
+        schedule_tsab_tabu_resets: None,
+        schedule_tsab_fingerprint_repeats: None,
+        schedule_tsab_escape_signals: None,
+        schedule_tsab_n1_kicks: None,
+        schedule_tsab_kick_moves: None,
+        schedule_tsab_elite_restarts: None,
+        schedule_tsab_n6_kicks: None,
+        schedule_tsab_restart_attempts: None,
+        schedule_tsab_restart_global_rebases: None,
+        schedule_tsab_restart_n6_generated: None,
+        schedule_tsab_restart_delta_probes: None,
+        schedule_tsab_restart_oracle_commits: None,
+        schedule_tsab_restart_rejections: None,
+        schedule_tsab_restart_interruptions: None,
+        schedule_tsab_restart_work_units: None,
+        schedule_tsab_restart_best_base_objective: None,
+        schedule_tsab_restart_best_kicked_objective: None,
+        schedule_tsab_post_restart_improvements: None,
+        schedule_tsab_restart_shortlist_peak_bytes: None,
+        schedule_tsab_ranking_audits: None,
+        schedule_tsab_exact_best_matches: None,
+        schedule_tsab_regret_sum: None,
+        schedule_tsab_regret_max: None,
+        schedule_tsab_workspace_peak_bytes: None,
+        schedule_tsab_activations: None,
+        schedule_tsab_activation_boundary: None,
+        schedule_tsab_legacy_warmup_work_steps: None,
+        schedule_tsab_activation_rebases: None,
+        schedule_tsab_activation_objective: None,
+        schedule_tsab_active_boundaries: None,
+        schedule_tsab_burst_work_limit: None,
+        schedule_tsab_burst_work_units: None,
+        schedule_tsab_improving_commits: None,
+        schedule_tsab_best_committed_objective: None,
+        schedule_tsab_fast_enabled: None,
+        schedule_tsab_fast_eligible: None,
+        schedule_tsab_fast_disabled: None,
+        schedule_tsab_fast_attempts: None,
+        schedule_tsab_fast_commits: None,
+        schedule_tsab_fast_fallbacks: None,
+        schedule_tsab_fast_date_changes: None,
+        schedule_tsab_fast_queue_pops: None,
+        schedule_tsab_fast_full_validations: None,
+        schedule_tsab_fast_oracle_mismatches: None,
+        schedule_tsab_fast_pending_promotions: None,
+        schedule_tsab_fast_pending_discards: None,
+        schedule_tsab_fast_transitions: None,
+        schedule_tsab_fast_work_units: None,
+        schedule_tsab_fast_elapsed_seconds: None,
+        schedule_tsab_fast_workspace_peak_bytes: None,
         schedule_session_initializations: None,
         schedule_session_resumes: None,
         schedule_session_rebases: None,
+        schedule_island_profile_mask: None,
+        schedule_baseline_island_profile_mask: None,
+        schedule_scored_island_profile_mask: None,
+        schedule_island_profile_count: None,
+        schedule_profile_construction_seconds: None,
+        schedule_profile_initial_objectives: None,
+        schedule_profile_initial_dispatch_rules: None,
+        schedule_profile_best_objectives: None,
+        schedule_profile_work_steps: None,
+        schedule_construction_bucket_visits: None,
+        schedule_construction_heap_pushes: None,
+        schedule_construction_stale_pops: None,
+        schedule_construction_heap_rebuilds: None,
+        schedule_construction_heap_peak: None,
+        schedule_reactive_restarts: None,
+        schedule_reactive_restart_dispatches: None,
+        schedule_reactive_restart_perturbations: None,
+        schedule_reactive_restart_rebuild_failures: None,
+        schedule_island_scored_candidates: None,
+        schedule_island_shortlisted_candidates: None,
+        schedule_approximate_candidates_generated: None,
+        schedule_approximate_candidates_refined: None,
+        schedule_approximate_candidates_certified: None,
+        schedule_approximate_candidates_unknown: None,
+        schedule_approximation_score_items: None,
+        schedule_approximation_sort_items: None,
+        schedule_approximation_local_span_items: None,
+        schedule_approximation_elapsed_seconds: None,
+        schedule_approximation_work_units: None,
+        schedule_direct_oracle_attempts: None,
+        schedule_direct_oracle_accepts: None,
+        schedule_direct_oracle_cycles: None,
+        schedule_direct_oracle_windows: None,
+        schedule_direct_oracle_objective_rejections: None,
+        schedule_exact_probes_avoided: None,
+        schedule_search_elite_pool_size: None,
+        schedule_search_elite_batches: None,
+        schedule_search_elite_batches_skipped_after_stop: None,
+        schedule_search_elite_candidates: None,
+        schedule_search_elite_insertions: None,
+        schedule_search_elite_duplicates: None,
+        schedule_search_elite_dominated: None,
+        schedule_search_elite_evictions: None,
+        schedule_search_elite_interruptions: None,
+        schedule_search_elite_merge_errors: None,
+        schedule_search_elite_snapshot_captures: None,
+        schedule_search_elite_snapshot_interruptions: None,
+        schedule_search_elite_snapshot_errors: None,
+        schedule_search_elite_objectives: None,
+        schedule_search_elite_pairwise_distances_ppm: None,
+        schedule_search_elite_min_distance_ppm: None,
+        schedule_search_elite_mean_distance_ppm: None,
+        schedule_search_elite_max_distance_ppm: None,
+        schedule_search_elite_capture_worker_seconds_sum: None,
+        schedule_search_elite_merge_wall_seconds: None,
+        schedule_search_elite_heap_lower_bound_bytes: None,
+        schedule_search_elite_peak_heap_lower_bound_bytes: None,
+        schedule_lns_shadow_enabled: None,
+        schedule_lns_shadow_active: None,
+        schedule_lns_shadow_owner_worker_mask: None,
+        schedule_lns_attempts: None,
+        schedule_lns_selected_operations: None,
+        schedule_lns_feasible: None,
+        schedule_lns_reconstructed: None,
+        schedule_lns_improvements: None,
+        schedule_lns_shadow_improvements: None,
+        schedule_lns_shadow_improvement_sum: None,
+        schedule_lns_shadow_best_improvement: None,
+        schedule_lns_timeouts: None,
+        schedule_lns_interruptions: None,
+        schedule_lns_infeasible: None,
+        schedule_lns_non_improving: None,
+        schedule_lns_reconstruction_rejections: None,
+        schedule_lns_oracle_rejections: None,
+        schedule_lns_exact_rejections: None,
+        schedule_lns_worker_seconds_sum: None,
+        schedule_lns_workspace_peak_bytes: None,
+        schedule_constructor_workers_requested: None,
+        schedule_constructor_multistart_enabled: None,
+        schedule_constructor_multistart_active: None,
+        schedule_constructor_multistart_owner_worker_mask: None,
+        schedule_constructor_multistart_attempts: None,
+        schedule_constructor_multistart_constructions: None,
+        schedule_constructor_multistart_interruptions: None,
+        schedule_constructor_multistart_failures: None,
+        schedule_constructor_multistart_feasible: None,
+        schedule_constructor_multistart_distinct_fingerprints: None,
+        schedule_constructor_multistart_other_fingerprint_observations: None,
+        schedule_constructor_multistart_initial_objective: None,
+        schedule_constructor_multistart_best_objective: None,
+        schedule_constructor_multistart_improvements: None,
+        schedule_constructor_multistart_work_units: None,
+        schedule_constructor_multistart_worker_seconds_sum: None,
+        schedule_constructor_multistart_workspace_peak_bytes: None,
+        schedule_constructor_multistart_best_ordinal: None,
+        schedule_constructor_multistart_best_seed: None,
+        schedule_constructor_multistart_best_fingerprint: None,
+        schedule_constructor_multistart_next_ordinal: None,
+        schedule_path_relink_enabled: None,
+        schedule_path_relink_active: None,
+        schedule_path_relink_guide_requests: None,
+        schedule_path_relink_best_guides: None,
+        schedule_path_relink_diverse_guides: None,
+        schedule_path_relink_guide_loads: None,
+        schedule_path_relink_guide_incompatible: None,
+        schedule_path_relink_guide_interruptions: None,
+        schedule_path_relink_critical_operations_scanned: None,
+        schedule_path_relink_candidates_generated: None,
+        schedule_path_relink_candidates_positive_gain: None,
+        schedule_path_relink_acyclicity_certified: None,
+        schedule_path_relink_acyclicity_unknown: None,
+        schedule_path_relink_prefilter_rejections: None,
+        schedule_path_relink_candidates_retained: None,
+        schedule_path_relink_candidates_refined: None,
+        schedule_path_relink_candidates_shortlisted: None,
+        schedule_path_relink_no_move: None,
+        schedule_path_relink_guide_arc_gain_shortlisted: None,
+        schedule_path_relink_oracle_attempts: None,
+        schedule_path_relink_oracle_accepts: None,
+        schedule_path_relink_cycle_rejections: None,
+        schedule_path_relink_window_rejections: None,
+        schedule_path_relink_other_rejections: None,
+        schedule_path_relink_rollbacks: None,
+        schedule_path_relink_elite_improvements: None,
+        schedule_path_relink_guide_arc_gain_accepted: None,
+        schedule_path_relink_worker_seconds_sum: None,
+        schedule_path_relink_workspace_peak_bytes: None,
         full_recompute_percentage: None,
         backend_build_seconds: None,
         construction_seconds: None,
@@ -1125,6 +1505,14 @@ fn parse_engine(engine: &str) -> PyResult<PythonEngine> {
         "exact" => Ok(PythonEngine::Exact),
         "ls" => Ok(PythonEngine::Ls),
         _ => Err(PyValueError::new_err("engine must be 'auto', 'exact', or 'ls'")),
+    }
+}
+
+fn parse_schedule_jssp_search(strategy: &str) -> PyResult<ScheduleJsspSearch> {
+    match strategy {
+        "legacy" => Ok(ScheduleJsspSearch::Legacy),
+        "tsab-candidate" => Ok(ScheduleJsspSearch::TsabCandidate),
+        _ => Err(PyValueError::new_err("schedule_jssp_search must be 'legacy' or 'tsab-candidate'")),
     }
 }
 
@@ -1603,6 +1991,231 @@ fn verbose_collection_finish(solution: &PySolution, run: &CollectionRun, profile
                     println!("  schedule session initializations: {}", solution.schedule_session_initializations.unwrap_or(0));
                     println!("  schedule session resumes: {}", solution.schedule_session_resumes.unwrap_or(0));
                     println!("  schedule session rebases: {}", solution.schedule_session_rebases.unwrap_or(0));
+                    println!("  schedule island profile mask: {}", solution.schedule_island_profile_mask.unwrap_or(0));
+                    println!("  schedule baseline island profile mask: {}", solution.schedule_baseline_island_profile_mask.unwrap_or(0));
+                    println!("  schedule scored island profile mask: {}", solution.schedule_scored_island_profile_mask.unwrap_or(0));
+                    println!("  schedule island profile count: {}", solution.schedule_island_profile_count.unwrap_or(0));
+                    println!(
+                        "  schedule profile construction seconds: {}",
+                        solution.schedule_profile_construction_seconds.as_deref().unwrap_or("none")
+                    );
+                    println!(
+                        "  schedule profile initial objectives: {}",
+                        solution.schedule_profile_initial_objectives.as_deref().unwrap_or("none")
+                    );
+                    println!(
+                        "  schedule profile initial dispatch rules: {}",
+                        solution.schedule_profile_initial_dispatch_rules.as_deref().unwrap_or("none")
+                    );
+                    println!(
+                        "  schedule profile best objectives: {}",
+                        solution.schedule_profile_best_objectives.as_deref().unwrap_or("none")
+                    );
+                    println!("  schedule construction bucket visits: {}", solution.schedule_construction_bucket_visits.unwrap_or(0));
+                    println!("  schedule construction heap pushes: {}", solution.schedule_construction_heap_pushes.unwrap_or(0));
+                    println!("  schedule construction stale pops: {}", solution.schedule_construction_stale_pops.unwrap_or(0));
+                    println!("  schedule construction heap rebuilds: {}", solution.schedule_construction_heap_rebuilds.unwrap_or(0));
+                    println!("  schedule construction heap peak: {}", solution.schedule_construction_heap_peak.unwrap_or(0));
+                    println!("  schedule reactive restarts: {}", solution.schedule_reactive_restarts.unwrap_or(0));
+                    println!("  schedule reactive restart dispatches: {}", solution.schedule_reactive_restart_dispatches.unwrap_or(0));
+                    println!(
+                        "  schedule reactive restart perturbations: {}",
+                        solution.schedule_reactive_restart_perturbations.unwrap_or(0)
+                    );
+                    println!(
+                        "  schedule reactive restart rebuild failures: {}",
+                        solution.schedule_reactive_restart_rebuild_failures.unwrap_or(0)
+                    );
+                    println!("  schedule island scored candidates: {}", solution.schedule_island_scored_candidates.unwrap_or(0));
+                    println!("  schedule island shortlisted candidates: {}", solution.schedule_island_shortlisted_candidates.unwrap_or(0));
+                    println!(
+                        "  schedule approximate candidates generated: {}",
+                        solution.schedule_approximate_candidates_generated.unwrap_or(0)
+                    );
+                    println!(
+                        "  schedule approximate candidates refined: {}",
+                        solution.schedule_approximate_candidates_refined.unwrap_or(0)
+                    );
+                    println!(
+                        "  schedule approximate candidates certified: {}",
+                        solution.schedule_approximate_candidates_certified.unwrap_or(0)
+                    );
+                    println!(
+                        "  schedule approximate candidates unknown: {}",
+                        solution.schedule_approximate_candidates_unknown.unwrap_or(0)
+                    );
+                    println!("  schedule approximation score items: {}", solution.schedule_approximation_score_items.unwrap_or(0));
+                    println!("  schedule approximation sort items: {}", solution.schedule_approximation_sort_items.unwrap_or(0));
+                    println!(
+                        "  schedule approximation local span items: {}",
+                        solution.schedule_approximation_local_span_items.unwrap_or(0)
+                    );
+                    println!("  schedule approximation elapsed: {:.6} s", solution.schedule_approximation_elapsed_seconds.unwrap_or(0.0));
+                    println!("  schedule approximation work units: {}", solution.schedule_approximation_work_units.unwrap_or(0));
+                    println!("  schedule direct oracle attempts: {}", solution.schedule_direct_oracle_attempts.unwrap_or(0));
+                    println!("  schedule direct oracle accepts: {}", solution.schedule_direct_oracle_accepts.unwrap_or(0));
+                    println!("  schedule direct oracle cycles: {}", solution.schedule_direct_oracle_cycles.unwrap_or(0));
+                    println!("  schedule direct oracle windows: {}", solution.schedule_direct_oracle_windows.unwrap_or(0));
+                    println!(
+                        "  schedule direct oracle objective rejections: {}",
+                        solution.schedule_direct_oracle_objective_rejections.unwrap_or(0)
+                    );
+                    println!("  schedule exact probes avoided: {}", solution.schedule_exact_probes_avoided.unwrap_or(0));
+                    println!("  schedule search elite pool size: {}", solution.schedule_search_elite_pool_size.unwrap_or(0));
+                    println!("  schedule search elite batches: {}", solution.schedule_search_elite_batches.unwrap_or(0));
+                    println!(
+                        "  schedule search elite batches skipped after stop: {}",
+                        solution.schedule_search_elite_batches_skipped_after_stop.unwrap_or(0)
+                    );
+                    println!("  schedule search elite candidates: {}", solution.schedule_search_elite_candidates.unwrap_or(0));
+                    println!("  schedule search elite insertions: {}", solution.schedule_search_elite_insertions.unwrap_or(0));
+                    println!("  schedule search elite duplicates: {}", solution.schedule_search_elite_duplicates.unwrap_or(0));
+                    println!("  schedule search elite dominated: {}", solution.schedule_search_elite_dominated.unwrap_or(0));
+                    println!("  schedule search elite evictions: {}", solution.schedule_search_elite_evictions.unwrap_or(0));
+                    println!("  schedule search elite interruptions: {}", solution.schedule_search_elite_interruptions.unwrap_or(0));
+                    println!("  schedule search elite merge errors: {}", solution.schedule_search_elite_merge_errors.unwrap_or(0));
+                    println!(
+                        "  schedule search elite snapshot captures: {}",
+                        solution.schedule_search_elite_snapshot_captures.unwrap_or(0)
+                    );
+                    println!(
+                        "  schedule search elite snapshot interruptions: {}",
+                        solution.schedule_search_elite_snapshot_interruptions.unwrap_or(0)
+                    );
+                    println!("  schedule search elite snapshot errors: {}", solution.schedule_search_elite_snapshot_errors.unwrap_or(0));
+                    println!(
+                        "  schedule search elite objectives: {}",
+                        solution.schedule_search_elite_objectives.as_deref().unwrap_or("none")
+                    );
+                    println!(
+                        "  schedule search elite pairwise distances ppm: {}",
+                        solution.schedule_search_elite_pairwise_distances_ppm.as_deref().unwrap_or("none")
+                    );
+                    println!(
+                        "  schedule search elite min distance ppm: {}",
+                        solution.schedule_search_elite_min_distance_ppm.map_or_else(|| "none".to_string(), |value| value.to_string())
+                    );
+                    println!(
+                        "  schedule search elite mean distance ppm: {}",
+                        solution.schedule_search_elite_mean_distance_ppm.map_or_else(|| "none".to_string(), |value| value.to_string())
+                    );
+                    println!(
+                        "  schedule search elite max distance ppm: {}",
+                        solution.schedule_search_elite_max_distance_ppm.map_or_else(|| "none".to_string(), |value| value.to_string())
+                    );
+                    println!(
+                        "  schedule search elite capture worker seconds sum: {:.6}",
+                        solution.schedule_search_elite_capture_worker_seconds_sum.unwrap_or(0.0)
+                    );
+                    println!(
+                        "  schedule search elite merge wall seconds: {:.6}",
+                        solution.schedule_search_elite_merge_wall_seconds.unwrap_or(0.0)
+                    );
+                    println!(
+                        "  schedule search elite heap lower bound bytes: {}",
+                        solution.schedule_search_elite_heap_lower_bound_bytes.unwrap_or(0)
+                    );
+                    println!(
+                        "  schedule search elite peak heap lower bound bytes: {}",
+                        solution.schedule_search_elite_peak_heap_lower_bound_bytes.unwrap_or(0)
+                    );
+                    println!("  schedule LNS shadow enabled: {}", solution.schedule_lns_shadow_enabled.unwrap_or(0));
+                    println!("  schedule LNS shadow active: {}", solution.schedule_lns_shadow_active.unwrap_or(0));
+                    println!("  schedule LNS shadow owner worker mask: {}", solution.schedule_lns_shadow_owner_worker_mask.unwrap_or(0));
+                    println!("  schedule LNS attempts: {}", solution.schedule_lns_attempts.unwrap_or(0));
+                    println!("  schedule LNS selected operations: {}", solution.schedule_lns_selected_operations.unwrap_or(0));
+                    println!("  schedule LNS feasible: {}", solution.schedule_lns_feasible.unwrap_or(0));
+                    println!("  schedule LNS reconstructed: {}", solution.schedule_lns_reconstructed.unwrap_or(0));
+                    println!("  schedule LNS improvements: {}", solution.schedule_lns_improvements.unwrap_or(0));
+                    println!("  schedule LNS shadow improvements: {}", solution.schedule_lns_shadow_improvements.unwrap_or(0));
+                    println!("  schedule LNS shadow improvement sum: {}", solution.schedule_lns_shadow_improvement_sum.unwrap_or(0));
+                    println!("  schedule LNS shadow best improvement: {}", solution.schedule_lns_shadow_best_improvement.unwrap_or(0));
+                    println!("  schedule LNS timeouts: {}", solution.schedule_lns_timeouts.unwrap_or(0));
+                    println!("  schedule LNS interruptions: {}", solution.schedule_lns_interruptions.unwrap_or(0));
+                    println!("  schedule LNS infeasible: {}", solution.schedule_lns_infeasible.unwrap_or(0));
+                    println!("  schedule LNS non-improving: {}", solution.schedule_lns_non_improving.unwrap_or(0));
+                    println!("  schedule LNS reconstruction rejections: {}", solution.schedule_lns_reconstruction_rejections.unwrap_or(0));
+                    println!("  schedule LNS oracle rejections: {}", solution.schedule_lns_oracle_rejections.unwrap_or(0));
+                    println!("  schedule LNS exact rejections: {}", solution.schedule_lns_exact_rejections.unwrap_or(0));
+                    println!("  schedule LNS worker seconds sum: {:.6}", solution.schedule_lns_worker_seconds_sum.unwrap_or(0.0));
+                    println!("  schedule LNS workspace peak bytes: {}", solution.schedule_lns_workspace_peak_bytes.unwrap_or(0));
+                    println!("  schedule path relink enabled: {}", solution.schedule_path_relink_enabled.unwrap_or(0));
+                    println!("  schedule path relink active: {}", solution.schedule_path_relink_active.unwrap_or(0));
+                    println!("  schedule path relink guide requests: {}", solution.schedule_path_relink_guide_requests.unwrap_or(0));
+                    println!("  schedule path relink best guides: {}", solution.schedule_path_relink_best_guides.unwrap_or(0));
+                    println!("  schedule path relink diverse guides: {}", solution.schedule_path_relink_diverse_guides.unwrap_or(0));
+                    println!("  schedule path relink guide loads: {}", solution.schedule_path_relink_guide_loads.unwrap_or(0));
+                    println!(
+                        "  schedule path relink guide incompatible: {}",
+                        solution.schedule_path_relink_guide_incompatible.unwrap_or(0)
+                    );
+                    println!(
+                        "  schedule path relink guide interruptions: {}",
+                        solution.schedule_path_relink_guide_interruptions.unwrap_or(0)
+                    );
+                    println!(
+                        "  schedule path relink critical operations scanned: {}",
+                        solution.schedule_path_relink_critical_operations_scanned.unwrap_or(0)
+                    );
+                    println!(
+                        "  schedule path relink candidates generated: {}",
+                        solution.schedule_path_relink_candidates_generated.unwrap_or(0)
+                    );
+                    println!(
+                        "  schedule path relink candidates positive gain: {}",
+                        solution.schedule_path_relink_candidates_positive_gain.unwrap_or(0)
+                    );
+                    println!(
+                        "  schedule path relink acyclicity certified: {}",
+                        solution.schedule_path_relink_acyclicity_certified.unwrap_or(0)
+                    );
+                    println!(
+                        "  schedule path relink acyclicity unknown: {}",
+                        solution.schedule_path_relink_acyclicity_unknown.unwrap_or(0)
+                    );
+                    println!(
+                        "  schedule path relink prefilter rejections: {}",
+                        solution.schedule_path_relink_prefilter_rejections.unwrap_or(0)
+                    );
+                    println!(
+                        "  schedule path relink candidates retained: {}",
+                        solution.schedule_path_relink_candidates_retained.unwrap_or(0)
+                    );
+                    println!(
+                        "  schedule path relink candidates refined: {}",
+                        solution.schedule_path_relink_candidates_refined.unwrap_or(0)
+                    );
+                    println!(
+                        "  schedule path relink candidates shortlisted: {}",
+                        solution.schedule_path_relink_candidates_shortlisted.unwrap_or(0)
+                    );
+                    println!("  schedule path relink no move: {}", solution.schedule_path_relink_no_move.unwrap_or(0));
+                    println!(
+                        "  schedule path relink guide arc gain shortlisted: {}",
+                        solution.schedule_path_relink_guide_arc_gain_shortlisted.unwrap_or(0)
+                    );
+                    println!("  schedule path relink oracle attempts: {}", solution.schedule_path_relink_oracle_attempts.unwrap_or(0));
+                    println!("  schedule path relink oracle accepts: {}", solution.schedule_path_relink_oracle_accepts.unwrap_or(0));
+                    println!("  schedule path relink cycle rejections: {}", solution.schedule_path_relink_cycle_rejections.unwrap_or(0));
+                    println!("  schedule path relink window rejections: {}", solution.schedule_path_relink_window_rejections.unwrap_or(0));
+                    println!("  schedule path relink other rejections: {}", solution.schedule_path_relink_other_rejections.unwrap_or(0));
+                    println!("  schedule path relink rollbacks: {}", solution.schedule_path_relink_rollbacks.unwrap_or(0));
+                    println!(
+                        "  schedule path relink elite improvements: {}",
+                        solution.schedule_path_relink_elite_improvements.unwrap_or(0)
+                    );
+                    println!(
+                        "  schedule path relink guide arc gain accepted: {}",
+                        solution.schedule_path_relink_guide_arc_gain_accepted.unwrap_or(0)
+                    );
+                    println!(
+                        "  schedule path relink worker seconds sum: {:.6}",
+                        solution.schedule_path_relink_worker_seconds_sum.unwrap_or(0.0)
+                    );
+                    println!(
+                        "  schedule path relink workspace peak bytes: {}",
+                        solution.schedule_path_relink_workspace_peak_bytes.unwrap_or(0)
+                    );
                 }
                 println!("  full recomputations: {:.2}%", solution.full_recompute_percentage.unwrap_or(0.0));
             }
@@ -2392,6 +3005,16 @@ impl PySolution {
     }
 
     #[getter]
+    fn schedule_incumbent_verification_seconds(&self) -> Option<f64> {
+        self.schedule_incumbent_verification_seconds
+    }
+
+    #[getter]
+    fn schedule_incumbent_verification_max_seconds(&self) -> Option<f64> {
+        self.schedule_incumbent_verification_max_seconds
+    }
+
+    #[getter]
     fn schedule_incumbent_incomplete_rejections(&self) -> Option<u64> {
         self.schedule_incumbent_incomplete_rejections
     }
@@ -2597,6 +3220,311 @@ impl PySolution {
     }
 
     #[getter]
+    fn schedule_tsab_owner_worker_mask(&self) -> Option<u64> {
+        self.schedule_tsab_owner_worker_mask
+    }
+
+    #[getter]
+    fn schedule_tsab_n5_generated(&self) -> Option<u64> {
+        self.schedule_tsab_n5_generated
+    }
+
+    #[getter]
+    fn schedule_tsab_ranked(&self) -> Option<u64> {
+        self.schedule_tsab_ranked
+    }
+
+    #[getter]
+    fn schedule_tsab_shortlists(&self) -> Option<u64> {
+        self.schedule_tsab_shortlists
+    }
+
+    #[getter]
+    fn schedule_tsab_delta_probes(&self) -> Option<u64> {
+        self.schedule_tsab_delta_probes
+    }
+
+    #[getter]
+    fn schedule_tsab_additional_delta_probes(&self) -> Option<u64> {
+        self.schedule_tsab_additional_delta_probes
+    }
+
+    #[getter]
+    fn schedule_tsab_full_oracle_commits(&self) -> Option<u64> {
+        self.schedule_tsab_full_oracle_commits
+    }
+
+    #[getter]
+    fn schedule_tsab_selected_shortlist_rank_sum(&self) -> Option<u64> {
+        self.schedule_tsab_selected_shortlist_rank_sum
+    }
+
+    #[getter]
+    fn schedule_tsab_selections(&self) -> Option<u64> {
+        self.schedule_tsab_selections
+    }
+
+    #[getter]
+    fn schedule_tsab_aspirations(&self) -> Option<u64> {
+        self.schedule_tsab_aspirations
+    }
+
+    #[getter]
+    fn schedule_tsab_tabu_rejections(&self) -> Option<u64> {
+        self.schedule_tsab_tabu_rejections
+    }
+
+    #[getter]
+    fn schedule_tsab_tabu_resets(&self) -> Option<u64> {
+        self.schedule_tsab_tabu_resets
+    }
+
+    #[getter]
+    fn schedule_tsab_fingerprint_repeats(&self) -> Option<u64> {
+        self.schedule_tsab_fingerprint_repeats
+    }
+
+    #[getter]
+    fn schedule_tsab_escape_signals(&self) -> Option<u64> {
+        self.schedule_tsab_escape_signals
+    }
+
+    #[getter]
+    fn schedule_tsab_n1_kicks(&self) -> Option<u64> {
+        self.schedule_tsab_n1_kicks
+    }
+
+    #[getter]
+    fn schedule_tsab_kick_moves(&self) -> Option<u64> {
+        self.schedule_tsab_kick_moves
+    }
+
+    #[getter]
+    fn schedule_tsab_elite_restarts(&self) -> Option<u64> {
+        self.schedule_tsab_elite_restarts
+    }
+
+    #[getter]
+    fn schedule_tsab_n6_kicks(&self) -> Option<u64> {
+        self.schedule_tsab_n6_kicks
+    }
+
+    #[getter]
+    fn schedule_tsab_restart_attempts(&self) -> Option<u64> {
+        self.schedule_tsab_restart_attempts
+    }
+
+    #[getter]
+    fn schedule_tsab_restart_global_rebases(&self) -> Option<u64> {
+        self.schedule_tsab_restart_global_rebases
+    }
+
+    #[getter]
+    fn schedule_tsab_restart_n6_generated(&self) -> Option<u64> {
+        self.schedule_tsab_restart_n6_generated
+    }
+
+    #[getter]
+    fn schedule_tsab_restart_delta_probes(&self) -> Option<u64> {
+        self.schedule_tsab_restart_delta_probes
+    }
+
+    #[getter]
+    fn schedule_tsab_restart_oracle_commits(&self) -> Option<u64> {
+        self.schedule_tsab_restart_oracle_commits
+    }
+
+    #[getter]
+    fn schedule_tsab_restart_rejections(&self) -> Option<u64> {
+        self.schedule_tsab_restart_rejections
+    }
+
+    #[getter]
+    fn schedule_tsab_restart_interruptions(&self) -> Option<u64> {
+        self.schedule_tsab_restart_interruptions
+    }
+
+    #[getter]
+    fn schedule_tsab_restart_work_units(&self) -> Option<u64> {
+        self.schedule_tsab_restart_work_units
+    }
+
+    #[getter]
+    fn schedule_tsab_restart_best_base_objective(&self) -> Option<i64> {
+        self.schedule_tsab_restart_best_base_objective
+    }
+
+    #[getter]
+    fn schedule_tsab_restart_best_kicked_objective(&self) -> Option<i64> {
+        self.schedule_tsab_restart_best_kicked_objective
+    }
+
+    #[getter]
+    fn schedule_tsab_post_restart_improvements(&self) -> Option<u64> {
+        self.schedule_tsab_post_restart_improvements
+    }
+
+    #[getter]
+    fn schedule_tsab_restart_shortlist_peak_bytes(&self) -> Option<u64> {
+        self.schedule_tsab_restart_shortlist_peak_bytes
+    }
+
+    #[getter]
+    fn schedule_tsab_ranking_audits(&self) -> Option<u64> {
+        self.schedule_tsab_ranking_audits
+    }
+
+    #[getter]
+    fn schedule_tsab_exact_best_matches(&self) -> Option<u64> {
+        self.schedule_tsab_exact_best_matches
+    }
+
+    #[getter]
+    fn schedule_tsab_regret_sum(&self) -> Option<u64> {
+        self.schedule_tsab_regret_sum
+    }
+
+    #[getter]
+    fn schedule_tsab_regret_max(&self) -> Option<u64> {
+        self.schedule_tsab_regret_max
+    }
+
+    #[getter]
+    fn schedule_tsab_workspace_peak_bytes(&self) -> Option<u64> {
+        self.schedule_tsab_workspace_peak_bytes
+    }
+
+    #[getter]
+    fn schedule_tsab_activations(&self) -> Option<u64> {
+        self.schedule_tsab_activations
+    }
+
+    #[getter]
+    fn schedule_tsab_activation_boundary(&self) -> Option<u64> {
+        self.schedule_tsab_activation_boundary
+    }
+
+    #[getter]
+    fn schedule_tsab_legacy_warmup_work_steps(&self) -> Option<u64> {
+        self.schedule_tsab_legacy_warmup_work_steps
+    }
+
+    #[getter]
+    fn schedule_tsab_activation_rebases(&self) -> Option<u64> {
+        self.schedule_tsab_activation_rebases
+    }
+
+    #[getter]
+    fn schedule_tsab_activation_objective(&self) -> Option<i64> {
+        self.schedule_tsab_activation_objective
+    }
+
+    #[getter]
+    fn schedule_tsab_active_boundaries(&self) -> Option<u64> {
+        self.schedule_tsab_active_boundaries
+    }
+
+    #[getter]
+    fn schedule_tsab_burst_work_limit(&self) -> Option<u64> {
+        self.schedule_tsab_burst_work_limit
+    }
+
+    #[getter]
+    fn schedule_tsab_burst_work_units(&self) -> Option<u64> {
+        self.schedule_tsab_burst_work_units
+    }
+
+    #[getter]
+    fn schedule_tsab_improving_commits(&self) -> Option<u64> {
+        self.schedule_tsab_improving_commits
+    }
+
+    #[getter]
+    fn schedule_tsab_best_committed_objective(&self) -> Option<i64> {
+        self.schedule_tsab_best_committed_objective
+    }
+
+    #[getter]
+    fn schedule_tsab_fast_enabled(&self) -> Option<u64> {
+        self.schedule_tsab_fast_enabled
+    }
+
+    #[getter]
+    fn schedule_tsab_fast_eligible(&self) -> Option<u64> {
+        self.schedule_tsab_fast_eligible
+    }
+
+    #[getter]
+    fn schedule_tsab_fast_disabled(&self) -> Option<u64> {
+        self.schedule_tsab_fast_disabled
+    }
+
+    #[getter]
+    fn schedule_tsab_fast_attempts(&self) -> Option<u64> {
+        self.schedule_tsab_fast_attempts
+    }
+
+    #[getter]
+    fn schedule_tsab_fast_commits(&self) -> Option<u64> {
+        self.schedule_tsab_fast_commits
+    }
+
+    #[getter]
+    fn schedule_tsab_fast_fallbacks(&self) -> Option<u64> {
+        self.schedule_tsab_fast_fallbacks
+    }
+
+    #[getter]
+    fn schedule_tsab_fast_date_changes(&self) -> Option<u64> {
+        self.schedule_tsab_fast_date_changes
+    }
+
+    #[getter]
+    fn schedule_tsab_fast_queue_pops(&self) -> Option<u64> {
+        self.schedule_tsab_fast_queue_pops
+    }
+
+    #[getter]
+    fn schedule_tsab_fast_full_validations(&self) -> Option<u64> {
+        self.schedule_tsab_fast_full_validations
+    }
+
+    #[getter]
+    fn schedule_tsab_fast_oracle_mismatches(&self) -> Option<u64> {
+        self.schedule_tsab_fast_oracle_mismatches
+    }
+
+    #[getter]
+    fn schedule_tsab_fast_pending_promotions(&self) -> Option<u64> {
+        self.schedule_tsab_fast_pending_promotions
+    }
+
+    #[getter]
+    fn schedule_tsab_fast_pending_discards(&self) -> Option<u64> {
+        self.schedule_tsab_fast_pending_discards
+    }
+
+    #[getter]
+    fn schedule_tsab_fast_transitions(&self) -> Option<u64> {
+        self.schedule_tsab_fast_transitions
+    }
+
+    #[getter]
+    fn schedule_tsab_fast_work_units(&self) -> Option<u64> {
+        self.schedule_tsab_fast_work_units
+    }
+
+    #[getter]
+    fn schedule_tsab_fast_elapsed_seconds(&self) -> Option<f64> {
+        self.schedule_tsab_fast_elapsed_seconds
+    }
+
+    #[getter]
+    fn schedule_tsab_fast_workspace_peak_bytes(&self) -> Option<u64> {
+        self.schedule_tsab_fast_workspace_peak_bytes
+    }
+
+    #[getter]
     fn schedule_session_initializations(&self) -> Option<u64> {
         self.schedule_session_initializations
     }
@@ -2609,6 +3537,641 @@ impl PySolution {
     #[getter]
     fn schedule_session_rebases(&self) -> Option<u64> {
         self.schedule_session_rebases
+    }
+
+    #[getter]
+    fn schedule_island_profile_mask(&self) -> Option<u64> {
+        self.schedule_island_profile_mask
+    }
+
+    #[getter]
+    fn schedule_baseline_island_profile_mask(&self) -> Option<u64> {
+        self.schedule_baseline_island_profile_mask
+    }
+
+    #[getter]
+    fn schedule_scored_island_profile_mask(&self) -> Option<u64> {
+        self.schedule_scored_island_profile_mask
+    }
+
+    #[getter]
+    fn schedule_island_profile_count(&self) -> Option<u64> {
+        self.schedule_island_profile_count
+    }
+
+    #[getter]
+    fn schedule_profile_construction_seconds(&self) -> Option<String> {
+        self.schedule_profile_construction_seconds.clone()
+    }
+
+    #[getter]
+    fn schedule_profile_initial_objectives(&self) -> Option<String> {
+        self.schedule_profile_initial_objectives.clone()
+    }
+
+    #[getter]
+    fn schedule_profile_initial_dispatch_rules(&self) -> Option<String> {
+        self.schedule_profile_initial_dispatch_rules.clone()
+    }
+
+    #[getter]
+    fn schedule_profile_best_objectives(&self) -> Option<String> {
+        self.schedule_profile_best_objectives.clone()
+    }
+
+    #[getter]
+    fn schedule_profile_work_steps(&self) -> Option<String> {
+        self.schedule_profile_work_steps.clone()
+    }
+
+    #[getter]
+    fn schedule_construction_bucket_visits(&self) -> Option<u64> {
+        self.schedule_construction_bucket_visits
+    }
+
+    #[getter]
+    fn schedule_construction_heap_pushes(&self) -> Option<u64> {
+        self.schedule_construction_heap_pushes
+    }
+
+    #[getter]
+    fn schedule_construction_stale_pops(&self) -> Option<u64> {
+        self.schedule_construction_stale_pops
+    }
+
+    #[getter]
+    fn schedule_construction_heap_rebuilds(&self) -> Option<u64> {
+        self.schedule_construction_heap_rebuilds
+    }
+
+    #[getter]
+    fn schedule_construction_heap_peak(&self) -> Option<u64> {
+        self.schedule_construction_heap_peak
+    }
+
+    #[getter]
+    fn schedule_reactive_restarts(&self) -> Option<u64> {
+        self.schedule_reactive_restarts
+    }
+
+    #[getter]
+    fn schedule_reactive_restart_dispatches(&self) -> Option<u64> {
+        self.schedule_reactive_restart_dispatches
+    }
+
+    #[getter]
+    fn schedule_reactive_restart_perturbations(&self) -> Option<u64> {
+        self.schedule_reactive_restart_perturbations
+    }
+
+    #[getter]
+    fn schedule_reactive_restart_rebuild_failures(&self) -> Option<u64> {
+        self.schedule_reactive_restart_rebuild_failures
+    }
+
+    #[getter]
+    fn schedule_island_scored_candidates(&self) -> Option<u64> {
+        self.schedule_island_scored_candidates
+    }
+
+    #[getter]
+    fn schedule_island_shortlisted_candidates(&self) -> Option<u64> {
+        self.schedule_island_shortlisted_candidates
+    }
+
+    #[getter]
+    fn schedule_approximate_candidates_generated(&self) -> Option<u64> {
+        self.schedule_approximate_candidates_generated
+    }
+
+    #[getter]
+    fn schedule_approximate_candidates_refined(&self) -> Option<u64> {
+        self.schedule_approximate_candidates_refined
+    }
+
+    #[getter]
+    fn schedule_approximate_candidates_certified(&self) -> Option<u64> {
+        self.schedule_approximate_candidates_certified
+    }
+
+    #[getter]
+    fn schedule_approximate_candidates_unknown(&self) -> Option<u64> {
+        self.schedule_approximate_candidates_unknown
+    }
+
+    #[getter]
+    fn schedule_approximation_score_items(&self) -> Option<u64> {
+        self.schedule_approximation_score_items
+    }
+
+    #[getter]
+    fn schedule_approximation_sort_items(&self) -> Option<u64> {
+        self.schedule_approximation_sort_items
+    }
+
+    #[getter]
+    fn schedule_approximation_local_span_items(&self) -> Option<u64> {
+        self.schedule_approximation_local_span_items
+    }
+
+    #[getter]
+    fn schedule_approximation_elapsed_seconds(&self) -> Option<f64> {
+        self.schedule_approximation_elapsed_seconds
+    }
+
+    #[getter]
+    fn schedule_approximation_work_units(&self) -> Option<u64> {
+        self.schedule_approximation_work_units
+    }
+
+    #[getter]
+    fn schedule_direct_oracle_attempts(&self) -> Option<u64> {
+        self.schedule_direct_oracle_attempts
+    }
+
+    #[getter]
+    fn schedule_direct_oracle_accepts(&self) -> Option<u64> {
+        self.schedule_direct_oracle_accepts
+    }
+
+    #[getter]
+    fn schedule_direct_oracle_cycles(&self) -> Option<u64> {
+        self.schedule_direct_oracle_cycles
+    }
+
+    #[getter]
+    fn schedule_direct_oracle_windows(&self) -> Option<u64> {
+        self.schedule_direct_oracle_windows
+    }
+
+    #[getter]
+    fn schedule_direct_oracle_objective_rejections(&self) -> Option<u64> {
+        self.schedule_direct_oracle_objective_rejections
+    }
+
+    #[getter]
+    fn schedule_exact_probes_avoided(&self) -> Option<u64> {
+        self.schedule_exact_probes_avoided
+    }
+
+    #[getter]
+    fn schedule_search_elite_pool_size(&self) -> Option<u64> {
+        self.schedule_search_elite_pool_size
+    }
+
+    #[getter]
+    fn schedule_search_elite_batches(&self) -> Option<u64> {
+        self.schedule_search_elite_batches
+    }
+
+    #[getter]
+    fn schedule_search_elite_batches_skipped_after_stop(&self) -> Option<u64> {
+        self.schedule_search_elite_batches_skipped_after_stop
+    }
+
+    #[getter]
+    fn schedule_search_elite_candidates(&self) -> Option<u64> {
+        self.schedule_search_elite_candidates
+    }
+
+    #[getter]
+    fn schedule_search_elite_insertions(&self) -> Option<u64> {
+        self.schedule_search_elite_insertions
+    }
+
+    #[getter]
+    fn schedule_search_elite_duplicates(&self) -> Option<u64> {
+        self.schedule_search_elite_duplicates
+    }
+
+    #[getter]
+    fn schedule_search_elite_dominated(&self) -> Option<u64> {
+        self.schedule_search_elite_dominated
+    }
+
+    #[getter]
+    fn schedule_search_elite_evictions(&self) -> Option<u64> {
+        self.schedule_search_elite_evictions
+    }
+
+    #[getter]
+    fn schedule_search_elite_interruptions(&self) -> Option<u64> {
+        self.schedule_search_elite_interruptions
+    }
+
+    #[getter]
+    fn schedule_search_elite_merge_errors(&self) -> Option<u64> {
+        self.schedule_search_elite_merge_errors
+    }
+
+    #[getter]
+    fn schedule_search_elite_snapshot_captures(&self) -> Option<u64> {
+        self.schedule_search_elite_snapshot_captures
+    }
+
+    #[getter]
+    fn schedule_search_elite_snapshot_interruptions(&self) -> Option<u64> {
+        self.schedule_search_elite_snapshot_interruptions
+    }
+
+    #[getter]
+    fn schedule_search_elite_snapshot_errors(&self) -> Option<u64> {
+        self.schedule_search_elite_snapshot_errors
+    }
+
+    #[getter]
+    fn schedule_search_elite_objectives(&self) -> Option<String> {
+        self.schedule_search_elite_objectives.clone()
+    }
+
+    #[getter]
+    fn schedule_search_elite_pairwise_distances_ppm(&self) -> Option<String> {
+        self.schedule_search_elite_pairwise_distances_ppm.clone()
+    }
+
+    #[getter]
+    fn schedule_search_elite_min_distance_ppm(&self) -> Option<u64> {
+        self.schedule_search_elite_min_distance_ppm
+    }
+
+    #[getter]
+    fn schedule_search_elite_mean_distance_ppm(&self) -> Option<u64> {
+        self.schedule_search_elite_mean_distance_ppm
+    }
+
+    #[getter]
+    fn schedule_search_elite_max_distance_ppm(&self) -> Option<u64> {
+        self.schedule_search_elite_max_distance_ppm
+    }
+
+    #[getter]
+    fn schedule_search_elite_capture_worker_seconds_sum(&self) -> Option<f64> {
+        self.schedule_search_elite_capture_worker_seconds_sum
+    }
+
+    #[getter]
+    fn schedule_search_elite_merge_wall_seconds(&self) -> Option<f64> {
+        self.schedule_search_elite_merge_wall_seconds
+    }
+
+    #[getter]
+    fn schedule_search_elite_heap_lower_bound_bytes(&self) -> Option<u64> {
+        self.schedule_search_elite_heap_lower_bound_bytes
+    }
+
+    #[getter]
+    fn schedule_search_elite_peak_heap_lower_bound_bytes(&self) -> Option<u64> {
+        self.schedule_search_elite_peak_heap_lower_bound_bytes
+    }
+
+    #[getter]
+    fn schedule_lns_shadow_enabled(&self) -> Option<u64> {
+        self.schedule_lns_shadow_enabled
+    }
+
+    #[getter]
+    fn schedule_lns_shadow_active(&self) -> Option<u64> {
+        self.schedule_lns_shadow_active
+    }
+
+    #[getter]
+    fn schedule_lns_shadow_owner_worker_mask(&self) -> Option<u64> {
+        self.schedule_lns_shadow_owner_worker_mask
+    }
+
+    #[getter]
+    fn schedule_lns_attempts(&self) -> Option<u64> {
+        self.schedule_lns_attempts
+    }
+
+    #[getter]
+    fn schedule_lns_selected_operations(&self) -> Option<u64> {
+        self.schedule_lns_selected_operations
+    }
+
+    #[getter]
+    fn schedule_lns_feasible(&self) -> Option<u64> {
+        self.schedule_lns_feasible
+    }
+
+    #[getter]
+    fn schedule_lns_reconstructed(&self) -> Option<u64> {
+        self.schedule_lns_reconstructed
+    }
+
+    #[getter]
+    fn schedule_lns_improvements(&self) -> Option<u64> {
+        self.schedule_lns_improvements
+    }
+
+    #[getter]
+    fn schedule_lns_shadow_improvements(&self) -> Option<u64> {
+        self.schedule_lns_shadow_improvements
+    }
+
+    #[getter]
+    fn schedule_lns_shadow_improvement_sum(&self) -> Option<u64> {
+        self.schedule_lns_shadow_improvement_sum
+    }
+
+    #[getter]
+    fn schedule_lns_shadow_best_improvement(&self) -> Option<u64> {
+        self.schedule_lns_shadow_best_improvement
+    }
+
+    #[getter]
+    fn schedule_lns_timeouts(&self) -> Option<u64> {
+        self.schedule_lns_timeouts
+    }
+
+    #[getter]
+    fn schedule_lns_interruptions(&self) -> Option<u64> {
+        self.schedule_lns_interruptions
+    }
+
+    #[getter]
+    fn schedule_lns_infeasible(&self) -> Option<u64> {
+        self.schedule_lns_infeasible
+    }
+
+    #[getter]
+    fn schedule_lns_non_improving(&self) -> Option<u64> {
+        self.schedule_lns_non_improving
+    }
+
+    #[getter]
+    fn schedule_lns_reconstruction_rejections(&self) -> Option<u64> {
+        self.schedule_lns_reconstruction_rejections
+    }
+
+    #[getter]
+    fn schedule_lns_oracle_rejections(&self) -> Option<u64> {
+        self.schedule_lns_oracle_rejections
+    }
+
+    #[getter]
+    fn schedule_lns_exact_rejections(&self) -> Option<u64> {
+        self.schedule_lns_exact_rejections
+    }
+
+    #[getter]
+    fn schedule_lns_worker_seconds_sum(&self) -> Option<f64> {
+        self.schedule_lns_worker_seconds_sum
+    }
+
+    #[getter]
+    fn schedule_lns_workspace_peak_bytes(&self) -> Option<u64> {
+        self.schedule_lns_workspace_peak_bytes
+    }
+
+    #[getter]
+    fn schedule_constructor_workers_requested(&self) -> Option<u64> {
+        self.schedule_constructor_workers_requested
+    }
+
+    #[getter]
+    fn schedule_constructor_multistart_enabled(&self) -> Option<u64> {
+        self.schedule_constructor_multistart_enabled
+    }
+
+    #[getter]
+    fn schedule_constructor_multistart_active(&self) -> Option<u64> {
+        self.schedule_constructor_multistart_active
+    }
+
+    #[getter]
+    fn schedule_constructor_multistart_owner_worker_mask(&self) -> Option<u64> {
+        self.schedule_constructor_multistart_owner_worker_mask
+    }
+
+    #[getter]
+    fn schedule_constructor_multistart_attempts(&self) -> Option<u64> {
+        self.schedule_constructor_multistart_attempts
+    }
+
+    #[getter]
+    fn schedule_constructor_multistart_constructions(&self) -> Option<u64> {
+        self.schedule_constructor_multistart_constructions
+    }
+
+    #[getter]
+    fn schedule_constructor_multistart_interruptions(&self) -> Option<u64> {
+        self.schedule_constructor_multistart_interruptions
+    }
+
+    #[getter]
+    fn schedule_constructor_multistart_failures(&self) -> Option<u64> {
+        self.schedule_constructor_multistart_failures
+    }
+
+    #[getter]
+    fn schedule_constructor_multistart_feasible(&self) -> Option<u64> {
+        self.schedule_constructor_multistart_feasible
+    }
+
+    #[getter]
+    fn schedule_constructor_multistart_distinct_fingerprints(&self) -> Option<u64> {
+        self.schedule_constructor_multistart_distinct_fingerprints
+    }
+
+    #[getter]
+    fn schedule_constructor_multistart_other_fingerprint_observations(&self) -> Option<u64> {
+        self.schedule_constructor_multistart_other_fingerprint_observations
+    }
+
+    #[getter]
+    fn schedule_constructor_multistart_initial_objective(&self) -> Option<i64> {
+        self.schedule_constructor_multistart_initial_objective
+    }
+
+    #[getter]
+    fn schedule_constructor_multistart_best_objective(&self) -> Option<i64> {
+        self.schedule_constructor_multistart_best_objective
+    }
+
+    #[getter]
+    fn schedule_constructor_multistart_improvements(&self) -> Option<u64> {
+        self.schedule_constructor_multistart_improvements
+    }
+
+    #[getter]
+    fn schedule_constructor_multistart_work_units(&self) -> Option<u64> {
+        self.schedule_constructor_multistart_work_units
+    }
+
+    #[getter]
+    fn schedule_constructor_multistart_worker_seconds_sum(&self) -> Option<f64> {
+        self.schedule_constructor_multistart_worker_seconds_sum
+    }
+
+    #[getter]
+    fn schedule_constructor_multistart_workspace_peak_bytes(&self) -> Option<u64> {
+        self.schedule_constructor_multistart_workspace_peak_bytes
+    }
+
+    #[getter]
+    fn schedule_constructor_multistart_best_ordinal(&self) -> Option<u64> {
+        self.schedule_constructor_multistart_best_ordinal
+    }
+
+    #[getter]
+    fn schedule_constructor_multistart_best_seed(&self) -> Option<u64> {
+        self.schedule_constructor_multistart_best_seed
+    }
+
+    #[getter]
+    fn schedule_constructor_multistart_best_fingerprint(&self) -> Option<u64> {
+        self.schedule_constructor_multistart_best_fingerprint
+    }
+
+    #[getter]
+    fn schedule_constructor_multistart_next_ordinal(&self) -> Option<u64> {
+        self.schedule_constructor_multistart_next_ordinal
+    }
+
+    #[getter]
+    fn schedule_path_relink_enabled(&self) -> Option<u64> {
+        self.schedule_path_relink_enabled
+    }
+
+    #[getter]
+    fn schedule_path_relink_active(&self) -> Option<u64> {
+        self.schedule_path_relink_active
+    }
+
+    #[getter]
+    fn schedule_path_relink_guide_requests(&self) -> Option<u64> {
+        self.schedule_path_relink_guide_requests
+    }
+
+    #[getter]
+    fn schedule_path_relink_best_guides(&self) -> Option<u64> {
+        self.schedule_path_relink_best_guides
+    }
+
+    #[getter]
+    fn schedule_path_relink_diverse_guides(&self) -> Option<u64> {
+        self.schedule_path_relink_diverse_guides
+    }
+
+    #[getter]
+    fn schedule_path_relink_guide_loads(&self) -> Option<u64> {
+        self.schedule_path_relink_guide_loads
+    }
+
+    #[getter]
+    fn schedule_path_relink_guide_incompatible(&self) -> Option<u64> {
+        self.schedule_path_relink_guide_incompatible
+    }
+
+    #[getter]
+    fn schedule_path_relink_guide_interruptions(&self) -> Option<u64> {
+        self.schedule_path_relink_guide_interruptions
+    }
+
+    #[getter]
+    fn schedule_path_relink_critical_operations_scanned(&self) -> Option<u64> {
+        self.schedule_path_relink_critical_operations_scanned
+    }
+
+    #[getter]
+    fn schedule_path_relink_candidates_generated(&self) -> Option<u64> {
+        self.schedule_path_relink_candidates_generated
+    }
+
+    #[getter]
+    fn schedule_path_relink_candidates_positive_gain(&self) -> Option<u64> {
+        self.schedule_path_relink_candidates_positive_gain
+    }
+
+    #[getter]
+    fn schedule_path_relink_acyclicity_certified(&self) -> Option<u64> {
+        self.schedule_path_relink_acyclicity_certified
+    }
+
+    #[getter]
+    fn schedule_path_relink_acyclicity_unknown(&self) -> Option<u64> {
+        self.schedule_path_relink_acyclicity_unknown
+    }
+
+    #[getter]
+    fn schedule_path_relink_prefilter_rejections(&self) -> Option<u64> {
+        self.schedule_path_relink_prefilter_rejections
+    }
+
+    #[getter]
+    fn schedule_path_relink_candidates_retained(&self) -> Option<u64> {
+        self.schedule_path_relink_candidates_retained
+    }
+
+    #[getter]
+    fn schedule_path_relink_candidates_refined(&self) -> Option<u64> {
+        self.schedule_path_relink_candidates_refined
+    }
+
+    #[getter]
+    fn schedule_path_relink_candidates_shortlisted(&self) -> Option<u64> {
+        self.schedule_path_relink_candidates_shortlisted
+    }
+
+    #[getter]
+    fn schedule_path_relink_no_move(&self) -> Option<u64> {
+        self.schedule_path_relink_no_move
+    }
+
+    #[getter]
+    fn schedule_path_relink_guide_arc_gain_shortlisted(&self) -> Option<u64> {
+        self.schedule_path_relink_guide_arc_gain_shortlisted
+    }
+
+    #[getter]
+    fn schedule_path_relink_oracle_attempts(&self) -> Option<u64> {
+        self.schedule_path_relink_oracle_attempts
+    }
+
+    #[getter]
+    fn schedule_path_relink_oracle_accepts(&self) -> Option<u64> {
+        self.schedule_path_relink_oracle_accepts
+    }
+
+    #[getter]
+    fn schedule_path_relink_cycle_rejections(&self) -> Option<u64> {
+        self.schedule_path_relink_cycle_rejections
+    }
+
+    #[getter]
+    fn schedule_path_relink_window_rejections(&self) -> Option<u64> {
+        self.schedule_path_relink_window_rejections
+    }
+
+    #[getter]
+    fn schedule_path_relink_other_rejections(&self) -> Option<u64> {
+        self.schedule_path_relink_other_rejections
+    }
+
+    #[getter]
+    fn schedule_path_relink_rollbacks(&self) -> Option<u64> {
+        self.schedule_path_relink_rollbacks
+    }
+
+    #[getter]
+    fn schedule_path_relink_elite_improvements(&self) -> Option<u64> {
+        self.schedule_path_relink_elite_improvements
+    }
+
+    #[getter]
+    fn schedule_path_relink_guide_arc_gain_accepted(&self) -> Option<u64> {
+        self.schedule_path_relink_guide_arc_gain_accepted
+    }
+
+    #[getter]
+    fn schedule_path_relink_worker_seconds_sum(&self) -> Option<f64> {
+        self.schedule_path_relink_worker_seconds_sum
+    }
+
+    #[getter]
+    fn schedule_path_relink_workspace_peak_bytes(&self) -> Option<u64> {
+        self.schedule_path_relink_workspace_peak_bytes
     }
 
     #[getter]
@@ -3891,7 +5454,7 @@ impl PyModel {
         Ok(())
     }
 
-    #[pyo3(signature = (*, search=None, search_policy=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, threads=1, engine="auto", conflict_budget=None, list_hint=None, max_iterations=None, profile=false, memory_limit_mb=None, schedule_cdcl=false, routing_two_way=true, routing_nearest_neighbor=true, routing_warm_start=true, linear_backend="auto", lp_root_ms=50, lp_node_ms=0, lp_node_depth_interval=8, lp_max_variables=2000, lp_max_rows=1000, lp_max_nonzeros=100000, lp_min_coverage_percent=1, lp_phase_max_variables=1000, lp_route_ng_size=8, lp_route_max_labels=2000000, lp_route_dual_stabilization_percent=75))]
+    #[pyo3(signature = (*, search=None, search_policy=None, assumptions=None, hints=None, branch_order=None, on_incumbent=None, verbose=false, time_limit=None, seed=0, threads=1, engine="auto", conflict_budget=None, list_hint=None, max_iterations=None, profile=false, memory_limit_mb=None, schedule_cdcl=false, schedule_path_relink=false, schedule_lns_shadow=false, schedule_constructor_workers=0, schedule_jssp_search="legacy", routing_two_way=true, routing_nearest_neighbor=true, routing_warm_start=true, linear_backend="auto", lp_root_ms=50, lp_node_ms=0, lp_node_depth_interval=8, lp_max_variables=2000, lp_max_rows=1000, lp_max_nonzeros=100000, lp_min_coverage_percent=1, lp_phase_max_variables=1000, lp_route_ng_size=8, lp_route_max_labels=2000000, lp_route_dual_stabilization_percent=75))]
     #[allow(clippy::too_many_arguments)]
     fn solve(
         &self,
@@ -3913,6 +5476,10 @@ impl PyModel {
         profile: bool,
         memory_limit_mb: Option<u64>,
         schedule_cdcl: bool,
+        schedule_path_relink: bool,
+        schedule_lns_shadow: bool,
+        schedule_constructor_workers: usize,
+        schedule_jssp_search: &str,
         routing_two_way: bool,
         routing_nearest_neighbor: bool,
         routing_warm_start: bool,
@@ -3991,6 +5558,10 @@ impl PyModel {
             search_policy: search_policy.unwrap_or_default(),
             publish_incumbent_assignments: on_incumbent.is_some(),
             schedule_cdcl,
+            schedule_path_relink,
+            schedule_lns_shadow,
+            schedule_constructor_workers,
+            schedule_jssp_search: parse_schedule_jssp_search(schedule_jssp_search)?,
             routing: RoutingControls {
                 two_way: routing_two_way,
                 nearest_neighbor: routing_nearest_neighbor,
@@ -4731,6 +6302,10 @@ impl PyModel {
         let schedule_incumbent_verifications = schedule_counter("schedule_incumbent_verifications");
         let schedule_incumbent_verification_rejections = schedule_counter("schedule_incumbent_verification_rejections");
         let schedule_incumbent_verification_interruptions = schedule_counter("schedule_incumbent_verification_interruptions");
+        let schedule_incumbent_verification_seconds =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_incumbent_verification_seconds")).flatten();
+        let schedule_incumbent_verification_max_seconds =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_incumbent_verification_max_seconds")).flatten();
         let schedule_incumbent_incomplete_rejections = schedule_counter("schedule_incumbent_incomplete_rejections");
         let schedule_restart_boundaries = schedule_counter("schedule_restart_boundaries");
         let schedule_restart_work = schedule_counter("schedule_restart_work");
@@ -4790,9 +6365,221 @@ impl PyModel {
         let schedule_tabu_hits = schedule_counter("schedule_tabu_hits");
         let schedule_tabu_aspirations = schedule_counter("schedule_tabu_aspirations");
         let schedule_tabu_forced_moves = schedule_counter("schedule_tabu_forced_moves");
+        let schedule_tsab_owner_worker_mask = schedule_counter("schedule_tsab_owner_worker_mask");
+        let schedule_tsab_n5_generated = schedule_counter("schedule_tsab_n5_generated");
+        let schedule_tsab_ranked = schedule_counter("schedule_tsab_ranked");
+        let schedule_tsab_shortlists = schedule_counter("schedule_tsab_shortlists");
+        let schedule_tsab_delta_probes = schedule_counter("schedule_tsab_delta_probes");
+        let schedule_tsab_additional_delta_probes = schedule_counter("schedule_tsab_additional_delta_probes");
+        let schedule_tsab_full_oracle_commits = schedule_counter("schedule_tsab_full_oracle_commits");
+        let schedule_tsab_selected_shortlist_rank_sum = schedule_counter("schedule_tsab_selected_shortlist_rank_sum");
+        let schedule_tsab_selections = schedule_counter("schedule_tsab_selections");
+        let schedule_tsab_aspirations = schedule_counter("schedule_tsab_aspirations");
+        let schedule_tsab_tabu_rejections = schedule_counter("schedule_tsab_tabu_rejections");
+        let schedule_tsab_tabu_resets = schedule_counter("schedule_tsab_tabu_resets");
+        let schedule_tsab_fingerprint_repeats = schedule_counter("schedule_tsab_fingerprint_repeats");
+        let schedule_tsab_escape_signals = schedule_counter("schedule_tsab_escape_signals");
+        let schedule_tsab_n1_kicks = schedule_counter("schedule_tsab_n1_kicks");
+        let schedule_tsab_kick_moves = schedule_counter("schedule_tsab_kick_moves");
+        let schedule_tsab_elite_restarts = schedule_counter("schedule_tsab_elite_restarts");
+        let schedule_tsab_n6_kicks = schedule_counter("schedule_tsab_n6_kicks");
+        let schedule_tsab_restart_attempts = schedule_counter("schedule_tsab_restart_attempts");
+        let schedule_tsab_restart_global_rebases = schedule_counter("schedule_tsab_restart_global_rebases");
+        let schedule_tsab_restart_n6_generated = schedule_counter("schedule_tsab_restart_n6_generated");
+        let schedule_tsab_restart_delta_probes = schedule_counter("schedule_tsab_restart_delta_probes");
+        let schedule_tsab_restart_oracle_commits = schedule_counter("schedule_tsab_restart_oracle_commits");
+        let schedule_tsab_restart_rejections = schedule_counter("schedule_tsab_restart_rejections");
+        let schedule_tsab_restart_interruptions = schedule_counter("schedule_tsab_restart_interruptions");
+        let schedule_tsab_restart_work_units = schedule_counter("schedule_tsab_restart_work_units");
+        let schedule_tsab_restart_best_base_objective =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_tsab_restart_best_base_objective")).flatten();
+        let schedule_tsab_restart_best_kicked_objective =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_tsab_restart_best_kicked_objective")).flatten();
+        let schedule_tsab_post_restart_improvements = schedule_counter("schedule_tsab_post_restart_improvements");
+        let schedule_tsab_restart_shortlist_peak_bytes = schedule_counter("schedule_tsab_restart_shortlist_peak_bytes");
+        let schedule_tsab_ranking_audits = schedule_counter("schedule_tsab_ranking_audits");
+        let schedule_tsab_exact_best_matches = schedule_counter("schedule_tsab_exact_best_matches");
+        let schedule_tsab_regret_sum = schedule_counter("schedule_tsab_regret_sum");
+        let schedule_tsab_regret_max = schedule_counter("schedule_tsab_regret_max");
+        let schedule_tsab_workspace_peak_bytes = schedule_counter("schedule_tsab_workspace_peak_bytes");
+        let schedule_tsab_activations = schedule_counter("schedule_tsab_activations");
+        let schedule_tsab_activation_boundary = schedule_counter("schedule_tsab_activation_boundary");
+        let schedule_tsab_legacy_warmup_work_steps = schedule_counter("schedule_tsab_legacy_warmup_work_steps");
+        let schedule_tsab_activation_rebases = schedule_counter("schedule_tsab_activation_rebases");
+        let schedule_tsab_activation_objective =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_tsab_activation_objective")).flatten();
+        let schedule_tsab_active_boundaries = schedule_counter("schedule_tsab_active_boundaries");
+        let schedule_tsab_burst_work_limit = schedule_counter("schedule_tsab_burst_work_limit");
+        let schedule_tsab_burst_work_units = schedule_counter("schedule_tsab_burst_work_units");
+        let schedule_tsab_improving_commits = schedule_counter("schedule_tsab_improving_commits");
+        let schedule_tsab_best_committed_objective =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_tsab_best_committed_objective")).flatten();
+        let schedule_tsab_fast_enabled = schedule_counter("schedule_tsab_fast_enabled");
+        let schedule_tsab_fast_eligible = schedule_counter("schedule_tsab_fast_eligible");
+        let schedule_tsab_fast_disabled = schedule_counter("schedule_tsab_fast_disabled");
+        let schedule_tsab_fast_attempts = schedule_counter("schedule_tsab_fast_attempts");
+        let schedule_tsab_fast_commits = schedule_counter("schedule_tsab_fast_commits");
+        let schedule_tsab_fast_fallbacks = schedule_counter("schedule_tsab_fast_fallbacks");
+        let schedule_tsab_fast_date_changes = schedule_counter("schedule_tsab_fast_date_changes");
+        let schedule_tsab_fast_queue_pops = schedule_counter("schedule_tsab_fast_queue_pops");
+        let schedule_tsab_fast_full_validations = schedule_counter("schedule_tsab_fast_full_validations");
+        let schedule_tsab_fast_oracle_mismatches = schedule_counter("schedule_tsab_fast_oracle_mismatches");
+        let schedule_tsab_fast_pending_promotions = schedule_counter("schedule_tsab_fast_pending_promotions");
+        let schedule_tsab_fast_pending_discards = schedule_counter("schedule_tsab_fast_pending_discards");
+        let schedule_tsab_fast_transitions = schedule_counter("schedule_tsab_fast_transitions");
+        let schedule_tsab_fast_work_units = schedule_counter("schedule_tsab_fast_work_units");
+        let schedule_tsab_fast_elapsed_seconds =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_tsab_fast_elapsed_seconds")).flatten();
+        let schedule_tsab_fast_workspace_peak_bytes = schedule_counter("schedule_tsab_fast_workspace_peak_bytes");
         let schedule_session_initializations = schedule_counter("schedule_session_initializations");
         let schedule_session_resumes = schedule_counter("schedule_session_resumes");
         let schedule_session_rebases = schedule_counter("schedule_session_rebases");
+        let schedule_island_profile_mask = schedule_counter("schedule_island_profile_mask");
+        let schedule_baseline_island_profile_mask = schedule_counter("schedule_baseline_island_profile_mask");
+        let schedule_scored_island_profile_mask = schedule_counter("schedule_scored_island_profile_mask");
+        let schedule_island_profile_count = schedule_counter("schedule_island_profile_count");
+        let schedule_profile_construction_seconds =
+            expose_schedule_profile.then(|| report_metadata(report, "schedule_profile_construction_seconds").map(str::to_string)).flatten();
+        let schedule_profile_initial_objectives =
+            expose_schedule_profile.then(|| report_metadata(report, "schedule_profile_initial_objectives").map(str::to_string)).flatten();
+        let schedule_profile_initial_dispatch_rules = expose_schedule_profile
+            .then(|| report_metadata(report, "schedule_profile_initial_dispatch_rules").map(str::to_string))
+            .flatten();
+        let schedule_profile_best_objectives =
+            expose_schedule_profile.then(|| report_metadata(report, "schedule_profile_best_objectives").map(str::to_string)).flatten();
+        let schedule_profile_work_steps =
+            expose_schedule_profile.then(|| report_metadata(report, "schedule_profile_work_steps").map(str::to_string)).flatten();
+        let schedule_construction_bucket_visits = schedule_counter("schedule_construction_bucket_visits");
+        let schedule_construction_heap_pushes = schedule_counter("schedule_construction_heap_pushes");
+        let schedule_construction_stale_pops = schedule_counter("schedule_construction_stale_pops");
+        let schedule_construction_heap_rebuilds = schedule_counter("schedule_construction_heap_rebuilds");
+        let schedule_construction_heap_peak = schedule_counter("schedule_construction_heap_peak");
+        let schedule_reactive_restarts = schedule_counter("schedule_reactive_restarts");
+        let schedule_reactive_restart_dispatches = schedule_counter("schedule_reactive_restart_dispatches");
+        let schedule_reactive_restart_perturbations = schedule_counter("schedule_reactive_restart_perturbations");
+        let schedule_reactive_restart_rebuild_failures = schedule_counter("schedule_reactive_restart_rebuild_failures");
+        let schedule_island_scored_candidates = schedule_counter("schedule_island_scored_candidates");
+        let schedule_island_shortlisted_candidates = schedule_counter("schedule_island_shortlisted_candidates");
+        let schedule_approximate_candidates_generated = schedule_counter("schedule_approximate_candidates_generated");
+        let schedule_approximate_candidates_refined = schedule_counter("schedule_approximate_candidates_refined");
+        let schedule_approximate_candidates_certified = schedule_counter("schedule_approximate_candidates_certified");
+        let schedule_approximate_candidates_unknown = schedule_counter("schedule_approximate_candidates_unknown");
+        let schedule_approximation_score_items = schedule_counter("schedule_approximation_score_items");
+        let schedule_approximation_sort_items = schedule_counter("schedule_approximation_sort_items");
+        let schedule_approximation_local_span_items = schedule_counter("schedule_approximation_local_span_items");
+        let schedule_approximation_elapsed_seconds =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_approximation_elapsed_seconds")).flatten();
+        let schedule_approximation_work_units = schedule_counter("schedule_approximation_work_units");
+        let schedule_direct_oracle_attempts = schedule_counter("schedule_direct_oracle_attempts");
+        let schedule_direct_oracle_accepts = schedule_counter("schedule_direct_oracle_accepts");
+        let schedule_direct_oracle_cycles = schedule_counter("schedule_direct_oracle_cycles");
+        let schedule_direct_oracle_windows = schedule_counter("schedule_direct_oracle_windows");
+        let schedule_direct_oracle_objective_rejections = schedule_counter("schedule_direct_oracle_objective_rejections");
+        let schedule_exact_probes_avoided = schedule_counter("schedule_exact_probes_avoided");
+        let schedule_search_elite_pool_size = schedule_counter("schedule_search_elite_pool_size");
+        let schedule_search_elite_batches = schedule_counter("schedule_search_elite_batches");
+        let schedule_search_elite_batches_skipped_after_stop = schedule_counter("schedule_search_elite_batches_skipped_after_stop");
+        let schedule_search_elite_candidates = schedule_counter("schedule_search_elite_candidates");
+        let schedule_search_elite_insertions = schedule_counter("schedule_search_elite_insertions");
+        let schedule_search_elite_duplicates = schedule_counter("schedule_search_elite_duplicates");
+        let schedule_search_elite_dominated = schedule_counter("schedule_search_elite_dominated");
+        let schedule_search_elite_evictions = schedule_counter("schedule_search_elite_evictions");
+        let schedule_search_elite_interruptions = schedule_counter("schedule_search_elite_interruptions");
+        let schedule_search_elite_merge_errors = schedule_counter("schedule_search_elite_merge_errors");
+        let schedule_search_elite_snapshot_captures = schedule_counter("schedule_search_elite_snapshot_captures");
+        let schedule_search_elite_snapshot_interruptions = schedule_counter("schedule_search_elite_snapshot_interruptions");
+        let schedule_search_elite_snapshot_errors = schedule_counter("schedule_search_elite_snapshot_errors");
+        let schedule_search_elite_objectives =
+            expose_schedule_profile.then(|| report_metadata(report, "schedule_search_elite_objectives").map(str::to_string)).flatten();
+        let schedule_search_elite_pairwise_distances_ppm = expose_schedule_profile
+            .then(|| report_metadata(report, "schedule_search_elite_pairwise_distances_ppm").map(str::to_string))
+            .flatten();
+        let schedule_search_elite_min_distance_ppm = schedule_counter("schedule_search_elite_min_distance_ppm");
+        let schedule_search_elite_mean_distance_ppm = schedule_counter("schedule_search_elite_mean_distance_ppm");
+        let schedule_search_elite_max_distance_ppm = schedule_counter("schedule_search_elite_max_distance_ppm");
+        let schedule_search_elite_capture_worker_seconds_sum =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_search_elite_capture_worker_seconds_sum")).flatten();
+        let schedule_search_elite_merge_wall_seconds =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_search_elite_merge_wall_seconds")).flatten();
+        let schedule_search_elite_heap_lower_bound_bytes = schedule_counter("schedule_search_elite_heap_lower_bound_bytes");
+        let schedule_search_elite_peak_heap_lower_bound_bytes = schedule_counter("schedule_search_elite_peak_heap_lower_bound_bytes");
+        let schedule_lns_shadow_enabled = schedule_counter("schedule_lns_shadow_enabled");
+        let schedule_lns_shadow_active = schedule_counter("schedule_lns_shadow_active");
+        let schedule_lns_shadow_owner_worker_mask = schedule_counter("schedule_lns_shadow_owner_worker_mask");
+        let schedule_lns_attempts = schedule_counter("schedule_lns_attempts");
+        let schedule_lns_selected_operations = schedule_counter("schedule_lns_selected_operations");
+        let schedule_lns_feasible = schedule_counter("schedule_lns_feasible");
+        let schedule_lns_reconstructed = schedule_counter("schedule_lns_reconstructed");
+        let schedule_lns_improvements = schedule_counter("schedule_lns_improvements");
+        let schedule_lns_shadow_improvements = schedule_counter("schedule_lns_shadow_improvements");
+        let schedule_lns_shadow_improvement_sum = schedule_counter("schedule_lns_shadow_improvement_sum");
+        let schedule_lns_shadow_best_improvement = schedule_counter("schedule_lns_shadow_best_improvement");
+        let schedule_lns_timeouts = schedule_counter("schedule_lns_timeouts");
+        let schedule_lns_interruptions = schedule_counter("schedule_lns_interruptions");
+        let schedule_lns_infeasible = schedule_counter("schedule_lns_infeasible");
+        let schedule_lns_non_improving = schedule_counter("schedule_lns_non_improving");
+        let schedule_lns_reconstruction_rejections = schedule_counter("schedule_lns_reconstruction_rejections");
+        let schedule_lns_oracle_rejections = schedule_counter("schedule_lns_oracle_rejections");
+        let schedule_lns_exact_rejections = schedule_counter("schedule_lns_exact_rejections");
+        let schedule_lns_worker_seconds_sum =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_lns_worker_seconds_sum")).flatten();
+        let schedule_lns_workspace_peak_bytes = schedule_counter("schedule_lns_workspace_peak_bytes");
+        let schedule_constructor_workers_requested = schedule_counter("schedule_constructor_workers_requested");
+        let schedule_constructor_multistart_enabled = schedule_counter("schedule_constructor_multistart_enabled");
+        let schedule_constructor_multistart_active = schedule_counter("schedule_constructor_multistart_active");
+        let schedule_constructor_multistart_owner_worker_mask = schedule_counter("schedule_constructor_multistart_owner_worker_mask");
+        let schedule_constructor_multistart_attempts = schedule_counter("schedule_constructor_multistart_attempts");
+        let schedule_constructor_multistart_constructions = schedule_counter("schedule_constructor_multistart_constructions");
+        let schedule_constructor_multistart_interruptions = schedule_counter("schedule_constructor_multistart_interruptions");
+        let schedule_constructor_multistart_failures = schedule_counter("schedule_constructor_multistart_failures");
+        let schedule_constructor_multistart_feasible = schedule_counter("schedule_constructor_multistart_feasible");
+        let schedule_constructor_multistart_distinct_fingerprints =
+            schedule_counter("schedule_constructor_multistart_distinct_fingerprints");
+        let schedule_constructor_multistart_other_fingerprint_observations =
+            schedule_counter("schedule_constructor_multistart_other_fingerprint_observations");
+        let schedule_constructor_multistart_initial_objective =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_constructor_multistart_initial_objective")).flatten();
+        let schedule_constructor_multistart_best_objective =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_constructor_multistart_best_objective")).flatten();
+        let schedule_constructor_multistart_improvements = schedule_counter("schedule_constructor_multistart_improvements");
+        let schedule_constructor_multistart_work_units = schedule_counter("schedule_constructor_multistart_work_units");
+        let schedule_constructor_multistart_worker_seconds_sum =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_constructor_multistart_worker_seconds_sum")).flatten();
+        let schedule_constructor_multistart_workspace_peak_bytes = schedule_counter("schedule_constructor_multistart_workspace_peak_bytes");
+        let schedule_constructor_multistart_best_ordinal = schedule_counter("schedule_constructor_multistart_best_ordinal");
+        let schedule_constructor_multistart_best_seed = schedule_counter("schedule_constructor_multistart_best_seed");
+        let schedule_constructor_multistart_best_fingerprint = schedule_counter("schedule_constructor_multistart_best_fingerprint");
+        let schedule_constructor_multistart_next_ordinal = schedule_counter("schedule_constructor_multistart_next_ordinal");
+        let schedule_path_relink_enabled = schedule_counter("schedule_path_relink_enabled");
+        let schedule_path_relink_active = schedule_counter("schedule_path_relink_active");
+        let schedule_path_relink_guide_requests = schedule_counter("schedule_path_relink_guide_requests");
+        let schedule_path_relink_best_guides = schedule_counter("schedule_path_relink_best_guides");
+        let schedule_path_relink_diverse_guides = schedule_counter("schedule_path_relink_diverse_guides");
+        let schedule_path_relink_guide_loads = schedule_counter("schedule_path_relink_guide_loads");
+        let schedule_path_relink_guide_incompatible = schedule_counter("schedule_path_relink_guide_incompatible");
+        let schedule_path_relink_guide_interruptions = schedule_counter("schedule_path_relink_guide_interruptions");
+        let schedule_path_relink_critical_operations_scanned = schedule_counter("schedule_path_relink_critical_operations_scanned");
+        let schedule_path_relink_candidates_generated = schedule_counter("schedule_path_relink_candidates_generated");
+        let schedule_path_relink_candidates_positive_gain = schedule_counter("schedule_path_relink_candidates_positive_gain");
+        let schedule_path_relink_acyclicity_certified = schedule_counter("schedule_path_relink_acyclicity_certified");
+        let schedule_path_relink_acyclicity_unknown = schedule_counter("schedule_path_relink_acyclicity_unknown");
+        let schedule_path_relink_prefilter_rejections = schedule_counter("schedule_path_relink_prefilter_rejections");
+        let schedule_path_relink_candidates_retained = schedule_counter("schedule_path_relink_candidates_retained");
+        let schedule_path_relink_candidates_refined = schedule_counter("schedule_path_relink_candidates_refined");
+        let schedule_path_relink_candidates_shortlisted = schedule_counter("schedule_path_relink_candidates_shortlisted");
+        let schedule_path_relink_no_move = schedule_counter("schedule_path_relink_no_move");
+        let schedule_path_relink_guide_arc_gain_shortlisted = schedule_counter("schedule_path_relink_guide_arc_gain_shortlisted");
+        let schedule_path_relink_oracle_attempts = schedule_counter("schedule_path_relink_oracle_attempts");
+        let schedule_path_relink_oracle_accepts = schedule_counter("schedule_path_relink_oracle_accepts");
+        let schedule_path_relink_cycle_rejections = schedule_counter("schedule_path_relink_cycle_rejections");
+        let schedule_path_relink_window_rejections = schedule_counter("schedule_path_relink_window_rejections");
+        let schedule_path_relink_other_rejections = schedule_counter("schedule_path_relink_other_rejections");
+        let schedule_path_relink_rollbacks = schedule_counter("schedule_path_relink_rollbacks");
+        let schedule_path_relink_elite_improvements = schedule_counter("schedule_path_relink_elite_improvements");
+        let schedule_path_relink_guide_arc_gain_accepted = schedule_counter("schedule_path_relink_guide_arc_gain_accepted");
+        let schedule_path_relink_worker_seconds_sum =
+            expose_schedule_profile.then(|| parse_report_metadata(report, "schedule_path_relink_worker_seconds_sum")).flatten();
+        let schedule_path_relink_workspace_peak_bytes = schedule_counter("schedule_path_relink_workspace_peak_bytes");
         let full_recompute_percentage =
             expose_search_profile.then(|| parse_report_metadata(report, "full_recompute_percentage").unwrap_or_default());
         let construction_seconds = expose_search_profile.then(|| parse_report_metadata(report, "construction_seconds").unwrap_or_default());
@@ -4852,6 +6639,8 @@ impl PyModel {
             schedule_incumbent_verifications,
             schedule_incumbent_verification_rejections,
             schedule_incumbent_verification_interruptions,
+            schedule_incumbent_verification_seconds,
+            schedule_incumbent_verification_max_seconds,
             schedule_incumbent_incomplete_rejections,
             schedule_restart_boundaries,
             schedule_restart_work,
@@ -4893,9 +6682,197 @@ impl PyModel {
             schedule_tabu_hits,
             schedule_tabu_aspirations,
             schedule_tabu_forced_moves,
+            schedule_tsab_owner_worker_mask,
+            schedule_tsab_n5_generated,
+            schedule_tsab_ranked,
+            schedule_tsab_shortlists,
+            schedule_tsab_delta_probes,
+            schedule_tsab_additional_delta_probes,
+            schedule_tsab_full_oracle_commits,
+            schedule_tsab_selected_shortlist_rank_sum,
+            schedule_tsab_selections,
+            schedule_tsab_aspirations,
+            schedule_tsab_tabu_rejections,
+            schedule_tsab_tabu_resets,
+            schedule_tsab_fingerprint_repeats,
+            schedule_tsab_escape_signals,
+            schedule_tsab_n1_kicks,
+            schedule_tsab_kick_moves,
+            schedule_tsab_elite_restarts,
+            schedule_tsab_n6_kicks,
+            schedule_tsab_restart_attempts,
+            schedule_tsab_restart_global_rebases,
+            schedule_tsab_restart_n6_generated,
+            schedule_tsab_restart_delta_probes,
+            schedule_tsab_restart_oracle_commits,
+            schedule_tsab_restart_rejections,
+            schedule_tsab_restart_interruptions,
+            schedule_tsab_restart_work_units,
+            schedule_tsab_restart_best_base_objective,
+            schedule_tsab_restart_best_kicked_objective,
+            schedule_tsab_post_restart_improvements,
+            schedule_tsab_restart_shortlist_peak_bytes,
+            schedule_tsab_ranking_audits,
+            schedule_tsab_exact_best_matches,
+            schedule_tsab_regret_sum,
+            schedule_tsab_regret_max,
+            schedule_tsab_workspace_peak_bytes,
+            schedule_tsab_activations,
+            schedule_tsab_activation_boundary,
+            schedule_tsab_legacy_warmup_work_steps,
+            schedule_tsab_activation_rebases,
+            schedule_tsab_activation_objective,
+            schedule_tsab_active_boundaries,
+            schedule_tsab_burst_work_limit,
+            schedule_tsab_burst_work_units,
+            schedule_tsab_improving_commits,
+            schedule_tsab_best_committed_objective,
+            schedule_tsab_fast_enabled,
+            schedule_tsab_fast_eligible,
+            schedule_tsab_fast_disabled,
+            schedule_tsab_fast_attempts,
+            schedule_tsab_fast_commits,
+            schedule_tsab_fast_fallbacks,
+            schedule_tsab_fast_date_changes,
+            schedule_tsab_fast_queue_pops,
+            schedule_tsab_fast_full_validations,
+            schedule_tsab_fast_oracle_mismatches,
+            schedule_tsab_fast_pending_promotions,
+            schedule_tsab_fast_pending_discards,
+            schedule_tsab_fast_transitions,
+            schedule_tsab_fast_work_units,
+            schedule_tsab_fast_elapsed_seconds,
+            schedule_tsab_fast_workspace_peak_bytes,
             schedule_session_initializations,
             schedule_session_resumes,
             schedule_session_rebases,
+            schedule_island_profile_mask,
+            schedule_baseline_island_profile_mask,
+            schedule_scored_island_profile_mask,
+            schedule_island_profile_count,
+            schedule_profile_construction_seconds,
+            schedule_profile_initial_objectives,
+            schedule_profile_initial_dispatch_rules,
+            schedule_profile_best_objectives,
+            schedule_profile_work_steps,
+            schedule_construction_bucket_visits,
+            schedule_construction_heap_pushes,
+            schedule_construction_stale_pops,
+            schedule_construction_heap_rebuilds,
+            schedule_construction_heap_peak,
+            schedule_reactive_restarts,
+            schedule_reactive_restart_dispatches,
+            schedule_reactive_restart_perturbations,
+            schedule_reactive_restart_rebuild_failures,
+            schedule_island_scored_candidates,
+            schedule_island_shortlisted_candidates,
+            schedule_approximate_candidates_generated,
+            schedule_approximate_candidates_refined,
+            schedule_approximate_candidates_certified,
+            schedule_approximate_candidates_unknown,
+            schedule_approximation_score_items,
+            schedule_approximation_sort_items,
+            schedule_approximation_local_span_items,
+            schedule_approximation_elapsed_seconds,
+            schedule_approximation_work_units,
+            schedule_direct_oracle_attempts,
+            schedule_direct_oracle_accepts,
+            schedule_direct_oracle_cycles,
+            schedule_direct_oracle_windows,
+            schedule_direct_oracle_objective_rejections,
+            schedule_exact_probes_avoided,
+            schedule_search_elite_pool_size,
+            schedule_search_elite_batches,
+            schedule_search_elite_batches_skipped_after_stop,
+            schedule_search_elite_candidates,
+            schedule_search_elite_insertions,
+            schedule_search_elite_duplicates,
+            schedule_search_elite_dominated,
+            schedule_search_elite_evictions,
+            schedule_search_elite_interruptions,
+            schedule_search_elite_merge_errors,
+            schedule_search_elite_snapshot_captures,
+            schedule_search_elite_snapshot_interruptions,
+            schedule_search_elite_snapshot_errors,
+            schedule_search_elite_objectives,
+            schedule_search_elite_pairwise_distances_ppm,
+            schedule_search_elite_min_distance_ppm,
+            schedule_search_elite_mean_distance_ppm,
+            schedule_search_elite_max_distance_ppm,
+            schedule_search_elite_capture_worker_seconds_sum,
+            schedule_search_elite_merge_wall_seconds,
+            schedule_search_elite_heap_lower_bound_bytes,
+            schedule_search_elite_peak_heap_lower_bound_bytes,
+            schedule_lns_shadow_enabled,
+            schedule_lns_shadow_active,
+            schedule_lns_shadow_owner_worker_mask,
+            schedule_lns_attempts,
+            schedule_lns_selected_operations,
+            schedule_lns_feasible,
+            schedule_lns_reconstructed,
+            schedule_lns_improvements,
+            schedule_lns_shadow_improvements,
+            schedule_lns_shadow_improvement_sum,
+            schedule_lns_shadow_best_improvement,
+            schedule_lns_timeouts,
+            schedule_lns_interruptions,
+            schedule_lns_infeasible,
+            schedule_lns_non_improving,
+            schedule_lns_reconstruction_rejections,
+            schedule_lns_oracle_rejections,
+            schedule_lns_exact_rejections,
+            schedule_lns_worker_seconds_sum,
+            schedule_lns_workspace_peak_bytes,
+            schedule_constructor_workers_requested,
+            schedule_constructor_multistart_enabled,
+            schedule_constructor_multistart_active,
+            schedule_constructor_multistart_owner_worker_mask,
+            schedule_constructor_multistart_attempts,
+            schedule_constructor_multistart_constructions,
+            schedule_constructor_multistart_interruptions,
+            schedule_constructor_multistart_failures,
+            schedule_constructor_multistart_feasible,
+            schedule_constructor_multistart_distinct_fingerprints,
+            schedule_constructor_multistart_other_fingerprint_observations,
+            schedule_constructor_multistart_initial_objective,
+            schedule_constructor_multistart_best_objective,
+            schedule_constructor_multistart_improvements,
+            schedule_constructor_multistart_work_units,
+            schedule_constructor_multistart_worker_seconds_sum,
+            schedule_constructor_multistart_workspace_peak_bytes,
+            schedule_constructor_multistart_best_ordinal,
+            schedule_constructor_multistart_best_seed,
+            schedule_constructor_multistart_best_fingerprint,
+            schedule_constructor_multistart_next_ordinal,
+            schedule_path_relink_enabled,
+            schedule_path_relink_active,
+            schedule_path_relink_guide_requests,
+            schedule_path_relink_best_guides,
+            schedule_path_relink_diverse_guides,
+            schedule_path_relink_guide_loads,
+            schedule_path_relink_guide_incompatible,
+            schedule_path_relink_guide_interruptions,
+            schedule_path_relink_critical_operations_scanned,
+            schedule_path_relink_candidates_generated,
+            schedule_path_relink_candidates_positive_gain,
+            schedule_path_relink_acyclicity_certified,
+            schedule_path_relink_acyclicity_unknown,
+            schedule_path_relink_prefilter_rejections,
+            schedule_path_relink_candidates_retained,
+            schedule_path_relink_candidates_refined,
+            schedule_path_relink_candidates_shortlisted,
+            schedule_path_relink_no_move,
+            schedule_path_relink_guide_arc_gain_shortlisted,
+            schedule_path_relink_oracle_attempts,
+            schedule_path_relink_oracle_accepts,
+            schedule_path_relink_cycle_rejections,
+            schedule_path_relink_window_rejections,
+            schedule_path_relink_other_rejections,
+            schedule_path_relink_rollbacks,
+            schedule_path_relink_elite_improvements,
+            schedule_path_relink_guide_arc_gain_accepted,
+            schedule_path_relink_worker_seconds_sum,
+            schedule_path_relink_workspace_peak_bytes,
             full_recompute_percentage,
             backend_build_seconds: profile.then_some(backend_build_seconds).flatten(),
             construction_seconds,

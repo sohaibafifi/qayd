@@ -47,11 +47,11 @@ pub use solve::{
 pub use types::{
     Assignment, Bound, CandidateSolution, CpControls, EngineKind, EngineReport, EventCallback, EventControl, EventSink, IgnoreEvents,
     IntervalValue, LinearBackendMode, LinearControls, ModelFamily, ObjectiveSense, OptimalityGap, ProofClaim, ProofKind, ProofRequest,
-    ProvenConclusion, RoutingControls, SatBackendMode, SatControls, SatPreprocess, SearchStats, SemanticAssumption, SemanticAssumptionOp,
-    SolveError, SolveEvent, SolveLimits, SolveMode, SolveRequest, SolveResult, SolveStatus, VerificationLevel,
+    ProvenConclusion, RoutingControls, SatBackendMode, SatControls, SatPreprocess, ScheduleJsspSearch, SearchStats, SemanticAssumption,
+    SemanticAssumptionOp, SolveError, SolveEvent, SolveLimits, SolveMode, SolveRequest, SolveResult, SolveStatus, VerificationLevel,
 };
 #[cfg(test)]
-pub(crate) use verify::verify_final_supervised_with_budget;
+pub(crate) use verify::{audit_no_overlap_holds, verify_final_supervised_with_budget};
 pub use verify::{audit_semantic_verification_calls, verify_semantic_assignment};
 pub(crate) use verify::{
     evaluate_int_expr_interruptible, verify_final_with_budget, verify_semantic_assignment_interruptible,

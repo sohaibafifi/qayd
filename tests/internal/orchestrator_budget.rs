@@ -43,6 +43,41 @@ fn finalization_reserve_records_and_enforces_the_deadline() {
 }
 
 #[test]
+fn larger_finalization_floor_is_opt_in_and_preserves_a_short_search_slice() {
+    let ordinary_budget = SolveBudget::new(Some(Duration::from_secs(2)));
+    let ordinary = ordinary_budget.search_stop();
+    let schedule_budget = SolveBudget::new(Some(Duration::from_secs(2)));
+    let schedule = schedule_budget.search_stop_with_finalization_reserve(Duration::from_millis(2_500));
+
+    let guard = Instant::now();
+    while !schedule.flag().load(Ordering::Acquire) && guard.elapsed() < Duration::from_millis(500) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    assert!(schedule.flag().load(Ordering::Acquire), "the schedule-specific reserve did not stop search early");
+    assert!(!ordinary.flag().load(Ordering::Acquire), "the ordinary engine reserve changed");
+    assert!(!schedule_budget.expired(), "the early cutoff must leave the parent finalization budget alive");
+    assert_eq!(schedule_budget.termination_reason(), TerminationReason::Deadline);
+}
+
+#[test]
+fn larger_finalization_floor_still_observes_hard_cancellation_immediately() {
+    let budget = SolveBudget::new(Some(Duration::from_secs(5)));
+    let search = budget.search_stop_with_finalization_reserve(Duration::from_millis(2_500));
+    assert!(!search.flag().load(Ordering::Acquire));
+
+    budget.cancel_with(TerminationReason::MemoryLimit);
+    let guard = Instant::now();
+    while !search.flag().load(Ordering::Acquire) && guard.elapsed() < Duration::from_millis(100) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    assert!(search.flag().load(Ordering::Acquire));
+    assert!(budget.hard_cancelled());
+    assert_eq!(budget.termination_reason(), TerminationReason::MemoryLimit);
+}
+
+#[test]
 fn non_cooperative_final_replay_cannot_escape_the_bounded_grace() {
     let budget = SolveBudget::new(None);
     budget.cancel_with(TerminationReason::Deadline);

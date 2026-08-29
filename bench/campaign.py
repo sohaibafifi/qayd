@@ -318,6 +318,16 @@ def command_for(
             command.append("--routing-warm-start" if args.routing_warm_start else "--no-routing-warm-start")
         if problem == "jssp":
             command.append("--compact-json")
+            command.extend(("--schedule-jssp-search", args.qayd_schedule_jssp_search))
+            if args.qayd_schedule_path_relink:
+                command.append("--schedule-path-relink")
+            if args.qayd_schedule_lns_shadow:
+                command.append("--schedule-lns-shadow")
+            if args.qayd_schedule_constructor_workers:
+                command.extend((
+                    "--schedule-constructor-workers",
+                    str(args.qayd_schedule_constructor_workers),
+                ))
         return command
     if solver == "ortools-cp-sat":
         return [sys.executable, str(ADAPTERS / "ortools_cp_sat.py"), problem, *common]
@@ -371,6 +381,10 @@ def run_key(solver: str, item: dict[str, Any], budget: int, seed: int, args: arg
             args.qayd_engine if solver.startswith("qayd-") else None,
             args.max_iterations if solver.startswith("qayd-") else None,
             args.profile_qayd if solver.startswith("qayd-") else None,
+            args.qayd_schedule_path_relink if solver.startswith("qayd-") else None,
+            args.qayd_schedule_lns_shadow if solver.startswith("qayd-") and item["problem"] == "jssp" else None,
+            args.qayd_schedule_constructor_workers if solver.startswith("qayd-") and item["problem"] == "jssp" else None,
+            args.qayd_schedule_jssp_search if solver.startswith("qayd-") and item["problem"] == "jssp" else None,
             args.routing_two_way if solver.startswith("qayd-") else None,
             args.routing_nearest_neighbor if solver.startswith("qayd-") else None,
             args.routing_warm_start if solver.startswith("qayd-") else None,
@@ -516,6 +530,24 @@ def main() -> None:
         "--prepare-qayd", action=argparse.BooleanOptionalAction, default=False,
         help="build and install the current source tree before running qayd",
     )
+    parser.add_argument(
+        "--qayd-schedule-path-relink", action=argparse.BooleanOptionalAction, default=False,
+        help="enable bounded JSSP path relinking for Qayd scheduling local search",
+    )
+    parser.add_argument(
+        "--qayd-schedule-lns-shadow", action=argparse.BooleanOptionalAction, default=False,
+        help="measure bounded exact JSSP repairs without publishing them",
+    )
+    parser.add_argument(
+        "--qayd-schedule-constructor-workers", type=int, default=0,
+        help="reserve one of seven Qayd JSSP LS workers for deterministic multi-start construction",
+    )
+    parser.add_argument(
+        "--qayd-schedule-jssp-search",
+        choices=("legacy", "tsab-candidate"),
+        default="legacy",
+        help="select the Qayd TSAB-inspired candidate-ranked N5 pilot or legacy JSSP search",
+    )
     parser.add_argument("--routing-two-way", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--routing-nearest-neighbor", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--routing-warm-start", action=argparse.BooleanOptionalAction, default=True)
@@ -548,6 +580,32 @@ def main() -> None:
     check_solver_arguments(solvers, args)
     suite_path, suite = load_suite(args.suite)
     instances = discover_instances(suite, set(args.family), args.limit_per_family)
+    if args.qayd_schedule_constructor_workers:
+        if not any(solver.startswith("qayd-") for solver in solvers):
+            raise SystemExit("--qayd-schedule-constructor-workers requires a Qayd solver")
+        if args.qayd_schedule_constructor_workers != 1:
+            raise SystemExit("--qayd-schedule-constructor-workers currently supports only 0 or 1")
+        if args.threads != 7 or args.qayd_engine != "ls":
+            raise SystemExit("--qayd-schedule-constructor-workers 1 requires --threads 7 and --qayd-engine ls")
+        if args.qayd_schedule_path_relink or args.qayd_schedule_lns_shadow:
+            raise SystemExit(
+                "--qayd-schedule-constructor-workers cannot yet be combined with path relinking or LNS shadow"
+            )
+        if any(item["problem"] != "jssp" for item in instances):
+            raise SystemExit("--qayd-schedule-constructor-workers is restricted to JSSP-only campaigns")
+    if args.qayd_schedule_jssp_search == "tsab-candidate":
+        if not any(solver.startswith("qayd-") for solver in solvers):
+            raise SystemExit("--qayd-schedule-jssp-search tsab-candidate requires a Qayd solver")
+        if args.threads != 7 or args.qayd_engine != "ls" or not args.profile_qayd:
+            raise SystemExit(
+                "--qayd-schedule-jssp-search tsab-candidate requires --threads 7, --qayd-engine ls, and --profile-qayd"
+            )
+        if args.qayd_schedule_constructor_workers or args.qayd_schedule_path_relink or args.qayd_schedule_lns_shadow:
+            raise SystemExit(
+                "--qayd-schedule-jssp-search tsab-candidate cannot yet be combined with constructor workers, path relinking, or LNS shadow"
+            )
+        if any(item["problem"] != "jssp" for item in instances):
+            raise SystemExit("--qayd-schedule-jssp-search tsab-candidate is restricted to JSSP-only campaigns")
     preflight_expected_instances(suite, instances)
     enforce_minimum_external_grace_seconds(suite, args.grace_seconds)
     if not instances:
@@ -582,6 +640,10 @@ def main() -> None:
         "qayd_engine": args.qayd_engine,
         "max_iterations": args.max_iterations,
         "profile_qayd": args.profile_qayd,
+        "qayd_schedule_path_relink": args.qayd_schedule_path_relink,
+        "qayd_schedule_lns_shadow": args.qayd_schedule_lns_shadow,
+        "qayd_schedule_constructor_workers": args.qayd_schedule_constructor_workers,
+        "qayd_schedule_jssp_search": args.qayd_schedule_jssp_search,
         "qayd_prepared": args.prepare_qayd,
         "qayd_artifact": qayd_artifact,
         "hexaly_artifact": hexaly_artifact,
@@ -597,6 +659,10 @@ def main() -> None:
     compatibility_fields = (
         "suite", "suite_file", "solvers", "budgets", "seeds", "threads",
         "memory_limit_mb", "grace_seconds", "qayd_engine", "max_iterations", "profile_qayd",
+        "qayd_schedule_path_relink",
+        "qayd_schedule_lns_shadow",
+        "qayd_schedule_constructor_workers",
+        "qayd_schedule_jssp_search",
         "qayd_prepared", "qayd_artifact",
         "hexaly_artifact", "hexaly_license_path",
         "routing_two_way", "routing_nearest_neighbor", "routing_warm_start",

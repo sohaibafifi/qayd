@@ -1,6 +1,6 @@
 //! Canonical semantic solution replay.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1316,6 +1316,44 @@ fn circuit_holds(successors: &[i64], stop: &AtomicBool) -> Result<bool, SolveErr
 
 fn no_overlap_holds(starts: &[i64], durations: &[i64], stop: &AtomicBool) -> Result<bool, SolveError> {
     let length = starts.len().min(durations.len());
+    for (index, &duration) in durations[..length].iter().enumerate() {
+        poll_stop(stop, index)?;
+        if duration < 0 {
+            return no_overlap_holds_pairwise(&starts[..length], &durations[..length], stop);
+        }
+    }
+
+    // Group equal starts before sweeping. A zero-duration interval is a point:
+    // it conflicts with a positive interval only when it lies strictly inside
+    // that interval, not when both start together or merely touch. Keeping the
+    // positive count per group preserves that exact pairwise convention.
+    let mut groups = BTreeMap::<i64, (u8, i128)>::new();
+    for (index, (&start, &duration)) in starts[..length].iter().zip(&durations[..length]).enumerate() {
+        poll_stop(stop, index)?;
+        let group = groups.entry(start).or_insert((0, i128::MIN));
+        if duration > 0 {
+            group.0 = group.0.saturating_add(1).min(2);
+            group.1 = group.1.max(i128::from(start) + i128::from(duration));
+        }
+    }
+
+    let mut latest_positive_end = i128::MIN;
+    for (index, (&start, &(positive_count, positive_end))) in groups.iter().enumerate() {
+        poll_stop(stop, index)?;
+        if latest_positive_end > i128::from(start) || positive_count > 1 {
+            check_stop(stop)?;
+            return Ok(false);
+        }
+        if positive_count == 1 {
+            latest_positive_end = latest_positive_end.max(positive_end);
+        }
+    }
+    check_stop(stop)?;
+    Ok(true)
+}
+
+fn no_overlap_holds_pairwise(starts: &[i64], durations: &[i64], stop: &AtomicBool) -> Result<bool, SolveError> {
+    let length = starts.len().min(durations.len());
     let mut progress = 0usize;
     for left in 0..length {
         let start = starts[left];
@@ -1335,6 +1373,11 @@ fn no_overlap_holds(starts: &[i64], durations: &[i64], stop: &AtomicBool) -> Res
     }
     check_stop(stop)?;
     Ok(true)
+}
+
+#[cfg(test)]
+pub(crate) fn audit_no_overlap_holds(starts: &[i64], durations: &[i64], stop: &AtomicBool) -> Result<bool, SolveError> {
+    no_overlap_holds(starts, durations, stop)
 }
 
 fn cumulative_holds(starts: &[i64], durations: &[i64], demands: &[i64], capacity: i64, stop: &AtomicBool) -> Result<bool, SolveError> {

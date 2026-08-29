@@ -13,7 +13,16 @@ use qayd::model::list::{
     ObjectiveTier, Op, ReduceOp, Reduction, Resource, Schedule,
 };
 use qayd::model::{Model, ModelPackage};
-use qayd::orchestrator::{solve_model_silent, SolveLimits, SolveMode, SolveRequest, SolveStatus};
+use qayd::orchestrator::{solve_model_silent, ScheduleJsspSearch, SolveLimits, SolveMode, SolveRequest, SolveStatus};
+
+#[test]
+fn tsab_candidate_request_requires_exactly_seven_threads() {
+    let request = SolveRequest { threads: 6, schedule_jssp_search: ScheduleJsspSearch::TsabCandidate, ..SolveRequest::default() };
+
+    let error = request.validate().expect_err("TSAB candidate must not silently fall back to Legacy");
+
+    assert_eq!(error.to_string(), "invalid solve request: schedule_jssp_search='tsab-candidate' currently requires threads=7");
+}
 
 /// A schedule-only collection model (no list variables).
 fn schedule_model(sched: Schedule) -> CollectionModel {

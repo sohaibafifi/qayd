@@ -215,10 +215,27 @@ impl SolveBudget {
     /// without escaping the request budget. Without a deadline the original
     /// cancellation flag is shared directly.
     pub(crate) fn search_stop(&self) -> SearchStop {
+        self.search_stop_inner(None)
+    }
+
+    /// Derive an engine-search flag while requesting a larger minimum tail for
+    /// finalization. Requests longer than the minimum finalization reserve keep
+    /// one cooperative search slice; hard cancellation and the parent deadline
+    /// remain authoritative.
+    pub(crate) fn search_stop_with_finalization_reserve(&self, reserve_floor: Duration) -> SearchStop {
+        self.search_stop_inner(Some(reserve_floor))
+    }
+
+    fn search_stop_inner(&self, reserve_floor: Option<Duration>) -> SearchStop {
         let Some(remaining) = self.remaining() else {
             return SearchStop { stop: self.stop_handle(), done: None, worker: None };
         };
-        let reserve = finalization_reserve(remaining);
+        let default_reserve = finalization_reserve(remaining);
+        let reserve = reserve_floor.map_or(default_reserve, |floor| {
+            let largest_reserve =
+                if remaining <= MIN_FINALIZATION_RESERVE { remaining } else { remaining.saturating_sub(MIN_FINALIZATION_RESERVE) };
+            default_reserve.max(floor.min(largest_reserve))
+        });
         let search_duration = remaining.saturating_sub(reserve);
         let stop = Arc::new(AtomicBool::new(search_duration.is_zero() || self.expired()));
         if stop.load(Ordering::Acquire) {
