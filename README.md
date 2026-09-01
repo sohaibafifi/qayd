@@ -1,87 +1,112 @@
 <p align="center">
-  <img src="qayd-logo.svg" width="120" alt="qayd logo">
+  <img src="qayd-logo.svg" width="120" alt="Qayd logo">
 </p>
 
-<h1 align="center">qayd</h1>
+<h1 align="center">Qayd</h1>
 
-<p align="center">Yet another constraint-programming solver, in Rust.</p>
+<p align="center">A constraint-programming solver in Rust, with Python and standard-format frontends.</p>
+
+<p align="center">
+  <a href="https://sohaibafifi.github.io/qayd/">Website</a> ·
+  <a href="examples/python/">Python examples</a> ·
+  <a href="bench/README.md">Benchmarks</a>
+</p>
 
 ## What It Is
 
-`qayd` solves constraint satisfaction and optimization problems over finite
-integer domains. The core solver has trailed domains, propagators, search, Lazy
-Clause Generation, and optional parallel search.
+Qayd provides one semantic modeling layer for finite-domain, collection,
+routing, packing, and scheduling problems. Rust, Python, XCSP3, FlatZinc,
+DIMACS CNF, and OPB inputs use the same solve path.
 
-The project also has an experimental list-domain engine for list-style models:
-routes, bins, ordered assignments, and scheduling prototypes. That engine is
-used by the Python examples and is being shaped toward list, lambda, and
-partition modeling.
+The solver can select exact search or local search according to the model and
+the request. Limits, cancellation, result statuses, and final solution checks
+are owned by one orchestrator.
 
 Priority order: correct, simple, fast.
 
-## Features
+## How It Works
 
-- **Finite-domain kernel.** Trailed integer domains use sparse sets for compact
-  domains, explicit support storage for sparse domains, and reversible bounds
-  with trailed holes for wide contiguous ranges.
-- **Lists, intervals, and lambdas.**
-- **Scheduling primitives.** Native Python intervals support optional
-  alternatives, precedence, unary and cumulative resources, asymmetric setup
-  sequences, piecewise-constant capacity calendars, state functions, and
-  makespan minimization. Alternative masters compose directly with the other
-  scheduling primitives.
-- **XCSP3-core front-end.** Reads CSP and mono-objective COP instances from XML,
-  `.lzma`, and `.xz` files and emits XCSP3 competition output. Supported
-  families include `intension`, `extension`, `regular`, `mdd`, `allDifferent`,
-  `allEqual`, `ordered`, `lex`, `precedence`, `sum`, `count`, `nValues`,
-  `cardinality`, `minimum`, `maximum`, `element`, `channel`, `noOverlap`,
-  `cumulative`, `binPacking`, `knapsack`, `instantiation`, `circuit`, and
-  `slide`. See the [XCSP3 format paper](https://arxiv.org/abs/1611.03398).
-  `--core` computes an exact minimal unsatisfiable subset of XCSP source
-  constraints after an UNSAT result.
-- **Global filtering.** Positive extension tables use
-  [Compact-Table](https://arxiv.org/abs/1604.06641)-style bitsets and residues.
-  `regular` follows [Pesant's layered automaton
-  propagator](https://doi.org/10.1007/978-3-540-30201-8_36).
-  `allDifferent` uses [Régin's matching
-  filter](https://aaai.org/Library/AAAI/1994/aaai94-055.php). Fixed-resource
-  `cumulative` includes [edge
-  finding](https://vilim.eu/petr/cp2009.pdf).
-- **Learning search.** [Lazy Clause
-  Generation](https://people.eng.unimelb.edu.au/pstuckey/papers/lazy.pdf)
-  combines finite-domain propagation with 1-UIP learning, backjumping, sparse
-  watched clauses, [LBD](https://www.ijcai.org/Proceedings/09/Papers/074.pdf)
-  reduction, [dom/wdeg](https://dl.acm.org/doi/10.5555/3000001.3000033),
-  [VSIDS](https://doi.org/10.1145/378239.379017), phase saving, and restarts.
-  A lone sequential search periodically *rephases*: every few restarts it
-  ignores saved phases and dives with the inverted polarity to escape regions
-  the saved phase keeps pulling it back to (this finds first solutions on
-  feasibility-hard COP instances that otherwise time out). Sparse domains
-  allocate atoms by support; wide domains allocate shared atoms on demand. Short
-  learned clauses are strengthened by budgeted CP-aware vivification through the
-  global propagators.
-- **Parallel search.**
-- **Optional certified LP relaxation.**
-- **Local-search COP engine.**
-- **Adaptive ordered-list search.**
-- **Beta MiniZinc support.** See
-  [the MiniZinc integration notes](frontends/flatzinc/minizinc/README.md).
-- **Beta SAT and Pseudo-Boolean frontends.**
+```text
+Rust / Python / XCSP3 / FlatZinc / DIMACS / OPB
+                         |
+                    ModelPackage
+                         |
+       validate -> plan -> execute -> semantic replay
+                         |
+                     SolveResult
+```
 
-## Entry Points
+`Model` describes variables, constraints, and objectives. `ModelPackage` adds
+format-neutral names and source locations. `SolveRequest` controls the solve
+mode, seed, workers, budgets, search policy, and optional engine settings.
 
-- `qayd`: CLI for XCSP3 instances, including `.xml`, `.xml.lzma`, and `.xz`.
-- `qayd-fzn`: beta FlatZinc driver for MiniZinc.
-- `qayd-sat`: beta DIMACS CNF frontend.
-- `qayd-pb`: beta OPB frontend.
-- Rust crate: canonical semantic modeling through `Model`, `ModelPackage`, and
-  `SolveRequest`, plus lower-level solver internals.
-- Python module: modeling experiments, especially list, lambda, and routing
-  examples.
+The orchestrator validates the model, prepares an executable plan, runs the
+selected engines, and independently replays a candidate before publishing it.
+Only the orchestrator assigns public statuses such as `SATISFIABLE`, `OPTIMAL`,
+`UNSATISFIABLE`, `UNKNOWN`, and `UNSUPPORTED`.
 
-Every frontend builds the same semantic package. The orchestrator validates it,
-compiles an executable backend plan, owns budgets and cancellation, then replays
-the final assignment before publication. A minimal Rust solve is:
+Semantic replay proves candidate feasibility and objective values. Optimality
+and infeasibility still require a complete engine claim.
+
+## Capabilities
+
+- **Finite-domain modeling.** Integer and Boolean variables, finite sets,
+  expressions, linear constraints, tables, automata, MDDs, and global
+  constraints such as `allDifferent`, `element`, `circuit`, `cumulative`, and
+  `noOverlap`.
+- **Exact search and learning.** Propagation, branch-and-bound, Lazy Clause
+  Generation, assumptions, custom search phases, restarts, and parallel search.
+- **Collections.** Ordered lists and unordered sets support partitions,
+  reductions, scans, windows, lexicographic objectives, fixed-point terms, and
+  exact or local-search execution. This surface remains experimental.
+- **Routing and packing.** Typed models and examples cover TSP, CVRP, VRPTW,
+  PDPTW, TOP, heterogeneous fleets, bin packing, and assignment problems.
+- **Scheduling.** Intervals, optional tasks, alternatives, precedences,
+  cumulative resources, setup sequences, calendars, state functions, and
+  makespan objectives support compact exact models and larger local-search
+  models.
+- **Control and diagnostics.** Reproducible seeds, time and memory limits,
+  conflict and iteration budgets, external cancellation, progress events,
+  reusable solve sessions, assumptions, and exact MUS extraction.
+- **Data and experiments.** Typed readers cover CVRPLIB, Solomon and
+  Gehring-Homberger, JSPLIB, and PSPLIB. Runnable examples include a broad
+  CSPLib catalog, while `bench/` provides provenance-aware campaigns and
+  independent validators.
+
+## Interfaces
+
+| Interface | Purpose |
+| --- | --- |
+| Rust crate | Build `Model` and solve it through `qayd::solve` |
+| Python package | Typed integer, collection, routing, packing, and scheduling models |
+| `qayd` | XCSP3 Core CLI, including compressed inputs and `--core` MUS extraction |
+| `qayd-fzn` | Beta FlatZinc driver and MiniZinc bundle |
+| `qayd-sat` | Beta DIMACS CNF frontend |
+| `qayd-pb` | Beta OPB pseudo-Boolean frontend |
+
+Each frontend exposes the subset appropriate to its input format. They share
+the orchestration and result contract, not an identical constraint surface.
+
+## Build And Test
+
+Build and validate the Rust workspace:
+
+```bash
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Build the Python extension and run its tests:
+
+```bash
+uv run maturin develop --profile pyext
+uv run python -m pytest tests/python
+```
+
+## Rust API
+
+The canonical Rust entry point accepts a semantic package and a solve request:
 
 ```rust
 use qayd::model::{Constraint, Model, ModelPackage, Relation};
@@ -99,133 +124,47 @@ let result = qayd::solve(
     &ModelPackage::new(model),
     &SolveRequest::default(),
     &mut IgnoreEvents,
-)?;
-# Ok::<(), qayd::orchestrator::SolveError>(())
+)
+.expect("the model is valid and supported");
+
+assert_eq!(result.status().as_str(), "SATISFIABLE");
 ```
 
-## Build And Test
+`qayd::solve_search` keeps the lower-level search API available for code that
+works directly with solver internals.
+
+## Command Line
+
+Solve an XCSP3 instance with a reproducible parallel run:
 
 ```bash
-cargo build
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo run --bin qayd -- -t 60 -p 4 --seed 0 path/to/instance.xml
 ```
 
-Optional LP backend checks:
-
-```bash
-cargo test --features lp-relaxation --test lp_relaxation
-cargo clippy --all-targets --features lp-relaxation -- -D warnings
-```
-
-Python extension checks:
-
-```bash
-cargo clippy --all-targets --features python -- -D warnings
-```
-
-To enable the optional certified LP bounds in the Python extension, build both
-features explicitly:
-
-```bash
-uv run maturin develop --profile pyext --features python,lp-relaxation
-uv run examples/python/routing/api/vrp.py \
-  data/vrplib/CVRP/X-n101-k25.vrp \
-  --time-limit 120 --threads 8 --linear-backend amthal
-```
-
-## CLI
-
-```bash
-cargo run --bin qayd -- [options] <instance.xml[.lzma|.xz]>
-```
-
-Common options:
-
-- `-t`, `--time SECONDS`: stop after a time limit.
-- `-v`, `--verbose`: print progress and search statistics.
-- `--seed SEED`: set a reproducible search seed.
-- `-p`, `--threads N`: set worker count.
-- `--ls`: search for good COP incumbents without proving optimality.
-- `--split`, `--probe N`, `--lns N`: optional parallel COP strategies.
-- `--core`: after an UNSAT result, print an exact source-constraint MUS.
-- `--linear-backend auto|native|amthal`: select the optional LP backend.
-- `--lp-root-ms N`: cap the root relaxation wall-clock time.
-- `--lp-node-ms N`: cap each persistent in-search LP reoptimization; zero, the default, disables node LP while retaining the root bound.
-- `--lp-node-depth N`: set the minimum depth interval between in-search LP solves.
-- `--lp-max-vars`, `--lp-max-rows`, `--lp-max-nonzeros`: cap active columns and retained matrix size. Rows touching the objective are retained first.
-- `--lp-min-coverage`, `--lp-phase-max-vars`: control eligibility and phase guidance; the phase guard counts physical CP variables, and zero disables LP phase guidance.
-
-The Amthal backend is linked from the private (not yet released) sibling crate `../amthal` only by
-`--features lp-relaxation`. Node relaxations retain one private simplex session
-per search worker, reuse a still-feasible primal, and turn a bound into pruning
-only after exact rational recertification. Without that feature, `auto` preserves the native
-path and an explicit `amthal` request returns a clear configuration error.
-Verbose output reports both the physical variable count and compact LP column
-count, nonlinear auxiliary columns, interval fallbacks, candidate and retained
-rows, nonzeros, objective coverage, and an explicit construction status such as
-`ready`, `no-rows`, or `invalid-objective`.
+Use `--help` on `qayd`, `qayd-fzn`, `qayd-sat`, or `qayd-pb` for the controls
+available to that frontend.
 
 ## Python Examples
 
-The Python examples live under `examples/python/`, grouped by domain: `routing/`,
-`scheduling/`, `packing/`, `optimization/`, `csplib/`, and `mus/`
-(infeasibility analysis). Routing and scheduling examples have native and API
-versions. The CSPLib collection has a catalog and a common runner:
+After building the Python extension, the examples run directly from the
+repository:
 
 ```bash
+uv run examples/python/optimization/search_policy.py
+uv run examples/python/routing/api/vrp.py --time-limit 2
+uv run examples/python/scheduling/api/intervals.py
 uv run python -m examples.python.csplib list
-uv run python -m examples.python.csplib prob007 --size 12
 ```
 
+The examples are grouped under `routing/`, `scheduling/`, `packing/`,
+`optimization/`, `mus/`, and `csplib/`. Routing and scheduling include both
+low-level native models and higher-level typed APIs.
 
-```python
-from qayd.datasets import load_instance, read_cvrplib, read_jsplib, read_psplib, read_solomon
+## Optional LP Integration
 
-instance = load_instance("data/X-n101-k25.vrp")  # marker-based detection
-distance = instance.edge_weights
-```
-
-Supported families are CVRPLIB/TSPLIB CVRP, Solomon and Gehring-Homberger
-VRPTW, JSPLIB job shop, and PSPLIB RCPSP/MRCPSP.
-
-Typical routing API shape:
-
-```python
-import qayd as cp
-
-model = cp.Model()
-customers = model.customers(range(1, n + 1))
-for customer in customers:
-    customer.demand = demand[customer.id]
-
-routes = model.routes(customers, vehicles=k, depot=0, travel=dist)
-for route in routes:
-    model.add(route.sum(lambda customer: customer.demand) <= capacity)
-
-model.minimize(routes.sum(lambda route: route.distance()))
-solution = model.solve(time_limit=30)
-print(solution.objective, solution.dual_bound, solution.relative_gap)
-```
-
-Typical scheduling API shape:
-
-```python
-model = cp.Model()
-tasks = model.tasks(range(n))
-for task in tasks:
-    task.duration = duration[task.id]
-    task.demand = demand[task.id]
-
-schedule = model.schedule(tasks, horizon=horizon)
-for before, after in precedences:
-    model.add(schedule[before].end <= schedule[after].start)
-for resource in resources:
-    model.add(schedule.resource(lambda task: task.demand[resource]) <= capacity[resource])
-
-model.minimize(schedule.makespan())
-solution = model.solve(time_limit=30)
-```
+The `lp-relaxation` feature is a source-only integration that requires the
+unreleased sibling Amthal checkout. It is not part of the default release
+binaries.
 
 ## License
 

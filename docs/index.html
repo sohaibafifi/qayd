@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Qayd</title>
-    <meta name="description" content="Qayd is a rich constraint programming solver in Rust.">
+    <meta name="description" content="Qayd provides a common semantic model and orchestration layer for heterogeneous constraint solving.">
     <link rel="icon" href="assets/qayd-logo.svg" type="image/svg+xml">
     <link rel="stylesheet" href="styles.css">
     <script src="app.js" defer></script>
@@ -27,35 +27,85 @@
           <h1>Qayd</h1>
           <p class="lead">Yet another rich Constraint Programming solver</p>
           <p class="summary">
-            Qayd combines finite-domain propagation, global constraints, learning search,
-            parallel optimization, and native collection models for routing, packing,
-            assignment, and scheduling.
+            A Unified Semantic Architecture for Heterogeneous Constraint Solving.
+            Qayd is a Rust constraint-solving system for finite-domain models, with
+            experimental APIs for routing, packing, assignment, and scheduling. Rust,
+            Python, and standard-format frontends share a semantic model and solver-neutral
+            orchestration layer across exact search, selected LCG and SAT paths, and local-search engines.
           </p>
         </div>
 
-        <div class="hero-art" aria-label="Qayd model preview">
+        <div class="hero-art" aria-label="Qayd API examples">
           <div class="code-card" data-tabs>
             <div class="code-tabs" role="tablist" aria-label="Code preview">
-              <button class="code-tab is-active" type="button" role="tab" aria-selected="true" data-tab="model">model.py</button>
-              <button class="code-tab" type="button" role="tab" aria-selected="false" data-tab="terminal">terminal</button>
+              <button class="code-tab is-active" type="button" role="tab" aria-selected="true" data-tab="rust">Rust</button>
+              <button class="code-tab" type="button" role="tab" aria-selected="false" data-tab="python">Python</button>
+              <button class="code-tab" type="button" role="tab" aria-selected="false" data-tab="routing">Routing API</button>
+              <button class="code-tab" type="button" role="tab" aria-selected="false" data-tab="scheduling">Scheduling API</button>
+              <button class="code-tab" type="button" role="tab" aria-selected="false" data-tab="cli">CLI</button>
             </div>
-            <pre data-panel="model"><code>routes = model.list_vars(k, customers)
+            <pre data-panel="rust"><code>use qayd::model::{Constraint, Model, ModelPackage, Relation};
+use qayd::orchestrator::{IgnoreEvents, SolveRequest};
+let mut model = Model::new();
+let x = model.int_range(0, 9);
+model.add_constraint(Constraint::Linear {
+    terms: vec![(1, x)],
+    relation: Relation::Ge,
+    rhs: 4,
+});
+let result = qayd::solve(
+    &amp;ModelPackage::new(model),
+    &amp;SolveRequest::default(),
+    &amp;mut IgnoreEvents,
+).unwrap();
+println!("{}", result.status().as_str()); // SATISFIABLE</code></pre>
+            <pre data-panel="python" hidden><code>import qayd as cp
 
-for r in routes:
-    model.add(cp.sum(r, lambda i: demand[i]) <= capacity)
+weights = [4, 3, 2, 1]
+profits = [8, 5, 6, 4]
 
-model.minimize(cp.sum(
-    cp.sum_edges(r, lambda i, j: dist[i][j], start=0, end=0)
-    for r in routes
-))</code></pre>
-            <pre data-panel="terminal" hidden><code>$ qayd -t 10 -p 4 -v instance.xml.lzma
-c variables 11842
-c propagators 29103
-c workers 4 (portfolio 2, lns 1, incumbent 1)
-c presolve reduced search 11842 -> 11524 fixed 318
-o 912
-o 884
-s SATISFIABLE</code></pre>
+model = cp.Model()
+take = model.int_vars(4, 0, 1, name="take")
+weight = sum(w * x for w, x in zip(weights, take))
+profit = sum(p * x for p, x in zip(profits, take))
+model.add(weight &lt;= 5)
+model.maximize(profit)
+solution = model.solve(seed=0)
+
+selected = [i for i, x in enumerate(take) if solution.value(x)]
+print(solution.status, solution.objective, selected)  # OPTIMAL 12 [0, 3]</code></pre>
+            <pre data-panel="routing" hidden><code>import qayd as cp
+
+distance = [
+    [0, 2, 4, 3], [2, 0, 1, 2],
+    [4, 1, 0, 1], [3, 2, 1, 0],
+]
+model = cp.Model()
+customers = model.customers([1, 2, 3])
+routes = model.routes(
+    customers, vehicles=1, depot=0, travel=distance,
+)
+model.minimize(routes.total_distance())
+solution = model.solve(engine="exact")
+print(solution.status, solution.objective)  # OPTIMAL 7</code></pre>
+            <pre data-panel="scheduling" hidden><code>import qayd as cp
+
+model = cp.Model()
+tasks = model.tasks(range(3))
+for task, duration in zip(tasks, [3, 2, 4]):
+    task.duration = duration
+
+schedule = model.schedule(tasks, horizon=9)
+model.add(schedule[0].end &lt;= schedule[1].start)
+model.minimize(schedule.makespan())
+solution = model.solve(engine="exact")
+print(solution.status, solution.objective)  # OPTIMAL 5</code></pre>
+            <pre data-panel="cli" hidden><code>$ ./target/debug/qayd \
+    --seed 0 --threads 1 \
+    bench/golden/fixtures/xcsp_minimize.xml
+
+o 1
+s OPTIMUM FOUND</code></pre>
           </div>
 <!--          <div class="route-card" aria-hidden="true">-->
 <!--            <svg viewBox="0 0 520 230" role="img">-->
@@ -76,85 +126,85 @@ s SATISFIABLE</code></pre>
 
       <section class="features" id="features">
         <div class="section-head">
-          <span class="kicker">Capabilities</span>
-          <h2>Supported Features</h2>
-          <p>Compact, current, and grounded in the solver code.</p>
+          <span class="kicker">System overview</span>
+          <h2>Architecture</h2>
+          <p>Qayd separates semantic modeling, solve planning, engine execution, and shared resource control.</p>
         </div>
         <div class="feature-list">
           <article>
             <div>
-              <h3>Finite-domain kernel</h3>
-              <p>Trailed integer domains, central solver ownership, propagation queues, branch-and-bound, and brute-force oracle tests.</p>
+              <h3>Semantic model</h3>
+              <p>Model and ModelPackage represent supported variables, constraints, objectives, names, and source metadata.</p>
             </div>
-            <span>Rust CP core</span>
+            <span>Model · ModelPackage</span>
           </article>
           <article>
             <div>
-              <h3>XCSP3 and FlatZinc</h3>
-              <p>XCSP3 instance solving through the CLI, plus a beta FlatZinc driver for MiniZinc workflows.</p>
+              <h3>Solve request and planning</h3>
+              <p>SolveRequest records the mode, seed, workers, limits, search policy, and optional controls. The orchestrator derives an executable solve plan.</p>
             </div>
-            <a href="https://xcsp.org">XCSP3</a>
+            <span>request · plan · execute</span>
           </article>
           <article>
             <div>
-              <h3>Tables, regular, and MDD</h3>
-              <p>Positive extension tables use bitsets and residues; regular constraints use layered automaton filtering.</p>
+              <h3>Solving engines</h3>
+              <p>Available backends include finite-domain propagation and branch-and-bound, selected LCG search paths, and beta SAT support. Some model families expose experimental local-search portfolios.</p>
             </div>
-            <span><a href="https://arxiv.org/abs/1604.06641">Compact-Table</a> · <a href="https://doi.org/10.1007/978-3-540-30201-8_36">Pesant</a></span>
+            <span>CP · LCG · SAT · LS</span>
           </article>
           <article>
             <div>
-              <h3>Global constraints</h3>
-              <p>Coverage includes allDifferent, allEqual, ordered, lex, sum, count, nValues, cardinality, element, scheduling, packing, circuit, and slide families.</p>
+              <h3>Shared execution control</h3>
+              <p>A common budget and stop signal cover preparation, compilation, worker startup, search, and persistent session epochs.</p>
             </div>
-            <span><a href="https://aaai.org/Library/AAAI/1994/aaai94-055.php">Regin</a> · <a href="https://vilim.eu/petr/cp2009.pdf">edge finding</a></span>
+            <span>budget · cancellation · sessions</span>
           </article>
           <article>
             <div>
-              <h3>Learning and parallel optimization</h3>
-              <p>Lazy Clause Generation, watched clauses, shared incumbents, clause sharing, split jobs, objective probes, and LNS workers.</p>
+              <h3>Domain-specific APIs</h3>
+              <p>Typed helpers cover routing, packing, assignment, and interval scheduling. List and set models remain experimental.</p>
             </div>
-            <span><a href="https://people.eng.unimelb.edu.au/pstuckey/papers/lazy.pdf">LCG</a> · <a href="https://doi.org/10.1007/978-3-031-95973-8_13">work stealing</a> · <a href="https://doi.org/10.1007/978-3-319-91086-4_4">LNS</a></span>
+            <span>routes · sets · intervals</span>
           </article>
           <article>
             <div>
-              <h3>Collection models</h3>
-              <p>Native ordered lists, item and edge reductions, scans, windows, pair reductions, lexicographic objectives, and interval schedules.</p>
+              <h3>Frontends and datasets</h3>
+              <p>Interfaces include Rust, Python, and XCSP3. FlatZinc, DIMACS, and OPB frontends are beta. Dataset readers include CVRPLIB, JSPLIB, and PSPLIB.</p>
             </div>
-            <span>routes · bins · schedules</span>
+            <span>CVRPLIB · JSPLIB · PSPLIB</span>
           </article>
         </div>
       </section>
 
       <section class="start" id="start">
         <div class="start-head">
-          <span class="kicker">Get going</span>
-          <h2>Start Locally</h2>
-          <p>Build, test, and run an example from the repository.</p>
+          <span class="kicker">Reproduction</span>
+          <h2>Build and run locally</h2>
+          <p>These commands build the workspace, install the Python extension, and run a tracked example.</p>
         </div>
         <div class="command-grid">
           <div class="command-card">
-            <span>build</span>
-            <code>cargo build && cargo test</code>
-            <button class="copy-button" type="button" data-copy="cargo build && cargo test">Copy</button>
+            <span>Rust workspace</span>
+            <code>cargo build --workspace</code>
+            <button class="copy-button" type="button" data-copy="cargo build --workspace">Copy</button>
           </div>
           <div class="command-card">
-            <span>python</span>
-            <code>uv run examples/python/vrp.py</code>
-            <button class="copy-button" type="button" data-copy="uv run examples/python/vrp.py">Copy</button>
+            <span>Python extension</span>
+            <code>uv run maturin develop --profile pyext</code>
+            <button class="copy-button" type="button" data-copy="uv run maturin develop --profile pyext">Copy</button>
           </div>
           <div class="command-card">
-            <span>quality</span>
-            <code>cargo clippy --all-targets -- -D warnings</code>
-            <button class="copy-button" type="button" data-copy="cargo clippy --all-targets -- -D warnings">Copy</button>
+            <span>Example</span>
+            <code>uv run examples/python/optimization/search_policy.py</code>
+            <button class="copy-button" type="button" data-copy="uv run examples/python/optimization/search_policy.py">Copy</button>
           </div>
         </div>
       </section>
     </main>
 
     <footer class="site-footer">
-      <span>Qayd Project</span>
-      <a href="https://github.com/sohaibafifi/qayd">Github</a>
+      <span>Qayd</span>
+      <a href="https://github.com/sohaibafifi/qayd">GitHub</a>
 
     </footer>
   </body>
