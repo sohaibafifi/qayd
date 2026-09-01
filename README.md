@@ -4,7 +4,7 @@
 
 <h1 align="center">Qayd</h1>
 
-<p align="center">A constraint-programming solver in Rust, with Python and standard-format frontends.</p>
+<p align="center">A Unified Semantic Architecture for Heterogeneous Constraint Solving.</p>
 
 <p align="center">
   <a href="https://sohaibafifi.github.io/qayd/">Website</a> ·

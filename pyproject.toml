@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "qayd"
-version = "0.9.1"
-description = "Yet another constraint-programming solver."
+version = "0.10.0"
+description = "A Unified Semantic Architecture for Heterogeneous Constraint Solving."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }

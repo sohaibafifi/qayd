@@ -2,7 +2,7 @@
 name = "qayd"
 version.workspace = true
 edition = "2021"
-description = "Yet another constraint-programming solver."
+description = "A Unified Semantic Architecture for Heterogeneous Constraint Solving."
 license = "MIT"
 
 [workspace]
@@ -14,7 +14,7 @@ default-members = [".", "frontends/flatzinc", "frontends/sat", "frontends/pb"]
 
 [workspace.package]
 # Single source of truth for all workspace crates released together.
-version = "0.9.1"
+version = "0.10.0"
 
 [lib]
 name = "qayd"
