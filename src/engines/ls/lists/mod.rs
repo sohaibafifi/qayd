@@ -75,8 +75,9 @@ pub(crate) use schedule_ls::{
     audit_direct_oracle_scan_layout, audit_direct_oracle_slot_split, audit_persistent_schedule_baseline_reference,
     audit_persistent_schedule_profile_split, audit_persistent_schedule_split, audit_schedule_island_profile,
     audit_schedule_lns_shadow_policy, audit_tsab_elite_restart_policy, audit_tsab_n6_restart_streaming_reference, audit_tsab_owner_mask,
-    audit_tsab_phase_policy, audit_tsab_selection_policy, audit_tsab_shortlist_policy, audit_tsab_streaming_reference, solve_schedule,
-    solve_schedule_capped_persistent_tsab,
+    audit_tsab_phase_policy, audit_tsab_selection_policy, audit_tsab_shortlist_policy, audit_tsab_streaming_reference,
+    audit_tsab_tail_corridor_selection, solve_schedule, solve_schedule_capped_persistent_tsab, solve_schedule_capped_persistent_tsab_multi,
+    solve_schedule_capped_persistent_tsab_multi_relink, solve_schedule_capped_persistent_tsab_with_finalization_stop,
 };
 #[allow(unused_imports)]
 pub(crate) use schedule_ls::{

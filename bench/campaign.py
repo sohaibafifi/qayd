@@ -544,9 +544,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--qayd-schedule-jssp-search",
-        choices=("legacy", "tsab-candidate"),
+        choices=("legacy", "tsab-candidate", "tsab-multi-candidate"),
         default="legacy",
-        help="select the Qayd TSAB-inspired candidate-ranked N5 pilot or legacy JSSP search",
+        help="select a single-owner or all-worker Qayd TSAB-inspired candidate-ranked N5 pilot, or legacy JSSP search",
     )
     parser.add_argument("--routing-two-way", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--routing-nearest-neighbor", action=argparse.BooleanOptionalAction, default=True)
@@ -593,19 +593,21 @@ def main() -> None:
             )
         if any(item["problem"] != "jssp" for item in instances):
             raise SystemExit("--qayd-schedule-constructor-workers is restricted to JSSP-only campaigns")
-    if args.qayd_schedule_jssp_search == "tsab-candidate":
+    if args.qayd_schedule_jssp_search in {"tsab-candidate", "tsab-multi-candidate"}:
+        strategy = args.qayd_schedule_jssp_search
         if not any(solver.startswith("qayd-") for solver in solvers):
-            raise SystemExit("--qayd-schedule-jssp-search tsab-candidate requires a Qayd solver")
+            raise SystemExit(f"--qayd-schedule-jssp-search {strategy} requires a Qayd solver")
         if args.threads != 7 or args.qayd_engine != "ls" or not args.profile_qayd:
             raise SystemExit(
-                "--qayd-schedule-jssp-search tsab-candidate requires --threads 7, --qayd-engine ls, and --profile-qayd"
+                f"--qayd-schedule-jssp-search {strategy} requires --threads 7, --qayd-engine ls, and --profile-qayd"
             )
-        if args.qayd_schedule_constructor_workers or args.qayd_schedule_path_relink or args.qayd_schedule_lns_shadow:
+        unsupported_path_relink = args.qayd_schedule_path_relink and strategy != "tsab-multi-candidate"
+        if args.qayd_schedule_constructor_workers or unsupported_path_relink or args.qayd_schedule_lns_shadow:
             raise SystemExit(
-                "--qayd-schedule-jssp-search tsab-candidate cannot yet be combined with constructor workers, path relinking, or LNS shadow"
+                f"--qayd-schedule-jssp-search {strategy} cannot yet be combined with constructor workers, path relinking, or LNS shadow"
             )
         if any(item["problem"] != "jssp" for item in instances):
-            raise SystemExit("--qayd-schedule-jssp-search tsab-candidate is restricted to JSSP-only campaigns")
+            raise SystemExit(f"--qayd-schedule-jssp-search {strategy} is restricted to JSSP-only campaigns")
     preflight_expected_instances(suite, instances)
     enforce_minimum_external_grace_seconds(suite, args.grace_seconds)
     if not instances:

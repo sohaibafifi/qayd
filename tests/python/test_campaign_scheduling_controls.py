@@ -117,15 +117,21 @@ def test_both_qayd_jssp_launchers_request_compact_json():
         assert command[command.index("--schedule-jssp-search") + 1] == "legacy"
 
 
-def test_tsab_candidate_control_is_explicit_and_jssp_only():
+@pytest.mark.parametrize("strategy", ("tsab-candidate", "tsab-multi-candidate"))
+def test_tsab_candidate_control_is_explicit_and_jssp_only(strategy):
     campaign = load_campaign()
-    enabled = arguments(threads=7, qayd_schedule_jssp_search="tsab-candidate")
+    enabled = arguments(
+        threads=7,
+        qayd_schedule_jssp_search=strategy,
+        qayd_schedule_path_relink=strategy == "tsab-multi-candidate",
+    )
 
     for solver in ("qayd-api", "qayd-native"):
         jssp = campaign.command_for(solver, item("jssp", ".txt"), 60, 37, enabled)
         rcpsp = campaign.command_for(solver, item("rcpsp", ".sm"), 60, 37, enabled)
 
-        assert jssp[jssp.index("--schedule-jssp-search") + 1] == "tsab-candidate"
+        assert jssp[jssp.index("--schedule-jssp-search") + 1] == strategy
+        assert ("--schedule-path-relink" in jssp) is (strategy == "tsab-multi-candidate")
         assert "--schedule-jssp-search" not in rcpsp
 
 
@@ -142,18 +148,19 @@ def test_tsab_candidate_control_participates_in_jssp_run_identity_only():
         "instance_sha256": "def456",
     }
 
+    strategies = ("legacy", "tsab-candidate", "tsab-multi-candidate")
     for instance, must_change in ((jssp, True), (rcpsp, False)):
-        legacy = campaign.run_key(
-            "qayd-native", instance, 60, 0, arguments(qayd_schedule_jssp_search="legacy")
-        )
-        candidate = campaign.run_key(
-            "qayd-native",
-            instance,
-            60,
-            0,
-            arguments(qayd_schedule_jssp_search="tsab-candidate"),
-        )
-        assert (legacy != candidate) is must_change
+        keys = {
+            campaign.run_key(
+                "qayd-native",
+                instance,
+                60,
+                0,
+                arguments(qayd_schedule_jssp_search=strategy),
+            )
+            for strategy in strategies
+        }
+        assert len(keys) == (len(strategies) if must_change else 1)
 
 
 def test_path_relink_control_is_explicit_and_jssp_only():

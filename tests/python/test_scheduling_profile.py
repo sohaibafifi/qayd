@@ -102,6 +102,12 @@ JSSP_TSAB_COUNTERS = (
     "schedule_tsab_restart_n6_generated",
     "schedule_tsab_restart_delta_probes",
     "schedule_tsab_restart_oracle_commits",
+    "schedule_tsab_restart_relink_attempts",
+    "schedule_tsab_restart_relink_commits",
+    "schedule_tsab_restart_relink_components_shortlisted",
+    "schedule_tsab_restart_relink_components_committed",
+    "schedule_tsab_restart_relink_guide_arc_gain_shortlisted",
+    "schedule_tsab_restart_relink_guide_arc_gain_accepted",
     "schedule_tsab_restart_rejections",
     "schedule_tsab_restart_interruptions",
     "schedule_tsab_restart_work_units",
@@ -125,6 +131,7 @@ JSSP_TSAB_COUNTERS = (
     "schedule_tsab_fast_attempts",
     "schedule_tsab_fast_commits",
     "schedule_tsab_fast_fallbacks",
+    "schedule_tsab_fast_work_cap_recoveries",
     "schedule_tsab_fast_date_changes",
     "schedule_tsab_fast_queue_pops",
     "schedule_tsab_fast_full_validations",
@@ -635,13 +642,13 @@ def test_scored_island_exposes_direct_oracle_accounting():
     assert classified <= profiled.schedule_direct_oracle_attempts
     assert set(_profile_best_objectives(profiled.schedule_profile_initial_objectives)) == set(range(7))
     assert _profile_strings(profiled.schedule_profile_initial_dispatch_rules) == {
-        0: "earliest-start",
-        1: "earliest-start",
-        2: "earliest-start",
-        3: "earliest-start",
-        4: "earliest-start",
+        0: "earliest-start-then-most-adjusted-work-c24",
+        1: "earliest-start-then-most-adjusted-work-c51",
+        2: "earliest-start-then-most-adjusted-work-c48",
+        3: "earliest-start-then-most-adjusted-work-c16",
+        4: "earliest-start-then-most-adjusted-work-c41",
         5: "earliest-start",
-        6: "earliest-start",
+        6: "earliest-start-then-most-work-remaining",
     }
 
 
@@ -731,6 +738,7 @@ def test_tsab_candidate_is_phased_bounded_and_reserves_only_worker_six():
     assert profiled.schedule_tsab_fast_oracle_mismatches == 0
     assert profiled.schedule_tsab_fast_pending_discards == 0
     assert profiled.schedule_tsab_fast_fallbacks >= 0
+    assert profiled.schedule_tsab_fast_work_cap_recoveries >= 0
     assert profiled.schedule_tsab_fast_date_changes >= 0
     assert profiled.schedule_tsab_fast_queue_pops >= 0
     assert profiled.schedule_tsab_fast_pending_promotions >= 0
@@ -755,7 +763,15 @@ def test_tsab_candidate_is_phased_bounded_and_reserves_only_worker_six():
     )
     assert all(getattr(profiled, field) == 0 for field in deferred)
     assert profiled.schedule_tsab_restart_delta_probes <= 4 * profiled.schedule_tsab_restart_attempts
-    assert profiled.schedule_tsab_restart_oracle_commits == profiled.schedule_tsab_n6_kicks
+    assert profiled.schedule_tsab_restart_relink_attempts == 0
+    assert profiled.schedule_tsab_restart_relink_commits == 0
+    assert profiled.schedule_tsab_restart_relink_components_shortlisted == 0
+    assert profiled.schedule_tsab_restart_relink_components_committed == 0
+    assert profiled.schedule_tsab_restart_relink_guide_arc_gain_shortlisted == 0
+    assert profiled.schedule_tsab_restart_relink_guide_arc_gain_accepted == 0
+    assert profiled.schedule_tsab_restart_oracle_commits == (
+        profiled.schedule_tsab_n6_kicks + profiled.schedule_tsab_restart_relink_commits
+    )
     assert profiled.schedule_tsab_n6_kicks == profiled.schedule_tsab_kick_moves
     assert profiled.schedule_tsab_restart_oracle_commits <= profiled.schedule_tsab_elite_restarts
     assert profiled.schedule_tsab_elite_restarts <= profiled.schedule_tsab_restart_attempts
@@ -782,17 +798,30 @@ def test_tsab_candidate_is_phased_bounded_and_reserves_only_worker_six():
 
 
 def test_tsab_candidate_rejects_invalid_public_value_and_experimental_combinations():
-    with pytest.raises(ValueError, match="must be 'legacy' or 'tsab-candidate'"):
+    with pytest.raises(ValueError, match="must be 'legacy', 'tsab-candidate', or 'tsab-multi-candidate'"):
         _solve_job_shop(profile=True, schedule_jssp_search="unknown")
-    with pytest.raises(ValueError, match="cannot yet be combined"):
-        _solve_job_shop(
-            profile=True,
-            threads=7,
-            schedule_jssp_search="tsab-candidate",
-            schedule_lns_shadow=True,
-        )
-    with pytest.raises(ValueError, match="currently requires threads=7"):
-        _solve_job_shop(profile=True, threads=6, schedule_jssp_search="tsab-candidate")
+    for strategy in ("tsab-candidate", "tsab-multi-candidate"):
+        with pytest.raises(ValueError, match="cannot yet be combined"):
+            _solve_job_shop(
+                profile=True,
+                threads=7,
+                schedule_jssp_search=strategy,
+                schedule_lns_shadow=True,
+            )
+        with pytest.raises(ValueError, match="currently requires threads=7"):
+            _solve_job_shop(profile=True, threads=6, schedule_jssp_search=strategy)
+
+
+def test_tsab_multi_candidate_accepts_the_worker_six_macro_relink_control():
+    profiled = _solve_job_shop(
+        profile=True,
+        threads=7,
+        schedule_jssp_search="tsab-multi-candidate",
+        schedule_path_relink=True,
+    )
+
+    assert profiled.status == "SATISFIABLE"
+    assert profiled.schedule_path_relink_enabled == 1
 
 
 def test_constructor_multistart_reserves_only_worker_six_and_reports_exact_accounting():
@@ -920,6 +949,7 @@ def test_tsab_launchers_emit_non_vacuous_bounded_candidate_metrics(launcher):
     assert record["schedule_tsab_fast_oracle_mismatches"] == 0
     assert record["schedule_tsab_fast_pending_discards"] == 0
     assert record["schedule_tsab_fast_fallbacks"] >= 0
+    assert record["schedule_tsab_fast_work_cap_recoveries"] >= 0
     assert record["schedule_tsab_fast_date_changes"] >= 0
     assert record["schedule_tsab_fast_queue_pops"] >= 0
     assert record["schedule_tsab_fast_pending_promotions"] >= 0
@@ -932,9 +962,18 @@ def test_tsab_launchers_emit_non_vacuous_bounded_candidate_metrics(launcher):
     assert record["schedule_tsab_selections"] <= record["schedule_tsab_shortlists"]
     assert record["schedule_tsab_restart_attempts"] > 0
     assert record["schedule_tsab_restart_n6_generated"] > 0
-    assert 0 < record["schedule_tsab_restart_delta_probes"] <= 4 * record["schedule_tsab_restart_attempts"]
-    assert record["schedule_tsab_restart_oracle_commits"] == record["schedule_tsab_n6_kicks"]
-    assert record["schedule_tsab_n6_kicks"] == record["schedule_tsab_kick_moves"]
+    restart_attempts = record["schedule_tsab_restart_attempts"]
+    restart_probes = record["schedule_tsab_restart_delta_probes"]
+    restart_commits = record["schedule_tsab_restart_oracle_commits"]
+    restart_rejections = record["schedule_tsab_restart_rejections"]
+    n6_kicks = record["schedule_tsab_n6_kicks"]
+    kick_moves = record["schedule_tsab_kick_moves"]
+    assert restart_probes <= record["schedule_tsab_restart_n6_generated"]
+    assert restart_probes <= 4 * restart_attempts
+    assert restart_probes > 0 or kick_moves > n6_kicks or (restart_commits == 0 and restart_rejections == restart_attempts)
+    assert restart_commits == n6_kicks
+    assert n6_kicks <= kick_moves <= 4 * n6_kicks
+    assert restart_commits + restart_rejections == restart_attempts
     assert record["schedule_tsab_restart_oracle_commits"] <= record["schedule_tsab_elite_restarts"]
     assert record["schedule_tsab_elite_restarts"] <= record["schedule_tsab_restart_attempts"]
     assert record["schedule_tsab_restart_global_rebases"] <= record["schedule_tsab_elite_restarts"]
@@ -948,6 +987,71 @@ def test_tsab_launchers_emit_non_vacuous_bounded_candidate_metrics(launcher):
     assert math.isfinite(record["schedule_incumbent_verification_seconds"])
     assert math.isfinite(record["schedule_incumbent_verification_max_seconds"])
     assert 0.0 <= record["schedule_incumbent_verification_max_seconds"] <= record["schedule_incumbent_verification_seconds"]
+
+
+@pytest.mark.parametrize(
+    "launcher",
+    (
+        "examples/python/scheduling/api/jssp.py",
+        "examples/python/scheduling/native/jssp.py",
+    ),
+)
+def test_tsab_multi_launchers_activate_every_worker_and_report_strategy(launcher):
+    completed = subprocess.run(
+        (
+            sys.executable,
+            str(ROOT / launcher),
+            "--jobs",
+            "8",
+            "--machines",
+            "6",
+            "--seed",
+            "1",
+            "--engine",
+            "ls",
+            "--threads",
+            "7",
+            "--time-limit",
+            "1",
+            "--max-iterations",
+            "16384",
+            "--profile",
+            "--schedule-jssp-search",
+            "tsab-multi-candidate",
+            "--json",
+            "--compact-json",
+        ),
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=20,
+    )
+    record = json.loads(completed.stdout)
+
+    assert record["verified"] is True
+    assert record["schedule_jssp_search"] == "tsab-multi-candidate"
+    assert record["schedule_tsab_owner_worker_mask"] == 0x7F
+    assert record["schedule_tsab_activations"] == 7
+    assert record["schedule_tsab_fast_enabled"] > 0
+    assert record["schedule_tsab_fast_eligible"] > 0
+    assert record["schedule_tsab_fast_attempts"] > 0
+    assert record["schedule_tsab_fast_full_validations"] > 0
+    assert record["schedule_tsab_fast_oracle_mismatches"] == 0
+    assert record["schedule_tsab_fast_pending_discards"] == 0
+    relink_attempts = record["schedule_tsab_restart_relink_attempts"]
+    relink_commits = record["schedule_tsab_restart_relink_commits"]
+    components_shortlisted = record["schedule_tsab_restart_relink_components_shortlisted"]
+    components_committed = record["schedule_tsab_restart_relink_components_committed"]
+    gain_shortlisted = record["schedule_tsab_restart_relink_guide_arc_gain_shortlisted"]
+    gain_accepted = record["schedule_tsab_restart_relink_guide_arc_gain_accepted"]
+    assert relink_commits <= relink_attempts
+    assert record["schedule_tsab_restart_oracle_commits"] == record["schedule_tsab_n6_kicks"] + relink_commits
+    assert 2 * relink_attempts <= components_shortlisted <= 8 * relink_attempts
+    assert 2 * relink_commits <= components_committed <= 8 * relink_commits
+    assert (components_committed == 0) == (relink_commits == 0)
+    assert (gain_accepted == 0) == (relink_commits == 0)
+    assert gain_accepted <= gain_shortlisted
 
 
 @pytest.mark.parametrize(

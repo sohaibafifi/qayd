@@ -6,7 +6,8 @@ use crate::orchestrator::{
     audit_schedule_path_relink_guide_choices, audit_schedule_search_elite_merge_error_classification,
     audit_schedule_search_elite_shadow_default_enabled, audit_schedule_transfer_attempts, audit_schedule_transfer_order,
     audit_with_schedule_search_elite_shadow, audit_with_schedule_search_elite_stop_before_merge,
-    schedule_local_search_finalization_reserve, schedule_restart_work,
+    audit_with_schedule_tsab_stop_after_pending_report, audit_with_schedule_tsab_stop_after_pending_report_for_owner,
+    schedule_local_search_finalization_reserve, schedule_restart_work, schedule_worker_allows_rebase,
 };
 use qayd::engines::ls::lists::schedule_elite::{
     test_clear_interrupt, test_interrupt_after_checkpoints, ScheduleEliteArchive, ScheduleEliteError, ScheduleEliteSolveToken,
@@ -19,16 +20,18 @@ use qayd::engines::ls::lists::{
     audit_persistent_schedule_profile_split, audit_persistent_schedule_split, audit_schedule_island_profile,
     audit_schedule_lns_shadow_policy, audit_tsab_elite_restart_policy, audit_tsab_n6_restart_streaming_reference, audit_tsab_owner_mask,
     audit_tsab_phase_policy, audit_tsab_selection_policy, audit_tsab_shortlist_policy, audit_tsab_streaming_reference,
-    schedule_state::DispatchRule, schedule_state::JobShopProblem, schedule_state::JobShopState, schedule_state::ScoredScheduleMove,
-    solve_schedule, solve_schedule_capped, solve_schedule_capped_persistent, solve_schedule_capped_persistent_relink,
-    solve_schedule_capped_persistent_relink_with_lns_shadow, solve_schedule_capped_persistent_shadow,
-    solve_schedule_capped_persistent_tsab, ScheduleConstructionMetrics, ScheduleJsspSearchStrategy, ScheduleSearchSession,
+    audit_tsab_tail_corridor_selection, schedule_state::CanonicalPathPolicy, schedule_state::DispatchRule, schedule_state::JobShopProblem,
+    schedule_state::JobShopState, schedule_state::ScheduleMove, schedule_state::ScoredScheduleMove, solve_schedule, solve_schedule_capped,
+    solve_schedule_capped_persistent, solve_schedule_capped_persistent_relink, solve_schedule_capped_persistent_relink_with_lns_shadow,
+    solve_schedule_capped_persistent_shadow, solve_schedule_capped_persistent_tsab, solve_schedule_capped_persistent_tsab_multi,
+    solve_schedule_capped_persistent_tsab_multi_relink, solve_schedule_capped_persistent_tsab_with_finalization_stop,
+    ScheduleConstructionMetrics, ScheduleJsspSearchStrategy, ScheduleSearchSession,
 };
 use qayd::model::list::{verify_collection_solution, CollectionModel, CollectionSolution, IntervalVar, Resource, Schedule};
 use qayd::model::{Model, ModelPackage};
 use qayd::orchestrator::{
-    audit_interrupt_next_collection_final_replay, EventCallback, EventControl, IgnoreEvents, SolveEvent, SolveLimits, SolveMode,
-    SolveRequest, SolveResult, SolveStatus,
+    audit_interrupt_next_collection_final_replay, EventCallback, EventControl, IgnoreEvents, ScheduleJsspSearch, SolveEvent, SolveLimits,
+    SolveMode, SolveRequest, SolveResult, SolveStatus,
 };
 
 static SCHEDULE_LNS_SHADOW_TIMING_LOCK: Mutex<()> = Mutex::new(());
@@ -238,6 +241,117 @@ fn schedule_finalization_reserve_scales_with_replay_size_and_caps_at_large_ta() 
     assert!(schedule_local_search_finalization_reserve(100_000) > schedule_local_search_finalization_reserve(16));
     assert_eq!(schedule_local_search_finalization_reserve(1_000_000), Duration::from_millis(2_500));
     assert_eq!(schedule_local_search_finalization_reserve(usize::MAX), Duration::from_millis(2_500));
+}
+
+#[test]
+fn schedule_tsab_terminal_pass_recovers_a_pending_report_then_replays_transfer_once() {
+    let (schedule, _) = tsab_candidate_fixture();
+    let seed = 8;
+    let package = ModelPackage::new(Model::from_collection(&CollectionModel {
+        items: Vec::new(),
+        lists: 0,
+        objectives: Vec::new(),
+        constraints: Vec::new(),
+        globals: Vec::new(),
+        schedule: Some(schedule),
+    }));
+    let request = SolveRequest {
+        mode: SolveMode::LocalSearch,
+        seed,
+        threads: 7,
+        limits: SolveLimits { time: Some(Duration::from_secs(30)), iterations: Some(7 * (256 + 256 + 128)), ..SolveLimits::default() },
+        profile: true,
+        schedule_jssp_search: ScheduleJsspSearch::TsabCandidate,
+        ..SolveRequest::default()
+    };
+
+    let (result, terminal_replay_attempts, pending_objective, published_objective) =
+        audit_with_schedule_tsab_stop_after_pending_report(|| {
+            qayd::solve(&package, &request, &mut IgnoreEvents).expect("terminal TSAB validation remains inside the solve contract")
+        });
+
+    assert_eq!(result.status(), SolveStatus::Satisfiable);
+    eprintln!(
+        "TSAB terminal orchestrator: objective={:?}, replay_attempts={}, validations={}, promotions={}, boundaries={}, work=[{},{}]",
+        result.primal().map(|primal| primal.objectives()),
+        terminal_replay_attempts,
+        metric(&result, "schedule_tsab_fast_full_validations"),
+        metric(&result, "schedule_tsab_fast_pending_promotions"),
+        metric(&result, "schedule_restart_boundaries"),
+        metric(&result, "schedule_worker_work_min"),
+        metric(&result, "schedule_worker_work_max")
+    );
+    assert_eq!(terminal_replay_attempts, 1, "the recovered pending candidate must cross Transfer replay exactly once");
+    let pending_objective = pending_objective.expect("the terminal kernel must expose its validated pending objective");
+    let published_objective = published_objective.expect("the Transfer replay must install the terminal candidate");
+    assert_eq!(pending_objective, published_objective);
+    assert_eq!(result.primal().and_then(|primal| primal.objectives().first().copied()), Some(pending_objective));
+    assert_eq!(metric(&result, "schedule_tsab_fast_full_validations"), 1);
+    assert_eq!(metric(&result, "schedule_tsab_fast_pending_promotions"), 1);
+    assert_eq!(metric(&result, "schedule_tsab_fast_oracle_mismatches"), 0);
+    assert_eq!(metric(&result, "schedule_tsab_fast_pending_discards"), 0);
+    assert_eq!(metric(&result, "schedule_restart_boundaries"), 3, "the quota-zero terminal pass is not a search boundary");
+    assert!(metric(&result, "schedule_worker_work_min") <= 640);
+    assert!(metric(&result, "schedule_worker_work_max") <= 640);
+    assert_eq!(metric(&result, "schedule_work_budget_overruns"), 0);
+    assert_eq!(metadata(&result, "schedule_incumbent_source_worker"), "6");
+    assert_eq!(metadata(&result, "schedule_incumbent_verification_rejections"), "0");
+    assert_eq!(metadata(&result, "schedule_incumbent_verification_interruptions"), "0");
+}
+
+#[test]
+fn schedule_tsab_multi_terminal_pass_recovers_worker_three_pending_report() {
+    let (schedule, _) = tsab_candidate_fixture();
+    let seed = 55;
+    let package = ModelPackage::new(Model::from_collection(&CollectionModel {
+        items: Vec::new(),
+        lists: 0,
+        objectives: Vec::new(),
+        constraints: Vec::new(),
+        globals: Vec::new(),
+        schedule: Some(schedule),
+    }));
+    let request = SolveRequest {
+        mode: SolveMode::LocalSearch,
+        seed,
+        threads: 7,
+        limits: SolveLimits { time: Some(Duration::from_secs(30)), iterations: Some(7 * (256 + 256 + 128)), ..SolveLimits::default() },
+        profile: true,
+        schedule_jssp_search: ScheduleJsspSearch::TsabMultiCandidate,
+        ..SolveRequest::default()
+    };
+
+    let (result, terminal_replay_attempts, pending_objective, published_objective) =
+        audit_with_schedule_tsab_stop_after_pending_report_for_owner(3, || {
+            qayd::solve(&package, &request, &mut IgnoreEvents)
+                .expect("terminal multi-owner TSAB validation remains inside the solve contract")
+        });
+
+    assert_eq!(result.status(), SolveStatus::Satisfiable);
+    eprintln!(
+        "TSAB multi terminal orchestrator: objective={:?}, replay_attempts={}, pending={pending_objective:?}, published={published_objective:?}, source={}",
+        result.primal().map(|primal| primal.objectives()),
+        terminal_replay_attempts,
+        metadata(&result, "schedule_incumbent_source_worker")
+    );
+    assert_eq!(terminal_replay_attempts, 1, "worker three pending candidate must cross Transfer replay exactly once");
+    let pending_objective = pending_objective.expect("worker three terminal validation must expose its pending objective");
+    let published_objective = published_objective.expect("worker three Transfer replay must install the terminal candidate");
+    assert_eq!(pending_objective, published_objective);
+    assert_eq!(result.primal().and_then(|primal| primal.objectives().first().copied()), Some(pending_objective));
+    assert_eq!(metric(&result, "schedule_tsab_owner_worker_mask"), 0x7f);
+    assert_eq!(metric(&result, "schedule_tsab_activations"), 7);
+    assert!(metric(&result, "schedule_tsab_fast_full_validations") >= 1);
+    assert!(metric(&result, "schedule_tsab_fast_pending_promotions") >= 1);
+    assert_eq!(metric(&result, "schedule_tsab_fast_oracle_mismatches"), 0);
+    assert_eq!(metric(&result, "schedule_tsab_fast_pending_discards"), 0);
+    assert_eq!(metric(&result, "schedule_restart_boundaries"), 3, "quota-zero terminal finalization is not a search boundary");
+    assert!(metric(&result, "schedule_worker_work_min") <= 640);
+    assert!(metric(&result, "schedule_worker_work_max") <= 640);
+    assert_eq!(metric(&result, "schedule_work_budget_overruns"), 0);
+    assert_eq!(metadata(&result, "schedule_incumbent_source_worker"), "3");
+    assert_eq!(metadata(&result, "schedule_incumbent_verification_rejections"), "0");
+    assert_eq!(metadata(&result, "schedule_incumbent_verification_interruptions"), "0");
 }
 
 #[test]
@@ -1270,27 +1384,39 @@ fn direct_oracle_profile_is_split_invariant_and_respects_its_work_quota() {
 }
 
 #[test]
-fn additional_baseline_workers_are_split_invariant() {
+fn seven_worker_adjusted_work_profiles_are_split_invariant() {
     let schedule = diversified_job_shop();
-    assert!(audit_persistent_schedule_profile_split(&schedule, 127, 3, 7, 37, 63));
-    assert!(audit_persistent_schedule_profile_split(&schedule, 127, 4, 7, 37, 63));
+    for worker in 0..=4 {
+        assert!(audit_persistent_schedule_profile_split(&schedule, 127, worker, 7, 37, 63), "profile {worker} changed across slices");
+    }
 }
 
 #[test]
-fn seven_and_eight_worker_island_profiles_are_deterministic_and_heterogeneous() {
-    let expected_dispatch = [
+fn adjusted_work_dispatch_portfolio_is_bounded_to_seven_workers_and_deterministic() {
+    let previous_dispatch = [
         "earliest-start",
         "earliest-start",
         "earliest-start",
         "earliest-start",
-        "earliest-start",
+        "earliest-start-then-most-work-remaining",
         "earliest-start",
         "earliest-start",
         "earliest-start",
     ];
+    let seven_worker_dispatch = [
+        "earliest-start-then-most-adjusted-work-c24",
+        "earliest-start-then-most-adjusted-work-c51",
+        "earliest-start-then-most-adjusted-work-c48",
+        "earliest-start-then-most-adjusted-work-c16",
+        "earliest-start-then-most-adjusted-work-c41",
+        "earliest-start",
+        "earliest-start-then-most-work-remaining",
+        "earliest-start",
+    ];
     let expected_widths = [32, 32, 32, 32, 32, 32, 96, 128];
 
-    for workers in [7, 8] {
+    for workers in [1, 2, 6, 7, 8] {
+        let expected_dispatch = if workers == 7 { seven_worker_dispatch } else { previous_dispatch };
         for worker in 0..workers {
             let first = audit_schedule_island_profile(worker, workers);
             let second = audit_schedule_island_profile(worker, workers);
@@ -1315,28 +1441,50 @@ fn profile_constructor_mapping_is_executed_deterministically_and_reports_only_ne
     let schedule = diversified_job_shop();
     let running = AtomicBool::new(false);
     let problem = JobShopProblem::recognize(&schedule, &running).unwrap().unwrap();
-    let expected_rules = [
+    let previous_rules = [
         DispatchRule::EarliestStart,
         DispatchRule::EarliestStart,
         DispatchRule::EarliestStart,
         DispatchRule::EarliestStart,
-        DispatchRule::EarliestStart,
+        DispatchRule::EarliestStartThenMostWorkRemaining,
         DispatchRule::EarliestStart,
         DispatchRule::EarliestStart,
         DispatchRule::EarliestStart,
     ];
-    let expected_names = [
+    let seven_worker_rules = [
+        DispatchRule::ADJUSTED_WORK_PORTFOLIO[0],
+        DispatchRule::ADJUSTED_WORK_PORTFOLIO[1],
+        DispatchRule::ADJUSTED_WORK_PORTFOLIO[2],
+        DispatchRule::ADJUSTED_WORK_PORTFOLIO[3],
+        DispatchRule::ADJUSTED_WORK_PORTFOLIO[4],
+        DispatchRule::EarliestStart,
+        DispatchRule::EarliestStartThenMostWorkRemaining,
+        DispatchRule::EarliestStart,
+    ];
+    let previous_names = [
         "earliest-start",
         "earliest-start",
         "earliest-start",
         "earliest-start",
+        "earliest-start-then-most-work-remaining",
         "earliest-start",
         "earliest-start",
         "earliest-start",
+    ];
+    let seven_worker_names = [
+        "earliest-start-then-most-adjusted-work-c24",
+        "earliest-start-then-most-adjusted-work-c51",
+        "earliest-start-then-most-adjusted-work-c48",
+        "earliest-start-then-most-adjusted-work-c16",
+        "earliest-start-then-most-adjusted-work-c41",
+        "earliest-start",
+        "earliest-start-then-most-work-remaining",
         "earliest-start",
     ];
 
-    for workers in [7, 8] {
+    for workers in [1, 2, 6, 7, 8] {
+        let expected_rules = if workers == 7 { seven_worker_rules } else { previous_rules };
+        let expected_names = if workers == 7 { seven_worker_names } else { previous_names };
         for worker in 0..workers {
             let expected = JobShopState::giffler_thompson(&problem, 127, expected_rules[worker], &running).unwrap().unwrap();
             let expected_metrics = expected.metrics();
@@ -1456,6 +1604,79 @@ fn run_tsab_slices(
     (solution.expect("at least one TSAB slice"), metrics, session.expect("JSSP owns a persistent TSAB session"))
 }
 
+fn run_tsab_multi_slices(
+    schedule: &Schedule,
+    seed: u64,
+    worker: usize,
+    slices: &[u64],
+) -> (CollectionSolution, Vec<ScheduleConstructionMetrics>, ScheduleSearchSession) {
+    let stop = AtomicBool::new(false);
+    let mut solution = None::<CollectionSolution>;
+    let mut session = None::<ScheduleSearchSession>;
+    let mut metrics = Vec::new();
+    for &work in slices {
+        let (next_solution, next_metrics, next_session) = solve_schedule_capped_persistent_tsab_multi(
+            schedule,
+            seed,
+            seed,
+            worker,
+            7,
+            &stop,
+            work,
+            solution.as_ref(),
+            session,
+            &mut |_| {},
+        );
+        solution = Some(next_solution);
+        session = next_session;
+        metrics.push(next_metrics);
+    }
+    (solution.expect("at least one multi-worker TSAB slice"), metrics, session.expect("JSSP owns a persistent multi-worker TSAB session"))
+}
+
+fn latched_tsab_pending_elite() -> (Schedule, u64, CollectionSolution, i64, ScheduleSearchSession) {
+    let (schedule, _) = tsab_candidate_fixture();
+    let seed = 0;
+    let (warm_solution, _, warm_session) = run_tsab_slices(&schedule, seed, &[256, 256]);
+    let stop = AtomicBool::new(false);
+    let (active_solution, _, active_session) =
+        solve_schedule_capped_persistent_tsab(&schedule, seed, seed, 6, 7, &stop, 1, Some(&warm_solution), Some(warm_session), &mut |_| {});
+
+    // Normalize the activation slice so the test hook starts from a fully
+    // validated fast state, whether its first four transitions improved or not.
+    stop.store(true, Ordering::Release);
+    let (latched_solution, _, latched_session) =
+        solve_schedule_capped_persistent_tsab(&schedule, seed, seed, 6, 7, &stop, 0, Some(&active_solution), active_session, &mut |_| {});
+    stop.store(false, Ordering::Release);
+    let (clean_solution, _, clean_session) =
+        solve_schedule_capped_persistent_tsab(&schedule, seed, seed, 6, 7, &stop, 0, Some(&latched_solution), latched_session, &mut |_| {});
+    let mut clean_session = clean_session.expect("the normalized TSAB session remains resumable");
+    assert!(!clean_session.test_tsab_fast_validation_due_on_resume());
+    assert_eq!(clean_session.test_tsab_pending_elite_objective(), None);
+    clean_session.test_stop_after_fast_pending_elite();
+
+    let (verified_solution, metrics, pending_session) = solve_schedule_capped_persistent_tsab(
+        &schedule,
+        seed,
+        seed,
+        6,
+        7,
+        &stop,
+        128,
+        Some(&clean_solution),
+        Some(clean_session),
+        &mut |_| {},
+    );
+    assert!(stop.load(Ordering::Acquire), "the test hook must stop on the first pending elite");
+    assert_eq!(metrics.schedule_tsab.fast_pending_promotions, 0);
+    let pending_session = pending_session.expect("a stopped exact fast trajectory remains resumable");
+    assert!(pending_session.test_tsab_fast_validation_due_on_resume());
+    let pending_objective = pending_session.test_tsab_pending_elite_objective().expect("the stop hook retains a pending elite");
+    assert_eq!(pending_session.tsab_fast_pending_objective(), Some(pending_objective));
+    assert!(pending_objective < verified_solution.objectives[0], "the pending objective must strictly improve the last verified elite");
+    (schedule, seed, verified_solution, pending_objective, pending_session)
+}
+
 fn exact_two_job_restart_fixture() -> (Schedule, CollectionSolution, CollectionSolution) {
     let schedule = Schedule {
         intervals: [10, 1, 10, 1]
@@ -1479,6 +1700,69 @@ fn exact_two_job_restart_fixture() -> (Schedule, CollectionSolution, CollectionS
     (schedule, solution(vec![0, 10, 11, 21], 22), solution(vec![0, 10, 0, 10], 11))
 }
 
+fn tail_corridor_restart_fixture() -> (Schedule, CollectionSolution) {
+    let schedule = Schedule {
+        intervals: (0..8).map(|_| IntervalVar { duration: 1, horizon: 8, modes: Vec::new(), optional: false }).collect(),
+        precedences: vec![(3, 4)],
+        resources: vec![Resource::NoOverlap(vec![0, 1, 2, 3]), Resource::NoOverlap(vec![4, 5, 6, 7])],
+        minimize_makespan: true,
+    };
+    let incumbent = CollectionSolution {
+        lists: Vec::new(),
+        objectives: vec![8],
+        feasible: true,
+        starts: (0..8).map(i64::from).collect(),
+        presences: vec![true; 8],
+        machines: vec![0, 0, 0, 0, 1, 1, 1, 1],
+        modes: vec![None; 8],
+        bound: None,
+    };
+    (schedule, incumbent)
+}
+
+fn coordinated_macro_restart_fixture() -> (Schedule, Vec<Vec<usize>>, Vec<Vec<usize>>) {
+    let durations = [9, 5, 3, 2, 8, 5, 2, 6, 8, 9, 4, 5, 2, 9, 2, 3];
+    let horizon = durations.iter().sum();
+    let schedule = Schedule {
+        intervals: durations.into_iter().map(|duration| IntervalVar { duration, horizon, modes: Vec::new(), optional: false }).collect(),
+        precedences: vec![(0, 1), (1, 2), (2, 3), (4, 5), (5, 6), (6, 7), (8, 9), (9, 10), (10, 11), (12, 13), (13, 14), (14, 15)],
+        resources: vec![
+            Resource::NoOverlap(vec![2, 5, 9, 13]),
+            Resource::NoOverlap(vec![0, 6, 10, 14]),
+            Resource::NoOverlap(vec![3, 7, 11, 12]),
+            Resource::NoOverlap(vec![1, 4, 8, 15]),
+        ],
+        minimize_makespan: true,
+    };
+    // Compact machine ids follow first occurrence in operation order, which
+    // maps raw machines [1, 3, 0, 2] to compact ids [0, 1, 2, 3].
+    let current = vec![vec![10, 0, 6, 14], vec![8, 4, 15, 1], vec![5, 9, 13, 2], vec![11, 12, 3, 7]];
+    let guide = vec![vec![10, 0, 6, 14], vec![8, 1, 4, 15], vec![9, 13, 2, 5], vec![11, 12, 3, 7]];
+    (schedule, current, guide)
+}
+
+fn rejected_tail_corridor_restart_schedule() -> Schedule {
+    const JOBS: usize = 7;
+    const MACHINES: usize = 4;
+    const SALT: usize = 15;
+    let operation_count = JOBS * MACHINES;
+    let durations: Vec<i64> =
+        (0..operation_count).map(|operation| 1 + i64::try_from((operation * 7 + SALT * 3) % 17).expect("small duration")).collect();
+    let horizon = durations.iter().sum();
+    let intervals = durations.into_iter().map(|duration| IntervalVar { duration, horizon, modes: Vec::new(), optional: false }).collect();
+    let precedences = (0..JOBS)
+        .flat_map(|job| (0..MACHINES - 1).map(move |operation| (job * MACHINES + operation, job * MACHINES + operation + 1)))
+        .collect();
+    let mut assigned = vec![Vec::new(); MACHINES];
+    for job in 0..JOBS {
+        for operation in 0..MACHINES {
+            let machine = (job * 3 + SALT + MACHINES - operation % MACHINES) % MACHINES;
+            assigned[machine].push(job * MACHINES + operation);
+        }
+    }
+    Schedule { intervals, precedences, resources: assigned.into_iter().map(Resource::NoOverlap).collect(), minimize_makespan: true }
+}
+
 fn forced_tsab_restart_session(
     schedule: &Schedule,
     seed: u64,
@@ -1494,10 +1778,10 @@ fn forced_tsab_restart_session(
 }
 
 fn naturally_due_tsab_restart(schedule: &Schedule, seed: u64) -> (CollectionSolution, ScheduleSearchSession) {
-    let (mut solution, _, mut session) = run_tsab_slices(schedule, seed, &[256, 256, 128]);
+    let (mut solution, _, mut session) = run_tsab_slices(schedule, seed, &[256, 256, 16]);
     for _ in 0..=3 {
         let (n5_work, _, _, _, _, scan_empty) = session.test_tsab_restart_state();
-        if n5_work >= 128 && scan_empty {
+        if n5_work >= 16 && scan_empty {
             return (solution, session);
         }
         let stop = AtomicBool::new(false);
@@ -1511,18 +1795,124 @@ fn naturally_due_tsab_restart(schedule: &Schedule, seed: u64) -> (CollectionSolu
 
 #[test]
 fn tsab_candidate_owner_phase_shortlist_and_admissibility_policies_are_bounded() {
-    assert_eq!(audit_tsab_owner_mask(7), 0x40, "only worker 6 owns the phased candidate");
-    assert_eq!(audit_tsab_owner_mask(6), 0, "the experimental ownership contract requires exactly seven workers");
+    assert_eq!(audit_tsab_owner_mask(ScheduleJsspSearchStrategy::TsabCandidate, 7), 0x40);
+    assert_eq!(audit_tsab_owner_mask(ScheduleJsspSearchStrategy::TsabMultiCandidate, 7), 0x7f);
+    assert_eq!(audit_tsab_owner_mask(ScheduleJsspSearchStrategy::Legacy, 7), 0);
+    assert_eq!(audit_tsab_owner_mask(ScheduleJsspSearchStrategy::TsabCandidate, 6), 0);
+    assert_eq!(audit_tsab_owner_mask(ScheduleJsspSearchStrategy::TsabMultiCandidate, 8), 0);
     assert_eq!(audit_tsab_phase_policy(), (512, 128, 8, 4), "warmup, burst, tenure, and K4 are fixed");
-    assert_eq!(audit_tsab_elite_restart_policy(), (128, 8, 4, 64), "elite restart cadence, credit, K4, and ppm bound are fixed");
+    assert_eq!(audit_tsab_elite_restart_policy(), (16, 8, 4, 64), "elite restart cadence, credit, K4, and ppm bound are fixed");
     assert_eq!(audit_tsab_shortlist_policy(), (4, 1, true), "streaming top-k retains one tabu candidate and no duplicates");
     assert!(audit_tsab_selection_policy(), "aspiration is strict and all-tabu search resets instead of forcing a commit");
+    for worker in 0..7 {
+        assert_eq!(
+            schedule_worker_allows_rebase(ScheduleJsspSearchStrategy::TsabMultiCandidate, worker),
+            matches!(worker, 0 | 6),
+            "the multi-owner candidate preserves the historical rebase policy"
+        );
+        assert_eq!(
+            schedule_worker_allows_rebase(ScheduleJsspSearchStrategy::TsabCandidate, worker),
+            matches!(worker, 0 | 6),
+            "the single-owner candidate preserves the same historical rebase policy"
+        );
+    }
     let (schedule, seed) = tsab_candidate_fixture();
     assert!(audit_tsab_streaming_reference(&schedule, seed));
     let (matches_reference, generated, shortlisted, heap_bytes) = audit_tsab_n6_restart_streaming_reference(&job_shop_schedule(64), seed);
     assert!(matches_reference, "streaming N6 inserts match the materialized deterministic reference");
     assert_eq!((generated, shortlisted), (122, 4));
     assert_eq!(heap_bytes, 4 * std::mem::size_of::<(bool, u64, ScoredScheduleMove)>());
+}
+
+#[test]
+fn tsab_multi_candidate_workers_zero_three_and_six_activate_after_the_exact_warmup() {
+    let (schedule, seed) = tsab_candidate_fixture();
+    let stop = AtomicBool::new(false);
+    for worker in [0, 3, 6] {
+        let (warm_solution, warm_metrics, warm_session) = run_tsab_multi_slices(&schedule, seed, worker, &[256, 256]);
+        assert_eq!(warm_metrics.iter().map(|metrics| metrics.schedule_tsab.legacy_warmup_work_steps).sum::<u64>(), 512);
+        assert!(warm_metrics.iter().all(|metrics| metrics.schedule_tsab.owner_worker_mask == 0));
+        assert_eq!(warm_session.test_tsab_phase_state().0, ScheduleJsspSearchStrategy::Legacy);
+        assert_eq!(warm_session.test_tsab_phase_state().2, 512);
+        assert_eq!(warm_session.test_tsab_requested_strategy(), ScheduleJsspSearchStrategy::TsabMultiCandidate);
+
+        let (_, active_metrics, active_session) = solve_schedule_capped_persistent_tsab_multi(
+            &schedule,
+            seed,
+            seed,
+            worker,
+            7,
+            &stop,
+            1,
+            Some(&warm_solution),
+            Some(warm_session),
+            &mut |_| {},
+        );
+        assert_eq!(active_metrics.schedule_tsab.owner_worker_mask, 1 << worker);
+        assert_eq!(active_metrics.schedule_tsab.activations, 1);
+        assert_eq!(active_metrics.schedule_tsab.legacy_warmup_work_steps, 0);
+        let active_session = active_session.expect("the activated multi-worker TSAB session remains persistent");
+        assert_eq!(active_session.test_tsab_phase_state().0, ScheduleJsspSearchStrategy::TsabCandidate);
+        assert_eq!(active_session.test_tsab_requested_strategy(), ScheduleJsspSearchStrategy::TsabMultiCandidate);
+        assert_eq!(active_session.test_tsab_canonical_path().0, CanonicalPathPolicy::Historical);
+    }
+}
+
+#[test]
+fn tsab_multi_candidate_arbitrary_splits_preserve_worker_three_trajectory() {
+    let (schedule, seed) = tsab_candidate_fixture();
+    let (monolithic_solution, monolithic_metrics, monolithic_session) = run_tsab_multi_slices(&schedule, seed, 3, &[256, 256, 40]);
+    let (split_solution, split_metrics, split_session) =
+        run_tsab_multi_slices(&schedule, seed, 3, &[1, 3, 17, 29, 61, 113, 256, 32, 15, 1, 1, 3, 4, 16]);
+
+    assert_schedule_solution_eq(&split_solution, &monolithic_solution);
+    assert!(split_session.test_same_tabu_trajectory(&monolithic_session));
+    assert_eq!(split_session.test_tsab_requested_strategy(), ScheduleJsspSearchStrategy::TsabMultiCandidate);
+    assert_eq!(split_session.test_tsab_phase_state().0, ScheduleJsspSearchStrategy::TsabCandidate);
+
+    let sum =
+        |metrics: &[ScheduleConstructionMetrics], field: fn(&ScheduleConstructionMetrics) -> u64| metrics.iter().map(field).sum::<u64>();
+    assert_eq!(sum(&split_metrics, |m| m.work_steps), sum(&monolithic_metrics, |m| m.work_steps));
+    assert_eq!(
+        sum(&split_metrics, |m| m.schedule_tsab.legacy_warmup_work_steps),
+        sum(&monolithic_metrics, |m| m.schedule_tsab.legacy_warmup_work_steps)
+    );
+    assert_eq!(sum(&split_metrics, |m| m.schedule_tsab.burst_work_units), sum(&monolithic_metrics, |m| m.schedule_tsab.burst_work_units));
+    assert_eq!(sum(&split_metrics, |m| m.schedule_tsab.fast_work_units), sum(&monolithic_metrics, |m| m.schedule_tsab.fast_work_units));
+    assert_eq!(
+        sum(&split_metrics, |m| m.schedule_tsab.restart_work_units),
+        sum(&monolithic_metrics, |m| m.schedule_tsab.restart_work_units)
+    );
+    assert_eq!(sum(&split_metrics, |m| m.schedule_tsab.fast_transitions), sum(&monolithic_metrics, |m| m.schedule_tsab.fast_transitions));
+    assert_eq!(
+        sum(&split_metrics, |m| m.schedule_tsab.fast_full_validations),
+        sum(&monolithic_metrics, |m| m.schedule_tsab.fast_full_validations)
+    );
+    assert_eq!(sum(&split_metrics, |m| m.schedule_tsab.activations), 1);
+    assert_eq!(split_metrics.iter().fold(0, |mask, metrics| mask | metrics.schedule_tsab.owner_worker_mask), 1 << 3);
+}
+
+#[test]
+fn tsab_multi_worker_six_preserves_the_single_owner_historical_anchor() {
+    let (schedule, seed) = tsab_candidate_fixture();
+    let slices = [256, 256, 128, 64];
+    let (single_solution, single_metrics, single_session) = run_tsab_slices(&schedule, seed, &slices);
+    let (multi_solution, multi_metrics, multi_session) = run_tsab_multi_slices(&schedule, seed, 6, &slices);
+
+    assert_schedule_solution_eq(&multi_solution, &single_solution);
+    assert_eq!(multi_session.test_tsab_canonical_path(), single_session.test_tsab_canonical_path());
+    assert_eq!(multi_session.test_tsab_canonical_path().0, CanonicalPathPolicy::Historical);
+    assert_eq!(multi_session.test_tsab_phase_state(), single_session.test_tsab_phase_state());
+    for (multi, single) in multi_metrics.iter().zip(&single_metrics) {
+        assert_eq!(multi.work_steps, single.work_steps);
+        assert_eq!(multi.moves_considered, single.moves_considered);
+        assert_eq!(multi.moves_accepted, single.moves_accepted);
+        let mut multi_tsab = multi.schedule_tsab;
+        let mut single_tsab = single.schedule_tsab;
+        multi_tsab.fast_elapsed = Duration::ZERO;
+        single_tsab.fast_elapsed = Duration::ZERO;
+        assert_eq!(multi_tsab, single_tsab);
+    }
 }
 
 #[test]
@@ -1595,7 +1985,10 @@ fn tsab_candidate_warms_for_exactly_two_256_unit_boundaries_then_activates_once(
     assert_eq!(tsab.legacy_warmup_work_steps, 0);
     assert_eq!(tsab.activation_rebases, 0);
     assert_eq!(tsab.activation_objective, Some(warm_current));
-    assert_eq!(active_solution.objectives.first().copied(), Some(warm_elite), "activation preserves the verified elite");
+    assert!(
+        active_solution.objectives.first().is_some_and(|&objective| objective <= warm_elite),
+        "active search keeps the verified elite monotone"
+    );
     assert_eq!(tsab.active_boundaries, 1);
     assert_eq!(tsab.burst_work_limit, 128);
     assert_eq!(tsab.burst_work_units, 128);
@@ -1604,7 +1997,8 @@ fn tsab_candidate_warms_for_exactly_two_256_unit_boundaries_then_activates_once(
     assert!(tsab.full_oracle_commits <= tsab.selections);
     assert_eq!(tsab.best_committed_objective.is_some(), tsab.improving_commits != 0);
     assert_eq!((tsab.fast_eligible, tsab.fast_enabled, tsab.fast_disabled), (1, 1, 0));
-    assert_eq!(tsab.fast_work_units, 128);
+    assert!(tsab.restart_attempts > 0);
+    assert_eq!(tsab.fast_work_units.saturating_add(tsab.restart_work_units), tsab.burst_work_units);
     assert!(tsab.fast_attempts > 0);
     assert_eq!(tsab.fast_transitions, tsab.fast_commits);
     assert!(tsab.fast_commits <= tsab.fast_attempts);
@@ -1619,6 +2013,7 @@ fn tsab_candidate_warms_for_exactly_two_256_unit_boundaries_then_activates_once(
     let (phase, boundaries, warmup, activation_boundary, _, _, _, direct_credit, tenure) = active_session.test_tsab_phase_state();
     assert_eq!(phase, ScheduleJsspSearchStrategy::TsabCandidate);
     assert_eq!((boundaries, warmup, activation_boundary, direct_credit, tenure), (3, 512, Some(2), 0, 8));
+    assert_eq!(active_session.test_tsab_canonical_path().0, CanonicalPathPolicy::Historical);
 
     let (_, next_metrics, next_session) = solve_schedule_capped_persistent_tsab(
         &schedule,
@@ -1676,7 +2071,7 @@ fn tsab_fast_batch_executes_at_least_ten_times_more_transitions_per_equal_work_b
     let mut reference_session = reference_session.expect("reference TSAB session activates");
     reference_session.test_disable_tsab_fast_path();
 
-    const WORK_UNITS: u64 = 120;
+    let work_units = audit_tsab_elite_restart_policy().0.saturating_sub(1);
     let fast_started = Instant::now();
     let (fast_solution, fast_metrics, fast_session) = solve_schedule_capped_persistent_tsab(
         &schedule,
@@ -1685,7 +2080,7 @@ fn tsab_fast_batch_executes_at_least_ten_times_more_transitions_per_equal_work_b
         6,
         7,
         &stop,
-        WORK_UNITS,
+        work_units,
         Some(&fast_base),
         Some(fast_session),
         &mut |_| {},
@@ -1699,7 +2094,7 @@ fn tsab_fast_batch_executes_at_least_ten_times_more_transitions_per_equal_work_b
         6,
         7,
         &stop,
-        WORK_UNITS,
+        work_units,
         Some(&reference_base),
         Some(reference_session),
         &mut |_| {},
@@ -1718,8 +2113,8 @@ fn tsab_fast_batch_executes_at_least_ten_times_more_transitions_per_equal_work_b
     assert_eq!(verify_collection_solution(&replay_model, &fast_solution).unwrap(), fast_solution.objectives);
     assert_eq!(verify_collection_solution(&replay_model, &reference_solution).unwrap(), reference_solution.objectives);
     assert!(fast_session.is_some() && reference_session.is_some());
-    assert_eq!(fast_metrics.work_steps, WORK_UNITS);
-    assert_eq!(reference_metrics.work_steps, WORK_UNITS);
+    assert_eq!(fast_metrics.work_steps, work_units);
+    assert_eq!(reference_metrics.work_steps, work_units);
     let fast_transitions = fast_metrics.schedule_tsab.fast_transitions;
     let reference_transitions = reference_metrics.schedule_tsab.full_oracle_commits;
     assert!(reference_transitions > 0, "reference K4 kernel must commit at least one transition");
@@ -1735,6 +2130,47 @@ fn tsab_fast_batch_executes_at_least_ten_times_more_transitions_per_equal_work_b
         fast_wall.as_millis(),
         reference_wall.as_millis()
     );
+}
+
+#[test]
+fn tsab_fast_work_cap_recovery_is_counted_without_a_transactional_fallback() {
+    let (schedule, seed) = tsab_candidate_fixture();
+    let (warm_solution, _, warm_session) = run_tsab_slices(&schedule, seed, &[256, 256]);
+    let stop = AtomicBool::new(false);
+    let (active_solution, _, active_session) =
+        solve_schedule_capped_persistent_tsab(&schedule, seed, seed, 6, 7, &stop, 1, Some(&warm_solution), Some(warm_session), &mut |_| {});
+    let mut active_session = active_session.expect("TSAB fast path activates");
+    active_session.test_force_tsab_fast_work_cap(0);
+
+    let (solution, metrics, session) = solve_schedule_capped_persistent_tsab(
+        &schedule,
+        seed,
+        seed,
+        6,
+        7,
+        &stop,
+        16,
+        Some(&active_solution),
+        Some(active_session),
+        &mut |_| {},
+    );
+    let fast = metrics.schedule_tsab;
+    assert!(fast.fast_attempts > 0);
+    assert_eq!(fast.fast_work_cap_recoveries, fast.fast_attempts);
+    assert_eq!(fast.fast_fallbacks, 0, "a recovered artificial WorkCap is not a transactional fallback");
+    assert_eq!(fast.fast_oracle_mismatches, 0);
+    assert!(fast.fast_full_validations > 0);
+    assert!(session.is_some(), "validated recovery keeps the persistent session");
+
+    let replay_model = CollectionModel {
+        items: Vec::new(),
+        lists: 0,
+        objectives: Vec::new(),
+        constraints: Vec::new(),
+        globals: Vec::new(),
+        schedule: Some(schedule),
+    };
+    assert_eq!(verify_collection_solution(&replay_model, &solution).unwrap(), solution.objectives);
 }
 
 #[test]
@@ -1754,10 +2190,19 @@ fn tsab_candidate_arbitrary_warmup_and_active_splits_preserve_the_trajectory() {
         6,
         7,
         &stop,
-        128,
+        40,
         Some(&mono_warm_solution),
         Some(mono_warm_session),
         &mut |_| {},
+    );
+    assert_eq!(mono_metrics.schedule_tsab.fast_work_units, 32);
+    assert_eq!(mono_metrics.schedule_tsab.restart_work_units, 8);
+    assert_eq!(mono_metrics.schedule_tsab.restart_attempts, 1);
+    assert_eq!(mono_metrics.schedule_tsab.elite_restarts, 1);
+    assert_eq!(mono_metrics.schedule_tsab.burst_work_units, 40);
+    assert_eq!(
+        mono_metrics.schedule_tsab.fast_work_units.saturating_add(mono_metrics.schedule_tsab.restart_work_units),
+        mono_metrics.schedule_tsab.burst_work_units
     );
     let mut split_solution = split_warm_solution;
     let mut split_session = Some(split_warm_session);
@@ -1767,7 +2212,11 @@ fn tsab_candidate_arbitrary_warmup_and_active_splits_preserve_the_trajectory() {
     let mut split_fast_transitions = 0u64;
     let mut split_fast_validations = 0u64;
     let mut split_fast_promotions = 0u64;
-    for work in [1, 3, 37, 87] {
+    let mut split_fast_work = 0u64;
+    let mut split_restart_work = 0u64;
+    let mut split_restart_attempts = 0u64;
+    let mut split_restarts = 0u64;
+    for work in [15, 1, 1, 3, 4, 16] {
         let (solution, metrics, session) = solve_schedule_capped_persistent_tsab(
             &schedule,
             seed,
@@ -1788,6 +2237,10 @@ fn tsab_candidate_arbitrary_warmup_and_active_splits_preserve_the_trajectory() {
         split_fast_transitions = split_fast_transitions.saturating_add(metrics.schedule_tsab.fast_transitions);
         split_fast_validations = split_fast_validations.saturating_add(metrics.schedule_tsab.fast_full_validations);
         split_fast_promotions = split_fast_promotions.saturating_add(metrics.schedule_tsab.fast_pending_promotions);
+        split_fast_work = split_fast_work.saturating_add(metrics.schedule_tsab.fast_work_units);
+        split_restart_work = split_restart_work.saturating_add(metrics.schedule_tsab.restart_work_units);
+        split_restart_attempts = split_restart_attempts.saturating_add(metrics.schedule_tsab.restart_attempts);
+        split_restarts = split_restarts.saturating_add(metrics.schedule_tsab.elite_restarts);
     }
     assert_schedule_solution_eq(&split_solution, &mono_active_solution);
     assert!(split_session
@@ -1800,6 +2253,11 @@ fn tsab_candidate_arbitrary_warmup_and_active_splits_preserve_the_trajectory() {
     assert_eq!(split_fast_transitions, mono_metrics.schedule_tsab.fast_transitions);
     assert_eq!(split_fast_validations, mono_metrics.schedule_tsab.fast_full_validations);
     assert_eq!(split_fast_promotions, mono_metrics.schedule_tsab.fast_pending_promotions);
+    assert_eq!(split_fast_work, mono_metrics.schedule_tsab.fast_work_units);
+    assert_eq!(split_restart_work, mono_metrics.schedule_tsab.restart_work_units);
+    assert_eq!(split_restart_attempts, mono_metrics.schedule_tsab.restart_attempts);
+    assert_eq!(split_restarts, mono_metrics.schedule_tsab.elite_restarts);
+    assert_eq!(split_fast_work.saturating_add(split_restart_work), 40);
 }
 
 #[test]
@@ -1910,6 +2368,176 @@ fn tsab_fast_stop_latches_full_validation_before_any_resumed_attempt() {
 }
 
 #[test]
+fn tsab_fast_finalization_stop_promotes_an_exact_pending_elite() {
+    let (schedule, seed, verified_solution, pending_objective, pending_session) = latched_tsab_pending_elite();
+    let search_stop = AtomicBool::new(true);
+    let finalization_stop = AtomicBool::new(false);
+    let mut reports = Vec::new();
+
+    let (solution, metrics, session) = solve_schedule_capped_persistent_tsab_with_finalization_stop(
+        &schedule,
+        seed,
+        seed,
+        6,
+        7,
+        &search_stop,
+        &finalization_stop,
+        0,
+        Some(&verified_solution),
+        Some(pending_session),
+        &mut |objective| reports.push(objective),
+    );
+
+    assert_eq!(solution.objectives, vec![pending_objective]);
+    assert_eq!(metrics.work_steps, 0);
+    assert_eq!(metrics.schedule_tsab.fast_attempts, 0);
+    assert_eq!(metrics.schedule_tsab.fast_full_validations, 1);
+    assert_eq!(metrics.schedule_tsab.fast_pending_promotions, 1);
+    assert_eq!(metrics.schedule_tsab.fast_oracle_mismatches, 0);
+    assert_eq!(metrics.schedule_tsab.fast_pending_discards, 0);
+    assert_eq!(reports, vec![pending_objective]);
+    eprintln!(
+        "TSAB terminal validation: verified={}, pending={}, returned={}, validations={}, promotions={}",
+        verified_solution.objectives[0],
+        pending_objective,
+        solution.objectives[0],
+        metrics.schedule_tsab.fast_full_validations,
+        metrics.schedule_tsab.fast_pending_promotions
+    );
+    let session = session.expect("terminal validation keeps the exact TSAB session");
+    assert!(!session.test_tsab_fast_validation_due_on_resume());
+    assert_eq!(session.test_tsab_pending_elite_objective(), None);
+
+    let replay_model = CollectionModel {
+        items: Vec::new(),
+        lists: 0,
+        objectives: Vec::new(),
+        constraints: Vec::new(),
+        globals: Vec::new(),
+        schedule: Some(schedule),
+    };
+    assert_eq!(verify_collection_solution(&replay_model, &solution).unwrap(), vec![pending_objective]);
+}
+
+#[test]
+fn tsab_fast_finalization_already_stopped_keeps_the_verified_elite_and_pending_latch() {
+    let (schedule, seed, verified_solution, pending_objective, pending_session) = latched_tsab_pending_elite();
+    let search_stop = AtomicBool::new(true);
+    let finalization_stop = AtomicBool::new(true);
+    let mut reports = Vec::new();
+
+    let (solution, metrics, session) = solve_schedule_capped_persistent_tsab_with_finalization_stop(
+        &schedule,
+        seed,
+        seed,
+        6,
+        7,
+        &search_stop,
+        &finalization_stop,
+        0,
+        Some(&verified_solution),
+        Some(pending_session),
+        &mut |objective| reports.push(objective),
+    );
+
+    assert_schedule_solution_eq(&solution, &verified_solution);
+    assert_eq!(metrics.schedule_tsab.fast_full_validations, 0);
+    assert_eq!(metrics.schedule_tsab.fast_pending_promotions, 0);
+    assert!(reports.is_empty());
+    let session = session.expect("the untouched pending trajectory remains resumable");
+    assert!(session.test_tsab_fast_validation_due_on_resume());
+    assert_eq!(session.test_tsab_pending_elite_objective(), Some(pending_objective));
+}
+
+#[test]
+fn tsab_fast_parent_stop_during_terminal_oracle_preserves_then_resumes_the_verified_elite() {
+    let (schedule, seed, verified_solution, pending_objective, mut pending_session) = latched_tsab_pending_elite();
+    pending_session.test_stop_during_tsab_fast_validation();
+    let search_stop = AtomicBool::new(true);
+    let finalization_stop = AtomicBool::new(false);
+
+    let (interrupted_solution, interrupted_metrics, interrupted_session) = solve_schedule_capped_persistent_tsab_with_finalization_stop(
+        &schedule,
+        seed,
+        seed,
+        6,
+        7,
+        &search_stop,
+        &finalization_stop,
+        0,
+        Some(&verified_solution),
+        Some(pending_session),
+        &mut |_| {},
+    );
+    assert!(finalization_stop.load(Ordering::Acquire), "the oracle hook must arm the parent stop");
+    assert_schedule_solution_eq(&interrupted_solution, &verified_solution);
+    assert_eq!(interrupted_metrics.schedule_tsab.fast_full_validations, 0);
+    assert_eq!(interrupted_metrics.schedule_tsab.fast_pending_promotions, 0);
+    let interrupted_session = interrupted_session.expect("an interrupted side oracle keeps the exact live trajectory");
+    assert!(interrupted_session.test_tsab_fast_validation_due_on_resume());
+    assert_eq!(interrupted_session.test_tsab_pending_elite_objective(), Some(pending_objective));
+
+    finalization_stop.store(false, Ordering::Release);
+    let (resumed_solution, resumed_metrics, resumed_session) = solve_schedule_capped_persistent_tsab_with_finalization_stop(
+        &schedule,
+        seed,
+        seed,
+        6,
+        7,
+        &search_stop,
+        &finalization_stop,
+        0,
+        Some(&interrupted_solution),
+        Some(interrupted_session),
+        &mut |_| {},
+    );
+    assert_eq!(resumed_solution.objectives, vec![pending_objective]);
+    assert_eq!(resumed_metrics.schedule_tsab.fast_full_validations, 1);
+    assert_eq!(resumed_metrics.schedule_tsab.fast_pending_promotions, 1);
+    let resumed_session = resumed_session.expect("a later reserve can finish the exact validation");
+    assert!(!resumed_session.test_tsab_fast_validation_due_on_resume());
+    assert_eq!(resumed_session.test_tsab_pending_elite_objective(), None);
+}
+
+#[test]
+fn separate_finalization_stop_is_bit_identical_for_legacy_workers() {
+    let schedule = diversified_job_shop();
+    let baseline_stop = AtomicBool::new(false);
+    let mut baseline_reports = Vec::new();
+    let (baseline_solution, baseline_metrics, baseline_session) =
+        solve_schedule_capped_persistent_tsab(&schedule, 127, 127, 0, 7, &baseline_stop, 16, None, None, &mut |objective| {
+            baseline_reports.push(objective)
+        });
+    let search_stop = AtomicBool::new(false);
+    let finalization_stop = AtomicBool::new(true);
+    let mut separate_reports = Vec::new();
+    let (separate_solution, separate_metrics, separate_session) = solve_schedule_capped_persistent_tsab_with_finalization_stop(
+        &schedule,
+        127,
+        127,
+        0,
+        7,
+        &search_stop,
+        &finalization_stop,
+        16,
+        None,
+        None,
+        &mut |objective| separate_reports.push(objective),
+    );
+
+    assert_schedule_solution_eq(&separate_solution, &baseline_solution);
+    assert_eq!(separate_reports, baseline_reports);
+    assert_eq!(separate_metrics.moves_considered, baseline_metrics.moves_considered);
+    assert_eq!(separate_metrics.moves_accepted, baseline_metrics.moves_accepted);
+    assert_eq!(separate_metrics.tabu_steps, baseline_metrics.tabu_steps);
+    assert_eq!(separate_metrics.schedule_tsab, Default::default());
+    assert!(separate_session
+        .as_ref()
+        .zip(baseline_session.as_ref())
+        .is_some_and(|(separate, baseline)| separate.test_same_tabu_trajectory(baseline)));
+}
+
+#[test]
 fn tsab_candidate_requested_on_non_jssp_fails_closed_for_worker_six() {
     let durations = [2, 1, 3, 2, 4, 1, 2, 3];
     let schedule = Schedule {
@@ -1987,6 +2615,68 @@ fn tsab_candidate_activation_rebase_uses_the_fresh_third_boundary_incumbent() {
     let activation_session = activation_session.expect("activation retains the session");
     assert_eq!(activation_session.test_tsab_phase_state().5, fresh.objectives[0]);
     assert!(first_solution.feasible);
+}
+
+#[test]
+fn tsab_elite_restart_becomes_due_after_exactly_sixteen_fast_work_units_and_two_validations() {
+    let (schedule, seed) = tsab_candidate_fixture();
+    let (warm_solution, _, warm_session) = run_tsab_slices(&schedule, seed, &[256, 256]);
+    let stop = AtomicBool::new(false);
+
+    let (before_due_solution, before_due_metrics, before_due_session) = solve_schedule_capped_persistent_tsab(
+        &schedule,
+        seed,
+        seed,
+        6,
+        7,
+        &stop,
+        15,
+        Some(&warm_solution),
+        Some(warm_session),
+        &mut |_| {},
+    );
+    assert_eq!(before_due_metrics.schedule_tsab.fast_work_units, 15);
+    assert_eq!(before_due_metrics.schedule_tsab.restart_work_units, 0);
+    assert_eq!(before_due_metrics.schedule_tsab.restart_attempts, 0);
+    assert_eq!(before_due_metrics.schedule_tsab.fast_transitions, 60);
+    assert_eq!(before_due_metrics.schedule_tsab.fast_full_validations, 1);
+    let before_due_session = before_due_session.expect("fifteen N5 work units retain the session");
+    let (n5_work, credit, epoch, _, _, scan_empty) = before_due_session.test_tsab_restart_state();
+    assert_eq!((n5_work, credit, epoch, scan_empty), (15, 0, 0, true));
+
+    let (due_solution, due_metrics, due_session) = solve_schedule_capped_persistent_tsab(
+        &schedule,
+        seed,
+        seed,
+        6,
+        7,
+        &stop,
+        1,
+        Some(&before_due_solution),
+        Some(before_due_session),
+        &mut |_| {},
+    );
+    assert_eq!(due_metrics.schedule_tsab.fast_work_units, 1);
+    assert_eq!(due_metrics.schedule_tsab.restart_work_units, 0);
+    assert_eq!(due_metrics.schedule_tsab.restart_attempts, 0);
+    assert_eq!(due_metrics.schedule_tsab.fast_transitions, 4);
+    assert_eq!(due_metrics.schedule_tsab.fast_full_validations, 1);
+    let mut due_session = due_session.expect("the exact restart boundary retains the session");
+    let (n5_work, credit, epoch, _, _, scan_empty) = due_session.test_tsab_restart_state();
+    assert_eq!((n5_work, credit, epoch, scan_empty), (16, 0, 0, true));
+    assert!(!due_session.test_tsab_fast_validation_due_on_resume());
+    assert!(due_session.test_tsab_state_matches_full_oracle());
+
+    let (_, restart_metrics, restarted_session) =
+        solve_schedule_capped_persistent_tsab(&schedule, seed, seed, 6, 7, &stop, 8, Some(&due_solution), Some(due_session), &mut |_| {});
+    assert_eq!(restart_metrics.schedule_tsab.fast_work_units, 0);
+    assert_eq!(restart_metrics.schedule_tsab.restart_work_units, 8);
+    assert_eq!(restart_metrics.schedule_tsab.restart_attempts, 1);
+    assert_eq!(restart_metrics.schedule_tsab.elite_restarts, 1);
+    let mut restarted_session = restarted_session.expect("the atomic N6 restart retains the session");
+    let (n5_work, credit, epoch, _, _, scan_empty) = restarted_session.test_tsab_restart_state();
+    assert_eq!((n5_work, credit, epoch, scan_empty), (0, 0, 1, true));
+    assert!(restarted_session.test_tsab_state_matches_full_oracle());
 }
 
 #[test]
@@ -2226,4 +2916,199 @@ fn tsab_elite_restart_n6_kick_is_deterministic_bounded_and_oracle_sound() {
     assert_eq!(second_metrics.schedule_tsab.restart_best_kicked_objective, tsab.restart_best_kicked_objective);
     assert!(second_session.test_same_tabu_trajectory(&first_session));
     assert!(first_session.test_tsab_state_matches_full_oracle());
+}
+
+#[test]
+fn tsab_tail_corridor_restart_is_deterministic_atomic_and_split_invariant() {
+    let (schedule, incumbent) = tail_corridor_restart_fixture();
+    let (first_solution, first_session) = forced_tsab_restart_session(&schedule, 47, &incumbent);
+    let (second_solution, second_session) = forced_tsab_restart_session(&schedule, 47, &incumbent);
+    let (split_solution, split_session) = forced_tsab_restart_session(&schedule, 47, &incumbent);
+    let stop = AtomicBool::new(false);
+
+    let mut first_reports = Vec::new();
+    let (first_solution, first_metrics, first_session) = solve_schedule_capped_persistent_tsab(
+        &schedule,
+        47,
+        47,
+        6,
+        7,
+        &stop,
+        8,
+        Some(&first_solution),
+        Some(first_session),
+        &mut |objective| first_reports.push(objective),
+    );
+    let mut second_reports = Vec::new();
+    let (second_solution, second_metrics, second_session) = solve_schedule_capped_persistent_tsab(
+        &schedule,
+        47,
+        47,
+        6,
+        7,
+        &stop,
+        8,
+        Some(&second_solution),
+        Some(second_session),
+        &mut |objective| second_reports.push(objective),
+    );
+
+    let (split_solution, first_split_metrics, split_session) =
+        solve_schedule_capped_persistent_tsab(&schedule, 47, 47, 6, 7, &stop, 3, Some(&split_solution), Some(split_session), &mut |_| {});
+    assert_eq!(first_split_metrics.schedule_tsab.restart_work_units, 3);
+    assert_eq!(first_split_metrics.schedule_tsab.restart_attempts, 0);
+    let mut split_reports = Vec::new();
+    let (split_solution, second_split_metrics, split_session) =
+        solve_schedule_capped_persistent_tsab(&schedule, 47, 47, 6, 7, &stop, 5, Some(&split_solution), split_session, &mut |objective| {
+            split_reports.push(objective)
+        });
+
+    let tsab = first_metrics.schedule_tsab;
+    assert_eq!(tsab.restart_attempts, 1);
+    assert_eq!(tsab.elite_restarts, 1);
+    assert_eq!(tsab.restart_n6_generated, 2);
+    assert_eq!(tsab.restart_delta_probes, 0, "the compound restart uses one full oracle and no single-move probe");
+    assert_eq!(tsab.restart_oracle_commits, 1);
+    assert_eq!(tsab.n6_kicks, 1);
+    assert_eq!(tsab.kick_moves, 2);
+    assert!(tsab.kick_moves > tsab.n6_kicks, "accepted compound restarts expose their component count");
+    assert_eq!(tsab.restart_best_base_objective, Some(8));
+    assert_eq!(tsab.restart_best_kicked_objective, Some(7));
+    assert_eq!(first_solution.objectives, vec![7]);
+    assert_eq!(first_reports, vec![7]);
+    let replay_model = CollectionModel {
+        items: Vec::new(),
+        lists: 0,
+        objectives: Vec::new(),
+        constraints: Vec::new(),
+        globals: Vec::new(),
+        schedule: Some(schedule.clone()),
+    };
+    assert_eq!(verify_collection_solution(&replay_model, &first_solution).unwrap(), vec![7]);
+
+    assert_schedule_solution_eq(&second_solution, &first_solution);
+    assert_eq!(second_reports, first_reports);
+    assert_eq!(second_metrics.schedule_tsab, tsab);
+    assert_schedule_solution_eq(&split_solution, &first_solution);
+    assert_eq!(split_reports, first_reports);
+    assert_eq!(second_split_metrics.schedule_tsab.restart_work_units, 5);
+    assert_eq!(second_split_metrics.schedule_tsab.restart_attempts, 1);
+    let mut first_session = first_session.expect("first tail-corridor restart retains the session");
+    let second_session = second_session.expect("second tail-corridor restart retains the session");
+    let split_session = split_session.expect("split tail-corridor restart retains the session");
+    assert!(second_session.test_same_tabu_trajectory(&first_session));
+    assert!(split_session.test_same_tabu_trajectory(&first_session));
+    assert!(first_session.test_tsab_state_matches_full_oracle());
+    assert!(audit_persistent_schedule_baseline_reference(&schedule, 47, 64), "the Legacy kernel remains on its reference trajectory");
+}
+
+#[test]
+fn tsab_multi_restart_commits_one_coordinated_farthest_guide_macro() {
+    let stop = AtomicBool::new(false);
+    let (schedule, current_order, guide_order) = coordinated_macro_restart_fixture();
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let current_state = JobShopState::from_machine_sequences(&problem, current_order, &stop).unwrap().unwrap();
+    let guide_state = JobShopState::from_machine_sequences(&problem, guide_order, &stop).unwrap().unwrap();
+    let current_objective = current_state.makespan();
+    let guide_objective = guide_state.makespan();
+    let incumbent = current_state.to_solution();
+    let mut archive = ScheduleEliteArchive::new();
+    archive.consider(&guide_state, &stop).unwrap();
+
+    let (base_solution, base_metrics, session) =
+        solve_schedule_capped_persistent_tsab_multi(&schedule, 53, 53, 6, 7, &stop, 0, Some(&incumbent), None, &mut |_| {});
+    assert_eq!(base_metrics.work_steps, 0);
+    assert_eq!(base_solution.objectives, vec![current_objective]);
+    let mut session = session.expect("the macro fixture owns a multi-worker TSAB session");
+    session.test_force_tsab_restart_due();
+    let request = ScheduleRelinkRequest { guide: archive.best().unwrap(), kind: ScheduleRelinkGuideKind::Diverse };
+    let mut reports = Vec::new();
+    let (solution, metrics, session) = solve_schedule_capped_persistent_tsab_multi_relink(
+        &schedule,
+        53,
+        53,
+        6,
+        7,
+        &stop,
+        8,
+        Some(&base_solution),
+        Some(session),
+        request,
+        &mut |objective| reports.push(objective),
+    );
+
+    let tsab = metrics.schedule_tsab;
+    assert_eq!(tsab.restart_attempts, 1);
+    assert_eq!(tsab.restart_relink_attempts, 1);
+    assert_eq!(tsab.restart_relink_commits, 1);
+    assert_eq!(tsab.restart_relink_components_shortlisted, 2);
+    assert_eq!(tsab.restart_relink_components_committed, 2);
+    assert_eq!(tsab.restart_relink_guide_arc_gain_shortlisted, 3);
+    assert_eq!(tsab.restart_relink_guide_arc_gain_accepted, 3);
+    assert_eq!(tsab.restart_oracle_commits, tsab.n6_kicks + tsab.restart_relink_commits);
+    assert_eq!((tsab.n6_kicks, tsab.kick_moves, tsab.restart_n6_generated, tsab.restart_delta_probes), (0, 0, 0, 0));
+    assert_eq!(tsab.restart_rejections, 0);
+    assert_eq!(tsab.restart_best_base_objective, Some(current_objective));
+    assert_eq!(tsab.restart_best_kicked_objective, Some(guide_objective));
+    assert_eq!(metrics.schedule_path_relink.oracle_attempts, 1);
+    assert_eq!(metrics.schedule_path_relink.oracle_accepts, 1);
+    assert_eq!(metrics.schedule_path_relink.rollbacks, 0);
+    assert_eq!(metrics.schedule_path_relink.guide_arc_gain_accepted, 3);
+    assert_eq!(solution.objectives, vec![current_objective.min(guide_objective)]);
+    assert_eq!(reports, (guide_objective < current_objective).then_some(vec![guide_objective]).unwrap_or_default());
+    let mut session = session.expect("the accepted macro restart remains resumable");
+    assert_eq!(session.test_tsab_restart_state().3, guide_objective);
+    assert!(session.test_tsab_state_matches_full_oracle());
+}
+
+#[test]
+fn tsab_tail_corridor_uses_the_shortest_non_adjacent_tailward_insert() {
+    let schedule = job_shop_schedule(6);
+    let stop = AtomicBool::new(false);
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let mut state = JobShopState::from_machine_sequences(&problem, vec![(0..6).collect()], &stop).unwrap().unwrap();
+    state.retain_canonical_critical_blocks_only();
+
+    assert_eq!(audit_tsab_tail_corridor_selection(&state), vec![ScheduleMove::Insert { machine: 0, from: 3, to: 5 }]);
+}
+
+#[test]
+fn tsab_rejected_tail_corridor_does_not_fall_back_to_a_second_oracle() {
+    let schedule = rejected_tail_corridor_restart_schedule();
+    let stop = AtomicBool::new(false);
+    let (base_solution, initial_metrics, session) =
+        solve_schedule_capped_persistent_tsab_multi(&schedule, 18, 18, 5, 7, &stop, 0, None, None, &mut |_| {});
+    assert_eq!(initial_metrics.work_steps, 0);
+    assert_eq!(base_solution.objectives, vec![113]);
+    let mut session = session.expect("the rejected-corridor fixture owns a persistent session");
+    session.test_force_tsab_restart_due();
+    let mut reports = Vec::new();
+    let (solution, metrics, session) = solve_schedule_capped_persistent_tsab_multi(
+        &schedule,
+        18,
+        18,
+        5,
+        7,
+        &stop,
+        8,
+        Some(&base_solution),
+        Some(session),
+        &mut |objective| reports.push(objective),
+    );
+
+    let tsab = metrics.schedule_tsab;
+    assert_eq!(tsab.restart_attempts, 1);
+    assert_eq!(tsab.elite_restarts, 1);
+    assert_eq!(tsab.restart_n6_generated, 2);
+    assert_eq!(tsab.restart_delta_probes, 0, "a rejected batch must not probe a single fallback");
+    assert_eq!(tsab.restart_oracle_commits, 0);
+    assert_eq!((tsab.n6_kicks, tsab.kick_moves), (0, 0));
+    assert_eq!(tsab.restart_rejections, 1);
+    assert_eq!(tsab.restart_best_base_objective, Some(113));
+    assert_eq!(tsab.restart_best_kicked_objective, None);
+    assert_schedule_solution_eq(&solution, &base_solution);
+    assert!(reports.is_empty());
+    let mut session = session.expect("a rejected tail-corridor restart retains the exact base session");
+    assert_eq!(session.test_tsab_restart_state().3, 113);
+    assert!(session.test_tsab_state_matches_full_oracle());
 }

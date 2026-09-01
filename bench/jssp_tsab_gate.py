@@ -11,7 +11,9 @@ from typing import Any
 
 
 FEASIBLE = {"SAT", "SATISFIABLE", "FEASIBLE", "OPTIMAL", "OPTIMUM"}
-EXPECTED_OWNER_MASK = 0x40
+TSAB_CANDIDATE = "tsab-candidate"
+TSAB_MULTI_CANDIDATE = "tsab-multi-candidate"
+TSAB_CANDIDATE_STRATEGIES = (TSAB_CANDIDATE, TSAB_MULTI_CANDIDATE)
 MAX_PEAK_MEMORY_MB = 11_264.0
 CONTROL_RETENTION = 0.90
 QUALITY_OBJECTIVE = 936_343
@@ -68,6 +70,7 @@ TSAB_COUNTERS = (
     "schedule_tsab_fast_attempts",
     "schedule_tsab_fast_commits",
     "schedule_tsab_fast_fallbacks",
+    "schedule_tsab_fast_work_cap_recoveries",
     "schedule_tsab_fast_date_changes",
     "schedule_tsab_fast_queue_pops",
     "schedule_tsab_fast_full_validations",
@@ -79,6 +82,14 @@ TSAB_COUNTERS = (
     "schedule_tsab_fast_workspace_peak_bytes",
 )
 TSAB_NUMBERS = ("schedule_tsab_fast_elapsed_seconds",)
+TSAB_RELINK_COUNTERS = (
+    "schedule_tsab_restart_relink_attempts",
+    "schedule_tsab_restart_relink_commits",
+    "schedule_tsab_restart_relink_components_shortlisted",
+    "schedule_tsab_restart_relink_components_committed",
+    "schedule_tsab_restart_relink_guide_arc_gain_shortlisted",
+    "schedule_tsab_restart_relink_guide_arc_gain_accepted",
+)
 TSAB_OPTIONAL_COUNTERS = (
     "schedule_tsab_activation_boundary",
     "schedule_tsab_activation_objective",
@@ -170,20 +181,27 @@ def _profile_map(value: object, label: str) -> dict[int, int]:
     return result
 
 
-def _provenance(campaign: Path, *, strategy: str) -> dict[str, Any]:
+def _provenance(campaign: Path, *, strategies: tuple[str, ...]) -> dict[str, Any]:
     value = _read_json(provenance_path(campaign))
     expected = {
         "threads": 7,
         "qayd_engine": "ls",
         "profile_qayd": True,
-        "qayd_schedule_jssp_search": strategy,
         "qayd_schedule_constructor_workers": 0,
-        "qayd_schedule_path_relink": False,
         "qayd_schedule_lns_shadow": False,
     }
     for field, expected_value in expected.items():
         if value.get(field) != expected_value:
             raise GateError(f"{campaign}: provenance {field} must be {expected_value!r}")
+    strategy = value.get("qayd_schedule_jssp_search")
+    if strategy not in strategies:
+        choices = ", ".join(repr(choice) for choice in strategies)
+        raise GateError(f"{campaign}: provenance qayd_schedule_jssp_search must be one of {choices}")
+    path_relink = value.get("qayd_schedule_path_relink")
+    if not isinstance(path_relink, bool) or (strategy != TSAB_MULTI_CANDIDATE and path_relink):
+        raise GateError(
+            f"{campaign}: provenance qayd_schedule_path_relink may be true only for {TSAB_MULTI_CANDIDATE!r}"
+        )
     host = value.get("host")
     artifact = value.get("qayd_artifact")
     if not isinstance(host, dict) or not isinstance(artifact, dict):
@@ -260,17 +278,22 @@ def _legacy_clean(record: dict[str, Any], label: str) -> bool:
         all(_integer(record.get(field), f"{label}.{field}") == 0 for field in TSAB_COUNTERS)
         and all(_number(record.get(field), f"{label}.{field}") == 0.0 for field in TSAB_NUMBERS)
         and all(_optional_integer(record.get(field), f"{label}.{field}") is None for field in TSAB_OPTIONAL_COUNTERS)
+        and all(_integer(record.get(field, 0), f"{label}.{field}") == 0 for field in TSAB_RELINK_COUNTERS)
     )
 
 
 def _candidate_checks(
-    record: dict[str, Any], baseline: dict[str, Any], label: str
-) -> tuple[list[str], bool, dict[int, float]]:
+    record: dict[str, Any], baseline: dict[str, Any], label: str, strategy: str
+) -> tuple[list[str], bool, dict[int, float], float | None]:
     failures: list[str] = []
     missing = [field for field in (*TSAB_COUNTERS, *TSAB_NUMBERS, *TSAB_OPTIONAL_COUNTERS) if field not in record]
     if missing:
         raise GateError(f"{label} is missing TSAB metrics: {', '.join(missing)}")
     counters = {field: _integer(record.get(field), f"{label}.{field}") for field in TSAB_COUNTERS}
+    missing_relink = [field for field in TSAB_RELINK_COUNTERS if field not in record]
+    if strategy == TSAB_MULTI_CANDIDATE and missing_relink:
+        raise GateError(f"{label} is missing TSAB relink metrics: {', '.join(missing_relink)}")
+    relink = {field: _integer(record.get(field, 0), f"{label}.{field}") for field in TSAB_RELINK_COUNTERS}
     fast_elapsed = _number(record.get("schedule_tsab_fast_elapsed_seconds"), f"{label}.schedule_tsab_fast_elapsed_seconds")
     activation_boundary = _optional_integer(
         record.get("schedule_tsab_activation_boundary"),
@@ -297,13 +320,19 @@ def _candidate_checks(
         f"{label}.schedule_tsab_restart_best_kicked_objective",
         minimum=1,
     )
-    if counters["schedule_tsab_owner_worker_mask"] != EXPECTED_OWNER_MASK:
+    multi = strategy == TSAB_MULTI_CANDIDATE
+    expected_owner_mask = 0x7F if multi else 0x40
+    expected_activations = 7 if multi else 1
+    expected_warmup_work = 3_584 if multi else 512
+    activation_rebases = counters["schedule_tsab_activation_rebases"]
+    if counters["schedule_tsab_owner_worker_mask"] != expected_owner_mask:
         failures.append("owner_mask")
     if (
-        counters["schedule_tsab_activations"] != 1
+        counters["schedule_tsab_activations"] != expected_activations
         or activation_boundary != 2
-        or counters["schedule_tsab_legacy_warmup_work_steps"] != 512
-        or counters["schedule_tsab_activation_rebases"] != 1
+        or counters["schedule_tsab_legacy_warmup_work_steps"] != expected_warmup_work
+        or (multi and not 1 <= activation_rebases <= expected_activations)
+        or (not multi and activation_rebases != 1)
         or activation_objective is None
     ):
         failures.append("phased_activation")
@@ -338,6 +367,8 @@ def _candidate_checks(
         failures.append("fast_transition_accounting")
     if counters["schedule_tsab_fast_fallbacks"] > fast_attempts:
         failures.append("fast_fallback_accounting")
+    if counters["schedule_tsab_fast_work_cap_recoveries"] == 0:
+        failures.append("fast_work_cap_recovery")
     if counters["schedule_tsab_fast_queue_pops"] < counters["schedule_tsab_fast_date_changes"]:
         failures.append("fast_queue_accounting")
     if (
@@ -378,19 +409,53 @@ def _candidate_checks(
     restart_work = counters["schedule_tsab_restart_work_units"]
     n6_kicks = counters["schedule_tsab_n6_kicks"]
     elite_restarts = counters["schedule_tsab_elite_restarts"]
+    relink_attempts = relink["schedule_tsab_restart_relink_attempts"]
+    relink_commits = relink["schedule_tsab_restart_relink_commits"]
+    relink_components_shortlisted = relink["schedule_tsab_restart_relink_components_shortlisted"]
+    relink_components_committed = relink["schedule_tsab_restart_relink_components_committed"]
+    relink_gain_shortlisted = relink["schedule_tsab_restart_relink_guide_arc_gain_shortlisted"]
+    relink_gain_accepted = relink["schedule_tsab_restart_relink_guide_arc_gain_accepted"]
     if restart_attempts == 0:
         failures.append("restart_activity")
-    if restart_rebases == 0 or restart_rebases > elite_restarts:
+    if restart_rebases > elite_restarts:
         failures.append("restart_global_rebase")
-    if restart_generated == 0 or restart_probes == 0 or restart_probes > restart_generated or restart_probes > 4 * restart_attempts:
+    kick_moves = counters["schedule_tsab_kick_moves"]
+    compound_commit_observed = kick_moves > n6_kicks
+    compound_rejections_accounted = restart_probes == 0 and restart_commits == 0 and restart_rejections == restart_attempts
+    if (
+        (restart_generated == 0 and relink_attempts == 0)
+        or (
+            restart_probes == 0
+            and relink_attempts == 0
+            and not compound_commit_observed
+            and not compound_rejections_accounted
+        )
+        or restart_probes > restart_generated
+        or restart_probes > 4 * restart_attempts
+    ):
         failures.append("restart_probe_accounting")
     if (
-        restart_commits != n6_kicks
-        or n6_kicks != counters["schedule_tsab_kick_moves"]
+        restart_commits != n6_kicks + relink_commits
+        or kick_moves < n6_kicks
+        or kick_moves > 4 * n6_kicks
         or restart_commits > elite_restarts
         or elite_restarts > restart_attempts
     ):
         failures.append("restart_commit_accounting")
+    if relink_commits > relink_attempts:
+        failures.append("restart_relink_commit_accounting")
+    if not 2 * relink_attempts <= relink_components_shortlisted <= 8 * relink_attempts:
+        failures.append("restart_relink_shortlist_accounting")
+    if not 2 * relink_commits <= relink_components_committed <= 8 * relink_commits:
+        failures.append("restart_relink_committed_accounting")
+    if (relink_components_committed == 0) != (relink_commits == 0):
+        failures.append("restart_relink_committed_presence")
+    if (relink_gain_accepted == 0) != (relink_commits == 0):
+        failures.append("restart_relink_gain_presence")
+    if relink_gain_accepted > relink_gain_shortlisted:
+        failures.append("restart_relink_gain_accounting")
+    if not multi and any(relink.values()):
+        failures.append("unexpected_relink_activity")
     if restart_commits + restart_rejections != restart_attempts:
         failures.append("restart_outcome_accounting")
     if restart_interruptions != 0:
@@ -432,9 +497,19 @@ def _candidate_checks(
 
     baseline_work = _profile_map(baseline.get("schedule_profile_work_steps"), f"{label}.baseline_profile_work")
     candidate_work = _profile_map(record.get("schedule_profile_work_steps"), f"{label}.candidate_profile_work")
+    work_balance = None
     if set(baseline_work) != set(range(7)) or set(candidate_work) != set(range(7)):
         failures.append("profile_coverage")
         retention: dict[int, float] = {}
+    elif multi:
+        retention = {}
+        warmup_per_profile = expected_warmup_work // expected_activations
+        if any(work <= warmup_per_profile for work in candidate_work.values()):
+            failures.append("multi_profile_activity")
+        if sum(candidate_work.values()) != expected_warmup_work + burst_work:
+            failures.append("multi_profile_work_accounting")
+        maximum_work = max(candidate_work.values())
+        work_balance = min(candidate_work.values()) / maximum_work if maximum_work else 0.0
     else:
         retention = {
             profile: candidate_work[profile] / baseline_work[profile]
@@ -453,12 +528,13 @@ def _candidate_checks(
     if post_restart_improvements > improving_commits:
         failures.append("post_restart_improvement_accounting")
     search_signal = post_restart_improvements > 0 or counters["schedule_tsab_fast_pending_promotions"] > 0
-    return failures, search_signal, retention
+    return failures, search_signal, retention, work_balance
 
 
 def evaluate(baseline_path: Path, candidate_path: Path) -> dict[str, Any]:
-    baseline_provenance = _provenance(baseline_path, strategy="legacy")
-    candidate_provenance = _provenance(candidate_path, strategy="tsab-candidate")
+    baseline_provenance = _provenance(baseline_path, strategies=("legacy",))
+    candidate_provenance = _provenance(candidate_path, strategies=TSAB_CANDIDATE_STRATEGIES)
+    candidate_strategy = candidate_provenance["qayd_schedule_jssp_search"]
     for nested, field in (("host", "source_tree_sha256"), ("qayd_artifact", "sha256")):
         if baseline_provenance[nested][field] != candidate_provenance[nested][field]:
             raise GateError(f"baseline/candidate provenance mismatch: {nested}.{field}")
@@ -496,7 +572,12 @@ def evaluate(baseline_path: Path, candidate_path: Path) -> dict[str, Any]:
             failures.append("baseline_integrity_counter")
         if _number(baseline_record.get("peak_memory_mb"), "baseline.peak_memory_mb") >= MAX_PEAK_MEMORY_MB:
             failures.append("baseline_memory")
-        candidate_failures, search_signal, retention = _candidate_checks(candidate_record, baseline_record, label)
+        candidate_failures, search_signal, retention, work_balance = _candidate_checks(
+            candidate_record,
+            baseline_record,
+            label,
+            candidate_strategy,
+        )
         failures.extend(candidate_failures)
         baseline_objective = _objective(baseline_record, "baseline")
         candidate_objective = _objective(candidate_record, label)
@@ -510,13 +591,29 @@ def evaluate(baseline_path: Path, candidate_path: Path) -> dict[str, Any]:
                 "candidate_objective": candidate_objective,
                 "objective_delta": candidate_objective - baseline_objective,
                 "control_work_retention": {str(profile): value for profile, value in sorted(retention.items())},
-                "minimum_control_work_retention": min(retention.values(), default=0.0),
+                "minimum_control_work_retention": min(retention.values()) if retention else None,
+                "multi_worker_work_balance": work_balance,
                 "fast_attempts": candidate_record["schedule_tsab_fast_attempts"],
                 "fast_transitions": candidate_record["schedule_tsab_fast_transitions"],
                 "fast_work_units": candidate_record["schedule_tsab_fast_work_units"],
                 "fast_fallbacks": candidate_record["schedule_tsab_fast_fallbacks"],
+                "fast_work_cap_recoveries": candidate_record["schedule_tsab_fast_work_cap_recoveries"],
                 "fast_full_validations": candidate_record["schedule_tsab_fast_full_validations"],
                 "fast_elapsed_seconds": candidate_record["schedule_tsab_fast_elapsed_seconds"],
+                "restart_relink_attempts": candidate_record.get("schedule_tsab_restart_relink_attempts", 0),
+                "restart_relink_commits": candidate_record.get("schedule_tsab_restart_relink_commits", 0),
+                "restart_relink_components_shortlisted": candidate_record.get(
+                    "schedule_tsab_restart_relink_components_shortlisted", 0
+                ),
+                "restart_relink_components_committed": candidate_record.get(
+                    "schedule_tsab_restart_relink_components_committed", 0
+                ),
+                "restart_relink_guide_arc_gain_shortlisted": candidate_record.get(
+                    "schedule_tsab_restart_relink_guide_arc_gain_shortlisted", 0
+                ),
+                "restart_relink_guide_arc_gain_accepted": candidate_record.get(
+                    "schedule_tsab_restart_relink_guide_arc_gain_accepted", 0
+                ),
                 "tsab_search_signal": search_signal,
                 "failures": failures,
             }
@@ -531,8 +628,9 @@ def evaluate(baseline_path: Path, candidate_path: Path) -> dict[str, Any]:
         for row in rows
     )
     return {
-        "schema_version": 4,
+        "schema_version": 7,
         "gate": "jssp-tsab-phased-candidate",
+        "candidate_strategy": candidate_strategy,
         "baseline": str(baseline_path),
         "candidate": str(candidate_path),
         "tsab_ready": ready,
@@ -549,21 +647,26 @@ def markdown(report: dict[str, Any]) -> str:
     lines = [
         "# JSSP TSAB candidate gate",
         "",
+        f"- Candidate strategy: **{report['candidate_strategy']}**",
         f"- Readiness: **{report['tsab_ready']}**",
         f"- Search signal: **{report['tsab_search_signal']}**",
         f"- Quality signal: **{report['tsab_quality_signal']}**",
         f"- Quality limit: **{report['quality_objective_limit']}**",
         f"- Failures: **{report['failure_count']}**",
         "",
-        "| Checkpoint | Seed | Legacy | TSAB | Delta | Minimum control retention | Search signal | Failures |",
-        "|---:|---:|---:|---:|---:|---:|:---:|:---|",
+        "| Checkpoint | Seed | Legacy | TSAB | Delta | Minimum control retention | Multi work balance | Search signal | Failures |",
+        "|---:|---:|---:|---:|---:|---:|---:|:---:|:---|",
     ]
     for row in report["rows"]:
         failures = ", ".join(row["failures"]) or "none"
+        retention = row["minimum_control_work_retention"]
+        retention_text = "n/a" if retention is None else f"{retention:.3f}"
+        balance = row["multi_worker_work_balance"]
+        balance_text = "n/a" if balance is None else f"{balance:.3f}"
         lines.append(
             f"| {row['checkpoint_seconds']} | {row['seed']} | {row['baseline_objective']} | "
             f"{row['candidate_objective']} | {row['objective_delta']} | "
-            f"{row['minimum_control_work_retention']:.3f} | {row['tsab_search_signal']} | {failures} |"
+            f"{retention_text} | {balance_text} | {row['tsab_search_signal']} | {failures} |"
         )
     return "\n".join(lines) + "\n"
 

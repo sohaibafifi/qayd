@@ -1,10 +1,11 @@
 use std::collections::BTreeSet;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use qayd::engines::ls::lists::move_acceptance::MinimizingMoveAcceptance;
 use qayd::engines::ls::lists::schedule_state::{
-    audit_strict_n5_layout, CriticalNeighborhood, DispatchRule, GifflerThompsonWorkspace, JobShopProblem, JobShopState, MachineArc,
-    MoveOutcome, MoveProbe, MoveRejection, ScheduleMove, ScheduleStateMetrics,
+    audit_adjusted_remaining_work_score, audit_strict_n5_layout, AdjustedWorkDispatchLane, CanonicalPathPolicy, CriticalNeighborhood,
+    DispatchRule, GifflerThompsonWorkspace, JobShopProblem, JobShopState, MachineArc, MoveOutcome, MoveProbe, MoveRejection, ScheduleMove,
+    ScheduleStateMetrics, ADJUSTED_WORK_DISPATCH_SPECS,
 };
 use qayd::engines::ls::lists::{schedule_constructor_multistart_supported, solve_schedule, solve_schedule_capped_persistent_hybrid};
 use qayd::model::list::{verify_collection_solution, CollectionModel, IntervalVar, Mode, Resource, Schedule};
@@ -27,6 +28,17 @@ fn fixed_job_shop() -> Schedule {
         intervals: durations.into_iter().map(|duration| IntervalVar { duration, horizon, modes: Vec::new(), optional: false }).collect(),
         precedences: vec![(0, 1), (2, 3)],
         resources: vec![Resource::NoOverlap(vec![0, 3]), Resource::NoOverlap(vec![1, 2])],
+        minimize_makespan: true,
+    }
+}
+
+fn combined_batch_cycle_job_shop() -> Schedule {
+    let durations = [1; 6];
+    let horizon = durations.iter().sum();
+    Schedule {
+        intervals: durations.into_iter().map(|duration| IntervalVar { duration, horizon, modes: Vec::new(), optional: false }).collect(),
+        precedences: vec![(0, 1), (2, 3), (4, 5)],
+        resources: vec![Resource::NoOverlap(vec![0, 2, 5]), Resource::NoOverlap(vec![3, 4, 1])],
         minimize_makespan: true,
     }
 }
@@ -230,6 +242,35 @@ fn apply_test_move(sequence: &mut Vec<usize>, movement: ScheduleMove) {
     }
 }
 
+fn apply_test_schedule_move(machine_sequences: &mut [Vec<usize>], movement: ScheduleMove) {
+    let machine = match movement {
+        ScheduleMove::AdjacentSwap { machine, .. } | ScheduleMove::Insert { machine, .. } => machine,
+    };
+    apply_test_move(&mut machine_sequences[machine], movement);
+}
+
+fn strict_n5_fixture(schedule: &Schedule) -> (JobShopProblem, Vec<Vec<usize>>, ScheduleMove) {
+    let stop = AtomicBool::new(false);
+    let problem = JobShopProblem::recognize(schedule, &stop).unwrap().expect("strict JSSP fixture");
+    for seed in 0..128u64 {
+        let Some(mut state) = JobShopState::giffler_thompson(&problem, seed, DispatchRule::Randomized, &stop).unwrap() else {
+            continue;
+        };
+        state.retain_canonical_critical_blocks_only();
+        let mut movement = None;
+        state
+            .visit_strict_n5_canonical_moves(&stop, |candidate, _| {
+                movement.get_or_insert(candidate);
+                Ok(())
+            })
+            .unwrap();
+        if let Some(movement) = movement {
+            return (problem, state.machine_sequences().to_vec(), movement);
+        }
+    }
+    panic!("fixture must expose a strict N5 movement");
+}
+
 fn single_machine_schedule(operation_count: usize) -> Schedule {
     Schedule {
         intervals: (0..operation_count)
@@ -397,6 +438,140 @@ fn all_dispatch_rules_construct_complete_states() {
         assert_eq!(state.starts().len(), problem.operation_count());
         assert!(verify_collection_solution(&collection(schedule.clone()), &state.to_solution()).is_ok());
     }
+    assert_eq!(
+        DispatchRule::LEGACY_MULTISTART,
+        [
+            DispatchRule::EarliestStart,
+            DispatchRule::ShortestProcessingTime,
+            DispatchRule::LongestProcessingTime,
+            DispatchRule::MostWorkRemaining,
+            DispatchRule::Randomized,
+        ]
+    );
+}
+
+#[test]
+fn earliest_start_then_most_work_remaining_obeys_its_lexicographic_oracle() {
+    let horizon = 200;
+    let mode = |machine, duration, start_window| Mode { reference: None, machine, duration, start_window };
+    let schedule = Schedule {
+        intervals: vec![
+            IntervalVar { duration: 0, horizon, modes: vec![mode(0, 10, (0, 100))], optional: false },
+            IntervalVar { duration: 0, horizon, modes: vec![mode(0, 10, (1, 100))], optional: false },
+            IntervalVar { duration: 0, horizon, modes: vec![mode(0, 10, (0, 100))], optional: false },
+            IntervalVar { duration: 0, horizon, modes: vec![mode(1, 1, (0, 100))], optional: false },
+            IntervalVar { duration: 0, horizon, modes: vec![mode(2, 100, (0, 100))], optional: false },
+            IntervalVar { duration: 0, horizon, modes: vec![mode(3, 20, (0, 100))], optional: false },
+        ],
+        precedences: vec![(0, 3), (1, 4), (2, 5)],
+        resources: vec![Resource::MachineNoOverlap],
+        minimize_makespan: true,
+    };
+    let stop = AtomicBool::new(false);
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let rule = DispatchRule::EarliestStartThenMostWorkRemaining;
+    let state = JobShopState::giffler_thompson(&problem, 41, rule, &stop).unwrap().unwrap();
+    let reference = JobShopState::giffler_thompson_reference(&problem, 41, rule, &stop).unwrap().unwrap();
+
+    assert_eq!(state.machine_sequences()[0][0], 2, "earliest start must dominate, then the larger remaining work must win");
+    assert_eq!(state.machine_sequences(), reference.machine_sequences());
+    assert_eq!(state.starts(), reference.starts());
+    assert_eq!(verify_collection_solution(&collection(schedule.clone()), &state.to_solution()).unwrap(), vec![state.makespan()]);
+
+    let mut tied = schedule;
+    for operation in 0..3 {
+        tied.intervals[operation].modes[0].start_window = (0, 100);
+    }
+    for operation in 3..6 {
+        tied.intervals[operation].modes[0].duration = 20;
+    }
+    let tied_problem = JobShopProblem::recognize(&tied, &stop).unwrap().unwrap();
+    let seed = 41u64;
+    let expected = (0..3usize).min_by_key(|&operation| (crate::mix64(seed ^ operation as u64), operation)).unwrap();
+    let first = JobShopState::giffler_thompson(&tied_problem, seed, rule, &stop).unwrap().unwrap();
+    let second = JobShopState::giffler_thompson(&tied_problem, seed, rule, &stop).unwrap().unwrap();
+
+    assert_eq!(first.machine_sequences()[0][0], expected, "random key and operation must resolve an exact priority tie");
+    assert_eq!(first.machine_sequences(), second.machine_sequences());
+    assert_eq!(first.starts(), second.starts());
+    assert_eq!(verify_collection_solution(&collection(tied), &first.to_solution()).unwrap(), vec![first.makespan()]);
+}
+
+#[test]
+fn adjusted_work_portfolio_obeys_an_independent_score_oracle() {
+    assert_eq!(
+        ADJUSTED_WORK_DISPATCH_SPECS,
+        [
+            (24, "earliest-start-then-most-adjusted-work-c24"),
+            (51, "earliest-start-then-most-adjusted-work-c51"),
+            (48, "earliest-start-then-most-adjusted-work-c48"),
+            (16, "earliest-start-then-most-adjusted-work-c16"),
+            (41, "earliest-start-then-most-adjusted-work-c41"),
+        ]
+    );
+    let horizon = 20_000;
+    let mode = |machine, duration, start_window| Mode { reference: None, machine, duration, start_window };
+    let root_durations = [50, 40, 30, 20, 10, 10];
+    let tail_durations = [1_515, 1_325, 1_010, 575, 90, 10_000];
+    let mut intervals = root_durations
+        .into_iter()
+        .enumerate()
+        .map(|(operation, duration)| IntervalVar {
+            duration: 0,
+            horizon,
+            modes: vec![mode(0, duration, (i64::from(operation == 5), 10_000))],
+            optional: false,
+        })
+        .collect::<Vec<_>>();
+    intervals.extend(tail_durations.into_iter().enumerate().map(|(tail, duration)| IntervalVar {
+        duration: 0,
+        horizon,
+        modes: vec![mode(tail + 1, duration, (0, 10_000))],
+        optional: false,
+    }));
+    let schedule = Schedule {
+        intervals,
+        precedences: (0..6).map(|operation| (operation, operation + 6)).collect(),
+        resources: vec![Resource::MachineNoOverlap],
+        minimize_makespan: true,
+    };
+    let stop = AtomicBool::new(false);
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let expected_first = [1, 4, 3, 0, 2];
+
+    for (lane, expected) in AdjustedWorkDispatchLane::ALL.into_iter().zip(expected_first) {
+        let rule = DispatchRule::EarliestStartThenMostAdjustedWork(lane);
+        let fast = JobShopState::giffler_thompson(&problem, 41, rule, &stop).unwrap().unwrap();
+        let reference = JobShopState::giffler_thompson_reference(&problem, 41, rule, &stop).unwrap().unwrap();
+        assert_eq!(fast.machine_sequences()[0][0], expected, "wrong adjusted-work winner for {lane:?}");
+        assert_eq!(fast.machine_sequences(), reference.machine_sequences());
+        assert_eq!(fast.starts(), reference.starts());
+        assert_eq!(verify_collection_solution(&collection(schedule.clone()), &fast.to_solution()).unwrap(), vec![fast.makespan()]);
+    }
+
+    let widened = audit_adjusted_remaining_work_score(i64::MAX, i64::MAX, 41);
+    assert_eq!(widened, i128::from(i64::MAX) - i128::from(i64::MAX) * 41);
+    assert_eq!(
+        audit_adjusted_remaining_work_score(i64::MIN, i64::MAX, i128::MAX),
+        i128::MIN,
+        "retuned coefficients must saturate instead of overflowing"
+    );
+
+    let mut tied = schedule;
+    for operation in 0..6 {
+        tied.intervals[operation].modes[0].start_window = (0, 10_000);
+        tied.intervals[operation].modes[0].duration = 10;
+        tied.intervals[operation + 6].modes[0].duration = 90;
+    }
+    let tied_problem = JobShopProblem::recognize(&tied, &stop).unwrap().unwrap();
+    let seed = 41u64;
+    let expected = (0..6usize).min_by_key(|&operation| (crate::mix64(seed ^ operation as u64), operation)).unwrap();
+    let rule = DispatchRule::ADJUSTED_WORK_PORTFOLIO[4];
+    let first = JobShopState::giffler_thompson(&tied_problem, seed, rule, &stop).unwrap().unwrap();
+    let second = JobShopState::giffler_thompson(&tied_problem, seed, rule, &stop).unwrap().unwrap();
+    assert_eq!(first.machine_sequences()[0][0], expected);
+    assert_eq!(first.machine_sequences(), second.machine_sequences());
+    assert_eq!(first.starts(), second.starts());
 }
 
 #[test]
@@ -440,7 +615,7 @@ fn compact_multistart_workspace_matches_complete_earliest_start_states() {
                 let complete = JobShopState::giffler_thompson(&problem, seed, DispatchRule::EarliestStart, &stop).unwrap();
                 let mut workspace = GifflerThompsonWorkspace::new(&problem);
                 let mut metrics = ScheduleStateMetrics::default();
-                let compact = workspace.construct(&problem, seed, &stop, &mut metrics).unwrap();
+                let compact = workspace.construct(&problem, seed, DispatchRule::EarliestStart, &stop, &mut metrics).unwrap();
                 match (complete, compact) {
                     (Some(complete), Some((objective, _))) => {
                         let solution = workspace.to_solution(&problem, objective);
@@ -836,6 +1011,180 @@ fn direct_full_oracle_rejections_are_atomic_for_objective_window_and_cycle() {
 }
 
 #[test]
+fn direct_full_oracle_batch_accepts_one_acyclic_candidate_and_matches_independent_oracle() {
+    let stop = AtomicBool::new(false);
+    let durations = [1, 2, 3, 4, 5, 6];
+    let horizon = durations.iter().sum();
+    let schedule = Schedule {
+        intervals: durations.into_iter().map(|duration| IntervalVar { duration, horizon, modes: Vec::new(), optional: false }).collect(),
+        precedences: Vec::new(),
+        resources: vec![Resource::NoOverlap(vec![0, 1, 2]), Resource::NoOverlap(vec![3, 4, 5])],
+        minimize_makespan: true,
+    };
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let sequences = vec![vec![0, 1, 2], vec![3, 4, 5]];
+    let movements = [ScheduleMove::Insert { machine: 0, from: 0, to: 2 }, ScheduleMove::Insert { machine: 1, from: 2, to: 0 }];
+    let mut candidate_sequences = sequences.clone();
+    for &movement in &movements {
+        apply_test_schedule_move(&mut candidate_sequences, movement);
+    }
+    let (oracle_starts, oracle_objective) = independent_fixed_oracle(&schedule, &candidate_sequences).unwrap();
+
+    let mut state = JobShopState::from_machine_sequences(&problem, sequences, &stop).unwrap().unwrap();
+    let previous = state.makespan();
+    let _ = state.take_metrics();
+    let outcome = state.consider_move_batch_full_oracle(&movements, MinimizingMoveAcceptance::Always, &stop).unwrap();
+
+    assert_eq!(outcome, MoveOutcome::Accepted { previous, current: oracle_objective });
+    assert_eq!(state.machine_sequences(), candidate_sequences);
+    assert_eq!(state.starts(), oracle_starts);
+    let metrics = state.metrics();
+    assert_eq!(metrics.moves_considered, 1);
+    assert_eq!(metrics.moves_accepted, 1);
+    assert_eq!(metrics.direct_oracle_attempts, 1);
+    assert_eq!(metrics.direct_oracle_accepts, 1);
+    assert_eq!(metrics.full_evaluations, 1);
+    assert_eq!(metrics.oracle_validations, 1);
+    assert_eq!(metrics.delta_evaluations, 0);
+    assert!(state.matches_full_oracle(&stop).unwrap());
+}
+
+#[test]
+fn direct_full_oracle_batch_detects_a_combined_cycle_and_rolls_back() {
+    let stop = AtomicBool::new(false);
+    let schedule = combined_batch_cycle_job_shop();
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let sequences = vec![vec![0, 2, 5], vec![3, 4, 1]];
+    let movements = [ScheduleMove::Insert { machine: 0, from: 0, to: 2 }, ScheduleMove::Insert { machine: 1, from: 2, to: 0 }];
+
+    for &movement in &movements {
+        let mut individual_sequences = sequences.clone();
+        apply_test_schedule_move(&mut individual_sequences, movement);
+        assert!(independent_fixed_oracle(&schedule, &individual_sequences).is_some());
+        let mut individual = JobShopState::from_machine_sequences(&problem, sequences.clone(), &stop).unwrap().unwrap();
+        assert!(matches!(
+            individual.consider_move_full_oracle(movement, MinimizingMoveAcceptance::Always, &stop).unwrap(),
+            MoveOutcome::Accepted { .. }
+        ));
+    }
+
+    let mut combined_sequences = sequences.clone();
+    for &movement in &movements {
+        apply_test_schedule_move(&mut combined_sequences, movement);
+    }
+    assert!(independent_fixed_oracle(&schedule, &combined_sequences).is_none());
+
+    let mut state = JobShopState::from_machine_sequences(&problem, sequences.clone(), &stop).unwrap().unwrap();
+    let old_starts = state.starts().to_vec();
+    let old_ends = state.ends().to_vec();
+    let old_makespan = state.makespan();
+    let old_path = state.critical_path().to_vec();
+    let _ = state.take_metrics();
+    let outcome = state.consider_move_batch_full_oracle(&movements, MinimizingMoveAcceptance::Always, &stop).unwrap();
+
+    assert_eq!(outcome, MoveOutcome::Rejected(MoveRejection::Cycle));
+    assert_eq!(state.machine_sequences(), sequences);
+    assert_eq!(state.starts(), old_starts);
+    assert_eq!(state.ends(), old_ends);
+    assert_eq!(state.makespan(), old_makespan);
+    assert_eq!(state.critical_path(), old_path);
+    let metrics = state.metrics();
+    assert_eq!(metrics.direct_oracle_attempts, 1);
+    assert_eq!(metrics.direct_oracle_cycles, 1);
+    assert_eq!(metrics.full_evaluations, 1);
+    assert_eq!(metrics.delta_evaluations, 0);
+    assert!(state.matches_full_oracle(&stop).unwrap());
+}
+
+#[test]
+fn direct_full_oracle_batch_objective_rejection_is_atomic() {
+    let stop = AtomicBool::new(false);
+    let schedule = single_machine_schedule(4);
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let sequences = vec![vec![0, 1, 2, 3]];
+    let movements = [ScheduleMove::Insert { machine: 0, from: 0, to: 3 }, ScheduleMove::AdjacentSwap { machine: 0, first_position: 0 }];
+    let mut state = JobShopState::from_machine_sequences(&problem, sequences.clone(), &stop).unwrap().unwrap();
+    let old_starts = state.starts().to_vec();
+    let old_ends = state.ends().to_vec();
+    let old_makespan = state.makespan();
+    let _ = state.take_metrics();
+
+    let outcome = state.consider_move_batch_full_oracle(&movements, MinimizingMoveAcceptance::Improving, &stop).unwrap();
+
+    assert_eq!(outcome, MoveOutcome::Rejected(MoveRejection::NotAccepted { current: old_makespan, candidate: old_makespan }));
+    assert_eq!(state.machine_sequences(), sequences);
+    assert_eq!(state.starts(), old_starts);
+    assert_eq!(state.ends(), old_ends);
+    assert_eq!(state.makespan(), old_makespan);
+    let metrics = state.metrics();
+    assert_eq!(metrics.objective_rejections, 1);
+    assert_eq!(metrics.direct_oracle_objective_rejections, 1);
+    assert_eq!(metrics.full_evaluations, 1);
+    assert_eq!(metrics.oracle_validations, 1);
+    assert!(state.matches_full_oracle(&stop).unwrap());
+}
+
+#[test]
+fn direct_full_oracle_batch_late_invalid_move_rolls_back_without_oracle_work() {
+    let stop = AtomicBool::new(false);
+    let schedule = single_machine_schedule(4);
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let sequences = vec![vec![0, 1, 2, 3]];
+    let movements = [ScheduleMove::Insert { machine: 0, from: 0, to: 3 }, ScheduleMove::Insert { machine: 0, from: 0, to: 99 }];
+    let mut state = JobShopState::from_machine_sequences(&problem, sequences.clone(), &stop).unwrap().unwrap();
+    let old_starts = state.starts().to_vec();
+    let old_ends = state.ends().to_vec();
+    let old_makespan = state.makespan();
+    let _ = state.take_metrics();
+
+    let outcome = state.consider_move_batch_full_oracle(&movements, MinimizingMoveAcceptance::Always, &stop).unwrap();
+
+    assert_eq!(outcome, MoveOutcome::Rejected(MoveRejection::Invalid));
+    assert_eq!(state.machine_sequences(), sequences);
+    assert_eq!(state.starts(), old_starts);
+    assert_eq!(state.ends(), old_ends);
+    assert_eq!(state.makespan(), old_makespan);
+    let metrics = state.metrics();
+    assert_eq!(metrics.moves_considered, 1);
+    assert_eq!(metrics.direct_oracle_attempts, 1);
+    assert_eq!(metrics.full_evaluations, 0);
+    assert_eq!(metrics.oracle_validations, 0);
+    assert!(state.matches_full_oracle(&stop).unwrap());
+}
+
+#[test]
+fn direct_full_oracle_batch_mid_apply_interruption_rolls_back_deterministically() {
+    let stop = AtomicBool::new(false);
+    let schedule = combined_batch_cycle_job_shop();
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let sequences = vec![vec![0, 2, 5], vec![3, 4, 1]];
+    let movements = [ScheduleMove::Insert { machine: 0, from: 0, to: 2 }, ScheduleMove::Insert { machine: 1, from: 2, to: 0 }];
+    let mut state = JobShopState::from_machine_sequences(&problem, sequences.clone(), &stop).unwrap().unwrap();
+    let old_starts = state.starts().to_vec();
+    let old_ends = state.ends().to_vec();
+    let old_makespan = state.makespan();
+    let old_path = state.critical_path().to_vec();
+    let _ = state.take_metrics();
+    state.test_stop_batch_after_applied_moves(1);
+
+    assert!(state.consider_move_batch_full_oracle(&movements, MinimizingMoveAcceptance::Always, &stop).is_err());
+    assert!(stop.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(state.machine_sequences(), sequences);
+    assert_eq!(state.starts(), old_starts);
+    assert_eq!(state.ends(), old_ends);
+    assert_eq!(state.makespan(), old_makespan);
+    assert_eq!(state.critical_path(), old_path);
+    let metrics = state.metrics();
+    assert_eq!(metrics.moves_considered, 1);
+    assert_eq!(metrics.direct_oracle_attempts, 1);
+    assert_eq!(metrics.full_evaluations, 0);
+    assert_eq!(metrics.oracle_validations, 0);
+
+    stop.store(false, std::sync::atomic::Ordering::Release);
+    assert!(state.matches_full_oracle(&stop).unwrap());
+}
+
+#[test]
 fn zero_duration_direct_oracle_is_exact_and_uses_no_delta_probe() {
     let stop = AtomicBool::new(false);
     let schedule = Schedule {
@@ -1089,6 +1438,154 @@ fn all_zero_slack_machine_blocks_cover_multiple_critical_paths() {
     assert!(state.critical_blocks().is_empty(), "baseline commits must skip all-critical materialization");
     assert_eq!(state.canonical_critical_blocks().len(), 1);
     assert!(state.matches_full_oracle(&stop).unwrap());
+}
+
+#[test]
+fn canonical_path_policy_preserves_history_and_selects_distinct_parallel_lane() {
+    let stop = AtomicBool::new(false);
+    let schedule = Schedule {
+        intervals: (0..4).map(|_| IntervalVar { duration: 1, horizon: 4, modes: Vec::new(), optional: false }).collect(),
+        precedences: Vec::new(),
+        resources: vec![Resource::NoOverlap(vec![0, 1]), Resource::NoOverlap(vec![2, 3])],
+        minimize_makespan: true,
+    };
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let mut state = JobShopState::from_machine_sequences(&problem, vec![vec![0, 1], vec![2, 3]], &stop).unwrap().unwrap();
+
+    let historical_fingerprint = state.canonical_path_fingerprint();
+    let all_blocks = state.critical_blocks().to_vec();
+    assert_eq!(state.canonical_path_policy(), CanonicalPathPolicy::Historical);
+    assert_eq!(state.critical_path(), &[2, 3]);
+    assert!(state.set_canonical_path_policy(CanonicalPathPolicy::Historical, &stop).unwrap());
+    assert_eq!(state.canonical_path_fingerprint(), historical_fingerprint);
+
+    assert!(state.set_canonical_path_policy(CanonicalPathPolicy::MachineFirstLowest, &stop).unwrap());
+    assert_eq!(state.canonical_path_policy(), CanonicalPathPolicy::MachineFirstLowest);
+    assert_eq!(state.critical_path(), &[0, 1]);
+    assert_ne!(state.canonical_path_fingerprint(), historical_fingerprint);
+    assert_eq!(
+        state
+            .canonical_critical_blocks()
+            .iter()
+            .map(|block| (block.machine(), block.first_position(), block.last_position()))
+            .collect::<Vec<_>>(),
+        vec![(0, 0, 1)],
+    );
+    assert_eq!(state.critical_blocks(), all_blocks, "lane selection must not alter the complete zero-slack block set");
+
+    assert!(state.set_canonical_path_policy(CanonicalPathPolicy::JobFirstHighest, &stop).unwrap());
+    assert_eq!(state.critical_path(), &[2, 3]);
+    assert_eq!(state.canonical_path_fingerprint(), historical_fingerprint);
+}
+
+#[test]
+fn canonical_path_policy_distinguishes_tight_machine_and_job_predecessors() {
+    let stop = AtomicBool::new(false);
+    let schedule = Schedule {
+        intervals: (0..3).map(|_| IntervalVar { duration: 1, horizon: 3, modes: Vec::new(), optional: false }).collect(),
+        precedences: vec![(0, 2)],
+        resources: vec![Resource::NoOverlap(vec![0]), Resource::NoOverlap(vec![1, 2])],
+        minimize_makespan: true,
+    };
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let mut state = JobShopState::from_machine_sequences(&problem, vec![vec![0], vec![1, 2]], &stop).unwrap().unwrap();
+
+    assert_eq!(state.starts(), &[0, 0, 1]);
+    assert_eq!(state.critical_path(), &[1, 2], "historical policy prefers the tight machine predecessor");
+    assert!(state.set_canonical_path_policy(CanonicalPathPolicy::JobFirstHighest, &stop).unwrap());
+    assert_eq!(state.critical_path(), &[0, 2], "job-first policy must choose the other tight predecessor");
+    assert!(state.canonical_critical_blocks().is_empty());
+    assert!(state.set_canonical_path_policy(CanonicalPathPolicy::MachineFirstLowest, &stop).unwrap());
+    assert_eq!(state.critical_path(), &[1, 2]);
+}
+
+#[test]
+fn canonical_path_policy_publication_is_atomic_and_rebuild_inherits_configuration() {
+    let stop = AtomicBool::new(false);
+    let schedule = Schedule {
+        intervals: (0..4).map(|_| IntervalVar { duration: 1, horizon: 4, modes: Vec::new(), optional: false }).collect(),
+        precedences: Vec::new(),
+        resources: vec![Resource::NoOverlap(vec![0, 1]), Resource::NoOverlap(vec![2, 3])],
+        minimize_makespan: true,
+    };
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let mut state = JobShopState::from_machine_sequences(&problem, vec![vec![0, 1], vec![2, 3]], &stop).unwrap().unwrap();
+    let old_policy = state.canonical_path_policy();
+    let old_path = state.critical_path().to_vec();
+    let old_fingerprint = state.canonical_path_fingerprint();
+    let old_canonical_blocks = state.canonical_critical_blocks().to_vec();
+    let old_all_blocks = state.critical_blocks().to_vec();
+
+    state.test_stop_analysis_after_path_operations(1);
+    assert!(state.set_canonical_path_policy(CanonicalPathPolicy::MachineFirstLowest, &stop).is_err());
+    assert_eq!(state.canonical_path_policy(), old_policy);
+    assert_eq!(state.critical_path(), old_path);
+    assert_eq!(state.canonical_path_fingerprint(), old_fingerprint);
+    assert_eq!(state.canonical_critical_blocks(), old_canonical_blocks);
+    assert_eq!(state.critical_blocks(), old_all_blocks);
+
+    stop.store(false, Ordering::Release);
+    assert!(state.set_canonical_path_policy(CanonicalPathPolicy::MachineFirstLowest, &stop).unwrap());
+    state.retain_canonical_critical_blocks_only();
+    let inherited = state
+        .rebuilt_from_machine_sequences(state.machine_sequences().to_vec(), &stop)
+        .unwrap()
+        .expect("inherited rebuild remains feasible");
+    assert_eq!(inherited.canonical_path_policy(), CanonicalPathPolicy::MachineFirstLowest);
+    assert_eq!(inherited.critical_path(), state.critical_path());
+    assert!(inherited.critical_blocks().is_empty());
+
+    let historical = state
+        .rebuilt_from_machine_sequences_with_policy(state.machine_sequences().to_vec(), CanonicalPathPolicy::Historical, &stop)
+        .unwrap()
+        .expect("direct historical rebuild remains feasible");
+    assert_eq!(historical.canonical_path_policy(), CanonicalPathPolicy::Historical);
+    assert_eq!(historical.critical_path(), &[2, 3]);
+    assert!(historical.critical_blocks().is_empty());
+}
+
+#[test]
+fn alternate_canonical_lanes_match_full_analysis_after_fast_n5_commits() {
+    let stop = AtomicBool::new(false);
+    let schedule = fixed_permutation_job_shop(5, 5, 1);
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let policies = [
+        CanonicalPathPolicy::MachineFirstLowest,
+        CanonicalPathPolicy::JobFirstHighest,
+        CanonicalPathPolicy::JobFirstLowest,
+        CanonicalPathPolicy::OperationHighest,
+        CanonicalPathPolicy::OperationLowest,
+        CanonicalPathPolicy::Mixed,
+    ];
+
+    for policy in policies {
+        let mut exercised = false;
+        for seed in 0..32 {
+            let Some(mut state) = JobShopState::giffler_thompson(&problem, seed, DispatchRule::Randomized, &stop).unwrap() else {
+                continue;
+            };
+            assert!(state.set_canonical_path_policy(policy, &stop).unwrap());
+            state.retain_canonical_critical_blocks_only();
+            let mut movement = None;
+            state
+                .visit_strict_n5_canonical_moves(&stop, |candidate, _| {
+                    movement.get_or_insert(candidate);
+                    Ok(())
+                })
+                .unwrap();
+            let Some(movement) = movement else {
+                continue;
+            };
+            let outcome = state.consider_strict_n5_fast(movement, MinimizingMoveAcceptance::Always, &stop).unwrap();
+            assert!(outcome.used_fast_path, "policy {policy:?} did not exercise the fast kernel");
+            assert!(matches!(outcome.outcome, MoveOutcome::Accepted { .. }));
+            assert!(state.refresh_from_full_oracle(&stop).unwrap(), "fast and full canonical analyses differ for {policy:?}");
+            assert_eq!(state.canonical_path_policy(), policy);
+            exercised = true;
+            break;
+        }
+        assert!(exercised, "no strict N5 move found for {policy:?}");
+    }
 }
 
 #[test]
@@ -2003,10 +2500,35 @@ fn strict_tsab_n5_uses_head_internal_and_tail_exclusions() {
     );
 }
 
+fn independent_strict_n5_taillard_estimate(state: &JobShopState, movement: ScheduleMove) -> i128 {
+    let ScheduleMove::AdjacentSwap { machine, first_position } = movement else {
+        panic!("strict N5 contains only adjacent swaps");
+    };
+    let sequence = &state.machine_sequences()[machine];
+    let a = sequence[first_position];
+    let b = sequence[first_position + 1];
+    let job_release = |operation: usize| {
+        state.job_predecessors(operation).iter().map(|&predecessor| i128::from(state.ends()[predecessor])).max().unwrap_or(0)
+    };
+    let job_tail = |operation: usize| {
+        state.job_successors(operation).iter().map(|&successor| i128::from(state.test_tails()[successor])).max().unwrap_or(0)
+    };
+    let left_completion = first_position.checked_sub(1).map_or(0, |left| i128::from(state.ends()[sequence[left]]));
+    let right_tail = sequence.get(first_position + 2).map_or(0, |&right| i128::from(state.test_tails()[right]));
+    let duration_a = i128::from(state.duration(a));
+    let duration_b = i128::from(state.duration(b));
+    let release_b = job_release(b).max(left_completion);
+    let release_a = job_release(a).max(release_b + duration_b);
+    let tail_a = duration_a + job_tail(a).max(right_tail);
+    let tail_b = duration_b + job_tail(b).max(tail_a);
+    (release_b + tail_b).max(release_a + tail_a)
+}
+
 #[test]
 fn strict_n5_fast_kernel_matches_independent_and_full_oracles_exhaustively() {
     let stop = AtomicBool::new(false);
     let mut exercised = 0usize;
+    let mut recovered = 0usize;
     for jobs in 2..=4 {
         for machines in 2..=4 {
             let schedules = std::iter::once(fixed_flow_shop(jobs, machines))
@@ -2028,13 +2550,33 @@ fn strict_n5_fast_kernel_matches_independent_and_full_oracles_exhaustively() {
                         .unwrap();
                     for movement in movements {
                         let sequences = reference.machine_sequences().to_vec();
+                        let starts_before = reference.starts().to_vec();
+                        let ends_before = reference.ends().to_vec();
+                        let tails_before = reference.test_tails().to_vec();
+                        let makespan_before = reference.makespan();
+                        let expected_estimate = independent_strict_n5_taillard_estimate(&reference, movement);
+                        let expected_secondary = reference.score_move_head_tail(movement, &stop).unwrap().unwrap();
+                        let score = reference.score_strict_n5_taillard(movement, &stop).unwrap().expect("strict N5 score");
+                        assert_eq!(score.estimated_makespan, expected_estimate);
+                        assert_eq!(score.secondary, expected_secondary);
+                        assert_eq!(reference.machine_sequences(), sequences);
+                        assert_eq!(reference.starts(), starts_before);
+                        assert_eq!(reference.ends(), ends_before);
+                        assert_eq!(reference.test_tails(), tails_before);
+                        assert_eq!(reference.makespan(), makespan_before);
                         let mut expected_sequences = sequences.clone();
                         let machine = match movement {
                             ScheduleMove::AdjacentSwap { machine, .. } | ScheduleMove::Insert { machine, .. } => machine,
                         };
                         apply_test_move(&mut expected_sequences[machine], movement);
                         let oracle = independent_fixed_oracle(&schedule, &expected_sequences).expect("strict N5 must preserve acyclicity");
-                        let mut state = JobShopState::from_machine_sequences(&problem, sequences, &stop).unwrap().unwrap();
+                        assert!(
+                            score.estimated_makespan <= i128::from(oracle.1),
+                            "Taillard estimate must not exceed exact candidate makespan: estimate={}, exact={}, move={movement:?}",
+                            score.estimated_makespan,
+                            oracle.1
+                        );
+                        let mut state = JobShopState::from_machine_sequences(&problem, sequences.clone(), &stop).unwrap().unwrap();
                         state.retain_canonical_critical_blocks_only();
                         let fast = state.consider_strict_n5_fast(movement, MinimizingMoveAcceptance::Always, &stop).unwrap();
                         assert!(fast.used_fast_path, "classical positive default-window JSSP must use the strict fast gate");
@@ -2048,13 +2590,284 @@ fn strict_n5_fast_kernel_matches_independent_and_full_oracles_exhaustively() {
                             "incremental dates, tails and canonical path must match full replay"
                         );
                         assert!(state.matches_full_oracle(&stop).unwrap());
+
+                        let mut work_cap_state = JobShopState::from_machine_sequences(&problem, sequences, &stop).unwrap().unwrap();
+                        work_cap_state.retain_canonical_critical_blocks_only();
+                        work_cap_state.test_configure_strict_n5_work_cap(0, false);
+                        let recovered_outcome =
+                            work_cap_state.consider_strict_n5_fast(movement, MinimizingMoveAcceptance::Always, &stop).unwrap();
+                        assert!(recovered_outcome.used_fast_path && recovered_outcome.used_topological_recovery);
+                        assert!(!recovered_outcome.fell_back);
+                        assert_eq!(work_cap_state.machine_sequences(), expected_sequences);
+                        assert_eq!(work_cap_state.starts(), oracle.0);
+                        assert_eq!(work_cap_state.makespan(), oracle.1);
+                        assert!(work_cap_state.refresh_from_full_oracle(&stop).unwrap());
+                        assert!(work_cap_state.matches_full_oracle(&stop).unwrap());
                         exercised += 1;
+                        recovered += 1;
                     }
                 }
             }
         }
     }
     assert!(exercised >= 64, "fixture sweep did not exercise enough strict N5 transitions: {exercised}");
+    assert_eq!(recovered, exercised, "every exhaustive transition must also pass the forced WorkCap oracle");
+}
+
+#[test]
+fn strict_n5_taillard_stream_is_deterministic_and_non_mutating() {
+    let stop = AtomicBool::new(false);
+    let schedule = fixed_permutation_job_shop(8, 8, 3);
+    let (problem, sequences, _) = strict_n5_fixture(&schedule);
+    let mut state = JobShopState::from_machine_sequences(&problem, sequences, &stop).unwrap().unwrap();
+    state.retain_canonical_critical_blocks_only();
+    let starts_before = state.starts().to_vec();
+    let tails_before = state.test_tails().to_vec();
+    let mut first = Vec::new();
+    let first_count = state
+        .visit_taillard_scored_strict_n5_canonical_moves(&stop, |movement, arcs, score| {
+            assert_eq!(state.score_strict_n5_taillard(movement, &stop).unwrap(), Some(score));
+            first.push((score.ranking_key(), movement, arcs));
+            Ok(())
+        })
+        .unwrap();
+    let mut second = Vec::new();
+    let second_count = state
+        .visit_taillard_scored_strict_n5_canonical_moves(&stop, |movement, arcs, score| {
+            second.push((score.ranking_key(), movement, arcs));
+            Ok(())
+        })
+        .unwrap();
+    assert!(first_count > 0);
+    assert_eq!(first_count, second_count);
+    assert_eq!(first, second);
+    assert_eq!(state.starts(), starts_before);
+    assert_eq!(state.test_tails(), tails_before);
+}
+
+#[test]
+fn strict_n5_work_cap_recovery_preserves_partial_work_and_matches_independent_oracles() {
+    let stop = AtomicBool::new(false);
+    let schedule = fixed_permutation_job_shop(8, 8, 3);
+    let (problem, sequences, movement) = strict_n5_fixture(&schedule);
+    let operation_count = problem.operation_count();
+    let machine = match movement {
+        ScheduleMove::AdjacentSwap { machine, .. } | ScheduleMove::Insert { machine, .. } => machine,
+    };
+    let mut expected_sequences = sequences.clone();
+    apply_test_move(&mut expected_sequences[machine], movement);
+    let (expected_starts, expected_makespan) = independent_fixed_oracle(&schedule, &expected_sequences).expect("strict N5 candidate");
+
+    let mut zero_prefix = JobShopState::from_machine_sequences(&problem, sequences.clone(), &stop).unwrap().unwrap();
+    zero_prefix.retain_canonical_critical_blocks_only();
+    zero_prefix.test_configure_strict_n5_work_cap(0, false);
+    let zero = zero_prefix.consider_strict_n5_fast(movement, MinimizingMoveAcceptance::Always, &stop).unwrap();
+    assert!(zero.used_fast_path && zero.used_topological_recovery && !zero.fell_back);
+    assert_eq!(zero.fallback_reason, None);
+
+    let mut one_prefix = JobShopState::from_machine_sequences(&problem, sequences, &stop).unwrap().unwrap();
+    one_prefix.retain_canonical_critical_blocks_only();
+    one_prefix.test_configure_strict_n5_work_cap(1, false);
+    let one = one_prefix.consider_strict_n5_fast(movement, MinimizingMoveAcceptance::Always, &stop).unwrap();
+    assert!(one.used_fast_path && one.used_topological_recovery && !one.fell_back);
+    assert_eq!(one.fallback_reason, None);
+    assert_eq!(one.queue_pops, zero.queue_pops.saturating_add(1), "the discarded streaming prefix remains accounted");
+    assert!(
+        one.queue_pops <= u64::try_from(operation_count.saturating_mul(4).saturating_add(1)).unwrap_or(u64::MAX),
+        "one streaming pop plus both exact closure/Kahn passes visits at most 4n+1 operations"
+    );
+    assert!(
+        one.forward_date_changes.saturating_add(one.reverse_tail_changes)
+            > zero.forward_date_changes.saturating_add(zero.reverse_tail_changes),
+        "the discarded streaming prefix must contain an actual date mutation, not only a queue pop"
+    );
+
+    for state in [&mut zero_prefix, &mut one_prefix] {
+        assert_eq!(state.machine_sequences(), expected_sequences);
+        assert_eq!(state.starts(), expected_starts);
+        assert_eq!(state.makespan(), expected_makespan);
+        assert!(state.refresh_from_full_oracle(&stop).unwrap());
+        assert!(state.matches_full_oracle(&stop).unwrap());
+    }
+}
+
+#[test]
+fn strict_n5_work_cap_recovery_rejection_and_interruption_are_atomic() {
+    let stop = AtomicBool::new(false);
+    let schedule = fixed_permutation_job_shop(9, 7, 2);
+    let (problem, sequences, movement) = strict_n5_fixture(&schedule);
+
+    let mut rejected = JobShopState::from_machine_sequences(&problem, sequences.clone(), &stop).unwrap().unwrap();
+    rejected.retain_canonical_critical_blocks_only();
+    let before_starts = rejected.starts().to_vec();
+    let before_ends = rejected.ends().to_vec();
+    let before_makespan = rejected.makespan();
+    rejected.test_configure_strict_n5_work_cap(1, false);
+    let outcome = rejected.consider_strict_n5_fast(movement, MinimizingMoveAcceptance::StrictlyBelow(i64::MIN), &stop).unwrap();
+    assert!(outcome.used_fast_path && outcome.used_topological_recovery && !outcome.fell_back);
+    assert!(matches!(outcome.outcome, MoveOutcome::Rejected(MoveRejection::NotAccepted { .. })));
+    assert_eq!(rejected.machine_sequences(), sequences);
+    assert_eq!(rejected.starts(), before_starts);
+    assert_eq!(rejected.ends(), before_ends);
+    assert_eq!(rejected.makespan(), before_makespan);
+    assert!(rejected.matches_full_oracle(&stop).unwrap(), "rejection must restore tails and derived analysis too");
+
+    let mut interrupted = JobShopState::from_machine_sequences(&problem, sequences.clone(), &stop).unwrap().unwrap();
+    interrupted.retain_canonical_critical_blocks_only();
+    interrupted.test_configure_strict_n5_work_cap(0, true);
+    assert!(interrupted.consider_strict_n5_fast(movement, MinimizingMoveAcceptance::Always, &stop).is_err());
+    assert!(stop.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(interrupted.machine_sequences(), sequences);
+    assert_eq!(interrupted.starts(), before_starts);
+    assert_eq!(interrupted.ends(), before_ends);
+    assert_eq!(interrupted.makespan(), before_makespan);
+    stop.store(false, std::sync::atomic::Ordering::Release);
+    assert!(interrupted.matches_full_oracle(&stop).unwrap(), "interruption must restore graph, dates, tails and analysis");
+}
+
+#[test]
+fn strict_n5_reverse_work_cap_recovers_without_discarding_exact_heads_and_rolls_back_atomically() {
+    let stop = AtomicBool::new(false);
+    let schedule = fixed_permutation_job_shop(9, 7, 2);
+    let (problem, sequences, movement) = strict_n5_fixture(&schedule);
+    let operation_count = problem.operation_count();
+    let machine = match movement {
+        ScheduleMove::AdjacentSwap { machine, .. } | ScheduleMove::Insert { machine, .. } => machine,
+    };
+    let mut expected_sequences = sequences.clone();
+    apply_test_move(&mut expected_sequences[machine], movement);
+    let (expected_starts, expected_makespan) = independent_fixed_oracle(&schedule, &expected_sequences).expect("strict N5 candidate");
+
+    let mut accepted = JobShopState::from_machine_sequences(&problem, sequences.clone(), &stop).unwrap().unwrap();
+    accepted.retain_canonical_critical_blocks_only();
+    accepted.test_configure_strict_n5_phase_work_caps(operation_count, 0, false, false);
+    let outcome = accepted.consider_strict_n5_fast(movement, MinimizingMoveAcceptance::Always, &stop).unwrap();
+    assert!(outcome.used_fast_path && outcome.used_topological_recovery && !outcome.fell_back);
+    assert!(accepted.test_last_strict_n5_work_cap_was_reverse());
+    assert!(outcome.forward_date_changes > 0, "forward streaming must complete before the forced reverse WorkCap");
+    assert!(
+        outcome.queue_pops <= u64::try_from(operation_count.saturating_mul(4)).unwrap_or(u64::MAX),
+        "forward streaming, the empty reverse prefix, and reverse closure/Kahn must stay within 4n"
+    );
+    assert_eq!(accepted.machine_sequences(), expected_sequences);
+    assert_eq!(accepted.starts(), expected_starts);
+    assert_eq!(accepted.makespan(), expected_makespan);
+    assert!(accepted.refresh_from_full_oracle(&stop).unwrap());
+    assert!(accepted.matches_full_oracle(&stop).unwrap());
+
+    let mut rejected = JobShopState::from_machine_sequences(&problem, sequences.clone(), &stop).unwrap().unwrap();
+    rejected.retain_canonical_critical_blocks_only();
+    let before_starts = rejected.starts().to_vec();
+    let before_ends = rejected.ends().to_vec();
+    let before_tails = rejected.test_tails().to_vec();
+    let before_path = rejected.critical_path().to_vec();
+    let before_blocks = rejected.critical_blocks().to_vec();
+    let before_makespan = rejected.makespan();
+    rejected.test_configure_strict_n5_phase_work_caps(operation_count, 0, false, false);
+    let outcome = rejected.consider_strict_n5_fast(movement, MinimizingMoveAcceptance::StrictlyBelow(i64::MIN), &stop).unwrap();
+    assert!(outcome.used_fast_path && outcome.used_topological_recovery && !outcome.fell_back);
+    assert!(rejected.test_last_strict_n5_work_cap_was_reverse());
+    assert!(matches!(outcome.outcome, MoveOutcome::Rejected(MoveRejection::NotAccepted { .. })));
+    assert_eq!(rejected.machine_sequences(), sequences);
+    assert_eq!(rejected.starts(), before_starts);
+    assert_eq!(rejected.ends(), before_ends);
+    assert_eq!(rejected.test_tails(), before_tails);
+    assert_eq!(rejected.critical_path(), before_path);
+    assert_eq!(rejected.critical_blocks(), before_blocks);
+    assert_eq!(rejected.makespan(), before_makespan);
+    assert!(rejected.matches_full_oracle(&stop).unwrap());
+
+    for stop_during_recovery in [false, true] {
+        let mut interrupted = JobShopState::from_machine_sequences(&problem, sequences.clone(), &stop).unwrap().unwrap();
+        interrupted.retain_canonical_critical_blocks_only();
+        let before_starts = interrupted.starts().to_vec();
+        let before_ends = interrupted.ends().to_vec();
+        let before_tails = interrupted.test_tails().to_vec();
+        let before_path = interrupted.critical_path().to_vec();
+        let before_blocks = interrupted.critical_blocks().to_vec();
+        let before_makespan = interrupted.makespan();
+        interrupted.test_configure_strict_n5_phase_work_caps(operation_count, 0, !stop_during_recovery, stop_during_recovery);
+        assert!(interrupted.consider_strict_n5_fast(movement, MinimizingMoveAcceptance::Always, &stop).is_err());
+        assert!(interrupted.test_last_strict_n5_work_cap_was_reverse());
+        assert!(stop.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(interrupted.machine_sequences(), sequences);
+        assert_eq!(interrupted.starts(), before_starts);
+        assert_eq!(interrupted.ends(), before_ends);
+        assert_eq!(interrupted.test_tails(), before_tails);
+        assert_eq!(interrupted.critical_path(), before_path);
+        assert_eq!(interrupted.critical_blocks(), before_blocks);
+        assert_eq!(interrupted.makespan(), before_makespan);
+        stop.store(false, std::sync::atomic::Ordering::Release);
+        assert!(interrupted.matches_full_oracle(&stop).unwrap());
+    }
+}
+
+#[test]
+fn strict_n5_work_cap_recovery_has_linear_queue_work_and_wrap_safe_epochs() {
+    let stop = AtomicBool::new(false);
+    let schedule = fixed_permutation_job_shop(80, 30, 11);
+    let (problem, sequences, movement) = strict_n5_fixture(&schedule);
+    let operation_count = problem.operation_count();
+    let mut state = JobShopState::from_machine_sequences(&problem, sequences, &stop).unwrap().unwrap();
+    state.retain_canonical_critical_blocks_only();
+    assert!(state.test_wrap_fast_dirty_epoch(), "dirty and streaming queue marks must both clear on epoch wrap");
+    state.test_configure_strict_n5_work_cap(0, false);
+    let outcome = state.consider_strict_n5_fast(movement, MinimizingMoveAcceptance::Always, &stop).unwrap();
+    assert!(outcome.used_fast_path && outcome.used_topological_recovery && !outcome.fell_back);
+    assert!(
+        outcome.queue_pops <= u64::try_from(operation_count.saturating_mul(4)).unwrap_or(u64::MAX),
+        "each forward/reverse closure and Kahn pass visits at most n operations: pops={}, n={operation_count}",
+        outcome.queue_pops
+    );
+    let capacities = state.workspace_capacities();
+    assert!(capacities.dirty_queue <= operation_count.saturating_mul(2));
+    assert!(capacities.dirty_topological <= operation_count.saturating_mul(2));
+    assert!(state.refresh_from_full_oracle(&stop).unwrap());
+}
+
+#[test]
+fn strict_n5_streaming_work_cap_policy_scales_with_large_instances() {
+    assert_eq!(JobShopState::test_strict_n5_streaming_pop_cap(0), 4_096);
+    assert_eq!(JobShopState::test_strict_n5_streaming_pop_cap(1), 4_096);
+    assert_eq!(JobShopState::test_strict_n5_streaming_pop_cap(4_095), 4_096);
+    assert_eq!(JobShopState::test_strict_n5_streaming_pop_cap(4_096), 4_096);
+    assert_eq!(JobShopState::test_strict_n5_streaming_pop_cap(4_097), 4_097);
+    assert_eq!(JobShopState::test_strict_n5_streaming_pop_cap(131_072), 131_072);
+    assert_eq!(JobShopState::test_strict_n5_streaming_pop_cap(1_000_000), 1_000_000);
+    assert_eq!(JobShopState::test_strict_n5_streaming_pop_cap(usize::MAX), usize::MAX);
+
+    let large_n = 1_000_000usize;
+    let large_cap = JobShopState::test_strict_n5_streaming_pop_cap(large_n);
+    assert_eq!(large_cap.saturating_mul(2), large_n.saturating_mul(2), "direct forward+reverse streaming bound");
+    assert_eq!(large_cap.saturating_add(large_n.saturating_mul(4)), large_n.saturating_mul(5), "full recovery bound");
+    assert_eq!(
+        large_cap.saturating_mul(2).saturating_add(large_n.saturating_mul(2)),
+        large_n.saturating_mul(4),
+        "reverse-only recovery bound"
+    );
+
+    let small_n = 2_400usize;
+    let small_cap = JobShopState::test_strict_n5_streaming_pop_cap(small_n);
+    assert_eq!(small_cap.saturating_mul(2), 8_192);
+    assert_eq!(small_cap.saturating_add(small_n.saturating_mul(4)), 4_096usize.saturating_add(small_n.saturating_mul(4)));
+    assert_eq!(small_cap.saturating_mul(2).saturating_add(small_n.saturating_mul(2)), 8_192usize.saturating_add(small_n.saturating_mul(2)));
+
+    let stop = AtomicBool::new(false);
+    let schedule = fixed_permutation_job_shop(80, 60, 11);
+    let (problem, sequences, movement) = strict_n5_fixture(&schedule);
+    let operation_count = problem.operation_count();
+    assert!(operation_count > 4_096);
+    assert_eq!(JobShopState::test_strict_n5_streaming_pop_cap(operation_count), operation_count);
+    let mut state = JobShopState::from_machine_sequences(&problem, sequences, &stop).unwrap().unwrap();
+    state.retain_canonical_critical_blocks_only();
+    let outcome = state.consider_strict_n5_fast(movement, MinimizingMoveAcceptance::Always, &stop).unwrap();
+    assert!(outcome.used_fast_path && !outcome.fell_back);
+    let queue_bound = if outcome.used_topological_recovery { operation_count.saturating_mul(5) } else { operation_count.saturating_mul(2) };
+    assert!(
+        outcome.queue_pops <= u64::try_from(queue_bound).unwrap_or(u64::MAX),
+        "two direct phases cost at most 2n; either recovery shape remains below the conservative 5n bound"
+    );
+    assert!(state.refresh_from_full_oracle(&stop).unwrap());
 }
 
 #[test]
@@ -2095,6 +2908,7 @@ fn strict_n5_fast_gate_falls_back_for_general_dag_zero_duration_and_windows() {
         let mut state = JobShopState::giffler_thompson(&problem, 0, DispatchRule::EarliestStart, &stop).unwrap().unwrap();
         assert!(!state.supports_strict_n5_fast_path());
         let movement = ScheduleMove::AdjacentSwap { machine: 0, first_position: 0 };
+        assert!(state.score_strict_n5_taillard(movement, &stop).unwrap().is_none());
         let before = state.machine_sequences().to_vec();
         let outcome = state.consider_strict_n5_fast(movement, MinimizingMoveAcceptance::Always, &stop).unwrap();
         assert!(!outcome.used_fast_path);

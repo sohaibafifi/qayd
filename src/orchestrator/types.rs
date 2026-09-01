@@ -23,6 +23,8 @@ pub enum ScheduleJsspSearch {
     Legacy,
     /// Run the bounded TSAB-inspired candidate-ranked N5 pilot.
     TsabCandidate,
+    /// Run the bounded TSAB-inspired candidate-ranked N5 pilot on every worker.
+    TsabMultiCandidate,
 }
 
 /// Stable engine identity used by events and diagnostics.
@@ -329,16 +331,23 @@ impl SolveRequest {
                 "schedule_constructor_workers cannot yet be combined with schedule_path_relink or schedule_lns_shadow".to_string(),
             ));
         }
-        if self.schedule_jssp_search == ScheduleJsspSearch::TsabCandidate
-            && (self.schedule_constructor_workers != 0 || self.schedule_path_relink || self.schedule_lns_shadow)
-        {
-            return Err(SolveError::InvalidRequest(
-                "schedule_jssp_search='tsab-candidate' cannot yet be combined with schedule_constructor_workers, schedule_path_relink, or schedule_lns_shadow"
-                    .to_string(),
-            ));
-        }
-        if self.schedule_jssp_search == ScheduleJsspSearch::TsabCandidate && self.threads != 7 {
-            return Err(SolveError::InvalidRequest("schedule_jssp_search='tsab-candidate' currently requires threads=7".to_string()));
+        let tsab_strategy = match self.schedule_jssp_search {
+            ScheduleJsspSearch::Legacy => None,
+            ScheduleJsspSearch::TsabCandidate => Some("tsab-candidate"),
+            ScheduleJsspSearch::TsabMultiCandidate => Some("tsab-multi-candidate"),
+        };
+        if let Some(strategy) = tsab_strategy {
+            let unsupported_path_relink =
+                self.schedule_path_relink && !matches!(self.schedule_jssp_search, ScheduleJsspSearch::TsabMultiCandidate);
+            if self.schedule_constructor_workers != 0 || unsupported_path_relink || self.schedule_lns_shadow {
+                return Err(SolveError::InvalidRequest(format!(
+                    "schedule_jssp_search='{}' cannot yet be combined with schedule_constructor_workers, schedule_path_relink, or schedule_lns_shadow",
+                    strategy
+                )));
+            }
+            if self.threads != 7 {
+                return Err(SolveError::InvalidRequest(format!("schedule_jssp_search='{strategy}' currently requires threads=7")));
+            }
         }
         if self.limits.memory_bytes == Some(0) {
             return Err(SolveError::InvalidRequest("memory limit must be positive when provided".to_string()));

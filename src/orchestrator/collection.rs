@@ -54,6 +54,10 @@ std::thread_local! {
     static FINAL_REPLAY_AUDIT: std::cell::Cell<FinalReplayAudit> = const { std::cell::Cell::new(FinalReplayAudit::None) };
     static SCHEDULE_SEARCH_ELITE_SHADOW_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static SCHEDULE_SEARCH_ELITE_STOP_BEFORE_MERGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SCHEDULE_TSAB_STOP_AFTER_PENDING_REPORT_OWNER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static SCHEDULE_TSAB_TERMINAL_REPLAY_ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SCHEDULE_TSAB_TERMINAL_PENDING_OBJECTIVE: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+    static SCHEDULE_TSAB_TERMINAL_PUBLISHED_OBJECTIVE: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -92,9 +96,64 @@ pub(crate) fn audit_with_schedule_search_elite_stop_before_merge<R>(audit: impl 
 }
 
 #[cfg(test)]
+pub(crate) fn audit_with_schedule_tsab_stop_after_pending_report<R>(audit: impl FnOnce() -> R) -> (R, u64, Option<i64>, Option<i64>) {
+    audit_with_schedule_tsab_stop_after_pending_report_for_owner(6, audit)
+}
+
+#[cfg(test)]
+pub(crate) fn audit_with_schedule_tsab_stop_after_pending_report_for_owner<R>(
+    owner: usize,
+    audit: impl FnOnce() -> R,
+) -> (R, u64, Option<i64>, Option<i64>) {
+    struct ResetStopAfterPendingReport {
+        owner: Option<usize>,
+        replay_attempts: u64,
+        pending_objective: Option<i64>,
+        published_objective: Option<i64>,
+    }
+
+    impl Drop for ResetStopAfterPendingReport {
+        fn drop(&mut self) {
+            SCHEDULE_TSAB_STOP_AFTER_PENDING_REPORT_OWNER.set(self.owner);
+            SCHEDULE_TSAB_TERMINAL_REPLAY_ATTEMPTS.set(self.replay_attempts);
+            SCHEDULE_TSAB_TERMINAL_PENDING_OBJECTIVE.set(self.pending_objective);
+            SCHEDULE_TSAB_TERMINAL_PUBLISHED_OBJECTIVE.set(self.published_objective);
+        }
+    }
+
+    let reset = ResetStopAfterPendingReport {
+        owner: SCHEDULE_TSAB_STOP_AFTER_PENDING_REPORT_OWNER.replace(Some(owner)),
+        replay_attempts: SCHEDULE_TSAB_TERMINAL_REPLAY_ATTEMPTS.replace(0),
+        pending_objective: SCHEDULE_TSAB_TERMINAL_PENDING_OBJECTIVE.replace(None),
+        published_objective: SCHEDULE_TSAB_TERMINAL_PUBLISHED_OBJECTIVE.replace(None),
+    };
+    let result = audit();
+    let replay_attempts = SCHEDULE_TSAB_TERMINAL_REPLAY_ATTEMPTS.get();
+    let pending_objective = SCHEDULE_TSAB_TERMINAL_PENDING_OBJECTIVE.get();
+    let published_objective = SCHEDULE_TSAB_TERMINAL_PUBLISHED_OBJECTIVE.get();
+    drop(reset);
+    (result, replay_attempts, pending_objective, published_objective)
+}
+
+#[cfg(test)]
 fn apply_schedule_search_elite_stop_before_merge(stop: &AtomicBool) {
     if SCHEDULE_SEARCH_ELITE_STOP_BEFORE_MERGE.replace(false) {
         stop.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+fn apply_schedule_tsab_stop_after_pending_report(sessions: &mut [Option<lists::ScheduleSearchSession>], stop: &AtomicBool) {
+    let Some(owner) = SCHEDULE_TSAB_STOP_AFTER_PENDING_REPORT_OWNER.get() else {
+        return;
+    };
+    if let Some(session) = sessions.get_mut(owner).and_then(Option::as_mut) {
+        if session.has_tsab_fast_pending_elite() {
+            SCHEDULE_TSAB_STOP_AFTER_PENDING_REPORT_OWNER.set(None);
+            stop.store(true, Ordering::Release);
+        } else {
+            session.test_return_after_fast_pending_elite();
+        }
     }
 }
 
@@ -480,11 +539,10 @@ fn validate_selected_plan_options(plan: &CollectionSolvePlan, request: &SolveReq
             ));
         }
     }
-    if request.schedule_jssp_search == ScheduleJsspSearch::TsabCandidate && !matches!(plan.backend, CollectionBackend::ScheduleLocalSearch)
+    if matches!(request.schedule_jssp_search, ScheduleJsspSearch::TsabCandidate | ScheduleJsspSearch::TsabMultiCandidate)
+        && !matches!(plan.backend, CollectionBackend::ScheduleLocalSearch)
     {
-        return Err(SolveError::InvalidRequest(
-            "schedule_jssp_search='tsab-candidate' requires a selected scheduling local-search backend".to_string(),
-        ));
+        return Err(SolveError::InvalidRequest("TSAB JSSP search requires a selected scheduling local-search backend".to_string()));
     }
     if request.list_hint.is_some()
         && !matches!(plan.backend, CollectionBackend::ListLocalSearch | CollectionBackend::RoutingLocalSearch)
@@ -767,6 +825,7 @@ fn solve_collection_plan_inner(
     let engine_stop = optional_stops
         .map(super::WarmStartStops::search)
         .unwrap_or_else(|| search_stop.as_ref().expect("ordinary collection search owns a stop token").flag());
+    let finalization_stop = transfer_stop.unwrap_or_else(|| budget.stop());
     let started = Instant::now();
     let mut event_error = None;
     let outcome = (|| -> Result<SolveResult, SolveError> {
@@ -828,6 +887,7 @@ fn solve_collection_plan_inner(
                     request,
                     budget,
                     engine_stop,
+                    finalization_stop,
                     transfer_stop,
                     max_iterations: plan.local_search_iterations.or(request.limits.iterations).unwrap_or(u64::MAX),
                     repeat_until_stopped: request.limits.time.is_some()
@@ -1314,6 +1374,7 @@ struct ScheduleLocalSearchRun<'a> {
     request: &'a SolveRequest,
     budget: &'a SolveBudget,
     engine_stop: &'a AtomicBool,
+    finalization_stop: &'a AtomicBool,
     transfer_stop: Option<&'a AtomicBool>,
     max_iterations: u64,
     repeat_until_stopped: bool,
@@ -1416,6 +1477,12 @@ struct ScheduleMetricsAggregate {
     schedule_tsab_restart_n6_generated: u64,
     schedule_tsab_restart_delta_probes: u64,
     schedule_tsab_restart_oracle_commits: u64,
+    schedule_tsab_restart_relink_attempts: u64,
+    schedule_tsab_restart_relink_commits: u64,
+    schedule_tsab_restart_relink_components_shortlisted: u64,
+    schedule_tsab_restart_relink_components_committed: u64,
+    schedule_tsab_restart_relink_guide_arc_gain_shortlisted: u64,
+    schedule_tsab_restart_relink_guide_arc_gain_accepted: u64,
     schedule_tsab_restart_rejections: u64,
     schedule_tsab_restart_interruptions: u64,
     schedule_tsab_restart_work_units: u64,
@@ -1444,6 +1511,7 @@ struct ScheduleMetricsAggregate {
     schedule_tsab_fast_attempts: u64,
     schedule_tsab_fast_commits: u64,
     schedule_tsab_fast_fallbacks: u64,
+    schedule_tsab_fast_work_cap_recoveries: u64,
     schedule_tsab_fast_date_changes: u64,
     schedule_tsab_fast_queue_pops: u64,
     schedule_tsab_fast_full_validations: u64,
@@ -1606,6 +1674,22 @@ impl ScheduleMetricsAggregate {
             self.schedule_tsab_restart_delta_probes.saturating_add(metrics.schedule_tsab.restart_delta_probes);
         self.schedule_tsab_restart_oracle_commits =
             self.schedule_tsab_restart_oracle_commits.saturating_add(metrics.schedule_tsab.restart_oracle_commits);
+        self.schedule_tsab_restart_relink_attempts =
+            self.schedule_tsab_restart_relink_attempts.saturating_add(metrics.schedule_tsab.restart_relink_attempts);
+        self.schedule_tsab_restart_relink_commits =
+            self.schedule_tsab_restart_relink_commits.saturating_add(metrics.schedule_tsab.restart_relink_commits);
+        self.schedule_tsab_restart_relink_components_shortlisted = self
+            .schedule_tsab_restart_relink_components_shortlisted
+            .saturating_add(metrics.schedule_tsab.restart_relink_components_shortlisted);
+        self.schedule_tsab_restart_relink_components_committed = self
+            .schedule_tsab_restart_relink_components_committed
+            .saturating_add(metrics.schedule_tsab.restart_relink_components_committed);
+        self.schedule_tsab_restart_relink_guide_arc_gain_shortlisted = self
+            .schedule_tsab_restart_relink_guide_arc_gain_shortlisted
+            .saturating_add(metrics.schedule_tsab.restart_relink_guide_arc_gain_shortlisted);
+        self.schedule_tsab_restart_relink_guide_arc_gain_accepted = self
+            .schedule_tsab_restart_relink_guide_arc_gain_accepted
+            .saturating_add(metrics.schedule_tsab.restart_relink_guide_arc_gain_accepted);
         self.schedule_tsab_restart_rejections =
             self.schedule_tsab_restart_rejections.saturating_add(metrics.schedule_tsab.restart_rejections);
         self.schedule_tsab_restart_interruptions =
@@ -1655,6 +1739,8 @@ impl ScheduleMetricsAggregate {
         self.schedule_tsab_fast_attempts = self.schedule_tsab_fast_attempts.saturating_add(metrics.schedule_tsab.fast_attempts);
         self.schedule_tsab_fast_commits = self.schedule_tsab_fast_commits.saturating_add(metrics.schedule_tsab.fast_commits);
         self.schedule_tsab_fast_fallbacks = self.schedule_tsab_fast_fallbacks.saturating_add(metrics.schedule_tsab.fast_fallbacks);
+        self.schedule_tsab_fast_work_cap_recoveries =
+            self.schedule_tsab_fast_work_cap_recoveries.saturating_add(metrics.schedule_tsab.fast_work_cap_recoveries);
         self.schedule_tsab_fast_date_changes = self.schedule_tsab_fast_date_changes.saturating_add(metrics.schedule_tsab.fast_date_changes);
         self.schedule_tsab_fast_queue_pops = self.schedule_tsab_fast_queue_pops.saturating_add(metrics.schedule_tsab.fast_queue_pops);
         self.schedule_tsab_fast_full_validations =
@@ -1840,6 +1926,10 @@ pub(crate) fn schedule_restart_work(interval_count: usize, quota: u64) -> u64 {
     quota.min(legacy.min(adaptive_cap))
 }
 
+pub(crate) fn schedule_worker_allows_rebase(strategy: lists::ScheduleJsspSearchStrategy, worker: usize) -> bool {
+    worker == 0 || (worker == 6 && strategy.requests_tsab())
+}
+
 fn schedule_round_seed(seed: u64, round: usize) -> u64 {
     if round == 0 {
         seed
@@ -1856,6 +1946,22 @@ fn schedule_candidate_precedes(
 ) -> bool {
     schedule_candidate_order(candidate, source_worker, source_round, &incumbent.solution, incumbent.source_worker, incumbent.source_round)
         == std::cmp::Ordering::Less
+}
+
+fn schedule_pending_key_precedes_incumbent(
+    objective: i64,
+    source_worker: usize,
+    source_round: usize,
+    incumbent: &SharedScheduleIncumbent,
+) -> bool {
+    schedule_candidate_key_order(
+        &[objective],
+        source_worker,
+        source_round,
+        &incumbent.solution.objectives,
+        incumbent.source_worker,
+        incumbent.source_round,
+    ) == std::cmp::Ordering::Less
 }
 
 fn schedule_candidate_order(
@@ -1934,6 +2040,15 @@ fn schedule_path_relink_guide<'a>(
     Some(lists::schedule_relink::ScheduleRelinkRequest { guide: &archive.entries()[index], kind })
 }
 
+fn schedule_tsab_macro_relink_guide(
+    archive: &lists::schedule_elite::ScheduleEliteArchive,
+) -> Option<lists::schedule_relink::ScheduleRelinkRequest<'_>> {
+    Some(lists::schedule_relink::ScheduleRelinkRequest {
+        guide: archive.farthest_from_best()?,
+        kind: lists::schedule_relink::ScheduleRelinkGuideKind::Diverse,
+    })
+}
+
 fn schedule_path_relink_guide_choice(
     seed: u64,
     round: usize,
@@ -1973,6 +2088,7 @@ fn result_from_schedule_local_search(
         request,
         budget,
         engine_stop,
+        finalization_stop,
         transfer_stop,
         max_iterations,
         repeat_until_stopped,
@@ -1993,15 +2109,13 @@ fn result_from_schedule_local_search(
             )
         });
     }
-    if request.schedule_jssp_search == ScheduleJsspSearch::TsabCandidate
+    if matches!(request.schedule_jssp_search, ScheduleJsspSearch::TsabCandidate | ScheduleJsspSearch::TsabMultiCandidate)
         && !lists::schedule_constructor_multistart_supported(schedule, engine_stop)
     {
         return Err(if engine_stop.load(Ordering::Acquire) {
-            SolveError::Interrupted("solve budget expired while validating TsabCandidate JSSP search".to_string())
+            SolveError::Interrupted("solve budget expired while validating TSAB JSSP search".to_string())
         } else {
-            SolveError::InvalidRequest(
-                "schedule_jssp_search='tsab-candidate' currently supports only mandatory fixed-assignment JSSP local search".to_string(),
-            )
+            SolveError::InvalidRequest("TSAB JSSP search currently supports only mandatory fixed-assignment JSSP local search".to_string())
         });
     }
     let restart_work_cap = schedule_restart_work(schedule.intervals.len(), u64::MAX);
@@ -2055,6 +2169,7 @@ fn result_from_schedule_local_search(
         let schedule_jssp_strategy = match request.schedule_jssp_search {
             ScheduleJsspSearch::Legacy => lists::ScheduleJsspSearchStrategy::Legacy,
             ScheduleJsspSearch::TsabCandidate => lists::ScheduleJsspSearchStrategy::TsabCandidate,
+            ScheduleJsspSearch::TsabMultiCandidate => lists::ScheduleJsspSearchStrategy::TsabMultiCandidate,
         };
         let mut remaining = (0..allocation.workers())
             .map(|worker| worker_iteration_quota(max_iterations, worker, allocation.workers()))
@@ -2064,226 +2179,411 @@ fn result_from_schedule_local_search(
         let mut worker_work = vec![0u64; allocation.workers()];
         let mut worker_sessions = (0..allocation.workers()).map(|_| None::<lists::ScheduleSearchSession>).collect::<Vec<_>>();
         let mut round = 0usize;
+        let mut terminal_finalization_attempted = false;
 
-        loop {
-            if engine_stop.load(Ordering::Acquire) || (!finite_work && !repeat_until_stopped && round > 0) {
-                break;
-            }
-            let inputs = remaining
-                .iter()
-                .enumerate()
-                .filter_map(|(worker, &left)| {
-                    let worker_quota = if finite_work { left } else { u64::MAX };
-                    let quota = schedule_restart_work(schedule.intervals.len(), worker_quota);
-                    (!retired[worker] && quota > 0).then_some((worker, quota))
-                })
-                .collect::<Vec<_>>();
-            if inputs.is_empty() {
-                break;
-            }
-            let injected = shared_incumbent.as_ref().map(|incumbent| incumbent.solution.clone());
-            if injected.is_some() {
-                incumbent_injection_attempts = incumbent_injection_attempts.saturating_add(u64::try_from(inputs.len()).unwrap_or(u64::MAX));
-            }
-            let mut prepared_inputs = Vec::with_capacity(inputs.len());
-            for (source_worker, quota) in inputs {
-                prepared_inputs.push((source_worker, quota, worker_sessions[source_worker].take()));
-            }
-            let round_seed = schedule_round_seed(request.seed, round);
-            let relink_guide = (request.profile && request.schedule_path_relink && allocation.workers() >= 7)
-                .then(|| schedule_path_relink_guide(&search_elite.archive, request.seed, round))
-                .flatten();
-            let summary = super::execute_workers_silent(
-                prepared_inputs,
-                engine_stop,
-                Arc::new(AtomicBool::new(false)),
-                round_seed,
-                |context, (source_worker, quota, session)| {
-                    let worker = u64::try_from(source_worker).unwrap_or(u64::MAX);
-                    let stable_seed = crate::mix64(request.seed ^ worker.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-                    let fallback_seed = round_seed.wrapping_add(worker);
-                    let worker_relink = (source_worker == 6).then_some(relink_guide).flatten();
-                    let (candidate, metrics, session) = lists::solve_schedule_capped_persistent_hybrid_with_strategy(
-                        schedule,
-                        stable_seed,
-                        fallback_seed,
-                        source_worker,
-                        allocation.workers(),
-                        context.stop(),
-                        quota,
-                        injected.as_ref(),
-                        session,
-                        source_worker == 0
-                            || (source_worker == 6 && schedule_jssp_strategy == lists::ScheduleJsspSearchStrategy::TsabCandidate),
-                        search_elite_token.as_ref(),
-                        schedule_lns_shadow,
-                        schedule_constructor_multistart,
-                        schedule_jssp_strategy,
-                        worker_relink,
-                        &mut |_| {},
-                    );
-                    (source_worker, quota, candidate, metrics, session)
-                },
-            );
-            peak_buffered_candidates = peak_buffered_candidates.max(summary.reports.len());
-            restart_boundaries = restart_boundaries.saturating_add(1);
-
-            let mut boundary_candidates = Vec::with_capacity(summary.reports.len());
-            let mut reported_workers = Vec::with_capacity(summary.reports.len());
-            for report in summary.reports {
-                let (source_worker, quota, candidate, metrics, returned_session): (
-                    usize,
-                    u64,
-                    CollectionSolution,
-                    lists::ScheduleConstructionMetrics,
-                    Option<lists::ScheduleSearchSession>,
-                ) = report.result;
-                let local_objective =
-                    if candidate.feasible && candidate.objectives.len() == 1 { candidate.objectives.first().copied() } else { None };
-                let constructor = metrics.constructor;
-                let used = metrics.work_steps;
-                worker_work[source_worker] = worker_work[source_worker].saturating_add(used);
-                if finite_work {
-                    remaining[source_worker] = remaining[source_worker].saturating_sub(used.min(quota));
-                    if used > quota {
-                        work_budget_overruns = work_budget_overruns.saturating_add(1);
-                        remaining[source_worker] = 0;
+        'search_and_finalization: loop {
+            loop {
+                if engine_stop.load(Ordering::Acquire) {
+                    let mut pending_owners = Vec::<(i64, usize)>::new();
+                    if !terminal_finalization_attempted
+                        && !budget.hard_cancelled()
+                        && !finalization_stop.load(Ordering::Acquire)
+                        && schedule_jssp_strategy.requests_tsab()
+                        && allocation.workers() == 7
+                    {
+                        pending_owners.extend(worker_sessions.iter().enumerate().filter_map(|(owner, session)| {
+                            session
+                                .as_ref()
+                                .and_then(lists::ScheduleSearchSession::tsab_fast_pending_objective)
+                                .map(|objective| (objective, owner))
+                        }));
+                        pending_owners.sort_unstable();
+                        terminal_finalization_attempted = !pending_owners.is_empty();
                     }
-                }
-                if used == 0 {
-                    zero_progress_rounds[source_worker] = zero_progress_rounds[source_worker].saturating_add(1);
-                    if candidate.feasible || zero_progress_rounds[source_worker] >= 2 {
-                        retired[source_worker] = true;
-                        stalled_workers = stalled_workers.saturating_add(1);
-                        if finite_work {
-                            stalled_unused_work_steps = stalled_unused_work_steps.saturating_add(remaining[source_worker]);
-                            remaining[source_worker] = 0;
+                    for (pending_objective, owner) in pending_owners {
+                        if budget.hard_cancelled() || finalization_stop.load(Ordering::Acquire) {
+                            break;
                         }
-                    }
-                } else {
-                    zero_progress_rounds[source_worker] = 0;
-                }
-                if candidate.feasible {
-                    boundary_candidates.push(ScheduleBoundaryCandidate { source_worker, solution: candidate, constructor });
-                } else {
-                    incumbent_rejections = incumbent_rejections.saturating_add(1);
-                    incomplete_rejections = incomplete_rejections.saturating_add(1);
-                }
-                aggregate.record(metrics, local_objective);
-                reported_workers.push(source_worker);
-                worker_sessions[source_worker] = returned_session;
-            }
-
-            boundary_candidates.sort_by(|left, right| {
-                schedule_candidate_order(&left.solution, left.source_worker, round, &right.solution, right.source_worker, round)
-            });
-            let mut eligible = Vec::with_capacity(boundary_candidates.len());
-            for (index, candidate) in boundary_candidates.iter().enumerate() {
-                if shared_incumbent
-                    .as_ref()
-                    .is_none_or(|incumbent| schedule_candidate_precedes(&candidate.solution, candidate.source_worker, round, incumbent))
-                {
-                    eligible.push(index);
-                } else {
-                    incumbent_rejections = incumbent_rejections.saturating_add(1);
-                }
-            }
-
-            let mut transfer_error = None;
-            let transfer_summary = attempt_schedule_transfer_batch(&eligible, |index| {
-                let candidate = &mut boundary_candidates[index];
-                incumbent_verifications = incumbent_verifications.saturating_add(1);
-                let verification_started = Instant::now();
-                let verification = verified_candidate(
-                    semantic,
-                    model,
-                    &candidate.solution,
-                    EngineKind::ScheduleLocalSearch,
-                    VerificationLevel::Transfer,
-                    budget.stop(),
-                );
-                let verification_elapsed = verification_started.elapsed();
-                incumbent_verification_elapsed = incumbent_verification_elapsed.saturating_add(verification_elapsed);
-                incumbent_verification_max_elapsed = incumbent_verification_max_elapsed.max(verification_elapsed);
-                match verification {
-                    Ok(verified) => {
-                        let canonical = match schedule_solution_from_verified(&verified) {
-                            Ok(canonical) => canonical,
-                            Err(error) => {
-                                transfer_error = Some(error);
-                                return ScheduleTransferAttempt::Interrupted;
-                            }
-                        };
-                        let precedes = shared_incumbent
+                        if shared_incumbent
                             .as_ref()
-                            .is_none_or(|incumbent| schedule_candidate_precedes(&canonical, candidate.source_worker, round, incumbent));
-                        if precedes {
-                            let strict_improvement =
-                                shared_incumbent.as_ref().is_none_or(|incumbent| canonical.objectives < incumbent.solution.objectives);
-                            candidate.solution = canonical.clone();
-                            shared_incumbent = Some(SharedScheduleIncumbent {
-                                solution: canonical,
-                                candidate: verified,
-                                source_worker: candidate.source_worker,
-                                source_round: round,
-                                constructor: candidate.constructor,
-                            });
-                            incumbent_publications = incumbent_publications.saturating_add(1);
-                            first_feasible.get_or_insert_with(|| started.elapsed());
-                            if strict_improvement {
-                                if let Some(objective) = candidate.solution.objectives.first().copied() {
-                                    if published_objective.is_none_or(|current| objective < current) {
-                                        published_objective = Some(objective);
-                                        progress_publications = progress_publications.saturating_add(1);
-                                        improvement(EngineKind::ScheduleLocalSearch, objective);
+                            .is_some_and(|incumbent| !schedule_pending_key_precedes_incumbent(pending_objective, owner, round, incumbent))
+                        {
+                            break;
+                        }
+                        let worker = u64::try_from(owner).unwrap_or(u64::MAX);
+                        let stable_seed = crate::mix64(request.seed ^ worker.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+                        let fallback_seed = schedule_round_seed(request.seed, round).wrapping_add(worker);
+                        let injected = shared_incumbent.as_ref().map(|incumbent| incumbent.solution.clone());
+                        let session = worker_sessions[owner].take();
+                        let (mut candidate, metrics, returned_session) = lists::solve_schedule_capped_persistent_hybrid_with_strategy(
+                            schedule,
+                            stable_seed,
+                            fallback_seed,
+                            owner,
+                            allocation.workers(),
+                            engine_stop,
+                            finalization_stop,
+                            0,
+                            injected.as_ref(),
+                            session,
+                            true,
+                            search_elite_token.as_ref(),
+                            schedule_lns_shadow,
+                            false,
+                            schedule_jssp_strategy,
+                            None,
+                            &mut |_| {},
+                        );
+                        worker_sessions[owner] = returned_session;
+                        let local_objective = if candidate.feasible && candidate.objectives.len() == 1 {
+                            candidate.objectives.first().copied()
+                        } else {
+                            None
+                        };
+                        let constructor = metrics.constructor;
+                        aggregate.record(metrics, local_objective);
+                        #[cfg(test)]
+                        SCHEDULE_TSAB_TERMINAL_PENDING_OBJECTIVE.set(local_objective);
+                        let terminal_candidate_precedes = shared_incumbent
+                            .as_ref()
+                            .is_none_or(|incumbent| schedule_candidate_precedes(&candidate, owner, round, incumbent));
+
+                        if candidate.feasible {
+                            if finalization_stop.load(Ordering::Acquire) || budget.hard_cancelled() {
+                                // The parent boundary became authoritative while
+                                // the internal oracle was running. Keep only the
+                                // incumbent that already crossed Transfer replay.
+                            } else if terminal_candidate_precedes {
+                                incumbent_verifications = incumbent_verifications.saturating_add(1);
+                                #[cfg(test)]
+                                SCHEDULE_TSAB_TERMINAL_REPLAY_ATTEMPTS.set(SCHEDULE_TSAB_TERMINAL_REPLAY_ATTEMPTS.get().saturating_add(1));
+                                let verification_started = Instant::now();
+                                let verification = verified_candidate(
+                                    semantic,
+                                    model,
+                                    &candidate,
+                                    EngineKind::ScheduleLocalSearch,
+                                    VerificationLevel::Transfer,
+                                    finalization_stop,
+                                );
+                                let verification_elapsed = verification_started.elapsed();
+                                incumbent_verification_elapsed = incumbent_verification_elapsed.saturating_add(verification_elapsed);
+                                incumbent_verification_max_elapsed = incumbent_verification_max_elapsed.max(verification_elapsed);
+                                match verification {
+                                    Ok(_) if finalization_stop.load(Ordering::Acquire) || budget.hard_cancelled() => {
+                                        worker_sessions[owner] = None;
+                                        incumbent_rejections = incumbent_rejections.saturating_add(1);
+                                        verification_interruptions = verification_interruptions.saturating_add(1);
+                                    }
+                                    Ok(verified) => {
+                                        let canonical = schedule_solution_from_verified(&verified)?;
+                                        if finalization_stop.load(Ordering::Acquire) || budget.hard_cancelled() {
+                                            worker_sessions[owner] = None;
+                                            incumbent_rejections = incumbent_rejections.saturating_add(1);
+                                            verification_interruptions = verification_interruptions.saturating_add(1);
+                                        } else if shared_incumbent
+                                            .as_ref()
+                                            .is_none_or(|incumbent| schedule_candidate_precedes(&canonical, owner, round, incumbent))
+                                        {
+                                            let strict_improvement = shared_incumbent
+                                                .as_ref()
+                                                .is_none_or(|incumbent| canonical.objectives < incumbent.solution.objectives);
+                                            #[cfg(test)]
+                                            SCHEDULE_TSAB_TERMINAL_PUBLISHED_OBJECTIVE.set(canonical.objectives.first().copied());
+                                            candidate = canonical.clone();
+                                            shared_incumbent = Some(SharedScheduleIncumbent {
+                                                solution: canonical,
+                                                candidate: verified,
+                                                source_worker: owner,
+                                                source_round: round,
+                                                constructor,
+                                            });
+                                            incumbent_publications = incumbent_publications.saturating_add(1);
+                                            first_feasible.get_or_insert_with(|| started.elapsed());
+                                            if strict_improvement {
+                                                if let Some(objective) = candidate.objectives.first().copied() {
+                                                    if published_objective.is_none_or(|current| objective < current) {
+                                                        published_objective = Some(objective);
+                                                        progress_publications = progress_publications.saturating_add(1);
+                                                        improvement(EngineKind::ScheduleLocalSearch, objective);
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            incumbent_rejections = incumbent_rejections.saturating_add(1);
+                                        }
+                                    }
+                                    Err(error) => {
+                                        worker_sessions[owner] = None;
+                                        incumbent_rejections = incumbent_rejections.saturating_add(1);
+                                        if matches!(error, SolveError::Interrupted(_)) || budget.stop().load(Ordering::Acquire) {
+                                            verification_interruptions = verification_interruptions.saturating_add(1);
+                                        } else {
+                                            verification_rejections = verification_rejections.saturating_add(1);
+                                        }
                                     }
                                 }
+                            } else {
+                                incumbent_rejections = incumbent_rejections.saturating_add(1);
                             }
                         } else {
                             incumbent_rejections = incumbent_rejections.saturating_add(1);
+                            incomplete_rejections = incomplete_rejections.saturating_add(1);
                         }
-                        ScheduleTransferAttempt::Accepted
+                        if shared_incumbent
+                            .as_ref()
+                            .is_some_and(|incumbent| !schedule_pending_key_precedes_incumbent(pending_objective, owner, round, incumbent))
+                        {
+                            break;
+                        }
                     }
-                    Err(error) => {
-                        worker_sessions[candidate.source_worker] = None;
-                        incumbent_rejections = incumbent_rejections.saturating_add(1);
-                        if matches!(error, SolveError::Interrupted(_)) || budget.stop().load(Ordering::Acquire) {
-                            verification_interruptions = verification_interruptions.saturating_add(1);
-                            ScheduleTransferAttempt::Interrupted
+                    break;
+                }
+                if !finite_work && !repeat_until_stopped && round > 0 {
+                    break;
+                }
+                let inputs = remaining
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(worker, &left)| {
+                        let worker_quota = if finite_work { left } else { u64::MAX };
+                        let quota = schedule_restart_work(schedule.intervals.len(), worker_quota);
+                        (!retired[worker] && quota > 0).then_some((worker, quota))
+                    })
+                    .collect::<Vec<_>>();
+                if inputs.is_empty() {
+                    break;
+                }
+                let injected = shared_incumbent.as_ref().map(|incumbent| incumbent.solution.clone());
+                if injected.is_some() {
+                    incumbent_injection_attempts =
+                        incumbent_injection_attempts.saturating_add(u64::try_from(inputs.len()).unwrap_or(u64::MAX));
+                }
+                let mut prepared_inputs = Vec::with_capacity(inputs.len());
+                for (source_worker, quota) in inputs {
+                    prepared_inputs.push((source_worker, quota, worker_sessions[source_worker].take()));
+                }
+                let round_seed = schedule_round_seed(request.seed, round);
+                let relink_guide = (request.profile && request.schedule_path_relink && allocation.workers() >= 7)
+                    .then(|| {
+                        if schedule_jssp_strategy == lists::ScheduleJsspSearchStrategy::TsabMultiCandidate {
+                            schedule_tsab_macro_relink_guide(&search_elite.archive)
                         } else {
-                            verification_rejections = verification_rejections.saturating_add(1);
-                            ScheduleTransferAttempt::Rejected
+                            schedule_path_relink_guide(&search_elite.archive, request.seed, round)
+                        }
+                    })
+                    .flatten();
+                let summary = super::execute_workers_silent(
+                    prepared_inputs,
+                    engine_stop,
+                    Arc::new(AtomicBool::new(false)),
+                    round_seed,
+                    |context, (source_worker, quota, session)| {
+                        let worker = u64::try_from(source_worker).unwrap_or(u64::MAX);
+                        let stable_seed = crate::mix64(request.seed ^ worker.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+                        let fallback_seed = round_seed.wrapping_add(worker);
+                        let worker_relink = (source_worker == 6).then_some(relink_guide).flatten();
+                        let (candidate, metrics, session) = lists::solve_schedule_capped_persistent_hybrid_with_strategy(
+                            schedule,
+                            stable_seed,
+                            fallback_seed,
+                            source_worker,
+                            allocation.workers(),
+                            context.stop(),
+                            finalization_stop,
+                            quota,
+                            injected.as_ref(),
+                            session,
+                            schedule_worker_allows_rebase(schedule_jssp_strategy, source_worker),
+                            search_elite_token.as_ref(),
+                            schedule_lns_shadow,
+                            schedule_constructor_multistart,
+                            schedule_jssp_strategy,
+                            worker_relink,
+                            &mut |_| {},
+                        );
+                        (source_worker, quota, candidate, metrics, session)
+                    },
+                );
+                peak_buffered_candidates = peak_buffered_candidates.max(summary.reports.len());
+                restart_boundaries = restart_boundaries.saturating_add(1);
+
+                let mut boundary_candidates = Vec::with_capacity(summary.reports.len());
+                let mut reported_workers = Vec::with_capacity(summary.reports.len());
+                for report in summary.reports {
+                    let (source_worker, quota, candidate, metrics, returned_session): (
+                        usize,
+                        u64,
+                        CollectionSolution,
+                        lists::ScheduleConstructionMetrics,
+                        Option<lists::ScheduleSearchSession>,
+                    ) = report.result;
+                    let local_objective =
+                        if candidate.feasible && candidate.objectives.len() == 1 { candidate.objectives.first().copied() } else { None };
+                    let constructor = metrics.constructor;
+                    let used = metrics.work_steps;
+                    worker_work[source_worker] = worker_work[source_worker].saturating_add(used);
+                    if finite_work {
+                        remaining[source_worker] = remaining[source_worker].saturating_sub(used.min(quota));
+                        if used > quota {
+                            work_budget_overruns = work_budget_overruns.saturating_add(1);
+                            remaining[source_worker] = 0;
+                        }
+                    }
+                    if used == 0 {
+                        zero_progress_rounds[source_worker] = zero_progress_rounds[source_worker].saturating_add(1);
+                        if candidate.feasible || zero_progress_rounds[source_worker] >= 2 {
+                            retired[source_worker] = true;
+                            stalled_workers = stalled_workers.saturating_add(1);
+                            if finite_work {
+                                stalled_unused_work_steps = stalled_unused_work_steps.saturating_add(remaining[source_worker]);
+                                remaining[source_worker] = 0;
+                            }
+                        }
+                    } else {
+                        zero_progress_rounds[source_worker] = 0;
+                    }
+                    if candidate.feasible {
+                        boundary_candidates.push(ScheduleBoundaryCandidate { source_worker, solution: candidate, constructor });
+                    } else {
+                        incumbent_rejections = incumbent_rejections.saturating_add(1);
+                        incomplete_rejections = incomplete_rejections.saturating_add(1);
+                    }
+                    aggregate.record(metrics, local_objective);
+                    reported_workers.push(source_worker);
+                    worker_sessions[source_worker] = returned_session;
+                }
+
+                #[cfg(test)]
+                apply_schedule_tsab_stop_after_pending_report(&mut worker_sessions, engine_stop);
+
+                boundary_candidates.sort_by(|left, right| {
+                    schedule_candidate_order(&left.solution, left.source_worker, round, &right.solution, right.source_worker, round)
+                });
+                let mut eligible = Vec::with_capacity(boundary_candidates.len());
+                for (index, candidate) in boundary_candidates.iter().enumerate() {
+                    if shared_incumbent
+                        .as_ref()
+                        .is_none_or(|incumbent| schedule_candidate_precedes(&candidate.solution, candidate.source_worker, round, incumbent))
+                    {
+                        eligible.push(index);
+                    } else {
+                        incumbent_rejections = incumbent_rejections.saturating_add(1);
+                    }
+                }
+
+                let mut transfer_error = None;
+                let transfer_summary = attempt_schedule_transfer_batch(&eligible, |index| {
+                    let candidate = &mut boundary_candidates[index];
+                    incumbent_verifications = incumbent_verifications.saturating_add(1);
+                    let verification_started = Instant::now();
+                    let verification = verified_candidate(
+                        semantic,
+                        model,
+                        &candidate.solution,
+                        EngineKind::ScheduleLocalSearch,
+                        VerificationLevel::Transfer,
+                        budget.stop(),
+                    );
+                    let verification_elapsed = verification_started.elapsed();
+                    incumbent_verification_elapsed = incumbent_verification_elapsed.saturating_add(verification_elapsed);
+                    incumbent_verification_max_elapsed = incumbent_verification_max_elapsed.max(verification_elapsed);
+                    match verification {
+                        Ok(verified) => {
+                            let canonical = match schedule_solution_from_verified(&verified) {
+                                Ok(canonical) => canonical,
+                                Err(error) => {
+                                    transfer_error = Some(error);
+                                    return ScheduleTransferAttempt::Interrupted;
+                                }
+                            };
+                            let precedes = shared_incumbent
+                                .as_ref()
+                                .is_none_or(|incumbent| schedule_candidate_precedes(&canonical, candidate.source_worker, round, incumbent));
+                            if precedes {
+                                let strict_improvement =
+                                    shared_incumbent.as_ref().is_none_or(|incumbent| canonical.objectives < incumbent.solution.objectives);
+                                candidate.solution = canonical.clone();
+                                shared_incumbent = Some(SharedScheduleIncumbent {
+                                    solution: canonical,
+                                    candidate: verified,
+                                    source_worker: candidate.source_worker,
+                                    source_round: round,
+                                    constructor: candidate.constructor,
+                                });
+                                incumbent_publications = incumbent_publications.saturating_add(1);
+                                first_feasible.get_or_insert_with(|| started.elapsed());
+                                if strict_improvement {
+                                    if let Some(objective) = candidate.solution.objectives.first().copied() {
+                                        if published_objective.is_none_or(|current| objective < current) {
+                                            published_objective = Some(objective);
+                                            progress_publications = progress_publications.saturating_add(1);
+                                            improvement(EngineKind::ScheduleLocalSearch, objective);
+                                        }
+                                    }
+                                }
+                            } else {
+                                incumbent_rejections = incumbent_rejections.saturating_add(1);
+                            }
+                            ScheduleTransferAttempt::Accepted
+                        }
+                        Err(error) => {
+                            worker_sessions[candidate.source_worker] = None;
+                            incumbent_rejections = incumbent_rejections.saturating_add(1);
+                            if matches!(error, SolveError::Interrupted(_)) || budget.stop().load(Ordering::Acquire) {
+                                verification_interruptions = verification_interruptions.saturating_add(1);
+                                ScheduleTransferAttempt::Interrupted
+                            } else {
+                                verification_rejections = verification_rejections.saturating_add(1);
+                                ScheduleTransferAttempt::Rejected
+                            }
+                        }
+                    }
+                });
+                if let Some(error) = transfer_error {
+                    return Err(error);
+                }
+                incumbent_rejections = incumbent_rejections
+                    .saturating_add(u64::try_from(eligible.len().saturating_sub(transfer_summary.attempts)).unwrap_or(u64::MAX));
+                debug_assert!(!transfer_summary.interrupted || transfer_summary.accepted.is_none());
+                debug_assert!(transfer_summary.attempts <= eligible.len());
+
+                let mut round_search_elites = Vec::new();
+                for source_worker in reported_workers {
+                    if let Some(session) = worker_sessions[source_worker].as_mut() {
+                        if let Some(candidate) = session.take_search_elite_candidate() {
+                            round_search_elites.push(candidate);
                         }
                     }
                 }
-            });
-            if let Some(error) = transfer_error {
-                return Err(error);
-            }
-            incumbent_rejections = incumbent_rejections
-                .saturating_add(u64::try_from(eligible.len().saturating_sub(transfer_summary.attempts)).unwrap_or(u64::MAX));
-            debug_assert!(!transfer_summary.interrupted || transfer_summary.accepted.is_none());
-            debug_assert!(transfer_summary.attempts <= eligible.len());
-
-            let mut round_search_elites = Vec::new();
-            for source_worker in reported_workers {
-                if let Some(session) = worker_sessions[source_worker].as_mut() {
-                    if let Some(candidate) = session.take_search_elite_candidate() {
-                        round_search_elites.push(candidate);
-                    }
+                let reference = worker_sessions.iter().flatten().next();
+                #[cfg(test)]
+                apply_schedule_search_elite_stop_before_merge(engine_stop);
+                search_elite.merge(reference, round_search_elites, engine_stop);
+                if transfer_summary.interrupted {
+                    break;
                 }
+                if finite_work && remaining.iter().all(|&left| left == 0) {
+                    break;
+                }
+                round = round.saturating_add(1);
             }
-            let reference = worker_sessions.iter().flatten().next();
-            #[cfg(test)]
-            apply_schedule_search_elite_stop_before_merge(engine_stop);
-            search_elite.merge(reference, round_search_elites, engine_stop);
-            if transfer_summary.interrupted {
-                break;
+
+            if !terminal_finalization_attempted
+                && engine_stop.load(Ordering::Acquire)
+                && !budget.hard_cancelled()
+                && !finalization_stop.load(Ordering::Acquire)
+                && schedule_jssp_strategy.requests_tsab()
+                && allocation.workers() == 7
+                && worker_sessions.iter().flatten().any(lists::ScheduleSearchSession::has_tsab_fast_pending_elite)
+            {
+                continue 'search_and_finalization;
             }
-            if finite_work && remaining.iter().all(|&left| left == 0) {
-                break;
-            }
-            round = round.saturating_add(1);
+            break;
+        }
+
+        if let Some(objective) = published_objective {
+            debug_assert!(shared_incumbent.as_ref().is_some_and(|incumbent| incumbent.solution.objectives[0] <= objective));
         }
 
         let worker_work_min = worker_work.iter().copied().min().unwrap_or(0);
@@ -2384,6 +2684,12 @@ fn result_from_schedule_local_search(
         schedule_tsab_restart_n6_generated,
         schedule_tsab_restart_delta_probes,
         schedule_tsab_restart_oracle_commits,
+        schedule_tsab_restart_relink_attempts,
+        schedule_tsab_restart_relink_commits,
+        schedule_tsab_restart_relink_components_shortlisted,
+        schedule_tsab_restart_relink_components_committed,
+        schedule_tsab_restart_relink_guide_arc_gain_shortlisted,
+        schedule_tsab_restart_relink_guide_arc_gain_accepted,
         schedule_tsab_restart_rejections,
         schedule_tsab_restart_interruptions,
         schedule_tsab_restart_work_units,
@@ -2412,6 +2718,7 @@ fn result_from_schedule_local_search(
         schedule_tsab_fast_attempts,
         schedule_tsab_fast_commits,
         schedule_tsab_fast_fallbacks,
+        schedule_tsab_fast_work_cap_recoveries,
         schedule_tsab_fast_date_changes,
         schedule_tsab_fast_queue_pops,
         schedule_tsab_fast_full_validations,
@@ -2620,6 +2927,21 @@ fn result_from_schedule_local_search(
         ("schedule_tsab_restart_n6_generated".to_string(), schedule_tsab_restart_n6_generated.to_string()),
         ("schedule_tsab_restart_delta_probes".to_string(), schedule_tsab_restart_delta_probes.to_string()),
         ("schedule_tsab_restart_oracle_commits".to_string(), schedule_tsab_restart_oracle_commits.to_string()),
+        ("schedule_tsab_restart_relink_attempts".to_string(), schedule_tsab_restart_relink_attempts.to_string()),
+        ("schedule_tsab_restart_relink_commits".to_string(), schedule_tsab_restart_relink_commits.to_string()),
+        (
+            "schedule_tsab_restart_relink_components_shortlisted".to_string(),
+            schedule_tsab_restart_relink_components_shortlisted.to_string(),
+        ),
+        ("schedule_tsab_restart_relink_components_committed".to_string(), schedule_tsab_restart_relink_components_committed.to_string()),
+        (
+            "schedule_tsab_restart_relink_guide_arc_gain_shortlisted".to_string(),
+            schedule_tsab_restart_relink_guide_arc_gain_shortlisted.to_string(),
+        ),
+        (
+            "schedule_tsab_restart_relink_guide_arc_gain_accepted".to_string(),
+            schedule_tsab_restart_relink_guide_arc_gain_accepted.to_string(),
+        ),
         ("schedule_tsab_restart_rejections".to_string(), schedule_tsab_restart_rejections.to_string()),
         ("schedule_tsab_restart_interruptions".to_string(), schedule_tsab_restart_interruptions.to_string()),
         ("schedule_tsab_restart_work_units".to_string(), schedule_tsab_restart_work_units.to_string()),
@@ -2663,6 +2985,7 @@ fn result_from_schedule_local_search(
         ("schedule_tsab_fast_attempts".to_string(), schedule_tsab_fast_attempts.to_string()),
         ("schedule_tsab_fast_commits".to_string(), schedule_tsab_fast_commits.to_string()),
         ("schedule_tsab_fast_fallbacks".to_string(), schedule_tsab_fast_fallbacks.to_string()),
+        ("schedule_tsab_fast_work_cap_recoveries".to_string(), schedule_tsab_fast_work_cap_recoveries.to_string()),
         ("schedule_tsab_fast_date_changes".to_string(), schedule_tsab_fast_date_changes.to_string()),
         ("schedule_tsab_fast_queue_pops".to_string(), schedule_tsab_fast_queue_pops.to_string()),
         ("schedule_tsab_fast_full_validations".to_string(), schedule_tsab_fast_full_validations.to_string()),

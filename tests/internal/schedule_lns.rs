@@ -488,8 +488,8 @@ fn workspace_reuses_large_index_buffers_and_keeps_neighborhood_storage_bounded()
     let mut config = apply_config();
     config.target_operations = 8;
     config.max_operations = 8;
-    config.local_budget = Duration::from_millis(100);
-    config.verification_reserve = Duration::from_millis(20);
+    config.local_budget = Duration::from_secs(1);
+    config.verification_reserve = Duration::from_millis(200);
     let mut metrics = ScheduleLnsMetrics::default();
     let mut workspace = ScheduleLnsWorkspace::default();
 

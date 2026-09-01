@@ -579,6 +579,12 @@ struct PySolution {
     schedule_tsab_restart_n6_generated: Option<u64>,
     schedule_tsab_restart_delta_probes: Option<u64>,
     schedule_tsab_restart_oracle_commits: Option<u64>,
+    schedule_tsab_restart_relink_attempts: Option<u64>,
+    schedule_tsab_restart_relink_commits: Option<u64>,
+    schedule_tsab_restart_relink_components_shortlisted: Option<u64>,
+    schedule_tsab_restart_relink_components_committed: Option<u64>,
+    schedule_tsab_restart_relink_guide_arc_gain_shortlisted: Option<u64>,
+    schedule_tsab_restart_relink_guide_arc_gain_accepted: Option<u64>,
     schedule_tsab_restart_rejections: Option<u64>,
     schedule_tsab_restart_interruptions: Option<u64>,
     schedule_tsab_restart_work_units: Option<u64>,
@@ -607,6 +613,7 @@ struct PySolution {
     schedule_tsab_fast_attempts: Option<u64>,
     schedule_tsab_fast_commits: Option<u64>,
     schedule_tsab_fast_fallbacks: Option<u64>,
+    schedule_tsab_fast_work_cap_recoveries: Option<u64>,
     schedule_tsab_fast_date_changes: Option<u64>,
     schedule_tsab_fast_queue_pops: Option<u64>,
     schedule_tsab_fast_full_validations: Option<u64>,
@@ -1293,6 +1300,12 @@ fn make_solution(
         schedule_tsab_restart_n6_generated: None,
         schedule_tsab_restart_delta_probes: None,
         schedule_tsab_restart_oracle_commits: None,
+        schedule_tsab_restart_relink_attempts: None,
+        schedule_tsab_restart_relink_commits: None,
+        schedule_tsab_restart_relink_components_shortlisted: None,
+        schedule_tsab_restart_relink_components_committed: None,
+        schedule_tsab_restart_relink_guide_arc_gain_shortlisted: None,
+        schedule_tsab_restart_relink_guide_arc_gain_accepted: None,
         schedule_tsab_restart_rejections: None,
         schedule_tsab_restart_interruptions: None,
         schedule_tsab_restart_work_units: None,
@@ -1321,6 +1334,7 @@ fn make_solution(
         schedule_tsab_fast_attempts: None,
         schedule_tsab_fast_commits: None,
         schedule_tsab_fast_fallbacks: None,
+        schedule_tsab_fast_work_cap_recoveries: None,
         schedule_tsab_fast_date_changes: None,
         schedule_tsab_fast_queue_pops: None,
         schedule_tsab_fast_full_validations: None,
@@ -1512,7 +1526,8 @@ fn parse_schedule_jssp_search(strategy: &str) -> PyResult<ScheduleJsspSearch> {
     match strategy {
         "legacy" => Ok(ScheduleJsspSearch::Legacy),
         "tsab-candidate" => Ok(ScheduleJsspSearch::TsabCandidate),
-        _ => Err(PyValueError::new_err("schedule_jssp_search must be 'legacy' or 'tsab-candidate'")),
+        "tsab-multi-candidate" => Ok(ScheduleJsspSearch::TsabMultiCandidate),
+        _ => Err(PyValueError::new_err("schedule_jssp_search must be 'legacy', 'tsab-candidate', or 'tsab-multi-candidate'")),
     }
 }
 
@@ -3335,6 +3350,36 @@ impl PySolution {
     }
 
     #[getter]
+    fn schedule_tsab_restart_relink_attempts(&self) -> Option<u64> {
+        self.schedule_tsab_restart_relink_attempts
+    }
+
+    #[getter]
+    fn schedule_tsab_restart_relink_commits(&self) -> Option<u64> {
+        self.schedule_tsab_restart_relink_commits
+    }
+
+    #[getter]
+    fn schedule_tsab_restart_relink_components_shortlisted(&self) -> Option<u64> {
+        self.schedule_tsab_restart_relink_components_shortlisted
+    }
+
+    #[getter]
+    fn schedule_tsab_restart_relink_components_committed(&self) -> Option<u64> {
+        self.schedule_tsab_restart_relink_components_committed
+    }
+
+    #[getter]
+    fn schedule_tsab_restart_relink_guide_arc_gain_shortlisted(&self) -> Option<u64> {
+        self.schedule_tsab_restart_relink_guide_arc_gain_shortlisted
+    }
+
+    #[getter]
+    fn schedule_tsab_restart_relink_guide_arc_gain_accepted(&self) -> Option<u64> {
+        self.schedule_tsab_restart_relink_guide_arc_gain_accepted
+    }
+
+    #[getter]
     fn schedule_tsab_restart_rejections(&self) -> Option<u64> {
         self.schedule_tsab_restart_rejections
     }
@@ -3472,6 +3517,11 @@ impl PySolution {
     #[getter]
     fn schedule_tsab_fast_fallbacks(&self) -> Option<u64> {
         self.schedule_tsab_fast_fallbacks
+    }
+
+    #[getter]
+    fn schedule_tsab_fast_work_cap_recoveries(&self) -> Option<u64> {
+        self.schedule_tsab_fast_work_cap_recoveries
     }
 
     #[getter]
@@ -6388,6 +6438,13 @@ impl PyModel {
         let schedule_tsab_restart_n6_generated = schedule_counter("schedule_tsab_restart_n6_generated");
         let schedule_tsab_restart_delta_probes = schedule_counter("schedule_tsab_restart_delta_probes");
         let schedule_tsab_restart_oracle_commits = schedule_counter("schedule_tsab_restart_oracle_commits");
+        let schedule_tsab_restart_relink_attempts = schedule_counter("schedule_tsab_restart_relink_attempts");
+        let schedule_tsab_restart_relink_commits = schedule_counter("schedule_tsab_restart_relink_commits");
+        let schedule_tsab_restart_relink_components_shortlisted = schedule_counter("schedule_tsab_restart_relink_components_shortlisted");
+        let schedule_tsab_restart_relink_components_committed = schedule_counter("schedule_tsab_restart_relink_components_committed");
+        let schedule_tsab_restart_relink_guide_arc_gain_shortlisted =
+            schedule_counter("schedule_tsab_restart_relink_guide_arc_gain_shortlisted");
+        let schedule_tsab_restart_relink_guide_arc_gain_accepted = schedule_counter("schedule_tsab_restart_relink_guide_arc_gain_accepted");
         let schedule_tsab_restart_rejections = schedule_counter("schedule_tsab_restart_rejections");
         let schedule_tsab_restart_interruptions = schedule_counter("schedule_tsab_restart_interruptions");
         let schedule_tsab_restart_work_units = schedule_counter("schedule_tsab_restart_work_units");
@@ -6420,6 +6477,7 @@ impl PyModel {
         let schedule_tsab_fast_attempts = schedule_counter("schedule_tsab_fast_attempts");
         let schedule_tsab_fast_commits = schedule_counter("schedule_tsab_fast_commits");
         let schedule_tsab_fast_fallbacks = schedule_counter("schedule_tsab_fast_fallbacks");
+        let schedule_tsab_fast_work_cap_recoveries = schedule_counter("schedule_tsab_fast_work_cap_recoveries");
         let schedule_tsab_fast_date_changes = schedule_counter("schedule_tsab_fast_date_changes");
         let schedule_tsab_fast_queue_pops = schedule_counter("schedule_tsab_fast_queue_pops");
         let schedule_tsab_fast_full_validations = schedule_counter("schedule_tsab_fast_full_validations");
@@ -6705,6 +6763,12 @@ impl PyModel {
             schedule_tsab_restart_n6_generated,
             schedule_tsab_restart_delta_probes,
             schedule_tsab_restart_oracle_commits,
+            schedule_tsab_restart_relink_attempts,
+            schedule_tsab_restart_relink_commits,
+            schedule_tsab_restart_relink_components_shortlisted,
+            schedule_tsab_restart_relink_components_committed,
+            schedule_tsab_restart_relink_guide_arc_gain_shortlisted,
+            schedule_tsab_restart_relink_guide_arc_gain_accepted,
             schedule_tsab_restart_rejections,
             schedule_tsab_restart_interruptions,
             schedule_tsab_restart_work_units,
@@ -6733,6 +6797,7 @@ impl PyModel {
             schedule_tsab_fast_attempts,
             schedule_tsab_fast_commits,
             schedule_tsab_fast_fallbacks,
+            schedule_tsab_fast_work_cap_recoveries,
             schedule_tsab_fast_date_changes,
             schedule_tsab_fast_queue_pops,
             schedule_tsab_fast_full_validations,

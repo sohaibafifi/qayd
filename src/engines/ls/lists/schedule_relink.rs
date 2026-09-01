@@ -1,8 +1,9 @@
 //! Bounded guide-directed path relinking for strict job-shop schedules.
 //!
-//! The archive remains search memory only. This module derives at most two
-//! N8-style insertions from one borrowed guide, and the scheduling kernel sends
-//! every selected insertion through the complete reconstruction oracle.
+//! The archive remains search memory only. This module derives either one
+//! N8-style insertion or a macro burst of at most eight insertions from one
+//! borrowed guide. The scheduling kernel sends every selected candidate through
+//! the complete reconstruction oracle.
 
 use std::cmp::Reverse;
 use std::mem::size_of;
@@ -14,8 +15,40 @@ use super::schedule_state::{HeadTailMoveScore, JobShopState, LocalMoveEstimate, 
 
 const STREAMING_CAPACITY: usize = 16;
 pub(crate) const RELINK_ORACLE_CAPACITY: usize = 1;
+pub(crate) const RELINK_MACRO_MIN_MOVES: usize = 2;
+pub(crate) const RELINK_MACRO_CAPACITY: usize = 8;
 const STOP_POLL_MASK: usize = 4_095;
 const NO_POSITION: u32 = u32::MAX;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RelinkPreparationKind {
+    Single,
+    Macro,
+}
+
+impl RelinkPreparationKind {
+    fn minimum_moves(self) -> usize {
+        match self {
+            Self::Single => 1,
+            Self::Macro => RELINK_MACRO_MIN_MOVES,
+        }
+    }
+
+    fn capacity(self) -> usize {
+        match self {
+            Self::Single => RELINK_ORACLE_CAPACITY,
+            Self::Macro => RELINK_MACRO_CAPACITY,
+        }
+    }
+
+    fn requires_distinct_machines(self) -> bool {
+        matches!(self, Self::Macro)
+    }
+
+    fn considers_internal_guide_anchors(self) -> bool {
+        matches!(self, Self::Macro)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScheduleRelinkGuideKind {
@@ -103,6 +136,7 @@ struct StreamingCandidate {
     movement: ScheduleMove,
     guide_arc_gain: u8,
     displacement: usize,
+    individual_acyclicity_certified: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +161,13 @@ impl ScheduleRelinkWorkspace {
         &self.shortlist
     }
 
+    /// Exact aggregate guide-arc gain of the last successfully prepared plan.
+    /// Macro moves use distinct machines, so their machine-arc deltas are
+    /// disjoint and the individual exact gains add without interaction.
+    pub(crate) fn shortlist_guide_arc_gain(&self) -> u64 {
+        self.shortlist.iter().map(|candidate| u64::from(candidate.guide_arc_gain)).sum()
+    }
+
     pub(crate) fn heap_lower_bound_bytes(&self) -> usize {
         self.guide_positions
             .capacity()
@@ -143,6 +184,33 @@ impl ScheduleRelinkWorkspace {
         metrics: &mut ScheduleRelinkMetrics,
         stop: &AtomicBool,
     ) -> Result<(), ScheduleEliteError> {
+        self.prepare_with_kind(state, request, RelinkPreparationKind::Single, metrics, stop)
+    }
+
+    /// Prepare a deterministic guided TSAB burst without applying any move.
+    ///
+    /// A published plan contains between two and eight insertions on distinct
+    /// machines. If fewer than two compatible positive-gain moves exist, the
+    /// published plan is empty. All fallible work completes before publication,
+    /// so incompatibility and interruption leave no partial plan visible.
+    pub(crate) fn prepare_macro(
+        &mut self,
+        state: &mut JobShopState,
+        request: ScheduleRelinkRequest<'_>,
+        metrics: &mut ScheduleRelinkMetrics,
+        stop: &AtomicBool,
+    ) -> Result<(), ScheduleEliteError> {
+        self.prepare_with_kind(state, request, RelinkPreparationKind::Macro, metrics, stop)
+    }
+
+    fn prepare_with_kind(
+        &mut self,
+        state: &mut JobShopState,
+        request: ScheduleRelinkRequest<'_>,
+        kind: RelinkPreparationKind,
+        metrics: &mut ScheduleRelinkMetrics,
+        stop: &AtomicBool,
+    ) -> Result<(), ScheduleEliteError> {
         let started = Instant::now();
         *metrics = ScheduleRelinkMetrics { requests: 1, ..ScheduleRelinkMetrics::default() };
         match request.kind {
@@ -153,7 +221,7 @@ impl ScheduleRelinkWorkspace {
         self.streaming.clear();
         self.refined.clear();
 
-        let result = self.prepare_inner(state, request, metrics, stop);
+        let result = self.prepare_inner(state, request, kind, metrics, stop);
         if let Err(error) = result {
             match error {
                 ScheduleEliteError::Interrupted => metrics.guide_interruptions = 1,
@@ -169,6 +237,7 @@ impl ScheduleRelinkWorkspace {
         &mut self,
         state: &mut JobShopState,
         request: ScheduleRelinkRequest<'_>,
+        kind: RelinkPreparationKind,
         metrics: &mut ScheduleRelinkMetrics,
         stop: &AtomicBool,
     ) -> Result<(), ScheduleEliteError> {
@@ -180,10 +249,16 @@ impl ScheduleRelinkWorkspace {
             self.load_guide(state, request.guide, stop)?;
         }
 
-        let blocks = state.critical_blocks().len();
+        let blocks = match kind {
+            RelinkPreparationKind::Single => state.critical_blocks().len(),
+            RelinkPreparationKind::Macro => state.canonical_critical_blocks().len(),
+        };
         for block_index in 0..blocks {
             checkpoint(stop)?;
-            let block = state.critical_blocks()[block_index];
+            let block = match kind {
+                RelinkPreparationKind::Single => state.critical_blocks()[block_index],
+                RelinkPreparationKind::Macro => state.canonical_critical_blocks()[block_index],
+            };
             let machine = block.machine();
             for from in block.first_position()..=block.last_position() {
                 poll(stop, from)?;
@@ -198,17 +273,21 @@ impl ScheduleRelinkWorkspace {
                 if let Some(&encoded_predecessor) = guide_position.checked_sub(1).and_then(|position| guide_sequence.get(position)) {
                     let predecessor = usize::try_from(encoded_predecessor).map_err(|_| ScheduleEliteError::EncodingOverflow)?;
                     let predecessor_position = state.position(predecessor).ok_or(ScheduleEliteError::InvalidMachineOrder)?;
-                    if !(block.first_position()..=block.last_position()).contains(&predecessor_position) {
+                    if kind.considers_internal_guide_anchors()
+                        || !(block.first_position()..=block.last_position()).contains(&predecessor_position)
+                    {
                         let to = if predecessor_position < from { predecessor_position.saturating_add(1) } else { predecessor_position };
-                        self.consider_candidate(state, machine, from, to, metrics, stop)?;
+                        self.consider_candidate(state, ScheduleMove::Insert { machine, from, to }, kind, metrics, stop)?;
                     }
                 }
                 if let Some(&encoded_successor) = guide_sequence.get(guide_position.saturating_add(1)) {
                     let successor = usize::try_from(encoded_successor).map_err(|_| ScheduleEliteError::EncodingOverflow)?;
                     let successor_position = state.position(successor).ok_or(ScheduleEliteError::InvalidMachineOrder)?;
-                    if !(block.first_position()..=block.last_position()).contains(&successor_position) {
+                    if kind.considers_internal_guide_anchors()
+                        || !(block.first_position()..=block.last_position()).contains(&successor_position)
+                    {
                         let to = if successor_position < from { successor_position } else { successor_position.saturating_sub(1) };
-                        self.consider_candidate(state, machine, from, to, metrics, stop)?;
+                        self.consider_candidate(state, ScheduleMove::Insert { machine, from, to }, kind, metrics, stop)?;
                     }
                 }
             }
@@ -228,6 +307,7 @@ impl ScheduleRelinkWorkspace {
         metrics.candidates_refined = u64::try_from(self.refined.len()).unwrap_or(u64::MAX);
         self.refined.sort_unstable_by_key(|candidate| {
             (
+                kind == RelinkPreparationKind::Macro && !candidate.candidate.individual_acyclicity_certified,
                 Reverse(candidate.candidate.guide_arc_gain),
                 !candidate.estimate.acyclicity_certified,
                 candidate.estimate.estimated_makespan,
@@ -239,12 +319,31 @@ impl ScheduleRelinkWorkspace {
                 candidate.candidate.movement,
             )
         });
-        self.shortlist.extend(self.refined.iter().take(RELINK_ORACLE_CAPACITY).map(|candidate| ScheduleRelinkCandidate {
-            movement: candidate.candidate.movement,
-            guide_arc_gain: candidate.candidate.guide_arc_gain,
-        }));
+        let mut selected: [Option<ScheduleRelinkCandidate>; RELINK_MACRO_CAPACITY] = [None; RELINK_MACRO_CAPACITY];
+        let mut selected_len = 0usize;
+        for candidate in &self.refined {
+            if selected_len == kind.capacity() {
+                break;
+            }
+            let candidate =
+                ScheduleRelinkCandidate { movement: candidate.candidate.movement, guide_arc_gain: candidate.candidate.guide_arc_gain };
+            if kind.requires_distinct_machines()
+                && selected[..selected_len]
+                    .iter()
+                    .flatten()
+                    .any(|selected| movement_machine(selected.movement) == movement_machine(candidate.movement))
+            {
+                continue;
+            }
+            selected[selected_len] = Some(candidate);
+            selected_len = selected_len.saturating_add(1);
+        }
+        checkpoint(stop)?;
+        if selected_len >= kind.minimum_moves() {
+            self.shortlist.extend(selected[..selected_len].iter().flatten().copied());
+        }
         metrics.candidates_shortlisted = u64::try_from(self.shortlist.len()).unwrap_or(u64::MAX);
-        metrics.guide_arc_gain_shortlisted = self.shortlist.iter().map(|candidate| u64::from(candidate.guide_arc_gain)).sum();
+        metrics.guide_arc_gain_shortlisted = self.shortlist_guide_arc_gain();
         metrics.no_move = u64::from(self.shortlist.is_empty());
         Ok(())
     }
@@ -295,17 +394,18 @@ impl ScheduleRelinkWorkspace {
     fn consider_candidate(
         &mut self,
         state: &JobShopState,
-        machine: usize,
-        from: usize,
-        to: usize,
+        movement: ScheduleMove,
+        kind: RelinkPreparationKind,
         metrics: &mut ScheduleRelinkMetrics,
         stop: &AtomicBool,
     ) -> Result<(), ScheduleEliteError> {
+        let ScheduleMove::Insert { machine, from, to } = movement else {
+            return Ok(());
+        };
         if from == to {
             return Ok(());
         }
         metrics.candidates_generated = metrics.candidates_generated.saturating_add(1);
-        let movement = ScheduleMove::Insert { machine, from, to };
         let Some(arcs) = state.move_arcs(movement) else {
             return Ok(());
         };
@@ -318,22 +418,35 @@ impl ScheduleRelinkWorkspace {
             return Ok(());
         }
         metrics.candidates_positive_gain = metrics.candidates_positive_gain.saturating_add(1);
-        if !state.certifies_insert_acyclicity(movement, stop).map_err(|_| ScheduleEliteError::Interrupted)? {
+        let individual_acyclicity_certified =
+            state.certifies_insert_acyclicity(movement, stop).map_err(|_| ScheduleEliteError::Interrupted)?;
+        if !individual_acyclicity_certified {
             metrics.acyclicity_unknown = metrics.acyclicity_unknown.saturating_add(1);
-            metrics.prefilter_rejections = metrics.prefilter_rejections.saturating_add(1);
-            return Ok(());
+            if kind == RelinkPreparationKind::Single {
+                metrics.prefilter_rejections = metrics.prefilter_rejections.saturating_add(1);
+                return Ok(());
+            }
+        } else {
+            metrics.acyclicity_certified = metrics.acyclicity_certified.saturating_add(1);
         }
-        metrics.acyclicity_certified = metrics.acyclicity_certified.saturating_add(1);
-        let candidate =
-            StreamingCandidate { movement, guide_arc_gain: u8::try_from(gain).unwrap_or(u8::MAX), displacement: from.abs_diff(to) };
-        if let Some(existing) = self.streaming.iter_mut().find(|existing| existing.movement == movement) {
-            if streaming_key(candidate) < streaming_key(*existing) {
+        let candidate = StreamingCandidate {
+            movement,
+            guide_arc_gain: u8::try_from(gain).map_err(|_| ScheduleEliteError::EncodingOverflow)?,
+            displacement: from.abs_diff(to),
+            individual_acyclicity_certified,
+        };
+        let existing = self.streaming.iter_mut().find(|existing| match kind {
+            RelinkPreparationKind::Single => existing.movement == movement,
+            RelinkPreparationKind::Macro => movement_machine(existing.movement) == machine,
+        });
+        if let Some(existing) = existing {
+            if streaming_key(candidate, kind) < streaming_key(*existing, kind) {
                 *existing = candidate;
             }
         } else {
             self.streaming.push(candidate);
         }
-        self.streaming.sort_unstable_by_key(|candidate| streaming_key(*candidate));
+        self.streaming.sort_unstable_by_key(|candidate| streaming_key(*candidate, kind));
         self.streaming.truncate(STREAMING_CAPACITY);
         Ok(())
     }
@@ -349,8 +462,19 @@ impl ScheduleRelinkWorkspace {
     }
 }
 
-fn streaming_key(candidate: StreamingCandidate) -> (Reverse<u8>, usize, ScheduleMove) {
-    (Reverse(candidate.guide_arc_gain), candidate.displacement, candidate.movement)
+fn streaming_key(candidate: StreamingCandidate, kind: RelinkPreparationKind) -> (bool, Reverse<u8>, usize, ScheduleMove) {
+    (
+        kind == RelinkPreparationKind::Macro && !candidate.individual_acyclicity_certified,
+        Reverse(candidate.guide_arc_gain),
+        candidate.displacement,
+        candidate.movement,
+    )
+}
+
+fn movement_machine(movement: ScheduleMove) -> usize {
+    match movement {
+        ScheduleMove::AdjacentSwap { machine, .. } | ScheduleMove::Insert { machine, .. } => machine,
+    }
 }
 
 fn checkpoint(stop: &AtomicBool) -> Result<(), ScheduleEliteError> {

@@ -24,6 +24,19 @@ fn tsab_candidate_request_requires_exactly_seven_threads() {
     assert_eq!(error.to_string(), "invalid solve request: schedule_jssp_search='tsab-candidate' currently requires threads=7");
 }
 
+#[test]
+fn tsab_multi_candidate_accepts_the_worker_six_macro_relink_control() {
+    let request = SolveRequest {
+        threads: 7,
+        profile: true,
+        schedule_path_relink: true,
+        schedule_jssp_search: ScheduleJsspSearch::TsabMultiCandidate,
+        ..SolveRequest::default()
+    };
+
+    request.validate().expect("multi-candidate path relinking is the worker-six macro restart control");
+}
+
 /// A schedule-only collection model (no list variables).
 fn schedule_model(sched: Schedule) -> CollectionModel {
     CollectionModel { items: vec![], lists: 0, objectives: vec![], constraints: vec![], globals: vec![], schedule: Some(sched) }

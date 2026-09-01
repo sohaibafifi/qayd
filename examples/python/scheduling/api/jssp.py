@@ -55,9 +55,9 @@ parser.add_argument(
 )
 parser.add_argument(
     "--schedule-jssp-search",
-    choices=("legacy", "tsab-candidate"),
+    choices=("legacy", "tsab-candidate", "tsab-multi-candidate"),
     default="legacy",
-    help="select the phased single-owner TSAB-inspired candidate-ranked N5 pilot or legacy JSSP search",
+    help="select a single-owner or all-worker TSAB-inspired candidate-ranked N5 pilot, or legacy JSSP search",
 )
 parser.add_argument("--json", action="store_true", help="emit one machine-readable result")
 parser.add_argument(
@@ -225,6 +225,12 @@ profile_record = {
     "schedule_tsab_restart_n6_generated": solution.schedule_tsab_restart_n6_generated,
     "schedule_tsab_restart_delta_probes": solution.schedule_tsab_restart_delta_probes,
     "schedule_tsab_restart_oracle_commits": solution.schedule_tsab_restart_oracle_commits,
+    "schedule_tsab_restart_relink_attempts": solution.schedule_tsab_restart_relink_attempts,
+    "schedule_tsab_restart_relink_commits": solution.schedule_tsab_restart_relink_commits,
+    "schedule_tsab_restart_relink_components_shortlisted": solution.schedule_tsab_restart_relink_components_shortlisted,
+    "schedule_tsab_restart_relink_components_committed": solution.schedule_tsab_restart_relink_components_committed,
+    "schedule_tsab_restart_relink_guide_arc_gain_shortlisted": solution.schedule_tsab_restart_relink_guide_arc_gain_shortlisted,
+    "schedule_tsab_restart_relink_guide_arc_gain_accepted": solution.schedule_tsab_restart_relink_guide_arc_gain_accepted,
     "schedule_tsab_restart_rejections": solution.schedule_tsab_restart_rejections,
     "schedule_tsab_restart_interruptions": solution.schedule_tsab_restart_interruptions,
     "schedule_tsab_restart_work_units": solution.schedule_tsab_restart_work_units,
@@ -253,6 +259,7 @@ profile_record = {
     "schedule_tsab_fast_attempts": solution.schedule_tsab_fast_attempts,
     "schedule_tsab_fast_commits": solution.schedule_tsab_fast_commits,
     "schedule_tsab_fast_fallbacks": solution.schedule_tsab_fast_fallbacks,
+    "schedule_tsab_fast_work_cap_recoveries": solution.schedule_tsab_fast_work_cap_recoveries,
     "schedule_tsab_fast_date_changes": solution.schedule_tsab_fast_date_changes,
     "schedule_tsab_fast_queue_pops": solution.schedule_tsab_fast_queue_pops,
     "schedule_tsab_fast_full_validations": solution.schedule_tsab_fast_full_validations,

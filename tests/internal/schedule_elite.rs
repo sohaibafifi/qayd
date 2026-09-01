@@ -123,6 +123,38 @@ fn capacity_four_keeps_the_global_best_and_a_farthest_first_frontier() {
 }
 
 #[test]
+fn farthest_from_best_is_the_borrowed_second_farthest_first_entry() {
+    let schedule = flow_shop();
+    let stop = AtomicBool::new(false);
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let mut archive = ScheduleEliteArchive::new();
+
+    assert!(archive.best().is_none());
+    assert!(archive.farthest_from_best().is_none());
+
+    let mut orders = all_orders().into_iter();
+    archive.consider(&state(&problem, orders.next().unwrap()), &stop).unwrap();
+    assert!(archive.farthest_from_best().is_none());
+
+    for order in orders {
+        archive.consider(&state(&problem, order), &stop).unwrap();
+    }
+
+    let best = archive.best().unwrap();
+    let farthest = archive.farthest_from_best().unwrap();
+    assert!(std::ptr::eq(best, &archive.entries()[0]));
+    assert!(std::ptr::eq(farthest, &archive.entries()[1]));
+
+    let farthest_distance = farthest.arc_distance(best).unwrap();
+    assert!(archive.entries()[2..].iter().all(|entry| entry.arc_distance(best).unwrap() <= farthest_distance));
+
+    let heap_before = archive.heap_lower_bound_bytes();
+    let borrowed_again = archive.farthest_from_best().unwrap();
+    assert!(std::ptr::eq(farthest, borrowed_again));
+    assert_eq!(archive.heap_lower_bound_bytes(), heap_before);
+}
+
+#[test]
 fn duplicate_orders_do_not_grow_or_perturb_the_archive() {
     let schedule = flow_shop();
     let stop = AtomicBool::new(false);

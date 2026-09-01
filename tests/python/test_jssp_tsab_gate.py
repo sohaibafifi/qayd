@@ -48,6 +48,12 @@ def tsab_metrics(**overrides):
         "schedule_tsab_restart_n6_generated": 0,
         "schedule_tsab_restart_delta_probes": 0,
         "schedule_tsab_restart_oracle_commits": 0,
+        "schedule_tsab_restart_relink_attempts": 0,
+        "schedule_tsab_restart_relink_commits": 0,
+        "schedule_tsab_restart_relink_components_shortlisted": 0,
+        "schedule_tsab_restart_relink_components_committed": 0,
+        "schedule_tsab_restart_relink_guide_arc_gain_shortlisted": 0,
+        "schedule_tsab_restart_relink_guide_arc_gain_accepted": 0,
         "schedule_tsab_restart_rejections": 0,
         "schedule_tsab_restart_interruptions": 0,
         "schedule_tsab_restart_work_units": 0,
@@ -76,6 +82,7 @@ def tsab_metrics(**overrides):
         "schedule_tsab_fast_attempts": 0,
         "schedule_tsab_fast_commits": 0,
         "schedule_tsab_fast_fallbacks": 0,
+        "schedule_tsab_fast_work_cap_recoveries": 0,
         "schedule_tsab_fast_date_changes": 0,
         "schedule_tsab_fast_queue_pops": 0,
         "schedule_tsab_fast_full_validations": 0,
@@ -140,6 +147,7 @@ def record(*, candidate=False, objective=943_043, seed=0):
                 schedule_tsab_fast_attempts=60,
                 schedule_tsab_fast_commits=48,
                 schedule_tsab_fast_fallbacks=3,
+                schedule_tsab_fast_work_cap_recoveries=3,
                 schedule_tsab_fast_date_changes=300,
                 schedule_tsab_fast_queue_pops=600,
                 schedule_tsab_fast_full_validations=2,
@@ -197,7 +205,27 @@ def record(*, candidate=False, objective=943_043, seed=0):
     }
 
 
-def write_campaign(tmp_path, name, item, *, strategy, source="c", artifact="d"):
+def multi_candidate_record(*, objective=943_043, seed=0):
+    item = record(candidate=True, objective=objective, seed=seed)
+    item.update(
+        schedule_profile_work_steps="0=521,1=521,2=521,3=521,4=520,5=520,6=520",
+        schedule_tsab_owner_worker_mask=0x7F,
+        schedule_tsab_activations=7,
+        schedule_tsab_legacy_warmup_work_steps=3_584,
+        schedule_tsab_activation_rebases=6,
+        schedule_tsab_n6_kicks=1,
+        schedule_tsab_kick_moves=1,
+        schedule_tsab_restart_relink_attempts=1,
+        schedule_tsab_restart_relink_commits=1,
+        schedule_tsab_restart_relink_components_shortlisted=3,
+        schedule_tsab_restart_relink_components_committed=3,
+        schedule_tsab_restart_relink_guide_arc_gain_shortlisted=5,
+        schedule_tsab_restart_relink_guide_arc_gain_accepted=4,
+    )
+    return item
+
+
+def write_campaign(tmp_path, name, item, *, strategy, source="c", artifact="d", path_relink=False):
     path = tmp_path / f"{name}.jsonl"
     path.write_text(json.dumps(item) + "\n", encoding="utf-8")
     provenance = {
@@ -209,7 +237,7 @@ def write_campaign(tmp_path, name, item, *, strategy, source="c", artifact="d"):
         "profile_qayd": True,
         "qayd_schedule_jssp_search": strategy,
         "qayd_schedule_constructor_workers": 0,
-        "qayd_schedule_path_relink": False,
+        "qayd_schedule_path_relink": path_relink,
         "qayd_schedule_lns_shadow": False,
         "qayd_artifact": {"sha256": artifact * 64},
         "host": {"source_tree_sha256": source * 64},
@@ -220,7 +248,15 @@ def write_campaign(tmp_path, name, item, *, strategy, source="c", artifact="d"):
     return path
 
 
-def write_pair(tmp_path, *, candidate=None, baseline=None, **provenance):
+def write_pair(
+    tmp_path,
+    *,
+    candidate=None,
+    baseline=None,
+    candidate_strategy="tsab-candidate",
+    candidate_path_relink=False,
+    **provenance,
+):
     baseline = baseline or record(candidate=False, objective=943_228)
     candidate = candidate or record(candidate=True)
     baseline_path = write_campaign(
@@ -235,9 +271,10 @@ def write_pair(tmp_path, *, candidate=None, baseline=None, **provenance):
         tmp_path,
         "candidate",
         candidate,
-        strategy="tsab-candidate",
+        strategy=candidate_strategy,
         source=provenance.get("candidate_source", "c"),
         artifact=provenance.get("candidate_artifact", "d"),
+        path_relink=candidate_path_relink,
     )
     return baseline_path, candidate_path
 
@@ -252,6 +289,129 @@ def test_ready_is_separate_from_quality_signal(tmp_path):
     assert report["tsab_search_signal"] is True
     assert report["tsab_quality_signal"] is False
     assert report["rows"][0]["minimum_control_work_retention"] == 1.0
+
+
+def test_multi_candidate_is_accepted_and_reports_relink_accounting(tmp_path):
+    gate = load_gate()
+    baseline, candidate = write_pair(
+        tmp_path,
+        candidate=multi_candidate_record(),
+        candidate_strategy="tsab-multi-candidate",
+        candidate_path_relink=True,
+    )
+
+    report = gate.evaluate(baseline, candidate)
+
+    assert report["tsab_ready"] is True
+    assert report["candidate_strategy"] == "tsab-multi-candidate"
+    assert report["rows"][0]["restart_relink_attempts"] == 1
+    assert report["rows"][0]["restart_relink_commits"] == 1
+    assert report["rows"][0]["control_work_retention"] == {}
+    assert report["rows"][0]["minimum_control_work_retention"] is None
+    assert report["rows"][0]["multi_worker_work_balance"] == 520 / 521
+
+
+def test_existing_mono_artifacts_may_omit_relink_metrics(tmp_path):
+    gate = load_gate()
+    baseline_record = record(candidate=False, objective=943_228)
+    candidate_record = record(candidate=True)
+    for field in gate.TSAB_RELINK_COUNTERS:
+        baseline_record.pop(field)
+        candidate_record.pop(field)
+    baseline, candidate = write_pair(tmp_path, baseline=baseline_record, candidate=candidate_record)
+
+    report = gate.evaluate(baseline, candidate)
+
+    assert report["tsab_ready"] is True
+    assert report["rows"][0]["restart_relink_attempts"] == 0
+
+
+def test_multi_candidate_requires_every_relink_metric(tmp_path):
+    gate = load_gate()
+    candidate_record = multi_candidate_record()
+    candidate_record.pop("schedule_tsab_restart_relink_attempts")
+    baseline, candidate = write_pair(
+        tmp_path,
+        candidate=candidate_record,
+        candidate_strategy="tsab-multi-candidate",
+    )
+
+    with pytest.raises(gate.GateError, match="missing TSAB relink metrics"):
+        gate.evaluate(baseline, candidate)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "failure"),
+    (
+        ("schedule_tsab_restart_relink_attempts", 0, "restart_relink_commit_accounting"),
+        ("schedule_tsab_restart_oracle_commits", 1, "restart_commit_accounting"),
+        ("schedule_tsab_restart_relink_components_shortlisted", 1, "restart_relink_shortlist_accounting"),
+        ("schedule_tsab_restart_relink_components_shortlisted", 9, "restart_relink_shortlist_accounting"),
+        ("schedule_tsab_restart_relink_components_committed", 1, "restart_relink_committed_accounting"),
+        ("schedule_tsab_restart_relink_components_committed", 9, "restart_relink_committed_accounting"),
+        ("schedule_tsab_restart_relink_components_committed", 0, "restart_relink_committed_presence"),
+        ("schedule_tsab_restart_relink_commits", 0, "restart_relink_committed_presence"),
+        ("schedule_tsab_restart_relink_guide_arc_gain_accepted", 0, "restart_relink_gain_presence"),
+        ("schedule_tsab_restart_relink_commits", 0, "restart_relink_gain_presence"),
+        ("schedule_tsab_restart_relink_guide_arc_gain_accepted", 6, "restart_relink_gain_accounting"),
+    ),
+)
+def test_multi_relink_invariants_fail_closed(tmp_path, field, value, failure):
+    gate = load_gate()
+    candidate_record = multi_candidate_record()
+    candidate_record[field] = value
+    baseline, candidate = write_pair(
+        tmp_path,
+        candidate=candidate_record,
+        candidate_strategy="tsab-multi-candidate",
+    )
+
+    report = gate.evaluate(baseline, candidate)
+
+    assert report["tsab_ready"] is False
+    assert failure in report["failures"]
+
+
+def test_compound_tail_corridor_commit_satisfies_restart_accounting_without_single_probes(tmp_path):
+    gate = load_gate()
+    candidate_record = record(candidate=True)
+    candidate_record["schedule_tsab_restart_delta_probes"] = 0
+    candidate_record["schedule_tsab_kick_moves"] = 8
+    baseline, candidate = write_pair(tmp_path, candidate=candidate_record)
+
+    report = gate.evaluate(baseline, candidate)
+
+    assert "restart_probe_accounting" not in report["failures"]
+    assert "restart_commit_accounting" not in report["failures"]
+
+
+def test_rejected_tail_corridor_satisfies_restart_probe_accounting_without_single_fallback(tmp_path):
+    gate = load_gate()
+    candidate_record = record(candidate=True)
+    candidate_record["schedule_tsab_restart_delta_probes"] = 0
+    candidate_record["schedule_tsab_restart_oracle_commits"] = 0
+    candidate_record["schedule_tsab_restart_rejections"] = 2
+    candidate_record["schedule_tsab_n6_kicks"] = 0
+    candidate_record["schedule_tsab_kick_moves"] = 0
+    candidate_record["schedule_tsab_restart_best_kicked_objective"] = None
+    baseline, candidate = write_pair(tmp_path, candidate=candidate_record)
+
+    report = gate.evaluate(baseline, candidate)
+
+    assert "restart_probe_accounting" not in report["failures"]
+    assert "restart_outcome_accounting" not in report["failures"]
+
+
+@pytest.mark.parametrize("kick_moves", [1, 9])
+def test_compound_tail_corridor_component_bounds_fail_closed(tmp_path, kick_moves):
+    gate = load_gate()
+    candidate_record = record(candidate=True)
+    candidate_record["schedule_tsab_kick_moves"] = kick_moves
+    baseline, candidate = write_pair(tmp_path, candidate=candidate_record)
+
+    report = gate.evaluate(baseline, candidate)
+
+    assert "restart_commit_accounting" in report["failures"]
 
 
 def test_fast_path_does_not_require_legacy_k4_probes_or_oracle_commits(tmp_path):
@@ -277,10 +437,21 @@ def test_fast_fallbacks_are_reported_but_not_a_readiness_failure(tmp_path):
     assert report["tsab_ready"] is True
 
 
+def test_fast_work_cap_recovery_rate_is_diagnostic_not_blocking(tmp_path):
+    gate = load_gate()
+    candidate_record = record(candidate=True)
+    candidate_record["schedule_tsab_fast_work_cap_recoveries"] = candidate_record["schedule_tsab_fast_attempts"]
+    baseline, candidate = write_pair(tmp_path, candidate=candidate_record)
+
+    report = gate.evaluate(baseline, candidate)
+
+    assert report["tsab_ready"] is True
+
+
 def test_legacy_arm_must_keep_every_fast_metric_zero(tmp_path):
     gate = load_gate()
     baseline_record = record(candidate=False, objective=943_228)
-    baseline_record["schedule_tsab_fast_fallbacks"] = 1
+    baseline_record["schedule_tsab_fast_work_cap_recoveries"] = 1
     baseline, candidate = write_pair(tmp_path, baseline=baseline_record)
 
     report = gate.evaluate(baseline, candidate)
@@ -327,7 +498,7 @@ def test_quality_signal_also_requires_no_regression_against_fresh_legacy(tmp_pat
         ("schedule_tsab_activation_rebases", 0, "phased_activation"),
         ("schedule_tsab_burst_work_units", 129, "burst_accounting"),
         ("schedule_tsab_restart_attempts", 0, "restart_activity"),
-        ("schedule_tsab_restart_global_rebases", 0, "restart_global_rebase"),
+        ("schedule_tsab_restart_global_rebases", 3, "restart_global_rebase"),
         ("schedule_tsab_restart_delta_probes", 9, "restart_probe_accounting"),
         ("schedule_tsab_n6_kicks", 1, "restart_commit_accounting"),
         ("schedule_tsab_restart_rejections", 1, "restart_outcome_accounting"),
@@ -344,6 +515,7 @@ def test_quality_signal_also_requires_no_regression_against_fresh_legacy(tmp_pat
         ("schedule_tsab_fast_pending_discards", 1, "fast_pending_discard"),
         ("schedule_tsab_fast_commits", 47, "fast_transition_accounting"),
         ("schedule_tsab_fast_fallbacks", 61, "fast_fallback_accounting"),
+        ("schedule_tsab_fast_work_cap_recoveries", 0, "fast_work_cap_recovery"),
         ("schedule_tsab_fast_date_changes", 601, "fast_queue_accounting"),
         ("schedule_tsab_fast_pending_promotions", 3, "fast_validation_accounting"),
         ("schedule_tsab_fast_workspace_peak_bytes", 0, "fast_workspace"),
@@ -383,6 +555,18 @@ def test_restart_without_an_admissible_kick_is_ready_after_a_global_rebase(tmp_p
     assert report["tsab_search_signal"] is True
 
 
+def test_restart_without_a_new_global_rebase_remains_ready(tmp_path):
+    gate = load_gate()
+    candidate_record = record(candidate=True)
+    candidate_record["schedule_tsab_restart_global_rebases"] = 0
+    baseline, candidate = write_pair(tmp_path, candidate=candidate_record)
+
+    report = gate.evaluate(baseline, candidate)
+
+    assert report["tsab_ready"] is True
+    assert "restart_global_rebase" not in report["failures"]
+
+
 def test_all_six_legacy_controls_must_retain_ninety_percent_of_fresh_work(tmp_path):
     gate = load_gate()
     candidate_record = record(candidate=True)
@@ -404,6 +588,39 @@ def test_worker_six_is_not_part_of_control_work_retention(tmp_path):
     report = gate.evaluate(baseline, candidate)
 
     assert report["tsab_ready"] is True
+
+
+def test_multi_candidate_requires_active_work_for_every_profile(tmp_path):
+    gate = load_gate()
+    candidate_record = multi_candidate_record()
+    candidate_record["schedule_profile_work_steps"] = "0=512,1=530,2=521,3=521,4=520,5=520,6=520"
+    baseline, candidate = write_pair(
+        tmp_path,
+        candidate=candidate_record,
+        candidate_strategy="tsab-multi-candidate",
+    )
+
+    report = gate.evaluate(baseline, candidate)
+
+    assert report["tsab_ready"] is False
+    assert "multi_profile_activity" in report["failures"]
+    assert "multi_profile_work_accounting" not in report["failures"]
+
+
+def test_multi_candidate_profile_work_must_equal_warmup_plus_burst(tmp_path):
+    gate = load_gate()
+    candidate_record = multi_candidate_record()
+    candidate_record["schedule_profile_work_steps"] = "0=522,1=521,2=521,3=521,4=520,5=520,6=520"
+    baseline, candidate = write_pair(
+        tmp_path,
+        candidate=candidate_record,
+        candidate_strategy="tsab-multi-candidate",
+    )
+
+    report = gate.evaluate(baseline, candidate)
+
+    assert report["tsab_ready"] is False
+    assert "multi_profile_work_accounting" in report["failures"]
 
 
 def test_search_signal_is_separate_from_readiness(tmp_path):

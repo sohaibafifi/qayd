@@ -26,6 +26,7 @@ _NeighborhoodProfile = Tuple[str, int, int, int, int, int, int, int, float]
 _RoutingCounter = Tuple[str, int]
 _VariableSelector = Literal["auto", "input-order", "first-fail", "max-regret", "dom-wdeg", "activity"]
 _ValueSelector = Literal["auto", "min", "max", "median", "random-seeded", "hint"]
+_ScheduleJsspSearch = Literal["legacy", "tsab-candidate", "tsab-multi-candidate"]
 
 # A relation string such as "==", "!=", "<=", "<", ">=", ">".
 STAR: int
@@ -815,6 +816,18 @@ class Solution:
     @property
     def schedule_tsab_restart_oracle_commits(self) -> Optional[int]: ...
     @property
+    def schedule_tsab_restart_relink_attempts(self) -> Optional[int]: ...
+    @property
+    def schedule_tsab_restart_relink_commits(self) -> Optional[int]: ...
+    @property
+    def schedule_tsab_restart_relink_components_shortlisted(self) -> Optional[int]: ...
+    @property
+    def schedule_tsab_restart_relink_components_committed(self) -> Optional[int]: ...
+    @property
+    def schedule_tsab_restart_relink_guide_arc_gain_shortlisted(self) -> Optional[int]: ...
+    @property
+    def schedule_tsab_restart_relink_guide_arc_gain_accepted(self) -> Optional[int]: ...
+    @property
     def schedule_tsab_restart_rejections(self) -> Optional[int]: ...
     @property
     def schedule_tsab_restart_interruptions(self) -> Optional[int]: ...
@@ -870,6 +883,8 @@ class Solution:
     def schedule_tsab_fast_commits(self) -> Optional[int]: ...
     @property
     def schedule_tsab_fast_fallbacks(self) -> Optional[int]: ...
+    @property
+    def schedule_tsab_fast_work_cap_recoveries(self) -> Optional[int]: ...
     @property
     def schedule_tsab_fast_date_changes(self) -> Optional[int]: ...
     @property
@@ -1436,7 +1451,7 @@ class Model:
         schedule_path_relink: bool = ...,
         schedule_lns_shadow: bool = ...,
         schedule_constructor_workers: int = ...,
-        schedule_jssp_search: str = ...,
+        schedule_jssp_search: _ScheduleJsspSearch = ...,
         routing_two_way: bool = ...,
         routing_nearest_neighbor: bool = ...,
         routing_warm_start: bool = ...,

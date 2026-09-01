@@ -3,7 +3,8 @@ use std::sync::atomic::AtomicBool;
 use qayd::engines::ls::lists::move_acceptance::MinimizingMoveAcceptance;
 use qayd::engines::ls::lists::schedule_elite::{ScheduleEliteArchive, ScheduleEliteError};
 use qayd::engines::ls::lists::schedule_relink::{
-    ScheduleRelinkGuideKind, ScheduleRelinkMetrics, ScheduleRelinkRequest, ScheduleRelinkWorkspace, RELINK_ORACLE_CAPACITY,
+    ScheduleRelinkGuideKind, ScheduleRelinkMetrics, ScheduleRelinkRequest, ScheduleRelinkWorkspace, RELINK_MACRO_CAPACITY,
+    RELINK_MACRO_MIN_MOVES, RELINK_ORACLE_CAPACITY,
 };
 use qayd::engines::ls::lists::schedule_state::{DispatchRule, JobShopProblem, JobShopState, MoveOutcome, MoveRejection};
 use qayd::model::list::{IntervalVar, Resource, Schedule};
@@ -21,6 +22,44 @@ fn diversified_job_shop() -> Schedule {
         ],
         minimize_makespan: true,
     }
+}
+
+fn nine_block_macro_job_shop() -> (Schedule, Vec<Vec<usize>>, Vec<Vec<usize>>) {
+    let machine_count = 9usize;
+    let operation_count = machine_count * 2;
+    let schedule = Schedule {
+        intervals: vec![
+            IntervalVar { duration: 1, horizon: i64::try_from(operation_count).unwrap(), modes: Vec::new(), optional: false };
+            operation_count
+        ],
+        precedences: (0..machine_count - 1).map(|machine| (machine * 2 + 1, (machine + 1) * 2)).collect(),
+        resources: (0..machine_count).map(|machine| Resource::NoOverlap(vec![machine * 2, machine * 2 + 1])).collect(),
+        minimize_makespan: true,
+    };
+    let current = (0..machine_count).map(|machine| vec![machine * 2, machine * 2 + 1]).collect();
+    let guide = (0..machine_count).map(|machine| vec![machine * 2 + 1, machine * 2]).collect();
+    (schedule, current, guide)
+}
+
+fn coordinated_unknown_macro_job_shop() -> (Schedule, Vec<Vec<usize>>, Vec<Vec<usize>>) {
+    let durations = [9, 5, 3, 2, 8, 5, 2, 6, 8, 9, 4, 5, 2, 9, 2, 3];
+    let horizon = durations.iter().sum();
+    let schedule = Schedule {
+        intervals: durations.into_iter().map(|duration| IntervalVar { duration, horizon, modes: Vec::new(), optional: false }).collect(),
+        precedences: vec![(0, 1), (1, 2), (2, 3), (4, 5), (5, 6), (6, 7), (8, 9), (9, 10), (10, 11), (12, 13), (13, 14), (14, 15)],
+        resources: vec![
+            Resource::NoOverlap(vec![2, 5, 9, 13]),
+            Resource::NoOverlap(vec![0, 6, 10, 14]),
+            Resource::NoOverlap(vec![3, 7, 11, 12]),
+            Resource::NoOverlap(vec![1, 4, 8, 15]),
+        ],
+        minimize_makespan: true,
+    };
+    // Compact machine ids follow first occurrence in operation order, which
+    // maps raw machines [1, 3, 0, 2] to compact ids [0, 1, 2, 3].
+    let current = vec![vec![10, 0, 6, 14], vec![8, 4, 15, 1], vec![5, 9, 13, 2], vec![11, 12, 3, 7]];
+    let guide = vec![vec![10, 0, 6, 14], vec![8, 1, 4, 15], vec![9, 13, 2, 5], vec![11, 12, 3, 7]];
+    (schedule, current, guide)
 }
 
 fn state(problem: &JobShopProblem, seed: u64) -> JobShopState {
@@ -184,6 +223,209 @@ fn guide_load_fails_closed_on_incompatibility_and_interruption() {
     let interrupted = AtomicBool::new(true);
     let mut interrupted_metrics = ScheduleRelinkMetrics::default();
     assert_eq!(workspace.prepare(&mut matching, request, &mut interrupted_metrics, &interrupted), Err(ScheduleEliteError::Interrupted));
+    assert_eq!(matching.machine_sequences(), matching_before);
+    assert_eq!(interrupted_metrics.guide_interruptions, 1);
+}
+
+#[test]
+fn macro_relink_is_deterministic_capped_distinct_and_exact_without_applying() {
+    let stop = AtomicBool::new(false);
+    let (schedule, current_order, guide_order) = nine_block_macro_job_shop();
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let archive = archive_for_order(&problem, guide_order.clone());
+    let request = ScheduleRelinkRequest { guide: archive.best().unwrap(), kind: ScheduleRelinkGuideKind::Best };
+    let mut first_state = JobShopState::from_machine_sequences(&problem, current_order.clone(), &stop).unwrap().unwrap();
+    let mut second_state = JobShopState::from_machine_sequences(&problem, current_order.clone(), &stop).unwrap().unwrap();
+    first_state.retain_canonical_critical_blocks_only();
+    second_state.retain_canonical_critical_blocks_only();
+    assert!(first_state.critical_blocks().is_empty());
+    assert_eq!(first_state.canonical_critical_blocks().len(), 9);
+    let mut first = ScheduleRelinkWorkspace::default();
+    let mut second = ScheduleRelinkWorkspace::default();
+    let mut first_metrics = ScheduleRelinkMetrics::default();
+    let mut second_metrics = ScheduleRelinkMetrics::default();
+
+    first.prepare_macro(&mut first_state, request, &mut first_metrics, &stop).unwrap();
+    second.prepare_macro(&mut second_state, request, &mut second_metrics, &stop).unwrap();
+
+    assert_eq!(first.shortlist(), second.shortlist());
+    assert_eq!(first.shortlist().len(), RELINK_MACRO_CAPACITY);
+    assert!(first.shortlist().len() >= RELINK_MACRO_MIN_MOVES);
+    assert!(first.shortlist().iter().all(|candidate| {
+        matches!(candidate.movement, qayd::engines::ls::lists::schedule_state::ScheduleMove::Insert { .. }) && candidate.guide_arc_gain > 0
+    }));
+    let machines = first
+        .shortlist()
+        .iter()
+        .map(|candidate| match candidate.movement {
+            qayd::engines::ls::lists::schedule_state::ScheduleMove::Insert { machine, .. } => machine,
+            qayd::engines::ls::lists::schedule_state::ScheduleMove::AdjacentSwap { .. } => unreachable!(),
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(machines.len(), first.shortlist().len());
+    assert_eq!(first_state.machine_sequences(), current_order);
+    assert_eq!(second_state.machine_sequences(), current_order);
+
+    let before_guide_arcs = guide_arc_count(&current_order, &guide_order);
+    let mut moved = current_order.clone();
+    for candidate in first.shortlist() {
+        apply_move(&mut moved, candidate.movement);
+    }
+    let exact_gain = guide_arc_count(&moved, &guide_order).saturating_sub(before_guide_arcs);
+    assert_eq!(u64::try_from(exact_gain).unwrap(), first.shortlist_guide_arc_gain());
+    assert_eq!(first_metrics.guide_arc_gain_shortlisted, first.shortlist_guide_arc_gain());
+    assert_eq!(first_metrics.candidates_shortlisted, u64::try_from(RELINK_MACRO_CAPACITY).unwrap());
+    assert_eq!(first_metrics.no_move, 0);
+
+    let movements = first.shortlist().iter().map(|candidate| candidate.movement).collect::<Vec<_>>();
+    assert!(matches!(
+        second_state.consider_move_batch_full_oracle(&movements, MinimizingMoveAcceptance::Always, &stop).unwrap(),
+        MoveOutcome::Accepted { .. }
+    ));
+    assert!(second_state.matches_full_oracle(&stop).unwrap());
+}
+
+#[test]
+fn macro_relink_identical_guide_publishes_no_partial_burst() {
+    let stop = AtomicBool::new(false);
+    let (schedule, current_order, _) = nine_block_macro_job_shop();
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let archive = archive_for_order(&problem, current_order.clone());
+    let request = ScheduleRelinkRequest { guide: archive.best().unwrap(), kind: ScheduleRelinkGuideKind::Best };
+    let mut current = JobShopState::from_machine_sequences(&problem, current_order.clone(), &stop).unwrap().unwrap();
+    current.retain_canonical_critical_blocks_only();
+    let mut workspace = ScheduleRelinkWorkspace::default();
+    let mut metrics = ScheduleRelinkMetrics::default();
+
+    workspace.prepare_macro(&mut current, request, &mut metrics, &stop).unwrap();
+
+    assert!(workspace.shortlist().is_empty());
+    assert_eq!(workspace.shortlist_guide_arc_gain(), 0);
+    assert_eq!(metrics.no_move, 1);
+    assert_eq!(current.machine_sequences(), current_order);
+}
+
+#[test]
+fn macro_relink_requires_two_distinct_machine_components() {
+    let stop = AtomicBool::new(false);
+    let schedule = Schedule {
+        intervals: vec![IntervalVar { duration: 1, horizon: 2, modes: Vec::new(), optional: false }; 2],
+        precedences: Vec::new(),
+        resources: vec![Resource::NoOverlap(vec![0, 1])],
+        minimize_makespan: true,
+    };
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let current_order = vec![vec![0, 1]];
+    let archive = archive_for_order(&problem, vec![vec![1, 0]]);
+    let request = ScheduleRelinkRequest { guide: archive.best().unwrap(), kind: ScheduleRelinkGuideKind::Best };
+    let mut current = JobShopState::from_machine_sequences(&problem, current_order.clone(), &stop).unwrap().unwrap();
+    current.retain_canonical_critical_blocks_only();
+    let mut workspace = ScheduleRelinkWorkspace::default();
+    let mut metrics = ScheduleRelinkMetrics::default();
+
+    workspace.prepare_macro(&mut current, request, &mut metrics, &stop).unwrap();
+
+    assert_eq!(metrics.candidates_retained, 1);
+    assert!(workspace.shortlist().is_empty());
+    assert_eq!(metrics.candidates_shortlisted, 0);
+    assert_eq!(metrics.no_move, 1);
+    assert_eq!(current.machine_sequences(), current_order);
+}
+
+#[test]
+fn macro_relink_keeps_coordinated_unknowns_for_the_batch_oracle() {
+    let stop = AtomicBool::new(false);
+    let (schedule, current_order, guide_order) = coordinated_unknown_macro_job_shop();
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let archive = archive_for_order(&problem, guide_order.clone());
+    let request = ScheduleRelinkRequest { guide: archive.best().unwrap(), kind: ScheduleRelinkGuideKind::Best };
+    let mut current = JobShopState::from_machine_sequences(&problem, current_order.clone(), &stop).unwrap().unwrap();
+    current.retain_canonical_critical_blocks_only();
+    let mut workspace = ScheduleRelinkWorkspace::default();
+    let mut metrics = ScheduleRelinkMetrics::default();
+
+    workspace.prepare_macro(&mut current, request, &mut metrics, &stop).unwrap();
+
+    assert_eq!(
+        workspace.shortlist(),
+        [
+            qayd::engines::ls::lists::schedule_relink::ScheduleRelinkCandidate {
+                movement: qayd::engines::ls::lists::schedule_state::ScheduleMove::Insert { machine: 1, from: 3, to: 1 },
+                guide_arc_gain: 2,
+            },
+            qayd::engines::ls::lists::schedule_relink::ScheduleRelinkCandidate {
+                movement: qayd::engines::ls::lists::schedule_state::ScheduleMove::Insert { machine: 2, from: 0, to: 3 },
+                guide_arc_gain: 1,
+            },
+        ]
+    );
+    assert_eq!(metrics.acyclicity_certified, 0);
+    assert!(metrics.acyclicity_unknown >= 2);
+    assert_eq!(metrics.prefilter_rejections, 0);
+    assert_eq!(workspace.shortlist_guide_arc_gain(), 3);
+    assert_eq!(current.machine_sequences(), current_order);
+
+    for candidate in workspace.shortlist() {
+        let mut isolated = JobShopState::from_machine_sequences(&problem, current_order.clone(), &stop).unwrap().unwrap();
+        assert_eq!(
+            isolated.consider_move_full_oracle(candidate.movement, MinimizingMoveAcceptance::Always, &stop).unwrap(),
+            MoveOutcome::Rejected(MoveRejection::Cycle)
+        );
+        assert_eq!(isolated.machine_sequences(), current_order);
+    }
+
+    let movements = workspace.shortlist().iter().map(|candidate| candidate.movement).collect::<Vec<_>>();
+    assert!(matches!(
+        current.consider_move_batch_full_oracle(&movements, MinimizingMoveAcceptance::Always, &stop).unwrap(),
+        MoveOutcome::Accepted { .. }
+    ));
+    assert_eq!(current.machine_sequences(), guide_order);
+    assert!(current.matches_full_oracle(&stop).unwrap());
+}
+
+#[test]
+fn macro_relink_incompatibility_and_interruption_clear_the_published_plan() {
+    let stop = AtomicBool::new(false);
+    let (schedule, current_order, guide_order) = nine_block_macro_job_shop();
+    let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+    let archive = archive_for_order(&problem, guide_order);
+    let request = ScheduleRelinkRequest { guide: archive.best().unwrap(), kind: ScheduleRelinkGuideKind::Diverse };
+    let mut matching = JobShopState::from_machine_sequences(&problem, current_order.clone(), &stop).unwrap().unwrap();
+    matching.retain_canonical_critical_blocks_only();
+    let mut workspace = ScheduleRelinkWorkspace::default();
+    let mut metrics = ScheduleRelinkMetrics::default();
+    workspace.prepare_macro(&mut matching, request, &mut metrics, &stop).unwrap();
+    assert_eq!(workspace.shortlist().len(), RELINK_MACRO_CAPACITY);
+
+    let different = Schedule {
+        intervals: vec![IntervalVar { duration: 1, horizon: 2, modes: Vec::new(), optional: false }; 2],
+        precedences: Vec::new(),
+        resources: vec![Resource::NoOverlap(vec![0, 1])],
+        minimize_makespan: true,
+    };
+    let different_problem = JobShopProblem::recognize(&different, &stop).unwrap().unwrap();
+    let mut different_state = state(&different_problem, 0);
+    let different_before = different_state.machine_sequences().to_vec();
+    let mut incompatible_metrics = ScheduleRelinkMetrics::default();
+    assert_eq!(
+        workspace.prepare_macro(&mut different_state, request, &mut incompatible_metrics, &stop),
+        Err(ScheduleEliteError::IncompatibleProblem)
+    );
+    assert!(workspace.shortlist().is_empty());
+    assert_eq!(different_state.machine_sequences(), different_before);
+    assert_eq!(incompatible_metrics.guide_incompatible, 1);
+
+    let mut recovery_metrics = ScheduleRelinkMetrics::default();
+    workspace.prepare_macro(&mut matching, request, &mut recovery_metrics, &stop).unwrap();
+    assert_eq!(workspace.shortlist().len(), RELINK_MACRO_CAPACITY);
+    let matching_before = matching.machine_sequences().to_vec();
+    let interrupted = AtomicBool::new(true);
+    let mut interrupted_metrics = ScheduleRelinkMetrics::default();
+    assert_eq!(
+        workspace.prepare_macro(&mut matching, request, &mut interrupted_metrics, &interrupted),
+        Err(ScheduleEliteError::Interrupted)
+    );
+    assert!(workspace.shortlist().is_empty());
     assert_eq!(matching.machine_sequences(), matching_before);
     assert_eq!(interrupted_metrics.guide_interruptions, 1);
 }

@@ -522,6 +522,16 @@ impl ScheduleEliteArchive {
         self.entries.first()
     }
 
+    /// Borrow the retained elite farthest from the best entry.
+    ///
+    /// The archive already stores its frontier in farthest-first order, with
+    /// the best entry at index zero. The requested elite is therefore the
+    /// entry at index one. This constant-time accessor does not decode, clone,
+    /// or allocate any schedule data.
+    pub(crate) fn farthest_from_best(&self) -> Option<&ScheduleEliteEntry> {
+        self.entries.get(1)
+    }
+
     pub(crate) fn entries(&self) -> &[ScheduleEliteEntry] {
         &self.entries
     }

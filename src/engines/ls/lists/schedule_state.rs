@@ -19,6 +19,12 @@ use super::move_acceptance::MinimizingMoveAcceptance;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ScheduleStateInterrupted;
 
+const STRICT_N5_MIN_STREAMING_POP_CAP: usize = 4_096;
+
+fn strict_n5_streaming_pop_cap(operation_count: usize) -> usize {
+    operation_count.max(STRICT_N5_MIN_STREAMING_POP_CAP)
+}
+
 fn checkpoint(stop: &AtomicBool) -> Result<(), ScheduleStateInterrupted> {
     if stop.load(Ordering::Acquire) {
         Err(ScheduleStateInterrupted)
@@ -27,10 +33,57 @@ fn checkpoint(stop: &AtomicBool) -> Result<(), ScheduleStateInterrupted> {
     }
 }
 
+/// Duration coefficients and provenance labels for the bounded adjusted-work
+/// Giffler-Thompson portfolio.
+///
+/// Each lane maximizes `remaining_work - coefficient * duration` after first
+/// minimizing earliest start. Keep the table as the single retuning and
+/// provenance point for the experimental seven-worker portfolio.
+pub(crate) const ADJUSTED_WORK_DISPATCH_SPECS: [(i128, &str); 5] = [
+    (24, "earliest-start-then-most-adjusted-work-c24"),
+    (51, "earliest-start-then-most-adjusted-work-c51"),
+    (48, "earliest-start-then-most-adjusted-work-c48"),
+    (16, "earliest-start-then-most-adjusted-work-c16"),
+    (41, "earliest-start-then-most-adjusted-work-c41"),
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdjustedWorkDispatchLane {
+    Lane0,
+    Lane1,
+    Lane2,
+    Lane3,
+    Lane4,
+}
+
+impl AdjustedWorkDispatchLane {
+    pub(crate) const ALL: [Self; 5] = [Self::Lane0, Self::Lane1, Self::Lane2, Self::Lane3, Self::Lane4];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Lane0 => 0,
+            Self::Lane1 => 1,
+            Self::Lane2 => 2,
+            Self::Lane3 => 3,
+            Self::Lane4 => 4,
+        }
+    }
+
+    pub(crate) fn duration_coefficient(self) -> i128 {
+        ADJUSTED_WORK_DISPATCH_SPECS[self.index()].0
+    }
+
+    pub(crate) fn dispatch_name(self) -> &'static str {
+        ADJUSTED_WORK_DISPATCH_SPECS[self.index()].1
+    }
+}
+
 /// Generic dispatch rules for the Giffler-Thompson constructor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DispatchRule {
     EarliestStart,
+    EarliestStartThenMostWorkRemaining,
+    EarliestStartThenMostAdjustedWork(AdjustedWorkDispatchLane),
     ShortestProcessingTime,
     LongestProcessingTime,
     MostWorkRemaining,
@@ -38,7 +91,32 @@ pub(crate) enum DispatchRule {
 }
 
 impl DispatchRule {
-    pub(crate) const ALL: [Self; 5] =
+    pub(crate) const ADJUSTED_WORK_PORTFOLIO: [Self; 5] = [
+        Self::EarliestStartThenMostAdjustedWork(AdjustedWorkDispatchLane::Lane0),
+        Self::EarliestStartThenMostAdjustedWork(AdjustedWorkDispatchLane::Lane1),
+        Self::EarliestStartThenMostAdjustedWork(AdjustedWorkDispatchLane::Lane2),
+        Self::EarliestStartThenMostAdjustedWork(AdjustedWorkDispatchLane::Lane3),
+        Self::EarliestStartThenMostAdjustedWork(AdjustedWorkDispatchLane::Lane4),
+    ];
+
+    pub(crate) const ALL: [Self; 11] = [
+        Self::EarliestStart,
+        Self::EarliestStartThenMostWorkRemaining,
+        Self::ADJUSTED_WORK_PORTFOLIO[0],
+        Self::ADJUSTED_WORK_PORTFOLIO[1],
+        Self::ADJUSTED_WORK_PORTFOLIO[2],
+        Self::ADJUSTED_WORK_PORTFOLIO[3],
+        Self::ADJUSTED_WORK_PORTFOLIO[4],
+        Self::ShortestProcessingTime,
+        Self::LongestProcessingTime,
+        Self::MostWorkRemaining,
+        Self::Randomized,
+    ];
+
+    /// Preserve the historical generic multistart sequence. The profiled
+    /// constructor ablation is selected explicitly by its owning worker and
+    /// must not perturb any other construction path.
+    pub(crate) const LEGACY_MULTISTART: [Self; 5] =
         [Self::EarliestStart, Self::ShortestProcessingTime, Self::LongestProcessingTime, Self::MostWorkRemaining, Self::Randomized];
 }
 
@@ -380,6 +458,187 @@ impl CriticalBlock {
     }
 }
 
+/// Deterministic tie policy for the single critical path consumed by strict N5.
+///
+/// `Historical` preserves the original machine-first, greatest-operation
+/// ordering exactly. The other variants provide reproducible portfolio lanes
+/// without changing dates, feasibility, or the complete zero-slack block set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CanonicalPathPolicy {
+    Historical,
+    MachineFirstLowest,
+    JobFirstHighest,
+    JobFirstLowest,
+    OperationHighest,
+    OperationLowest,
+    Mixed,
+}
+
+#[derive(Clone, Copy)]
+struct CanonicalChoice {
+    machine_arc: bool,
+    operation: usize,
+}
+
+fn canonical_choice_better(policy: CanonicalPathPolicy, anchor: usize, candidate: CanonicalChoice, incumbent: CanonicalChoice) -> bool {
+    match policy {
+        CanonicalPathPolicy::Historical => (candidate.machine_arc, candidate.operation) > (incumbent.machine_arc, incumbent.operation),
+        CanonicalPathPolicy::MachineFirstLowest => {
+            (candidate.machine_arc && !incumbent.machine_arc)
+                || (candidate.machine_arc == incumbent.machine_arc && candidate.operation < incumbent.operation)
+        }
+        CanonicalPathPolicy::JobFirstHighest => {
+            (!candidate.machine_arc && incumbent.machine_arc)
+                || (candidate.machine_arc == incumbent.machine_arc && candidate.operation > incumbent.operation)
+        }
+        CanonicalPathPolicy::JobFirstLowest => {
+            (!candidate.machine_arc && incumbent.machine_arc)
+                || (candidate.machine_arc == incumbent.machine_arc && candidate.operation < incumbent.operation)
+        }
+        CanonicalPathPolicy::OperationHighest => {
+            candidate.operation > incumbent.operation
+                || (candidate.operation == incumbent.operation && candidate.machine_arc && !incumbent.machine_arc)
+        }
+        CanonicalPathPolicy::OperationLowest => {
+            candidate.operation < incumbent.operation
+                || (candidate.operation == incumbent.operation && candidate.machine_arc && !incumbent.machine_arc)
+        }
+        CanonicalPathPolicy::Mixed => {
+            let mixed_key = |choice: CanonicalChoice| {
+                let operation = u64::try_from(choice.operation).unwrap_or(u64::MAX);
+                let anchor = u64::try_from(anchor).unwrap_or(u64::MAX);
+                mix64(operation ^ anchor.rotate_left(23) ^ u64::from(choice.machine_arc).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            };
+            (mixed_key(candidate), candidate.machine_arc, candidate.operation)
+                > (mixed_key(incumbent), incumbent.machine_arc, incumbent.operation)
+        }
+    }
+}
+
+fn consider_canonical_choice(
+    policy: CanonicalPathPolicy,
+    anchor: usize,
+    selected: &mut Option<CanonicalChoice>,
+    candidate: CanonicalChoice,
+) {
+    if selected.is_none_or(|incumbent| canonical_choice_better(policy, anchor, candidate, incumbent)) {
+        *selected = Some(candidate);
+    }
+}
+
+fn select_canonical_terminal(
+    candidates: impl Iterator<Item = usize>,
+    machine_predecessors: &[usize],
+    starts: &[i64],
+    ends: &[i64],
+    makespan: i64,
+    policy: CanonicalPathPolicy,
+    stop: &AtomicBool,
+) -> Result<Option<CanonicalChoice>, ReconstructionFailure> {
+    let mut terminal = None;
+    for operation in candidates {
+        checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
+        if ends[operation] != makespan {
+            continue;
+        }
+        let machine_predecessor = machine_predecessors[operation];
+        let has_tight_machine_predecessor = machine_predecessor != NO_OPERATION && ends[machine_predecessor] == starts[operation];
+        consider_canonical_choice(
+            policy,
+            NO_OPERATION,
+            &mut terminal,
+            CanonicalChoice { machine_arc: has_tight_machine_predecessor, operation },
+        );
+    }
+    Ok(terminal)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_canonical_path_from_terminal(
+    critical_path: &mut Vec<usize>,
+    canonical_critical_blocks: &mut Vec<CriticalBlock>,
+    problem: &JobShopProblem,
+    machine_predecessors: &[usize],
+    positions: &[usize],
+    starts: &[i64],
+    ends: &[i64],
+    policy: CanonicalPathPolicy,
+    terminal: Option<CanonicalChoice>,
+    fine_grained_checkpoints: bool,
+    stop_after_path_operations: &mut Option<usize>,
+    stop: &AtomicBool,
+) -> Result<(), ReconstructionFailure> {
+    critical_path.clear();
+    if let Some(CanonicalChoice { mut operation, .. }) = terminal {
+        loop {
+            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
+            critical_path.push(operation);
+            if *stop_after_path_operations == Some(critical_path.len()) {
+                *stop_after_path_operations = None;
+                stop.store(true, Ordering::Release);
+                return Err(ReconstructionFailure::Interrupted);
+            }
+            let machine_predecessor = machine_predecessors[operation];
+            let mut predecessor_choice = None;
+            for &predecessor in problem.precedences.predecessors(operation) {
+                if fine_grained_checkpoints {
+                    checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
+                }
+                if ends[predecessor] == starts[operation] {
+                    consider_canonical_choice(
+                        policy,
+                        operation,
+                        &mut predecessor_choice,
+                        CanonicalChoice { machine_arc: predecessor == machine_predecessor, operation: predecessor },
+                    );
+                }
+            }
+            if machine_predecessor != NO_OPERATION
+                && !problem.precedences.predecessors(operation).contains(&machine_predecessor)
+                && ends[machine_predecessor] == starts[operation]
+            {
+                consider_canonical_choice(
+                    policy,
+                    operation,
+                    &mut predecessor_choice,
+                    CanonicalChoice { machine_arc: true, operation: machine_predecessor },
+                );
+            }
+            let Some(CanonicalChoice { operation: predecessor, .. }) = predecessor_choice else {
+                break;
+            };
+            operation = predecessor;
+            if critical_path.len() > problem.operation_count() {
+                return Err(ReconstructionFailure::Cycle);
+            }
+        }
+        critical_path.reverse();
+    }
+
+    canonical_critical_blocks.clear();
+    let mut path_start = 0usize;
+    while path_start < critical_path.len() {
+        checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
+        let machine = problem.machine(critical_path[path_start]);
+        let first_position = positions[critical_path[path_start]];
+        let mut path_end = path_start;
+        while path_end + 1 < critical_path.len()
+            && problem.machine(critical_path[path_end + 1]) == machine
+            && positions[critical_path[path_end + 1]] == positions[critical_path[path_end]] + 1
+        {
+            if fine_grained_checkpoints {
+                checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
+            }
+            path_end += 1;
+        }
+        if path_end > path_start {
+            canonical_critical_blocks.push(CriticalBlock { machine, first_position, last_position: positions[critical_path[path_end]] });
+        }
+        path_start = path_end + 1;
+    }
+    Ok(())
+}
+
 const NO_OPERATION: usize = usize::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -484,6 +743,19 @@ struct EvaluationWorkspace {
     local_tails: Vec<i128>,
     observed_capacities: [usize; 14],
     growths: u64,
+    #[cfg(test)]
+    fast_forward_value_change_pop_cap: Option<usize>,
+    #[cfg(test)]
+    fast_reverse_value_change_pop_cap: Option<usize>,
+    #[cfg(test)]
+    fast_stop_on_work_cap: bool,
+    #[cfg(test)]
+    fast_stop_during_reverse_recovery: bool,
+    #[cfg(test)]
+    fast_last_work_cap_phase: Option<FastN5PropagationPhase>,
+    #[cfg(test)]
+    batch_stop_after_applied_moves: Option<usize>,
+    analysis_stop_after_path_operations: Option<usize>,
 }
 
 impl EvaluationWorkspace {
@@ -521,6 +793,19 @@ impl EvaluationWorkspace {
             local_tails: Vec::with_capacity(operation_count.min(4_096)),
             observed_capacities: [0; 14],
             growths: 0,
+            #[cfg(test)]
+            fast_forward_value_change_pop_cap: None,
+            #[cfg(test)]
+            fast_reverse_value_change_pop_cap: None,
+            #[cfg(test)]
+            fast_stop_on_work_cap: false,
+            #[cfg(test)]
+            fast_stop_during_reverse_recovery: false,
+            #[cfg(test)]
+            fast_last_work_cap_phase: None,
+            #[cfg(test)]
+            batch_stop_after_applied_moves: None,
+            analysis_stop_after_path_operations: None,
         };
         workspace.observed_capacities = workspace.capacity_snapshot();
         workspace
@@ -750,6 +1035,7 @@ impl EvaluationWorkspace {
         machine_successors: &[usize],
         positions: &[usize],
         machine_sequences: &[Vec<usize>],
+        canonical_path_policy: CanonicalPathPolicy,
         collect_all_critical_blocks: bool,
         stop: &AtomicBool,
     ) -> Result<(), ReconstructionFailure> {
@@ -781,81 +1067,29 @@ impl EvaluationWorkspace {
             self.trial_tails[operation] = tail;
         }
 
-        self.trial_critical_path.clear();
-        let mut terminal = None;
-        for &operation in &self.trial_topological {
-            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
-            if self.trial_ends[operation] == self.trial_makespan {
-                let machine_predecessor = machine_predecessors[operation];
-                let has_tight_machine_predecessor =
-                    machine_predecessor != NO_OPERATION && self.trial_ends[machine_predecessor] == self.trial_starts[operation];
-                let key = (has_tight_machine_predecessor, operation);
-                if terminal.is_none_or(|old_key| key > old_key) {
-                    terminal = Some(key);
-                }
-            }
-        }
-        if let Some((_, mut operation)) = terminal {
-            loop {
-                checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
-                self.trial_critical_path.push(operation);
-                let machine_predecessor = machine_predecessors[operation];
-                let mut predecessor_choice = None;
-                for &predecessor in problem.precedences.predecessors(operation) {
-                    checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
-                    if self.trial_ends[predecessor] == self.trial_starts[operation] {
-                        let key = (predecessor == machine_predecessor, predecessor);
-                        if predecessor_choice.is_none_or(|old_key| key > old_key) {
-                            predecessor_choice = Some(key);
-                        }
-                    }
-                }
-                if machine_predecessor != NO_OPERATION
-                    && !problem.precedences.predecessors(operation).contains(&machine_predecessor)
-                    && self.trial_ends[machine_predecessor] == self.trial_starts[operation]
-                {
-                    let key = (true, machine_predecessor);
-                    if predecessor_choice.is_none_or(|old_key| key > old_key) {
-                        predecessor_choice = Some(key);
-                    }
-                }
-                let Some((_, predecessor)) = predecessor_choice else {
-                    break;
-                };
-                operation = predecessor;
-                if self.trial_critical_path.len() > problem.operation_count() {
-                    return Err(ReconstructionFailure::Cycle);
-                }
-            }
-            self.trial_critical_path.reverse();
-        }
-
-        // Preserve the historical deterministic-path blocks alongside the
-        // broader zero-slack block set. Baseline islands consume this list so
-        // the experimental scoring kernel cannot change their probe stream.
-        self.trial_canonical_critical_blocks.clear();
-        let mut path_start = 0usize;
-        while path_start < self.trial_critical_path.len() {
-            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
-            let machine = problem.machine(self.trial_critical_path[path_start]);
-            let first_position = positions[self.trial_critical_path[path_start]];
-            let mut path_end = path_start;
-            while path_end + 1 < self.trial_critical_path.len()
-                && problem.machine(self.trial_critical_path[path_end + 1]) == machine
-                && positions[self.trial_critical_path[path_end + 1]] == positions[self.trial_critical_path[path_end]] + 1
-            {
-                checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
-                path_end += 1;
-            }
-            if path_end > path_start {
-                self.trial_canonical_critical_blocks.push(CriticalBlock {
-                    machine,
-                    first_position,
-                    last_position: positions[self.trial_critical_path[path_end]],
-                });
-            }
-            path_start = path_end + 1;
-        }
+        let terminal = select_canonical_terminal(
+            self.trial_topological.iter().copied(),
+            machine_predecessors,
+            &self.trial_starts,
+            &self.trial_ends,
+            self.trial_makespan,
+            canonical_path_policy,
+            stop,
+        )?;
+        build_canonical_path_from_terminal(
+            &mut self.trial_critical_path,
+            &mut self.trial_canonical_critical_blocks,
+            problem,
+            machine_predecessors,
+            positions,
+            &self.trial_starts,
+            &self.trial_ends,
+            canonical_path_policy,
+            terminal,
+            true,
+            &mut self.analysis_stop_after_path_operations,
+            stop,
+        )?;
 
         self.trial_critical_blocks.clear();
         if !collect_all_critical_blocks {
@@ -1092,6 +1326,23 @@ impl HeadTailMoveScore {
     }
 }
 
+/// Taillard's constant-work evaluation of one adjacent strict N5 swap.
+///
+/// The estimate uses the accepted heads and tails outside the four affected
+/// machine positions. It is advisory only: the exact fast kernel remains the
+/// sole authority for feasibility and the candidate makespan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StrictN5TaillardScore {
+    pub(crate) estimated_makespan: i128,
+    pub(crate) secondary: HeadTailMoveScore,
+}
+
+impl StrictN5TaillardScore {
+    pub(crate) fn ranking_key(self) -> (i128, (i128, i128, u8, Reverse<u8>)) {
+        (self.estimated_makespan, self.secondary.ranking_key())
+    }
+}
+
 /// One structured move paired with advisory head-tail guidance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ScoredScheduleMove {
@@ -1167,16 +1418,28 @@ pub(crate) struct FastN5Outcome {
     pub(crate) used_fast_path: bool,
     pub(crate) fell_back: bool,
     pub(crate) fallback_reason: Option<FastN5FallbackReason>,
+    /// A bounded streaming phase exhausted its work cap and an exact Kahn
+    /// recovery replaced the artificial fallback in one or both directions.
     pub(crate) used_topological_recovery: bool,
+    /// Total value mutations performed, including streaming mutations rolled
+    /// back before a topological recovery.
     pub(crate) forward_date_changes: u64,
     pub(crate) reverse_tail_changes: u64,
+    /// Total queue work spent across both streaming phases, including any
+    /// abandoned prefix and the closure/Kahn traversals used for recovery.
     pub(crate) queue_pops: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FastN5PropagationPhase {
+    Forward,
+    Reverse,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FastN5PropagationFailureKind {
     Interrupted,
-    WorkCap,
+    WorkCap(FastN5PropagationPhase),
     Reconstruction(ReconstructionFailure),
 }
 
@@ -1186,6 +1449,25 @@ struct FastN5PropagationFailure {
     forward_date_changes: u64,
     reverse_tail_changes: u64,
     queue_pops: u64,
+}
+
+impl FastN5PropagationFailure {
+    fn new(kind: FastN5PropagationFailureKind, forward_date_changes: u64, reverse_tail_changes: u64, queue_pops: usize) -> Self {
+        Self { kind, forward_date_changes, reverse_tail_changes, queue_pops: u64::try_from(queue_pops).unwrap_or(u64::MAX) }
+    }
+
+    fn from_reconstruction(
+        failure: ReconstructionFailure,
+        forward_date_changes: u64,
+        reverse_tail_changes: u64,
+        queue_pops: usize,
+    ) -> Self {
+        let kind = match failure {
+            ReconstructionFailure::Interrupted => FastN5PropagationFailureKind::Interrupted,
+            failure => FastN5PropagationFailureKind::Reconstruction(failure),
+        };
+        Self::new(kind, forward_date_changes, reverse_tail_changes, queue_pops)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1233,6 +1515,7 @@ pub(crate) struct JobShopState {
     machine_predecessors: Vec<usize>,
     machine_successors: Vec<usize>,
     positions: Vec<usize>,
+    canonical_path_policy: CanonicalPathPolicy,
     collect_all_critical_blocks: bool,
     reconstruction: Reconstruction,
     workspace: EvaluationWorkspace,
@@ -1431,6 +1714,17 @@ impl JobShopState {
         stop: &AtomicBool,
         metrics: &mut ScheduleStateMetrics,
     ) -> Result<Option<Self>, ScheduleStateInterrupted> {
+        Self::initialize_configured(problem, machine_sequences, CanonicalPathPolicy::Historical, true, stop, metrics)
+    }
+
+    fn initialize_configured(
+        problem: &JobShopProblem,
+        machine_sequences: Vec<Vec<usize>>,
+        canonical_path_policy: CanonicalPathPolicy,
+        collect_all_critical_blocks: bool,
+        stop: &AtomicBool,
+        metrics: &mut ScheduleStateMetrics,
+    ) -> Result<Option<Self>, ScheduleStateInterrupted> {
         checkpoint(stop)?;
         if machine_sequences.len() != problem.machine_count() {
             return Ok(None);
@@ -1452,7 +1746,16 @@ impl JobShopState {
             Err(ReconstructionFailure::Interrupted) => return Err(ScheduleStateInterrupted),
             Err(_) => return Ok(None),
         }
-        match workspace.build_analysis(problem, &machine_predecessors, &machine_successors, &positions, &machine_sequences, true, stop) {
+        match workspace.build_analysis(
+            problem,
+            &machine_predecessors,
+            &machine_successors,
+            &positions,
+            &machine_sequences,
+            canonical_path_policy,
+            collect_all_critical_blocks,
+            stop,
+        ) {
             Ok(()) => {}
             Err(ReconstructionFailure::Interrupted) => return Err(ScheduleStateInterrupted),
             Err(_) => return Ok(None),
@@ -1468,7 +1771,8 @@ impl JobShopState {
             machine_predecessors,
             machine_successors,
             positions,
-            collect_all_critical_blocks: true,
+            canonical_path_policy,
+            collect_all_critical_blocks,
             reconstruction,
             workspace,
             metrics: *metrics,
@@ -1523,6 +1827,11 @@ impl JobShopState {
         &self.reconstruction.ends
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_tails(&self) -> &[i64] {
+        &self.reconstruction.tails
+    }
+
     pub(crate) fn duration(&self, operation: usize) -> i64 {
         self.problem.duration(operation)
     }
@@ -1559,6 +1868,78 @@ impl JobShopState {
 
     pub(crate) fn critical_path(&self) -> &[usize] {
         &self.reconstruction.critical_path
+    }
+
+    pub(crate) fn canonical_path_policy(&self) -> CanonicalPathPolicy {
+        self.canonical_path_policy
+    }
+
+    /// Stable identity of the currently published canonical path.
+    pub(crate) fn canonical_path_fingerprint(&self) -> u64 {
+        let mut fingerprint = mix64(u64::try_from(self.reconstruction.critical_path.len()).unwrap_or(u64::MAX));
+        for (index, &operation) in self.reconstruction.critical_path.iter().enumerate() {
+            fingerprint = mix64(
+                fingerprint ^ u64::try_from(index).unwrap_or(u64::MAX).rotate_left(17) ^ u64::try_from(operation).unwrap_or(u64::MAX),
+            );
+        }
+        fingerprint
+    }
+
+    /// Re-select the canonical critical path under a deterministic portfolio
+    /// policy. Trial analysis remains private until every checkpoint succeeds.
+    pub(crate) fn set_canonical_path_policy(
+        &mut self,
+        policy: CanonicalPathPolicy,
+        stop: &AtomicBool,
+    ) -> Result<bool, ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        if policy == self.canonical_path_policy {
+            return Ok(true);
+        }
+        let terminal = match select_canonical_terminal(
+            self.reconstruction.topological.iter().copied(),
+            &self.machine_predecessors,
+            &self.reconstruction.starts,
+            &self.reconstruction.ends,
+            self.reconstruction.makespan,
+            policy,
+            stop,
+        ) {
+            Ok(terminal) => terminal,
+            Err(ReconstructionFailure::Interrupted) => return Err(ScheduleStateInterrupted),
+            Err(_) => return Ok(false),
+        };
+        if terminal.is_none() && self.problem.operation_count() != 0 {
+            return Ok(false);
+        }
+        match build_canonical_path_from_terminal(
+            &mut self.workspace.trial_critical_path,
+            &mut self.workspace.trial_canonical_critical_blocks,
+            &self.problem,
+            &self.machine_predecessors,
+            &self.positions,
+            &self.reconstruction.starts,
+            &self.reconstruction.ends,
+            policy,
+            terminal,
+            true,
+            &mut self.workspace.analysis_stop_after_path_operations,
+            stop,
+        ) {
+            Ok(()) => {}
+            Err(ReconstructionFailure::Interrupted) => return Err(ScheduleStateInterrupted),
+            Err(_) => return Ok(false),
+        }
+
+        self.canonical_path_policy = policy;
+        self.reconstruction.critical_path.clear();
+        self.reconstruction.critical_path.extend_from_slice(&self.workspace.trial_critical_path);
+        self.reconstruction.canonical_critical_blocks.clear();
+        self.reconstruction.canonical_critical_blocks.extend_from_slice(&self.workspace.trial_canonical_critical_blocks);
+        self.metrics.critical_path_updates = self.metrics.critical_path_updates.saturating_add(1);
+        self.workspace.observe_growths();
+        self.metrics.workspace_growths = self.workspace.growths;
+        Ok(true)
     }
 
     pub(crate) fn critical_blocks(&self) -> &[CriticalBlock] {
@@ -1605,6 +1986,59 @@ impl JobShopState {
             .saturating_add(self.workspace.fast_queue_marks.len().saturating_mul(size_of::<u32>()))
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_configure_strict_n5_work_cap(&mut self, pop_cap: usize, stop_on_work_cap: bool) {
+        self.workspace.fast_forward_value_change_pop_cap = Some(pop_cap);
+        self.workspace.fast_reverse_value_change_pop_cap = Some(pop_cap);
+        self.workspace.fast_stop_on_work_cap = stop_on_work_cap;
+        self.workspace.fast_stop_during_reverse_recovery = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_configure_strict_n5_phase_work_caps(
+        &mut self,
+        forward_pop_cap: usize,
+        reverse_pop_cap: usize,
+        stop_on_work_cap: bool,
+        stop_during_reverse_recovery: bool,
+    ) {
+        self.workspace.fast_forward_value_change_pop_cap = Some(forward_pop_cap);
+        self.workspace.fast_reverse_value_change_pop_cap = Some(reverse_pop_cap);
+        self.workspace.fast_stop_on_work_cap = stop_on_work_cap;
+        self.workspace.fast_stop_during_reverse_recovery = stop_during_reverse_recovery;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_strict_n5_streaming_pop_cap(operation_count: usize) -> usize {
+        strict_n5_streaming_pop_cap(operation_count)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_last_strict_n5_work_cap_was_reverse(&self) -> bool {
+        matches!(self.workspace.fast_last_work_cap_phase, Some(FastN5PropagationPhase::Reverse))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_stop_batch_after_applied_moves(&mut self, applied_moves: usize) {
+        self.workspace.batch_stop_after_applied_moves = Some(applied_moves);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_stop_analysis_after_path_operations(&mut self, operations: usize) {
+        self.workspace.analysis_stop_after_path_operations = Some(operations);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_wrap_fast_dirty_epoch(&mut self) -> bool {
+        self.workspace.dirty_epoch = u32::MAX;
+        self.workspace.dirty_marks.fill(u32::MAX);
+        self.workspace.fast_queue_marks.fill(u32::MAX);
+        let epoch = self.workspace.next_dirty_epoch();
+        epoch == 1
+            && self.workspace.dirty_marks.iter().all(|&mark| mark == 0)
+            && self.workspace.fast_queue_marks.iter().all(|&mark| mark == 0)
+    }
+
     /// Rebuild a replacement state against this state's validated problem.
     /// The accepted state is never mutated; callers replace it only after a
     /// successful reconstruction.
@@ -1613,13 +2047,19 @@ impl JobShopState {
         machine_sequences: Vec<Vec<usize>>,
         stop: &AtomicBool,
     ) -> Result<Option<Self>, ScheduleStateInterrupted> {
-        let rebuilt = Self::from_machine_sequences(&self.problem, machine_sequences, stop)?;
-        Ok(rebuilt.map(|mut state| {
-            if !self.collect_all_critical_blocks {
-                state.retain_canonical_critical_blocks_only();
-            }
-            state
-        }))
+        self.rebuilt_from_machine_sequences_with_policy(machine_sequences, self.canonical_path_policy, stop)
+    }
+
+    /// Rebuild directly under a requested canonical lane while inheriting the
+    /// current all-critical block materialization policy.
+    pub(crate) fn rebuilt_from_machine_sequences_with_policy(
+        &self,
+        machine_sequences: Vec<Vec<usize>>,
+        policy: CanonicalPathPolicy,
+        stop: &AtomicBool,
+    ) -> Result<Option<Self>, ScheduleStateInterrupted> {
+        let mut metrics = ScheduleStateMetrics::default();
+        Self::initialize_configured(&self.problem, machine_sequences, policy, self.collect_all_critical_blocks, stop, &mut metrics)
     }
 
     /// Stop materializing the broader zero-slack block set on future commits.
@@ -1664,6 +2104,14 @@ impl JobShopState {
         let Some(arcs) = self.move_arcs(movement) else {
             return Ok(None);
         };
+        Ok(Some(self.score_move_head_tail_from_arcs(arcs, stop)?))
+    }
+
+    fn score_move_head_tail_from_arcs(
+        &self,
+        arcs: ScheduleMoveArcs,
+        stop: &AtomicBool,
+    ) -> Result<HeadTailMoveScore, ScheduleStateInterrupted> {
         let mut max_added_arc_path = i128::MIN;
         let mut total_added_arc_path = 0i128;
         let mut critical_arcs_removed = 0u8;
@@ -1683,7 +2131,71 @@ impl JobShopState {
         if max_added_arc_path == i128::MIN {
             max_added_arc_path = i128::from(self.makespan());
         }
-        Ok(Some(HeadTailMoveScore { max_added_arc_path, total_added_arc_path, critical_arcs_removed, tight_arcs_added }))
+        Ok(HeadTailMoveScore { max_added_arc_path, total_added_arc_path, critical_arcs_removed, tight_arcs_added })
+    }
+
+    /// Evaluate `... left, a, b, right ... -> ... left, b, a, right ...`
+    /// with Taillard's adjacent-swap head-tail equations. This specialized
+    /// score is available only for the strict classical N5 fast-path shape.
+    pub(crate) fn score_strict_n5_taillard(
+        &self,
+        movement: ScheduleMove,
+        stop: &AtomicBool,
+    ) -> Result<Option<StrictN5TaillardScore>, ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        if !self.supports_strict_n5_fast_path() || !self.is_current_strict_n5_move(movement) {
+            return Ok(None);
+        }
+        let Some(arcs) = self.move_arcs(movement) else {
+            return Ok(None);
+        };
+        Ok(Some(self.score_strict_n5_taillard_unchecked(movement, arcs, stop)?))
+    }
+
+    fn score_strict_n5_taillard_unchecked(
+        &self,
+        movement: ScheduleMove,
+        arcs: ScheduleMoveArcs,
+        stop: &AtomicBool,
+    ) -> Result<StrictN5TaillardScore, ScheduleStateInterrupted> {
+        let ScheduleMove::AdjacentSwap { machine, first_position } = movement else {
+            unreachable!("the strict N5 visitor emits only adjacent swaps");
+        };
+        let sequence = &self.machine_sequences[machine];
+        let a = sequence[first_position];
+        let b = sequence[first_position + 1];
+
+        let job_release = |operation: usize| {
+            self.problem
+                .job_predecessors(operation)
+                .iter()
+                .map(|&predecessor| i128::from(self.reconstruction.ends[predecessor]))
+                .max()
+                .unwrap_or(0)
+        };
+        let job_tail = |operation: usize| {
+            self.problem
+                .job_successors(operation)
+                .iter()
+                .map(|&successor| i128::from(self.reconstruction.tails[successor]))
+                .max()
+                .unwrap_or(0)
+        };
+        let left_completion = first_position
+            .checked_sub(1)
+            .and_then(|position| sequence.get(position))
+            .map_or(0, |&left| i128::from(self.reconstruction.ends[left]));
+        let right_tail = sequence.get(first_position.saturating_add(2)).map_or(0, |&right| i128::from(self.reconstruction.tails[right]));
+        let duration_a = i128::from(self.problem.duration(a));
+        let duration_b = i128::from(self.problem.duration(b));
+
+        let release_b = job_release(b).max(left_completion);
+        let release_a = job_release(a).max(release_b.saturating_add(duration_b));
+        let tail_a = duration_a.saturating_add(job_tail(a).max(right_tail));
+        let tail_b = duration_b.saturating_add(job_tail(b).max(tail_a));
+        let estimated_makespan = release_b.saturating_add(tail_b).max(release_a.saturating_add(tail_a));
+        let secondary = self.score_move_head_tail_from_arcs(arcs, stop)?;
+        Ok(StrictN5TaillardScore { estimated_makespan, secondary })
     }
 
     /// Generate the union of critical neighborhoods and rank it by advisory
@@ -1776,6 +2288,27 @@ impl JobShopState {
         Ok(generated)
     }
 
+    /// Stream strict N5 moves with Taillard's adjacent-swap estimate. No
+    /// neighborhood or shortlist is materialized.
+    pub(crate) fn visit_taillard_scored_strict_n5_canonical_moves(
+        &self,
+        stop: &AtomicBool,
+        mut visit: impl FnMut(ScheduleMove, ScheduleMoveArcs, StrictN5TaillardScore) -> Result<(), ScheduleStateInterrupted>,
+    ) -> Result<usize, ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        if !self.supports_strict_n5_fast_path() {
+            return Ok(0);
+        }
+        let mut generated = 0usize;
+        Self::visit_strict_n5_moves(&self.reconstruction.canonical_critical_blocks, stop, |movement| {
+            let arcs = self.move_arcs(movement).expect("strict canonical N5 movements are structurally valid");
+            let score = self.score_strict_n5_taillard_unchecked(movement, arcs, stop)?;
+            generated = generated.saturating_add(1);
+            visit(movement, arcs, score)
+        })?;
+        Ok(generated)
+    }
+
     pub(crate) fn supports_strict_n5_fast_path(&self) -> bool {
         self.problem.supports_strict_n5_fast_path()
     }
@@ -1816,19 +2349,32 @@ impl JobShopState {
         Ok(())
     }
 
+    /// Certify that every machine arc added by a move follows the accepted
+    /// topological order. Components sharing this certificate can be composed
+    /// into one batch without creating a cycle. `false` means unknown.
+    pub(crate) fn certifies_move_topological_acyclicity(&self, movement: ScheduleMove) -> bool {
+        self.move_arcs(movement).is_some_and(|arcs| {
+            arcs.added
+                .into_iter()
+                .flatten()
+                .all(|arc| self.reconstruction.topological_rank[arc.before] < self.reconstruction.topological_rank[arc.after])
+        })
+    }
+
     /// Certify that one insertion preserves acyclicity without mutating the
     /// accepted graph.
     ///
     /// The first certificate keeps the existing accepted topological order.
     /// The second applies Propositions 1 and 2 of the N8 neighborhood to the
-    /// operation immediately left or right of the moved operation. The paper's
-    /// non-strict inequalities apply only when the precedence graph is a union
-    /// of job chains, no chain revisits a machine, and every duration is
-    /// positive. If such a classical chain model contains a zero duration,
-    /// equality is not enough to exclude a zero-length return path, so the
-    /// certificate requires a strict inequality. Non-classical precedence
-    /// graphs may still pass the first topological-order certificate, but the
-    /// N8 propositions are not applied. `false` means unknown, never cyclic.
+    /// operation immediately left or right of the moved operation. These N8
+    /// propositions are sound for one move but are not composable across a
+    /// batch. Batch callers must use
+    /// [`Self::certifies_move_topological_acyclicity`] for every component.
+    /// The paper's non-strict inequalities apply only when the precedence
+    /// graph is a union of job chains, no chain revisits a machine, and every
+    /// duration is positive. With zero duration, equality is insufficient.
+    /// Non-classical precedence graphs use only the topological certificate.
+    /// `false` means unknown, never cyclic.
     pub(crate) fn certifies_insert_acyclicity(&self, movement: ScheduleMove, stop: &AtomicBool) -> Result<bool, ScheduleStateInterrupted> {
         checkpoint(stop)?;
         let ScheduleMove::Insert { machine, from, to } = movement else {
@@ -1837,13 +2383,7 @@ impl JobShopState {
         if !move_is_valid(&self.machine_sequences, movement) {
             return Ok(false);
         }
-        let arcs = self.move_arcs(movement).expect("a validated insertion has changed arcs");
-        if arcs
-            .added
-            .into_iter()
-            .flatten()
-            .all(|arc| self.reconstruction.topological_rank[arc.before] < self.reconstruction.topological_rank[arc.after])
-        {
+        if self.certifies_move_topological_acyclicity(movement) {
             return Ok(true);
         }
         if !self.problem.n8_classical_chain_model {
@@ -2126,6 +2666,10 @@ impl JobShopState {
         let arcs = self.move_arcs(movement).expect("a strict N5 movement has changed arcs");
         self.metrics.moves_considered = self.metrics.moves_considered.saturating_add(1);
         self.metrics.delta_evaluations = self.metrics.delta_evaluations.saturating_add(1);
+        #[cfg(test)]
+        {
+            self.workspace.fast_last_work_cap_phase = None;
+        }
         self.workspace.begin_fast_patch();
         self.apply_graph_patch(movement);
         if stop.load(Ordering::Acquire) {
@@ -2144,17 +2688,25 @@ impl JobShopState {
                 self.rollback_graph_patch(movement);
                 return Err(ScheduleStateInterrupted);
             }
-            Err(FastN5PropagationFailure {
-                kind: FastN5PropagationFailureKind::WorkCap,
-                queue_pops: streaming_queue_pops,
-                ..
-            }) => {
+            Err(
+                streaming @ FastN5PropagationFailure {
+                    kind: FastN5PropagationFailureKind::WorkCap(FastN5PropagationPhase::Forward), ..
+                },
+            ) => {
+                #[cfg(test)]
+                {
+                    self.workspace.fast_last_work_cap_phase = Some(FastN5PropagationPhase::Forward);
+                }
                 self.rollback_fast_dates();
                 self.workspace.begin_fast_patch();
                 used_topological_recovery = true;
-                match self.evaluate_strict_n5_topologically(arcs, streaming_queue_pops, stop) {
+                #[cfg(test)]
+                if self.workspace.fast_stop_on_work_cap {
+                    stop.store(true, Ordering::Release);
+                }
+                match self.evaluate_strict_n5_topologically(arcs, streaming, stop) {
                     Ok(result) => result,
-                    Err(ReconstructionFailure::Interrupted) => {
+                    Err(FastN5PropagationFailure { kind: FastN5PropagationFailureKind::Interrupted, .. }) => {
                         self.rollback_fast_dates();
                         self.rollback_graph_patch(movement);
                         return Err(ScheduleStateInterrupted);
@@ -2163,15 +2715,70 @@ impl JobShopState {
                         self.rollback_fast_dates();
                         self.rollback_graph_patch(movement);
                         let outcome = self.consider_move_inner(movement, acceptance, stop, false)?;
+                        let fallback_reason = match failure.kind {
+                            FastN5PropagationFailureKind::WorkCap(_) => FastN5FallbackReason::WorkCap,
+                            FastN5PropagationFailureKind::Reconstruction(failure) => Self::fast_n5_fallback_reason(failure),
+                            FastN5PropagationFailureKind::Interrupted => unreachable!("interruption handled above"),
+                        };
                         return Ok(FastN5Outcome {
                             outcome,
                             used_fast_path: false,
                             fell_back: true,
-                            fallback_reason: Some(Self::fast_n5_fallback_reason(failure)),
+                            fallback_reason: Some(fallback_reason),
                             used_topological_recovery: true,
-                            forward_date_changes: 0,
-                            reverse_tail_changes: 0,
-                            queue_pops: u64::try_from(streaming_queue_pops).unwrap_or(u64::MAX),
+                            forward_date_changes: failure.forward_date_changes,
+                            reverse_tail_changes: failure.reverse_tail_changes,
+                            queue_pops: failure.queue_pops,
+                        });
+                    }
+                }
+            }
+            Err(
+                streaming @ FastN5PropagationFailure {
+                    kind: FastN5PropagationFailureKind::WorkCap(FastN5PropagationPhase::Reverse), ..
+                },
+            ) => {
+                #[cfg(test)]
+                {
+                    self.workspace.fast_last_work_cap_phase = Some(FastN5PropagationPhase::Reverse);
+                }
+                self.rollback_fast_tails();
+                used_topological_recovery = true;
+                #[cfg(test)]
+                if self.workspace.fast_stop_on_work_cap {
+                    stop.store(true, Ordering::Release);
+                }
+                match self.evaluate_strict_n5_reverse_topologically(
+                    arcs,
+                    streaming.forward_date_changes,
+                    streaming.reverse_tail_changes,
+                    usize::try_from(streaming.queue_pops).unwrap_or(usize::MAX),
+                    stop,
+                ) {
+                    Ok(result) => result,
+                    Err(FastN5PropagationFailure { kind: FastN5PropagationFailureKind::Interrupted, .. }) => {
+                        self.rollback_fast_dates();
+                        self.rollback_graph_patch(movement);
+                        return Err(ScheduleStateInterrupted);
+                    }
+                    Err(failure) => {
+                        self.rollback_fast_dates();
+                        self.rollback_graph_patch(movement);
+                        let outcome = self.consider_move_inner(movement, acceptance, stop, false)?;
+                        let fallback_reason = match failure.kind {
+                            FastN5PropagationFailureKind::WorkCap(_) => FastN5FallbackReason::WorkCap,
+                            FastN5PropagationFailureKind::Reconstruction(failure) => Self::fast_n5_fallback_reason(failure),
+                            FastN5PropagationFailureKind::Interrupted => unreachable!("interruption handled above"),
+                        };
+                        return Ok(FastN5Outcome {
+                            outcome,
+                            used_fast_path: false,
+                            fell_back: true,
+                            fallback_reason: Some(fallback_reason),
+                            used_topological_recovery: true,
+                            forward_date_changes: failure.forward_date_changes,
+                            reverse_tail_changes: failure.reverse_tail_changes,
+                            queue_pops: failure.queue_pops,
                         });
                     }
                 }
@@ -2267,10 +2874,25 @@ impl JobShopState {
         &mut self,
         arcs: ScheduleMoveArcs,
         stop: &AtomicBool,
-    ) -> Result<(i64, u64, u64, u64), ReconstructionFailure> {
+    ) -> Result<(i64, u64, u64, u64), FastN5PropagationFailure> {
         let operation_count = self.problem.operation_count();
-        let pop_cap = operation_count.saturating_mul(8).clamp(4_096, 131_072);
+        // Each direction receives an independent streaming budget C=max(n,
+        // 4_096). Direct convergence costs at most 2C. A forward WorkCap costs
+        // C plus at most 4n for exact forward/reverse recovery. A reverse
+        // WorkCap costs at most 2C plus 2n for reverse-only recovery. For large
+        // instances these bounds are respectively 2n, 5n and 4n.
+        let default_pop_cap = strict_n5_streaming_pop_cap(operation_count);
+        #[cfg(test)]
+        let forward_pop_cap = self.workspace.fast_forward_value_change_pop_cap.unwrap_or(default_pop_cap);
+        #[cfg(not(test))]
+        let forward_pop_cap = default_pop_cap;
+        #[cfg(test)]
+        let reverse_pop_cap = self.workspace.fast_reverse_value_change_pop_cap.unwrap_or(default_pop_cap);
+        #[cfg(not(test))]
+        let reverse_pop_cap = default_pop_cap;
         let mut queue_pops = 0usize;
+        let mut forward_queue_pops = 0usize;
+        let mut reverse_queue_pops = 0usize;
         let mut forward_date_changes = 0u64;
         let mut reverse_tail_changes = 0u64;
 
@@ -2282,15 +2904,31 @@ impl JobShopState {
         }
         let mut cursor = 0usize;
         while cursor < self.workspace.dirty_queue.len() {
-            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
-            if queue_pops >= pop_cap {
-                return Err(ReconstructionFailure::Cycle);
+            if stop.load(Ordering::Acquire) {
+                return Err(FastN5PropagationFailure::new(
+                    FastN5PropagationFailureKind::Interrupted,
+                    forward_date_changes,
+                    reverse_tail_changes,
+                    queue_pops,
+                ));
+            }
+            if forward_queue_pops >= forward_pop_cap {
+                return Err(FastN5PropagationFailure::new(
+                    FastN5PropagationFailureKind::WorkCap(FastN5PropagationPhase::Forward),
+                    forward_date_changes,
+                    reverse_tail_changes,
+                    queue_pops,
+                ));
             }
             let operation = self.workspace.dirty_queue[cursor];
             cursor += 1;
             queue_pops = queue_pops.saturating_add(1);
+            forward_queue_pops = forward_queue_pops.saturating_add(1);
             self.workspace.fast_queue_marks[operation] = 0;
-            let (start, end) = earliest_dates(&self.problem, &self.machine_predecessors, &self.reconstruction.ends, operation)?;
+            let (start, end) =
+                earliest_dates(&self.problem, &self.machine_predecessors, &self.reconstruction.ends, operation).map_err(|failure| {
+                    FastN5PropagationFailure::from_reconstruction(failure, forward_date_changes, reverse_tail_changes, queue_pops)
+                })?;
             if start == self.reconstruction.starts[operation] && end == self.reconstruction.ends[operation] {
                 continue;
             }
@@ -2308,6 +2946,18 @@ impl JobShopState {
             }
         }
 
+        // The strict gate guarantees positive durations, and changed_roots
+        // contains the head of every added machine arc. Any newly introduced
+        // cycle therefore contains a changed root and cannot reach a forward
+        // value-change fixed point: dates keep increasing until WorkCap (or a
+        // numeric error), where the exact forward Kahn pass detects the cycle.
+        // Reaching the reverse phase proves that starts/ends are exact on a DAG.
+        // More specifically, for a canonical block fragment p->a->b->s, the
+        // replacement arcs p->b and a->s only shortcut existing paths. A cycle
+        // through b->a would require another a=>b path after removing a->b;
+        // with positive durations that would force start[b] > end[a], contrary
+        // to a and b being consecutive on the critical block.
+
         let epoch = self.workspace.next_dirty_epoch();
         self.workspace.dirty_queue.clear();
         for arc in arcs.removed.into_iter().flatten().chain(arcs.added.into_iter().flatten()) {
@@ -2315,22 +2965,51 @@ impl JobShopState {
         }
         cursor = 0;
         while cursor < self.workspace.dirty_queue.len() {
-            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
-            if queue_pops >= pop_cap {
-                return Err(ReconstructionFailure::Cycle);
+            if stop.load(Ordering::Acquire) {
+                return Err(FastN5PropagationFailure::new(
+                    FastN5PropagationFailureKind::Interrupted,
+                    forward_date_changes,
+                    reverse_tail_changes,
+                    queue_pops,
+                ));
+            }
+            if reverse_queue_pops >= reverse_pop_cap {
+                return Err(FastN5PropagationFailure::new(
+                    FastN5PropagationFailureKind::WorkCap(FastN5PropagationPhase::Reverse),
+                    forward_date_changes,
+                    reverse_tail_changes,
+                    queue_pops,
+                ));
             }
             let operation = self.workspace.dirty_queue[cursor];
             cursor += 1;
             queue_pops = queue_pops.saturating_add(1);
+            reverse_queue_pops = reverse_queue_pops.saturating_add(1);
             self.workspace.fast_queue_marks[operation] = 0;
             let duration = self.problem.duration(operation);
             let mut tail = duration;
             for &successor in self.problem.precedences.successors(operation) {
-                tail = tail.max(duration.checked_add(self.reconstruction.tails[successor]).ok_or(ReconstructionFailure::Numeric)?);
+                let Some(candidate) = duration.checked_add(self.reconstruction.tails[successor]) else {
+                    return Err(FastN5PropagationFailure::from_reconstruction(
+                        ReconstructionFailure::Numeric,
+                        forward_date_changes,
+                        reverse_tail_changes,
+                        queue_pops,
+                    ));
+                };
+                tail = tail.max(candidate);
             }
             let machine_successor = self.machine_successors[operation];
             if machine_successor != NO_OPERATION && !self.problem.precedences.successors(operation).contains(&machine_successor) {
-                tail = tail.max(duration.checked_add(self.reconstruction.tails[machine_successor]).ok_or(ReconstructionFailure::Numeric)?);
+                let Some(candidate) = duration.checked_add(self.reconstruction.tails[machine_successor]) else {
+                    return Err(FastN5PropagationFailure::from_reconstruction(
+                        ReconstructionFailure::Numeric,
+                        forward_date_changes,
+                        reverse_tail_changes,
+                        queue_pops,
+                    ));
+                };
+                tail = tail.max(candidate);
             }
             if tail == self.reconstruction.tails[operation] {
                 continue;
@@ -2348,8 +3027,246 @@ impl JobShopState {
             }
         }
 
-        let makespan = self.workspace.makespan_from_sink_union(&self.problem, &self.machine_sequences, &self.reconstruction.ends, stop)?;
+        let makespan =
+            self.workspace.makespan_from_sink_union(&self.problem, &self.machine_sequences, &self.reconstruction.ends, stop).map_err(
+                |failure| FastN5PropagationFailure::from_reconstruction(failure, forward_date_changes, reverse_tail_changes, queue_pops),
+            )?;
         Ok((makespan, forward_date_changes, reverse_tail_changes, u64::try_from(queue_pops).unwrap_or(u64::MAX)))
+    }
+
+    /// Recover a wide strict-N5 value-change cone with one exact Kahn pass in
+    /// each direction. The graph is already patched and all streaming date
+    /// mutations have been rolled back before entry.
+    fn evaluate_strict_n5_topologically(
+        &mut self,
+        arcs: ScheduleMoveArcs,
+        partial: FastN5PropagationFailure,
+        stop: &AtomicBool,
+    ) -> Result<(i64, u64, u64, u64), FastN5PropagationFailure> {
+        let mut forward_date_changes = partial.forward_date_changes;
+        let reverse_tail_changes = partial.reverse_tail_changes;
+        let mut queue_pops = usize::try_from(partial.queue_pops).unwrap_or(usize::MAX);
+
+        let epoch = self.workspace.next_dirty_epoch();
+        self.workspace.dirty_queue.clear();
+        for &operation in &self.workspace.changed_roots {
+            mark_dirty(&mut self.workspace.dirty_marks, &mut self.workspace.dirty_queue, &mut self.workspace.indegrees, epoch, operation);
+        }
+        let mut cursor = 0usize;
+        while cursor < self.workspace.dirty_queue.len() {
+            if stop.load(Ordering::Acquire) {
+                return Err(FastN5PropagationFailure::new(
+                    FastN5PropagationFailureKind::Interrupted,
+                    forward_date_changes,
+                    reverse_tail_changes,
+                    queue_pops,
+                ));
+            }
+            let operation = self.workspace.dirty_queue[cursor];
+            cursor += 1;
+            queue_pops = queue_pops.saturating_add(1);
+            for &successor in self.problem.precedences.successors(operation) {
+                mark_dirty(
+                    &mut self.workspace.dirty_marks,
+                    &mut self.workspace.dirty_queue,
+                    &mut self.workspace.indegrees,
+                    epoch,
+                    successor,
+                );
+                let Some(degree) = self.workspace.indegrees[successor].checked_add(1) else {
+                    return Err(FastN5PropagationFailure::from_reconstruction(
+                        ReconstructionFailure::Numeric,
+                        forward_date_changes,
+                        reverse_tail_changes,
+                        queue_pops,
+                    ));
+                };
+                self.workspace.indegrees[successor] = degree;
+            }
+            let machine_successor = self.machine_successors[operation];
+            if machine_successor != NO_OPERATION && !self.problem.precedences.successors(operation).contains(&machine_successor) {
+                mark_dirty(
+                    &mut self.workspace.dirty_marks,
+                    &mut self.workspace.dirty_queue,
+                    &mut self.workspace.indegrees,
+                    epoch,
+                    machine_successor,
+                );
+                let Some(degree) = self.workspace.indegrees[machine_successor].checked_add(1) else {
+                    return Err(FastN5PropagationFailure::from_reconstruction(
+                        ReconstructionFailure::Numeric,
+                        forward_date_changes,
+                        reverse_tail_changes,
+                        queue_pops,
+                    ));
+                };
+                self.workspace.indegrees[machine_successor] = degree;
+            }
+        }
+        if let Err(failure) = self.workspace.rebuild_dirty_topology(&self.problem, &self.machine_successors, epoch, stop) {
+            queue_pops = queue_pops.saturating_add(self.workspace.dirty_topological.len());
+            return Err(FastN5PropagationFailure::from_reconstruction(failure, forward_date_changes, reverse_tail_changes, queue_pops));
+        }
+        queue_pops = queue_pops.saturating_add(self.workspace.dirty_topological.len());
+        for index in 0..self.workspace.dirty_topological.len() {
+            if stop.load(Ordering::Acquire) {
+                return Err(FastN5PropagationFailure::new(
+                    FastN5PropagationFailureKind::Interrupted,
+                    forward_date_changes,
+                    reverse_tail_changes,
+                    queue_pops,
+                ));
+            }
+            let operation = self.workspace.dirty_topological[index];
+            let (start, end) =
+                earliest_dates(&self.problem, &self.machine_predecessors, &self.reconstruction.ends, operation).map_err(|failure| {
+                    FastN5PropagationFailure::from_reconstruction(failure, forward_date_changes, reverse_tail_changes, queue_pops)
+                })?;
+            if start == self.reconstruction.starts[operation] && end == self.reconstruction.ends[operation] {
+                continue;
+            }
+            self.record_fast_patch(operation);
+            self.reconstruction.starts[operation] = start;
+            self.reconstruction.ends[operation] = end;
+            forward_date_changes = forward_date_changes.saturating_add(1);
+        }
+
+        self.evaluate_strict_n5_reverse_topologically(arcs, forward_date_changes, reverse_tail_changes, queue_pops, stop)
+    }
+
+    /// Rebuild only the exact reverse closure. Starts and ends are already
+    /// exact for the patched graph, while every tail has been restored to its
+    /// original value before this method is entered.
+    fn evaluate_strict_n5_reverse_topologically(
+        &mut self,
+        arcs: ScheduleMoveArcs,
+        forward_date_changes: u64,
+        mut reverse_tail_changes: u64,
+        mut queue_pops: usize,
+        stop: &AtomicBool,
+    ) -> Result<(i64, u64, u64, u64), FastN5PropagationFailure> {
+        let epoch = self.workspace.next_dirty_epoch();
+        self.workspace.dirty_queue.clear();
+        for arc in arcs.removed.into_iter().flatten().chain(arcs.added.into_iter().flatten()) {
+            mark_dirty(&mut self.workspace.dirty_marks, &mut self.workspace.dirty_queue, &mut self.workspace.indegrees, epoch, arc.before);
+        }
+        let mut cursor = 0usize;
+        while cursor < self.workspace.dirty_queue.len() {
+            if stop.load(Ordering::Acquire) {
+                return Err(FastN5PropagationFailure::new(
+                    FastN5PropagationFailureKind::Interrupted,
+                    forward_date_changes,
+                    reverse_tail_changes,
+                    queue_pops,
+                ));
+            }
+            let operation = self.workspace.dirty_queue[cursor];
+            cursor += 1;
+            queue_pops = queue_pops.saturating_add(1);
+            #[cfg(test)]
+            if self.workspace.fast_stop_during_reverse_recovery && cursor == 1 {
+                stop.store(true, Ordering::Release);
+            }
+            for &predecessor in self.problem.precedences.predecessors(operation) {
+                mark_dirty(
+                    &mut self.workspace.dirty_marks,
+                    &mut self.workspace.dirty_queue,
+                    &mut self.workspace.indegrees,
+                    epoch,
+                    predecessor,
+                );
+                let Some(degree) = self.workspace.indegrees[predecessor].checked_add(1) else {
+                    return Err(FastN5PropagationFailure::from_reconstruction(
+                        ReconstructionFailure::Numeric,
+                        forward_date_changes,
+                        reverse_tail_changes,
+                        queue_pops,
+                    ));
+                };
+                self.workspace.indegrees[predecessor] = degree;
+            }
+            let machine_predecessor = self.machine_predecessors[operation];
+            if machine_predecessor != NO_OPERATION && !self.problem.precedences.predecessors(operation).contains(&machine_predecessor) {
+                mark_dirty(
+                    &mut self.workspace.dirty_marks,
+                    &mut self.workspace.dirty_queue,
+                    &mut self.workspace.indegrees,
+                    epoch,
+                    machine_predecessor,
+                );
+                let Some(degree) = self.workspace.indegrees[machine_predecessor].checked_add(1) else {
+                    return Err(FastN5PropagationFailure::from_reconstruction(
+                        ReconstructionFailure::Numeric,
+                        forward_date_changes,
+                        reverse_tail_changes,
+                        queue_pops,
+                    ));
+                };
+                self.workspace.indegrees[machine_predecessor] = degree;
+            }
+        }
+        if let Err(failure) = self.workspace.rebuild_reverse_dirty_topology(&self.problem, &self.machine_predecessors, epoch, stop) {
+            queue_pops = queue_pops.saturating_add(self.workspace.dirty_topological.len());
+            return Err(FastN5PropagationFailure::from_reconstruction(failure, forward_date_changes, reverse_tail_changes, queue_pops));
+        }
+        queue_pops = queue_pops.saturating_add(self.workspace.dirty_topological.len());
+        for index in 0..self.workspace.dirty_topological.len() {
+            if stop.load(Ordering::Acquire) {
+                return Err(FastN5PropagationFailure::new(
+                    FastN5PropagationFailureKind::Interrupted,
+                    forward_date_changes,
+                    reverse_tail_changes,
+                    queue_pops,
+                ));
+            }
+            let operation = self.workspace.dirty_topological[index];
+            let duration = self.problem.duration(operation);
+            let mut tail = duration;
+            for &successor in self.problem.precedences.successors(operation) {
+                let Some(candidate) = duration.checked_add(self.reconstruction.tails[successor]) else {
+                    return Err(FastN5PropagationFailure::from_reconstruction(
+                        ReconstructionFailure::Numeric,
+                        forward_date_changes,
+                        reverse_tail_changes,
+                        queue_pops,
+                    ));
+                };
+                tail = tail.max(candidate);
+            }
+            let machine_successor = self.machine_successors[operation];
+            if machine_successor != NO_OPERATION && !self.problem.precedences.successors(operation).contains(&machine_successor) {
+                let Some(candidate) = duration.checked_add(self.reconstruction.tails[machine_successor]) else {
+                    return Err(FastN5PropagationFailure::from_reconstruction(
+                        ReconstructionFailure::Numeric,
+                        forward_date_changes,
+                        reverse_tail_changes,
+                        queue_pops,
+                    ));
+                };
+                tail = tail.max(candidate);
+            }
+            if tail == self.reconstruction.tails[operation] {
+                continue;
+            }
+            self.record_fast_patch(operation);
+            self.reconstruction.tails[operation] = tail;
+            reverse_tail_changes = reverse_tail_changes.saturating_add(1);
+        }
+
+        let makespan =
+            self.workspace.makespan_from_sink_union(&self.problem, &self.machine_sequences, &self.reconstruction.ends, stop).map_err(
+                |failure| FastN5PropagationFailure::from_reconstruction(failure, forward_date_changes, reverse_tail_changes, queue_pops),
+            )?;
+        Ok((makespan, forward_date_changes, reverse_tail_changes, u64::try_from(queue_pops).unwrap_or(u64::MAX)))
+    }
+
+    fn fast_n5_fallback_reason(failure: ReconstructionFailure) -> FastN5FallbackReason {
+        match failure {
+            ReconstructionFailure::Interrupted => unreachable!("interruption is returned to the caller"),
+            ReconstructionFailure::Cycle => FastN5FallbackReason::Cycle,
+            ReconstructionFailure::Window => FastN5FallbackReason::Window,
+            ReconstructionFailure::Numeric => FastN5FallbackReason::Numeric,
+        }
     }
 
     fn enqueue_fast_value_change(&mut self, epoch: u32, operation: usize) {
@@ -2381,6 +3298,17 @@ impl JobShopState {
         self.clear_fast_patch();
     }
 
+    /// Restore the original tails while retaining the forward start/end patch
+    /// and its journal. A reverse-only recovery can then replace the discarded
+    /// streaming tails, and any later failure still has the original snapshot
+    /// needed for a complete rollback.
+    fn rollback_fast_tails(&mut self) {
+        for index in (0..self.workspace.fast_patched_operations.len()).rev() {
+            let operation = self.workspace.fast_patched_operations[index];
+            self.reconstruction.tails[operation] = self.workspace.fast_patched_tails[index];
+        }
+    }
+
     fn clear_fast_patch(&mut self) {
         self.workspace.fast_patched_operations.clear();
         self.workspace.fast_patched_starts.clear();
@@ -2389,98 +3317,36 @@ impl JobShopState {
     }
 
     fn build_fast_canonical_analysis(&mut self, makespan: i64, stop: &AtomicBool) -> Result<(), ReconstructionFailure> {
-        self.workspace.trial_critical_path.clear();
-        self.workspace.trial_canonical_critical_blocks.clear();
-        let mut terminal = None;
-        for &operation in &self.problem.precedence_sinks {
-            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
-            if self.reconstruction.ends[operation] == makespan {
-                let machine_predecessor = self.machine_predecessors[operation];
-                let key = (
-                    machine_predecessor != NO_OPERATION
-                        && self.reconstruction.ends[machine_predecessor] == self.reconstruction.starts[operation],
-                    operation,
-                );
-                if terminal.is_none_or(|old| key > old) {
-                    terminal = Some(key);
-                }
-            }
-        }
-        for sequence in &self.machine_sequences {
-            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
-            let Some(&operation) = sequence.last() else {
-                continue;
-            };
-            if self.reconstruction.ends[operation] == makespan {
-                let machine_predecessor = self.machine_predecessors[operation];
-                let key = (
-                    machine_predecessor != NO_OPERATION
-                        && self.reconstruction.ends[machine_predecessor] == self.reconstruction.starts[operation],
-                    operation,
-                );
-                if terminal.is_none_or(|old| key > old) {
-                    terminal = Some(key);
-                }
-            }
-        }
-        let Some((_, mut operation)) = terminal else {
-            return Err(ReconstructionFailure::Cycle);
-        };
-        loop {
-            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
-            self.workspace.trial_critical_path.push(operation);
-            let machine_predecessor = self.machine_predecessors[operation];
-            let mut predecessor_choice = None;
-            for &predecessor in self.problem.precedences.predecessors(operation) {
-                if self.reconstruction.ends[predecessor] == self.reconstruction.starts[operation] {
-                    let key = (predecessor == machine_predecessor, predecessor);
-                    if predecessor_choice.is_none_or(|old| key > old) {
-                        predecessor_choice = Some(key);
-                    }
-                }
-            }
-            if machine_predecessor != NO_OPERATION
-                && !self.problem.precedences.predecessors(operation).contains(&machine_predecessor)
-                && self.reconstruction.ends[machine_predecessor] == self.reconstruction.starts[operation]
-            {
-                let key = (true, machine_predecessor);
-                if predecessor_choice.is_none_or(|old| key > old) {
-                    predecessor_choice = Some(key);
-                }
-            }
-            let Some((_, predecessor)) = predecessor_choice else {
-                break;
-            };
-            operation = predecessor;
-            if self.workspace.trial_critical_path.len() > self.problem.operation_count() {
-                return Err(ReconstructionFailure::Cycle);
-            }
-        }
-        self.workspace.trial_critical_path.reverse();
-
-        let mut path_start = 0usize;
-        while path_start < self.workspace.trial_critical_path.len() {
-            checkpoint(stop).map_err(|_| ReconstructionFailure::Interrupted)?;
-            let machine = self.problem.machine(self.workspace.trial_critical_path[path_start]);
-            let first_position = self.positions[self.workspace.trial_critical_path[path_start]];
-            let mut path_end = path_start;
-            while path_end + 1 < self.workspace.trial_critical_path.len()
-                && self.problem.machine(self.workspace.trial_critical_path[path_end + 1]) == machine
-                && self.positions[self.workspace.trial_critical_path[path_end + 1]]
-                    == self.positions[self.workspace.trial_critical_path[path_end]] + 1
-            {
-                path_end += 1;
-            }
-            if path_end > path_start {
-                self.workspace.trial_canonical_critical_blocks.push(CriticalBlock {
-                    machine,
-                    first_position,
-                    last_position: self.positions[self.workspace.trial_critical_path[path_end]],
-                });
-            }
-            path_start = path_end + 1;
-        }
-        Ok(())
+        let candidates = self
+            .problem
+            .precedence_sinks
+            .iter()
+            .copied()
+            .chain(self.machine_sequences.iter().filter_map(|sequence| sequence.last().copied()));
+        let terminal = select_canonical_terminal(
+            candidates,
+            &self.machine_predecessors,
+            &self.reconstruction.starts,
+            &self.reconstruction.ends,
+            makespan,
+            self.canonical_path_policy,
+            stop,
+        )?
+        .ok_or(ReconstructionFailure::Cycle)?;
+        build_canonical_path_from_terminal(
+            &mut self.workspace.trial_critical_path,
+            &mut self.workspace.trial_canonical_critical_blocks,
+            &self.problem,
+            &self.machine_predecessors,
+            &self.positions,
+            &self.reconstruction.starts,
+            &self.reconstruction.ends,
+            self.canonical_path_policy,
+            Some(terminal),
+            false,
+            &mut self.workspace.analysis_stop_after_path_operations,
+            stop,
+        )
     }
 
     /// Reconstruct a move into temporary buffers and commit it only when it is
@@ -2568,12 +3434,101 @@ impl JobShopState {
             &self.machine_successors,
             &self.positions,
             &self.machine_sequences,
+            self.canonical_path_policy,
             self.collect_all_critical_blocks,
             stop,
         ) {
             self.rollback_graph_patch(movement);
             return self.direct_oracle_failure(failure);
         }
+        self.reconstruction.commit(&self.workspace);
+        self.clear_date_patch();
+        self.metrics.moves_accepted = self.metrics.moves_accepted.saturating_add(1);
+        self.metrics.direct_oracle_accepts = self.metrics.direct_oracle_accepts.saturating_add(1);
+        self.metrics.critical_path_updates = self.metrics.critical_path_updates.saturating_add(1);
+        self.workspace.observe_growths();
+        self.metrics.workspace_growths = self.workspace.growths;
+        Ok(MoveOutcome::Accepted { previous, current: candidate })
+    }
+
+    /// Apply a sequence of structured moves as one atomic candidate and run
+    /// the complete reconstruction oracle exactly once. Every move is
+    /// interpreted against the order produced by the preceding moves. No
+    /// single-move feasibility certificate can authorize the combined graph.
+    ///
+    /// The batch counts as one considered candidate and one direct-oracle
+    /// attempt. Invalid or rejected batches, oracle failures, and cancellation
+    /// restore all applied sequence changes in reverse order before returning.
+    pub(crate) fn consider_move_batch_full_oracle(
+        &mut self,
+        movements: &[ScheduleMove],
+        acceptance: MinimizingMoveAcceptance,
+        stop: &AtomicBool,
+    ) -> Result<MoveOutcome, ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        self.metrics.moves_considered = self.metrics.moves_considered.saturating_add(1);
+        self.metrics.direct_oracle_attempts = self.metrics.direct_oracle_attempts.saturating_add(1);
+        if movements.is_empty() {
+            return Ok(MoveOutcome::Rejected(MoveRejection::Invalid));
+        }
+
+        let previous = self.makespan();
+        let mut applied = 0usize;
+        for &movement in movements {
+            if stop.load(Ordering::Acquire) {
+                self.rollback_graph_patches(&movements[..applied]);
+                return Err(ScheduleStateInterrupted);
+            }
+            if !move_is_valid(&self.machine_sequences, movement) {
+                self.rollback_graph_patches(&movements[..applied]);
+                return Ok(MoveOutcome::Rejected(MoveRejection::Invalid));
+            }
+            self.apply_graph_patch(movement);
+            applied += 1;
+
+            #[cfg(test)]
+            if self.workspace.batch_stop_after_applied_moves == Some(applied) {
+                self.workspace.batch_stop_after_applied_moves = None;
+                stop.store(true, Ordering::Release);
+            }
+            if stop.load(Ordering::Acquire) {
+                self.rollback_graph_patches(&movements[..applied]);
+                return Err(ScheduleStateInterrupted);
+            }
+        }
+
+        let candidate = match self.run_full_evaluation(stop) {
+            Ok(candidate) => candidate,
+            Err(failure) => {
+                self.rollback_graph_patches(&movements[..applied]);
+                return self.direct_oracle_failure(failure);
+            }
+        };
+        self.metrics.oracle_validations = self.metrics.oracle_validations.saturating_add(1);
+        if !acceptance.accepts(previous, candidate) {
+            self.rollback_graph_patches(&movements[..applied]);
+            self.metrics.objective_rejections = self.metrics.objective_rejections.saturating_add(1);
+            self.metrics.direct_oracle_objective_rejections = self.metrics.direct_oracle_objective_rejections.saturating_add(1);
+            return Ok(MoveOutcome::Rejected(MoveRejection::NotAccepted { current: previous, candidate }));
+        }
+        if let Err(failure) = self.workspace.build_analysis(
+            &self.problem,
+            &self.machine_predecessors,
+            &self.machine_successors,
+            &self.positions,
+            &self.machine_sequences,
+            self.canonical_path_policy,
+            self.collect_all_critical_blocks,
+            stop,
+        ) {
+            self.rollback_graph_patches(&movements[..applied]);
+            return self.direct_oracle_failure(failure);
+        }
+        if stop.load(Ordering::Acquire) {
+            self.rollback_graph_patches(&movements[..applied]);
+            return Err(ScheduleStateInterrupted);
+        }
+
         self.reconstruction.commit(&self.workspace);
         self.clear_date_patch();
         self.metrics.moves_accepted = self.metrics.moves_accepted.saturating_add(1);
@@ -2679,6 +3634,7 @@ impl JobShopState {
             &self.machine_successors,
             &self.positions,
             &self.machine_sequences,
+            self.canonical_path_policy,
             self.collect_all_critical_blocks,
             stop,
         ) {
@@ -2723,6 +3679,12 @@ impl JobShopState {
             &mut self.positions,
             None,
         );
+    }
+
+    fn rollback_graph_patches(&mut self, movements: &[ScheduleMove]) {
+        for &movement in movements.iter().rev() {
+            self.rollback_graph_patch(movement);
+        }
     }
 
     fn evaluate_delta(&mut self, stop: &AtomicBool) -> Result<i64, ReconstructionFailure> {
@@ -2869,6 +3831,7 @@ impl JobShopState {
             &self.machine_successors,
             &self.positions,
             &self.machine_sequences,
+            self.canonical_path_policy,
             self.collect_all_critical_blocks,
             stop,
         ) {
@@ -2911,6 +3874,7 @@ impl JobShopState {
             &self.machine_successors,
             &self.positions,
             &self.machine_sequences,
+            self.canonical_path_policy,
             self.collect_all_critical_blocks,
             stop,
         ) {
@@ -2972,6 +3936,7 @@ impl GifflerThompsonWorkspace {
         &mut self,
         problem: &JobShopProblem,
         seed: u64,
+        rule: DispatchRule,
         stop: &AtomicBool,
         metrics: &mut ScheduleStateMetrics,
     ) -> Result<Option<(i64, u64)>, ScheduleStateInterrupted> {
@@ -3000,9 +3965,7 @@ impl GifflerThompsonWorkspace {
             let Some((pivot, pivot_machine, cutoff)) = self.ready.pop_pivot(stop, metrics)? else {
                 return Ok(None);
             };
-            let Some(selected) =
-                self.ready.select(problem, pivot, pivot_machine, cutoff, DispatchRule::EarliestStart, seed, step, stop, metrics)?
-            else {
+            let Some(selected) = self.ready.select(problem, pivot, pivot_machine, cutoff, rule, seed, step, stop, metrics)? else {
                 return Ok(None);
             };
             let operation = selected.operation;
@@ -3345,6 +4308,15 @@ struct DispatchCandidate {
     end: i64,
 }
 
+fn adjusted_remaining_work_score(remaining_work: i64, duration: i64, duration_coefficient: i128) -> i128 {
+    i128::from(remaining_work).saturating_sub(i128::from(duration).saturating_mul(duration_coefficient))
+}
+
+#[cfg(test)]
+pub(crate) fn audit_adjusted_remaining_work_score(remaining_work: i64, duration: i64, duration_coefficient: i128) -> i128 {
+    adjusted_remaining_work_score(remaining_work, duration, duration_coefficient)
+}
+
 fn dispatch_better(
     problem: &JobShopProblem,
     rule: DispatchRule,
@@ -3359,6 +4331,22 @@ fn dispatch_better(
         DispatchRule::EarliestStart => {
             (candidate.start, random_key(candidate.operation), candidate.operation)
                 < (incumbent.start, random_key(incumbent.operation), incumbent.operation)
+        }
+        DispatchRule::EarliestStartThenMostWorkRemaining => {
+            (candidate.start, Reverse(problem.remaining_work[candidate.operation]), random_key(candidate.operation), candidate.operation)
+                < (
+                    incumbent.start,
+                    Reverse(problem.remaining_work[incumbent.operation]),
+                    random_key(incumbent.operation),
+                    incumbent.operation,
+                )
+        }
+        DispatchRule::EarliestStartThenMostAdjustedWork(lane) => {
+            let adjusted_work = |operation: usize| {
+                adjusted_remaining_work_score(problem.remaining_work[operation], problem.duration(operation), lane.duration_coefficient())
+            };
+            (candidate.start, Reverse(adjusted_work(candidate.operation)), random_key(candidate.operation), candidate.operation)
+                < (incumbent.start, Reverse(adjusted_work(incumbent.operation)), random_key(incumbent.operation), incumbent.operation)
         }
         DispatchRule::ShortestProcessingTime => {
             (problem.duration(candidate.operation), random_key(candidate.operation), candidate.operation)
