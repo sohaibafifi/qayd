@@ -140,6 +140,9 @@ mod list_portfolio_phase5;
 #[path = "../tests/internal/list_search_metrics.rs"]
 mod list_search_metrics;
 #[cfg(test)]
+#[path = "../tests/internal/load_balance.rs"]
+mod load_balance_tests;
+#[cfg(test)]
 #[path = "../tests/internal/ls_cop.rs"]
 mod ls_cop;
 #[cfg(test)]
@@ -229,6 +232,9 @@ mod scheduling_kernel;
 #[cfg(test)]
 #[path = "../tests/internal/semantic_preparation_interruption.rs"]
 mod semantic_preparation_interruption;
+#[cfg(test)]
+#[path = "../tests/internal/sum_squares.rs"]
+mod sum_squares_tests;
 #[cfg(test)]
 #[path = "../tests/internal/verification_boundaries.rs"]
 mod verification_boundaries;

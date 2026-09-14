@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::constraints::{
-    count, divisibility, graph, intension, interval as interval_constraints, lex, linear, prefix_set, primitives, scheduling, table,
+    count, divisibility, graph, intension, interval as interval_constraints, lex, linear, prefix_set, primitives, scheduling, sum_squares,
+    table,
 };
 use crate::expr::Expr;
 use crate::ids::VarId;
@@ -117,6 +118,70 @@ fn materialized_affine_view(model: &Model, objective: IntVarRef, stop: &AtomicBo
         }
         if !variables.is_empty() {
             return Some((coefficients, variables));
+        }
+    }
+    None
+}
+
+/// Recognize a sum of distinct variable squares with an unconditional fixed
+/// total on exactly that scope. Selected/reified equalities are deliberately
+/// excluded: their total is not an invariant of the original objective.
+fn fixed_sum_square_view(model: &Model, expr: &IntExpr, stop: &AtomicBool) -> Option<(Vec<IntVarRef>, i128)> {
+    let IntExpr::Add(expressions) = expr else {
+        return None;
+    };
+    let mut scope = BTreeSet::new();
+    for expression in expressions {
+        if interrupted(stop) {
+            return None;
+        }
+        let IntExpr::Mul(factors) = expression else {
+            return None;
+        };
+        let [IntExpr::Variable(left), IntExpr::Variable(right)] = factors.as_slice() else {
+            return None;
+        };
+        if left != right || !scope.insert(*left) {
+            return None;
+        }
+    }
+    if scope.is_empty() {
+        return None;
+    }
+    for constraint in &model.constraints {
+        if interrupted(stop) {
+            return None;
+        }
+        let Constraint::Linear { terms, relation: Relation::Eq, rhs } = constraint else {
+            continue;
+        };
+        let mut coefficients = BTreeMap::<IntVarRef, i128>::new();
+        for &(coefficient, variable) in terms {
+            if interrupted(stop) {
+                return None;
+            }
+            *coefficients.entry(variable).or_default() += i128::from(coefficient);
+        }
+        coefficients.retain(|_, coefficient| *coefficient != 0);
+        if coefficients.len() != scope.len() {
+            continue;
+        }
+        let sign = *coefficients.values().next()?;
+        if sign != 1 && sign != -1 {
+            continue;
+        }
+        let mut matches = true;
+        for (&variable, &coefficient) in &coefficients {
+            if interrupted(stop) {
+                return None;
+            }
+            if coefficient != sign || !scope.contains(&variable) {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            return Some((scope.into_iter().collect(), i128::from(*rhs) * sign));
         }
     }
     None
@@ -465,9 +530,41 @@ impl CompiledCp {
         }
 
         let mut objectives = Vec::with_capacity(model.objectives.len());
+        let mut materialized_objectives = Vec::new();
         for objective in &model.objectives {
             if interrupted(stop) {
                 return Ok(None);
+            }
+            if let Objective::IntExpr { minimize: true, expr } = objective {
+                let square_view = fixed_sum_square_view(model, expr, stop);
+                if interrupted(stop) {
+                    return Ok(None);
+                }
+                if let Some((variables, total)) = square_view {
+                    let mut physical = Vec::with_capacity(variables.len());
+                    let mut upper = 0i128;
+                    for variable in variables {
+                        if interrupted(stop) {
+                            return Ok(None);
+                        }
+                        let variable = int_variables[variable.0];
+                        let lo = i128::from(solver.store.min(variable));
+                        let hi = i128::from(solver.store.max(variable));
+                        upper += (lo * lo).max(hi * hi);
+                        physical.push(variable);
+                    }
+                    // The original i64 expression remains authoritative
+                    // whenever its entire interval image cannot fit i32.
+                    if let Ok(upper) = i32::try_from(upper) {
+                        let materialized = solver.new_var_range(0, upper);
+                        if !sum_squares::fixed_sum_squares_interruptible(&mut solver, &physical, materialized, total, stop) {
+                            return Ok(None);
+                        }
+                        materialized_objectives.push(materialized);
+                        objectives.push(PhysicalObjective::Var(true, materialized));
+                        continue;
+                    }
+                }
             }
             objectives.push(match objective {
                 Objective::IntExpr { minimize, expr: IntExpr::Variable(variable) } => {
@@ -510,6 +607,13 @@ impl CompiledCp {
         );
         let mut search_members = BTreeSet::new();
         for &variable in &int_variables {
+            if interrupted(stop) {
+                return Ok(None);
+            }
+            search.push(variable);
+            search_members.insert(variable);
+        }
+        for variable in materialized_objectives {
             if interrupted(stop) {
                 return Ok(None);
             }
@@ -809,8 +913,55 @@ fn estimate_semantic_bytes(model: &Model, stop: &AtomicBool) -> Option<u64> {
         if interrupted(stop) {
             return None;
         }
-        if let Objective::IntExpr { expr, .. } = objective {
+        if let Objective::IntExpr { minimize, expr } = objective {
             bytes = bytes.saturating_add(estimate_expr_bytes(expr, stop)?);
+            if *minimize {
+                if let Some((variables, _)) = fixed_sum_square_view(model, expr, stop) {
+                    let mut upper = 0i128;
+                    for variable in &variables {
+                        if interrupted(stop) {
+                            return None;
+                        }
+                        // Estimation also runs before semantic validation. An
+                        // invalid reference must reach that validator as an
+                        // error rather than panic during optional lowering.
+                        let Some(domain) = model.int_vars.get(variable.0) else {
+                            upper = i128::from(i32::MAX) + 1;
+                            break;
+                        };
+                        let (lo, hi) = match domain {
+                            IntDomain::Bool => (0, 1),
+                            IntDomain::Range { lo, hi } => (i128::from(*lo), i128::from(*hi)),
+                            IntDomain::Set(values) => {
+                                let mut lo = i128::MAX;
+                                let mut hi = i128::MIN;
+                                for &value in values {
+                                    if interrupted(stop) {
+                                        return None;
+                                    }
+                                    lo = lo.min(i128::from(value));
+                                    hi = hi.max(i128::from(value));
+                                }
+                                (lo, hi)
+                            }
+                        };
+                        upper = upper.saturating_add(lo.saturating_mul(lo).max(hi.saturating_mul(hi)));
+                    }
+                    if i32::try_from(upper).is_ok() {
+                        let width = u128::try_from(upper + 1).ok()?;
+                        let cells = if width <= 4_096 { width } else { 1 };
+                        // Include the derived domain, its LCG/search metadata,
+                        // subscriptions and the retained i128 bound snapshot.
+                        bytes = bytes
+                            .saturating_add(3_072)
+                            .saturating_add(cells.saturating_mul(24))
+                            .saturating_add(wide(variables.len()).saturating_mul(192));
+                    }
+                }
+                if interrupted(stop) {
+                    return None;
+                }
+            }
         }
     }
     Some(u64::try_from(bytes).unwrap_or(u64::MAX))

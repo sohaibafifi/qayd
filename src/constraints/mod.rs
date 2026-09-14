@@ -14,4 +14,5 @@ pub(crate) mod prefix_set;
 pub mod primitives;
 pub(crate) mod resource_profile;
 pub mod scheduling;
+pub(crate) mod sum_squares;
 pub mod table;

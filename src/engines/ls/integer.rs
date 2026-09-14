@@ -12,10 +12,13 @@ use crate::constraints::table::{Dfa, Mdd, MddArc};
 use crate::engines::ls::cop::{LocalRhs, LocalSearchSpec};
 use crate::engines::ls::disjunctive_schedule::DisjunctiveSchedulePlan;
 use crate::engines::ls::exact_cover::ExactCoverPlan;
+use crate::engines::ls::load_balance::LoadBalancePlan;
 use crate::engines::ls::scenario_schedule::ScenarioSchedulePlan;
 use crate::expr::Expr;
 use crate::ids::VarId;
-use crate::model::{BoolLiteral, CompiledCp, Constraint, IntExpr as SemanticIntExpr, IntGlobalConstraint, Model, Relation, SetVarRef};
+use crate::model::{
+    BoolLiteral, CompiledCp, Constraint, IntExpr as SemanticIntExpr, IntGlobalConstraint, Model, Objective, Relation, SetVarRef,
+};
 use crate::orchestrator::SolveError;
 
 #[derive(Clone)]
@@ -29,6 +32,7 @@ pub(crate) struct IntegerLocalSearchPlan {
 pub(crate) enum IntegerWarmStartPlan {
     Local(IntegerLocalSearchPlan),
     ExactCover(ExactCoverPlan),
+    LoadBalance(LoadBalancePlan),
     ScenarioSchedule(ScenarioSchedulePlan),
     DisjunctiveSchedule(DisjunctiveSchedulePlan),
     Fallbacks(Vec<IntegerWarmStartPlan>),
@@ -88,6 +92,40 @@ fn warm_start_preflight(model: &Model, stop: &AtomicBool) -> Option<WarmStartPre
             return None;
         }
         cost = cost.add(constraint_plan_cost(model, constraint, stop)?);
+    }
+    for objective in model.objectives() {
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        if let Objective::IntExpr { minimize: true, expr: expr @ SemanticIntExpr::Add(terms) } = objective {
+            let mut square_sum = !terms.is_empty();
+            for term in terms {
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    return None;
+                }
+                let SemanticIntExpr::Mul(factors) = term else {
+                    square_sum = false;
+                    break;
+                };
+                if !matches!(factors.as_slice(), [SemanticIntExpr::Variable(left), SemanticIntExpr::Variable(right)] if left == right) {
+                    square_sum = false;
+                    break;
+                }
+            }
+            if square_sum {
+                // CP may materialize a nonvariable objective. Its LS view then
+                // owns an equality, a functional expression and an auxiliary
+                // domain. Conservatively allow the largest enumerated domain
+                // here, before the physical compiler has selected its form.
+                let domain_bytes = (crate::engines::ls::cop::MAX_DOMAIN_VALUES as u128).saturating_mul(4);
+                let expression_cost = expression_plan_cost(expr, stop)?;
+                cost = cost.add(expression_cost).add(expression_cost).add(PlanCost {
+                    bytes: 512u128.saturating_add(domain_bytes),
+                    work: 2,
+                    scope: 1,
+                });
+            }
+        }
     }
     let structural = 4_096u128
         .saturating_add((model.int_vars().len() as u128).saturating_mul(256))
@@ -316,6 +354,16 @@ pub(crate) fn compile_warm_start(
             plans.push(IntegerWarmStartPlan::ExactCover(plan));
         }
     }
+    let balance_allowance = allowance.saturating_sub(estimated_bytes);
+    if preflight.inspection_work <= MAX_WARM_START_INSPECTION_WORK {
+        if let Some(plan) = LoadBalancePlan::compile(model, stop, balance_allowance) {
+            let plan_bytes = plan.estimated_bytes();
+            if plan_bytes <= balance_allowance {
+                estimated_bytes = estimated_bytes.saturating_add(plan_bytes);
+                plans.push(IntegerWarmStartPlan::LoadBalance(plan));
+            }
+        }
+    }
     let scenario_allowance = allowance.saturating_sub(estimated_bytes);
     if preflight.structural_plan_bytes <= scenario_allowance {
         if let Some(plan) = ScenarioSchedulePlan::compile(model, stop) {
@@ -394,6 +442,19 @@ pub(crate) fn compile_interruptible(
         }
         if !compile_constraint(&mut spec, model, compiled, constraint, stop)? {
             return Ok(None);
+        }
+    }
+    if let (Some(physical), Some(Objective::IntExpr { expr, .. })) =
+        (compiled.objectives().first().and_then(crate::problem::Objective::var), model.objectives().first())
+    {
+        if !matches!(expr, SemanticIntExpr::Variable(_)) {
+            let Some(expression) = expression_of(compiled, expr, stop)? else {
+                return Ok(None);
+            };
+            // The physical CP auxiliary has no semantic constraint of its
+            // own. Recreate its definition so LS derives it from decisions,
+            // excludes it from mutable variables, and scores canonical values.
+            spec.add_expr(Expr::Eq(Box::new(Expr::Var(physical)), Box::new(expression)));
         }
     }
     if spec.unsupported() > 0 {

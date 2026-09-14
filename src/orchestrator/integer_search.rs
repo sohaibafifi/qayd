@@ -12,6 +12,7 @@ use crate::engines::ls::cop::{solve_ls_capped, solve_ls_capped_borrowed, LocalSe
 use crate::engines::ls::disjunctive_schedule::DisjunctiveSchedulePlan;
 use crate::engines::ls::exact_cover::ExactCoverPlan;
 use crate::engines::ls::integer::{IntegerLocalSearchPlan, IntegerWarmStartPlan};
+use crate::engines::ls::load_balance::{LoadBalanceLimits, LoadBalancePlan};
 use crate::engines::ls::scenario_schedule::{ConstructionLimits, ScenarioSchedulePlan};
 use crate::expr::Expr;
 use crate::ids::VarId;
@@ -82,6 +83,9 @@ pub(crate) fn warm_start(
         IntegerWarmStartPlan::ExactCover(plan) => {
             exact_cover_warm_start(model, compiled, plan, request, budget, search_stop, transfer_stop)
         }
+        IntegerWarmStartPlan::LoadBalance(plan) => {
+            load_balance_warm_start(model, compiled, plan, request, budget, search_stop, transfer_stop)
+        }
         IntegerWarmStartPlan::ScenarioSchedule(plan) => {
             scenario_schedule_warm_start(model, compiled, plan, request, budget, search_stop, transfer_stop)
         }
@@ -103,6 +107,51 @@ pub(crate) fn warm_start(
             Ok(None)
         }
     }
+}
+
+fn load_balance_warm_start(
+    model: &Model,
+    compiled: &CompiledCp,
+    plan: &LoadBalancePlan,
+    request: &SolveRequest,
+    budget: &SolveBudget,
+    search_stop: &AtomicBool,
+    transfer_stop: &AtomicBool,
+) -> Result<Option<IntegerWarmStart>, SolveError> {
+    if budget.expired() {
+        return Ok(None);
+    }
+    let started = Instant::now();
+    let Some(solution) = plan.construct(request.seed, None, search_stop, LoadBalanceLimits::default()) else {
+        return Ok(None);
+    };
+    let repair = SemanticRepairContext { model, compiled, request, budget, stop: transfer_stop };
+    let Some(repaired) = repair_partial_semantic_candidate(&repair, &solution.values, request.seed, VerificationLevel::Transfer)? else {
+        return Ok(None);
+    };
+    let physical_objective = repaired
+        .physical_objective
+        .ok_or_else(|| SolveError::InvalidResult("load-balancing warm start has no physical objective".to_string()))?;
+    if physical_objective != solution.objective || repaired.candidate.objectives() != [solution.objective] {
+        return Err(SolveError::InvalidResult(format!(
+            "load-balancing warm start scored {}, physical replay produced {}, canonical replay produced {:?}",
+            solution.objective,
+            physical_objective,
+            repaired.candidate.objectives()
+        )));
+    }
+    Ok(Some(IntegerWarmStart {
+        candidate: repaired.candidate,
+        physical_solution: repaired.physical_solution,
+        physical_objective,
+        report: EngineReport {
+            engine: Some(EngineKind::IntegerLocalSearch),
+            search: crate::search::SolveStats { solutions: 1, nodes: solution.iterations, ..crate::search::SolveStats::default() },
+            elapsed: started.elapsed(),
+            improvements: solution.improvements,
+            metadata: vec![("ls_role".to_string(), "load_balance_warm_start".to_string())],
+        },
+    }))
 }
 
 fn exact_cover_warm_start(
