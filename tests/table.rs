@@ -136,6 +136,106 @@ fn positive_extension_prunes_at_root() {
 }
 
 #[test]
+fn positive_extension_repeated_variable_rows_require_consistent_values() {
+    let mut solver = Solver::new();
+    let x = solver.new_var_range(0, 2);
+    extension(&mut solver, &[x, x], &[vec![0, 1], vec![1, 2]], true);
+    assert!(enumerate(&mut solver, &[x]).is_empty());
+}
+
+#[test]
+fn positive_extension_first_pass_filters_even_without_losing_a_tuple() {
+    let mut solver = Solver::new();
+    let x = solver.new_var_range(0, 2);
+    let wildcard = solver.new_var_set(&[-3, 0, 4]);
+    extension(&mut solver, &[x, wildcard], &[vec![0, STAR], vec![1, STAR]], true);
+
+    solver.store.push_level();
+    solver.propagate().unwrap();
+    assert_eq!(solver.store.values(x).collect::<BTreeSet<_>>(), BTreeSet::from([0, 1]));
+    solver.store.pop_level();
+    assert_eq!(solver.store.values(x).collect::<BTreeSet<_>>(), BTreeSet::from([0, 1, 2]));
+
+    // Returning past the first propagation restores its uninitialized marker.
+    // This sibling change only touches a wildcard column, but x=2 still lacks
+    // support and must be removed by the new first pass.
+    solver.store.push_level();
+    solver.store.remove(wildcard, 0).unwrap();
+    solver.propagate().unwrap();
+    assert_eq!(solver.store.values(x).collect::<BTreeSet<_>>(), BTreeSet::from([0, 1]));
+    assert_eq!(solver.store.values(wildcard).collect::<BTreeSet<_>>(), BTreeSet::from([-3, 4]));
+    solver.store.pop_level();
+}
+
+#[test]
+fn positive_extension_unchanged_wildcard_wakes_restore_across_nested_branches() {
+    let mut solver = Solver::new();
+    let x = solver.new_var_set(&[0, 2, 4]);
+    let wildcard = solver.new_var_set(&[0, 2, 4]);
+    let z = solver.new_var_set(&[0, 2, 4]);
+    extension(&mut solver, &[x, wildcard, z], &[vec![0, STAR, 0], vec![2, STAR, 2], vec![4, STAR, 4]], true);
+    solver.propagate().unwrap();
+
+    solver.store.push_level();
+    solver.store.remove(wildcard, 2).unwrap();
+    solver.propagate().unwrap();
+    assert_eq!(solver.store.values(x).collect::<BTreeSet<_>>(), BTreeSet::from([0, 2, 4]));
+
+    solver.store.push_level();
+    solver.store.remove(z, 4).unwrap();
+    solver.propagate().unwrap();
+    assert_eq!(solver.store.values(x).collect::<BTreeSet<_>>(), BTreeSet::from([0, 2]));
+    solver.store.pop_level();
+
+    // An equally sized sibling domain removes a different live tuple.
+    solver.store.push_level();
+    solver.store.remove(z, 0).unwrap();
+    solver.propagate().unwrap();
+    assert_eq!(solver.store.values(x).collect::<BTreeSet<_>>(), BTreeSet::from([2, 4]));
+    assert_eq!(solver.store.values(wildcard).collect::<BTreeSet<_>>(), BTreeSet::from([0, 4]));
+    solver.store.pop_level();
+    solver.store.pop_level();
+    solver.enqueue_all();
+    solver.propagate().unwrap();
+    for variable in [x, wildcard, z] {
+        assert_eq!(solver.store.values(variable).collect::<BTreeSet<_>>(), BTreeSet::from([0, 2, 4]));
+    }
+}
+
+#[test]
+fn positive_extension_repeated_variable_wildcard_subsets_match_oracle() {
+    let patterns =
+        [vec![0, 0], vec![0, 1], vec![1, 0], vec![1, 1], vec![0, STAR], vec![1, STAR], vec![STAR, 0], vec![STAR, 1], vec![STAR, STAR]];
+    for selected in 0..1usize << patterns.len() {
+        let tuples = patterns.iter().enumerate().filter(|(i, _)| selected & (1 << i) != 0).map(|(_, row)| row.clone()).collect::<Vec<_>>();
+        let mut solver = Solver::new();
+        let x = solver.new_var_range(0, 1);
+        extension(&mut solver, &[x, x], &tuples, true);
+        let expected =
+            oracle_set(1, 0, 1, |assignment| tuples.iter().any(|row| row.iter().all(|&value| value == STAR || value == assignment[0])));
+        assert_eq!(enumerate(&mut solver, &[x]), expected, "pattern subset {selected}");
+    }
+}
+
+#[test]
+fn positive_extension_repeated_scope_keeps_shared_template_and_star_meaning() {
+    let tuples = [vec![STAR, 0, 1], vec![2, STAR, 2], vec![1, 1, STAR]];
+    let template = extension_template(3, &tuples);
+    let mut solver = Solver::new();
+    let repeated = solver.new_var_range(0, 2);
+    let distinct = (0..3).map(|_| solver.new_var_range(0, 2)).collect::<Vec<_>>();
+    extension_from_template(&mut solver, &[repeated; 3], Arc::clone(&template), true);
+    extension_from_template(&mut solver, &distinct, template, true);
+    let mut search = vec![repeated];
+    search.extend_from_slice(&distinct);
+    let expected = oracle_set(4, 0, 2, |assignment| {
+        tuples.iter().any(|row| row.iter().all(|&value| value == STAR || value == assignment[0]))
+            && tuples.iter().any(|row| row.iter().zip(&assignment[1..]).all(|(&value, &actual)| value == STAR || value == actual))
+    });
+    assert_eq!(enumerate(&mut solver, &search), expected);
+}
+
+#[test]
 fn shared_extension_template_matches_oracle() {
     let allowed = [vec![0, 1], vec![1, 0]];
     let template = extension_template(2, &allowed);

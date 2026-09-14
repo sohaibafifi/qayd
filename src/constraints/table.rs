@@ -134,6 +134,9 @@ struct Extension {
     vars: Vec<VarId>,
     positive: bool,
     template: Arc<ExtensionTemplate>,
+    /// Intrinsically consistent rows for a positive scope with repeated vars.
+    /// Kept separate so immutable templates remain shareable across scopes.
+    valid_rows: Option<Vec<u64>>,
     current: Vec<u64>,
     union: Vec<u64>,
     /// Reversible `currTable`: two `i32` halves per tuple word (positive only).
@@ -179,6 +182,47 @@ impl Extension {
             return None;
         }
         let nwords = template.full.len();
+        let valid_rows = if positive {
+            let mut first_columns = HashMap::new();
+            let mut repeated = HashMap::<usize, Vec<usize>>::new();
+            for (column, &variable) in vars.iter().enumerate() {
+                if stop.load(Ordering::Acquire) {
+                    return None;
+                }
+                match first_columns.entry(variable) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(column);
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry) => repeated.entry(*entry.get()).or_default().push(column),
+                }
+            }
+            if repeated.is_empty() {
+                None
+            } else {
+                let mut valid = template.full.clone();
+                for row in 0..template.tuples.len() / vars.len() {
+                    'groups: for (&first, duplicates) in &repeated {
+                        let mut value = template.tuples[row * vars.len() + first];
+                        for &column in duplicates {
+                            if stop.load(Ordering::Acquire) {
+                                return None;
+                            }
+                            let other = template.tuples[row * vars.len() + column];
+                            if value != STAR && other != STAR && value != other {
+                                valid[row / 64] &= !(1u64 << (row % 64));
+                                break 'groups;
+                            }
+                            if value == STAR {
+                                value = other;
+                            }
+                        }
+                    }
+                }
+                Some(valid)
+            }
+        } else {
+            None
+        };
         let mut residues = Vec::new();
         if positive {
             residues.reserve(vars.len());
@@ -201,7 +245,7 @@ impl Extension {
         // initial domains (and any pre-propagate removals) are folded in once.
         let (curr_words, col_size) = if positive {
             let mut words = Vec::with_capacity(template.full.len().saturating_mul(2));
-            for &full_word in &template.full {
+            for &full_word in valid_rows.as_deref().unwrap_or(&template.full) {
                 if stop.load(Ordering::Acquire) {
                     return None;
                 }
@@ -248,6 +292,7 @@ impl Extension {
             search,
             cover,
             template,
+            valid_rows,
             buf: Vec::new(),
             killer_seen,
             explain_gen: 0,
@@ -412,6 +457,7 @@ impl Propagator for Extension {
             vars,
             positive,
             template,
+            valid_rows,
             current,
             union,
             curr_words,
@@ -435,9 +481,12 @@ impl Propagator for Extension {
             for (w, cur) in current.iter_mut().enumerate() {
                 *cur = rev_load_word(store, curr_words, w);
             }
+            let mut first_propagation = false;
             for (c, &v) in vars.iter().enumerate() {
                 let sz = store.size(v) as i32;
-                if store.rev_get(col_size[c]) == sz {
+                let previous_size = store.rev_get(col_size[c]);
+                first_propagation |= previous_size == -1;
+                if previous_size == sz {
                     continue;
                 }
                 // AND in (wildcards OR union of still-present values) for this column.
@@ -448,9 +497,14 @@ impl Propagator for Extension {
                     }
                 }
                 ts_and(current, union);
+                store.rev_set(col_size[c], sz);
             }
+            let mut table_changed = false;
             for (w, &cur) in current.iter().enumerate() {
-                rev_store_word(store, curr_words, w, cur);
+                if cur != rev_load_word(store, curr_words, w) {
+                    table_changed = true;
+                    rev_store_word(store, curr_words, w, cur);
+                }
             }
 
             if ts_is_zero(current) {
@@ -463,11 +517,31 @@ impl Propagator for Extension {
                 let fallback_width = scope_width(store, vars, why);
                 *explain_gen += 1;
                 why.clear();
-                return if push_killers(full, tuples, arity, vars, store, killer_seen, *explain_gen, last_kill_col, why, fallback_width) {
+                return if push_killers(
+                    valid_rows.as_deref().unwrap_or(full),
+                    tuples,
+                    arity,
+                    vars,
+                    store,
+                    killer_seen,
+                    *explain_gen,
+                    last_kill_col,
+                    why,
+                    fallback_width,
+                ) {
                     Err(store.fail_because(std::mem::take(why)))
                 } else {
                     Err(Inconsistency)
                 };
+            }
+
+            // Once every value has been checked, only a lost live tuple can
+            // invalidate a surviving value's support. Wildcard-only shrinkage
+            // commonly leaves the live set intact. Both the live words and
+            // last-seen sizes are reversible, so this also holds after a pop.
+            // First propagation still filters root values absent from all rows.
+            if !first_propagation && !table_changed {
+                return Ok(());
             }
 
             // Pass 1 (detection, no store mutation): collect the unsupported
@@ -488,7 +562,7 @@ impl Propagator for Extension {
                 for &(c, val) in removals.iter() {
                     store.remove(vars[c], val)?;
                 }
-            } else {
+            } else if !removals.is_empty() {
                 // Collect-explain-remove: build EVERY reason against the entry
                 // domains before the first mutation — a removal applied mid-loop
                 // would let a later killer cite a value removed by this same
@@ -501,6 +575,9 @@ impl Propagator for Extension {
                     union.copy_from_slice(&star[c]);
                     if let Some(bs) = supports[c].get(&val) {
                         ts_or(union, bs);
+                    }
+                    if let Some(valid) = valid_rows {
+                        ts_and(union, valid);
                     }
                     *explain_gen += 1;
                     why.clear();

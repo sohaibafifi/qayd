@@ -5,9 +5,9 @@ use qayd::model::IntGlobalConstraint;
 use qayd::model::{Constraint, IntExpr, Model, ModelPackage, Objective, Relation};
 #[cfg(not(feature = "lp-relaxation"))]
 use qayd::orchestrator::SolveError;
-#[cfg(feature = "lp-relaxation")]
-use qayd::orchestrator::SolveStatus;
 use qayd::orchestrator::{solve_model, IgnoreEvents, LinearBackendMode, LinearControls, SolveRequest};
+#[cfg(feature = "lp-relaxation")]
+use qayd::orchestrator::{SearchPhase, SearchPolicy, SolveStatus, ValueSelector, VariableSelector};
 
 fn request(backend: LinearBackendMode) -> SolveRequest {
     SolveRequest {
@@ -120,6 +120,9 @@ fn selected_constraints_use_a_selector_guarded_big_m_row() {
 #[test]
 fn persistent_node_relaxation_prunes_only_after_exact_recertification() {
     let request = SolveRequest {
+        // Replay incumbent phases to visit partial covers under stricter bounds
+        // and exercise node LP independently of automatic objective polarity.
+        search_policy: SearchPolicy::new(vec![SearchPhase::new((0..6).collect(), VariableSelector::Auto, ValueSelector::Hint)]),
         linear: LinearControls {
             backend: LinearBackendMode::Amthal,
             root_time: Duration::from_secs(1),

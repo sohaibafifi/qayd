@@ -6,7 +6,10 @@ use crate::expr::Expr;
 use crate::lcg::clause::{ClauseSharing, SharedClausePool};
 use crate::lcg::engine::audit_affine_expr_directions;
 use crate::problem::Objective as ProblemObjective;
-use crate::search::{optimize_seeded, optimize_seeded_with_scope, Objective, SharedObjectiveBound};
+use crate::search::{
+    optimize_seeded, optimize_seeded_with_scope, optimize_seeded_with_scope_and_relaxation, Objective, SharedObjectiveBound,
+};
+use crate::search_policy::{CompiledSearchPhase, ValueSelector, VariableSelector};
 use crate::Solver;
 
 fn first_linear_incumbent(coeffs: &[i64], minimizing: bool) -> (i64, Vec<i32>) {
@@ -14,8 +17,12 @@ fn first_linear_incumbent(coeffs: &[i64], minimizing: bool) -> (i64, Vec<i32>) {
 }
 
 fn first_linear_incumbent_seeded(coeffs: &[i64], minimizing: bool, seed: u64) -> (i64, Vec<i32>) {
+    first_linear_incumbent_with_domain(coeffs, minimizing, seed, 4)
+}
+
+fn first_linear_incumbent_with_domain(coeffs: &[i64], minimizing: bool, seed: u64, domain_max: i32) -> (i64, Vec<i32>) {
     let mut solver = Solver::new();
-    let vars = (0..coeffs.len()).map(|_| solver.new_var_range(0, 4)).collect::<Vec<_>>();
+    let vars = (0..coeffs.len()).map(|_| solver.new_var_range(0, domain_max)).collect::<Vec<_>>();
     let mut incumbents = Vec::new();
     let _ = optimize_seeded(
         &mut solver,
@@ -138,7 +145,7 @@ fn first_incumbent_uses_the_improving_endpoint_for_linear_terms() {
 }
 
 #[test]
-fn wide_affine_search_separates_feasibility_and_bounded_dive_policies() {
+fn wide_boolean_affine_search_uses_exact_directions_on_the_first_dive() {
     let run = |bounded_dive: bool| {
         let mut solver = Solver::new();
         let variables = (0..64).map(|_| solver.new_var_range(0, 1)).collect::<Vec<_>>();
@@ -171,13 +178,12 @@ fn wide_affine_search_separates_feasibility_and_bounded_dive_policies() {
 
     let complete = run(false);
     let bounded_dive = run(true);
-    assert_eq!(&complete[..2], &[0, 1]);
-    assert_eq!(complete.last(), Some(&64));
-    assert_eq!(bounded_dive.first(), Some(&64));
+    assert_eq!(complete, [64]);
+    assert_eq!(bounded_dive, [64]);
 }
 
 #[test]
-fn constrained_multi_term_objective_finds_feasibility_before_exact_directions() {
+fn constrained_wide_boolean_objective_uses_exact_directions_immediately() {
     let mut solver = Solver::new();
     let variables = (0..9).map(|_| solver.new_var_range(0, 1)).collect::<Vec<_>>();
     let coefficients = vec![1; variables.len()];
@@ -200,8 +206,254 @@ fn constrained_multi_term_objective_finds_feasibility_before_exact_directions() 
         |value, _| incumbents.push(value),
     );
 
-    assert_eq!(incumbents.first(), Some(&0));
-    assert_eq!(incumbents.last(), Some(&1));
+    assert_eq!(incumbents, [1]);
+}
+
+#[test]
+fn wide_boolean_affine_mixed_coefficients_use_improving_values() {
+    let coefficients = [3, -2, 5, -7, 1, 4, -3, 2, -1];
+    for minimizing in [false, true] {
+        let expected = coefficients.iter().map(|&coefficient| i32::from((coefficient < 0) == minimizing)).collect::<Vec<_>>();
+        let optimum = coefficients.iter().zip(&expected).map(|(coefficient, &value)| coefficient * i64::from(value)).sum();
+        for seed in 0..4 {
+            assert_eq!(first_linear_incumbent_with_domain(&coefficients, minimizing, seed, 1), (optimum, expected.clone()));
+        }
+    }
+}
+
+#[test]
+fn wide_affine_objective_with_an_active_non_boolean_term_keeps_the_feasibility_policy() {
+    for non_boolean_terms in [1, 9] {
+        let mut solver = Solver::new();
+        let variables = (0..9).map(|index| solver.new_var_range(0, if index < non_boolean_terms { 4 } else { 1 })).collect::<Vec<_>>();
+        let coefficients = vec![1; variables.len()];
+        let mut incumbents = Vec::new();
+        let (best, _, complete) = optimize_seeded(
+            &mut solver,
+            &variables,
+            Objective::Linear { coeffs: &coefficients, vars: &variables },
+            false,
+            &AtomicBool::new(false),
+            0,
+            None,
+            None,
+            &[],
+            None,
+            Vec::new(),
+            Vec::new(),
+            |value, _| incumbents.push(value),
+        );
+        assert!(complete);
+        assert_eq!(incumbents.first(), Some(&0));
+        assert_eq!(best.map(|(_, value)| value), Some(9 + 3 * non_boolean_terms));
+    }
+}
+
+#[test]
+fn wide_boolean_affine_incumbent_phases_do_not_limit_improvement_to_one() {
+    let mut solver = Solver::new();
+    let selector = solver.new_var_range(0, 2);
+    let terms = (0..9).map(|_| solver.new_var_range(0, 1)).collect::<Vec<_>>();
+    for &term in &terms {
+        linear(&mut solver, &[1, -1], &[term, selector], Relation::Le, 0);
+    }
+    let coefficients = vec![1; terms.len()];
+    let mut search = vec![selector];
+    search.extend(&terms);
+    let phases = vec![CompiledSearchPhase {
+        scope: vec![selector],
+        semantic_salts: vec![0],
+        variable: VariableSelector::InputOrder,
+        value: ValueSelector::Min,
+    }];
+    let mut incumbents = Vec::new();
+    let (best, _, complete) = optimize_seeded_with_scope_and_relaxation(
+        &mut solver,
+        &search,
+        None,
+        Objective::Linear { coeffs: &coefficients, vars: &terms },
+        false,
+        &AtomicBool::new(false),
+        0,
+        None,
+        None,
+        &[],
+        None,
+        Vec::new(),
+        Vec::new(),
+        phases,
+        None,
+        |value, assignment| {
+            assert!(assignment[1..].iter().all(|&term| term <= assignment[0]));
+            assert_eq!(value, assignment[1..].iter().map(|&term| i64::from(term)).sum::<i64>());
+            incumbents.push(value);
+        },
+    );
+    assert!(complete);
+    assert_eq!(best.map(|(_, value)| value), Some(9));
+    assert_eq!(incumbents, [0, 9]);
+}
+
+#[test]
+fn wide_boolean_affine_initial_hints_and_explicit_value_selectors_keep_precedence() {
+    for (selector, hinted, minimizing, expected_first) in [
+        (None, 9, false, 0),
+        (None, 1, false, 8),
+        (Some(ValueSelector::Min), 0, false, 0),
+        (Some(ValueSelector::Max), 0, true, 9),
+        (Some(ValueSelector::Hint), 9, false, 0),
+        (Some(ValueSelector::Auto), 0, false, 9),
+    ] {
+        let mut solver = Solver::new();
+        let variables = (0..9).map(|_| solver.new_var_range(0, 1)).collect::<Vec<_>>();
+        let coefficients = vec![1; variables.len()];
+        let initial_phase = (0..variables.len()).map(|index| (index < hinted).then_some(0)).collect();
+        let phases = selector
+            .map(|value| {
+                vec![CompiledSearchPhase {
+                    scope: variables.clone(),
+                    semantic_salts: (0..variables.len() as u64).collect(),
+                    variable: VariableSelector::Auto,
+                    value,
+                }]
+            })
+            .unwrap_or_default();
+        let mut first = None;
+        let (best, _, complete) = optimize_seeded_with_scope_and_relaxation(
+            &mut solver,
+            &variables,
+            None,
+            Objective::Linear { coeffs: &coefficients, vars: &variables },
+            minimizing,
+            &AtomicBool::new(false),
+            0,
+            None,
+            None,
+            &[],
+            None,
+            initial_phase,
+            Vec::new(),
+            phases,
+            None,
+            |value, _| {
+                first.get_or_insert(value);
+            },
+        );
+        assert_eq!(first, Some(expected_first), "selector={selector:?}, hinted={hinted}");
+        assert!(complete);
+        assert_eq!(best.map(|(_, value)| value), Some(if minimizing { 0 } else { 9 }));
+    }
+}
+
+#[test]
+fn wide_boolean_affine_directions_ignore_zero_and_cancelled_non_boolean_terms() {
+    let mut solver = Solver::new();
+    let terms = (0..9).map(|_| solver.new_var_range(0, 1)).collect::<Vec<_>>();
+    let cancelled = solver.new_var_range(0, 4);
+    let zero = solver.new_var_range(0, 4);
+    let mut objective_vars = terms.clone();
+    objective_vars.extend([cancelled, cancelled, zero]);
+    let mut coefficients = vec![1; terms.len()];
+    coefficients.extend([7, -7, 0]);
+    let mut search = terms;
+    search.extend([cancelled, zero]);
+    let mut first = None;
+    let (best, _, complete) = optimize_seeded(
+        &mut solver,
+        &search,
+        Objective::Linear { coeffs: &coefficients, vars: &objective_vars },
+        false,
+        &AtomicBool::new(false),
+        0,
+        None,
+        None,
+        &[],
+        None,
+        Vec::new(),
+        Vec::new(),
+        |value, assignment| {
+            if first.replace(value).is_none() {
+                assert_eq!(&assignment[9..], &[0, 0], "early objective guidance must preserve neutral terms' initial minimum values");
+            }
+        },
+    );
+    assert!(complete);
+    assert_eq!(first, Some(9));
+    assert_eq!(best.map(|(_, value)| value), Some(9));
+}
+
+#[test]
+fn constrained_wide_boolean_affine_objectives_with_mixed_signs_match_brute_force() {
+    let coefficients = [3, -2, 5, -7, 1, 4, -3, 2, -1, 6];
+    let feasible_values = (0u16..1 << coefficients.len())
+        .filter(|bits| bits.count_ones() <= 4 && (bits & 1) + ((bits >> 1) & 1) == 1)
+        .map(|bits| coefficients.iter().enumerate().map(|(index, coefficient)| coefficient * i64::from((bits >> index) & 1)).sum::<i64>())
+        .collect::<Vec<_>>();
+    for minimizing in [false, true] {
+        let optimum = if minimizing { *feasible_values.iter().min().unwrap() } else { *feasible_values.iter().max().unwrap() };
+        for representation in 0..3 {
+            let mut solver = Solver::new();
+            let terms = (0..coefficients.len()).map(|_| solver.new_var_range(0, 1)).collect::<Vec<_>>();
+            linear(&mut solver, &vec![1; terms.len()], &terms, Relation::Le, 4);
+            linear(&mut solver, &[1, 1], &terms[..2], Relation::Eq, 1);
+            let offset = if representation == 0 { 0 } else { 7 };
+            let mut search = terms.clone();
+            let materialized = (representation == 2).then(|| solver.new_var_range(-50, 50));
+            if let Some(materialized) = materialized {
+                let mut equality_coefficients = coefficients.to_vec();
+                equality_coefficients.push(-1);
+                let mut equality_terms = terms.clone();
+                equality_terms.push(materialized);
+                linear(&mut solver, &equality_coefficients, &equality_terms, Relation::Eq, -offset);
+                search.push(materialized);
+            }
+            let expression = Expr::Add(
+                std::iter::once(Expr::Const(offset))
+                    .chain(
+                        coefficients
+                            .iter()
+                            .zip(&terms)
+                            .map(|(&coefficient, &term)| Expr::Mul(vec![Expr::Const(coefficient), Expr::Var(term)])),
+                    )
+                    .collect(),
+            );
+            let objective = match representation {
+                0 => Objective::Linear { coeffs: &coefficients, vars: &terms },
+                1 => Objective::Expr(&expression),
+                _ => Objective::VarWithAffine { objective: materialized.unwrap(), coeffs: &coefficients, vars: &terms },
+            };
+            let mut previous = None;
+            let (best, _, complete) = optimize_seeded(
+                &mut solver,
+                &search,
+                objective,
+                minimizing,
+                &AtomicBool::new(false),
+                0,
+                None,
+                None,
+                &[],
+                None,
+                Vec::new(),
+                Vec::new(),
+                |value, assignment| {
+                    let terms = &assignment[..coefficients.len()];
+                    assert!(terms.iter().all(|&term| (0..=1).contains(&term)));
+                    assert!(terms.iter().sum::<i32>() <= 4);
+                    assert_eq!(terms[0] + terms[1], 1);
+                    assert_eq!(
+                        value,
+                        offset + terms.iter().zip(&coefficients).map(|(&term, coefficient)| i64::from(term) * coefficient).sum::<i64>()
+                    );
+                    if let Some(previous) = previous.replace(value) {
+                        assert!(if minimizing { value < previous } else { value > previous });
+                    }
+                },
+            );
+            assert!(complete, "representation={representation}, minimizing={minimizing}");
+            assert_eq!(best.map(|(_, value)| value), Some(optimum + offset));
+        }
+    }
 }
 
 #[test]

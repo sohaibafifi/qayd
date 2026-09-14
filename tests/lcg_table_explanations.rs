@@ -17,6 +17,33 @@ use qayd::{optimize_with, solve_search, SearchControl, SolveStats, Solver, VarId
 
 static NEVER_STOP: AtomicBool = AtomicBool::new(false);
 
+#[test]
+fn repeated_scope_reasons_exclude_intrinsically_impossible_rows() {
+    let cases = [
+        vec![vec![0, 1], vec![1, 2]],
+        vec![vec![0, 1], vec![1, 2], vec![2, 2]],
+        vec![vec![STAR, 0, 1], vec![STAR, 1, 1], vec![2, STAR, 2]],
+    ];
+    for tuples in cases {
+        for force_scope in [false, true] {
+            for minimizing in [false, true] {
+                let mut solver = Solver::new();
+                solver.set_force_scope_reasons(force_scope);
+                let x = solver.new_var_range(0, 2);
+                extension(&mut solver, &vec![x; tuples[0].len()], &tuples, true);
+                let mut expected = (0..=2)
+                    .filter(|&actual| tuples.iter().any(|row| row.iter().all(|&value| value == STAR || value == actual)))
+                    .collect::<Vec<_>>();
+                if !minimizing {
+                    expected.reverse();
+                }
+                let (best, _) = optimize_with(&mut solver, &[x], x, minimizing, &NEVER_STOP, |_| {});
+                assert_eq!(best.map(|(_, value)| value), expected.first().copied());
+            }
+        }
+    }
+}
+
 /// Does assignment `a` match tuple `t` (STAR matches anything)?
 fn tuple_matches(t: &[i32], a: &[i32]) -> bool {
     t.iter().zip(a).all(|(&p, &v)| p == STAR || p == v)

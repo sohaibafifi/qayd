@@ -29,9 +29,9 @@ const REPHASE_PERIOD: u64 = 4;
 /// of a symbolic objective. The root interval check remains enabled above it.
 const MAX_EXPR_SINGLETON_PROBE_WORK: usize = 32_768;
 
-/// Small objectives benefit from directed branching on the first dive. Large
-/// objectives first need a cheap feasible assignment before their decisions
-/// can safely dominate the feasibility heuristic.
+/// Small objectives can prioritize their variables on the first dive. Wide
+/// Boolean affine objectives guide values immediately while preserving the
+/// feasibility variable order; other wide objectives wait for an incumbent.
 const MAX_IMMEDIATE_OBJECTIVE_VARIABLES: usize = 8;
 
 /// Literal evaluations reserved for a one-shot guarded-objective phase hint.
@@ -82,6 +82,7 @@ struct ObjectiveImpact {
     directions: Vec<i8>,
     preferred_values: Vec<Option<i32>>,
     defer_until_incumbent: bool,
+    boolean_affine: bool,
 }
 
 fn constant_expr_value(expression: &Expr) -> Option<i128> {
@@ -317,6 +318,7 @@ impl ObjectiveImpact {
         let mut preferred_values = vec![None; nvars];
         let mut nonlinear = false;
         let mut defer_structural = false;
+        let mut affine = false;
         let bounded_dive = matches!(
             objective,
             Objective::BoundedDiveVarWithAffine { .. } | Objective::BoundedDiveLinear { .. } | Objective::BoundedDiveExpr(_)
@@ -333,12 +335,13 @@ impl ObjectiveImpact {
             | Objective::Linear { coeffs, vars }
             | Objective::BoundedDiveLinear { coeffs, vars }
             | Objective::BoundedDiveVarWithAffine { coeffs, vars, .. } => {
+                affine = true;
                 // Every Boolean decision fixes its complete contribution to a
                 // linear objective. A bounded dive can therefore prioritize a
                 // wide Boolean sum cheaply. The complete pass preserves the
-                // feasibility variable order for every wide objective and only
-                // uses the exact coefficient signs for value selection after
-                // it has found an incumbent.
+                // feasibility variable order for every wide objective. Boolean
+                // terms use their exact coefficient signs immediately; other
+                // wide objectives wait for a feasibility incumbent.
                 let boolean_objective =
                     vars.iter().all(|&variable| store.size(variable) <= 2 && store.min(variable) >= 0 && store.max(variable) <= 1);
                 let prioritize_terms = vars.len() <= MAX_IMMEDIATE_OBJECTIVE_VARIABLES || (bounded_dive && boolean_objective);
@@ -373,10 +376,11 @@ impl ObjectiveImpact {
                         // infeasible all-target assignment.
                         impact.fill(0);
                     }
-                } else if !affine_expr_directions(expression, factor, &mut signed)
-                    && !monotone_expr_directions(expression, factor as i8, &mut signed)
-                {
-                    nonlinear = true;
+                } else {
+                    affine = affine_expr_directions(expression, factor, &mut signed);
+                    if !affine && !monotone_expr_directions(expression, factor as i8, &mut signed) {
+                        nonlinear = true;
+                    }
                 }
                 if nonlinear {
                     // An otherwise unsupported nonlinear objective still
@@ -394,19 +398,28 @@ impl ObjectiveImpact {
         }
         let directions: Vec<i8> = signed.into_iter().map(|coeff| coeff.signum() as i8).collect();
         let mut active_variables = 0usize;
+        let mut boolean_affine = affine;
+        let mut active_direction = false;
         for (index, ((coefficient, direction), preferred)) in impact.iter().zip(&directions).zip(&preferred_values).enumerate() {
             let variable = VarId(u32::try_from(index).ok()?);
             if store.size(variable) > 1 && (*coefficient != 0 || *direction != 0 || preferred.is_some()) {
                 active_variables += 1;
             }
+            if store.size(variable) > 1 && *direction != 0 {
+                active_direction = true;
+                boolean_affine &= store.min(variable) >= 0 && store.max(variable) <= 1;
+            }
         }
-        // A wide objective first follows the feasibility heuristic. Once that
-        // supplies a verified incumbent, its exact value directions become a
-        // useful improvement policy. A bounded dive opts into those directions
-        // immediately and remains capped independently of model provenance.
+        // Zero and cancelling terms must not invent a Boolean value policy.
+        // Fixed non-Boolean terms are constants and do not affect branching.
+        boolean_affine &= active_direction;
+        // Boolean affine values can follow the exact improving direction from
+        // the first decision without changing the feasibility variable order.
+        // Other wide objectives retain the feasibility-first policy unless a
+        // bounded dive explicitly opts into immediate objective guidance.
         let defer_until_incumbent =
             !bounded_dive && (nonlinear || defer_structural || active_variables > MAX_IMMEDIATE_OBJECTIVE_VARIABLES);
-        (active_variables > 0).then_some(Self { coeffs: impact, directions, preferred_values, defer_until_incumbent })
+        (active_variables > 0).then_some(Self { coeffs: impact, directions, preferred_values, defer_until_incumbent, boolean_affine })
     }
 
     fn score(&self, solver: &Solver, var: VarId) -> u128 {
@@ -612,9 +625,9 @@ impl Cdcl<'_> {
         })
     }
 
-    /// The decision literal for `v`: `[v = p]` toward the saved phase `p` when it
-    /// is still in the domain (skipped on a rephasing segment), else a polarity
-    /// endpoint chosen by [`rephase_value`](Self::rephase_value).
+    /// Choose an in-domain equality toward a saved phase or an improving value.
+    /// Automatic Boolean affine decisions do not replay a poorer incumbent's
+    /// phases, but caller-provided hints retain their requested precedence.
     fn decision_lit(&self, v: VarId, phase: &[Option<i32>], objective: Option<&ObjectiveImpact>) -> Lit {
         self.decision_lit_with_policy(v, phase, objective, false)
     }
@@ -631,7 +644,13 @@ impl Cdcl<'_> {
     ) -> Lit {
         let nonlinear_objective_variable =
             objective.is_some_and(|impact| impact.prefers_max(v).is_none() && impact.score(self.solver, v) > 0);
-        let honor_saved_phase = if nonlinear_objective_variable { honor_directionless_phase } else { self.rephase_mode == 0 };
+        let explicit_phase = self.initial_phase.len() == self.solver.store.num_vars() && self.initial_phase[v.index()].is_some();
+        let directed_boolean = objective.is_some_and(|impact| impact.boolean_affine && impact.prefers_max(v).is_some());
+        let honor_saved_phase = if nonlinear_objective_variable {
+            honor_directionless_phase
+        } else {
+            self.rephase_mode == 0 && (!directed_boolean || explicit_phase)
+        };
         let val = match phase[v.index()] {
             Some(p) if honor_saved_phase && self.solver.store.contains(v, p) => p,
             _ => self.rephase_value(v, objective),
@@ -1283,11 +1302,11 @@ impl Cdcl<'_> {
             if guarded_hint_restart.is_some_and(|restart| restart != self.restarts_done) {
                 guarded_hint_restart = None;
             }
-            // A nonlinear occurrence score has no sound improving polarity.
-            // Activate it only after the regular feasibility heuristic has
-            // supplied an incumbent and therefore a useful objective bound.
+            // Boolean affine objectives may guide their terms immediately.
+            // Other deferred policies need an incumbent and its useful bound.
+            let has_incumbent = best.is_some() || enforced.is_some();
             let active_objective =
-                objective_impact.as_ref().filter(|impact| !impact.defer_until_incumbent || best.is_some() || enforced.is_some());
+                objective_impact.as_ref().filter(|impact| impact.boolean_affine || !impact.defer_until_incumbent || has_incumbent);
             match self.select_search_decision(vars, primary_branch_scope, active_objective) {
                 None => {
                     if self.stopped() {
@@ -1349,7 +1368,11 @@ impl Cdcl<'_> {
                 }
                 Some(decision) => {
                     stats.nodes += 1;
-                    let lit = self.selected_decision_lit(decision, &phase, active_objective, guarded_hint_restart.is_some());
+                    // Early Boolean guidance must not activate the unrelated
+                    // variables' seeded polarity before the first incumbent.
+                    let value_objective = active_objective
+                        .filter(|impact| !impact.defer_until_incumbent || has_incumbent || impact.prefers_max(decision.variable).is_some());
+                    let lit = self.selected_decision_lit(decision, &phase, value_objective, guarded_hint_restart.is_some());
                     self.decide(lit).expect("in-domain decision cannot fail");
                     if !self.propagate_and_learn() {
                         if self.stopped() || self.conflict_budget_exhausted() {
