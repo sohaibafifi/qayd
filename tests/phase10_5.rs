@@ -365,8 +365,17 @@ fn semantic_integer_local_search_accepts_satisfaction_models() {
         ..SolveRequest::default()
     };
 
-    let result = solve_model_silent(&ModelPackage::new(model), &request).unwrap();
+    let mut progress_events = 0;
+    let mut sink = EventCallback(|event| {
+        if let SolveEvent::Progress { objectives, .. } = event {
+            assert!(objectives.is_empty(), "the internal satisfaction score is not a semantic objective");
+            progress_events += 1;
+        }
+        Ok(EventControl::Continue)
+    });
+    let result = solve_model(&ModelPackage::new(model), &request, &mut sink).unwrap();
 
+    assert!(progress_events > 0);
     assert_eq!(result.status(), SolveStatus::Satisfiable);
     assert_eq!(result.primal().unwrap().assignment().integers, [Some(1)]);
     assert!(result.primal().unwrap().objectives().is_empty());

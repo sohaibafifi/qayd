@@ -26,7 +26,7 @@ use qayd::constraints::linear::{linear, Relation};
 use qayd::constraints::primitives::{all_different, all_equal, element, maximum, minimum, precedence_with_covered};
 use qayd::constraints::scheduling::{bin_packing, cumulative, no_overlap};
 use qayd::constraints::table::{extension, mdd, regular, Dfa, Mdd, MddArc, STAR};
-use qayd::engines::ls::cop::{solve_ls, LocalRhs, LocalSearchSpec, LsConfig};
+use qayd::engines::ls::cop::{solve_ls_capped, LocalRhs, LocalSearchSpec, LsConfig};
 use qayd::expr::{self, Expr};
 use qayd::problem::{Objective, Problem};
 use qayd::{Solver, VarId};
@@ -82,12 +82,12 @@ fn ls_feasible(assignment: &[i32], post: impl FnOnce(&mut Solver, &mut LocalSear
     }
     post(&mut solver, &mut spec, &vars);
     let problem = Problem { solver, search: vars.clone(), objective: Some(Objective::Var(true, vars[0])) };
-    // Already-stopped flag: the mutable-empty early path runs before the search
-    // loop is entered, so no iteration ever happens - this only guards against a
-    // hang if that invariant ever regressed.
-    let stop = AtomicBool::new(true);
+    // Construction now honors cancellation as well. Use a zero iteration cap
+    // to inspect only the complete assignment without cancelling that check.
+    let stop = AtomicBool::new(false);
     let mut fired = false;
-    solve_ls(problem, spec, &stop, 1, LsConfig::default(), |_v, _sol, _src| fired = true);
+    let outcome = solve_ls_capped(problem, spec, &stop, 1, LsConfig::default(), 0, |_v, _sol, _src| fired = true);
+    assert_eq!(outcome.iterations, 0);
     fired
 }
 

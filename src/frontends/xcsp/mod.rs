@@ -1,7 +1,7 @@
 //! XCSP3-core front-end: parse via `xcsp3-rust-parser`, build through
 //! [`callback::Model`], solve, and report competition-style output.
 
-mod callback;
+pub(crate) mod callback;
 
 use std::collections::BTreeSet;
 use std::fmt::Display;

@@ -115,6 +115,60 @@ fn objective_only_controls_are_not_forwarded_to_satisfaction_components() {
     assert_eq!(result.primal().unwrap().objectives(), &[1]);
 }
 
+fn mixed_local_search_package() -> ModelPackage {
+    let mut model = Model::new();
+    let cost = model.int_range(1, 1);
+    let left = model.bool_var();
+    let right = model.bool_var();
+    model.add_constraint(Constraint::Linear { terms: vec![(1, left), (1, right)], relation: Relation::Eq, rhs: 1 });
+    model.add_objective(Objective::IntExpr { minimize: true, expr: cost.into() });
+    ModelPackage::new(model)
+}
+
+#[test]
+fn local_search_decomposition_keeps_satisfaction_progress_objective_free() {
+    for threads in [1, 3] {
+        let package = mixed_local_search_package();
+        let request = SolveRequest {
+            mode: SolveMode::LocalSearch,
+            threads,
+            limits: SolveLimits { iterations: Some(300), ..SolveLimits::default() },
+            ..SolveRequest::default()
+        };
+        let plan = compile_model_plan(&package, &request, &SolveBudget::new(None)).unwrap();
+        assert!(matches!(plan.description(), ExecutablePlan::Decomposed { components, .. } if components.len() == 2));
+        let mut progress_events = 0;
+        let mut sink = EventCallback(|event| {
+            if let SolveEvent::Progress { objectives, .. } = event {
+                assert_eq!(objectives, &[1], "a satisfaction component must not add a tier to parent progress");
+                progress_events += 1;
+            }
+            Ok(EventControl::Continue)
+        });
+        let result = solve_model(&package, &request, &mut sink).unwrap();
+        assert_eq!(result.status(), SolveStatus::Satisfiable);
+        assert!(progress_events > 0);
+        assert_eq!(result.primal().unwrap().objectives(), &[1]);
+        let values = &result.primal().unwrap().assignment().integers;
+        assert_eq!(values[0], Some(1));
+        assert_eq!(values[1].unwrap() + values[2].unwrap(), 1);
+        assert!(result.proof().is_none());
+        result.validate_contract().unwrap();
+    }
+}
+
+#[test]
+fn interrupted_local_search_component_progress_is_not_global_feasibility() {
+    let request = SolveRequest { mode: SolveMode::LocalSearch, ..SolveRequest::default() };
+    let mut sink =
+        EventCallback(|event| Ok(if matches!(event, SolveEvent::Progress { .. }) { EventControl::Stop } else { EventControl::Continue }));
+    let result = solve_model(&mixed_local_search_package(), &request, &mut sink).unwrap();
+    assert_eq!(result.status(), SolveStatus::Unknown);
+    assert!(result.primal().is_none());
+    assert!(result.proof().is_none());
+    result.validate_contract().unwrap();
+}
+
 #[test]
 fn an_objective_spanning_components_stays_on_the_single_engine_path() {
     let mut model = Model::new();

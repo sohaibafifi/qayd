@@ -4,6 +4,7 @@ mod invariants;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::constraints::linear::Relation;
 use crate::constraints::table::{Dfa, Mdd, STAR};
@@ -36,6 +37,8 @@ const MIN_CONFLICTS_FULL: usize = 24;
 /// Min-conflicts (#1b): random domain samples added to the candidate set on a
 /// large domain, alongside the current value and any structural suggestions.
 const MIN_CONFLICTS_SAMPLES: usize = 8;
+const MAX_OBJECTIVE_SCOPE_VARIABLES: usize = 65_536;
+const MAX_OBJECTIVE_SCOPE_DEPTH: usize = 256;
 
 #[derive(Clone)]
 pub(crate) enum LocalConstraint {
@@ -103,6 +106,12 @@ pub(crate) enum LocalConstraint {
         array: Vec<VarId>,
         value: i32,
     },
+    ElementConst {
+        array: Arc<[i32]>,
+        index: VarId,
+        target: VarId,
+        start_index: i32,
+    },
     Cumulative {
         starts: Vec<VarId>,
         durations: Vec<LocalRhs>,
@@ -152,6 +161,7 @@ enum Functional {
     Expr { target: VarId, expr: Expr },
     Linear { target: VarId, coeff: i64, terms: Vec<(i64, VarId)>, rhs: i64 },
     Element { target: VarId, array: Vec<VarId>, index: VarId, start_index: i32 },
+    ElementConst { target: VarId, array: Arc<[i32]>, index: VarId, start_index: i32 },
     BoolTable { target: VarId, left: VarId, right: VarId, true_pairs: Vec<(i32, i32)> },
 }
 
@@ -165,6 +175,7 @@ pub enum LocalRhs {
 pub struct LocalSearchSpec {
     constraints: Vec<LocalConstraint>,
     functionals: Vec<Functional>,
+    functionals_normalized: bool,
     derived: Vec<bool>,
     /// Variables owned by the semantic model, as opposed to physical helper
     /// variables introduced while posting constraints.
@@ -356,7 +367,7 @@ impl LocalDomain {
     /// Move-candidate values for a range-only domain (`values` empty): both
     /// endpoints plus a bounded set of uniform interior draws over `[min,max]`.
     /// Every emitted value lies in `[min,max]`, which for a contiguous range
-    /// (verified in [`LocalModel::new`]) is a genuine domain member. Fills `out`;
+    /// (verified in [`LocalModel::new_interruptible`]) is a genuine domain member. Fills `out`;
     /// callers with a materialised domain iterate `values` directly instead.
     fn sample_range(&self, seed: u64, out: &mut Vec<i32>) {
         out.clear();
@@ -699,6 +710,11 @@ fn functional_from_extension(vars: &[VarId], tuples: &[Vec<i32>]) -> Option<Func
     Some(Functional::BoolTable { target, left, right, true_pairs })
 }
 
+fn constant_element_value(array: &[i32], index: i32, start_index: i32) -> Option<i32> {
+    let offset = usize::try_from(i64::from(index) - i64::from(start_index)).ok()?;
+    array.get(offset).copied()
+}
+
 fn relation_violation(lhs: i64, rel: Relation, rhs: i64) -> i64 {
     match rel {
         Relation::Eq => (lhs - rhs).abs(),
@@ -808,6 +824,10 @@ fn constraint_vars(constraint: &LocalConstraint, out: &mut Vec<VarId>) {
                 out.extend(row.iter().copied());
             }
         }
+        LocalConstraint::ElementConst { index, target, .. } => {
+            out.push(*index);
+            out.push(*target);
+        }
         LocalConstraint::Count { vars, rhs, .. }
         | LocalConstraint::NValues { vars, rhs, .. }
         | LocalConstraint::Extremum { vars, rhs, .. } => {
@@ -868,6 +888,7 @@ fn functional_inputs(functional: &Functional, out: &mut Vec<VarId>) {
             out.push(*index);
             out.extend(array.iter().copied());
         }
+        Functional::ElementConst { index, .. } => out.push(*index),
         Functional::BoolTable { left, right, .. } => {
             out.push(*left);
             out.push(*right);
@@ -880,8 +901,67 @@ fn functional_target(functional: &Functional) -> VarId {
         Functional::Expr { target, .. }
         | Functional::Linear { target, .. }
         | Functional::Element { target, .. }
+        | Functional::ElementConst { target, .. }
         | Functional::BoolTable { target, .. } => *target,
     }
+}
+
+fn objective_scope_step(stop: &AtomicBool, remaining: &mut u64) -> Option<()> {
+    if stop.load(Ordering::Acquire) {
+        return None;
+    }
+    *remaining = remaining.checked_sub(1)?;
+    Some(())
+}
+
+fn objective_scope_variable(variable: VarId, needed: &mut [bool], stop: &AtomicBool, remaining: &mut u64) -> Option<()> {
+    objective_scope_step(stop, remaining)?;
+    *needed.get_mut(variable.index())? = true;
+    Some(())
+}
+
+fn objective_scope_expression(expression: &Expr, needed: &mut [bool], stop: &AtomicBool, remaining: &mut u64, depth: usize) -> Option<()> {
+    objective_scope_step(stop, remaining)?;
+    if depth >= MAX_OBJECTIVE_SCOPE_DEPTH {
+        return None;
+    }
+    match expression {
+        Expr::Const(_) => {}
+        Expr::Var(variable) => objective_scope_variable(*variable, needed, stop, remaining)?,
+        Expr::Neg(inner) | Expr::Abs(inner) | Expr::Not(inner) => {
+            objective_scope_expression(inner, needed, stop, remaining, depth + 1)?;
+        }
+        Expr::Sub(left, right)
+        | Expr::Div(left, right)
+        | Expr::Mod(left, right)
+        | Expr::Eq(left, right)
+        | Expr::Ne(left, right)
+        | Expr::Lt(left, right)
+        | Expr::Le(left, right)
+        | Expr::Gt(left, right)
+        | Expr::Ge(left, right)
+        | Expr::Imp(left, right)
+        | Expr::Iff(left, right) => {
+            objective_scope_expression(left, needed, stop, remaining, depth + 1)?;
+            objective_scope_expression(right, needed, stop, remaining, depth + 1)?;
+        }
+        Expr::Add(children)
+        | Expr::Mul(children)
+        | Expr::Min(children)
+        | Expr::Max(children)
+        | Expr::And(children)
+        | Expr::Or(children) => {
+            for child in children {
+                objective_scope_expression(child, needed, stop, remaining, depth + 1)?;
+            }
+        }
+        Expr::IfThenElse(condition, then_value, else_value) => {
+            objective_scope_expression(condition, needed, stop, remaining, depth + 1)?;
+            objective_scope_expression(then_value, needed, stop, remaining, depth + 1)?;
+            objective_scope_expression(else_value, needed, stop, remaining, depth + 1)?;
+        }
+    }
+    Some(())
 }
 
 fn constraint_has_lex_touching(constraint: &LocalConstraint, variables: &HashSet<VarId>) -> bool {
@@ -911,20 +991,53 @@ fn mismatch_symbols(functionals: &[Functional], counter: VarId) -> Option<Vec<(V
     Some(symbols)
 }
 
-fn order_functionals(mut functionals: Vec<Functional>) -> Option<Vec<Functional>> {
+fn order_functionals(mut functionals: Vec<Functional>, stop: &AtomicBool) -> Option<Vec<Functional>> {
     let mut targets = HashSet::with_capacity(functionals.len());
-    if functionals.iter().any(|functional| !targets.insert(functional_target(functional))) {
+    for functional in &functionals {
+        if stop.load(Ordering::Acquire)
+            || (!matches!(functional, Functional::ElementConst { .. }) && !targets.insert(functional_target(functional)))
+        {
+            return None;
+        }
+    }
+    // Constant lookups always retain their exact constraint. Prefer any other
+    // producer of their target, including definitions posted after the lookup.
+    functionals.retain(|functional| {
+        !stop.load(Ordering::Acquire)
+            && (!matches!(functional, Functional::ElementConst { .. }) || targets.insert(functional_target(functional)))
+    });
+    if stop.load(Ordering::Acquire) {
         return None;
     }
     let mut ordered = Vec::with_capacity(functionals.len());
     while !functionals.is_empty() {
-        let remaining_targets = functionals.iter().map(functional_target).collect::<HashSet<_>>();
+        let mut remaining_targets = HashSet::with_capacity(functionals.len());
+        for functional in &functionals {
+            if stop.load(Ordering::Acquire) {
+                return None;
+            }
+            remaining_targets.insert(functional_target(functional));
+        }
         let ready = functionals.iter().position(|functional| {
+            if stop.load(Ordering::Acquire) {
+                return false;
+            }
             let mut inputs = Vec::new();
             functional_inputs(functional, &mut inputs);
-            inputs.into_iter().all(|input| !remaining_targets.contains(&input))
+            inputs.into_iter().all(|input| !stop.load(Ordering::Acquire) && !remaining_targets.contains(&input))
         });
-        ordered.push(functionals.remove(ready?));
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        if let Some(ready) = ready {
+            ordered.push(functionals.remove(ready));
+        } else {
+            // A newly derived lookup must not make a previously searchable
+            // cyclic relation unsupported. Its target becomes mutable again;
+            // the exact lookup predicate still checks every candidate.
+            let demoted = functionals.iter().position(|functional| matches!(functional, Functional::ElementConst { .. }))?;
+            functionals.remove(demoted);
+        }
     }
     Some(ordered)
 }
@@ -965,8 +1078,121 @@ impl LocalSearchSpec {
         self.derived.get(variable.index()).copied().unwrap_or(false)
     }
 
+    /// Finalize dependency ownership before a spec is used both for search and
+    /// candidate repair. Demoted lookup targets must be fixed from the candidate
+    /// just like other primary variables during canonical replay.
+    #[cfg(test)]
+    pub(crate) fn normalize_functionals(&mut self) -> bool {
+        self.normalize_functionals_interruptible(&AtomicBool::new(false))
+    }
+
+    pub(crate) fn normalize_functionals_interruptible(&mut self, stop: &AtomicBool) -> bool {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.functionals_normalized {
+            return true;
+        }
+        let Some(functionals) = order_functionals(std::mem::take(&mut self.functionals), stop) else {
+            self.derived.fill(false);
+            self.mark_unsupported();
+            return false;
+        };
+        self.derived.fill(false);
+        for functional in &functionals {
+            if stop.load(Ordering::Acquire) {
+                self.mark_unsupported();
+                return false;
+            }
+            self.derived[functional_target(functional).index()] = true;
+        }
+        self.functionals = functionals;
+        self.functionals_normalized = true;
+        true
+    }
+
     pub(crate) fn is_decision(&self, variable: VarId) -> bool {
         self.decisions.get(variable.index()).copied().unwrap_or(false)
+    }
+
+    /// Semantic decisions that control the objective through the normalized
+    /// functional graph. This is a conservative scope for search guidance;
+    /// expressions are traversed structurally, without algebraic cancellation.
+    /// Work, variable storage, and expression depth are bounded independently.
+    pub(crate) fn objective_decision_scope(&self, problem: &Problem, stop: &AtomicBool, max_work: u64) -> Option<Vec<VarId>> {
+        if stop.load(Ordering::Acquire) || !self.functionals_normalized || self.unsupported > 0 {
+            return None;
+        }
+        let variables = problem.solver.store.num_vars();
+        if variables > MAX_OBJECTIVE_SCOPE_VARIABLES {
+            return None;
+        }
+        let mut remaining = max_work.checked_sub(variables as u64)?;
+        let mut needed = vec![false; variables];
+        match problem.objective.as_ref()? {
+            Objective::Var(_, variable) | Objective::VarWithAffine(_, variable, _, _) => {
+                objective_scope_variable(*variable, &mut needed, stop, &mut remaining)?;
+            }
+            Objective::Linear(_, coefficients, variables) => {
+                if coefficients.len() != variables.len() {
+                    return None;
+                }
+                for (&coefficient, &variable) in coefficients.iter().zip(variables) {
+                    objective_scope_step(stop, &mut remaining)?;
+                    if coefficient != 0 {
+                        objective_scope_variable(variable, &mut needed, stop, &mut remaining)?;
+                    }
+                }
+            }
+            Objective::Expr(_, expression) => objective_scope_expression(expression, &mut needed, stop, &mut remaining, 0)?,
+        }
+        for functional in self.functionals.iter().rev() {
+            objective_scope_step(stop, &mut remaining)?;
+            let target = functional_target(functional);
+            let required = needed.get_mut(target.index())?;
+            if !*required {
+                continue;
+            }
+            *required = false;
+            match functional {
+                Functional::Expr { expr, .. } => objective_scope_expression(expr, &mut needed, stop, &mut remaining, 0)?,
+                Functional::Linear { terms, .. } => {
+                    for &(_, variable) in terms {
+                        objective_scope_variable(variable, &mut needed, stop, &mut remaining)?;
+                    }
+                }
+                Functional::Element { array, index, .. } => {
+                    objective_scope_variable(*index, &mut needed, stop, &mut remaining)?;
+                    for &variable in array {
+                        objective_scope_variable(variable, &mut needed, stop, &mut remaining)?;
+                    }
+                }
+                Functional::ElementConst { index, .. } => objective_scope_variable(*index, &mut needed, stop, &mut remaining)?,
+                Functional::BoolTable { left, right, .. } => {
+                    objective_scope_variable(*left, &mut needed, stop, &mut remaining)?;
+                    objective_scope_variable(*right, &mut needed, stop, &mut remaining)?;
+                }
+            }
+        }
+        let mut scope = Vec::new();
+        for (index, required) in needed.into_iter().enumerate() {
+            objective_scope_step(stop, &mut remaining)?;
+            if !required {
+                continue;
+            }
+            let variable = VarId(index as u32);
+            if self.is_derived(variable) {
+                return None;
+            }
+            if self.is_decision(variable) {
+                scope.push(variable);
+            } else if problem.solver.store.size(variable) != 1 {
+                // An unresolved physical helper could hide a required decision.
+                // Decline this optional scope instead of silently omitting it.
+                return None;
+            }
+        }
+        (!stop.load(Ordering::Acquire)).then_some(scope)
     }
 
     pub(crate) fn has_guarded_mismatch_structure(&self) -> bool {
@@ -1087,6 +1313,20 @@ impl LocalSearchSpec {
         }
     }
 
+    /// Add `target = array[index - start_index]`. Literal constants, including
+    /// `i32::MIN`, retain their value and have no table-wildcard interpretation.
+    /// Aliased and guarded uses keep the exact constraint without introducing
+    /// a self-dependent or unconditionally active derived variable.
+    pub fn add_element_const(&mut self, array: Vec<i32>, index: VarId, target: VarId, start_index: i32) {
+        let array: Arc<[i32]> = Arc::from(array);
+        if !self.suppress_functionals && index != target && !self.is_derived(target) {
+            self.mark_functional(Functional::ElementConst { target, array: Arc::clone(&array), index, start_index });
+        }
+        // Every definition remains checked. In particular, a second lookup
+        // defining the same target may impose an additional restriction.
+        self.constraints.push(LocalConstraint::ElementConst { array, index, target, start_index });
+    }
+
     pub fn add_cumulative(&mut self, starts: Vec<VarId>, durations: Vec<VarId>, heights: Vec<VarId>, cap: LocalRhs) {
         self.add_cumulative_rhs(
             starts,
@@ -1155,10 +1395,12 @@ impl LocalSearchSpec {
     }
 
     fn mark_functional(&mut self, functional: Functional) {
+        self.functionals_normalized = false;
         let target = match &functional {
             Functional::Expr { target, .. }
             | Functional::Linear { target, .. }
             | Functional::Element { target, .. }
+            | Functional::ElementConst { target, .. }
             | Functional::BoolTable { target, .. } => *target,
         };
         self.ensure(target);
@@ -1167,16 +1409,94 @@ impl LocalSearchSpec {
     }
 }
 
+fn filter_unary_domains(domains: &mut [LocalDomain], constraints: &[LocalConstraint], stop: &AtomicBool) -> bool {
+    for constraint in constraints {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        let (vars, tuples, positive) = match constraint {
+            LocalConstraint::Extension { vars, tuples } => (vars, tuples, true),
+            LocalConstraint::NegExtension { vars, tuples } => (vars, tuples, false),
+            // In particular, selected tables must not restrict a domain while
+            // their selector is inactive.
+            _ => continue,
+        };
+        let [variable] = vars.as_slice() else {
+            continue;
+        };
+        let Some(domain) = domains.get_mut(variable.index()) else {
+            return false;
+        };
+        if domain.values.is_empty() {
+            // Range-only domains cannot represent the holes induced by a
+            // table. Their original predicate remains responsible for it.
+            continue;
+        }
+        domain.values.sort_unstable();
+        // At most MAX_DOMAIN_VALUES bytes of temporary membership storage,
+        // independent of the number of rows or duplicate literals.
+        let mut mentioned = vec![false; domain.values.len()];
+        let mut wildcard = false;
+        let mut well_formed = true;
+        for tuple in tuples {
+            if stop.load(Ordering::Acquire) {
+                return false;
+            }
+            let [value] = tuple.as_slice() else {
+                well_formed = false;
+                break;
+            };
+            if *value == STAR {
+                wildcard = true;
+            } else if let Ok(position) = domain.values.binary_search(value) {
+                mentioned[position] = true;
+            }
+        }
+        if !well_formed {
+            // Preserve the existing exact-table treatment of malformed rows
+            // instead of inferring a stronger domain from only part of them.
+            continue;
+        }
+        let mut position = 0;
+        domain.values.retain(|_| {
+            let listed = wildcard || mentioned[position];
+            position += 1;
+            listed == positive
+        });
+        let (Some(&minimum), Some(&maximum)) = (domain.values.first(), domain.values.last()) else {
+            return false;
+        };
+        domain.min = minimum;
+        domain.max = maximum;
+    }
+    !stop.load(Ordering::Acquire)
+}
+
 impl LocalModel {
-    fn new(problem: &Problem, spec: LocalSearchSpec) -> Result<Self, usize> {
+    fn new_interruptible(problem: &Problem, mut spec: LocalSearchSpec, stop: &AtomicBool) -> Result<Self, usize> {
+        if !spec.normalize_functionals_interruptible(stop) {
+            return Err(1);
+        }
         let objective = problem.objective.clone().ok_or(1usize)?;
         let mut domains = Vec::with_capacity(problem.solver.store.num_vars());
         for i in 0..problem.solver.store.num_vars() {
+            if stop.load(Ordering::Acquire) {
+                return Err(1);
+            }
             let var = VarId(i as u32);
             let min = problem.solver.store.min(var);
             let max = problem.solver.store.max(var);
             let size = problem.solver.store.size(var);
-            let values = if size <= MAX_DOMAIN_VALUES { problem.solver.store.values(var).collect::<Vec<_>>() } else { Vec::new() };
+            let mut values = Vec::new();
+            if size <= MAX_DOMAIN_VALUES {
+                values.reserve(size);
+                for value in problem.solver.store.values(var) {
+                    if stop.load(Ordering::Acquire) {
+                        return Err(1);
+                    }
+                    values.push(value);
+                }
+            }
             if values.is_empty() && min > max {
                 return Err(1);
             }
@@ -1190,14 +1510,17 @@ impl LocalModel {
             );
             domains.push(LocalDomain { min, max, values });
         }
+        let constraints = spec.constraints;
+        if !filter_unary_domains(&mut domains, &constraints, stop) {
+            return Err(1);
+        }
+        let functionals = spec.functionals;
         let mutable = problem
             .search
             .iter()
             .copied()
             .filter(|&var| domains[var.index()].is_searchable() && !spec.derived.get(var.index()).copied().unwrap_or(false))
             .collect();
-        let constraints = spec.constraints;
-        let functionals = order_functionals(spec.functionals).ok_or(1usize)?;
         let bool_tables = bool_tables(&functionals);
         let exact_covers = exact_cover_rows(&constraints, &domains);
         let invariants = invariants::InvariantGraph::compile(domains.len(), &constraints, &functionals, &objective).ok_or(1usize)?;
@@ -2294,6 +2617,7 @@ impl LocalModel {
                 Functional::Expr { target, .. }
                 | Functional::Linear { target, .. }
                 | Functional::Element { target, .. }
+                | Functional::ElementConst { target, .. }
                 | Functional::BoolTable { target, .. } => *target,
             };
             if !self.domains[target.index()].contains(value) {
@@ -2321,6 +2645,9 @@ impl LocalModel {
                     return None;
                 }
                 Some(assignment[array[offset as usize].index()])
+            }
+            Functional::ElementConst { array, index, start_index, .. } => {
+                constant_element_value(array, assignment[index.index()], *start_index)
             }
             Functional::BoolTable { left, right, true_pairs, .. } => {
                 Some(i32::from(true_pairs.binary_search(&(assignment[left.index()], assignment[right.index()])).is_ok()))
@@ -2443,6 +2770,9 @@ impl LocalModel {
                 relation_violation(value as i64, *rel, rhs.value(assignment))
             }
             LocalConstraint::ElementMember { array, value } => element_member_violation(array, *value, assignment),
+            LocalConstraint::ElementConst { array, index, target, start_index } => {
+                i64::from(constant_element_value(array, assignment[index.index()], *start_index) != Some(assignment[target.index()]))
+            }
             LocalConstraint::Cumulative { starts, durations, heights, cap } => {
                 cumulative_violation(starts, durations, heights, cap.value(assignment), assignment)
             }
@@ -3570,7 +3900,7 @@ where
     let unsupported = spec.unsupported();
     let constraints = spec.constraints.len();
     let functionals = spec.functionals.len();
-    let Ok(model) = LocalModel::new(problem, spec) else {
+    let Ok(model) = LocalModel::new_interruptible(problem, spec, stop) else {
         return LocalSearchOutcome {
             best: None,
             iterations: 0,
@@ -3884,7 +4214,7 @@ pub(crate) fn audit_invariant_transactions(
     initial: Vec<i32>,
     moves: &[(VarId, i32)],
 ) -> Option<InvariantAudit> {
-    let model = LocalModel::new(problem, spec).ok()?;
+    let model = LocalModel::new_interruptible(problem, spec, &AtomicBool::new(false)).ok()?;
     let mut state = invariants::InvariantState::new(&model, initial);
     for &(variable, value) in moves {
         let before_assignment = state.assignment().to_vec();
@@ -3921,4 +4251,12 @@ pub(crate) fn audit_invariant_transactions(
         objective_full_evaluations: metrics.objective_full_evaluations,
         full_rebuilds: metrics.full_rebuilds,
     })
+}
+
+/// Enumerated local domains after unconditional unary filtering. An empty
+/// vector denotes a preserved range-only domain, not an infeasible domain.
+#[cfg(test)]
+pub(crate) fn audit_local_domains(problem: &Problem, spec: LocalSearchSpec, stop: &AtomicBool) -> Option<Vec<Vec<i32>>> {
+    let model = LocalModel::new_interruptible(problem, spec, stop).ok()?;
+    Some(model.domains.into_iter().map(|domain| domain.values).collect())
 }

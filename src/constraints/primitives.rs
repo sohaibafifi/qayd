@@ -52,6 +52,195 @@ pub fn not_equal(solver: &mut Solver, x: VarId, y: VarId) -> PropId {
 }
 
 // ---------------------------------------------------------------------------
+// Disjunctions of integer disequalities
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum IntegerDisequalityTerm {
+    Variable(VarId),
+    Constant(i64),
+}
+
+#[derive(Clone)]
+struct IntegerDisequalityClause {
+    /// Distinct, normalized alternatives; no reflexive or constant comparisons.
+    pairs: Vec<[IntegerDisequalityTerm; 2]>,
+}
+
+#[derive(PartialEq, Eq)]
+enum DisequalityState {
+    False,
+    True,
+    Undecided,
+}
+
+impl IntegerDisequalityClause {
+    fn state(store: &Store, pair: &[IntegerDisequalityTerm; 2]) -> DisequalityState {
+        use IntegerDisequalityTerm::{Constant, Variable};
+        match *pair {
+            [Variable(left), Variable(right)] => {
+                if store.max(left) < store.min(right) || store.max(right) < store.min(left) {
+                    DisequalityState::True
+                } else if store.is_fixed(left) && store.is_fixed(right) {
+                    DisequalityState::False
+                } else {
+                    DisequalityState::Undecided
+                }
+            }
+            [Variable(variable), Constant(value)] | [Constant(value), Variable(variable)] => {
+                let Ok(value) = i32::try_from(value) else { return DisequalityState::True };
+                if !store.contains(variable, value) {
+                    DisequalityState::True
+                } else if store.is_fixed(variable) {
+                    DisequalityState::False
+                } else {
+                    DisequalityState::Undecided
+                }
+            }
+            [Constant(left), Constant(right)] => {
+                if left == right {
+                    DisequalityState::False
+                } else {
+                    DisequalityState::True
+                }
+            }
+        }
+    }
+
+    /// Falsifying every other alternative implies the remaining disequality.
+    /// These equalities are sufficient even with shared variables and holes.
+    fn false_premises(&self, store: &Store, except: Option<usize>, should_stop: &dyn Fn() -> bool) -> Option<Vec<Premise>> {
+        let mut why = Vec::new();
+        if !store.explaining() {
+            return Some(why);
+        }
+        for (index, pair) in self.pairs.iter().enumerate() {
+            if should_stop() {
+                return None;
+            }
+            if Some(index) != except {
+                for term in pair {
+                    if let IntegerDisequalityTerm::Variable(variable) = *term {
+                        why.push(Premise::Eq { var: variable, val: store.value(variable) });
+                    }
+                }
+            }
+        }
+        Some(why)
+    }
+
+    fn propagate_with_stop(&self, store: &mut Store, should_stop: &dyn Fn() -> bool) -> Result<(), Inconsistency> {
+        if should_stop() {
+            return Ok(());
+        }
+        let mut unit = None;
+        for (index, pair) in self.pairs.iter().enumerate() {
+            if should_stop() {
+                return Ok(());
+            }
+            match Self::state(store, pair) {
+                DisequalityState::True => return Ok(()),
+                DisequalityState::False => {}
+                DisequalityState::Undecided if unit.is_some() => return Ok(()),
+                DisequalityState::Undecided => unit = Some(index),
+            }
+        }
+        let Some(index) = unit else {
+            let Some(why) = self.false_premises(store, None, should_stop) else { return Ok(()) };
+            return Err(store.fail_because(why));
+        };
+        use IntegerDisequalityTerm::{Constant, Variable};
+        let (target, forbidden, fixed_endpoint) = match self.pairs[index] {
+            [Variable(left), Variable(right)] if store.is_fixed(left) => (right, store.value(left), Some(left)),
+            [Variable(left), Variable(right)] if store.is_fixed(right) => (left, store.value(right), Some(right)),
+            [Variable(variable), Constant(value)] | [Constant(value), Variable(variable)] => {
+                let Ok(value) = i32::try_from(value) else { return Ok(()) };
+                (variable, value, None)
+            }
+            _ => return Ok(()),
+        };
+        let Some(mut why) = self.false_premises(store, Some(index), should_stop) else { return Ok(()) };
+        if should_stop() {
+            return Ok(());
+        }
+        if store.explaining() {
+            if let Some(variable) = fixed_endpoint {
+                why.push(Premise::Eq { var: variable, val: forbidden });
+            }
+        }
+        store.remove_because(target, forbidden, why)
+    }
+}
+
+impl Propagator for IntegerDisequalityClause {
+    fn register(&mut self, store: &mut Store, me: PropId) {
+        self.register_until(store, me, &|| false);
+    }
+
+    fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
+        // An alternative becomes false only when its variables are fixed equal.
+        // A sole remaining disequality filters only when an endpoint is fixed.
+        // Domain holes can establish entailment but cannot enable more pruning.
+        for pair in &self.pairs {
+            if should_stop() {
+                return false;
+            }
+            for term in pair {
+                if let IntegerDisequalityTerm::Variable(variable) = *term {
+                    store.subscribe(variable, me, Event::Fix);
+                }
+            }
+        }
+        !should_stop()
+    }
+
+    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+        self.propagate_with_stop(store, &|| false)
+    }
+
+    fn propagate_until(&mut self, store: &mut Store, should_stop: &dyn Fn() -> bool) -> Result<(), Inconsistency> {
+        self.propagate_with_stop(store, should_stop)
+    }
+
+    fn priority(&self) -> Priority {
+        if self.pairs.len() <= 2 {
+            Priority::Cheap
+        } else {
+            Priority::Linear
+        }
+    }
+}
+
+pub(crate) fn integer_disequality_clause_interruptible(
+    solver: &mut Solver,
+    pairs: Vec<[IntegerDisequalityTerm; 2]>,
+    stop: &AtomicBool,
+) -> bool {
+    use IntegerDisequalityTerm::{Constant, Variable};
+    let mut normalized = Vec::with_capacity(pairs.len());
+    for mut pair in pairs {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        if pair[0] == pair[1] {
+            continue;
+        }
+        match pair {
+            [Constant(_), Constant(_)] => return true,
+            [Variable(_), Constant(value)] | [Constant(value), Variable(_)] if i32::try_from(value).is_err() => return true,
+            _ => {}
+        }
+        if pair[0] > pair[1] {
+            pair.swap(0, 1);
+        }
+        normalized.push(pair);
+    }
+    normalized.sort_unstable();
+    normalized.dedup();
+    solver.post_until(Box::new(IntegerDisequalityClause { pairs: normalized }), &|| stop.load(Ordering::Acquire)).is_some()
+}
+
+// ---------------------------------------------------------------------------
 // sign products: y = x * z for {-1, 1} variables
 // ---------------------------------------------------------------------------
 

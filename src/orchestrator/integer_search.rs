@@ -39,7 +39,8 @@ struct Improvement {
 }
 
 const INTERNAL_REPLAY_INTERVAL: Duration = Duration::from_millis(25);
-const SIGNED_PRODUCT_SQUARES_WARM_START_ITERATIONS: u64 = 50_000;
+const LOCAL_WARM_START_ITERATIONS: u64 = 50_000;
+const PENALTY_SCOUT_CONFLICTS: u64 = 4_096;
 
 struct RepairedCandidate {
     candidate: CandidateSolution,
@@ -256,14 +257,23 @@ fn local_warm_start(
     search_stop: &AtomicBool,
     transfer_stop: &AtomicBool,
 ) -> Result<Option<IntegerWarmStart>, SolveError> {
-    if !plan.signed_product_square_warm_start {
+    let Some(warm_start_role) = plan.warm_start_role() else {
         return Ok(None);
-    }
-    if budget.expired() {
+    };
+    if budget.expired() || search_stop.load(Ordering::Acquire) || transfer_stop.load(Ordering::Acquire) {
         return Ok(None);
     }
 
     let started = Instant::now();
+    if let Some(phase) = &plan.additive_penalty_scout {
+        let repair = RepairContext { model, compiled, spec: &plan.spec, request, budget, stop: transfer_stop };
+        if let Some(warm) = additive_penalty_scout(&repair, phase, search_stop)? {
+            return Ok(Some(warm));
+        }
+        if budget.expired() || search_stop.load(Ordering::Acquire) || transfer_stop.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+    }
     // LocalModel owns one normalized spec copy, covered by estimated_bytes. The
     // much larger physical CP root remains borrowed throughout this warm start.
     let outcome = solve_ls_capped_borrowed(
@@ -272,7 +282,7 @@ fn local_warm_start(
         search_stop,
         request.seed,
         LsConfig { gls: true, min_conflicts: true, kick_bandit: false },
-        SIGNED_PRODUCT_SQUARES_WARM_START_ITERATIONS,
+        LOCAL_WARM_START_ITERATIONS,
         |_, _, _| {},
     );
     let LocalSearchOutcome {
@@ -332,7 +342,7 @@ fn local_warm_start(
             elapsed: started.elapsed(),
             improvements: 1,
             metadata: vec![
-                ("ls_role".to_string(), "signed_product_squares_warm_start".to_string()),
+                ("ls_role".to_string(), warm_start_role.to_string()),
                 ("ls_moves".to_string(), moves.to_string()),
                 ("ls_constraints".to_string(), constraints.to_string()),
                 ("ls_functionals".to_string(), functionals.to_string()),
@@ -345,6 +355,74 @@ fn local_warm_start(
                 ("ls_invariant_objective_evaluations".to_string(), invariant_objective_evaluations.to_string()),
                 ("ls_invariant_objective_full_evaluations".to_string(), invariant_objective_full_evaluations.to_string()),
                 ("ls_invariant_full_rebuilds".to_string(), invariant_full_rebuilds.to_string()),
+            ],
+        },
+    }))
+}
+
+fn additive_penalty_scout(
+    repair: &RepairContext<'_>,
+    phase: &crate::search_policy::CompiledSearchPhase,
+    search_stop: &AtomicBool,
+) -> Result<Option<IntegerWarmStart>, SolveError> {
+    if repair.budget.expired() || search_stop.load(Ordering::Acquire) || repair.stop.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let started = Instant::now();
+    let problem = repair.compiled.problem();
+    // Reuse the one worker-root allowance. This clone must be dropped before
+    // canonical repair clones the root, or before the LS fallback starts.
+    let (solution, stats, _) = {
+        let mut solver = problem.solver.clone();
+        crate::search::decide_sat_assuming_seeded_with_scope(
+            &mut solver,
+            &problem.search,
+            None,
+            &[],
+            search_stop,
+            repair.request.seed,
+            None,
+            Some(PENALTY_SCOUT_CONFLICTS),
+            Vec::new(),
+            Vec::new(),
+            vec![phase.clone()],
+        )
+    };
+    let Some(values) = solution else {
+        // A scout's exhausted or interrupted search never supplies a proof.
+        return Ok(None);
+    };
+    let Some(repaired) = repair_candidate(repair, &values, repair.request.seed, VerificationLevel::Transfer)? else {
+        return Ok(None);
+    };
+    let physical_objective = repaired
+        .physical_objective
+        .ok_or_else(|| SolveError::InvalidResult("penalty feasibility scout has no physical objective".to_string()))?;
+    if repaired.candidate.objectives() != [physical_objective] {
+        return Err(SolveError::InvalidResult(format!(
+            "penalty feasibility scout physical objective {physical_objective} differs from canonical replay {:?}",
+            repaired.candidate.objectives()
+        )));
+    }
+    let candidate = CandidateSolution::verified(
+        repaired.candidate.assignment().clone(),
+        repaired.candidate.objectives().to_vec(),
+        EngineKind::IntegerExact,
+        VerificationLevel::Transfer,
+    );
+    Ok(Some(IntegerWarmStart {
+        candidate,
+        physical_solution: repaired.physical_solution,
+        physical_objective,
+        report: EngineReport {
+            engine: Some(EngineKind::IntegerExact),
+            search: stats,
+            elapsed: started.elapsed(),
+            improvements: 1,
+            metadata: vec![
+                ("ls_role".to_string(), "additive_penalty_warm_start".to_string()),
+                ("warm_start_method".to_string(), "objective_inputs_cp_scout".to_string()),
+                ("scout_scope_variables".to_string(), phase.scope.len().to_string()),
             ],
         },
     }))
@@ -571,7 +649,9 @@ pub(crate) fn solve(run: IntegerSearchRun<'_>) -> Result<SolveResult, SolveError
             }
             let control = sink.emit(SolveEvent::Progress {
                 engine: EngineKind::IntegerLocalSearch,
-                objectives: vec![event.payload.objective],
+                // A satisfaction search uses an internal zero score, but owns
+                // no semantic objective tier, including inside decomposition.
+                objectives: if model.objectives().is_empty() { Vec::new() } else { vec![event.payload.objective] },
                 elapsed: budget.elapsed(),
             })?;
             if control == EventControl::Stop {

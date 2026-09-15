@@ -110,6 +110,9 @@ mod divisibility_compaction;
 #[path = "../tests/internal/exact_cover_warm_start.rs"]
 mod exact_cover_warm_start;
 #[cfg(test)]
+#[path = "../tests/internal/integer_disequality_clause.rs"]
+mod integer_disequality_clause_tests;
+#[cfg(test)]
 #[path = "../tests/internal/lcg_atom_layout.rs"]
 mod lcg_atom_layout;
 #[cfg(test)]
@@ -145,6 +148,18 @@ mod load_balance_tests;
 #[cfg(test)]
 #[path = "../tests/internal/ls_cop.rs"]
 mod ls_cop;
+#[cfg(test)]
+#[path = "../tests/internal/ls_element_functional.rs"]
+mod ls_element_functional_tests;
+#[cfg(test)]
+#[path = "../tests/internal/ls_objective_scope.rs"]
+mod ls_objective_scope_tests;
+#[cfg(test)]
+#[path = "../tests/internal/ls_penalty_warm_start.rs"]
+mod ls_penalty_warm_start_tests;
+#[cfg(test)]
+#[path = "../tests/internal/ls_unary_domains.rs"]
+mod ls_unary_domains_tests;
 #[cfg(test)]
 #[path = "../tests/internal/ls_violation_oracle.rs"]
 mod ls_violation_oracle;

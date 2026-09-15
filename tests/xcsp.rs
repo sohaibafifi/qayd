@@ -950,6 +950,42 @@ fn element_over_constant_array() {
 }
 
 #[test]
+fn literal_element_indices_and_values_survive_exact_and_local_search_output() {
+    for start in [-2, 0, 1] {
+        let index = start + 1;
+        let xml = format!(
+            "<instance format=\"XCSP3\" type=\"COP\">
+               <variables><var id=\"idx\">{index}</var><var id=\"cost\">0..9</var></variables>
+               <constraints><element><list startIndex=\"{start}\">5 8 3</list><index>idx</index><value>cost</value></element></constraints>
+               <objectives><minimize>cost</minimize></objectives>
+             </instance>"
+        );
+        for mode in [Mode::Default, Mode::Ls] {
+            let mut output = Vec::new();
+            run_to_with_options(
+                &xml,
+                true,
+                &AtomicBool::new(false),
+                &mut output,
+                RunOptions { mode, time_limit: Some(Duration::from_secs(1)), ..RunOptions::default() },
+            )
+            .unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("o 8"), "{output}");
+            assert!(output.contains(&format!("v {index} 8")), "{output}");
+            assert!(!output.contains("s UNKNOWN"), "{output}");
+            assert!(!output.contains("s UNSATISFIABLE"), "{output}");
+            if mode == Mode::Ls {
+                assert!(output.contains("s SATISFIABLE"), "{output}");
+                assert!(!output.contains("s OPTIMUM FOUND"), "{output}");
+            } else {
+                assert!(output.contains("s OPTIMUM FOUND"), "{output}");
+            }
+        }
+    }
+}
+
+#[test]
 fn circuit_refs_in_text() {
     // circuit scope given directly in the element text (no <list>).
     let xml = r#"

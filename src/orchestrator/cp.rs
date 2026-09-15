@@ -671,7 +671,7 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
                 let candidate_control = sink.emit(SolveEvent::Candidate(warm.candidate.clone()))?;
                 let progress_control = if candidate_control == EventControl::Continue {
                     sink.emit(SolveEvent::Progress {
-                        engine: EngineKind::IntegerLocalSearch,
+                        engine: warm.candidate.source(),
                         objectives: warm.candidate.objectives().to_vec(),
                         elapsed: budget.elapsed(),
                     })?

@@ -385,7 +385,7 @@ impl Model {
         shared
     }
 
-    pub(super) fn into_package(mut self) -> ModelPackage {
+    pub(crate) fn into_package(mut self) -> ModelPackage {
         if let Some(objective) = self.objective.take() {
             self.package.model.add_objective(objective);
         }
@@ -1336,16 +1336,14 @@ impl XcspCallback for Model {
     }
     fn on_constraint_element_v6(&mut self, list: &[i32], start_index: i32, index: String, value: String) {
         guard!(self, {
-            let array = self.consts(list);
             let val = self.var_id(&value)?;
-            self.post_element(array, start_index, &index, val)
+            self.post_element_const(list, start_index, &index, val)
         });
     }
     fn on_constraint_element_v7(&mut self, list: &[i32], start_index: i32, index: String, value: i32) {
         guard!(self, {
-            let array = self.consts(list);
             let val = self.constant(value);
-            self.post_element(array, start_index, &index, val)
+            self.post_element_const(list, start_index, &index, val)
         });
     }
 
@@ -1974,6 +1972,13 @@ impl Model {
         let idx = self.var_id(index)?;
         let idx = self.zero_based_index(idx, start_index, array.len());
         element(&mut self.package.model, &array, idx, value);
+        Ok(())
+    }
+
+    fn post_element_const(&mut self, array: &[i32], start_index: i32, index: &str, value: IntVarRef) -> Result<(), String> {
+        let index = self.var_id(index)?;
+        let index = self.zero_based_index(index, start_index, array.len());
+        global(&mut self.package.model, IntGlobalConstraint::ElementConst { array: array.to_vec(), index, value });
         Ok(())
     }
 

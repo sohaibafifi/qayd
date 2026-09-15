@@ -107,9 +107,36 @@ enum BooleanFormula {
 enum NativeIntension {
     All(Vec<NativeIntension>),
     Clauses(Vec<Vec<BooleanLiteral>>),
+    IntegerDisequalityClause(Vec<[super::primitives::IntegerDisequalityTerm; 2]>),
     Linear(AffinePredicate),
     PositiveDifference { target: VarId, left: VarId, right: VarId },
     ReifiedLinear { selector: VarId, active_value: i32, predicate: AffinePredicate, equivalence: bool },
+}
+
+/// Integer comparisons need no reified variables to propagate a disjunction.
+/// Restrict its operands to variables and constants, whose evaluation is total;
+/// arithmetic operands may overflow and must keep the original expression path.
+fn integer_disequality_clause(expression: &Expr, stop: &AtomicBool) -> Option<NativeIntension> {
+    use super::primitives::IntegerDisequalityTerm;
+    let Expr::Or(alternatives) = expression else {
+        return None;
+    };
+    let operand = |expression: &Expr| match expression {
+        Expr::Var(variable) => Some(IntegerDisequalityTerm::Variable(*variable)),
+        Expr::Const(value) => Some(IntegerDisequalityTerm::Constant(*value)),
+        _ => None,
+    };
+    let mut pairs = Vec::with_capacity(alternatives.len());
+    for alternative in alternatives {
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        let Expr::Ne(left, right) = alternative else {
+            return None;
+        };
+        pairs.push([operand(left)?, operand(right)?]);
+    }
+    Some(NativeIntension::IntegerDisequalityClause(pairs))
 }
 
 /// Match only raw integer variables: their difference fits i64 even when the
@@ -304,6 +331,9 @@ fn native_intension(store: &Store, expression: &Expr, stop: &AtomicBool) -> Opti
             BooleanFormula::And(literals) => NativeIntension::Clauses(literals.into_iter().map(|literal| vec![literal]).collect()),
         });
     }
+    if let Some(clause) = integer_disequality_clause(expression, stop) {
+        return Some(clause);
+    }
     affine_predicate(store, expression, stop).map(NativeIntension::Linear)
 }
 
@@ -336,6 +366,9 @@ fn post_native_intension(solver: &mut Solver, plan: NativeIntension, stop: &Atom
     match plan {
         NativeIntension::All(plans) => plans.into_iter().all(|plan| post_native_intension(solver, plan, stop)),
         NativeIntension::Clauses(clauses) => clauses.into_iter().all(|clause| post_clause(solver, clause, stop)),
+        NativeIntension::IntegerDisequalityClause(pairs) => {
+            super::primitives::integer_disequality_clause_interruptible(solver, pairs, stop)
+        }
         NativeIntension::Linear(predicate) => linear::linear_without_relaxation_interruptible(
             solver,
             predicate.coefficients,

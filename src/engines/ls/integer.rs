@@ -21,12 +21,27 @@ use crate::model::{
     BoolLiteral, CompiledCp, Constraint, IntExpr as SemanticIntExpr, IntGlobalConstraint, Model, Objective, Relation, SetVarRef,
 };
 use crate::orchestrator::SolveError;
+use crate::search_policy::{CompiledSearchPhase, ValueSelector, VariableSelector};
 
 #[derive(Clone)]
 pub(crate) struct IntegerLocalSearchPlan {
     pub(crate) spec: LocalSearchSpec,
     pub(crate) signed_product_square_warm_start: bool,
+    pub(crate) additive_penalty_warm_start: bool,
+    pub(crate) additive_penalty_scout: Option<CompiledSearchPhase>,
     pub(crate) estimated_bytes: u64,
+}
+
+impl IntegerLocalSearchPlan {
+    pub(crate) fn warm_start_role(&self) -> Option<&'static str> {
+        if self.signed_product_square_warm_start {
+            Some("signed_product_squares_warm_start")
+        } else if self.additive_penalty_warm_start {
+            Some("additive_penalty_warm_start")
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -85,7 +100,10 @@ fn warm_start_preflight(model: &Model, stop: &AtomicBool) -> Option<WarmStartPre
     let physical_variables =
         model.int_vars().len().saturating_add(model.sets().iter().map(|set| set.possible.len()).fold(0usize, usize::saturating_add));
     let mut cost = PlanCost {
-        bytes: 4_096u128.saturating_add((physical_variables as u128).saturating_mul(16)),
+        // Include bounded objective-dependency inspection, the retained scout
+        // scope and salts, their execution copy, and candidate value buffers.
+        // The execution multiplier below also covers temporary scope storage.
+        bytes: 8_192u128.saturating_add((physical_variables as u128).saturating_mul(80)),
         work: physical_variables as u128,
         scope: physical_variables as u128,
     };
@@ -98,6 +116,12 @@ fn warm_start_preflight(model: &Model, stop: &AtomicBool) -> Option<WarmStartPre
     for objective in model.objectives() {
         if stop.load(std::sync::atomic::Ordering::Acquire) {
             return None;
+        }
+        if let Objective::IntExpr { expr, .. } = objective {
+            // LocalModel clones a symbolic objective and builds its incidence
+            // data. The execution multiplier also covers that owned copy;
+            // ordinary nonlinear sums need the same accounting as constraints.
+            cost = cost.add(expression_plan_cost(expr, stop)?);
         }
         if let Objective::IntExpr { minimize: true, expr: expr @ SemanticIntExpr::Add(terms) } = objective {
             let mut square_sum = !terms.is_empty();
@@ -154,6 +178,119 @@ pub(crate) fn audit_warm_start_preflight(model: &Model, stop: &AtomicBool) -> Op
 pub(crate) fn audit_compile_warm_start(model: &Model, compiled: &CompiledCp, memory_allowance: u64, stop: &AtomicBool) -> (bool, u64) {
     let compiled = compile_warm_start(model, compiled, memory_allowance, stop);
     (compiled.plan.is_some(), compiled.estimated_bytes)
+}
+
+/// Admit generic LS only for a bounded, nonnegative additive penalty shape.
+/// This recognizes objective algebra, not frontend names or constraint order.
+/// Hard constraints remain authoritative during canonical candidate repair.
+pub(crate) fn has_additive_penalty_objective(model: &Model, stop: &AtomicBool) -> bool {
+    let [Objective::IntExpr { minimize: true, expr: SemanticIntExpr::Add(terms) }] = model.objectives() else {
+        return false;
+    };
+    if stop.load(std::sync::atomic::Ordering::Acquire)
+        || model.int_vars().len() as u64 > MAX_WARM_START_INSPECTION_WORK
+        || terms.len() as u64 > MAX_WARM_START_INSPECTION_WORK
+    {
+        return false;
+    }
+    // Zero means absent, one is one unconditional nonnegative element
+    // definition, and two excludes ambiguous or unsuitable definitions.
+    let mut preferences = vec![0u8; model.int_vars().len()];
+    let mut work = model.int_vars().len() as u64;
+    for constraint in model.constraints() {
+        work = work.saturating_add(1);
+        if work > MAX_WARM_START_INSPECTION_WORK || stop.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        if let Constraint::IntegerGlobal(IntGlobalConstraint::ElementConst { array, index, value }) = constraint {
+            let Some(slot) = preferences.get_mut(value.0) else {
+                return false;
+            };
+            let mut suitable = *slot == 0 && index != value && !array.is_empty();
+            for &entry in array {
+                work = work.saturating_add(1);
+                if work > MAX_WARM_START_INSPECTION_WORK || stop.load(std::sync::atomic::Ordering::Acquire) {
+                    return false;
+                }
+                suitable &= entry >= 0;
+            }
+            *slot = if suitable { 1 } else { 2 };
+        }
+    }
+    let mut pending = terms.iter().collect::<Vec<_>>();
+    let mut binary_penalty = false;
+    while let Some(expression) = pending.pop() {
+        work = work.saturating_add(1);
+        if work > MAX_WARM_START_INSPECTION_WORK || stop.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        match expression {
+            SemanticIntExpr::Constant(value) if *value >= 0 => {}
+            SemanticIntExpr::Variable(variable) if preferences.get(variable.0) == Some(&1) => {}
+            SemanticIntExpr::Add(values) => {
+                if values.len() as u64 > MAX_WARM_START_INSPECTION_WORK.saturating_sub(work) {
+                    return false;
+                }
+                pending.extend(values);
+            }
+            SemanticIntExpr::Mul(factors) => {
+                let mut term = None;
+                let mut coefficient = 1i64;
+                for factor in factors {
+                    work = work.saturating_add(1);
+                    if work > MAX_WARM_START_INSPECTION_WORK || stop.load(std::sync::atomic::Ordering::Acquire) {
+                        return false;
+                    }
+                    match factor {
+                        SemanticIntExpr::Constant(value) if *value >= 0 => {
+                            let Some(product) = coefficient.checked_mul(*value) else { return false };
+                            coefficient = product;
+                        }
+                        SemanticIntExpr::Constant(_) => return false,
+                        _ if term.replace(factor).is_some() => return false,
+                        _ => {}
+                    }
+                }
+                // A zero coefficient cannot manufacture a binary penalty.
+                // Reject it conservatively instead of ignoring eager arithmetic.
+                if coefficient == 0 {
+                    return false;
+                }
+                if let Some(term) = term {
+                    pending.push(term);
+                }
+            }
+            SemanticIntExpr::Eq(left, right) => {
+                let (SemanticIntExpr::Variable(left), SemanticIntExpr::Variable(right)) = (&**left, &**right) else {
+                    return false;
+                };
+                if left == right {
+                    return false;
+                }
+                binary_penalty = true;
+            }
+            SemanticIntExpr::Max(values) => {
+                let difference = match values.as_slice() {
+                    [SemanticIntExpr::Constant(0), difference] | [difference, SemanticIntExpr::Constant(0)] => difference,
+                    _ => return false,
+                };
+                let SemanticIntExpr::Sub(distance, value) = difference else { return false };
+                let (SemanticIntExpr::Constant(distance), SemanticIntExpr::Abs(value)) = (&**distance, &**value) else {
+                    return false;
+                };
+                let SemanticIntExpr::Sub(left, right) = &**value else { return false };
+                let (SemanticIntExpr::Variable(left), SemanticIntExpr::Variable(right)) = (&**left, &**right) else {
+                    return false;
+                };
+                if *distance <= 0 || left == right {
+                    return false;
+                }
+                binary_penalty = true;
+            }
+            _ => return false,
+        }
+    }
+    binary_penalty
 }
 
 fn constraint_plan_cost(model: &Model, constraint: &Constraint, stop: &AtomicBool) -> Option<PlanCost> {
@@ -383,12 +520,14 @@ pub(crate) fn compile_warm_start(
             plans.push(IntegerWarmStartPlan::ScenarioSchedule(plan));
         }
     }
-    let local_possible = preflight.inspection_work <= MAX_WARM_START_INSPECTION_WORK
-        && LocalSearchSpec::may_have_signed_product_square_objective(compiled.problem(), stop);
     let local_allowance = allowance.saturating_sub(estimated_bytes);
-    if local_possible && preflight.local_plan_bytes <= local_allowance {
+    let local_possible = local_search_peak_bytes(preflight.local_plan_bytes) <= local_allowance
+        && preflight.inspection_work <= MAX_WARM_START_INSPECTION_WORK
+        && (LocalSearchSpec::may_have_signed_product_square_objective(compiled.problem(), stop)
+            || has_additive_penalty_objective(model, stop));
+    if local_possible {
         if let Ok(Some(plan)) = compile_interruptible(model, compiled, stop, local_allowance) {
-            if plan.signed_product_square_warm_start {
+            if plan.warm_start_role().is_some() {
                 estimated_bytes = estimated_bytes.saturating_add(plan.estimated_bytes);
                 plans.push(IntegerWarmStartPlan::Local(plan));
             }
@@ -475,11 +614,54 @@ pub(crate) fn compile_interruptible(
             spec.unsupported()
         )));
     }
+    // Candidate repair must use the same dependency ownership as LocalModel,
+    // including elements demoted after duplicate or cyclic definitions.
+    if !spec.normalize_functionals_interruptible(stop) {
+        return Ok(None);
+    }
     let signed_product_square_warm_start = spec.has_signed_product_square_structure_interruptible(compiled.problem(), stop);
+    let additive_penalty_warm_start =
+        preflight.inspection_work <= MAX_WARM_START_INSPECTION_WORK && has_additive_penalty_objective(model, stop);
+    let additive_penalty_scout = if additive_penalty_warm_start { compile_penalty_scout_phase(&spec, compiled, stop) } else { None };
     if stop.load(std::sync::atomic::Ordering::Acquire) {
         return Ok(None);
     }
-    Ok(Some(IntegerLocalSearchPlan { spec, signed_product_square_warm_start, estimated_bytes }))
+    Ok(Some(IntegerLocalSearchPlan {
+        spec,
+        signed_product_square_warm_start,
+        additive_penalty_warm_start,
+        additive_penalty_scout,
+        estimated_bytes,
+    }))
+}
+
+fn compile_penalty_scout_phase(spec: &LocalSearchSpec, compiled: &CompiledCp, stop: &AtomicBool) -> Option<CompiledSearchPhase> {
+    let inputs = spec.objective_decision_scope(compiled.problem(), stop, MAX_WARM_START_INSPECTION_WORK)?;
+    let mut required = vec![false; compiled.problem().solver.store.num_vars()];
+    for variable in inputs {
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        required[variable.index()] = true;
+    }
+    let mut scope = Vec::new();
+    let mut semantic_salts = Vec::new();
+    for (semantic, &physical) in compiled.int_variables().iter().enumerate() {
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        if required[physical.index()] {
+            scope.push(physical);
+            semantic_salts.push(u64::try_from(semantic).unwrap_or(u64::MAX));
+            required[physical.index()] = false;
+        }
+    }
+    (!scope.is_empty()).then_some(CompiledSearchPhase {
+        scope,
+        semantic_salts,
+        variable: VariableSelector::DomWdeg,
+        value: ValueSelector::RandomSeeded,
+    })
 }
 
 fn compile_constraint(
@@ -596,17 +778,17 @@ fn compile_global(
             spec.add_element(vars(array), map[index.0], map[value.0], 0);
         }
         IntGlobalConstraint::ElementConst { array, index, value } => {
-            let mut tuples = Vec::with_capacity(array.len());
+            let mut copied = Vec::with_capacity(array.len());
             for (position, value) in array.iter().enumerate() {
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     return Ok(false);
                 }
-                let Ok(position) = i32::try_from(position) else {
+                if i32::try_from(position).is_err() {
                     return Err(SolveError::Compile("element array index exceeds i32".to_string()));
-                };
-                tuples.push(vec![position, *value]);
+                }
+                copied.push(*value);
             }
-            spec.add_extension(vec![map[index.0], map[value.0]], tuples, true);
+            spec.add_element_const(copied, map[index.0], map[value.0], 0);
         }
         IntGlobalConstraint::Count { variables, value, relation, count } => {
             spec.add_count(vars(variables), vec![*value], physical_relation(*relation), LocalRhs::Const(*count));
