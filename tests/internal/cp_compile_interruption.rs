@@ -299,6 +299,42 @@ fn optional_integer_warm_start_obeys_its_memory_allowance_and_prearmed_stop() {
 }
 
 #[test]
+fn ordering_warm_start_is_included_in_the_optional_plan_memory_budget() {
+    let mut model = Model::new();
+    let positions = (0..3).map(|_| model.int_range(0, 2)).collect::<Vec<_>>();
+    let penalties = (0..3).map(|_| model.int_range(0, 2)).collect::<Vec<_>>();
+    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::AllDifferent { variables: positions.clone(), except: Vec::new() }));
+    for (arc, (from, to)) in [(0, 1), (1, 2), (2, 0)].into_iter().enumerate() {
+        model.add_constraint(Constraint::Intension(IntExpr::Eq(
+            Box::new(penalties[arc].into()),
+            Box::new(IntExpr::Max(vec![
+                IntExpr::Sub(Box::new(positions[from].into()), Box::new(positions[to].into())),
+                IntExpr::Constant(0),
+            ])),
+        )));
+    }
+    model.add_objective(Objective::IntExpr { minimize: true, expr: IntExpr::Add(penalties.iter().copied().map(Into::into).collect()) });
+    let stop = AtomicBool::new(false);
+    let compiled = CompiledCp::compile_interruptible(&model, &stop).unwrap().unwrap();
+    assert_eq!(audit_integer_warm_start_compile(&model, &compiled, 0, &stop), (false, 0));
+    let (admitted, bytes) = audit_integer_warm_start_compile(&model, &compiled, u64::MAX, &stop);
+    assert!(admitted);
+    assert!(bytes > 0);
+    assert_eq!(audit_integer_warm_start_compile(&model, &compiled, bytes, &stop), (true, bytes));
+    assert_eq!(audit_integer_warm_start_compile(&model, &compiled, bytes - 1, &stop), (false, 0));
+    assert_eq!(audit_integer_warm_start_compile(&model, &compiled, u64::MAX, &AtomicBool::new(true)), (false, 0));
+
+    let cp_bytes = CompiledCp::estimate_semantic_bytes_interruptible(&model, &stop).unwrap();
+    let exact_bytes = audit_cp_concurrent_bytes(cp_bytes, 0, SolveMode::Auto, 1, 1);
+    let unlimited = compile_cp_plan(&model, &SolveRequest::default(), &SolveBudget::new(None)).unwrap();
+    assert!(unlimited.estimated_backend_bytes() >= exact_bytes + bytes);
+    let request =
+        SolveRequest { limits: SolveLimits { memory_bytes: Some(exact_bytes), ..SolveLimits::default() }, ..SolveRequest::default() };
+    let limited = compile_cp_plan(&model, &request, &SolveBudget::new(None)).unwrap();
+    assert_eq!(limited.estimated_backend_bytes(), exact_bytes, "the optional ordering plan must not consume the exact solver's budget");
+}
+
+#[test]
 fn flat_expression_lowering_stops_while_collecting_operands() {
     let mut model = Model::new();
     let variable = model.int_range(0, 1);

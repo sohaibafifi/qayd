@@ -161,6 +161,9 @@ mod orchestrator_architecture;
 #[path = "../tests/internal/orchestrator_budget.rs"]
 mod orchestrator_budget;
 #[cfg(test)]
+#[path = "../tests/internal/ordering_warm_start.rs"]
+mod ordering_warm_start;
+#[cfg(test)]
 #[path = "../tests/internal/phase4_quality_bench.rs"]
 mod phase4_quality_bench;
 #[cfg(test)]
@@ -175,6 +178,9 @@ mod phase7;
 #[cfg(test)]
 #[path = "../tests/internal/phase9_phase10.rs"]
 mod phase9_phase10;
+#[cfg(test)]
+#[path = "../tests/internal/positive_difference.rs"]
+mod positive_difference_tests;
 #[cfg(test)]
 #[path = "../tests/internal/prefix_set_compaction.rs"]
 mod prefix_set_compaction;

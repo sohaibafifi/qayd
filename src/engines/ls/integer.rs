@@ -13,6 +13,7 @@ use crate::engines::ls::cop::{LocalRhs, LocalSearchSpec};
 use crate::engines::ls::disjunctive_schedule::DisjunctiveSchedulePlan;
 use crate::engines::ls::exact_cover::ExactCoverPlan;
 use crate::engines::ls::load_balance::LoadBalancePlan;
+use crate::engines::ls::ordering::OrderingPlan;
 use crate::engines::ls::scenario_schedule::ScenarioSchedulePlan;
 use crate::expr::Expr;
 use crate::ids::VarId;
@@ -33,6 +34,7 @@ pub(crate) enum IntegerWarmStartPlan {
     Local(IntegerLocalSearchPlan),
     ExactCover(ExactCoverPlan),
     LoadBalance(LoadBalancePlan),
+    Ordering(OrderingPlan),
     ScenarioSchedule(ScenarioSchedulePlan),
     DisjunctiveSchedule(DisjunctiveSchedulePlan),
     Fallbacks(Vec<IntegerWarmStartPlan>),
@@ -361,6 +363,16 @@ pub(crate) fn compile_warm_start(
             if plan_bytes <= balance_allowance {
                 estimated_bytes = estimated_bytes.saturating_add(plan_bytes);
                 plans.push(IntegerWarmStartPlan::LoadBalance(plan));
+            }
+        }
+    }
+    let ordering_allowance = allowance.saturating_sub(estimated_bytes);
+    if preflight.inspection_work <= MAX_WARM_START_INSPECTION_WORK {
+        if let Some(plan) = OrderingPlan::compile(model, stop, ordering_allowance) {
+            let plan_bytes = plan.estimated_bytes();
+            if plan_bytes <= ordering_allowance {
+                estimated_bytes = estimated_bytes.saturating_add(plan_bytes);
+                plans.push(IntegerWarmStartPlan::Ordering(plan));
             }
         }
     }

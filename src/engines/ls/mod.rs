@@ -11,5 +11,6 @@ pub(crate) mod integer;
 #[allow(dead_code)]
 pub(crate) mod lists;
 pub(crate) mod load_balance;
+pub(crate) mod ordering;
 pub(crate) mod scenario_schedule;
 pub(crate) mod schedule_ir;

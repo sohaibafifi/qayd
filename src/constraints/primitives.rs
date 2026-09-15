@@ -7,7 +7,7 @@ use crate::constraints::intension::intension;
 use crate::constraints::linear::Relation;
 use crate::expr::{eq, imp, int, or, var};
 use crate::ids::{PropId, VarId};
-use crate::propagator::{Event, Inconsistency, Propagator};
+use crate::propagator::{Event, Inconsistency, Priority, Propagator};
 use crate::store::{Premise, Solver, Store};
 
 /// The constraint `x != y + c` (forward checking).
@@ -272,6 +272,111 @@ pub fn all_equal(solver: &mut Solver, vars: &[VarId]) {
 // ---------------------------------------------------------------------------
 // minimum / maximum
 // ---------------------------------------------------------------------------
+
+/// `target = max(0, left - right)`, without materializing the possibly wider
+/// difference. Each filtering round uses only bounds, never enumerates values.
+#[derive(Clone)]
+struct PositiveDifference {
+    target: VarId,
+    left: VarId,
+    right: VarId,
+}
+
+impl PositiveDifference {
+    fn tighten(store: &mut Store, variable: VarId, lower: i64, upper: i64) -> Result<bool, Inconsistency> {
+        let before = (store.min(variable), store.max(variable));
+        let lower = lower.max(i64::from(before.0));
+        let upper = upper.min(i64::from(before.1));
+        if lower > upper {
+            return Err(Inconsistency);
+        }
+        // Both retained bounds lie inside the existing i32 domain.
+        if lower > i64::from(before.0) {
+            store.remove_below(variable, lower as i32)?;
+        }
+        if upper < i64::from(before.1) {
+            store.remove_above(variable, upper as i32)?;
+        }
+        Ok(before != (store.min(variable), store.max(variable)))
+    }
+
+    fn propagate_with_stop(&self, store: &mut Store, should_stop: &dyn Fn() -> bool) -> Result<(), Inconsistency> {
+        if self.left == self.right {
+            return if should_stop() { Ok(()) } else { store.fix(self.target, 0) };
+        }
+        loop {
+            if should_stop() {
+                return Ok(());
+            }
+            let bounds = |variable| (i64::from(store.min(variable)), i64::from(store.max(variable)));
+            let (xl, xu) = bounds(self.left);
+            let (yl, yu) = bounds(self.right);
+            let mut changed;
+            if self.target == self.left {
+                // x=max(0,x-y) iff x,y>=0 and at least one of them is zero.
+                changed = Self::tighten(store, self.left, 0, xu)?;
+                changed |= Self::tighten(store, self.right, 0, yu)?;
+                if store.min(self.left) > 0 {
+                    changed |= Self::tighten(store, self.right, 0, 0)?;
+                }
+                if store.min(self.right) > 0 {
+                    changed |= Self::tighten(store, self.left, 0, 0)?;
+                }
+            } else if self.target == self.right {
+                // y=max(0,x-y): y=0 allows x<=0; y>0 requires x=2y.
+                // Handle this alias directly instead of repeatedly tightening
+                // the same variable through the independent-variable formulas.
+                changed = Self::tighten(store, self.right, 0.max((xl + 1).div_euclid(2)), 0.max(xu.div_euclid(2)))?;
+                let lower = i64::from(store.min(self.right));
+                let upper = i64::from(store.max(self.right));
+                changed |= Self::tighten(store, self.left, if lower > 0 { 2 * lower } else { xl }, 2 * upper)?;
+            } else {
+                changed = Self::tighten(store, self.target, 0.max(xl - yu), 0.max(xu - yl))?;
+                let upper = i64::from(store.max(self.target));
+                let lower = i64::from(store.min(self.target));
+                // x-y<=z always. If z is positive, the equality arm is active.
+                changed |= Self::tighten(store, self.left, if lower > 0 { yl + lower } else { xl }, yu + upper)?;
+                changed |= Self::tighten(store, self.right, xl - upper, if lower > 0 { xu - lower } else { yu })?;
+            }
+            // Sparse domains can jump beyond a requested endpoint. Revisit
+            // the constant-size bound calculation until those jumps stabilize.
+            if !changed {
+                return Ok(());
+            }
+        }
+    }
+}
+
+impl Propagator for PositiveDifference {
+    fn register(&mut self, store: &mut Store, me: PropId) {
+        for variable in [self.target, self.left, self.right] {
+            store.subscribe(variable, me, Event::BoundChange);
+        }
+    }
+
+    fn priority(&self) -> Priority {
+        Priority::Cheap
+    }
+
+    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+        self.propagate_with_stop(store, &|| false)
+    }
+
+    fn propagate_until(&mut self, store: &mut Store, should_stop: &dyn Fn() -> bool) -> Result<(), Inconsistency> {
+        self.propagate_with_stop(store, should_stop)
+    }
+}
+
+/// Native positive part of an integer-variable difference. Whole-scope reasons
+/// include the three domains and any enclosing selector guard.
+pub(crate) fn positive_difference_interruptible(solver: &mut Solver, target: VarId, left: VarId, right: VarId, stop: &AtomicBool) -> bool {
+    if stop.load(Ordering::Acquire) {
+        return false;
+    }
+    crate::constraints::linear::record_relaxation(solver, &[1], &[target], Relation::Ge, 0);
+    crate::constraints::linear::record_relaxation(solver, &[1, -1, 1], &[target, left, right], Relation::Ge, 0);
+    solver.post_until(Box::new(PositiveDifference { target, left, right }), &|| stop.load(Ordering::Acquire)).is_some()
+}
 
 /// `y = min(xs)` or `y = max(xs)` (bounds reasoning).
 #[derive(Clone)]

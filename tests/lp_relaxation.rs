@@ -100,6 +100,35 @@ fn affine_intension_comparisons_feed_the_same_relaxation_ir() {
 
 #[cfg(feature = "lp-relaxation")]
 #[test]
+fn positive_difference_definition_supplies_a_certified_epigraph_row() {
+    let mut model = Model::new();
+    let x = model.int_range(0, 4);
+    let y = model.int_range(0, 4);
+    let z = model.int_range(0, 4);
+    // Interval propagation leaves overlapping x/y bounds and z.min=0.
+    // Combining x-y>=1 with z>=x-y in the LP proves z>=1 directly.
+    model.add_constraint(Constraint::Linear { terms: vec![(1, x), (-1, y)], relation: Relation::Ge, rhs: 1 });
+    model.add_constraint(Constraint::Intension(IntExpr::Eq(
+        Box::new(IntExpr::Variable(z)),
+        Box::new(IntExpr::IfThenElse(
+            Box::new(IntExpr::Lt(Box::new(IntExpr::Variable(x)), Box::new(IntExpr::Variable(y)))),
+            Box::new(IntExpr::Constant(0)),
+            Box::new(IntExpr::Sub(Box::new(IntExpr::Variable(x)), Box::new(IntExpr::Variable(y)))),
+        )),
+    )));
+    model.add_objective(Objective::IntExpr { minimize: true, expr: IntExpr::Variable(z) });
+    let result = solve_model(&ModelPackage::new(model), &request(LinearBackendMode::Amthal), &mut IgnoreEvents).unwrap();
+    assert_eq!(result.status(), SolveStatus::Optimal);
+    assert_eq!(result.primal().unwrap().objectives(), [1]);
+    let stats = result.aggregate_search_stats();
+    assert_eq!(stats.lp_source_rows, 3);
+    assert_eq!(stats.lp_root_bound, Some(1));
+    assert_eq!(stats.lp_certified, 1);
+    assert_eq!(stats.lp_auxiliary_columns, 0);
+}
+
+#[cfg(feature = "lp-relaxation")]
+#[test]
 fn selected_constraints_use_a_selector_guarded_big_m_row() {
     let mut model = Model::new();
     let selector = model.bool_var();

@@ -108,7 +108,44 @@ enum NativeIntension {
     All(Vec<NativeIntension>),
     Clauses(Vec<Vec<BooleanLiteral>>),
     Linear(AffinePredicate),
+    PositiveDifference { target: VarId, left: VarId, right: VarId },
     ReifiedLinear { selector: VarId, active_value: i32, predicate: AffinePredicate, equivalence: bool },
+}
+
+/// Match only raw integer variables: their difference fits i64 even when the
+/// positive part does not fit an i32 domain. Extending this rewrite to arbitrary
+/// expressions could evaluate an overflowing branch that the original if skips.
+fn positive_difference(expression: &Expr) -> Option<(VarId, VarId)> {
+    let difference = |expression: &Expr| match expression {
+        Expr::Sub(left, right) => match (left.as_ref(), right.as_ref()) {
+            (Expr::Var(left), Expr::Var(right)) => Some((*left, *right)),
+            _ => None,
+        },
+        _ => None,
+    };
+    match expression {
+        Expr::IfThenElse(condition, then_value, otherwise) if matches!(then_value.as_ref(), Expr::Const(0)) => {
+            let (left, right) = difference(otherwise)?;
+            let (condition_left, condition_right) = match condition.as_ref() {
+                Expr::Lt(left, right) | Expr::Le(left, right) => (left.as_ref(), right.as_ref()),
+                _ => return None,
+            };
+            matches!((condition_left, condition_right), (Expr::Var(a), Expr::Var(b)) if *a == left && *b == right).then_some((left, right))
+        }
+        Expr::Max(terms) => match terms.as_slice() {
+            [Expr::Const(0), expression] | [expression, Expr::Const(0)] => difference(expression),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn positive_difference_equality(left: &Expr, right: &Expr) -> Option<NativeIntension> {
+    let Expr::Var(target) = left else {
+        return None;
+    };
+    let (left, right) = positive_difference(right)?;
+    Some(NativeIntension::PositiveDifference { target: *target, left, right })
 }
 
 fn complement(relation: LinearRelation) -> LinearRelation {
@@ -249,6 +286,11 @@ fn native_intension(store: &Store, expression: &Expr, stop: &AtomicBool) -> Opti
             });
         }
         Expr::Iff(left, right) | Expr::Eq(left, right) => {
+            if matches!(expression, Expr::Eq(_, _)) {
+                if let Some(plan) = positive_difference_equality(left, right).or_else(|| positive_difference_equality(right, left)) {
+                    return Some(plan);
+                }
+            }
             if let Some(plan) = reified_equivalence(store, left, right, stop).or_else(|| reified_equivalence(store, right, left, stop)) {
                 return Some(plan);
             }
@@ -302,6 +344,9 @@ fn post_native_intension(solver: &mut Solver, plan: NativeIntension, stop: &Atom
             predicate.rhs,
             stop,
         ),
+        NativeIntension::PositiveDifference { target, left, right } => {
+            super::primitives::positive_difference_interruptible(solver, target, left, right, stop)
+        }
         NativeIntension::ReifiedLinear { selector, active_value, predicate, equivalence } => linear::reified_linear_interruptible(
             solver,
             linear::ReifiedLinearSpec {
