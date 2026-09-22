@@ -1067,24 +1067,36 @@ fn domain_cells(model: &Model, variables: &[super::IntVarRef], stop: &AtomicBool
     Some(cells)
 }
 
-fn table_support_count(tuples: &[Vec<i32>], arity: usize, stop: &AtomicBool) -> Option<u128> {
-    let mut total = 0u128;
-    // One set at a time keeps the estimator's peak temporary memory bounded by
-    // a single column instead of duplicating the whole table body.
-    let mut values = BTreeSet::new();
+fn table_support_bytes(tuples: &[Vec<i32>], arity: usize, stop: &AtomicBool) -> Option<u128> {
+    let mut bytes = 0u128;
+    let words = tuples.len().div_ceil(64);
+    // Count nonzero words one column at a time. A value repeated within one
+    // tuple word needs just one sparse entry, and no full bitset is allocated
+    // by preflight. The last word is enough because rows arrive in order.
+    let mut values = BTreeMap::<i32, (usize, usize)>::new();
     for column in 0..arity {
         values.clear();
-        for tuple in tuples {
+        for (row, tuple) in tuples.iter().enumerate() {
             if interrupted(stop) {
                 return None;
             }
             if let Some(&value) = tuple.get(column).filter(|&&value| value != table::STAR) {
-                values.insert(value);
+                let word = row / 64;
+                let (last, count) = values.entry(value).or_insert((usize::MAX, 0));
+                if *last != word {
+                    *last = word;
+                    *count += 1;
+                }
             }
         }
-        total = total.saturating_add(wide(values.len()));
+        for &(_, nonzero_words) in values.values() {
+            if interrupted(stop) {
+                return None;
+            }
+            bytes = bytes.saturating_add(table::extension_support_estimated_bytes(nonzero_words, words)).saturating_add(64);
+        }
     }
-    Some(total)
+    Some(bytes)
 }
 
 fn estimate_global_bytes(
@@ -1126,17 +1138,23 @@ fn estimate_global_bytes(
             let words = tuple_count.saturating_add(63) / 64;
             let key = (variables.len(), tuples.as_ptr() as usize, tuples.len());
             let template = if table_templates.insert(key) {
-                let support_values = table_support_count(tuples, variables.len(), stop)?;
-                support_values
-                    .saturating_mul(words)
-                    .saturating_mul(8)
-                    .saturating_add(support_values.saturating_mul(64))
+                table_support_bytes(tuples, variables.len(), stop)?
+                    // Wildcard/full bitsets stay dense. One extra word vector
+                    // covers the temporary sparse body during promotion.
+                    .saturating_add(arity.saturating_add(2).saturating_mul(words).saturating_mul(8))
                     .saturating_add(arity.saturating_mul(tuple_count).saturating_mul(4))
                     .saturating_add(4096)
             } else {
                 0
             };
-            let layered_scratch = arity.saturating_add(1).saturating_mul(words).saturating_mul(if *positive { 48 } else { 32 });
+            let layered_scratch = if *positive {
+                // Positive tables have current/union and optional valid rows,
+                // reversible word handles/values/epochs, and trail capacity.
+                // The completion-search layers belong only to negative tables.
+                words.saturating_mul(128).saturating_add(arity.saturating_add(1).saturating_mul(128))
+            } else {
+                arity.saturating_add(1).saturating_mul(words).saturating_mul(32)
+            };
             let residues = domain_cells(model, variables, stop)?.saturating_mul(if *positive { 160 } else { 32 });
             4096u128.saturating_add(template).saturating_add(layered_scratch).saturating_add(residues)
         }
