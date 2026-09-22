@@ -1006,7 +1006,7 @@ fn order_functionals(mut functionals: Vec<Functional>, stop: &AtomicBool) -> Opt
     // relations after demotion. Other functional kinds may own their only
     // representation, so their uniqueness and cycle checks remain unchanged.
     functionals.retain(|functional| {
-        !stop.load(Ordering::Acquire) && !(matches!(functional, Functional::Expr { .. }) && definitions[&functional_target(functional)] > 1)
+        !(stop.load(Ordering::Acquire) || matches!(functional, Functional::Expr { .. }) && definitions[&functional_target(functional)] > 1)
     });
     let mut targets = HashSet::with_capacity(functionals.len());
     for functional in &functionals {
