@@ -328,7 +328,17 @@ impl SolveBudget {
     /// Bound optional search and reserve a short tail of the same allowance for
     /// canonical repair and transfer verification.
     pub(crate) fn warm_start_stops(&self) -> Option<WarmStartStops> {
-        let duration = self.warm_start_duration();
+        self.optional_search_stops(self.warm_start_duration())
+    }
+
+    /// Improve an admitted additive-penalty incumbent, leaving at least two
+    /// thirds of the remaining request for exact search and final replay.
+    pub(crate) fn penalty_refinement_stops(&self) -> Option<WarmStartStops> {
+        let duration = self.remaining().map_or(MAX_WARM_START_TIME, |remaining| (remaining / 3).min(Duration::from_secs(60)));
+        self.optional_search_stops(duration)
+    }
+
+    fn optional_search_stops(&self, duration: Duration) -> Option<WarmStartStops> {
         if duration.is_zero() {
             return None;
         }

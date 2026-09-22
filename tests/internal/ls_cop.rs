@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use qayd::constraints::linear::Relation;
 use qayd::engines::ls::cop::{
-    audit_invariant_transactions, solve_ls, solve_ls_capped, solve_ls_capped_borrowed, LocalSearchSpec, LsConfig, MAX_DOMAIN_VALUES,
+    audit_invariant_transactions, solve_ls, solve_ls_capped, solve_ls_capped_borrowed, solve_ls_capped_borrowed_with_initial,
+    LocalSearchSpec, LsConfig, MAX_DOMAIN_VALUES,
 };
 use qayd::expr::Expr;
 use qayd::ids::VarId;
@@ -716,4 +717,109 @@ fn generic_extension_without_exact_cover_keeps_constructive_initialization_and_r
     assert_eq!(first_source.as_deref(), Some("constructive"));
     assert_eq!(outcome.restarts, 1, "generic extension models must keep the constructive restart path");
     assert_eq!(outcome.best.as_ref().map(|(_, objective)| *objective), Some(0));
+}
+
+fn seeded_local_fixture() -> (Problem, LocalSearchSpec) {
+    let mut solver = Solver::new();
+    let _unused = solver.new_var_range(7, 7);
+    let x = solver.new_var_set(&[0, 1, 3]);
+    let y = solver.new_var_range(0, 3);
+    let sum = solver.new_var_range(0, 6);
+    let mut spec = LocalSearchSpec::default();
+    for variable in [x, y, sum] {
+        spec.add_var(variable);
+    }
+    spec.add_expr(Expr::Eq(Box::new(Expr::Var(sum)), Box::new(Expr::Add(vec![Expr::Var(x), Expr::Var(y)]))));
+    spec.add_expr(Expr::Ne(Box::new(Expr::Var(x)), Box::new(Expr::Var(y))));
+    (Problem { solver, search: vec![sum, y, x], objective: Some(Objective::Var(true, sum)) }, spec)
+}
+
+#[test]
+fn integer_local_seed_maps_search_order_and_recomputes_functionals() {
+    let (problem, spec) = seeded_local_fixture();
+    let mut published = Vec::new();
+    let outcome = solve_ls_capped_borrowed_with_initial(
+        &problem,
+        spec,
+        &AtomicBool::new(false),
+        0,
+        LsConfig::default(),
+        0,
+        Some(&[0, 3, 1]),
+        |objective, values, source| published.push((objective, values.to_vec(), source)),
+    )
+    .unwrap();
+    assert_eq!(outcome.best, Some((vec![4, 3, 1], 4)));
+    assert_eq!(published, [(4, vec![4, 3, 1], "seeded-local-search")]);
+    assert_eq!(outcome.iterations, 0);
+}
+
+#[test]
+fn integer_local_seed_rejects_wrong_lengths_domains_and_infeasibility() {
+    for values in [vec![0, 3], vec![0, 3, 1, 7], vec![0, 3, 2], vec![0, 1, 1], vec![7, 3, 1]] {
+        let (problem, spec) = seeded_local_fixture();
+        let result = solve_ls_capped_borrowed_with_initial(
+            &problem,
+            spec,
+            &AtomicBool::new(false),
+            0,
+            LsConfig::default(),
+            10,
+            Some(&values),
+            |_, _, _| panic!("an invalid seed must not publish an incumbent"),
+        );
+        assert!(result.is_err(), "invalid seed was accepted: {values:?}");
+    }
+}
+
+#[test]
+fn integer_local_seed_survives_immediate_stop_after_publication() {
+    let (problem, spec) = seeded_local_fixture();
+    let stop = AtomicBool::new(false);
+    let outcome =
+        solve_ls_capped_borrowed_with_initial(&problem, spec, &stop, 0, LsConfig::default(), u64::MAX, Some(&[4, 3, 1]), |_, _, _| {
+            stop.store(true, Ordering::Release)
+        })
+        .unwrap();
+    assert_eq!(outcome.best, Some((vec![4, 3, 1], 4)));
+    assert_eq!(outcome.iterations, 0);
+}
+
+#[test]
+fn integer_local_seed_prearmed_stop_does_not_publish() {
+    let (problem, spec) = seeded_local_fixture();
+    let outcome = solve_ls_capped_borrowed_with_initial(
+        &problem,
+        spec,
+        &AtomicBool::new(true),
+        0,
+        LsConfig::default(),
+        10,
+        Some(&[4, 3, 1]),
+        |_, _, _| panic!("cancelled seed initialization must not publish"),
+    )
+    .unwrap();
+    assert!(outcome.best.is_none());
+    assert_eq!(outcome.iterations, 0);
+}
+
+#[test]
+fn integer_local_seed_keeps_a_monotone_incumbent_during_search() {
+    let (problem, spec) = seeded_local_fixture();
+    let mut objectives = Vec::new();
+    let outcome = solve_ls_capped_borrowed_with_initial(
+        &problem,
+        spec,
+        &AtomicBool::new(false),
+        0,
+        LsConfig::default(),
+        64,
+        Some(&[4, 3, 1]),
+        |objective, _, _| objectives.push(objective),
+    )
+    .unwrap();
+    assert_eq!(objectives.first(), Some(&4));
+    assert!(objectives.windows(2).all(|pair| pair[1] < pair[0]));
+    assert_eq!(outcome.best.as_ref().map(|(_, value)| value), objectives.last());
+    assert!(outcome.best.unwrap().1 < 4, "a feasible seed should allow immediate objective descent");
 }
