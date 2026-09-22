@@ -70,6 +70,8 @@ General options:
   -p, --threads <N>                  Set the worker count [default: 1; N >= 1]
       --mem-limit <MiB>              Set the process memory limit [MiB >= 1]
       --core                         Print an exact source-constraint MUS after UNSAT
+      --all-solutions                Print each verified incumbent assignment
+                                     Uses a monolithic integer plan for full snapshots
 
 Search options:
       --ls                           Run incumbent-only local search
@@ -192,6 +194,7 @@ fn main() {
     let mut lns = 0;
     let mut no_learn_csp = false;
     let mut core = false;
+    let mut all_solutions = false;
     let mut semantic_branching = false;
     let mut force_scope_reasons = false;
     let mut shared_pool_capacity = 1 << 14;
@@ -209,6 +212,7 @@ fn main() {
             "--seed" => seed = Some(parse(it.next().map(String::as_str), "--seed needs an unsigned integer")),
             "-p" | "--threads" => workers = Some(positive(it.next().map(String::as_str), "-p/--threads needs a positive integer")),
             "--ls" => ls = true,
+            "--all-solutions" => all_solutions = true,
             "--split" => split = true,
             "--probe" => probes = positive(it.next().map(String::as_str), "--probe needs a positive integer"),
             "--lns" => lns = positive(it.next().map(String::as_str), "--lns needs a positive integer"),
@@ -303,6 +307,7 @@ fn main() {
             mem_limit,
             linear,
             core,
+            all_solutions,
         },
         search_policy,
     );

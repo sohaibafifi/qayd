@@ -285,7 +285,10 @@ fn compile_model_plan_inner(
                 // Prefer that route only after it has actually compiled. Mixed
                 // families and disjoint list universes have no monolithic
                 // representation and must retain their decomposed plan.
-                if should_try_monolithic_deadline_plan(&components, request) {
+                // Assignment snapshots must represent the complete original
+                // model. Prefer a supported monolithic plan for this explicit
+                // observation request; default search selection is unchanged.
+                if request.publish_incumbent_assignments || should_try_monolithic_deadline_plan(&components, request) {
                     if let Some(plan) =
                         try_compile_monolithic_plan(model, request, budget, has_integer, has_collection, collection_families)?
                     {
