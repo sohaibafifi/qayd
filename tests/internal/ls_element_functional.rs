@@ -368,3 +368,100 @@ fn constant_element_normalization_honors_stop_and_invalidates_after_new_producer
     assert!(!spec.is_derived(right));
     assert_eq!(spec.unsupported(), 0);
 }
+
+#[test]
+fn duplicate_expression_outputs_match_a_fixed_assignment_oracle() {
+    for x_value in 0..=2 {
+        for y_value in 0..=2 {
+            for output in 0..=2 {
+                let mut solver = Solver::new();
+                let x = solver.new_var_range(x_value, x_value);
+                let y = solver.new_var_range(y_value, y_value);
+                let target = solver.new_var_range(output, output);
+                let mut spec = spec_for(&[x, y, target]);
+                for input in [x, y] {
+                    spec.add_expr(Expr::Eq(Box::new(Expr::Var(target)), Box::new(Expr::Add(vec![Expr::Var(input), Expr::Const(0)]))));
+                }
+                assert!(spec.normalize_functionals());
+                assert!(!spec.is_derived(target), "ambiguous expression outputs must remain searchable");
+                assert!(spec.normalize_functionals(), "normalization must remain idempotent");
+                let problem = Problem { solver, search: vec![x, y, target], objective: Some(Objective::Var(true, target)) };
+                let outcome = solve_ls_capped(problem, spec, &AtomicBool::new(false), 0, LsConfig::default(), 1, |_, _, _| {});
+                let feasible = output == x_value && output == y_value;
+                assert_eq!(outcome.best.is_some(), feasible, "values=({x_value},{y_value},{output})");
+                assert_eq!(outcome.constraints, 2, "both defining equations must still be checked");
+                assert_eq!(outcome.functionals, 0);
+                assert_eq!(outcome.unsupported, 0);
+                if let Some((values, objective)) = outcome.best {
+                    assert_eq!(values, [x_value, y_value, output]);
+                    assert_eq!(objective, i64::from(output));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn duplicate_expression_outputs_preserve_canonical_repair_ownership() {
+    let mut model = Model::new();
+    let x = model.int_range(0, 2);
+    let y = model.int_range(1, 1);
+    let target = model.int_range(0, 2);
+    for input in [x, y] {
+        model.add_constraint(Constraint::Intension(crate::model::IntExpr::Eq(
+            Box::new(target.into()),
+            Box::new(crate::model::IntExpr::Add(vec![input.into(), 0.into()])),
+        )));
+    }
+    model.add_objective(SemanticObjective::IntExpr { minimize: true, expr: target.into() });
+    let stop = AtomicBool::new(false);
+    let compiled = CompiledCp::compile_interruptible(&model, &stop).unwrap().unwrap();
+    let local = integer::compile_interruptible(&model, &compiled, &stop, u64::MAX).unwrap().unwrap();
+    assert!(!local.spec.is_derived(compiled.int_variables()[target.0]));
+    let request = SolveRequest {
+        mode: SolveMode::LocalSearch,
+        limits: crate::orchestrator::SolveLimits { iterations: Some(64), ..crate::orchestrator::SolveLimits::default() },
+        ..SolveRequest::default()
+    };
+    let budget = SolveBudget::new(Some(std::time::Duration::from_secs(2)));
+    let plan = compile_cp_plan(&model, &request, &budget).unwrap();
+    let result = solve_cp_plan(&model, &plan, &request, &budget, &mut IgnoreEvents).unwrap();
+    assert_eq!(result.status(), SolveStatus::Satisfiable);
+    assert_eq!(result.primal().unwrap().assignment().integers, [Some(1), Some(1), Some(1)]);
+    assert_eq!(result.primal().unwrap().objectives(), [1]);
+    assert!(result.proof().is_none());
+}
+
+#[test]
+fn expression_dependency_cycles_report_unsupported_instead_of_memory_exhaustion() {
+    let mut model = Model::new();
+    let x = model.int_range(0, 1);
+    let y = model.int_range(0, 1);
+    for (target, input) in [(x, y), (y, x)] {
+        model.add_constraint(Constraint::Intension(crate::model::IntExpr::Eq(
+            Box::new(target.into()),
+            Box::new(crate::model::IntExpr::Add(vec![input.into(), 0.into()])),
+        )));
+    }
+    model.add_objective(SemanticObjective::IntExpr { minimize: true, expr: x.into() });
+    let request = SolveRequest { mode: SolveMode::LocalSearch, ..SolveRequest::default() };
+    let result = compile_cp_plan(&model, &request, &SolveBudget::new(None));
+    assert!(
+        matches!(result, Err(crate::orchestrator::SolveError::Unsupported(message)) if message.contains("cycle") && !message.contains("memory"))
+    );
+}
+
+#[test]
+fn duplicate_variable_element_outputs_remain_unsupported() {
+    let left = VarId(0);
+    let right = VarId(1);
+    let index = VarId(2);
+    let target = VarId(3);
+    let mut spec = spec_for(&[left, right, index, target]);
+    // Variable elements own their defining relation, so removing either
+    // producer without reconstructing a constraint would weaken this model.
+    spec.add_element(vec![left], index, target, 0);
+    spec.add_element(vec![right], index, target, 0);
+    assert!(!spec.normalize_functionals());
+    assert_eq!(spec.unsupported(), 1);
+}
