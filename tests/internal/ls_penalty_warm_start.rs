@@ -531,7 +531,8 @@ fn penalty_refinement_without_improvement_retains_the_scout() {
     let mut model = Model::new();
     let x = model.int_range(0, 2);
     let y = model.int_range(0, 2);
-    model.add_constraint(Constraint::Intension(IntExpr::Ne(Box::new(x.into()), Box::new(y.into()))));
+    model.add_constraint(Constraint::Intension(IntExpr::Eq(Box::new(x.into()), Box::new(y.into()))));
+    // Equality forces cost five, above the interval lower bound four.
     let model = objective(model, vec![equal(x, y), 4.into()], true);
     let mut local_candidates = 0;
     let mut sink = EventCallback(|event| {
@@ -553,8 +554,38 @@ fn penalty_refinement_without_improvement_retains_the_scout() {
         .expect("a completed refinement must have its own effort report");
     assert_eq!(refinement.improvements, 0);
     assert_eq!(local_candidates, 0);
-    assert_eq!(result.primal().unwrap().objectives(), [4]);
+    assert_eq!(result.primal().unwrap().objectives(), [5]);
     assert_eq!(result.status(), SolveStatus::Optimal);
+}
+
+#[test]
+fn penalty_scout_at_the_root_bound_skips_refinement_and_keeps_cp_proof() {
+    for offset in [0i64, 4] {
+        for seed in 0..3 {
+            let mut model = Model::new();
+            let x = model.int_range(0, 2);
+            let y = model.int_range(0, 2);
+            model.add_constraint(Constraint::Intension(IntExpr::Ne(Box::new(x.into()), Box::new(y.into()))));
+            let model = objective(model, vec![equal(x, y), offset.into()], true);
+            let request = SolveRequest {
+                seed,
+                limits: SolveLimits { time: Some(std::time::Duration::from_secs(1)), ..SolveLimits::default() },
+                ..SolveRequest::default()
+            };
+            let result = solve_model_silent(&ModelPackage::new(model), &request).unwrap();
+            // Every feasible pair is unequal, so the independent optimum is offset.
+            assert!(scout_started(&result));
+            assert!(
+                !result.reports().iter().any(|report| {
+                    report.metadata.iter().any(|(key, value)| key == "warm_start_method" && value == "cp_seeded_local_search")
+                }),
+                "a scout at the root bound must leave proof work to CP without optional refinement"
+            );
+            assert_eq!(result.primal().unwrap().objectives(), [offset]);
+            assert_eq!(result.status(), SolveStatus::Optimal);
+            assert!(result.proof().is_some());
+        }
+    }
 }
 
 #[test]

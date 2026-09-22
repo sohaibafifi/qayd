@@ -283,6 +283,23 @@ fn local_warm_start(
             return Ok(scout);
         }
     }
+    if let Some(warm) = scout.as_ref() {
+        let store = &compiled.problem().solver.store;
+        let lower = match compiled.problem().objective.as_ref() {
+            Some(PhysicalObjective::Expr(true, expression)) => {
+                Some(expression.bounds(&|variable| (i64::from(store.min(variable)), i64::from(store.max(variable)))).0)
+            }
+            Some(PhysicalObjective::Var(true, variable) | PhysicalObjective::VarWithAffine(true, variable, _, _)) => {
+                Some(i64::from(store.min(*variable)))
+            }
+            _ => None,
+        };
+        if lower == Some(warm.physical_objective) {
+            // CP retains proof authority; optional refinement cannot improve a
+            // verified incumbent that already attains the immutable root bound.
+            return Ok(scout);
+        }
+    }
     let refinement_stops = scout.as_ref().and_then(|_| budget.penalty_refinement_stops());
     if scout.is_some() && refinement_stops.is_none() {
         return Ok(scout);
