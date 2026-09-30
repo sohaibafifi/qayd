@@ -86,6 +86,14 @@ fn merge_search_stats_covers_every_counter() {
         learned_lits: 4,
         vivified_clauses: 5,
         vivified_lits: 6,
+        semantic_minimized_clauses: 33,
+        semantic_minimized_lits: 34,
+        nogoods: qayd::lcg::nogood::NogoodStats {
+            removed_values: 2,
+            cpip_multi_predicate: 3,
+            peak_scratch_bytes: 40,
+            ..Default::default()
+        },
         binary_clause_visits: 7,
         watched_clause_visits: 8,
         watched_literal_scans: 9,
@@ -119,6 +127,14 @@ fn merge_search_stats_covers_every_counter() {
         learned_lits: 40,
         vivified_clauses: 50,
         vivified_lits: 60,
+        semantic_minimized_clauses: 330,
+        semantic_minimized_lits: 340,
+        nogoods: qayd::lcg::nogood::NogoodStats {
+            removed_values: 20,
+            cpip_multi_predicate: 30,
+            peak_scratch_bytes: 4,
+            ..Default::default()
+        },
         binary_clause_visits: 70,
         watched_clause_visits: 80,
         watched_literal_scans: 90,
@@ -157,6 +173,14 @@ fn merge_search_stats_covers_every_counter() {
             learned_lits: 44,
             vivified_clauses: 55,
             vivified_lits: 66,
+            semantic_minimized_clauses: 363,
+            semantic_minimized_lits: 374,
+            nogoods: qayd::lcg::nogood::NogoodStats {
+                removed_values: 22,
+                cpip_multi_predicate: 33,
+                peak_scratch_bytes: 40,
+                ..Default::default()
+            },
             binary_clause_visits: 77,
             watched_clause_visits: 88,
             watched_literal_scans: 99,

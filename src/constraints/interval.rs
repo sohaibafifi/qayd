@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 
+use crate::constraints::cumulative_profile::{CumulativeStats, IncrementalProfile, ProfileUpdate};
 use crate::constraints::resource_profile::{
     build_profile, earliest_feasible_start, EnergeticAnalysis, EnergeticWorkspace, FixedCumulativeTask, ProfileSegment,
 };
@@ -120,6 +121,209 @@ fn cumulative_profile_premises(store: &Store, intervals: &[IntervalId], lo: i128
     why
 }
 
+/// A native timetable deduction's complete integer-start coverage obligation.
+#[derive(Clone, Copy)]
+pub(crate) enum TimetableCertificate {
+    Overload { time: i128 },
+    LowerBound { occurrence: usize, bound: i128 },
+    NoFit { occurrence: usize },
+}
+
+pub(crate) struct LiftedCumulativeReason {
+    pub(crate) premises: Vec<Premise>,
+    pub(crate) lifted_bounds: u64,
+    pub(crate) omitted_tautologies: u64,
+}
+
+/// This is an explanation constructor, not an additional scheduling filter.
+/// `None` preserves the original reason when a coverage certificate cannot be
+/// reconstructed. `Err(())` is cancellation and must never become a conflict.
+pub(crate) struct CumulativeReasonContext<'a> {
+    pub(crate) store: &'a Store,
+    pub(crate) intervals: &'a [IntervalId],
+    pub(crate) demands: &'a [i32],
+    pub(crate) capacity: i32,
+    pub(crate) profile: &'a [ProfileSegment],
+}
+
+impl CumulativeReasonContext<'_> {
+    fn cover_window(
+        &self,
+        window: (i128, i128),
+        target: Option<usize>,
+        target_demand: i128,
+        covered: &mut [Option<(i128, i128)>],
+        stop: Option<&dyn Fn() -> bool>,
+    ) -> Result<bool, ()> {
+        let mut usage = target_demand;
+        if usage > i128::from(self.capacity) {
+            return Ok(true);
+        }
+        for (occurrence, &interval) in self.intervals.iter().enumerate() {
+            if interruption_requested(stop) {
+                return Err(());
+            }
+            // Exclude one occurrence, rather than every equal IntervalId.
+            // All other occurrences retain their demand and presence semantics.
+            if Some(occurrence) == target || self.store.interval_presence(interval) != IntervalPresence::Present {
+                continue;
+            }
+            let demand = i128::from(self.demands[occurrence]);
+            let duration = i128::from(self.store.interval_duration(interval));
+            if demand <= 0 || duration <= 0 {
+                continue;
+            }
+            let start = i128::from(self.store.interval_start_max(interval));
+            let end = i128::from(self.store.interval_start_min(interval)) + duration;
+            if start <= window.0 && window.1 <= end {
+                covered[occurrence] =
+                    Some(covered[occurrence].map_or(window, |previous| (previous.0.min(window.0), previous.1.max(window.1))));
+                usage += demand;
+                if usage > i128::from(self.capacity) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn explain(
+        &self,
+        certificate: TimetableCertificate,
+        stop: Option<&dyn Fn() -> bool>,
+    ) -> Result<Option<LiftedCumulativeReason>, ()> {
+        if interruption_requested(stop) {
+            return Err(());
+        }
+        if self.intervals.len() != self.demands.len() || self.capacity < 0 {
+            return Ok(None);
+        }
+        let mut covered = vec![None; self.intervals.len()];
+        let mut target_bounds = None;
+        match certificate {
+            TimetableCertificate::Overload { time } => {
+                // Integer starts and durations make a single unit window an
+                // exact overload witness, even beyond the i32 time horizon.
+                if !self.cover_window((time, time + 1), None, 0, &mut covered, stop)? {
+                    return Ok(None);
+                }
+            }
+            TimetableCertificate::LowerBound { occurrence, .. } | TimetableCertificate::NoFit { occurrence } => {
+                let Some(&interval) = self.intervals.get(occurrence) else { return Ok(None) };
+                if self.store.interval_presence(interval) != IntervalPresence::Present {
+                    return Ok(None);
+                }
+                let duration = i128::from(self.store.interval_duration(interval));
+                let demand = i128::from(self.demands[occurrence]);
+                if duration <= 0 || demand <= 0 {
+                    return Ok(None);
+                }
+                let lower = i128::from(self.store.interval_start_min(interval));
+                let upper = i128::from(self.store.interval_start_max(interval));
+                let end = match certificate {
+                    TimetableCertificate::LowerBound { bound, .. } if lower < bound && bound <= upper => bound,
+                    TimetableCertificate::NoFit { .. } => upper + 1,
+                    _ => return Ok(None),
+                };
+                let mut candidate = lower;
+                let mut lifted_lower = lower;
+                while candidate < end {
+                    if interruption_requested(stop) {
+                        return Err(());
+                    }
+                    // Replay the same first-overload jumps as the unchanged
+                    // timetable filter. A certificate cannot skip a removed
+                    // integer start, including between separated segments.
+                    let own_start = upper;
+                    let own_end = lower + duration;
+                    let mut conflict_end = None;
+                    if demand > i128::from(self.capacity) {
+                        conflict_end = Some(end);
+                    } else {
+                        for segment in self.profile {
+                            if interruption_requested(stop) {
+                                return Err(());
+                            }
+                            if candidate.max(segment.start) >= (candidate + duration).min(segment.end) {
+                                continue;
+                            }
+                            let own = if own_start <= segment.start && segment.end <= own_end { demand } else { 0 };
+                            if segment.usage - own + demand > i128::from(self.capacity) {
+                                conflict_end = Some(segment.end);
+                                break;
+                            }
+                        }
+                    }
+                    let Some(conflict_end) = conflict_end else { return Ok(None) };
+                    let window_end = conflict_end.min(end);
+                    if window_end <= candidate {
+                        return Ok(None);
+                    }
+                    let window_start = (candidate + duration - 1).min(window_end - 1);
+                    if !self.cover_window((window_start, window_end), Some(occurrence), demand, &mut covered, stop)? {
+                        return Ok(None);
+                    }
+                    if candidate == lower {
+                        // Every start at least this bound intersects the first
+                        // certified window; this may weaken the old lower bound.
+                        lifted_lower = window_start - duration + 1;
+                    }
+                    candidate = window_end;
+                }
+                target_bounds = Some((interval, lifted_lower, matches!(certificate, TimetableCertificate::NoFit { .. })));
+            }
+        }
+        let mut reason = LiftedCumulativeReason { premises: Vec::new(), lifted_bounds: 0, omitted_tautologies: 0 };
+        for (occurrence, window) in covered.into_iter().enumerate() {
+            if interruption_requested(stop) {
+                return Err(());
+            }
+            let Some((start, end)) = window else { continue };
+            let interval = self.intervals[occurrence];
+            reason.premises.extend(present_premise(self.store, interval));
+            let duration = i128::from(self.store.interval_duration(interval));
+            if !reason.bound(self.store, interval, end - duration, true) || !reason.bound(self.store, interval, start, false) {
+                return Ok(None);
+            }
+        }
+        if let Some((interval, lower, conflict)) = target_bounds {
+            reason.premises.extend(present_premise(self.store, interval));
+            if !reason.bound(self.store, interval, lower, true) {
+                return Ok(None);
+            }
+            if conflict && !reason.bound(self.store, interval, i128::from(self.store.interval_start_max(interval)), false) {
+                return Ok(None);
+            }
+        }
+        if interruption_requested(stop) {
+            return Err(());
+        }
+        Ok(Some(reason))
+    }
+}
+
+impl LiftedCumulativeReason {
+    fn bound(&mut self, store: &Store, interval: IntervalId, bound: i128, lower: bool) -> bool {
+        let original = if lower { store.interval_start_min(interval) } else { store.interval_start_max(interval) };
+        // A certificate may weaken a current premise, never strengthen it.
+        if (lower && bound > i128::from(original)) || (!lower && bound < i128::from(original)) {
+            return false;
+        }
+        if (lower && original > i32::MIN && bound < i128::from(original)) || (!lower && original < i32::MAX && bound > i128::from(original))
+        {
+            self.lifted_bounds += 1;
+        }
+        if (lower && bound <= i128::from(i32::MIN)) || (!lower && bound >= i128::from(i32::MAX)) {
+            self.omitted_tautologies += 1;
+            return true;
+        }
+        let Ok(bound) = i32::try_from(bound) else { return false };
+        let var = store.interval_start_var(interval);
+        self.premises.push(if lower { Premise::Ge { var, bound } } else { Premise::Le { var, bound } });
+        true
+    }
+}
+
 /// Post interval precedence.
 pub fn interval_precedence(solver: &mut Solver, before: IntervalId, after: IntervalId) -> PropId {
     solver.post(Box::new(IntervalPrecedence { before, after }))
@@ -137,6 +341,8 @@ pub fn interval_precedence(solver: &mut Solver, before: IntervalId, after: Inter
 pub struct NoOverlap {
     intervals: Vec<IntervalId>,
     branch_orders: bool,
+    /// Frozen semantics, also marks the supported mandatory positive-duration scope.
+    edge_finding_tasks: Option<Arc<[(VarId, i64)]>>,
     /// `(a, b, order index)` for each unordered pair; the order index addresses
     /// the trailed order decision in the store.
     pairs: Vec<(usize, usize, usize)>,
@@ -280,6 +486,14 @@ fn remove_pairwise_unsupported_values(
 }
 
 impl Propagator for NoOverlap {
+    fn inference_constraint(&self) -> Option<crate::inference::InferenceConstraint> {
+        self.edge_finding_tasks.as_ref().map(|tasks| crate::inference::InferenceConstraint::NoOverlap { tasks: tasks.to_vec() })
+    }
+
+    fn inference_description_work(&self) -> usize {
+        self.edge_finding_tasks.as_ref().map_or(0, |tasks| tasks.len())
+    }
+
     fn priority(&self) -> Priority {
         Priority::Expensive
     }
@@ -316,6 +530,24 @@ impl NoOverlap {
             store.subscribe_interval(interval, me, IntervalEvent::PresenceChange);
             store.subscribe(store.interval_start_var(interval), me, Event::DomainChange);
         }
+        self.edge_finding_tasks = None;
+        if !self.branch_orders {
+            let mut tasks = Vec::with_capacity(self.intervals.len());
+            let mut eligible = true;
+            for &interval in &self.intervals {
+                if interruption_requested(should_stop) {
+                    return false;
+                }
+                if store.interval_presence_var(interval).is_some() || store.interval_duration(interval) <= 0 {
+                    eligible = false;
+                    break;
+                }
+                tasks.push((store.interval_start_var(interval), i64::from(store.interval_duration(interval))));
+            }
+            if eligible {
+                self.edge_finding_tasks = Some(tasks.into());
+            }
+        }
         self.pairs.clear();
         let n = self.intervals.len();
         self.pair_index.clear();
@@ -347,6 +579,11 @@ impl NoOverlap {
     }
 
     fn propagate_core(&mut self, store: &mut Store, should_stop: Option<&dyn Fn() -> bool>) -> Result<(), Inconsistency> {
+        store.record_unary_edge_finding(crate::constraints::unary_edge_finding::UnaryEdgeFindingStats {
+            propagation_calls: 1,
+            unsupported_calls: u64::from(store.unary_edge_finding_enabled() && self.edge_finding_tasks.is_none()),
+            ..Default::default()
+        });
         loop {
             if interruption_requested(should_stop) {
                 return Ok(());
@@ -453,6 +690,13 @@ impl NoOverlap {
             };
             changed |= detectable_changed;
 
+            if store.unary_edge_finding_enabled() && self.edge_finding_tasks.is_some() {
+                let Some(edge_changed) = crate::constraints::unary_edge_finding::propagate(store, &self.intervals, should_stop)? else {
+                    return Ok(());
+                };
+                changed |= edge_changed;
+            }
+
             if !changed {
                 return Ok(());
             }
@@ -542,6 +786,7 @@ pub fn no_overlap(solver: &mut Solver, intervals: &[IntervalId]) -> PropId {
     solver.post(Box::new(NoOverlap {
         intervals: intervals.to_vec(),
         branch_orders: true,
+        edge_finding_tasks: None,
         pairs: Vec::new(),
         pair_index: Vec::new(),
         present: Vec::new(),
@@ -558,6 +803,7 @@ pub(crate) fn no_overlap_until(solver: &mut Solver, intervals: Vec<IntervalId>, 
         Box::new(NoOverlap {
             intervals,
             branch_orders: true,
+            edge_finding_tasks: None,
             pairs: Vec::new(),
             pair_index: Vec::new(),
             present: Vec::new(),
@@ -574,6 +820,7 @@ pub(crate) fn mandatory_no_overlap(solver: &mut Solver, intervals: &[IntervalId]
     solver.post(Box::new(NoOverlap {
         intervals: intervals.to_vec(),
         branch_orders: false,
+        edge_finding_tasks: None,
         pairs: Vec::new(),
         pair_index: Vec::new(),
         present: Vec::new(),
@@ -591,6 +838,7 @@ pub(crate) fn mandatory_no_overlap_until(
         Box::new(NoOverlap {
             intervals,
             branch_orders: false,
+            edge_finding_tasks: None,
             pairs: Vec::new(),
             pair_index: Vec::new(),
             present: Vec::new(),
@@ -687,13 +935,95 @@ pub struct Cumulative {
     present: Vec<usize>,
     tasks: Vec<FixedCumulativeTask>,
     energetic: EnergeticWorkspace,
+    profile_cache: Option<IncrementalProfile>,
+    root_registered: bool,
+    inference_tasks: Option<Arc<[crate::inference::InferenceCumulativeTask]>>,
 }
 
 impl Cumulative {
+    fn timetable_reason(
+        &self,
+        store: &Store,
+        original: Vec<Premise>,
+        certificate: TimetableCertificate,
+        stats: &mut CumulativeStats,
+        stop: Option<&dyn Fn() -> bool>,
+    ) -> Option<Vec<Premise>> {
+        let original_width = original.len();
+        let reason = if store.lifted_cumulative_explanations_enabled() && self.inference_tasks.is_some() {
+            let context = CumulativeReasonContext {
+                store,
+                intervals: &self.intervals,
+                demands: &self.demands,
+                capacity: self.capacity,
+                profile: &self.profile,
+            };
+            match context.explain(certificate, stop) {
+                Ok(Some(lifted)) => {
+                    stats.lifted_bounds = stats.lifted_bounds.saturating_add(lifted.lifted_bounds);
+                    stats.omitted_tautologies = stats.omitted_tautologies.saturating_add(lifted.omitted_tautologies);
+                    lifted.premises
+                }
+                Ok(None) => original,
+                Err(()) => {
+                    stats.interrupted = stats.interrupted.saturating_add(1);
+                    return None;
+                }
+            }
+        } else {
+            original
+        };
+        stats.reason_calls = stats.reason_calls.saturating_add(1);
+        stats.original_premises = stats.original_premises.saturating_add(original_width as u64);
+        stats.emitted_premises = stats.emitted_premises.saturating_add(reason.len() as u64);
+        Some(reason)
+    }
+
+    fn register_core(&mut self, store: &mut Store, me: PropId, should_stop: Option<&dyn Fn() -> bool>) -> bool {
+        self.root_registered = store.level() == 0;
+        let mut supported = self.intervals.len() == self.demands.len() && self.capacity >= 0;
+        let mut tasks = Vec::with_capacity(self.intervals.len());
+        for (index, &interval) in self.intervals.iter().enumerate() {
+            if interruption_polled(should_stop, index) {
+                return false;
+            }
+            store.subscribe_interval(interval, me, IntervalEvent::StartBoundChange);
+            store.subscribe_interval(interval, me, IntervalEvent::EndBoundChange);
+            store.subscribe_interval(interval, me, IntervalEvent::PresenceChange);
+            let duration = store.interval_duration(interval);
+            let demand = self.demands.get(index).copied().unwrap_or(-1);
+            supported &= duration >= 0 && demand >= 0;
+            tasks.push(crate::inference::InferenceCumulativeTask {
+                start: store.interval_start_var(interval),
+                duration: i64::from(duration),
+                demand: i64::from(demand),
+                presence: store.interval_presence_var(interval),
+            });
+        }
+        if interruption_requested(should_stop) {
+            return false;
+        }
+        self.inference_tasks = supported.then(|| Arc::from(tasks));
+        true
+    }
+
     fn propagate_core(&mut self, store: &mut Store, should_stop: Option<&dyn Fn() -> bool>) -> Result<(), Inconsistency> {
+        let mut stats = CumulativeStats { propagation_calls: 1, ..CumulativeStats::default() };
+        let result = self.propagate_with_profile(store, should_stop, &mut stats);
+        store.record_cumulative(stats);
+        result
+    }
+
+    fn propagate_with_profile(
+        &mut self,
+        store: &mut Store,
+        should_stop: Option<&dyn Fn() -> bool>,
+        stats: &mut CumulativeStats,
+    ) -> Result<(), Inconsistency> {
         let n = self.intervals.len();
         loop {
             if interruption_requested(should_stop) {
+                stats.interrupted = stats.interrupted.saturating_add(1);
                 return Ok(());
             }
             self.present.clear();
@@ -722,13 +1052,20 @@ impl Cumulative {
             };
             match energetic {
                 Ok(EnergeticAnalysis::Complete) => {}
-                Ok(EnergeticAnalysis::Interrupted) => return Ok(()),
-                Err(_) if interruption_requested(should_stop) => return Ok(()),
+                Ok(EnergeticAnalysis::Interrupted) => {
+                    stats.interrupted = stats.interrupted.saturating_add(1);
+                    return Ok(());
+                }
+                Err(_) if interruption_requested(should_stop) => {
+                    stats.interrupted = stats.interrupted.saturating_add(1);
+                    return Ok(());
+                }
                 Err(_) => return Err(Inconsistency),
             }
             let mut changed = false;
             for (position, &task) in self.present.iter().enumerate() {
                 if interruption_requested(should_stop) {
+                    stats.interrupted = stats.interrupted.saturating_add(1);
                     return Ok(());
                 }
                 let lower_bound = self.energetic.lower_bounds()[position];
@@ -740,6 +1077,7 @@ impl Cumulative {
 
             for (position, &task) in self.present.iter().enumerate() {
                 if interruption_requested(should_stop) {
+                    stats.interrupted = stats.interrupted.saturating_add(1);
                     return Ok(());
                 }
                 let interval = self.intervals[task];
@@ -754,9 +1092,60 @@ impl Cumulative {
             // Mandatory-part profile from the compulsory region of every
             // *present* interval. Optional (undecided) intervals do not yet
             // consume the resource, so they are excluded from the profile.
-            build_profile(self.tasks.iter().copied().map(FixedCumulativeTask::compulsory_part), &mut self.events, &mut self.profile);
+            let mut cached = false;
+            if store.incremental_cumulative_enabled() {
+                if self.root_registered && self.inference_tasks.is_some() {
+                    if self.profile_cache.is_none() && store.level() == 0 {
+                        self.profile_cache = IncrementalProfile::new(store, n);
+                    }
+                    if let Some(cache) = &mut self.profile_cache {
+                        // Existing energetic snapshots are already refreshed.
+                        // Map them back to stable original occurrence indices,
+                        // including absent and undecided optional occurrences.
+                        let mut position = 0;
+                        let parts = (0..n).map(|occurrence| {
+                            if self.present.get(position) == Some(&occurrence) {
+                                let part = self.tasks[position].compulsory_part();
+                                position += 1;
+                                Some(part)
+                            } else {
+                                None
+                            }
+                        });
+                        match cache.update(store, parts, stats, should_stop) {
+                            ProfileUpdate::Ready => match cache.materialize(store, &mut self.profile, stats, should_stop) {
+                                ProfileUpdate::Ready => cached = true,
+                                ProfileUpdate::Interrupted => return Ok(()),
+                                ProfileUpdate::Fallback => unreachable!("updated cumulative cache must be readable"),
+                            },
+                            ProfileUpdate::Interrupted => return Ok(()),
+                            ProfileUpdate::Fallback => {}
+                        }
+                    } else {
+                        stats.fallback_calls = stats.fallback_calls.saturating_add(1);
+                    }
+                } else {
+                    stats.fallback_calls = stats.fallback_calls.saturating_add(1);
+                }
+            }
+            if !cached {
+                build_profile(self.tasks.iter().copied().map(FixedCumulativeTask::compulsory_part), &mut self.events, &mut self.profile);
+                if store.cumulative_metrics_enabled() {
+                    stats.profile_rebuilds = stats.profile_rebuilds.saturating_add(1);
+                    stats.endpoint_updates = stats.endpoint_updates.saturating_add(self.events.len() as u64);
+                    stats.peak_event_points = stats.peak_event_points.max(
+                        self.events
+                            .iter()
+                            .map(|(time, _)| time)
+                            .fold((None, 0u64), |(previous, count), time| (Some(time), count + u64::from(previous != Some(time))))
+                            .1,
+                    );
+                    stats.segments_emitted = stats.segments_emitted.saturating_add(self.profile.len() as u64);
+                }
+            }
             for segment in &self.profile {
                 if interruption_requested(should_stop) {
+                    stats.interrupted = stats.interrupted.saturating_add(1);
                     return Ok(());
                 }
                 if segment.usage > i128::from(self.capacity) {
@@ -768,6 +1157,7 @@ impl Cumulative {
                     let mut why = Vec::new();
                     for &interval in &self.intervals {
                         if interruption_requested(should_stop) {
+                            stats.interrupted = stats.interrupted.saturating_add(1);
                             return Ok(());
                         }
                         if store.interval_presence(interval) != IntervalPresence::Present {
@@ -784,6 +1174,11 @@ impl Cumulative {
                     if interruption_requested(should_stop) {
                         return Ok(());
                     }
+                    let Some(why) = self.timetable_reason(store, why, TimetableCertificate::Overload { time: t }, stats, should_stop)
+                    else {
+                        return Ok(());
+                    };
+                    stats.timetable_conflicts = stats.timetable_conflicts.saturating_add(1);
                     return Err(store.fail_because(why));
                 }
             }
@@ -791,6 +1186,7 @@ impl Cumulative {
             // Push each present interval's start past instants it cannot cover.
             for idx in 0..n {
                 if interruption_requested(should_stop) {
+                    stats.interrupted = stats.interrupted.saturating_add(1);
                     return Ok(());
                 }
                 let interval = self.intervals[idx];
@@ -812,6 +1208,7 @@ impl Cumulative {
 
                 let feasible = earliest_feasible_start(&self.profile, smin, smax, duration, demand, own_part, i128::from(self.capacity));
                 if interruption_requested(should_stop) {
+                    stats.interrupted = stats.interrupted.saturating_add(1);
                     return Ok(());
                 }
 
@@ -824,12 +1221,24 @@ impl Cumulative {
                         // present intervals fixing the profile there.
                         let mut why = cumulative_profile_premises(store, &self.intervals, smin, start + duration, interval);
                         if interruption_requested(should_stop) {
+                            stats.interrupted = stats.interrupted.saturating_add(1);
                             return Ok(());
                         }
                         why.extend(present_premise(store, interval));
                         why.push(Premise::Ge { var: store.interval_start_var(interval), bound: smin as i32 });
                         let start = i32::try_from(start).map_err(|_| Inconsistency)?;
-                        changed |= store.set_interval_start_min_because(interval, start, why)?;
+                        let Some(why) = self.timetable_reason(
+                            store,
+                            why,
+                            TimetableCertificate::LowerBound { occurrence: idx, bound: i128::from(start) },
+                            stats,
+                            should_stop,
+                        ) else {
+                            return Ok(());
+                        };
+                        let updated = store.set_interval_start_min_because(interval, start, why)?;
+                        stats.timetable_updates = stats.timetable_updates.saturating_add(u64::from(updated));
+                        changed |= updated;
                     }
                     // For an undecided optional interval, a start bound is
                     // conditional on presence. Keep its backing domain unchanged
@@ -840,18 +1249,28 @@ impl Cumulative {
                             // A present interval fits nowhere in its window.
                             let mut why = cumulative_profile_premises(store, &self.intervals, smin, smax + duration, interval);
                             if interruption_requested(should_stop) {
+                                stats.interrupted = stats.interrupted.saturating_add(1);
                                 return Ok(());
                             }
                             why.extend(present_premise(store, interval));
                             why.push(Premise::Ge { var: store.interval_start_var(interval), bound: smin as i32 });
                             why.push(Premise::Le { var: store.interval_start_var(interval), bound: smax as i32 });
+                            let Some(why) =
+                                self.timetable_reason(store, why, TimetableCertificate::NoFit { occurrence: idx }, stats, should_stop)
+                            else {
+                                return Ok(());
+                            };
+                            stats.timetable_conflicts = stats.timetable_conflicts.saturating_add(1);
                             return Err(store.fail_because(why));
                         }
                         IntervalPresence::Optional => {
                             if interruption_requested(should_stop) {
+                                stats.interrupted = stats.interrupted.saturating_add(1);
                                 return Ok(());
                             }
-                            changed |= store.forbid_interval_presence(interval)?;
+                            let updated = store.forbid_interval_presence(interval)?;
+                            stats.timetable_updates = stats.timetable_updates.saturating_add(u64::from(updated));
+                            changed |= updated;
                         }
                         IntervalPresence::Absent => {}
                     },
@@ -865,28 +1284,27 @@ impl Cumulative {
 }
 
 impl Propagator for Cumulative {
+    fn inference_constraint(&self) -> Option<crate::inference::InferenceConstraint> {
+        self.inference_tasks
+            .as_ref()
+            .map(|tasks| crate::inference::InferenceConstraint::Cumulative { tasks: tasks.to_vec(), capacity: i64::from(self.capacity) })
+    }
+
+    fn inference_description_work(&self) -> usize {
+        self.inference_tasks.as_ref().map_or(0, |tasks| tasks.len())
+    }
+
     fn priority(&self) -> Priority {
         Priority::Expensive
     }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
-        for &interval in &self.intervals {
-            store.subscribe_interval(interval, me, IntervalEvent::StartBoundChange);
-            store.subscribe_interval(interval, me, IntervalEvent::EndBoundChange);
-            store.subscribe_interval(interval, me, IntervalEvent::PresenceChange);
-        }
+        let completed = self.register_core(store, me, None);
+        debug_assert!(completed);
     }
 
     fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
-        for (index, &interval) in self.intervals.iter().enumerate() {
-            if interruption_polled(Some(should_stop), index) {
-                return false;
-            }
-            store.subscribe_interval(interval, me, IntervalEvent::StartBoundChange);
-            store.subscribe_interval(interval, me, IntervalEvent::EndBoundChange);
-            store.subscribe_interval(interval, me, IntervalEvent::PresenceChange);
-        }
-        !should_stop()
+        self.register_core(store, me, Some(should_stop))
     }
 
     fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
@@ -911,6 +1329,9 @@ pub fn cumulative(solver: &mut Solver, intervals: &[IntervalId], demands: &[i32]
         present: Vec::new(),
         tasks: Vec::with_capacity(n),
         energetic: EnergeticWorkspace::default(),
+        profile_cache: None,
+        root_registered: false,
+        inference_tasks: None,
     }))
 }
 
@@ -933,6 +1354,9 @@ pub(crate) fn cumulative_until(
             present: Vec::new(),
             tasks: Vec::with_capacity(n),
             energetic: EnergeticWorkspace::default(),
+            profile_cache: None,
+            root_registered: false,
+            inference_tasks: None,
         }),
         should_stop,
     )

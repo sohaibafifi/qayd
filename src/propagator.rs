@@ -67,6 +67,27 @@ impl Clone for Box<dyn Propagator> {
 
 /// A filtering algorithm attached to a set of variables.
 pub trait Propagator: PropagatorClone + Send {
+    /// Immutable semantics for independent runtime inference checks.
+    ///
+    /// `None` reports this family as uncovered. Guard wrappers must not expose
+    /// their inner constraint without also representing the guard semantics.
+    fn inference_constraint(&self) -> Option<crate::inference::InferenceConstraint> {
+        None
+    }
+
+    /// Upper bound on visits needed to copy [`Self::inference_constraint`].
+    /// Implementations returning a descriptor must account for every copied
+    /// collection entry so the runtime checker can reject oversized preparation
+    /// before allocating it. Constant-size and unsupported descriptors cost zero.
+    fn inference_description_work(&self) -> usize {
+        0
+    }
+
+    /// Diagnostic family name used in inference-check coverage reports.
+    fn inference_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     /// Subscribe to the variables/events this propagator reacts to. `me` is its own id.
     fn register(&mut self, store: &mut Store, me: PropId);
 

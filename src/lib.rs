@@ -28,9 +28,11 @@
 pub mod constraints;
 pub mod domains;
 mod engines;
+pub mod explanation;
 pub mod expr;
 pub mod frontends;
 pub mod ids;
+pub mod inference;
 pub mod lcg;
 mod lns;
 pub mod mem;
@@ -110,6 +112,13 @@ mod divisibility_compaction;
 #[path = "../tests/internal/exact_cover_warm_start.rs"]
 mod exact_cover_warm_start;
 #[cfg(test)]
+#[path = "../tests/internal/inference_runtime.rs"]
+mod inference_runtime;
+
+#[cfg(test)]
+#[path = "../tests/internal/deferred_runtime.rs"]
+mod deferred_runtime;
+#[cfg(test)]
 #[path = "../tests/internal/integer_disequality_clause.rs"]
 mod integer_disequality_clause_tests;
 #[cfg(test)]
@@ -124,6 +133,9 @@ mod lcg_guarded_sum;
 #[cfg(test)]
 #[path = "../tests/internal/lcg_objective_branching.rs"]
 mod lcg_objective_branching;
+#[cfg(test)]
+#[path = "../tests/internal/lcg_research.rs"]
+mod lcg_research;
 #[cfg(test)]
 #[path = "../tests/internal/lcg_root_probe_budget.rs"]
 mod lcg_root_probe_budget;
@@ -262,3 +274,19 @@ mod verification_boundaries;
 #[cfg(test)]
 #[path = "../tests/internal/vrptw_search.rs"]
 mod vrptw_search;
+
+#[cfg(test)]
+#[path = "../tests/internal/unary_edge_finding.rs"]
+mod unary_edge_finding;
+
+#[cfg(test)]
+#[path = "../tests/internal/lcg_nogoods.rs"]
+mod lcg_nogoods_tests;
+
+#[cfg(test)]
+#[path = "../tests/internal/cumulative_profile.rs"]
+mod cumulative_profile_tests;
+
+#[cfg(test)]
+#[path = "../tests/internal/cumulative_metrics.rs"]
+mod cumulative_metrics;

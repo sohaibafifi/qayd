@@ -6,11 +6,18 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use crate::explanation::{DeferredReason, RetainedExplanation, RetainedKind, MAX_DEFERRED_PREMISES};
 use crate::ids::{PropId, VarId};
+use crate::inference::{InferenceConclusion, InferenceLiteral};
 use crate::lcg::clause::{ClauseDb, ClauseRef, ClauseSharing, SharedClause};
 use crate::lcg::lit::{Atom, AtomKind, AtomTable, LazyAtomRegistry, Lit, LitOrConst};
+use crate::lcg::nogood::{
+    self, NogoodStats, Plan as NogoodPlan, MAX_CPIP_CHECK_LITERALS, MAX_CPIP_RESOLUTION_STEPS, MAX_NOGOOD_CLAUSE_LEN,
+    MAX_NOGOOD_DOMAIN_VALUES,
+};
+use crate::lcg::semantic::{self, SemanticMinimizationStats};
 use crate::lcg::view::{self, Tri};
 use crate::propagator::Inconsistency;
 use crate::search_policy::CompiledSearchPhase;
@@ -43,6 +50,8 @@ const VIVIFY_MAX_LBD: u32 = 4;
 const VIVIFY_MAX_REMOVED: usize = 2;
 const VIVIFY_MAX_VARS: usize = 50_000;
 const MINIMIZE_LEARNT_MAX_LEN: usize = 128;
+/// At most two bound atoms per Boolean variable in the initial deferred slice.
+const MAX_DEFERRED_FALLBACK_LITS: usize = 512;
 
 type ProofLogger<'s> = dyn FnMut(&[Lit]) + 's;
 
@@ -60,6 +69,55 @@ pub enum Reason {
     /// Propagator inference. Literals are `D_S` (true scope literals entailing
     /// the inference); reason clause is `(consequent ∨ ⋁ ¬D_S)`.
     Generic(Arc<[Lit]>),
+    /// Engine-local lazy translation of immutable historical premises.
+    Deferred(Arc<DeferredLcgReason>),
+}
+
+struct DeferredFallback {
+    lits: Arc<[Lit]>,
+    _retained: Option<RetainedExplanation>,
+}
+
+struct CachedDeferredReason {
+    lits: Arc<[Lit]>,
+    _retained: Option<RetainedExplanation>,
+}
+
+/// An engine-local historical reason with a complete, shared invocation
+/// fallback. Its translated cache never enters the cloneable FD Solver.
+pub struct DeferredLcgReason {
+    raw: DeferredReason,
+    step_trail_len: usize,
+    fallback: Arc<DeferredFallback>,
+    cache: OnceLock<CachedDeferredReason>,
+}
+
+impl DeferredLcgReason {
+    fn antecedents<'a>(&'a self, engine: &Cdcl<'_>) -> &'a [Lit] {
+        if let Some(handle) = self.raw.metrics() {
+            handle.request(self.cache.get().is_some());
+        }
+        &self
+            .cache
+            .get_or_init(|| {
+                let premises = self.raw.expand_lcg();
+                let translated = (premises.len() <= self.raw.max_premises())
+                    .then(|| translate_deferred_premises(&engine.atoms, &premises))
+                    .flatten()
+                    .filter(|lits| lits.iter().all(|&lit| engine.was_recorded_before(lit, self.step_trail_len)));
+                match translated {
+                    Some(lits) => {
+                        let retained = self
+                            .raw
+                            .metrics()
+                            .map(|handle| handle.retain(RetainedKind::Cache, lits.len().saturating_mul(std::mem::size_of::<Lit>())));
+                        CachedDeferredReason { lits: Arc::from(lits), _retained: retained }
+                    }
+                    None => CachedDeferredReason { lits: Arc::clone(&self.fallback.lits), _retained: None },
+                }
+            })
+            .lits
+    }
 }
 
 /// A detected conflict, before analysis turns it into a learned clause.
@@ -205,9 +263,22 @@ fn build_ds(atoms: &AtomTable, scope: &[ScopeVar]) -> Vec<Lit> {
 /// Translate a tight [`Premise`] conjunction into the true literals that entail
 /// the inference (constants fold away).
 fn translate_premises(atoms: &AtomTable, premises: &[Premise]) -> Option<Vec<Lit>> {
+    translate_premises_with_constants(atoms, premises, false)
+}
+
+/// A historical provider cannot cite a premise false at the immutable root.
+/// Such a premise has no trail literal to validate against the saved cutoff.
+fn translate_deferred_premises(atoms: &AtomTable, premises: &[Premise]) -> Option<Vec<Lit>> {
+    translate_premises_with_constants(atoms, premises, true)
+}
+
+fn translate_premises_with_constants(atoms: &AtomTable, premises: &[Premise], reject_false: bool) -> Option<Vec<Lit>> {
     let mut lits = Vec::with_capacity(premises.len());
     let push = |loc: Option<LitOrConst>, out: &mut Vec<Lit>| -> Option<()> {
         let loc = loc?;
+        if reject_false && matches!(loc, LitOrConst::False) {
+            return None;
+        }
         if let LitOrConst::Lit(l) = loc {
             out.push(l);
         }
@@ -236,6 +307,17 @@ fn cause_lits(atoms: &AtomTable, cause: &Cause, fallback: &[ScopeVar]) -> Vec<Li
     match cause {
         Cause::Premises(p) => translate_premises(atoms, p).unwrap_or_else(|| build_ds(atoms, fallback)),
         Cause::Scope => build_ds(atoms, fallback),
+        Cause::Deferred(reason) => {
+            if let Some(handle) = reason.metrics() {
+                handle.request(false);
+            }
+            let premises = reason.expand_lcg();
+            if premises.len() > reason.max_premises() {
+                build_ds(atoms, fallback)
+            } else {
+                translate_deferred_premises(atoms, &premises).unwrap_or_else(|| build_ds(atoms, fallback))
+            }
+        }
     }
 }
 
@@ -264,6 +346,46 @@ fn translate(atoms: &AtomTable, ev: &DomEvent) -> Option<Lit> {
         DomEvent::LeTrue { var, bound } => lit(atoms.ge_i64(var, i64::from(bound) + 1)).map(Lit::negate),
         DomEvent::NeTrue { var, val } => lit(atoms.eq(var, val)).map(Lit::negate),
         DomEvent::EqTrue { var, val } => lit(atoms.eq(var, val)),
+    }
+}
+
+enum CpipAnalysis {
+    Learned { literals: Vec<Lit>, variable: VarId, current_predicates: usize },
+    Fallback,
+    RootConflict,
+    Interrupted,
+}
+
+struct CpipAudit {
+    enabled: bool,
+    complete: bool,
+    limit: usize,
+    literals: usize,
+    sources: Vec<Vec<Lit>>,
+}
+
+impl CpipAudit {
+    fn new(limit: Option<usize>) -> Self {
+        Self {
+            enabled: limit.is_some(),
+            complete: true,
+            limit: limit.unwrap_or(0).min(MAX_CPIP_CHECK_LITERALS),
+            literals: 0,
+            sources: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, source: &[Lit]) {
+        if !self.enabled || !self.complete {
+            return;
+        }
+        if source.len() > self.limit.saturating_sub(self.literals) {
+            self.complete = false;
+            self.sources.clear();
+            return;
+        }
+        self.literals += source.len();
+        self.sources.push(source.to_vec());
     }
 }
 
@@ -383,6 +505,14 @@ pub struct Cdcl<'s> {
     vivify_checker: Option<Solver>,
     /// Reusable to-clear stack for allocation-free learned-clause minimization.
     min_stack: Vec<u32>,
+    /// Opt-in integer-semantic deletion pass, disabled for Boolean proofs.
+    semantic_minimization: bool,
+    semantic_minimization_stats: SemanticMinimizationStats,
+    extended_nogoods: bool,
+    cpip: bool,
+    /// A CPIP target must remain within the enumeration cap after backjumping.
+    nogood_root_sizes: Vec<usize>,
+    nogood_statistics: NogoodStats,
 }
 
 impl<'s> Cdcl<'s> {
@@ -440,6 +570,10 @@ impl<'s> Cdcl<'s> {
         }
         let n = atoms.num_atoms();
         let propagation_calls_at_start = solver.propagation_calls();
+        let semantic_minimization = solver.semantic_minimization_enabled();
+        let extended_nogoods = solver.extended_nogoods_enabled();
+        let cpip = solver.cpip_enabled();
+        let nogood_root_sizes = if cpip { (0..nvars).map(|index| solver.store.size(VarId(index as u32))).collect() } else { Vec::new() };
         Cdcl {
             solver,
             atoms,
@@ -492,6 +626,12 @@ impl<'s> Cdcl<'s> {
             proof_empty_logged: false,
             vivify_checker: None,
             min_stack: Vec::new(),
+            semantic_minimization,
+            semantic_minimization_stats: SemanticMinimizationStats::default(),
+            extended_nogoods,
+            cpip,
+            nogood_root_sizes,
+            nogood_statistics: NogoodStats::default(),
         }
     }
 
@@ -503,6 +643,23 @@ impl<'s> Cdcl<'s> {
     /// Set the reproducible search diversification seed.
     pub(crate) fn set_seed(&mut self, seed: u64) {
         self.seed = seed;
+    }
+
+    /// Enable bounded, deletion-only semantic minimization of learned clauses.
+    /// Disabled by default. A Boolean proof logger always suppresses this pass,
+    /// since the logger does not certify the integer-semantic implication.
+    pub fn set_semantic_minimization(&mut self, enabled: bool) {
+        self.semantic_minimization = enabled;
+    }
+
+    /// Counters accumulated by semantic minimization in this engine instance.
+    pub fn semantic_minimization_stats(&self) -> SemanticMinimizationStats {
+        self.semantic_minimization_stats
+    }
+
+    /// Counters for the bounded extended propagation and CPIP experiment.
+    pub fn nogood_stats(&self) -> NogoodStats {
+        self.nogood_statistics
     }
 
     /// Enable learned-clause exchange for one portfolio worker.
@@ -689,6 +846,9 @@ impl<'s> Cdcl<'s> {
         stats.learned_lits = self.learned_lits;
         stats.vivified_clauses = self.vivified_clauses;
         stats.vivified_lits = self.vivified_lits;
+        stats.semantic_minimized_clauses = self.semantic_minimization_stats.shortened_clauses;
+        stats.semantic_minimized_lits = self.semantic_minimization_stats.removed_literals;
+        stats.nogoods = self.nogood_statistics;
         stats.binary_clause_visits = self.binary_clause_visits;
         stats.watched_clause_visits = self.watched_clause_visits;
         stats.watched_literal_scans = self.watched_literal_scans;
@@ -935,6 +1095,9 @@ impl<'s> Cdcl<'s> {
             return;
         }
         let ds: Arc<[Lit]> = Arc::from(self.ds_recorded(var));
+        if let Some(handle) = self.solver.explanation_handle() {
+            handle.eager_lcg(ds.len());
+        }
         for l in todo {
             self.record(l, Reason::Generic(Arc::clone(&ds)));
         }
@@ -1091,6 +1254,19 @@ impl<'s> Cdcl<'s> {
             if let Err(c) = self.propagate_clauses() {
                 return Err(Conflict::Clause(c));
             }
+            // The semantic pass runs only after clause channeling reaches its
+            // fixpoint. Standard SAT watches remain sound and independent.
+            if self.extended_nogoods {
+                if self.proof_logging_enabled() {
+                    self.nogood_statistics.skipped_proof_logging = self.nogood_statistics.skipped_proof_logging.saturating_add(1);
+                } else if self.propagate_extended_nogoods()? {
+                    continue;
+                }
+            }
+            if self.stopped() {
+                self.solver.store.clear_queue();
+                return Ok(());
+            }
             // Then run a single FD propagator and record its inferences.
             let Some(pid) = self.solver.peek_prop() else {
                 return Ok(());
@@ -1123,6 +1299,236 @@ impl<'s> Cdcl<'s> {
         }
     }
 
+    /// Full bounded scan used by the initial opt-in experiment. A changed
+    /// clause restarts normal SAT/CP propagation before scanning further.
+    fn propagate_extended_nogoods(&mut self) -> Result<bool, Conflict> {
+        self.nogood_statistics.extended_scans = self.nogood_statistics.extended_scans.saturating_add(1);
+        for index in 0..self.clauses.len() {
+            if self.stopped() {
+                self.nogood_statistics.interrupted = self.nogood_statistics.interrupted.saturating_add(1);
+                return Ok(false);
+            }
+            let clause = ClauseRef(index as u32);
+            if self.clauses.get(clause).lits.is_empty() {
+                continue;
+            }
+            if self.propagate_extended_clause(clause)? || self.qhead < self.trail.len() {
+                // Synchronizing a late lazy atom can enqueue SAT work without
+                // changing its already-determined integer domain.
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn check_nogood_inference(&mut self, clause: &[Lit], antecedents: &[Lit], conclusion: InferenceConclusion) {
+        let Some(limit) = self.solver.store.lcg_check_work_limit() else {
+            return;
+        };
+        if clause.len().saturating_add(antecedents.len()) > limit {
+            self.solver.store.note_uncovered_lcg_inference(matches!(conclusion, InferenceConclusion::Conflict));
+            return;
+        }
+        let decoded = clause.iter().map(|&literal| nogood::inference_literal(&self.atoms, literal)).collect::<Vec<_>>();
+        let premises = antecedents.iter().map(|&literal| nogood::premise(&self.atoms, literal)).collect::<Vec<_>>();
+        self.solver.store.check_lcg_inference(&decoded, &premises, conclusion);
+    }
+
+    /// Apply a complete semantic plan with historical, clause-independent
+    /// reason storage. Each x!=v reason cites only already-true predicates on
+    /// other variables: fixing x=v falsifies every x-literal in this clause.
+    fn propagate_extended_clause(&mut self, reference: ClauseRef) -> Result<bool, Conflict> {
+        let clause = Arc::clone(&self.clauses.get(reference).lits);
+        if clause.len() <= MAX_NOGOOD_CLAUSE_LEN {
+            // A lazy predicate may first have been recorded at a deeper level
+            // than the bound that entails it. Backjump removes that record,
+            // but the predicate can remain determined by the restored domain.
+            // Rebuild a historical reason before using its semantic truth.
+            // This boundary is shared by recurring scans and CPIP assertion.
+            for &literal in clause.iter() {
+                if self.stopped() {
+                    self.nogood_statistics.interrupted = self.nogood_statistics.interrupted.saturating_add(1);
+                    return Ok(false);
+                }
+                self.nogood_statistics.predicate_visits = self.nogood_statistics.predicate_visits.saturating_add(1);
+                if self.tvalue(literal) == Tri::Unknown && self.value(literal) != Tri::Unknown {
+                    self.sync_var(self.atoms.var_of(literal.atom()));
+                }
+            }
+        }
+        let plan = nogood::plan(&self.solver.store, &self.atoms, &clause, self.stop, &mut self.nogood_statistics);
+        let NogoodPlan::Remove { var, values, antecedents } = plan else {
+            return match plan {
+                NogoodPlan::Conflict => {
+                    let reason = clause.iter().map(|literal| literal.negate()).collect::<Vec<_>>();
+                    self.check_nogood_inference(&clause, &reason, InferenceConclusion::Conflict);
+                    self.nogood_statistics.conflicts = self.nogood_statistics.conflicts.saturating_add(1);
+                    Err(Conflict::Clause(reference))
+                }
+                _ => Ok(false),
+            };
+        };
+        assert!(antecedents.iter().all(|&literal| self.tvalue(literal) == Tri::True), "extended reason antecedents must be synchronized");
+        let antecedents: Arc<[Lit]> = Arc::from(antecedents);
+        let mut changed = false;
+        for value in values {
+            if self.stopped() {
+                self.nogood_statistics.interrupted = self.nogood_statistics.interrupted.saturating_add(1);
+                return Ok(changed);
+            }
+            if !self.solver.store.contains(var, value) {
+                continue;
+            }
+            self.check_nogood_inference(&clause, &antecedents, InferenceConclusion::Predicate(Premise::Ne { var, val: value }));
+            if self.solver.store.is_fixed(var) {
+                // Do not mutate the final value. A conflict additionally needs
+                // the existing singleton, unlike an individual value deletion.
+                let mut reason = antecedents.to_vec();
+                for literal in [self.atoms.ge(var, value), neg(self.atoms.ge_i64(var, i64::from(value) + 1))] {
+                    if let LitOrConst::Lit(literal) = literal {
+                        assert_eq!(self.tvalue(literal), Tri::True);
+                        if !reason.contains(&literal) {
+                            reason.push(literal);
+                        }
+                    }
+                }
+                self.check_nogood_inference(&clause, &reason, InferenceConclusion::Conflict);
+                self.nogood_statistics.conflicts = self.nogood_statistics.conflicts.saturating_add(1);
+                return Err(Conflict::Generic(reason));
+            }
+            let LitOrConst::Lit(equality) = self.atoms.eq(var, value) else {
+                unreachable!("supported present value must have an equality literal");
+            };
+            self.assign(equality.negate(), Reason::Generic(Arc::clone(&antecedents)))
+                .expect("deleting one value from a nonsingleton domain cannot fail");
+            self.nogood_statistics.propagations = self.nogood_statistics.propagations.saturating_add(1);
+            self.nogood_statistics.removed_values = self.nogood_statistics.removed_values.saturating_add(1);
+            self.nogood_statistics.reasons = self.nogood_statistics.reasons.saturating_add(1);
+            self.nogood_statistics.reason_literals = self.nogood_statistics.reason_literals.saturating_add(antecedents.len() as u64);
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    fn check_cpip_derivation(&mut self, audit: CpipAudit, learned: &[Lit]) {
+        if !audit.enabled {
+            return;
+        }
+        if !audit.complete || audit.literals.saturating_add(learned.len()) > audit.limit {
+            self.solver.store.note_uncovered_lcg_derivation();
+            return;
+        }
+        let sources = audit
+            .sources
+            .iter()
+            .map(|source| source.iter().map(|&literal| nogood::inference_literal(&self.atoms, literal)).collect::<Vec<InferenceLiteral>>())
+            .collect::<Vec<_>>();
+        let references = sources.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let learned = learned.iter().map(|&literal| nogood::inference_literal(&self.atoms, literal)).collect::<Vec<_>>();
+        self.solver.store.check_lcg_clause_entailment(&references, &learned);
+    }
+
+    /// Resolution stops at the first point where all deepest-level predicates
+    /// concern one CP variable. More than one predicate may remain. The audit
+    /// includes dropped root facts explicitly, rather than assuming them.
+    fn analyze_cpip(&mut self, conflict: &Conflict) -> CpipAnalysis {
+        self.nogood_statistics.cpip_attempts = self.nogood_statistics.cpip_attempts.saturating_add(1);
+        if self.stopped() {
+            self.nogood_statistics.interrupted = self.nogood_statistics.interrupted.saturating_add(1);
+            return CpipAnalysis::Interrupted;
+        }
+        let conflict_len = match conflict {
+            Conflict::Clause(reference) => self.clauses.get(*reference).lits.len(),
+            Conflict::Generic(antecedents) => antecedents.len(),
+        };
+        if conflict_len > MAX_NOGOOD_CLAUSE_LEN {
+            self.nogood_statistics.skipped_clause_limit = self.nogood_statistics.skipped_clause_limit.saturating_add(1);
+            return CpipAnalysis::Fallback;
+        }
+        let mut pending = self.conflict_lits(conflict);
+        let mut audit = CpipAudit::new(self.solver.store.lcg_check_work_limit());
+        audit.push(&pending);
+        let mut working = Vec::<Lit>::new();
+        let mut steps = 0;
+        loop {
+            if self.stopped() {
+                self.nogood_statistics.interrupted = self.nogood_statistics.interrupted.saturating_add(1);
+                return CpipAnalysis::Interrupted;
+            }
+            if pending.len() > MAX_NOGOOD_CLAUSE_LEN {
+                self.nogood_statistics.skipped_clause_limit = self.nogood_statistics.skipped_clause_limit.saturating_add(1);
+                return CpipAnalysis::Fallback;
+            }
+            for literal in pending.drain(..) {
+                if self.tvalue(literal) != Tri::False || self.level_of(literal.atom()) == UNSET {
+                    return CpipAnalysis::Fallback;
+                }
+                if self.level_of(literal.atom()) == 0 {
+                    audit.push(&[literal.negate()]);
+                } else if !working.contains(&literal) {
+                    working.push(literal);
+                }
+            }
+            if working.len() > MAX_NOGOOD_CLAUSE_LEN {
+                self.nogood_statistics.skipped_clause_limit = self.nogood_statistics.skipped_clause_limit.saturating_add(1);
+                return CpipAnalysis::Fallback;
+            }
+            self.nogood_statistics
+                .scratch((working.len() + pending.capacity() + audit.literals).saturating_mul(std::mem::size_of::<Lit>()));
+            let Some(level) = working.iter().map(|literal| self.level_of(literal.atom())).max() else {
+                self.check_cpip_derivation(audit, &[]);
+                return CpipAnalysis::RootConflict;
+            };
+            let current = working.iter().filter(|literal| self.level_of(literal.atom()) == level).copied().collect::<Vec<_>>();
+            let variable = self.atoms.var_of(current[0].atom());
+            if current.iter().all(|literal| self.atoms.var_of(literal.atom()) == variable) {
+                if self.nogood_root_sizes.get(variable.index()).is_none_or(|&size| size > MAX_NOGOOD_DOMAIN_VALUES) {
+                    self.nogood_statistics.skipped_domain_limit = self.nogood_statistics.skipped_domain_limit.saturating_add(1);
+                    return CpipAnalysis::Fallback;
+                }
+                self.check_cpip_derivation(audit, &working);
+                if self.stopped() {
+                    self.nogood_statistics.interrupted = self.nogood_statistics.interrupted.saturating_add(1);
+                    return CpipAnalysis::Interrupted;
+                }
+                for literal in &working {
+                    self.bump_var(self.atoms.var_of(literal.atom()));
+                }
+                self.decay_activity();
+                return CpipAnalysis::Learned { literals: working, variable, current_predicates: current.len() };
+            }
+            if steps == MAX_CPIP_RESOLUTION_STEPS {
+                return CpipAnalysis::Fallback;
+            }
+            let latest = current.iter().max_by_key(|literal| self.atom_trail_pos[literal.atom() as usize]).copied().unwrap();
+            let assigned = latest.negate();
+            if matches!(self.reason_of(assigned.atom()), Reason::Decision | Reason::Fact | Reason::Unset) {
+                return CpipAnalysis::Fallback;
+            }
+            // Bound optional analysis copies before materializing the next
+            // reason. Deferred reasons already have their separate I3 cap.
+            let reason_len = match self.reason_of(assigned.atom()) {
+                Reason::Clause(reference) => self.clauses.get(*reference).lits.len(),
+                Reason::Generic(antecedents) => antecedents.len().saturating_add(1),
+                Reason::Deferred(reason) => reason.antecedents(self).len().saturating_add(1),
+                Reason::Decision | Reason::Fact | Reason::Unset => unreachable!(),
+            };
+            if reason_len > MAX_NOGOOD_CLAUSE_LEN {
+                self.nogood_statistics.skipped_clause_limit = self.nogood_statistics.skipped_clause_limit.saturating_add(1);
+                return CpipAnalysis::Fallback;
+            }
+            working.retain(|literal| *literal != latest);
+            pending = self.reason_lits(assigned);
+            if audit.enabled && audit.complete {
+                pending.push(assigned);
+                audit.push(&pending);
+                pending.pop();
+            }
+            steps += 1;
+            self.nogood_statistics.cpip_resolution_steps = self.nogood_statistics.cpip_resolution_steps.saturating_add(1);
+        }
+    }
+
     /// Drain a just-run propagator's primary events, recording each inferred
     /// literal with a [`Generic`](Reason::Generic) reason from the store's scope
     /// snapshot. Record every primary first: the FD domain already reflects the
@@ -1130,6 +1536,16 @@ impl<'s> Cdcl<'s> {
     /// buffered event could mirror facts caused by later, unrecorded events.
     fn record_prop_events(&mut self, step_trail_len: usize) -> Result<(), Conflict> {
         let events = std::mem::take(&mut self.solver.store.events);
+        let can_defer_scope = self.solver.deferred_explanations_enabled()
+            && events.iter().any(|event| matches!(&event.cause, Cause::Deferred(_)))
+            && self
+                .conflict_scope
+                .iter()
+                .try_fold(0usize, |count, scope| {
+                    count.checked_add(2)?.checked_add(scope.holes.len()).filter(|&count| count <= MAX_DEFERRED_FALLBACK_LITS)
+                })
+                .is_some();
+        let mut deferred_fallback: Option<Arc<DeferredFallback>> = None;
         self.changed_vars.clear();
         for ev in &events {
             let var = match ev.primary {
@@ -1140,9 +1556,36 @@ impl<'s> Cdcl<'s> {
             };
             if let Some(lit) = translate(&self.atoms, &ev.primary) {
                 if !self.is_assigned(lit.atom()) {
-                    let preferred = cause_lits(&self.atoms, &ev.cause, &self.conflict_scope);
-                    let ds = self.reason_before_step(preferred, step_trail_len);
-                    self.record(lit, Reason::Generic(Arc::from(ds)));
+                    let reason = match &ev.cause {
+                        Cause::Deferred(raw) if can_defer_scope && raw.max_premises() <= MAX_DEFERRED_PREMISES => {
+                            let fallback = deferred_fallback.get_or_insert_with(|| {
+                                let lits = build_ds(&self.atoms, &self.conflict_scope);
+                                assert!(
+                                    lits.iter().all(|&lit| self.was_recorded_before(lit, step_trail_len)),
+                                    "deferred fallback must precede the propagator invocation"
+                                );
+                                let retained = raw.metrics().map(|handle| {
+                                    handle.retain(RetainedKind::Fallback, lits.len().saturating_mul(std::mem::size_of::<Lit>()))
+                                });
+                                Arc::new(DeferredFallback { lits: Arc::from(lits), _retained: retained })
+                            });
+                            Reason::Deferred(Arc::new(DeferredLcgReason {
+                                raw: raw.clone(),
+                                step_trail_len,
+                                fallback: Arc::clone(fallback),
+                                cache: OnceLock::new(),
+                            }))
+                        }
+                        _ => {
+                            let preferred = cause_lits(&self.atoms, &ev.cause, &self.conflict_scope);
+                            let ds = self.reason_before_step(preferred, step_trail_len);
+                            if let Some(handle) = self.solver.explanation_handle() {
+                                handle.eager_lcg(ds.len());
+                            }
+                            Reason::Generic(Arc::from(ds))
+                        }
+                    };
+                    self.record(lit, reason);
                 }
             }
             if !self.changed_vars.contains(&var) {
@@ -1578,20 +2021,61 @@ impl<'s> Cdcl<'s> {
     /// conflict (a falsified blocking clause after enumerating a solution).
     pub(crate) fn resolve_conflict(&mut self, conflict: Conflict) -> bool {
         self.conflicts += 1;
-        let Some(mut learnt) = self.analyze(conflict) else {
-            self.log_proof_clause(&[]);
-            return false;
+        let cpip = if self.cpip && !self.proof_logging_enabled() {
+            self.analyze_cpip(&conflict)
+        } else {
+            if self.cpip {
+                self.nogood_statistics.skipped_proof_logging = self.nogood_statistics.skipped_proof_logging.saturating_add(1);
+            }
+            CpipAnalysis::Fallback
         };
-        self.minimize_learnt(&mut learnt);
-        self.vivify_learned(&mut learnt);
-        // Backjump level recomputed here: vivification may have shortened the clause.
-        let btlevel = learnt[1..].iter().map(|l| self.level_of(l.atom()) as usize).max().unwrap_or(0);
-        // Two-watched-literal invariant: slot 1 must hold a btlevel literal so the
-        // two watched literals are the last two to be unassigned on backjump. Post
-        // backjump every learnt[1..] is still false, so `initial_watches` picks
-        // index 1 as the second watch; keep the max-level literal there.
-        if let Some(k) = (1..learnt.len()).find(|&i| self.level_of(learnt[i].atom()) as usize == btlevel) {
-            learnt.swap(1, k);
+        let (mut learnt, asserting_variable) = match cpip {
+            CpipAnalysis::Interrupted => return true,
+            CpipAnalysis::RootConflict => {
+                self.log_proof_clause(&[]);
+                return false;
+            }
+            CpipAnalysis::Learned { literals, variable, current_predicates } => {
+                self.nogood_statistics.cpip_learned = self.nogood_statistics.cpip_learned.saturating_add(1);
+                self.nogood_statistics.cpip_multi_predicate =
+                    self.nogood_statistics.cpip_multi_predicate.saturating_add(u64::from(current_predicates > 1));
+                self.nogood_statistics.cpip_asserting_predicates =
+                    self.nogood_statistics.cpip_asserting_predicates.saturating_add(current_predicates as u64);
+                (literals, Some(variable))
+            }
+            CpipAnalysis::Fallback => {
+                if self.cpip && !self.proof_logging_enabled() {
+                    self.nogood_statistics.cpip_fallbacks = self.nogood_statistics.cpip_fallbacks.saturating_add(1);
+                }
+                let Some(mut literals) = self.analyze(conflict) else {
+                    self.log_proof_clause(&[]);
+                    return false;
+                };
+                self.minimize_learnt(&mut literals);
+                self.semantic_minimize_learnt(&mut literals);
+                self.vivify_learned(&mut literals);
+                (literals, None)
+            }
+        };
+        // A CPIP block asserts a domain reduction on one variable. Backjump
+        // past ALL predicates on that variable, including earlier-level ones.
+        let btlevel = if let Some(variable) = asserting_variable {
+            learnt
+                .iter()
+                .filter(|literal| self.atoms.var_of(literal.atom()) != variable)
+                .map(|literal| self.level_of(literal.atom()) as usize)
+                .max()
+                .unwrap_or(0)
+        } else {
+            learnt[1..].iter().map(|literal| self.level_of(literal.atom()) as usize).max().unwrap_or(0)
+        };
+        // First-UIP has one asserting literal and a second watch at the
+        // backjump level. A CPIP block may have several open literals; normal
+        // initial watch selection below chooses two of them after backjump.
+        if asserting_variable.is_none() {
+            if let Some(k) = (1..learnt.len()).find(|&i| self.level_of(learnt[i].atom()) as usize == btlevel) {
+                learnt.swap(1, k);
+            }
         }
         self.learned_lits += learnt.len() as u64;
         // LBD measured at learn time, while every literal is still assigned.
@@ -1614,6 +2098,17 @@ impl<'s> Cdcl<'s> {
         self.backjump_to(btlevel);
         let asserting = learnt[0];
         let cref = self.add_shared_clause(learnt, deletable, lbd);
+        if asserting_variable.is_some() {
+            // This immediate assertion is required even in the CPIP-only
+            // ablation, where recurring extended propagation is disabled.
+            return match self.propagate_extended_clause(cref) {
+                Ok(changed) => {
+                    assert!(changed || self.stopped(), "CPIP block did not assert a domain reduction after backjump");
+                    true
+                }
+                Err(conflict) => self.resolve_conflict(conflict),
+            };
+        }
         // Post-backjump, the asserting literal is the only open one; it cannot wipe a domain.
         match self.assign(asserting, Reason::Clause(cref)) {
             Ok(()) => true,
@@ -1786,6 +2281,11 @@ impl<'s> Cdcl<'s> {
                     self.bucket_footprint(&mut buckets, sel_vars, &ds);
                     stack.extend_from_slice(&ds);
                 }
+                Reason::Deferred(reason) => {
+                    let ds = reason.antecedents(self);
+                    self.bucket_footprint(&mut buckets, sel_vars, ds);
+                    stack.extend_from_slice(ds);
+                }
                 // A clause reason carries no selector here (no learning on this
                 // path); just keep walking its antecedents.
                 Reason::Clause(c) => {
@@ -1816,6 +2316,28 @@ impl<'s> Cdcl<'s> {
                     entry.1.push(lit);
                 }
             }
+        }
+    }
+
+    /// Apply optional integer-semantic deletion before CP vivification.
+    pub(crate) fn semantic_minimize_learnt(&mut self, learnt: &mut Vec<Lit>) {
+        if !self.semantic_minimization || learnt.len() < 2 {
+            return;
+        }
+        if self.proof_logging_enabled() {
+            self.semantic_minimization_stats.skipped_proof_logging += 1;
+            return;
+        }
+        if learnt.len() > semantic::MAX_CLAUSE_LEN {
+            self.semantic_minimization_stats.skipped_oversized += 1;
+            return;
+        }
+        self.semantic_minimization_stats.considered_clauses += 1;
+        let (removed, interrupted) = semantic::minimize(&self.atoms, learnt, self.stop);
+        self.semantic_minimization_stats.interrupted += u64::from(interrupted);
+        if removed > 0 {
+            self.semantic_minimization_stats.shortened_clauses += 1;
+            self.semantic_minimization_stats.removed_literals += removed as u64;
         }
     }
 
@@ -1924,7 +2446,7 @@ impl<'s> Cdcl<'s> {
 
     /// The antecedents to resolve against: `p`'s reason-clause literals other
     /// than `p` (all currently false).
-    fn reason_lits(&self, p: Lit) -> Vec<Lit> {
+    pub(crate) fn reason_lits(&self, p: Lit) -> Vec<Lit> {
         match self.reason_of(p.atom()) {
             Reason::Clause(c) => {
                 let c = *c;
@@ -1932,6 +2454,7 @@ impl<'s> Cdcl<'s> {
             }
             // Reason clause (p ∨ ⋁ ¬D_S); antecedents are ¬D_S.
             Reason::Generic(ds) => ds.iter().map(|l| l.negate()).collect(),
+            Reason::Deferred(reason) => reason.antecedents(self).iter().map(|lit| lit.negate()).collect(),
             // No antecedents (never resolved here).
             Reason::Decision | Reason::Fact | Reason::Unset => Vec::new(),
         }

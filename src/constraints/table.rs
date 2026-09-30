@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::ids::{PropId, VarId};
+use crate::inference::InferenceConstraint;
 use crate::propagator::{Event, Inconsistency, Propagator};
 use crate::store::{Premise, Solver, Store};
 use crate::trail::ReversibleInt;
@@ -115,6 +116,8 @@ pub const STAR: i32 = i32::MIN;
 #[derive(Clone)]
 pub struct ExtensionTemplate {
     arity: usize,
+    /// Raw row count, retained even when a table has zero columns.
+    rows: usize,
     /// `supports[c][value]` = bitset of tuples whose column `c` equals `value`.
     supports: Vec<HashMap<i32, Vec<u64>>>,
     /// `star[c]` = bitset of tuples with a wildcard in column `c`.
@@ -359,7 +362,7 @@ impl ExtensionTemplate {
                 body.push(value);
             }
         }
-        Some(Self { arity, supports, star, full, tuples: Arc::from(body) })
+        Some(Self { arity, rows: tuples.len(), supports, star, full, tuples: Arc::from(body) })
     }
 }
 
@@ -436,6 +439,23 @@ fn scope_width(store: &Store, vars: &[VarId], scratch: &mut Vec<Premise>) -> usi
 }
 
 impl Propagator for Extension {
+    fn inference_description_work(&self) -> usize {
+        if self.positive {
+            self.vars.len()
+        } else {
+            0
+        }
+    }
+
+    fn inference_constraint(&self) -> Option<InferenceConstraint> {
+        self.positive.then(|| InferenceConstraint::PositiveTable {
+            variables: self.vars.clone(),
+            tuples: Arc::clone(&self.template.tuples),
+            arity: self.template.arity,
+            rows: self.template.rows,
+        })
+    }
+
     fn register(&mut self, store: &mut Store, me: PropId) {
         for &v in &self.vars {
             store.subscribe(v, me, Event::DomainChange);
@@ -472,7 +492,7 @@ impl Propagator for Extension {
             removals,
             why,
         } = self;
-        let ExtensionTemplate { arity, supports, star, full, tuples } = &**template;
+        let ExtensionTemplate { arity, supports, star, full, tuples, .. } = &**template;
         let arity = *arity;
 
         if *positive {

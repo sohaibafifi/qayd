@@ -81,6 +81,17 @@ Search options:
       --semantic-branching           Branch first on XCSP semantic variables
       --search-phase <SPEC>          Add an ordered exact-search phase; repeatable
       --force-scope-reasons          Use whole-scope LCG reasons (ablation)
+      --semantic-minimization       Simplify learned LCG clauses using integer semantics
+      --check-inferences            Diagnose supported CP inferences with an independent oracle
+      --deferred-explanations       Build supported Boolean-row explanations on demand
+      --explanation-metrics         Report explanation work and retained storage
+      --extended-nogoods           Enable bounded same-variable nogood propagation
+      --cpip                       Enable bounded variable-level conflict learning
+      --unary-edge-finding          Enable explained mandatory unary edge finding
+      --unary-edge-finding-metrics  Report unary propagation work
+      --incremental-cumulative     Maintain native cumulative profile events
+      --lifted-cumulative-explanations  Weaken native timetable reason bounds
+      --cumulative-metrics         Report native cumulative propagation work
       --shared-pool-cap <N>          Set the shared learned-clause capacity
                                      [default: 16384; N >= 1]
 
@@ -194,6 +205,17 @@ fn main() {
     let mut core = false;
     let mut semantic_branching = false;
     let mut force_scope_reasons = false;
+    let mut semantic_minimization = false;
+    let mut extended_nogoods = false;
+    let mut cpip = false;
+    let mut check_inferences = false;
+    let mut deferred_explanations = false;
+    let mut explanation_metrics = false;
+    let mut unary_edge_finding = false;
+    let mut unary_edge_finding_metrics = false;
+    let mut incremental_cumulative = false;
+    let mut lifted_cumulative_explanations = false;
+    let mut cumulative_metrics = false;
     let mut shared_pool_capacity = 1 << 14;
     let mut mem_limit: Option<usize> = None;
     let mut linear = qayd::orchestrator::LinearControls::default();
@@ -217,6 +239,17 @@ fn main() {
             "--semantic-branching" => semantic_branching = true,
             "--search-phase" => search_phases.push(search_phase(it.next().map(String::as_str))),
             "--force-scope-reasons" => force_scope_reasons = true,
+            "--semantic-minimization" => semantic_minimization = true,
+            "--extended-nogoods" => extended_nogoods = true,
+            "--cpip" => cpip = true,
+            "--check-inferences" => check_inferences = true,
+            "--deferred-explanations" => deferred_explanations = true,
+            "--explanation-metrics" => explanation_metrics = true,
+            "--unary-edge-finding" => unary_edge_finding = true,
+            "--unary-edge-finding-metrics" => unary_edge_finding_metrics = true,
+            "--incremental-cumulative" => incremental_cumulative = true,
+            "--lifted-cumulative-explanations" => lifted_cumulative_explanations = true,
+            "--cumulative-metrics" => cumulative_metrics = true,
             "--shared-pool-cap" => {
                 shared_pool_capacity = positive(it.next().map(String::as_str), "--shared-pool-cap needs a positive integer")
             }
@@ -298,6 +331,17 @@ fn main() {
             no_learn_csp,
             semantic_branching,
             force_scope_reasons,
+            semantic_minimization,
+            extended_nogoods,
+            cpip,
+            check_inferences,
+            deferred_explanations,
+            explanation_metrics,
+            unary_edge_finding,
+            unary_edge_finding_metrics,
+            incremental_cumulative,
+            lifted_cumulative_explanations,
+            cumulative_metrics,
             shared_pool_capacity,
             time_limit: time_limit.map(Duration::from_secs),
             mem_limit,

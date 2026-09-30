@@ -169,7 +169,20 @@ impl SemanticSolveSession {
             || request.schedule_cdcl
             || request.routing != super::RoutingControls::default()
             || request.sat != super::SatControls::default()
-            || request.cp != super::CpControls::default()
+            || (super::CpControls {
+                semantic_minimization: false,
+                extended_nogoods: false,
+                cpip: false,
+                check_inferences: false,
+                deferred_explanations: false,
+                explanation_metrics: false,
+                unary_edge_finding: false,
+                unary_edge_finding_metrics: false,
+                incremental_cumulative: false,
+                lifted_cumulative_explanations: false,
+                cumulative_metrics: false,
+                ..request.cp
+            }) != super::CpControls::default()
             || request.limits.iterations.is_some()
         {
             return Err(SolveError::InvalidRequest(

@@ -18,7 +18,7 @@ use crate::orchestrator::{execute_specialized, SolveLimits, SolveRequest, Termin
 use qayd::mem::{self, Pressure};
 
 #[global_allocator]
-static ALLOC: mem::Tracking = mem::Tracking;
+static ALLOC: crate::cumulative_metrics::CountingAllocator = crate::cumulative_metrics::CountingAllocator;
 
 #[test]
 fn allocator_counts_live_bytes() {
