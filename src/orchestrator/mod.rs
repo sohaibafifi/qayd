@@ -4,6 +4,7 @@
 //! cross-engine events, verification boundaries, and final result semantics.
 
 mod budget;
+pub(crate) mod certificate;
 mod collection;
 mod cp;
 mod diagnostics;

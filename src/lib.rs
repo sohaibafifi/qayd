@@ -25,6 +25,7 @@
 //! assert_eq!(result.primal().unwrap().assignment().integers[value.0], Some(1));
 //! ```
 
+pub mod certificate;
 pub mod constraints;
 pub mod domains;
 mod engines;
@@ -290,3 +291,15 @@ mod cumulative_profile_tests;
 #[cfg(test)]
 #[path = "../tests/internal/cumulative_metrics.rs"]
 mod cumulative_metrics;
+
+#[cfg(test)]
+#[path = "../tests/internal/certificate_hash.rs"]
+mod certificate_hash_tests;
+
+#[cfg(test)]
+#[path = "../tests/internal/certificate_producer.rs"]
+mod certificate_producer_tests;
+
+#[cfg(test)]
+#[path = "../tests/internal/certificate_runtime.rs"]
+mod certificate_runtime_tests;
