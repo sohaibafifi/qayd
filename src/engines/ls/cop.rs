@@ -4203,7 +4203,7 @@ pub(crate) struct InvariantAudit {
     pub(crate) full_rebuilds: u64,
 }
 
-/// Differential transaction oracle used from `tests/`. Every speculative score
+/// Differential transaction oracle. Every speculative score
 /// is compared with the independent full scorer, rollback must restore the
 /// complete state, and commit must materialize exactly the fully completed
 /// assignment.

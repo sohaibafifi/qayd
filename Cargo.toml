@@ -19,6 +19,7 @@ version = "0.10.0"
 [lib]
 name = "qayd"
 path = "src/lib.rs"
+test = false
 # `cdylib` for the optional PyO3 extension module (built under `--features python`
 # by maturin); `rlib` keeps the binary and the flatzinc frontend linking normally.
 crate-type = ["rlib", "cdylib"]

@@ -24,29 +24,6 @@ are owned by one orchestrator.
 
 Priority order: correct, simple, fast.
 
-## How It Works
-
-```text
-Rust / Python / XCSP3 / FlatZinc / DIMACS / OPB
-                         |
-                    ModelPackage
-                         |
-       validate -> plan -> execute -> semantic replay
-                         |
-                     SolveResult
-```
-
-`Model` describes variables, constraints, and objectives. `ModelPackage` adds
-format-neutral names and source locations. `SolveRequest` controls the solve
-mode, seed, workers, budgets, search policy, and optional engine settings.
-
-The orchestrator validates the model, prepares an executable plan, runs the
-selected engines, and independently replays a candidate before publishing it.
-Only the orchestrator assigns public statuses such as `SATISFIABLE`, `OPTIMAL`,
-`UNSATISFIABLE`, `UNKNOWN`, and `UNSUPPORTED`.
-
-Semantic replay proves candidate feasibility and objective values. Optimality
-and infeasibility still require a complete engine claim.
 
 ## Capabilities
 
