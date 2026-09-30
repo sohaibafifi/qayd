@@ -400,6 +400,9 @@ pub fn merge_search_stats(total: &mut SolveStats, part: SolveStats) {
     total.learned_lits = total.learned_lits.saturating_add(part.learned_lits);
     total.vivified_clauses = total.vivified_clauses.saturating_add(part.vivified_clauses);
     total.vivified_lits = total.vivified_lits.saturating_add(part.vivified_lits);
+    total.semantic_minimized_clauses = total.semantic_minimized_clauses.saturating_add(part.semantic_minimized_clauses);
+    total.semantic_minimized_lits = total.semantic_minimized_lits.saturating_add(part.semantic_minimized_lits);
+    total.nogoods.merge(part.nogoods);
     total.binary_clause_visits = total.binary_clause_visits.saturating_add(part.binary_clause_visits);
     total.watched_clause_visits = total.watched_clause_visits.saturating_add(part.watched_clause_visits);
     total.watched_literal_scans = total.watched_literal_scans.saturating_add(part.watched_literal_scans);

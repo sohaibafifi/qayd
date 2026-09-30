@@ -50,6 +50,10 @@ pub struct RunOptions {
     pub no_learn_csp: bool,
     /// Use whole propagator scopes instead of tight reasons.
     pub force_scope_reasons: bool,
+    /// Opt-in simplification using the integer meaning of learned literals.
+    pub semantic_minimization: bool,
+    pub extended_nogoods: bool,
+    pub cpip: bool,
     /// Requested shared-clause ring capacity. Rounded down to a power of two.
     pub shared_pool_capacity: usize,
     /// Total conflict ceiling shared by all complete workers.
@@ -149,6 +153,9 @@ impl Default for RunOptions {
             lns: 0,
             no_learn_csp: false,
             force_scope_reasons: false,
+            semantic_minimization: false,
+            extended_nogoods: false,
+            cpip: false,
             shared_pool_capacity: 1 << 14,
             conflict_limit: None,
         }
@@ -687,6 +694,9 @@ pub(crate) fn audit_explicit_policy_proof_roles(workers: usize) -> (Vec<bool>, b
 /// Race diversified find-one workers on the same CSP.
 pub(crate) fn solve_csp(mut problem: Problem, stop: &AtomicBool, options: RunOptions, guidance: SearchGuidance) -> CspOutcome {
     problem.solver.set_force_scope_reasons(options.force_scope_reasons);
+    problem.solver.set_semantic_minimization(options.semantic_minimization);
+    problem.solver.set_extended_nogoods(options.extended_nogoods);
+    problem.solver.set_cpip(options.cpip);
     let chronological_compatible = guidance.is_chronological_dfs_compatible() && options.conflict_limit.is_none();
     let scoped_no_learn = options.no_learn_csp && chronological_compatible;
     let search_kind = if scoped_no_learn || (options.workers == 1 && chronological_compatible) {
@@ -821,6 +831,9 @@ pub(crate) fn solve_cop_with_progress<W: Write>(
     }
     problem.solver.set_force_scope_reasons(options.force_scope_reasons);
     let minimizing = problem.objective_dir().expect("COP lost its objective");
+    problem.solver.set_semantic_minimization(options.semantic_minimization);
+    problem.solver.set_extended_nogoods(options.extended_nogoods);
+    problem.solver.set_cpip(options.cpip);
     match prepare_root(&mut problem, stop) {
         RootPreparation::Ready => {}
         RootPreparation::Inconsistent => {

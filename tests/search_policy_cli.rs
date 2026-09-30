@@ -107,6 +107,17 @@ fn command_line_help_is_grouped_complete_and_terminal_friendly() {
         "--semantic-branching",
         "--search-phase",
         "--force-scope-reasons",
+        "--semantic-minimization",
+        "--check-inferences",
+        "--deferred-explanations",
+        "--explanation-metrics",
+        "--extended-nogoods",
+        "--cpip",
+        "--unary-edge-finding",
+        "--unary-edge-finding-metrics",
+        "--incremental-cumulative",
+        "--lifted-cumulative-explanations",
+        "--cumulative-metrics",
         "--shared-pool-cap",
         "--linear-backend",
         "--lp-root-ms",
@@ -163,4 +174,53 @@ fn command_line_search_phases_reject_noncanonical_selectors() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("unknown variable selector"), "{stderr}");
+}
+
+#[test]
+fn command_line_nogood_controls_reach_lcg_and_report_checker_coverage() {
+    let instance = TemporaryInstance::new("nogoods");
+    let output = Command::new(env!("CARGO_BIN_EXE_qayd"))
+        .args(["--verbose", "--extended-nogoods", "--cpip", "--check-inferences", "--search-phase", "0,1:activity:min"])
+        .arg(&instance.0)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("s SATISFIABLE"), "{stdout}");
+    let scans = stdout.lines().find_map(|line| line.strip_prefix("c nogoods scans ")).unwrap();
+    assert!(scans.split_whitespace().next().unwrap().parse::<u64>().unwrap() > 0, "{stdout}");
+    assert!(stdout.contains("c inference lcg checked "), "{stdout}");
+}
+
+#[test]
+fn command_line_cumulative_controls_are_independent_and_reach_the_native_engine() {
+    let instance = TemporaryInstance::new("cumulative");
+    std::fs::write(
+        &instance.0,
+        r#"<instance format="XCSP3" type="CSP">
+             <variables><array id="s" size="[3]"> 0..3 </array></variables>
+             <constraints><cumulative>
+               <origins>s[]</origins><lengths>2 2 2</lengths><heights>1 1 1</heights><condition>(le,2)</condition>
+             </cumulative></constraints>
+           </instance>"#,
+    )
+    .unwrap();
+    for (incremental, lifted) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_qayd"));
+        command.args(["--verbose", "--cumulative-metrics", "--check-inferences"]);
+        if incremental {
+            command.arg("--incremental-cumulative");
+        }
+        if lifted {
+            command.arg("--lifted-cumulative-explanations");
+        }
+        let output = command.arg(&instance.0).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("s SATISFIABLE"), "{stdout}");
+        let prefix = format!("c cumulative incremental {incremental} lifted {lifted} calls ");
+        let report = stdout.lines().find_map(|line| line.strip_prefix(&prefix)).unwrap_or_else(|| panic!("{stdout}"));
+        assert!(report.split_whitespace().next().unwrap().parse::<u64>().unwrap() > 0, "{stdout}");
+        assert!(stdout.contains("c inference checking checked "), "{stdout}");
+    }
 }

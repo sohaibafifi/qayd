@@ -2,6 +2,7 @@
 //! [`Propagator`](crate::Propagator) plus a posting helper.
 
 pub mod count;
+pub mod cumulative_profile;
 pub(crate) mod divisibility;
 pub mod flatten;
 pub mod graph;
@@ -16,3 +17,4 @@ pub(crate) mod resource_profile;
 pub mod scheduling;
 pub(crate) mod sum_squares;
 pub mod table;
+pub mod unary_edge_finding;

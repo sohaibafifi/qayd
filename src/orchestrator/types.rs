@@ -168,6 +168,34 @@ pub struct CpControls {
     pub lns: usize,
     pub no_learn_csp: bool,
     pub force_scope_reasons: bool,
+    /// Opt-in semantic simplification of learned LCG clauses. Does not change
+    /// the selected search driver; chronological searches have no learned clauses.
+    pub semantic_minimization: bool,
+    /// Bounded same-variable nogood propagation, disabled by default.
+    pub extended_nogoods: bool,
+    /// Bounded variable-level conflict cut and generalized block assertion.
+    pub cpip: bool,
+    /// Check supported runtime CP inferences against a bounded independent
+    /// oracle. A rejected inference panics (aborts in the release profile).
+    /// Unsupported and resource-limited checks are reported as uncovered.
+    pub check_inferences: bool,
+    /// Defer supported Boolean-row explanations until LCG requests them.
+    /// Disabled by default; other propagators retain their eager path.
+    pub deferred_explanations: bool,
+    /// Collect explanation work and retained-storage diagnostics in either
+    /// eager or deferred mode. Deferred mode also enables these diagnostics.
+    pub explanation_metrics: bool,
+    /// Add theta-lambda edge finding to supported mandatory unary resources.
+    /// Positive fixed durations without auxiliary order variables only.
+    pub unary_edge_finding: bool,
+    /// Instrument unary propagation in either arm; enabled with edge finding.
+    pub unary_edge_finding_metrics: bool,
+    /// Maintain reversible sparse events for native constant cumulative resources.
+    pub incremental_cumulative: bool,
+    /// Lift native cumulative timetable premises using sufficient certificates.
+    pub lifted_cumulative_explanations: bool,
+    /// Instrument native cumulative propagation in any experimental arm.
+    pub cumulative_metrics: bool,
     pub shared_pool_capacity: usize,
 }
 
@@ -198,7 +226,25 @@ pub struct SatControls {
 
 impl Default for CpControls {
     fn default() -> Self {
-        Self { split: false, probes: 0, lns: 0, no_learn_csp: false, force_scope_reasons: false, shared_pool_capacity: 1 << 14 }
+        Self {
+            split: false,
+            probes: 0,
+            lns: 0,
+            no_learn_csp: false,
+            force_scope_reasons: false,
+            semantic_minimization: false,
+            extended_nogoods: false,
+            cpip: false,
+            check_inferences: false,
+            deferred_explanations: false,
+            explanation_metrics: false,
+            unary_edge_finding: false,
+            unary_edge_finding_metrics: false,
+            incremental_cumulative: false,
+            lifted_cumulative_explanations: false,
+            cumulative_metrics: false,
+            shared_pool_capacity: 1 << 14,
+        }
     }
 }
 
@@ -714,6 +760,9 @@ pub struct EngineReport {
 
 /// Low-frequency facts crossing engine boundaries.
 #[derive(Clone, Debug, PartialEq)]
+// Keep the existing by-value event API. The final report carries optional
+// research counters; these low-frequency events do not justify boxing it.
+#[allow(clippy::large_enum_variant)]
 pub enum SolveEvent {
     Candidate(CandidateSolution),
     Bound(Bound),

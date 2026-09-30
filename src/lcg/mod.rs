@@ -15,5 +15,7 @@ pub mod clause;
 pub mod engine;
 pub(crate) mod guarded_sum;
 pub mod lit;
+pub mod nogood;
+pub mod semantic;
 pub mod trail;
 pub mod view;

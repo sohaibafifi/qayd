@@ -132,6 +132,12 @@ pub struct SolveStats {
     pub vivified_clauses: u64,
     /// Literals removed by CP-aware vivification.
     pub vivified_lits: u64,
+    /// Learned clauses shortened by experimental domain-semantic minimization.
+    pub semantic_minimized_clauses: u64,
+    /// Literals removed by experimental domain-semantic minimization.
+    pub semantic_minimized_lits: u64,
+    /// Work and pruning from the bounded experimental nogood/CPIP modes.
+    pub nogoods: crate::lcg::nogood::NogoodStats,
     /// Binary clauses visited during CDCL unit propagation.
     pub binary_clause_visits: u64,
     /// Non-binary watched clauses visited during CDCL unit propagation.

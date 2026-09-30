@@ -2,13 +2,22 @@
 //! propagation queue; [`Solver`] holds the propagator objects and drives the
 //! event-driven fixpoint.
 
-use std::collections::{HashSet, VecDeque};
-use std::sync::Arc;
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
+use crate::constraints::cumulative_profile::{CumulativeMetricsHandle, CumulativeStats};
+use crate::constraints::unary_edge_finding::{UnaryEdgeFindingMetricsHandle, UnaryEdgeFindingStats};
 use crate::domains::int::Domain;
 use crate::domains::interval::{IntervalDomain, IntervalEvent, IntervalPresence};
 use crate::domains::list::{ListDomain, ListEvent};
+use crate::explanation::{DeferredReason, DeferredReasonSource, ExplanationMetricsHandle, ExplanationStats, MAX_DEFERRED_PREMISES};
 use crate::ids::{IntervalId, ListId, PropId, VarId};
+use crate::inference::{
+    check_clause_entailment, check_inference, ClauseCheckOutcome, ClauseEntailment, Inference, InferenceCheckConfig, InferenceCheckOutcome,
+    InferenceCheckStats, InferenceConclusion, InferenceConstraint, InferenceDomain, InferenceLiteral, MAX_INFERENCE_WORK,
+};
 use crate::propagator::{Event, Inconsistency, Priority, Propagator, Selected, NBANDS};
 use crate::trail::{ReversibleInt, Trail};
 
@@ -118,6 +127,8 @@ pub enum Cause {
     /// Tight propagator-supplied premises that entail the change; set via the
     /// `*_because` mutators.
     Premises(Vec<Premise>),
+    /// Immutable historical premises expanded only by a consumer that needs them.
+    Deferred(DeferredReason),
 }
 
 /// A primary domain change plus why it happened ([`Cause`]).
@@ -136,6 +147,77 @@ pub enum StepOutcome {
     Ran(PropId),
     /// This propagator wiped out a domain.
     Failed(PropId),
+}
+
+#[derive(Default)]
+struct InferenceMonitor {
+    stats: InferenceCheckStats,
+    uncovered: BTreeMap<&'static str, u64>,
+    poisoned: bool,
+}
+
+#[derive(Clone, Copy)]
+enum LcgCheckKind {
+    Inference,
+    Conflict,
+    Derivation,
+}
+
+enum LcgCheckError {
+    Uncovered { resource_limited: bool },
+    Rejected(String),
+}
+
+/// Shared diagnostics for a solver and all its search-worker clones.
+///
+/// Cloning a solver shares this handle, so work is counted once across workers.
+/// A rejected inference poisons every sibling using the same handle.
+#[derive(Clone)]
+pub struct InferenceCheckHandle {
+    monitor: Arc<Mutex<InferenceMonitor>>,
+}
+
+impl InferenceCheckHandle {
+    /// Completed and uncovered inference checks across all attached workers.
+    pub fn stats(&self) -> InferenceCheckStats {
+        self.monitor.lock().expect("inference monitor lock poisoned").stats
+    }
+
+    /// Unsupported propagator families and their invocation counts.
+    pub fn uncovered_families(&self) -> Vec<(String, u64)> {
+        self.monitor
+            .lock()
+            .expect("inference monitor lock poisoned")
+            .uncovered
+            .iter()
+            .map(|(name, count)| ((*name).to_owned(), *count))
+            .collect()
+    }
+}
+
+#[derive(Clone)]
+struct InferenceInvocation {
+    id: PropId,
+    name: &'static str,
+    constraint: Option<InferenceConstraint>,
+    scope_premises: Vec<Premise>,
+    resource_limited: bool,
+    remaining_work: usize,
+    failed_mutation: bool,
+    /// Domain before a mutator reported inconsistency; never use its emptied
+    /// post-state to validate a subsequently supplied explicit conflict reason.
+    failed_domain: Option<InferenceDomain>,
+}
+
+#[derive(Clone)]
+struct RuntimeInferenceChecks {
+    config: InferenceCheckConfig,
+    roots: Vec<InferenceDomain>,
+    baseline_limited: bool,
+    baseline_remaining: usize,
+    root_bytes: u64,
+    handle: InferenceCheckHandle,
+    invocation: Option<InferenceInvocation>,
 }
 
 /// Owns all mutable solver state: domains, trail, subscriptions, and the
@@ -176,6 +258,7 @@ pub struct Store {
     /// Tight reason staged by a `*_because` mutator; bound to its next real
     /// change, else falls back to a scope snapshot.
     pending_premises: Option<Vec<Premise>>,
+    pending_deferred: Option<DeferredReason>,
     /// Tight reason staged by [`fail_because`](Store::fail_because); drained by
     /// the LCG layer on a conflict.
     pending_conflict: Option<Vec<Premise>>,
@@ -195,6 +278,17 @@ pub struct Store {
     /// Whether an LCG trail consumes reasons. Off outside learning, so
     /// propagators with costly explanation construction can skip it entirely.
     explain: bool,
+    deferred_explanations: bool,
+    explanation_metrics: Option<ExplanationMetricsHandle>,
+    unary_edge_finding: bool,
+    unary_edge_finding_metrics: Option<UnaryEdgeFindingMetricsHandle>,
+    incremental_cumulative: bool,
+    lifted_cumulative_explanations: bool,
+    cumulative_metrics: Option<CumulativeMetricsHandle>,
+    /// Opt-in checker baseline and invocation context. Disabled by default.
+    inference: Option<RuntimeInferenceChecks>,
+    /// Cannot be cleared by disabling or reconfiguring the checker.
+    inference_poisoned: bool,
     /// Unary-resource interval pairs registered by `no_overlap`. Each pair's order
     /// is a boolean variable (`1` = first-before-second, `0` = second-before-first,
     /// unfixed = undecided), so the order decision is a first-class atom the
@@ -208,6 +302,493 @@ impl Store {
     /// An empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[inline]
+    fn assert_inference_healthy(&self) {
+        let shared_poisoned =
+            self.inference.as_ref().is_some_and(|checks| checks.handle.monitor.lock().expect("inference monitor lock poisoned").poisoned);
+        assert!(
+            !self.inference_poisoned && !shared_poisoned,
+            "solver poisoned by a rejected runtime inference; discard this solver and its clones"
+        );
+    }
+
+    fn inference_spend(remaining: &mut usize, work: usize) -> bool {
+        match remaining.checked_sub(work) {
+            Some(after) => {
+                *remaining = after;
+                true
+            }
+            None => {
+                *remaining = 0;
+                false
+            }
+        }
+    }
+
+    fn inference_domain(&self, var: VarId, remaining: &mut usize) -> Option<InferenceDomain> {
+        if !Self::inference_spend(remaining, 1) {
+            return None;
+        }
+        let dom = &self.domains[var.index()];
+        let (min, max) = if dom.size(&self.trail) == 0 { (1, 0) } else { (dom.min(&self.trail), dom.max(&self.trail)) };
+        let mut holes = Vec::new();
+        if dom.size(&self.trail) as i64 != i64::from(max) - i64::from(min) + 1 {
+            let budget = Cell::new(*remaining);
+            let complete = dom.append_removed_values_until(&self.trail, &mut holes, &|| {
+                let left = budget.get();
+                budget.set(left.saturating_sub(1));
+                left == 0
+            });
+            *remaining = budget.get();
+            if !complete {
+                return None;
+            }
+        }
+        Some(InferenceDomain { var, min, max, values: self.sparse_values(var), holes })
+    }
+
+    fn inference_domain_bytes(domains: &[InferenceDomain]) -> u64 {
+        domains.iter().fold(0u64, |total, domain| {
+            total
+                .saturating_add(std::mem::size_of::<InferenceDomain>() as u64)
+                .saturating_add((domain.holes.len() as u64).saturating_mul(4))
+                .saturating_add((domain.values.as_ref().map_or(0, |values| values.len()) as u64).saturating_mul(4))
+        })
+    }
+
+    fn record_inference_new_var(&mut self, var: VarId) {
+        if let Some(checks) = &self.inference {
+            if checks.baseline_limited {
+                return;
+            }
+            let started = Instant::now();
+            let mut remaining = checks.baseline_remaining;
+            let domain = self.inference_domain(var, &mut remaining);
+            let checks = self.inference.as_mut().unwrap();
+            checks.baseline_remaining = remaining;
+            if let Some(domain) = domain {
+                checks.root_bytes = checks.root_bytes.saturating_add(Self::inference_domain_bytes(std::slice::from_ref(&domain)));
+                checks.roots.push(domain);
+            } else {
+                checks.baseline_limited = true;
+                checks.roots.clear();
+                checks.root_bytes = 0;
+            }
+            let mut monitor = checks.handle.monitor.lock().expect("inference monitor lock poisoned");
+            monitor.stats.peak_snapshot_bytes = monitor.stats.peak_snapshot_bytes.max(checks.root_bytes);
+            monitor.stats.elapsed_nanos =
+                monitor.stats.elapsed_nanos.saturating_add(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        }
+    }
+
+    fn begin_inference_invocation(&mut self, id: PropId, prop: &dyn Propagator) {
+        let Some(checks) = &self.inference else { return };
+        let started = Instant::now();
+        self.assert_inference_healthy();
+        let mut remaining = checks.config.max_work.min(MAX_INFERENCE_WORK);
+        let description_limited = !Self::inference_spend(&mut remaining, prop.inference_description_work());
+        let constraint = if description_limited { None } else { prop.inference_constraint() };
+        let unsupported = !description_limited && constraint.is_none();
+        let mut resource_limited = !unsupported && (description_limited || checks.baseline_limited);
+        let mut scope_premises = Vec::new();
+        if !unsupported && !resource_limited {
+            if !Self::inference_spend(&mut remaining, self.scope[id.index()].len()) {
+                resource_limited = true;
+            } else {
+                for &var in &self.scope[id.index()] {
+                    let Some(domain) = self.inference_domain(var, &mut remaining) else {
+                        resource_limited = true;
+                        break;
+                    };
+                    if !Self::inference_spend(&mut remaining, 2usize.saturating_add(domain.holes.len())) {
+                        resource_limited = true;
+                        break;
+                    }
+                    scope_premises.push(Premise::Ge { var, bound: domain.min });
+                    scope_premises.push(Premise::Le { var, bound: domain.max });
+                    scope_premises.extend(domain.holes.into_iter().map(|val| Premise::Ne { var, val }));
+                }
+            }
+        }
+        if resource_limited {
+            scope_premises.clear();
+        }
+        let name = prop.inference_name();
+        let checks = self.inference.as_mut().unwrap();
+        {
+            let mut monitor = checks.handle.monitor.lock().expect("inference monitor lock poisoned");
+            if unsupported {
+                monitor.stats.unsupported_calls = monitor.stats.unsupported_calls.saturating_add(1);
+                let count = monitor.uncovered.entry(name).or_default();
+                *count = count.saturating_add(1);
+            }
+            let snapshot_bytes =
+                checks.root_bytes.saturating_add((scope_premises.len() as u64).saturating_mul(std::mem::size_of::<Premise>() as u64));
+            monitor.stats.peak_snapshot_bytes = monitor.stats.peak_snapshot_bytes.max(snapshot_bytes);
+            monitor.stats.elapsed_nanos =
+                monitor.stats.elapsed_nanos.saturating_add(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        }
+        checks.invocation = Some(InferenceInvocation {
+            id,
+            name,
+            constraint,
+            scope_premises,
+            resource_limited,
+            remaining_work: remaining,
+            failed_mutation: false,
+            failed_domain: None,
+        });
+    }
+
+    fn inference_premises(&mut self, cause: &Cause) -> Option<Vec<Premise>> {
+        let checks = self.inference.as_ref().unwrap();
+        let invocation = checks.invocation.as_ref().unwrap();
+        if let Cause::Deferred(reason) = cause {
+            let expansion_work = reason.max_premises().saturating_mul(4).saturating_add(1);
+            if invocation.resource_limited || invocation.constraint.is_none() || expansion_work >= invocation.remaining_work {
+                return None;
+            }
+            self.inference.as_mut().unwrap().invocation.as_mut().unwrap().remaining_work -= expansion_work;
+            let started = Instant::now();
+            let premises = reason.expand_checker();
+            {
+                let mut monitor = self.inference.as_ref().unwrap().handle.monitor.lock().expect("inference monitor lock poisoned");
+                monitor.stats.elapsed_nanos =
+                    monitor.stats.elapsed_nanos.saturating_add(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+            }
+            if premises.len() > reason.max_premises() {
+                self.inference_poisoned = true;
+                self.inference.as_ref().unwrap().handle.monitor.lock().expect("inference monitor lock poisoned").poisoned = true;
+                panic!("runtime inference rejected: deferred explanation provider exceeded its complete-premise bound");
+            }
+            return Some(premises);
+        }
+        let premises = match cause {
+            Cause::Premises(premises) => premises,
+            Cause::Scope => &invocation.scope_premises,
+            Cause::Deferred(_) => unreachable!("deferred premise branch handled above"),
+        };
+        (!invocation.resource_limited && invocation.constraint.is_some() && premises.len() < invocation.remaining_work)
+            .then(|| premises.clone())
+    }
+
+    fn record_uncovered_inference(&mut self, conflict: bool, resource_limited: bool, started: Instant) {
+        let checks = self.inference.as_mut().unwrap();
+        if resource_limited {
+            let invocation = checks.invocation.as_mut().unwrap();
+            invocation.resource_limited = true;
+            invocation.remaining_work = 0;
+        }
+        let mut monitor = checks.handle.monitor.lock().expect("inference monitor lock poisoned");
+        let counter = if conflict { &mut monitor.stats.uncovered_conflicts } else { &mut monitor.stats.uncovered_inferences };
+        *counter = counter.saturating_add(1);
+        if resource_limited {
+            monitor.stats.resource_limited = monitor.stats.resource_limited.saturating_add(1);
+        }
+        monitor.stats.elapsed_nanos =
+            monitor.stats.elapsed_nanos.saturating_add(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+    }
+
+    fn check_runtime_inference(&mut self, premises: Vec<Premise>, conclusion: InferenceConclusion) {
+        let started = Instant::now();
+        let checks = self.inference.as_ref().unwrap();
+        let invocation = checks.invocation.as_ref().unwrap();
+        let conflict = matches!(conclusion, InferenceConclusion::Conflict);
+        let handle = checks.handle.clone();
+        if invocation.resource_limited {
+            self.record_uncovered_inference(conflict, true, started);
+            return;
+        }
+        let Some(constraint) = &invocation.constraint else {
+            self.record_uncovered_inference(conflict, false, started);
+            return;
+        };
+        let mut remaining = invocation.remaining_work;
+        let input_size = premises.len().saturating_add(invocation.scope_premises.len()).saturating_add(1);
+        // Precharge premise copies, collection, and comparison-sort visits.
+        let sort_work = input_size.saturating_mul((usize::BITS - input_size.leading_zeros()) as usize + 3);
+        if !Self::inference_spend(&mut remaining, sort_work) {
+            self.record_uncovered_inference(conflict, true, started);
+            return;
+        }
+        let mut variables: Vec<VarId> = premises.iter().map(Premise::var).collect();
+        if let InferenceConclusion::Predicate(predicate) = conclusion {
+            variables.push(predicate.var());
+        }
+        variables.extend(invocation.scope_premises.iter().map(Premise::var));
+        variables.sort_unstable_by_key(|var| var.0);
+        variables.dedup();
+        let mut snapshot = Vec::new();
+        for var in variables.into_iter().filter(|var| var.index() < self.domains.len()) {
+            let domain = match &invocation.failed_domain {
+                Some(domain) if domain.var == var => {
+                    if Self::inference_spend(&mut remaining, domain.holes.len().saturating_add(1)) {
+                        Some(domain.clone())
+                    } else {
+                        None
+                    }
+                }
+                _ => self.inference_domain(var, &mut remaining),
+            };
+            let Some(domain) = domain else {
+                self.record_uncovered_inference(conflict, true, started);
+                return;
+            };
+            snapshot.push(domain);
+        }
+        let snapshot_bytes = checks
+            .root_bytes
+            .saturating_add(Self::inference_domain_bytes(&snapshot))
+            .saturating_add((invocation.scope_premises.len() as u64).saturating_mul(std::mem::size_of::<Premise>() as u64))
+            .saturating_add(
+                invocation.failed_domain.as_ref().map_or(0, |domain| Self::inference_domain_bytes(std::slice::from_ref(domain))),
+            );
+        let inference = Inference {
+            propagator: invocation.id,
+            constraint,
+            root_domains: &checks.roots,
+            premises: &premises,
+            conclusion,
+            snapshot: &snapshot,
+        };
+        let name = invocation.name;
+        let outcome = check_inference(&inference, InferenceCheckConfig { max_work: remaining, ..checks.config });
+        let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        let invocation = self.inference.as_mut().unwrap().invocation.as_mut().unwrap();
+        let mut monitor = handle.monitor.lock().expect("inference monitor lock poisoned");
+        monitor.stats.elapsed_nanos = monitor.stats.elapsed_nanos.saturating_add(elapsed);
+        monitor.stats.peak_snapshot_bytes = monitor.stats.peak_snapshot_bytes.max(snapshot_bytes);
+        match outcome {
+            InferenceCheckOutcome::Checked { assignments, work } => {
+                invocation.remaining_work = remaining.saturating_sub(work as usize);
+                let counter = if conflict { &mut monitor.stats.checked_conflicts } else { &mut monitor.stats.checked_inferences };
+                *counter = counter.saturating_add(1);
+                monitor.stats.assignments = monitor.stats.assignments.saturating_add(assignments);
+                monitor.stats.work = monitor.stats.work.saturating_add(work);
+            }
+            InferenceCheckOutcome::Uncovered(reason) => {
+                // Incomplete oracle outcomes do not expose consumed work.
+                // Exhaust the invocation budget conservatively, including
+                // malformed descriptors, rather than repeatedly spending it.
+                invocation.remaining_work = 0;
+                invocation.resource_limited = true;
+                let counter = if conflict { &mut monitor.stats.uncovered_conflicts } else { &mut monitor.stats.uncovered_inferences };
+                *counter = counter.saturating_add(1);
+                if reason.is_resource_limit() {
+                    monitor.stats.resource_limited = monitor.stats.resource_limited.saturating_add(1);
+                }
+            }
+            InferenceCheckOutcome::Rejected(failure) => {
+                monitor.poisoned = true;
+                self.inference_poisoned = true;
+                drop(monitor);
+                panic!("runtime inference rejected ({name}): {failure}");
+            }
+        }
+    }
+
+    /// Remaining per-check construction ceiling for the optional LCG checks.
+    /// Callers must report an uncovered check if a complete decoded input
+    /// cannot be built inside this bound, never supply a partial source list.
+    pub(crate) fn lcg_check_work_limit(&self) -> Option<usize> {
+        self.inference.as_ref().map(|checks| checks.config.max_work.min(MAX_INFERENCE_WORK))
+    }
+
+    pub(crate) fn note_uncovered_lcg_inference(&mut self, conflict: bool) {
+        let kind = if conflict { LcgCheckKind::Conflict } else { LcgCheckKind::Inference };
+        self.record_lcg_result(kind, Instant::now(), 0, Err(LcgCheckError::Uncovered { resource_limited: true }));
+    }
+
+    pub(crate) fn note_uncovered_lcg_derivation(&mut self) {
+        self.record_lcg_result(LcgCheckKind::Derivation, Instant::now(), 0, Err(LcgCheckError::Uncovered { resource_limited: true }));
+    }
+
+    fn record_lcg_result(&mut self, kind: LcgCheckKind, started: Instant, snapshot_bytes: u64, outcome: Result<(u64, u64), LcgCheckError>) {
+        self.assert_inference_healthy();
+        let Some(checks) = &self.inference else { return };
+        let mut monitor = checks.handle.monitor.lock().expect("inference monitor lock poisoned");
+        monitor.stats.elapsed_nanos =
+            monitor.stats.elapsed_nanos.saturating_add(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        monitor.stats.peak_snapshot_bytes = monitor.stats.peak_snapshot_bytes.max(snapshot_bytes);
+        match outcome {
+            Ok((assignments, work)) => {
+                let count = match kind {
+                    LcgCheckKind::Inference => &mut monitor.stats.lcg_checked_inferences,
+                    LcgCheckKind::Conflict => &mut monitor.stats.lcg_checked_conflicts,
+                    LcgCheckKind::Derivation => &mut monitor.stats.lcg_checked_derivations,
+                };
+                *count = count.saturating_add(1);
+                monitor.stats.assignments = monitor.stats.assignments.saturating_add(assignments);
+                monitor.stats.work = monitor.stats.work.saturating_add(work);
+            }
+            Err(LcgCheckError::Uncovered { resource_limited }) => {
+                let count = match kind {
+                    LcgCheckKind::Inference => &mut monitor.stats.lcg_uncovered_inferences,
+                    LcgCheckKind::Conflict => &mut monitor.stats.lcg_uncovered_conflicts,
+                    LcgCheckKind::Derivation => &mut monitor.stats.lcg_uncovered_derivations,
+                };
+                *count = count.saturating_add(1);
+                monitor.stats.resource_limited = monitor.stats.resource_limited.saturating_add(u64::from(resource_limited));
+            }
+            Err(LcgCheckError::Rejected(failure)) => {
+                monitor.poisoned = true;
+                self.inference_poisoned = true;
+                drop(monitor);
+                panic!("LCG inference rejected: {failure}");
+            }
+        }
+    }
+
+    /// Validate a clause-driven deduction before its domain mutation. The
+    /// source clause is a hypothesis; this does not certify its provenance.
+    pub(crate) fn check_lcg_inference(&mut self, clause: &[InferenceLiteral], premises: &[Premise], conclusion: InferenceConclusion) {
+        self.assert_inference_healthy();
+        let Some(checks) = &self.inference else { return };
+        let started = Instant::now();
+        let kind = if matches!(conclusion, InferenceConclusion::Conflict) { LcgCheckKind::Conflict } else { LcgCheckKind::Inference };
+        let config = checks.config;
+        let mut remaining = config.max_work.min(MAX_INFERENCE_WORK);
+        let size = clause.len().saturating_add(premises.len()).saturating_add(1);
+        let preparation = size.saturating_mul((usize::BITS - size.leading_zeros()) as usize + 4);
+        if checks.baseline_limited || !Self::inference_spend(&mut remaining, preparation) {
+            self.record_lcg_result(kind, started, 0, Err(LcgCheckError::Uncovered { resource_limited: true }));
+            return;
+        }
+        let mut variables: Vec<_> = clause.iter().map(|literal| literal.predicate.var()).chain(premises.iter().map(Premise::var)).collect();
+        if let InferenceConclusion::Predicate(predicate) = conclusion {
+            variables.push(predicate.var());
+        }
+        variables.sort_unstable();
+        variables.dedup();
+        let mut snapshot = Vec::with_capacity(variables.len());
+        for var in variables.into_iter().filter(|var| var.index() < self.domains.len()) {
+            let Some(domain) = self.inference_domain(var, &mut remaining) else {
+                self.record_lcg_result(kind, started, 0, Err(LcgCheckError::Uncovered { resource_limited: true }));
+                return;
+            };
+            snapshot.push(domain);
+        }
+        let checks = self.inference.as_ref().unwrap();
+        let bytes = checks
+            .root_bytes
+            .saturating_add(Self::inference_domain_bytes(&snapshot))
+            .saturating_add((size as u64).saturating_mul(std::mem::size_of::<InferenceLiteral>() as u64));
+        let constraint = InferenceConstraint::Clause { literals: clause.to_vec() };
+        let outcome = check_inference(
+            &Inference {
+                // Clause checks have no propagator arena entry. The surrounding
+                // diagnostic explicitly identifies their LCG origin.
+                propagator: PropId(u32::MAX),
+                constraint: &constraint,
+                root_domains: &checks.roots,
+                premises,
+                conclusion,
+                snapshot: &snapshot,
+            },
+            InferenceCheckConfig { max_work: remaining, ..config },
+        );
+        let result = match outcome {
+            InferenceCheckOutcome::Checked { assignments, work } => Ok((assignments, work)),
+            InferenceCheckOutcome::Uncovered(reason) => Err(LcgCheckError::Uncovered { resource_limited: reason.is_resource_limit() }),
+            InferenceCheckOutcome::Rejected(failure) => Err(LcgCheckError::Rejected(failure.to_string())),
+        };
+        self.record_lcg_result(kind, started, bytes, result);
+    }
+
+    /// Validate only `frozen roots AND sources => conclusion`. Source clauses
+    /// include every resolved reason and any omitted root unit. Nonroot trail
+    /// assignments are not axioms, and this is not original-model proof replay.
+    pub(crate) fn check_lcg_clause_entailment(&mut self, sources: &[&[InferenceLiteral]], conclusion: &[InferenceLiteral]) {
+        self.assert_inference_healthy();
+        let Some(checks) = &self.inference else { return };
+        let started = Instant::now();
+        let mut remaining = checks.config.max_work.min(MAX_INFERENCE_WORK);
+        if checks.baseline_limited || !Self::inference_spend(&mut remaining, sources.len().saturating_add(conclusion.len())) {
+            self.record_lcg_result(LcgCheckKind::Derivation, started, 0, Err(LcgCheckError::Uncovered { resource_limited: true }));
+            return;
+        }
+        let mut literals = conclusion.len();
+        for source in sources {
+            if !Self::inference_spend(&mut remaining, source.len()) {
+                self.record_lcg_result(LcgCheckKind::Derivation, started, 0, Err(LcgCheckError::Uncovered { resource_limited: true }));
+                return;
+            }
+            literals = literals.saturating_add(source.len());
+        }
+        let bytes = checks.root_bytes.saturating_add((literals as u64).saturating_mul(std::mem::size_of::<InferenceLiteral>() as u64));
+        let inference = ClauseEntailment { root_domains: &checks.roots, sources, conclusion };
+        let outcome = check_clause_entailment(&inference, InferenceCheckConfig { max_work: remaining, ..checks.config });
+        let result = match outcome {
+            ClauseCheckOutcome::Checked { assignments, work } => Ok((assignments, work)),
+            ClauseCheckOutcome::Uncovered(reason) => Err(LcgCheckError::Uncovered { resource_limited: reason.is_resource_limit() }),
+            ClauseCheckOutcome::Rejected(failure) => Err(LcgCheckError::Rejected(failure.to_string())),
+        };
+        self.record_lcg_result(LcgCheckKind::Derivation, started, bytes, result);
+    }
+
+    /// Check before any domain mutation, including a failed fixing attempt.
+    fn check_inference_mutation(&mut self, cause: &Cause, predicate: Premise, opposing: Option<Premise>) {
+        self.assert_inference_healthy();
+        if self.inference.as_ref().is_none_or(|checks| checks.invocation.is_none()) {
+            return;
+        }
+        let started = Instant::now();
+        if let Some(premises) = self.inference_premises(cause) {
+            self.check_runtime_inference(premises, InferenceConclusion::Predicate(predicate));
+        } else {
+            let invocation = self.inference.as_ref().unwrap().invocation.as_ref().unwrap();
+            let limited = invocation.resource_limited || invocation.constraint.is_some();
+            self.record_uncovered_inference(false, limited, started);
+        }
+        if let Some(opposing) = opposing {
+            let started = Instant::now();
+            if let Some(mut premises) = self.inference_premises(cause) {
+                premises.push(opposing);
+                self.check_runtime_inference(premises, InferenceConclusion::Conflict);
+            } else {
+                let invocation = self.inference.as_ref().unwrap().invocation.as_ref().unwrap();
+                let limited = invocation.resource_limited || invocation.constraint.is_some();
+                self.record_uncovered_inference(true, limited, started);
+            }
+            let invocation = self.inference.as_ref().unwrap().invocation.as_ref().unwrap();
+            let mut remaining = invocation.remaining_work;
+            let domain = if invocation.resource_limited || invocation.constraint.is_none() {
+                None
+            } else {
+                self.inference_domain(predicate.var(), &mut remaining)
+            };
+            let invocation = self.inference.as_mut().unwrap().invocation.as_mut().unwrap();
+            invocation.failed_mutation = true;
+            invocation.failed_domain = domain;
+            invocation.remaining_work = remaining;
+            if invocation.failed_domain.is_none() && invocation.constraint.is_some() {
+                invocation.resource_limited = true;
+                invocation.remaining_work = 0;
+            }
+        }
+    }
+
+    fn end_inference_invocation(&mut self, failed: bool) {
+        let Some(checks) = &self.inference else { return };
+        let invocation = checks.invocation.as_ref().unwrap();
+        if failed && (!invocation.failed_mutation || (self.pending_conflict.is_some() && !self.force_scope_reasons)) {
+            let started = Instant::now();
+            let reason = match &self.pending_conflict {
+                Some(premises) if !self.force_scope_reasons => premises,
+                _ => &invocation.scope_premises,
+            };
+            if invocation.resource_limited || invocation.constraint.is_none() || reason.len() >= invocation.remaining_work {
+                let limited = invocation.resource_limited || invocation.constraint.is_some();
+                self.record_uncovered_inference(true, limited, started);
+            } else {
+                let premises = reason.clone();
+                self.check_runtime_inference(premises, InferenceConclusion::Conflict);
+            }
+        }
+        self.inference.as_mut().unwrap().invocation = None;
+        self.assert_inference_healthy();
     }
 
     /// Register a unary-resource pair owned by propagator `prop`, returning its
@@ -295,23 +876,27 @@ impl Store {
 
     /// Create a variable with domain `[lo, hi]`.
     pub fn new_var_range(&mut self, lo: i32, hi: i32) -> VarId {
+        self.assert_inference_healthy();
         let id = VarId(self.domains.len() as u32);
         let dom = Domain::new_range(lo, hi, &mut self.trail);
         self.domains.push(dom);
         self.subs.push(VarSubs::default());
         self.var_weight_cache.push(0);
         self.relevant.push(false);
+        self.record_inference_new_var(id);
         id
     }
 
     /// Create a variable with an explicit set of domain values.
     pub fn new_var_set(&mut self, values: &[i32]) -> VarId {
+        self.assert_inference_healthy();
         let id = VarId(self.domains.len() as u32);
         let dom = Domain::new_set(values, &mut self.trail);
         self.domains.push(dom);
         self.subs.push(VarSubs::default());
         self.var_weight_cache.push(0);
         self.relevant.push(false);
+        self.record_inference_new_var(id);
         id
     }
 
@@ -566,9 +1151,15 @@ impl Store {
 
     /// Remove `val` from `var`. `Err` on wipeout.
     pub fn remove(&mut self, var: VarId, val: i32) -> Result<(), Inconsistency> {
+        self.assert_inference_healthy();
         let i = var.index();
         // Pick the reason only when the op will actually change the domain.
-        let cause = self.cause_for(self.domains[i].contains(val, &self.trail));
+        let will_change = self.domains[i].contains(val, &self.trail);
+        let cause = self.cause_for(will_change);
+        if will_change && self.inference.is_some() {
+            let opposing = self.is_fixed(var).then_some(Premise::Eq { var, val });
+            self.check_inference_mutation(&cause, Premise::Ne { var, val }, opposing);
+        }
         let (old_min, old_max) = self.bounds(i);
         let changed = self.domains[i].remove(val, &mut self.trail);
         if changed {
@@ -580,12 +1171,17 @@ impl Store {
 
     /// Fix `var` to `val`. `Err` if `val` is absent.
     pub fn fix(&mut self, var: VarId, val: i32) -> Result<(), Inconsistency> {
+        self.assert_inference_healthy();
         let i = var.index();
         let will_change = {
             let dom = &self.domains[i];
             dom.contains(val, &self.trail) && !dom.is_fixed(&self.trail)
         };
-        let cause = self.cause_for(will_change);
+        let absent = !self.domains[i].contains(val, &self.trail);
+        let cause = self.cause_for(will_change || (absent && self.inference.is_some()));
+        if (will_change || absent) && self.inference.is_some() {
+            self.check_inference_mutation(&cause, Premise::Eq { var, val }, absent.then_some(Premise::Ne { var, val }));
+        }
         let (old_min, old_max) = self.bounds(i);
         let changed = self.domains[i].fix(val, &mut self.trail)?;
         if changed {
@@ -597,8 +1193,14 @@ impl Store {
 
     /// Remove all values `< bound` from `var`. `Err` on wipeout.
     pub fn remove_below(&mut self, var: VarId, bound: i32) -> Result<(), Inconsistency> {
+        self.assert_inference_healthy();
         let i = var.index();
-        let cause = self.cause_for(bound > self.domains[i].min(&self.trail));
+        let will_change = bound > self.domains[i].min(&self.trail);
+        let cause = self.cause_for(will_change);
+        if will_change && self.inference.is_some() {
+            let opposing = (bound > self.max(var)).then_some(Premise::Le { var, bound: self.max(var) });
+            self.check_inference_mutation(&cause, Premise::Ge { var, bound }, opposing);
+        }
         let (old_min, old_max) = self.bounds(i);
         let changed = self.domains[i].remove_below(bound, &mut self.trail);
         if changed {
@@ -610,8 +1212,14 @@ impl Store {
 
     /// Remove all values `> bound` from `var`. `Err` on wipeout.
     pub fn remove_above(&mut self, var: VarId, bound: i32) -> Result<(), Inconsistency> {
+        self.assert_inference_healthy();
         let i = var.index();
-        let cause = self.cause_for(bound < self.domains[i].max(&self.trail));
+        let will_change = bound < self.domains[i].max(&self.trail);
+        let cause = self.cause_for(will_change);
+        if will_change && self.inference.is_some() {
+            let opposing = (bound < self.min(var)).then_some(Premise::Ge { var, bound: self.min(var) });
+            self.check_inference_mutation(&cause, Premise::Le { var, bound }, opposing);
+        }
         let (old_min, old_max) = self.bounds(i);
         let changed = self.domains[i].remove_above(bound, &mut self.trail);
         if changed {
@@ -834,6 +1442,12 @@ impl Store {
     /// pre-propagator scope fallback. Always clears the pending premises.
     fn cause_for(&mut self, will_change: bool) -> Cause {
         let pending = self.pending_premises.take();
+        let deferred = self.pending_deferred.take();
+        if let Some(reason) = deferred {
+            if will_change && self.deferred_explanations_enabled() {
+                return Cause::Deferred(reason);
+            }
+        }
         match pending {
             Some(p) if !self.force_scope_reasons => {
                 let mut p = if will_change { p } else { Vec::new() };
@@ -884,6 +1498,76 @@ impl Store {
     #[inline]
     pub fn explaining(&self) -> bool {
         self.explain
+            || self
+                .inference
+                .as_ref()
+                .and_then(|checks| checks.invocation.as_ref())
+                .is_some_and(|invocation| invocation.constraint.is_some() && !invocation.resource_limited && invocation.remaining_work > 0)
+    }
+
+    /// Whether the optional mandatory unary edge finder is enabled.
+    pub fn unary_edge_finding_enabled(&self) -> bool {
+        self.unary_edge_finding
+    }
+
+    pub(crate) fn record_unary_edge_finding(&self, stats: UnaryEdgeFindingStats) {
+        if let Some(handle) = &self.unary_edge_finding_metrics {
+            handle.record(stats);
+        }
+    }
+
+    /// Whether native cumulative resources maintain reversible profile events.
+    pub fn incremental_cumulative_enabled(&self) -> bool {
+        self.incremental_cumulative
+    }
+
+    /// Whether native cumulative timetable reasons use certificate bounds.
+    pub fn lifted_cumulative_explanations_enabled(&self) -> bool {
+        self.lifted_cumulative_explanations
+    }
+
+    pub fn cumulative_metrics_enabled(&self) -> bool {
+        self.cumulative_metrics.is_some()
+    }
+
+    pub(crate) fn record_cumulative(&self, stats: CumulativeStats) {
+        if let Some(handle) = &self.cumulative_metrics {
+            handle.record(stats);
+        }
+    }
+
+    /// Whether this invocation may emit raw deferred reasons. The first slice
+    /// requires LCG and excludes guarded, scope-only, and finesse explanations.
+    pub fn deferred_explanations_enabled(&self) -> bool {
+        self.deferred_explanations
+            && self.explain
+            && self.current.is_some()
+            && !self.force_scope_reasons
+            && self.injected_premises.is_empty()
+            && self.finesse.is_none()
+    }
+
+    /// Fix a value using an immutable historical explanation provider.
+    /// Oversized providers use the complete scope fallback without expansion.
+    /// Ineligible guarded or instrumentation paths materialize an eager reason.
+    pub fn fix_deferred(&mut self, var: VarId, val: i32, source: Arc<dyn DeferredReasonSource>) -> Result<(), Inconsistency> {
+        if self.is_fixed(var) && self.value(var) == val {
+            return self.fix(var, val);
+        }
+        if source.max_premises() > MAX_DEFERRED_PREMISES {
+            return self.fix(var, val);
+        }
+        if !self.deferred_explanations_enabled() {
+            return self.fix_because(var, val, source.premises());
+        }
+        self.pending_deferred = Some(DeferredReason::new(source, self.explanation_metrics.clone()));
+        self.fix(var, val)
+    }
+
+    fn record_eager_premises(&self, count: usize) {
+        if let Some(handle) = &self.explanation_metrics {
+            handle.eager_premises(count);
+        }
     }
 
     // --- domain mutations with a tight, propagator-supplied reason ---
@@ -893,24 +1577,28 @@ impl Store {
 
     /// [`remove`](Store::remove), explained by `why`.
     pub fn remove_because(&mut self, var: VarId, val: i32, why: Vec<Premise>) -> Result<(), Inconsistency> {
+        self.record_eager_premises(why.len());
         self.pending_premises = Some(why);
         self.remove(var, val)
     }
 
     /// [`fix`](Store::fix), explained by `why`.
     pub fn fix_because(&mut self, var: VarId, val: i32, why: Vec<Premise>) -> Result<(), Inconsistency> {
+        self.record_eager_premises(why.len());
         self.pending_premises = Some(why);
         self.fix(var, val)
     }
 
     /// [`remove_below`](Store::remove_below), explained by `why`.
     pub fn remove_below_because(&mut self, var: VarId, bound: i32, why: Vec<Premise>) -> Result<(), Inconsistency> {
+        self.record_eager_premises(why.len());
         self.pending_premises = Some(why);
         self.remove_below(var, bound)
     }
 
     /// [`remove_above`](Store::remove_above), explained by `why`.
     pub fn remove_above_because(&mut self, var: VarId, bound: i32, why: Vec<Premise>) -> Result<(), Inconsistency> {
+        self.record_eager_premises(why.len());
         self.pending_premises = Some(why);
         self.remove_above(var, bound)
     }
@@ -918,6 +1606,7 @@ impl Store {
     /// Report inconsistency with a tight conflict reason (`why`: premises true
     /// now that are jointly infeasible). Use as `return Err(store.fail_because(..))`.
     pub fn fail_because(&mut self, why: Vec<Premise>) -> Inconsistency {
+        self.record_eager_premises(why.len());
         self.record_finesse(&why, true);
         self.pending_conflict = Some(why);
         Inconsistency
@@ -960,6 +1649,7 @@ impl Store {
     /// Clear any staged-but-unconsumed reason so it never leaks across runs.
     pub(crate) fn clear_pending(&mut self) {
         self.pending_premises = None;
+        self.pending_deferred = None;
         self.pending_conflict = None;
         self.injected_premises.clear();
     }
@@ -1307,11 +1997,13 @@ impl Store {
 
     /// Open a search level.
     pub fn push_level(&mut self) {
+        self.assert_inference_healthy();
         self.trail.push_level();
     }
 
     /// Close the current search level, undoing its domain changes.
     pub fn pop_level(&mut self) {
+        self.assert_inference_healthy();
         self.trail.pop_level();
     }
 
@@ -1342,6 +2034,12 @@ pub struct Solver {
     fallback_intensions: u64,
     /// Propagator invocations performed by this solver clone.
     propagation_calls: u64,
+    /// Experimental domain-semantic simplification of learned clauses.
+    semantic_minimization: bool,
+    /// Bounded experimental same-variable clause propagation.
+    extended_nogoods: bool,
+    /// Experimental variable-level conflict cut with generalized assertion.
+    cpip: bool,
     #[cfg(feature = "lp-relaxation")]
     linear_relaxation: Vec<LinearRelaxationRow>,
 }
@@ -1362,6 +2060,225 @@ impl Solver {
     /// ablation control; normal solving uses the tighter propagator reasons.
     pub fn set_force_scope_reasons(&mut self, on: bool) {
         self.store.set_force_scope_reasons(on);
+    }
+
+    /// Enable experimental semantic minimization in subsequent LCG searches.
+    /// Disabled by default and bypassed while streaming a SAT proof.
+    pub fn set_semantic_minimization(&mut self, on: bool) {
+        self.semantic_minimization = on;
+    }
+
+    /// Whether subsequent LCG searches should simplify clauses semantically.
+    pub fn semantic_minimization_enabled(&self) -> bool {
+        self.semantic_minimization
+    }
+
+    /// Enable bounded same-variable nogood propagation in subsequent LCG searches.
+    /// Disabled by default and suppressed while a Boolean proof is streamed.
+    pub fn set_extended_nogoods(&mut self, enabled: bool) {
+        self.store.assert_inference_healthy();
+        assert_eq!(self.store.level(), 0, "nogood propagation must be configured at search level zero");
+        self.extended_nogoods = enabled;
+    }
+
+    /// Whether subsequent LCG searches use extended nogood propagation.
+    pub fn extended_nogoods_enabled(&self) -> bool {
+        self.extended_nogoods
+    }
+
+    /// Enable bounded CPIP analysis in subsequent LCG searches.
+    /// Generalized learned-block assertion is part of this mode, even when
+    /// recurring extended nogood propagation is disabled. Unsupported cuts
+    /// retain first-UIP; a Boolean proof logger suppresses CPIP.
+    pub fn set_cpip(&mut self, enabled: bool) {
+        self.store.assert_inference_healthy();
+        assert_eq!(self.store.level(), 0, "CPIP must be configured at search level zero");
+        self.cpip = enabled;
+    }
+
+    /// Whether subsequent LCG searches use the CPIP conflict cut.
+    pub fn cpip_enabled(&self) -> bool {
+        self.cpip
+    }
+
+    /// Enable bounded historical explanations in subsequent LCG propagation.
+    /// Disabled by default; guarded and unsupported propagators remain eager.
+    /// Configure this at level zero before starting a search.
+    pub fn set_deferred_explanations(&mut self, enabled: bool) {
+        self.store.assert_inference_healthy();
+        assert_eq!(self.store.level(), 0, "deferred explanations must be configured at search level zero");
+        self.store.deferred_explanations = enabled;
+    }
+
+    /// Whether deferred propagation explanations are configured for LCG.
+    pub fn deferred_explanations_enabled(&self) -> bool {
+        self.store.deferred_explanations
+    }
+
+    /// Enable explanation instrumentation for either eager or deferred search.
+    /// Enabling creates a fresh report shared by subsequent worker clones.
+    /// Byte estimates cover deferred payloads only, with per-handle shared raw
+    /// history counted conservatively; they are not total solver allocations.
+    pub fn set_explanation_metrics(&mut self, enabled: bool) {
+        self.store.assert_inference_healthy();
+        assert_eq!(self.store.level(), 0, "explanation metrics must be configured at search level zero");
+        self.store.explanation_metrics = enabled.then(ExplanationMetricsHandle::default);
+    }
+
+    /// Shared explanation report retained across solver moves and clones.
+    pub fn explanation_handle(&self) -> Option<ExplanationMetricsHandle> {
+        self.store.explanation_metrics.clone()
+    }
+
+    /// Current explanation report, or all-zero counters when uninstrumented.
+    pub fn explanation_stats(&self) -> ExplanationStats {
+        self.explanation_handle().map_or_else(ExplanationStats::default, |handle| handle.stats())
+    }
+
+    /// Enable the mandatory positive-duration unary edge finder at level zero.
+    /// Unsupported resource shapes retain their existing propagation.
+    pub fn set_unary_edge_finding(&mut self, enabled: bool) {
+        self.store.assert_inference_healthy();
+        assert_eq!(self.store.level(), 0, "unary edge finding must be configured at search level zero");
+        if self.store.unary_edge_finding != enabled {
+            self.store.unary_edge_finding = enabled;
+            self.enqueue_all();
+        }
+    }
+
+    pub fn unary_edge_finding_enabled(&self) -> bool {
+        self.store.unary_edge_finding
+    }
+
+    /// Start a fresh diagnostic report shared by subsequent solver clones.
+    pub fn set_unary_edge_finding_metrics(&mut self, enabled: bool) {
+        self.store.assert_inference_healthy();
+        assert_eq!(self.store.level(), 0, "unary edge-finding metrics must be configured at search level zero");
+        self.store.unary_edge_finding_metrics = enabled.then(UnaryEdgeFindingMetricsHandle::default);
+    }
+
+    pub fn unary_edge_finding_handle(&self) -> Option<UnaryEdgeFindingMetricsHandle> {
+        self.store.unary_edge_finding_metrics.clone()
+    }
+
+    pub fn unary_edge_finding_stats(&self) -> UnaryEdgeFindingStats {
+        self.unary_edge_finding_handle().map_or_else(UnaryEdgeFindingStats::default, |handle| handle.stats())
+    }
+
+    /// Enable reversible event maintenance for native constant cumulative
+    /// resources. Other cumulative adapters keep their existing propagation.
+    pub fn set_incremental_cumulative(&mut self, enabled: bool) {
+        self.store.assert_inference_healthy();
+        assert_eq!(self.store.level(), 0, "incremental cumulative must be configured at search level zero");
+        if self.store.incremental_cumulative != enabled {
+            self.store.incremental_cumulative = enabled;
+            self.enqueue_all();
+        }
+    }
+
+    pub fn incremental_cumulative_enabled(&self) -> bool {
+        self.store.incremental_cumulative
+    }
+
+    /// Lift native cumulative timetable reasons independently of incremental
+    /// profile maintenance. Energetic and optional scope fallbacks are retained.
+    pub fn set_lifted_cumulative_explanations(&mut self, enabled: bool) {
+        self.store.assert_inference_healthy();
+        assert_eq!(self.store.level(), 0, "lifted cumulative explanations must be configured at search level zero");
+        if self.store.lifted_cumulative_explanations != enabled {
+            self.store.lifted_cumulative_explanations = enabled;
+            self.enqueue_all();
+        }
+    }
+
+    pub fn lifted_cumulative_explanations_enabled(&self) -> bool {
+        self.store.lifted_cumulative_explanations
+    }
+
+    /// Start a fresh diagnostic report shared by subsequent solver clones.
+    pub fn set_cumulative_metrics(&mut self, enabled: bool) {
+        self.store.assert_inference_healthy();
+        assert_eq!(self.store.level(), 0, "cumulative metrics must be configured at search level zero");
+        self.store.cumulative_metrics = enabled.then(CumulativeMetricsHandle::default);
+    }
+
+    pub fn cumulative_handle(&self) -> Option<CumulativeMetricsHandle> {
+        self.store.cumulative_metrics.clone()
+    }
+
+    pub fn cumulative_stats(&self) -> CumulativeStats {
+        self.cumulative_handle().map_or_else(CumulativeStats::default, |handle| handle.stats())
+    }
+
+    /// Enable independent, bounded runtime checks for supported propagators.
+    ///
+    /// This diagnostic mode must be configured at search level zero. It freezes
+    /// the current domains as the checker baseline and captures subsequently
+    /// created variables. Direct posting or registration simplifications outside
+    /// propagator invocations are outside coverage. Unsupported families and resource-limited checks are reported
+    /// as uncovered, never counted as checked. Reasons are constructed even
+    /// outside LCG, so this mode can be substantially slower than normal solving.
+    /// `max_work` bounds snapshot preparation and checker work cumulatively per
+    /// propagator invocation. Baseline capture has a separate budget of the same
+    /// size; an incomplete baseline makes all supported inferences uncovered.
+    ///
+    /// A rejected inference panics before its pruning or conflict is accepted
+    /// and permanently poisons this solver and its clones. Catching the panic
+    /// does not permit reuse; release profiles using panic=abort end the process.
+    /// `None` disables checking. Enabling again starts a fresh report.
+    pub fn set_inference_checking(&mut self, config: Option<InferenceCheckConfig>) {
+        self.store.assert_inference_healthy();
+        assert_eq!(self.store.level(), 0, "runtime inference checking must be configured at search level zero");
+        self.store.inference = config.map(|config| {
+            let started = Instant::now();
+            let mut baseline_remaining = config.max_work.min(MAX_INFERENCE_WORK);
+            let mut baseline_limited = self.store.domains.len() > baseline_remaining;
+            let mut roots = Vec::new();
+            let mut root_bytes = 0u64;
+            if !baseline_limited {
+                for index in 0..self.store.domains.len() {
+                    let Some(domain) = self.store.inference_domain(VarId(index as u32), &mut baseline_remaining) else {
+                        baseline_limited = true;
+                        break;
+                    };
+                    root_bytes = root_bytes.saturating_add(Store::inference_domain_bytes(std::slice::from_ref(&domain)));
+                    roots.push(domain);
+                }
+            }
+            let peak_snapshot_bytes = root_bytes;
+            if baseline_limited {
+                roots.clear();
+                root_bytes = 0;
+                baseline_remaining = 0;
+            }
+            let monitor = InferenceMonitor {
+                stats: InferenceCheckStats {
+                    peak_snapshot_bytes,
+                    elapsed_nanos: started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                    ..InferenceCheckStats::default()
+                },
+                ..InferenceMonitor::default()
+            };
+            RuntimeInferenceChecks {
+                config,
+                roots,
+                baseline_limited,
+                baseline_remaining,
+                root_bytes,
+                handle: InferenceCheckHandle { monitor: Arc::new(Mutex::new(monitor)) },
+                invocation: None,
+            }
+        });
+    }
+
+    /// Shared monitor retained across solver moves and worker clones.
+    pub fn inference_check_handle(&self) -> Option<InferenceCheckHandle> {
+        self.store.inference.as_ref().map(|checks| checks.handle.clone())
+    }
+
+    /// Snapshot of the shared report, or zero counters when disabled.
+    pub fn inference_check_stats(&self) -> InferenceCheckStats {
+        self.inference_check_handle().map_or_else(InferenceCheckStats::default, |handle| handle.stats())
     }
 
     /// Create a variable with domain `[lo, hi]`.
@@ -1386,6 +2303,7 @@ impl Solver {
     /// auxiliary variables may already exist, so callers must discard this
     /// solver instead of attempting propagation or posting more constraints.
     pub(crate) fn post_until(&mut self, prop: Box<dyn Propagator>, should_stop: &dyn Fn() -> bool) -> Option<PropId> {
+        self.store.assert_inference_healthy();
         if should_stop() {
             return None;
         }
@@ -1500,6 +2418,7 @@ impl Solver {
     /// Enqueue every propagator (at the start of each search, so a reused
     /// solver still produces a self-contained solve).
     pub fn enqueue_all(&mut self) {
+        self.store.assert_inference_healthy();
         for i in 0..self.propagators.len() {
             self.store.enqueue(PropId(i as u32));
         }
@@ -1508,6 +2427,7 @@ impl Solver {
     /// Run the propagation fixpoint until the queue empties (consistent) or a
     /// propagator reports `Inconsistency`.
     pub fn propagate(&mut self) -> Result<(), Inconsistency> {
+        self.store.assert_inference_healthy();
         while let Some(id) = self.store.dequeue() {
             self.run_prop(id)?;
         }
@@ -1518,6 +2438,7 @@ impl Solver {
     /// queue and returns `Ok`; the caller must abandon the search, never treat
     /// this as a consistent fixpoint.
     pub fn propagate_until<F: Fn() -> bool>(&mut self, should_stop: F) -> Result<(), Inconsistency> {
+        self.store.assert_inference_healthy();
         while let Some(id) = self.store.dequeue() {
             if should_stop() {
                 self.store.clear_queue();
@@ -1536,6 +2457,7 @@ impl Solver {
     /// the store buffer. Returns after one propagator so the LCG engine can
     /// attribute the events and any conflict to it.
     pub fn propagate_step(&mut self) -> StepOutcome {
+        self.store.assert_inference_healthy();
         let Some(id) = self.store.dequeue() else {
             return StepOutcome::Empty;
         };
@@ -1554,7 +2476,9 @@ impl Solver {
         let mut prop = self.propagators[id.index()].take().expect("running a propagator that is not present");
         self.store.clear_pending();
         self.store.current = Some(id);
+        self.store.begin_inference_invocation(id, prop.as_ref());
         let result = prop.propagate(&mut self.store);
+        self.store.end_inference_invocation(result.is_err());
         self.store.current = None;
         self.propagators[id.index()] = Some(prop);
         if let Err(error) = result {
@@ -1575,7 +2499,9 @@ impl Solver {
         let mut prop = self.propagators[id.index()].take().expect("running a propagator that is not present");
         self.store.clear_pending();
         self.store.current = Some(id);
+        self.store.begin_inference_invocation(id, prop.as_ref());
         let result = prop.propagate_until(&mut self.store, should_stop);
+        self.store.end_inference_invocation(result.is_err());
         self.store.current = None;
         self.propagators[id.index()] = Some(prop);
         if let Err(e) = result {

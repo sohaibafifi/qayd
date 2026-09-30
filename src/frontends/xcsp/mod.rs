@@ -43,6 +43,22 @@ pub struct RunOptions {
     /// on the model structure.
     pub semantic_branching: bool,
     pub force_scope_reasons: bool,
+    pub semantic_minimization: bool,
+    /// Bounded same-variable nogood propagation, disabled by default.
+    pub extended_nogoods: bool,
+    /// Bounded variable-level conflict cut and generalized block assertion.
+    pub cpip: bool,
+    pub check_inferences: bool,
+    pub deferred_explanations: bool,
+    pub explanation_metrics: bool,
+    pub unary_edge_finding: bool,
+    pub unary_edge_finding_metrics: bool,
+    /// Maintain reversible sparse events for native constant cumulative resources.
+    pub incremental_cumulative: bool,
+    /// Lift native cumulative timetable premises using sufficient certificates.
+    pub lifted_cumulative_explanations: bool,
+    /// Instrument native cumulative propagation in any experimental arm.
+    pub cumulative_metrics: bool,
     pub shared_pool_capacity: usize,
     pub time_limit: Option<Duration>,
     pub mem_limit: Option<usize>,
@@ -69,6 +85,17 @@ impl Default for RunOptions {
             no_learn_csp: false,
             semantic_branching: false,
             force_scope_reasons: false,
+            semantic_minimization: false,
+            extended_nogoods: false,
+            cpip: false,
+            check_inferences: false,
+            deferred_explanations: false,
+            explanation_metrics: false,
+            unary_edge_finding: false,
+            unary_edge_finding_metrics: false,
+            incremental_cumulative: false,
+            lifted_cumulative_explanations: false,
+            cumulative_metrics: false,
             shared_pool_capacity: 1 << 14,
             time_limit: None,
             mem_limit: None,
@@ -434,6 +461,17 @@ fn solve_request(options: RunOptions, primary_branch_scope: Vec<usize>, search_p
             lns: options.lns,
             no_learn_csp: options.no_learn_csp,
             force_scope_reasons: options.force_scope_reasons,
+            semantic_minimization: options.semantic_minimization,
+            extended_nogoods: options.extended_nogoods,
+            cpip: options.cpip,
+            check_inferences: options.check_inferences,
+            deferred_explanations: options.deferred_explanations,
+            explanation_metrics: options.explanation_metrics,
+            unary_edge_finding: options.unary_edge_finding,
+            unary_edge_finding_metrics: options.unary_edge_finding_metrics,
+            incremental_cumulative: options.incremental_cumulative,
+            lifted_cumulative_explanations: options.lifted_cumulative_explanations,
+            cumulative_metrics: options.cumulative_metrics,
             shared_pool_capacity: options.shared_pool_capacity,
         },
         primary_branch_scope: (!options.local_search() && options.semantic_branching).then_some(primary_branch_scope),
@@ -489,6 +527,22 @@ fn write_report<W: Write>(w: &mut W, result: &SolveResult) -> std::io::Result<()
     if stats.vivified_clauses > 0 {
         writeln!(w, "c inprocessing vivified {} removed {}", stats.vivified_clauses, stats.vivified_lits)?;
     }
+    if result.reports().iter().any(|report| report.metadata.iter().any(|(key, value)| key == "semantic_minimization" && value == "true")) {
+        writeln!(
+            w,
+            "c semantic minimization enabled clauses {} removed {}",
+            stats.semantic_minimized_clauses, stats.semantic_minimized_lits
+        )?;
+    }
+    if result.reports().iter().any(|report| report.metadata.iter().any(|(key, _)| key == "extended_nogoods" || key == "cpip")) {
+        let n = stats.nogoods;
+        writeln!(w, "c nogoods scans {} clauses {} predicates {} values {} propagations {} removed {} conflicts {} reasons {} premises {} cpip_attempts {} cpip_learned {} cpip_blocks {} fallbacks {}",
+            n.extended_scans, n.clause_visits, n.predicate_visits, n.value_visits, n.propagations, n.removed_values, n.conflicts, n.reasons, n.reason_literals, n.cpip_attempts, n.cpip_learned, n.cpip_multi_predicate, n.cpip_fallbacks)?;
+    }
+    write_inference_report(w, result)?;
+    write_explanation_report(w, result)?;
+    write_unary_report(w, result)?;
+    write_cumulative_report(w, result)?;
     if stats.lp_model_status != Default::default() {
         writeln!(
             w,
@@ -601,6 +655,122 @@ fn write_report<W: Write>(w: &mut W, result: &SolveResult) -> std::io::Result<()
     }
     if let (Some(attempts), Some(improved)) = (value("lns_attempts"), value("lns_improved")) {
         writeln!(w, "c lns attempts {attempts} improved {improved}")?;
+    }
+    Ok(())
+}
+
+fn write_cumulative_report<W: Write>(w: &mut W, result: &SolveResult) -> std::io::Result<()> {
+    let fields = result.reports().iter().flat_map(|report| &report.metadata).collect::<Vec<_>>();
+    let value = |wanted: &str| fields.iter().find_map(|(key, value)| (key == wanted).then_some(value.as_str()));
+    let Some(incremental) = value("incremental_cumulative") else {
+        return Ok(());
+    };
+    let lifted = value("lifted_cumulative_explanations").unwrap_or("false");
+    let sum = |wanted: &str| {
+        fields.iter().filter(|(key, _)| key == wanted).filter_map(|(_, value)| value.parse::<u64>().ok()).fold(0u64, u64::saturating_add)
+    };
+    writeln!(w, "c cumulative incremental {incremental} lifted {lifted} calls {} rebuilds {} updates {} endpoints {} restored {} reasons {} premises {} lifted_bounds {} fallback {}",
+        sum("cumulative_propagation_calls"), sum("cumulative_profile_rebuilds"), sum("cumulative_incremental_updates"),
+        sum("cumulative_endpoint_updates"), sum("cumulative_restored_tasks"), sum("cumulative_reason_calls"),
+        sum("cumulative_emitted_premises"), sum("cumulative_lifted_bounds"), sum("cumulative_fallback_calls"))
+}
+
+fn write_unary_report<W: Write>(w: &mut W, result: &SolveResult) -> std::io::Result<()> {
+    let fields = result.reports().iter().flat_map(|report| &report.metadata).collect::<Vec<_>>();
+    let Some(enabled) = fields.iter().find_map(|(key, value)| (key == "unary_edge_finding").then_some(value)) else {
+        return Ok(());
+    };
+    let sum = |wanted: &str| {
+        fields.iter().filter(|(key, _)| key == wanted).filter_map(|(_, value)| value.parse::<u64>().ok()).fold(0u64, u64::saturating_add)
+    };
+    writeln!(w, "c unary_edge_finding {enabled} calls {} passes {} tree_operations {} overloads {} updates {} removed {} premises {} unsupported {}",
+        sum("unary_propagation_calls"), sum("unary_directional_passes"), sum("unary_tree_operations"),
+        sum("unary_overloads"), sum("unary_bound_updates"), sum("unary_eliminated_starts"),
+        sum("unary_reason_premises"), sum("unary_unsupported_calls"))
+}
+
+fn write_explanation_report<W: Write>(w: &mut W, result: &SolveResult) -> std::io::Result<()> {
+    let Some(mode) = result
+        .reports()
+        .iter()
+        .flat_map(|report| &report.metadata)
+        .find_map(|(key, value)| (key == "explanation_mode").then_some(value.as_str()))
+    else {
+        return Ok(());
+    };
+    let sum = |wanted: &str| -> u64 {
+        result
+            .reports()
+            .iter()
+            .flat_map(|report| &report.metadata)
+            .filter(|(key, _)| key == wanted)
+            .filter_map(|(_, value)| value.parse::<u64>().ok())
+            .fold(0u64, u64::saturating_add)
+    };
+    let peak = result
+        .reports()
+        .iter()
+        .flat_map(|report| &report.metadata)
+        .filter(|(key, _)| key == "explanation_peak_retained_upper_bytes")
+        .filter_map(|(_, value)| value.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    writeln!(w,
+        "c explanations mode {mode} handles {} requested {} expanded {} cache_hits {} checker_expansions {} eager_premises {} materialized_premises {} tracked_peak_upper_bytes {peak}",
+        sum("explanation_created_handles"), sum("explanation_lcg_requests"), sum("explanation_lcg_first_expansions"),
+        sum("explanation_lcg_cache_hits"), sum("explanation_checker_expansions"), sum("explanation_eager_premises"),
+        sum("explanation_materialized_premises"),
+    )
+}
+
+fn write_inference_report<W: Write>(w: &mut W, result: &SolveResult) -> std::io::Result<()> {
+    let reports = result
+        .reports()
+        .iter()
+        .filter(|report| report.metadata.iter().any(|(key, value)| key == "inference_checking" && value == "true"))
+        .collect::<Vec<_>>();
+    if reports.is_empty() {
+        return Ok(());
+    }
+    let sum = |key: &str| {
+        reports
+            .iter()
+            .flat_map(|report| &report.metadata)
+            .filter(|(name, _)| name == key)
+            .filter_map(|(_, value)| value.parse::<u64>().ok())
+            .fold(0u64, u64::saturating_add)
+    };
+    let peak = reports
+        .iter()
+        .flat_map(|report| &report.metadata)
+        .filter(|(name, _)| name == "inference_peak_snapshot_bytes")
+        .filter_map(|(_, value)| value.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    writeln!(
+        w,
+        "c inference checking checked {} conflicts {} uncovered {} uncovered_conflicts {} unsupported_calls {} limited {} time_ns {} peak_snapshot_bytes {}",
+        sum("inference_checked_inferences"),
+        sum("inference_checked_conflicts"),
+        sum("inference_uncovered_inferences"),
+        sum("inference_uncovered_conflicts"),
+        sum("inference_unsupported_calls"),
+        sum("inference_resource_limited"),
+        sum("inference_elapsed_nanos"),
+        peak,
+    )?;
+    writeln!(
+        w,
+        "c inference lcg checked {} conflicts {} derivations {} uncovered {} uncovered_conflicts {} uncovered_derivations {}",
+        sum("inference_lcg_checked_inferences"),
+        sum("inference_lcg_checked_conflicts"),
+        sum("inference_lcg_checked_derivations"),
+        sum("inference_lcg_uncovered_inferences"),
+        sum("inference_lcg_uncovered_conflicts"),
+        sum("inference_lcg_uncovered_derivations")
+    )?;
+    for (_, family) in reports.iter().flat_map(|report| &report.metadata).filter(|(name, _)| name == "inference_uncovered_family") {
+        writeln!(w, "c inference uncovered family {family}")?;
     }
     Ok(())
 }

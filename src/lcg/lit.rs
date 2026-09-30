@@ -197,6 +197,13 @@ impl AtomKind {
 }
 
 impl AtomTable {
+    /// Immutable interval used when the atom table was constructed. For an
+    /// explicit support this is a conservative superset of the root domain.
+    pub(crate) fn initial_bounds(&self, var: VarId) -> (i32, i32) {
+        let bounds = &self.vars[var.index()];
+        (bounds.lo, bounds.hi)
+    }
+
     /// Allocate atoms for every variable; `bounds(var) == (min, max)` of its
     /// starting domain.
     pub fn build(num_vars: usize, bounds: impl Fn(VarId) -> (i32, i32)) -> AtomTable {

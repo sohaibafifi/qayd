@@ -290,7 +290,20 @@ fn compile_cp_plan_inner(
     let warm_start_eligible = request.mode != SolveMode::LocalSearch
         && request.threads == 1
         && request.limits.conflicts.is_none()
-        && request.cp == super::CpControls::default()
+        && (super::CpControls {
+            semantic_minimization: false,
+            extended_nogoods: false,
+            cpip: false,
+            check_inferences: false,
+            deferred_explanations: false,
+            explanation_metrics: false,
+            unary_edge_finding: false,
+            unary_edge_finding_metrics: false,
+            incremental_cumulative: false,
+            lifted_cumulative_explanations: false,
+            cumulative_metrics: false,
+            ..request.cp
+        }) == super::CpControls::default()
         && request.assumptions.is_empty()
         && request.hints.is_empty()
         && request.primary_branch_scope.is_none()
@@ -580,7 +593,26 @@ struct SatisfactionSolve<'a, 'session, 'assumptions> {
 fn solve_satisfaction(context: SatisfactionSolve<'_, '_, '_>) -> Result<SolveResult, SolveError> {
     let SatisfactionSolve { model, compiled, guidance, request, budget, engine_stop, started, mut incremental, allocation } = context;
     let first_worker = incremental.as_ref().map(|search| search.next_worker());
-    let problem = clone_problem(compiled.problem());
+    let mut problem = clone_problem(compiled.problem());
+    problem.solver.set_semantic_minimization(request.cp.semantic_minimization);
+    problem.solver.set_extended_nogoods(request.cp.extended_nogoods);
+    problem.solver.set_cpip(request.cp.cpip);
+    if request.cp.check_inferences {
+        problem.solver.set_inference_checking(Some(crate::inference::InferenceCheckConfig::default()));
+    }
+    let inference_check = problem.solver.inference_check_handle();
+    problem.solver.set_deferred_explanations(request.cp.deferred_explanations);
+    problem.solver.set_explanation_metrics(request.cp.explanation_metrics || request.cp.deferred_explanations);
+    let explanation_check = problem.solver.explanation_handle();
+    problem.solver.set_unary_edge_finding(request.cp.unary_edge_finding);
+    problem.solver.set_unary_edge_finding_metrics(request.cp.unary_edge_finding_metrics || request.cp.unary_edge_finding);
+    let unary_check = problem.solver.unary_edge_finding_handle();
+    problem.solver.set_incremental_cumulative(request.cp.incremental_cumulative);
+    problem.solver.set_lifted_cumulative_explanations(request.cp.lifted_cumulative_explanations);
+    problem.solver.set_cumulative_metrics(
+        request.cp.cumulative_metrics || request.cp.incremental_cumulative || request.cp.lifted_cumulative_explanations,
+    );
+    let cumulative_check = problem.solver.cumulative_handle();
     let outcome = if let Some(search) = incremental.as_deref_mut() {
         search.solve_csp(problem, engine_stop, request.seed, request.limits.conflicts)
     } else {
@@ -606,6 +638,14 @@ fn solve_satisfaction(context: SatisfactionSolve<'_, '_, '_>) -> Result<SolveRes
     };
     let mut metadata = cp_metadata(outcome.shared_clauses, outcome.imported_clauses, None, None, None);
     metadata.push(("csp_search".to_string(), outcome.search_kind.to_string()));
+    append_inference_metadata(&mut metadata, inference_check.as_slice());
+    append_explanation_metadata(&mut metadata, explanation_check.as_slice(), request.cp.deferred_explanations);
+    append_unary_metadata(&mut metadata, unary_check.as_slice(), request.cp.unary_edge_finding);
+    append_cumulative_metadata(&mut metadata, cumulative_check.as_slice(), request);
+    append_nogood_controls(&mut metadata, request);
+    if request.cp.semantic_minimization {
+        metadata.push(("semantic_minimization".to_string(), "true".to_string()));
+    }
     if let Some(first_worker) = first_worker {
         let workers = incremental.as_ref().map_or(0, |search| search.next_worker().saturating_sub(first_worker));
         metadata.push(("clause_session_workers".to_string(), workers.to_string()));
@@ -714,6 +754,10 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
     let mut linear_backends = std::collections::BTreeSet::new();
     let mut proof_methods = Vec::with_capacity(objective_count);
     let mut used_certified_bound = false;
+    let mut inference_checks = Vec::new();
+    let mut explanation_checks = Vec::new();
+    let mut unary_checks = Vec::new();
+    let mut cumulative_checks = Vec::new();
 
     for (tier, objective) in compiled.objectives().iter().enumerate() {
         if engine_stop.load(std::sync::atomic::Ordering::Acquire) || remaining_conflicts == Some(0) {
@@ -723,7 +767,7 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
         }
 
         let final_tier = tier + 1 == objective_count;
-        let tier_problem = if incremental.is_some() {
+        let mut tier_problem = if incremental.is_some() {
             // Session prefixes are assumptions, so no mutable root needs to
             // survive between tiers. Keep only the persistent compiled template
             // plus the exact worker copies that run this tier.
@@ -741,6 +785,33 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
                 clone_problem(problem.as_ref().expect("the active lexicographic tier has a CP problem"))
             }
         };
+        tier_problem.solver.set_semantic_minimization(request.cp.semantic_minimization);
+        tier_problem.solver.set_extended_nogoods(request.cp.extended_nogoods);
+        tier_problem.solver.set_cpip(request.cp.cpip);
+        if request.cp.check_inferences {
+            tier_problem.solver.set_inference_checking(Some(crate::inference::InferenceCheckConfig::default()));
+            if let Some(handle) = tier_problem.solver.inference_check_handle() {
+                inference_checks.push(handle);
+            }
+        }
+        tier_problem.solver.set_unary_edge_finding(request.cp.unary_edge_finding);
+        tier_problem.solver.set_unary_edge_finding_metrics(request.cp.unary_edge_finding_metrics || request.cp.unary_edge_finding);
+        if let Some(handle) = tier_problem.solver.unary_edge_finding_handle() {
+            unary_checks.push(handle);
+        }
+        tier_problem.solver.set_incremental_cumulative(request.cp.incremental_cumulative);
+        tier_problem.solver.set_lifted_cumulative_explanations(request.cp.lifted_cumulative_explanations);
+        tier_problem.solver.set_cumulative_metrics(
+            request.cp.cumulative_metrics || request.cp.incremental_cumulative || request.cp.lifted_cumulative_explanations,
+        );
+        if let Some(handle) = tier_problem.solver.cumulative_handle() {
+            cumulative_checks.push(handle);
+        }
+        tier_problem.solver.set_deferred_explanations(request.cp.deferred_explanations);
+        tier_problem.solver.set_explanation_metrics(request.cp.explanation_metrics || request.cp.deferred_explanations);
+        if let Some(handle) = tier_problem.solver.explanation_handle() {
+            explanation_checks.push(handle);
+        }
         let var_objective = tier_problem.var_objective().is_some();
         let mut linear_controls = request.linear;
         if let Some(remaining) = budget.remaining() {
@@ -976,6 +1047,14 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
     });
 
     let mut metadata = cp_metadata(shared_clauses, imported_clauses, split_jobs, probe_stats, lns_stats);
+    append_inference_metadata(&mut metadata, &inference_checks);
+    append_explanation_metadata(&mut metadata, &explanation_checks, request.cp.deferred_explanations);
+    append_unary_metadata(&mut metadata, &unary_checks, request.cp.unary_edge_finding);
+    append_cumulative_metadata(&mut metadata, &cumulative_checks, request);
+    append_nogood_controls(&mut metadata, request);
+    if request.cp.semantic_minimization {
+        metadata.push(("semantic_minimization".to_string(), "true".to_string()));
+    }
     if !linear_backends.is_empty() {
         metadata.push(("linear_backends".to_string(), linear_backends.into_iter().collect::<Vec<_>>().join(",")));
     }
@@ -1001,6 +1080,220 @@ fn upsert_bound(bounds: &mut Vec<Bound>, replacement: Bound) {
     } else {
         bounds.push(replacement);
     }
+}
+
+fn append_inference_metadata(metadata: &mut Vec<(String, String)>, checks: &[crate::store::InferenceCheckHandle]) {
+    if checks.is_empty() {
+        return;
+    }
+    metadata.push(("inference_checking".to_string(), "true".to_string()));
+    let mut counts = [0u64; 16];
+    let mut families = std::collections::BTreeMap::<String, u64>::new();
+    for check in checks {
+        let stats = check.stats();
+        let values = [
+            stats.checked_inferences,
+            stats.checked_conflicts,
+            stats.uncovered_inferences,
+            stats.uncovered_conflicts,
+            stats.unsupported_calls,
+            stats.resource_limited,
+            stats.assignments,
+            stats.work,
+            stats.elapsed_nanos,
+            stats.peak_snapshot_bytes,
+            stats.lcg_checked_inferences,
+            stats.lcg_checked_conflicts,
+            stats.lcg_checked_derivations,
+            stats.lcg_uncovered_inferences,
+            stats.lcg_uncovered_conflicts,
+            stats.lcg_uncovered_derivations,
+        ];
+        for (index, value) in values.into_iter().enumerate() {
+            counts[index] = if index == 9 { counts[index].max(value) } else { counts[index].saturating_add(value) };
+        }
+        for (family, calls) in check.uncovered_families() {
+            let count = families.entry(family).or_default();
+            *count = count.saturating_add(calls);
+        }
+    }
+    let keys = [
+        "inference_checked_inferences",
+        "inference_checked_conflicts",
+        "inference_uncovered_inferences",
+        "inference_uncovered_conflicts",
+        "inference_unsupported_calls",
+        "inference_resource_limited",
+        "inference_assignments",
+        "inference_work",
+        "inference_elapsed_nanos",
+        "inference_peak_snapshot_bytes",
+        "inference_lcg_checked_inferences",
+        "inference_lcg_checked_conflicts",
+        "inference_lcg_checked_derivations",
+        "inference_lcg_uncovered_inferences",
+        "inference_lcg_uncovered_conflicts",
+        "inference_lcg_uncovered_derivations",
+    ];
+    metadata.extend(keys.into_iter().zip(counts).map(|(key, value)| (key.to_string(), value.to_string())));
+    metadata.extend(families.into_iter().map(|(name, count)| ("inference_uncovered_family".to_string(), format!("{name}:{count}"))));
+}
+
+fn append_nogood_controls(metadata: &mut Vec<(String, String)>, request: &SolveRequest) {
+    if request.cp.extended_nogoods || request.cp.cpip {
+        metadata.push(("extended_nogoods".to_string(), request.cp.extended_nogoods.to_string()));
+        metadata.push(("cpip".to_string(), request.cp.cpip.to_string()));
+    }
+}
+
+fn append_cumulative_metadata(
+    metadata: &mut Vec<(String, String)>,
+    handles: &[crate::constraints::cumulative_profile::CumulativeMetricsHandle],
+    request: &SolveRequest,
+) {
+    if handles.is_empty() {
+        return;
+    }
+    metadata.push(("incremental_cumulative".to_string(), request.cp.incremental_cumulative.to_string()));
+    metadata.push(("lifted_cumulative_explanations".to_string(), request.cp.lifted_cumulative_explanations.to_string()));
+    let mut stats = crate::constraints::cumulative_profile::CumulativeStats::default();
+    for handle in handles {
+        stats.merge(handle.stats());
+    }
+    let values = [
+        stats.propagation_calls,
+        stats.profile_rebuilds,
+        stats.incremental_updates,
+        stats.task_comparisons,
+        stats.changed_tasks,
+        stats.endpoint_updates,
+        stats.segments_emitted,
+        stats.undo_records,
+        stats.restored_tasks,
+        stats.peak_undo_records,
+        stats.peak_event_points,
+        stats.fallback_calls,
+        stats.interrupted,
+        stats.reason_calls,
+        stats.original_premises,
+        stats.emitted_premises,
+        stats.lifted_bounds,
+        stats.omitted_tautologies,
+        stats.timetable_updates,
+        stats.timetable_conflicts,
+    ];
+    let keys = [
+        "cumulative_propagation_calls",
+        "cumulative_profile_rebuilds",
+        "cumulative_incremental_updates",
+        "cumulative_task_comparisons",
+        "cumulative_changed_tasks",
+        "cumulative_endpoint_updates",
+        "cumulative_segments_emitted",
+        "cumulative_undo_records",
+        "cumulative_restored_tasks",
+        "cumulative_peak_undo_records",
+        "cumulative_peak_event_points",
+        "cumulative_fallback_calls",
+        "cumulative_interrupted",
+        "cumulative_reason_calls",
+        "cumulative_original_premises",
+        "cumulative_emitted_premises",
+        "cumulative_lifted_bounds",
+        "cumulative_omitted_tautologies",
+        "cumulative_timetable_updates",
+        "cumulative_timetable_conflicts",
+    ];
+    metadata.extend(keys.into_iter().zip(values).map(|(key, value)| (key.to_string(), value.to_string())));
+}
+
+fn append_unary_metadata(
+    metadata: &mut Vec<(String, String)>,
+    handles: &[crate::constraints::unary_edge_finding::UnaryEdgeFindingMetricsHandle],
+    enabled: bool,
+) {
+    if handles.is_empty() {
+        return;
+    }
+    metadata.push(("unary_edge_finding".to_string(), enabled.to_string()));
+    let mut stats = crate::constraints::unary_edge_finding::UnaryEdgeFindingStats::default();
+    for handle in handles {
+        stats.merge(handle.stats());
+    }
+    let values = [
+        stats.propagation_calls,
+        stats.directional_passes,
+        stats.tree_operations,
+        stats.overloads,
+        stats.bound_updates,
+        stats.eliminated_starts,
+        stats.reason_premises,
+        stats.unsupported_calls,
+    ];
+    let keys = [
+        "unary_propagation_calls",
+        "unary_directional_passes",
+        "unary_tree_operations",
+        "unary_overloads",
+        "unary_bound_updates",
+        "unary_eliminated_starts",
+        "unary_reason_premises",
+        "unary_unsupported_calls",
+    ];
+    metadata.extend(keys.into_iter().zip(values).map(|(key, value)| (key.to_string(), value.to_string())));
+}
+
+fn append_explanation_metadata(
+    metadata: &mut Vec<(String, String)>,
+    handles: &[crate::explanation::ExplanationMetricsHandle],
+    deferred: bool,
+) {
+    if handles.is_empty() {
+        return;
+    }
+    metadata.push(("explanation_mode".to_string(), if deferred { "deferred" } else { "eager" }.to_string()));
+    let mut counts = [0u64; 15];
+    for handle in handles {
+        let stats = handle.stats();
+        let values = [
+            stats.created_handles,
+            stats.lcg_requests,
+            stats.lcg_first_expansions,
+            stats.lcg_cache_hits,
+            stats.checker_expansions,
+            stats.materialized_premises,
+            stats.eager_premise_buffers,
+            stats.eager_premises,
+            stats.eager_lcg_buffers,
+            stats.eager_lcg_literals,
+            stats.retained_raw_bytes,
+            stats.retained_fallback_bytes,
+            stats.retained_cache_bytes,
+            stats.peak_retained_bytes,
+            1,
+        ];
+        for (index, value) in values.into_iter().enumerate() {
+            counts[index] = if index == 13 { counts[index].max(value) } else { counts[index].saturating_add(value) };
+        }
+    }
+    let keys = [
+        "explanation_created_handles",
+        "explanation_lcg_requests",
+        "explanation_lcg_first_expansions",
+        "explanation_lcg_cache_hits",
+        "explanation_checker_expansions",
+        "explanation_materialized_premises",
+        "explanation_eager_premise_buffers",
+        "explanation_eager_premises",
+        "explanation_eager_lcg_buffers",
+        "explanation_eager_lcg_literals",
+        "explanation_retained_raw_upper_bytes",
+        "explanation_retained_fallback_bytes",
+        "explanation_retained_cache_bytes",
+        "explanation_peak_retained_upper_bytes",
+        "explanation_contexts",
+    ];
+    metadata.extend(keys.into_iter().zip(counts).map(|(key, value)| (key.to_string(), value.to_string())));
 }
 
 fn optional_warm_start_report(elapsed: Duration, rejection: &str) -> EngineReport {
@@ -1035,6 +1328,9 @@ fn cp_options(request: &SolveRequest, allocation: super::WorkerAllocation, seed:
         lns: request.cp.lns,
         no_learn_csp: request.cp.no_learn_csp,
         force_scope_reasons: request.cp.force_scope_reasons,
+        semantic_minimization: request.cp.semantic_minimization,
+        extended_nogoods: request.cp.extended_nogoods,
+        cpip: request.cp.cpip,
         shared_pool_capacity: request.cp.shared_pool_capacity,
         conflict_limit,
     }

@@ -4,19 +4,57 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
+use crate::explanation::DeferredReasonSource;
 use crate::ids::{PropId, VarId};
+use crate::inference::{InferenceConstraint, InferenceRelation};
 use crate::propagator::{Event, Inconsistency, Priority, Propagator};
 use crate::store::{Premise, Solver, Store};
 
 /// Sentinel for "exclude no term" (conflict reason: every term contributes).
 const NO_SKIP: usize = usize::MAX;
 
+/// Bound historical explanation payloads in the first deferred family.
+const DEFERRED_BOOLEAN_MAX_LITERALS: usize = 256;
+
 #[derive(Clone, Copy)]
 struct WeightedBoolLiteral {
     variable: VarId,
     active_value: i32,
     weight: i128,
+}
+
+/// Keep the original vector until a deferred deduction actually needs shared
+/// metadata. Conversion consumes the vector, so no duplicate template remains.
+#[derive(Clone)]
+enum BooleanLiterals {
+    Eager(Vec<WeightedBoolLiteral>),
+    Shared(Arc<[WeightedBoolLiteral]>),
+}
+
+impl BooleanLiterals {
+    fn shared(&mut self) -> Arc<[WeightedBoolLiteral]> {
+        match self {
+            Self::Eager(literals) => {
+                let shared: Arc<[WeightedBoolLiteral]> = std::mem::take(literals).into();
+                *self = Self::Shared(Arc::clone(&shared));
+                shared
+            }
+            Self::Shared(literals) => Arc::clone(literals),
+        }
+    }
+}
+
+impl std::ops::Deref for BooleanLiterals {
+    type Target = [WeightedBoolLiteral];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Eager(literals) => literals,
+            Self::Shared(literals) => literals,
+        }
+    }
 }
 
 /// A normalized pseudo-Boolean inequality `sum(weight * literal) <= bound`.
@@ -27,11 +65,69 @@ struct WeightedBoolLiteral {
 /// the public `i64` boundary.
 #[derive(Clone)]
 struct BooleanLinearLeq {
-    literals: Vec<WeightedBoolLiteral>,
+    literals: BooleanLiterals,
     bound: i128,
 }
 
+/// Every deduction in one invocation fixes its target inactive. Consequently
+/// no deduction changes the historical active set shared by these handles.
+struct BooleanReasonSnapshot {
+    literals: Arc<[WeightedBoolLiteral]>,
+    active: [u64; DEFERRED_BOOLEAN_MAX_LITERALS / 64],
+    bound: i128,
+}
+
+struct BooleanDeferredReason {
+    snapshot: Arc<BooleanReasonSnapshot>,
+    skip: usize,
+}
+
+impl DeferredReasonSource for BooleanDeferredReason {
+    fn premises(&self) -> Vec<Premise> {
+        let threshold = self.snapshot.bound - self.snapshot.literals[self.skip].weight;
+        let mut total = 0i128;
+        let mut reason = Vec::new();
+        for (index, literal) in self.snapshot.literals.iter().enumerate() {
+            if index == self.skip || self.snapshot.active[index / 64] & (1u64 << (index % 64)) == 0 {
+                continue;
+            }
+            reason.push(Premise::Eq { var: literal.variable, val: literal.active_value });
+            total += literal.weight;
+            if total > threshold {
+                break;
+            }
+        }
+        debug_assert!(total > threshold, "deferred pseudo-Boolean explanation does not cross its threshold");
+        reason
+    }
+
+    fn max_premises(&self) -> usize {
+        // Also bound the number of historical template entries inspected.
+        self.snapshot.literals.len()
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        // Include all retained data and Arc reference-count headers. This is
+        // conservative if a consumer counts the same shared graph per handle.
+        std::mem::size_of::<Self>()
+            + std::mem::size_of::<BooleanReasonSnapshot>()
+            + std::mem::size_of_val(self.snapshot.literals.as_ref())
+            + 6 * std::mem::size_of::<usize>()
+    }
+}
+
 impl BooleanLinearLeq {
+    fn deferred_snapshot(&mut self, store: &Store) -> Arc<BooleanReasonSnapshot> {
+        let literals = self.literals.shared();
+        let mut active = [0u64; DEFERRED_BOOLEAN_MAX_LITERALS / 64];
+        for (index, literal) in literals.iter().enumerate() {
+            if store.is_fixed(literal.variable) && store.value(literal.variable) == literal.active_value {
+                active[index / 64] |= 1u64 << (index % 64);
+            }
+        }
+        Arc::new(BooleanReasonSnapshot { literals, active, bound: self.bound })
+    }
+
     fn reason_above(&self, store: &Store, threshold: i128, skip: usize) -> Vec<Premise> {
         if !store.explaining() {
             return Vec::new();
@@ -54,18 +150,37 @@ impl BooleanLinearLeq {
 }
 
 impl Propagator for BooleanLinearLeq {
+    fn inference_description_work(&self) -> usize {
+        self.literals.len()
+    }
+
+    fn inference_constraint(&self) -> Option<InferenceConstraint> {
+        let mut rhs = self.bound;
+        let mut terms = Vec::with_capacity(self.literals.len());
+        for literal in self.literals.iter() {
+            let coefficient = if literal.active_value == 1 {
+                literal.weight
+            } else {
+                rhs = rhs.checked_sub(literal.weight)?;
+                literal.weight.checked_neg()?
+            };
+            terms.push((literal.variable, coefficient));
+        }
+        Some(InferenceConstraint::Linear { terms, relation: InferenceRelation::Le, rhs })
+    }
+
     fn priority(&self) -> Priority {
         Priority::Linear
     }
 
     fn register(&mut self, store: &mut Store, me: PropId) {
-        for literal in &self.literals {
+        for literal in self.literals.iter() {
             store.subscribe(literal.variable, me, Event::Fix);
         }
     }
 
     fn register_until(&mut self, store: &mut Store, me: PropId, should_stop: &dyn Fn() -> bool) -> bool {
-        for literal in &self.literals {
+        for literal in self.literals.iter() {
             if should_stop() {
                 return false;
             }
@@ -91,12 +206,18 @@ impl Propagator for BooleanLinearLeq {
         }
 
         let slack = self.bound - true_sum;
+        let deferred = self.literals.len() <= DEFERRED_BOOLEAN_MAX_LITERALS && store.deferred_explanations_enabled();
+        let mut snapshot = None;
         for index in 0..self.literals.len() {
             let literal = self.literals[index];
             if store.is_fixed(literal.variable) || literal.weight <= slack {
                 continue;
             }
-            if store.explaining() {
+            if deferred {
+                let snapshot = snapshot.get_or_insert_with(|| self.deferred_snapshot(store));
+                let reason = BooleanDeferredReason { snapshot: Arc::clone(snapshot), skip: index };
+                store.fix_deferred(literal.variable, 1 - literal.active_value, Arc::new(reason))?;
+            } else if store.explaining() {
                 let reason = self.reason_above(store, self.bound - literal.weight, index);
                 store.fix_because(literal.variable, 1 - literal.active_value, reason)?;
             } else {
@@ -155,6 +276,18 @@ impl LinearLeq {
 }
 
 impl Propagator for LinearLeq {
+    fn inference_description_work(&self) -> usize {
+        self.vars.len()
+    }
+
+    fn inference_constraint(&self) -> Option<InferenceConstraint> {
+        Some(InferenceConstraint::Linear {
+            terms: self.vars.iter().copied().zip(self.coeffs.iter().copied().map(i128::from)).collect(),
+            relation: InferenceRelation::Le,
+            rhs: i128::from(self.c),
+        })
+    }
+
     fn priority(&self) -> Priority {
         Priority::Linear
     }
@@ -263,6 +396,18 @@ impl LinearEq {
 }
 
 impl Propagator for LinearEq {
+    fn inference_description_work(&self) -> usize {
+        self.vars.len()
+    }
+
+    fn inference_constraint(&self) -> Option<InferenceConstraint> {
+        Some(InferenceConstraint::Linear {
+            terms: self.vars.iter().copied().zip(self.coeffs.iter().copied().map(i128::from)).collect(),
+            relation: InferenceRelation::Eq,
+            rhs: i128::from(self.c),
+        })
+    }
+
     fn priority(&self) -> Priority {
         Priority::Linear
     }
@@ -344,6 +489,18 @@ impl LinearNeq {
 }
 
 impl Propagator for LinearNeq {
+    fn inference_description_work(&self) -> usize {
+        self.vars.len()
+    }
+
+    fn inference_constraint(&self) -> Option<InferenceConstraint> {
+        Some(InferenceConstraint::Linear {
+            terms: self.vars.iter().copied().zip(self.coeffs.iter().copied().map(i128::from)).collect(),
+            relation: InferenceRelation::Ne,
+            rhs: i128::from(self.c),
+        })
+    }
+
     fn priority(&self) -> Priority {
         Priority::Linear
     }
@@ -692,7 +849,7 @@ fn normalized_boolean_leq(
         literals.push(WeightedBoolLiteral { variable, active_value, weight });
     }
     literals.sort_by_key(|literal| (std::cmp::Reverse(literal.weight), literal.variable, literal.active_value));
-    Some(BooleanLinearLeq { literals, bound })
+    Some(BooleanLinearLeq { literals: BooleanLiterals::Eager(literals), bound })
 }
 
 fn boolean_linear_leq(store: &Store, coefficients: &[i64], variables: &[VarId], relation: Relation, rhs: i64) -> Option<BooleanLinearLeq> {
