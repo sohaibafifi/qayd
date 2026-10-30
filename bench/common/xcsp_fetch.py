@@ -9,6 +9,7 @@ instances. If the repo already has them under `data/XCSP<YY>/<TRACK><YY>/`, we
 reuse that instead of downloading.
 """
 import os
+from pathlib import PurePosixPath
 import subprocess
 import zipfile
 
@@ -26,15 +27,17 @@ def fetch_xcsp(track, year, out, limit=0, mini=False, repo_root=None):
         local = os.path.join(repo_root, "data", f"XCSP{year}", subdir)
         if os.path.isdir(local):
             names = sorted(n for n in os.listdir(local) if n.endswith((".lzma", ".xml", ".xz")))
-            if limit:
+            # An empty or capped cache does not establish complete coverage.
+            # Full-track requests must check the archive membership below.
+            if limit and len(names) >= limit:
                 names = names[:limit]
-            for n in names:
-                dst = os.path.join(dest, n)
-                if not os.path.exists(dst):
-                    with open(os.path.join(local, n), "rb") as s, open(dst, "wb") as d:
-                        d.write(s.read())
-            print(f"reused {len(names)} instances from {local}", flush=True)
-            return dest
+                for n in names:
+                    dst = os.path.join(dest, n)
+                    if not os.path.exists(dst):
+                        with open(os.path.join(local, n), "rb") as s, open(dst, "wb") as d:
+                            d.write(s.read())
+                print(f"reused {len(names)} instances from {local}", flush=True)
+                return dest
 
     # download + extract only this track's members
     zpath = os.path.join(out, f"instancesXCSP{year}.zip")
@@ -47,9 +50,14 @@ def fetch_xcsp(track, year, out, limit=0, mini=False, repo_root=None):
 
     n = 0
     with zipfile.ZipFile(zpath) as z:
+        # Official archives may wrap the track in an XCSP<YY>/ directory.
         members = [m for m in z.namelist()
-                   if m.startswith(subdir + "/") and m.endswith((".lzma", ".xml", ".xz"))]
+                   if subdir in PurePosixPath(m).parts and m.endswith((".lzma", ".xml", ".xz"))]
         members.sort()
+        if not members:
+            raise SystemExit(f"archive contains no {subdir} instances: {zpath}")
+        if len({os.path.basename(m) for m in members}) != len(members):
+            raise SystemExit(f"duplicate instance basenames in {subdir}: {zpath}")
         if limit:
             members = members[:limit]
         for m in members:

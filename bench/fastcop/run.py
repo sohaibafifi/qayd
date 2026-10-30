@@ -324,7 +324,11 @@ def limited_argv(
 def process_tree_rss_kb(root_pid: int) -> Optional[int]:
     """Best-effort resident memory for a process and all descendants."""
     proc_root = Path("/proc")
-    if (proc_root / str(root_pid) / "status").is_file():
+    try:
+        has_status = (proc_root / str(root_pid) / "status").is_file()
+    except ProcessLookupError:
+        return 0
+    if has_status:
         pending = [root_pid]
         descendants = set()
         total = 0
@@ -341,7 +345,7 @@ def process_tree_rss_kb(root_pid: int) -> Optional[int]:
                         break
                 children = process_dir / "task" / str(pid) / "children"
                 pending.extend(int(child) for child in children.read_text().split())
-            except (FileNotFoundError, PermissionError, ValueError):
+            except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
                 continue
         return total
 

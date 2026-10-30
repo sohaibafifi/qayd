@@ -1,5 +1,13 @@
 # qayd benchmarking - SAT / PB / CSP / COP
 
+For the large paired campaign on an OAR cluster, including MiniZinc and
+routing/scheduling, see [the bounded worker-pool workflow](cluster/README.md).
+Large SAT datasets and SAT campaign runs are currently deferred in that workflow.
+Its [scientific protocol](cluster/PROTOCOL.md) uses category-specific published
+budgets. A separate [Hexaly protocol](cluster/HEXALY.md) prepares comparisons
+with published tables and records the remaining differences in objectives,
+BKS snapshots and hardware.
+
 Fetch competition instances, run the matching `qayd` frontend against a
 literature baseline solver, and compare. One directory per problem class; the
 runner and comparator are shared in `common/`.

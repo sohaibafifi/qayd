@@ -19,6 +19,31 @@ def write_script(path: Path, source: str) -> Path:
     return path
 
 
+@pytest.mark.parametrize("disappearing_pid", (100, 101))
+def test_rss_sampling_tolerates_a_process_exiting_during_proc_read(monkeypatch, disappearing_pid):
+    monkeypatch.setattr(Path, "is_file", lambda path: path == Path("/proc/100/status"))
+
+    def read_proc(path, *args, **kwargs):
+        if str(path) == f"/proc/{disappearing_pid}/status":
+            raise ProcessLookupError(3, "No such process")
+        if path == Path("/proc/100/status"):
+            return "VmRSS:\t10 kB\n"
+        if path == Path("/proc/100/task/100/children"):
+            return "101"
+        raise AssertionError(f"unexpected proc read: {path}")
+
+    monkeypatch.setattr(Path, "read_text", read_proc)
+    assert fastcop_run.process_tree_rss_kb(100) == (0 if disappearing_pid == 100 else 10)
+
+
+def test_rss_sampling_tolerates_process_exit_during_status_lookup(monkeypatch):
+    def exited(_path):
+        raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr(Path, "is_file", exited)
+    assert fastcop_run.process_tree_rss_kb(100) == 0
+
+
 def test_objective_detection_reads_past_old_eight_megabyte_cutoff(tmp_path):
     instance = tmp_path / "large.xml"
     padding = " " * ((8 << 20) + 1024)
