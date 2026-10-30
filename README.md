@@ -150,9 +150,15 @@ cargo build --release --manifest-path integrations/amthal/Cargo.toml
 integrations/amthal/target/release/qayd your-instance.xml.lzma -v -t 180
 ```
 
-This manifest enables LP by default. Add `--all-features` to the build command
-to also enable Python. Ordinary builds use `cargo build --release` and require
-no Amthal checkout, including with `--all-features`.
+This manifest enables LP by default; `--all-features` is unnecessary. For the
+Python extension with LP, use:
+
+```bash
+uv run maturin develop --manifest-path integrations/amthal/Cargo.toml --profile pyext --features python
+```
+
+Ordinary builds use `cargo build --release` and require no Amthal checkout.
+The public workspace's `--all-features` does not select the private LP backend.
 
 ## License
 

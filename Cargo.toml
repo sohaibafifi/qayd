@@ -4,7 +4,6 @@ version.workspace = true
 edition = "2021"
 description = "A Unified Semantic Architecture for Heterogeneous Constraint Solving."
 license = "MIT"
-build = "build.rs"
 
 [workspace]
 members = [".", "frontends/flatzinc", "frontends/sat", "frontends/pb"]
