@@ -168,6 +168,41 @@ fn fixed_star_table_cdcl_matches_chronological() {
     assert_eq!(best.map(|(_, v)| v), want.iter().map(|a| a[0]).min(), "CDCL optimum diverged from chronological");
 }
 
+#[test]
+fn hybrid_support_reasons_match_oracle_across_tuple_words() {
+    let mut rows = (0..257).map(|row| vec![1000 + row, row % 2, row % 3]).collect::<Vec<_>>();
+    for (index, tuple) in [
+        (0, vec![0, 0, STAR]),
+        (63, vec![1, 2, 0]),
+        (64, vec![2, STAR, 1]),
+        (127, vec![0, 1, 2]),
+        (128, vec![STAR, 2, 2]),
+        (255, vec![2, 1, STAR]),
+        (256, vec![1, 0, 1]),
+    ] {
+        rows[index] = tuple;
+    }
+    for repeated in [false, true] {
+        let n = if repeated { 2 } else { 3 };
+        let want = oracle::solutions(&vec![vec![0, 1, 2]; n], |assignment| {
+            let scope = [assignment[0], assignment[1], assignment[if repeated { 0 } else { 2 }]];
+            rows.iter().any(|row| tuple_matches(row, &scope))
+        });
+        for force_scope in [false, true] {
+            for minimizing in [false, true] {
+                let mut solver = Solver::new();
+                solver.set_force_scope_reasons(force_scope);
+                let vars = (0..n).map(|_| solver.new_var_range(0, 2)).collect::<Vec<_>>();
+                let scope = [vars[0], vars[1], vars[if repeated { 0 } else { 2 }]];
+                extension(&mut solver, &scope, &rows, true);
+                let (best, _) = optimize_with(&mut solver, &vars, vars[0], minimizing, &NEVER_STOP, |_| {});
+                let expected = if minimizing { want.iter().map(|a| a[0]).min() } else { want.iter().map(|a| a[0]).max() };
+                assert_eq!(best.map(|(_, value)| value), expected, "repeated={repeated}, scope={force_scope}, min={minimizing}");
+            }
+        }
+    }
+}
+
 /// Table-encoded permutation of `0..n-1` (each adjacent pair constrained to an
 /// `a != b` allowed table forces all-different) whose sum must exceed the
 /// invariant n(n-1)/2: UNSAT, provable only at depth where `extension` failures

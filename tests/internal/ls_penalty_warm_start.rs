@@ -218,6 +218,13 @@ fn stopping_on_penalty_warm_start_retains_a_verified_incumbent_without_proof() {
     assert!(scout_started(&result));
     assert_eq!(candidate_source, Some(EngineKind::IntegerExact));
     assert_eq!(progress_source, Some(EngineKind::IntegerExact));
+    assert!(
+        !result
+            .reports()
+            .iter()
+            .any(|report| { report.metadata.iter().any(|(key, value)| key == "warm_start_method" && value == "cp_seeded_local_search") }),
+        "event cancellation on the scout must skip refinement"
+    );
 }
 
 #[test]
@@ -491,4 +498,101 @@ fn examination_actual_semantic_penalty_admission_diagnostic() {
     assert_eq!(elements, 0);
     assert_eq!(constant_elements, 254);
     assert!(has_additive_penalty_objective(model, &stop));
+}
+
+#[test]
+fn penalty_scout_is_published_before_seeded_refinement_and_exact_proof() {
+    let mut candidates = Vec::new();
+    let mut sink = EventCallback(|event| {
+        if let SolveEvent::Candidate(candidate) = event {
+            candidates.push((candidate.source(), candidate.objectives().to_vec()));
+        }
+        Ok(EventControl::Continue)
+    });
+    let request = SolveRequest {
+        limits: SolveLimits { time: Some(std::time::Duration::from_secs(1)), ..SolveLimits::default() },
+        ..SolveRequest::default()
+    };
+    let result = solve_model(&ModelPackage::new(fixture()), &request, &mut sink).unwrap();
+    assert_eq!(candidates.first().unwrap().0, EngineKind::IntegerExact);
+    assert!(scout_started(&result));
+    assert!(result.reports().iter().any(|report| {
+        report.engine == Some(EngineKind::IntegerLocalSearch)
+            && report.metadata.iter().any(|(key, value)| key == "warm_start_method" && value == "cp_seeded_local_search")
+    }));
+    assert!(result.primal().unwrap().objectives()[0] <= candidates[0].1[0]);
+    assert_eq!(result.status(), SolveStatus::Optimal);
+    assert_eq!(result.primal().unwrap().objectives(), [5]);
+    assert!(result.proof().is_some());
+}
+
+#[test]
+fn penalty_refinement_without_improvement_retains_the_scout() {
+    let mut model = Model::new();
+    let x = model.int_range(0, 2);
+    let y = model.int_range(0, 2);
+    model.add_constraint(Constraint::Intension(IntExpr::Eq(Box::new(x.into()), Box::new(y.into()))));
+    // Equality forces cost five, above the interval lower bound four.
+    let model = objective(model, vec![equal(x, y), 4.into()], true);
+    let mut local_candidates = 0;
+    let mut sink = EventCallback(|event| {
+        if matches!(event, SolveEvent::Candidate(candidate) if candidate.source() == EngineKind::IntegerLocalSearch) {
+            local_candidates += 1;
+        }
+        Ok(EventControl::Continue)
+    });
+    let request = SolveRequest {
+        limits: SolveLimits { time: Some(std::time::Duration::from_secs(1)), ..SolveLimits::default() },
+        ..SolveRequest::default()
+    };
+    let result = solve_model(&ModelPackage::new(model), &request, &mut sink).unwrap();
+    assert!(scout_started(&result));
+    let refinement = result
+        .reports()
+        .iter()
+        .find(|report| report.metadata.iter().any(|(key, value)| key == "warm_start_method" && value == "cp_seeded_local_search"))
+        .expect("a completed refinement must have its own effort report");
+    assert_eq!(refinement.improvements, 0);
+    assert_eq!(local_candidates, 0);
+    assert_eq!(result.primal().unwrap().objectives(), [5]);
+    assert_eq!(result.status(), SolveStatus::Optimal);
+}
+
+#[test]
+fn penalty_scout_at_the_root_bound_skips_refinement_and_keeps_cp_proof() {
+    for offset in [0i64, 4] {
+        for seed in 0..3 {
+            let mut model = Model::new();
+            let x = model.int_range(0, 2);
+            let y = model.int_range(0, 2);
+            model.add_constraint(Constraint::Intension(IntExpr::Ne(Box::new(x.into()), Box::new(y.into()))));
+            let model = objective(model, vec![equal(x, y), offset.into()], true);
+            let request = SolveRequest {
+                seed,
+                limits: SolveLimits { time: Some(std::time::Duration::from_secs(1)), ..SolveLimits::default() },
+                ..SolveRequest::default()
+            };
+            let result = solve_model_silent(&ModelPackage::new(model), &request).unwrap();
+            // Every feasible pair is unequal, so the independent optimum is offset.
+            assert!(scout_started(&result));
+            assert!(
+                !result.reports().iter().any(|report| {
+                    report.metadata.iter().any(|(key, value)| key == "warm_start_method" && value == "cp_seeded_local_search")
+                }),
+                "a scout at the root bound must leave proof work to CP without optional refinement"
+            );
+            assert_eq!(result.primal().unwrap().objectives(), [offset]);
+            assert_eq!(result.status(), SolveStatus::Optimal);
+            assert!(result.proof().is_some());
+        }
+    }
+}
+
+#[test]
+fn penalty_scout_checkpoint_propagates_event_errors() {
+    let expected = crate::orchestrator::SolveError::Engine("test event failure".to_string());
+    let mut sink =
+        EventCallback(|event| if matches!(event, SolveEvent::Candidate(_)) { Err(expected.clone()) } else { Ok(EventControl::Continue) });
+    let result = solve_model(&ModelPackage::new(fixture()), &SolveRequest::default(), &mut sink);
+    assert!(matches!(result, Err(error) if error == expected));
 }

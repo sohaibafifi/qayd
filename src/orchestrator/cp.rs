@@ -706,24 +706,46 @@ fn solve_lexicographic(context: LexicographicSolve<'_, '_, '_>) -> Result<SolveR
     let mut primal = None;
     if let (Some(warm_plan), Some(warm_stops)) = (warm_start.filter(|_| !budget.expired()), budget.warm_start_stops()) {
         let warm_started = Instant::now();
-        match super::integer_search::warm_start(model, compiled, warm_plan, request, budget, warm_stops.search(), warm_stops.transfer()) {
-            Ok(Some(warm)) => {
-                let candidate_control = sink.emit(SolveEvent::Candidate(warm.candidate.clone()))?;
-                let progress_control = if candidate_control == EventControl::Continue {
-                    sink.emit(SolveEvent::Progress {
-                        engine: warm.candidate.source(),
-                        objectives: warm.candidate.objectives().to_vec(),
-                        elapsed: budget.elapsed(),
-                    })?
-                } else {
-                    EventControl::Stop
-                };
-                if progress_control == EventControl::Stop {
-                    budget.cancel_with(TerminationReason::EventSink);
+        let mut checkpointed = false;
+        let mut event_error = None;
+        let outcome = {
+            let mut checkpoint = |warm: &super::integer_search::IntegerWarmStart| {
+                if let Err(error) = publish_integer_warm_start(warm, budget, sink) {
+                    event_error = Some(error.clone());
+                    return Err(error);
                 }
                 primal = Some(promote_warm_candidate(&warm.candidate));
-                initial_incumbent = Some(portfolio::InitialIncumbent { solution: warm.physical_solution, value: warm.physical_objective });
-                reports.push(warm.report);
+                initial_incumbent =
+                    Some(portfolio::InitialIncumbent { solution: warm.physical_solution.clone(), value: warm.physical_objective });
+                reports.push(warm.report.clone());
+                checkpointed = true;
+                Ok(())
+            };
+            super::integer_search::warm_start(
+                model,
+                compiled,
+                warm_plan,
+                request,
+                budget,
+                warm_stops.search(),
+                warm_stops.transfer(),
+                &mut checkpoint,
+            )
+        };
+        if let Some(error) = event_error {
+            return Err(error);
+        }
+        match outcome {
+            Ok(Some(warm)) => {
+                if initial_incumbent.as_ref().is_none_or(|incumbent| incumbent.value != warm.physical_objective) {
+                    publish_integer_warm_start(&warm, budget, sink)?;
+                    primal = Some(promote_warm_candidate(&warm.candidate));
+                    initial_incumbent =
+                        Some(portfolio::InitialIncumbent { solution: warm.physical_solution, value: warm.physical_objective });
+                }
+                if !checkpointed || warm.report.engine == Some(EngineKind::IntegerLocalSearch) {
+                    reports.push(warm.report);
+                }
             }
             Ok(None) if warm_stops.transfer().load(std::sync::atomic::Ordering::Acquire) && !budget.expired() => {
                 reports.push(optional_warm_start_report(warm_started.elapsed(), "time allowance exhausted"));
@@ -1317,6 +1339,27 @@ fn promote_warm_candidate(candidate: &CandidateSolution) -> CandidateSolution {
         candidate.source(),
         VerificationLevel::Final,
     )
+}
+
+fn publish_integer_warm_start(
+    warm: &super::integer_search::IntegerWarmStart,
+    budget: &SolveBudget,
+    sink: &mut dyn EventSink,
+) -> Result<(), SolveError> {
+    let candidate_control = sink.emit(SolveEvent::Candidate(warm.candidate.clone()))?;
+    let progress_control = if candidate_control == EventControl::Continue {
+        sink.emit(SolveEvent::Progress {
+            engine: warm.candidate.source(),
+            objectives: warm.candidate.objectives().to_vec(),
+            elapsed: budget.elapsed(),
+        })?
+    } else {
+        EventControl::Stop
+    };
+    if progress_control == EventControl::Stop {
+        budget.cancel_with(TerminationReason::EventSink);
+    }
+    Ok(())
 }
 
 fn cp_options(request: &SolveRequest, allocation: super::WorkerAllocation, seed: u64, conflict_limit: Option<u64>) -> RunOptions {

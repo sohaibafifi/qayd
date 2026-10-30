@@ -99,6 +99,7 @@ fn command_line_help_is_grouped_complete_and_terminal_friendly() {
         "--threads",
         "--mem-limit",
         "--core",
+        "--all-solutions",
         "--ls",
         "--split",
         "--probe",

@@ -617,7 +617,12 @@ pub(crate) fn compile_interruptible(
     // Candidate repair must use the same dependency ownership as LocalModel,
     // including elements demoted after duplicate or cyclic definitions.
     if !spec.normalize_functionals_interruptible(stop) {
-        return Ok(None);
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(None);
+        }
+        return Err(SolveError::Unsupported(
+            "integer local-search functional dependencies contain unsupported duplicate outputs or a cycle".to_string(),
+        ));
     }
     let signed_product_square_warm_start = spec.has_signed_product_square_structure_interruptible(compiled.problem(), stop);
     let additive_penalty_warm_start =

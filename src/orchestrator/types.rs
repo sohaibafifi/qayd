@@ -327,7 +327,9 @@ pub struct SolveRequest {
     pub search_policy: SearchPolicy,
     /// Request verified assignment snapshots for improving incumbents. This is
     /// intentionally opt-in because replaying every improvement is unsuitable
-    /// for high-frequency heuristic loops.
+    /// for high-frequency heuristic loops. A supported monolithic plan is
+    /// preferred for complete snapshots; genuinely mixed decompositions
+    /// still reject this request rather than publish partial assignments.
     pub publish_incumbent_assignments: bool,
     pub proof: ProofRequest,
 }

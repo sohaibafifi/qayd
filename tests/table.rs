@@ -438,3 +438,72 @@ fn cloned_solver_with_shared_extension_template_matches_oracle() {
     assert_eq!(enumerate(&mut s, &v), want);
     assert_eq!(enumerate(&mut clone, &v), want);
 }
+
+fn hybrid_support_rows() -> Vec<Vec<i32>> {
+    // Common values span every word and become dense. The in-domain values
+    // of column zero occupy only one or two words and stay sparse.
+    let mut rows = (0..257).map(|row| vec![1000 + row, row % 2, row % 3]).collect::<Vec<_>>();
+    for (index, tuple) in [
+        (0, vec![0, 0, STAR]),
+        (63, vec![1, 2, 0]),
+        (64, vec![2, STAR, 1]),
+        (127, vec![0, 1, 2]),
+        (128, vec![STAR, 2, 2]),
+        (255, vec![2, 1, STAR]),
+        (256, vec![1, 0, 1]),
+    ] {
+        rows[index] = tuple;
+    }
+    rows
+}
+
+#[test]
+fn hybrid_extension_supports_match_oracle_with_stars_and_repeated_scopes() {
+    let rows = hybrid_support_rows();
+    let template = extension_template(3, &rows);
+    for positive in [false, true] {
+        for repeated in [false, true] {
+            let n = if repeated { 2 } else { 3 };
+            let want = oracle_set(n, 0, 2, |assignment| {
+                let scope = [assignment[0], assignment[1], assignment[if repeated { 0 } else { 2 }]];
+                rows.iter().any(|row| row.iter().zip(scope).all(|(&pattern, value)| pattern == STAR || pattern == value)) == positive
+            });
+            let mut solver = Solver::new();
+            let vars = (0..n).map(|_| solver.new_var_range(0, 2)).collect::<Vec<_>>();
+            let scope = [vars[0], vars[1], vars[if repeated { 0 } else { 2 }]];
+            extension_from_template(&mut solver, &scope, Arc::clone(&template), positive);
+            let mut cloned = solver.clone();
+            assert_eq!(enumerate(&mut solver, &vars), want, "positive={positive}, repeated={repeated}");
+            assert_eq!(enumerate(&mut cloned, &vars), want, "cloned: positive={positive}, repeated={repeated}");
+        }
+    }
+}
+
+#[test]
+fn hybrid_extension_support_residues_survive_sibling_backtracking() {
+    let rows = hybrid_support_rows();
+    let mut solver = Solver::new();
+    let vars = (0..3).map(|_| solver.new_var_range(0, 2)).collect::<Vec<_>>();
+    extension(&mut solver, &vars, &rows, true);
+    solver.store.push_level();
+    solver.propagate().unwrap();
+    let root = vars.iter().map(|&var| solver.store.values(var).collect::<BTreeSet<_>>()).collect::<Vec<_>>();
+    for column in 0..vars.len() {
+        for &removed in &root[column] {
+            solver.store.push_level();
+            solver.store.remove(vars[column], removed).unwrap();
+            let mut expected = root.clone();
+            expected[column].remove(&removed);
+            let feasible = ac_fixpoint(&rows, vars.len(), &mut expected);
+            solver.enqueue_all();
+            assert_eq!(solver.propagate().is_ok(), feasible);
+            if feasible {
+                for (&var, want) in vars.iter().zip(&expected) {
+                    assert_eq!(&solver.store.values(var).collect::<BTreeSet<_>>(), want);
+                }
+            }
+            solver.store.pop_level();
+        }
+    }
+    solver.store.pop_level();
+}

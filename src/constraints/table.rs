@@ -34,20 +34,106 @@ fn ts_is_zero(bs: &[u64]) -> bool {
 fn ts_intersects(a: &[u64], b: &[u64]) -> bool {
     a.iter().zip(b).any(|(x, y)| x & y != 0)
 }
-fn ts_has_match(current: &[u64], star: &[u64], exact: Option<&Vec<u64>>, residue: &mut usize) -> bool {
+fn ts_dense_has_match(current: &[u64], support: &[u64], residue: &mut usize) -> bool {
     if current.is_empty() {
         return false;
     }
     for offset in 0..current.len() {
         let word = (*residue + offset) % current.len();
-        let exact = exact.map_or(0, |bits| bits[word]);
-        if current[word] & (star[word] | exact) != 0 {
+        if current[word] & support[word] != 0 {
             *residue = word;
             return true;
         }
     }
     false
 }
+
+/// Rare values retain only nonzero tuple words. Dense values keep the usual
+/// bitset so unions and intersections do not pay for sparse indexing.
+#[derive(Clone)]
+enum SupportBits {
+    Sparse(Vec<(usize, u64)>),
+    Dense(Vec<u64>),
+}
+
+/// The builder doubles sparse capacity explicitly and promotes before that
+/// allocation would cost as much as a dense bitset. Keep preflight identical.
+pub(crate) fn extension_support_estimated_bytes(nonzero_words: usize, words: usize) -> u128 {
+    if nonzero_words == 0 {
+        return 0;
+    }
+    let capacity = nonzero_words.checked_next_power_of_two().unwrap_or(usize::MAX);
+    let sparse = (capacity as u128).saturating_mul(std::mem::size_of::<(usize, u64)>() as u128);
+    sparse.min((words as u128).saturating_mul(8))
+}
+
+impl SupportBits {
+    fn new() -> Self {
+        Self::Sparse(Vec::new())
+    }
+
+    fn insert(&mut self, word: usize, mask: u64, words: usize, stop: &AtomicBool) -> bool {
+        match self {
+            Self::Dense(bits) => bits[word] |= mask,
+            Self::Sparse(entries) => {
+                if let Some((last_word, bits)) = entries.last_mut() {
+                    if *last_word == word {
+                        *bits |= mask;
+                        return true;
+                    }
+                }
+                // Tuple rows arrive in order, so sparse words stay sorted and
+                // no search or separate index is needed during construction.
+                if entries.len() == entries.capacity() {
+                    let capacity = entries.capacity().saturating_mul(2).max(1);
+                    if capacity.saturating_mul(std::mem::size_of::<(usize, u64)>()) >= words.saturating_mul(8) {
+                        let mut bits = vec![0; words];
+                        for &(index, value) in entries.iter() {
+                            if stop.load(Ordering::Acquire) {
+                                return false;
+                            }
+                            bits[index] = value;
+                        }
+                        bits[word] |= mask;
+                        *self = Self::Dense(bits);
+                        return true;
+                    }
+                    entries.reserve_exact(capacity - entries.len());
+                }
+                entries.push((word, mask));
+            }
+        }
+        true
+    }
+
+    fn or_into(&self, dst: &mut [u64]) {
+        match self {
+            Self::Dense(bits) => ts_or(dst, bits),
+            Self::Sparse(entries) => {
+                for &(word, bits) in entries {
+                    dst[word] |= bits;
+                }
+            }
+        }
+    }
+
+    fn has_match(&self, current: &[u64], residue: &mut usize) -> bool {
+        match self {
+            Self::Dense(bits) => ts_dense_has_match(current, bits, residue),
+            Self::Sparse(entries) => {
+                let start = entries.partition_point(|&(word, _)| word < *residue);
+                for &(word, bits) in entries[start..].iter().chain(&entries[..start]) {
+                    if current[word] & bits != 0 {
+                        *residue = word;
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+}
+
 /// Reversible `currTable` words are stored as two `i32` halves per `u64` (the
 /// trail only carries `i32`). Bit patterns round-trip through `as` casts.
 #[inline]
@@ -61,11 +147,22 @@ fn rev_store_word(store: &mut Store, words: &[ReversibleInt], w: usize, v: u64) 
     store.rev_set(words[2 * w], v as u32 as i32);
     store.rev_set(words[2 * w + 1], (v >> 32) as u32 as i32);
 }
-fn ts_and_match(dst: &mut [u64], star: &[u64], exact: Option<&Vec<u64>>) {
+fn ts_and_match(dst: &mut [u64], star: &[u64], exact: Option<&SupportBits>) {
     match exact {
-        Some(exact) => {
+        Some(SupportBits::Dense(exact)) => {
             for ((d, s), e) in dst.iter_mut().zip(star).zip(exact) {
                 *d &= s | e;
+            }
+        }
+        Some(SupportBits::Sparse(entries)) => {
+            let mut entries = entries.iter().peekable();
+            for (word, (d, s)) in dst.iter_mut().zip(star).enumerate() {
+                let exact = if entries.peek().is_some_and(|&&(index, _)| index == word) {
+                    entries.next().expect("the matching sparse word exists").1
+                } else {
+                    0
+                };
+                *d &= s | exact;
             }
         }
         None => ts_and(dst, star),
@@ -75,7 +172,7 @@ fn ts_and_match(dst: &mut [u64], star: &[u64], exact: Option<&Vec<u64>>) {
 struct NegativeSearch<'a> {
     store: &'a Store,
     vars: &'a [VarId],
-    supports: &'a [HashMap<i32, Vec<u64>>],
+    supports: &'a [HashMap<i32, SupportBits>],
     star: &'a [Vec<u64>],
     cover: &'a [Vec<u64>],
     fixed_col: usize,
@@ -119,9 +216,10 @@ pub struct ExtensionTemplate {
     /// Raw row count, retained even when a table has zero columns.
     rows: usize,
     /// `supports[c][value]` = bitset of tuples whose column `c` equals `value`.
-    supports: Vec<HashMap<i32, Vec<u64>>>,
+    supports: Vec<HashMap<i32, SupportBits>>,
     /// `star[c]` = bitset of tuples with a wildcard in column `c`.
     star: Vec<Vec<u64>>,
+    star_nonempty: Vec<bool>,
     /// Bitset with exactly the `ntuples` low bits set.
     full: Vec<u64>,
     /// Row-major `ntuples * arity` matrix (`tuple[t][c] == tuples[t*arity + c]`,
@@ -267,20 +365,25 @@ impl Extension {
             (Vec::new(), Vec::new())
         };
         let mut physical_vars = Vec::with_capacity(vars.len());
-        let mut search = Vec::with_capacity(vars.len().saturating_add(1));
-        let mut cover = Vec::with_capacity(vars.len().saturating_add(1));
+        let mut search = Vec::new();
+        let mut cover = Vec::new();
         let mut killer_seen = Vec::with_capacity(vars.len());
         for &variable in vars {
             if stop.load(Ordering::Acquire) {
                 return None;
             }
             physical_vars.push(variable);
-            search.push(vec![0u64; nwords]);
-            cover.push(vec![0u64; nwords]);
             killer_seen.push(HashMap::new());
         }
-        search.push(vec![0u64; nwords]);
-        cover.push(vec![0u64; nwords]);
+        if !positive {
+            for _ in 0..=vars.len() {
+                if stop.load(Ordering::Acquire) {
+                    return None;
+                }
+                search.push(vec![0u64; nwords]);
+                cover.push(vec![0u64; nwords]);
+            }
+        }
         if stop.load(Ordering::Acquire) {
             return None;
         }
@@ -324,8 +427,9 @@ impl ExtensionTemplate {
         }
         let ntuples = tuples.len();
         let nwords = ntuples.div_ceil(64);
-        let mut supports: Vec<HashMap<i32, Vec<u64>>> = Vec::with_capacity(arity);
+        let mut supports: Vec<HashMap<i32, SupportBits>> = Vec::with_capacity(arity);
         let mut star: Vec<Vec<u64>> = Vec::with_capacity(arity);
+        let mut star_nonempty = vec![false; arity];
         for _ in 0..arity {
             if stop.load(Ordering::Acquire) {
                 return None;
@@ -340,9 +444,9 @@ impl ExtensionTemplate {
                 }
                 if val == STAR {
                     star[c][t / 64] |= 1u64 << (t % 64);
-                } else {
-                    let bs = supports[c].entry(val).or_insert_with(|| vec![0u64; nwords]);
-                    bs[t / 64] |= 1u64 << (t % 64);
+                    star_nonempty[c] = true;
+                } else if !supports[c].entry(val).or_insert_with(SupportBits::new).insert(t / 64, 1u64 << (t % 64), nwords, stop) {
+                    return None;
                 }
             }
         }
@@ -362,7 +466,7 @@ impl ExtensionTemplate {
                 body.push(value);
             }
         }
-        Some(Self { arity, rows: tuples.len(), supports, star, full, tuples: Arc::from(body) })
+        Some(Self { arity, rows: tuples.len(), supports, star, star_nonempty, full, tuples: Arc::from(body) })
     }
 }
 
@@ -492,7 +596,7 @@ impl Propagator for Extension {
             removals,
             why,
         } = self;
-        let ExtensionTemplate { arity, supports, star, full, tuples, .. } = &**template;
+        let ExtensionTemplate { arity, supports, star, star_nonempty, full, tuples, .. } = &**template;
         let arity = *arity;
 
         if *positive {
@@ -513,7 +617,7 @@ impl Propagator for Extension {
                 union.copy_from_slice(&star[c]);
                 for val in store.values(v) {
                     if let Some(bs) = supports[c].get(&val) {
-                        ts_or(union, bs);
+                        bs.or_into(union);
                     }
                 }
                 ts_and(current, union);
@@ -569,11 +673,17 @@ impl Propagator for Extension {
             // stays at entry domains for the explanation pass below.
             removals.clear();
             for (c, &v) in vars.iter().enumerate() {
+                // A live wildcard supports every value in this column. Check
+                // it once instead of rescanning its bitset for each sparse
+                // value; columns without wildcards need no dense scan at all.
+                if star_nonempty[c] && ts_intersects(current, &star[c]) {
+                    continue;
+                }
                 buf.clear();
                 buf.extend(store.values(v));
                 for &val in buf.iter() {
                     let residue = residues[c].get_mut(&val).expect("extension residue missing root-domain value");
-                    if !ts_has_match(current, &star[c], supports[c].get(&val), residue) {
+                    if !supports[c].get(&val).is_some_and(|bits| bits.has_match(current, residue)) {
                         removals.push((c, val));
                     }
                 }
@@ -594,7 +704,7 @@ impl Propagator for Extension {
                     // (a STAR in column c supports v too).
                     union.copy_from_slice(&star[c]);
                     if let Some(bs) = supports[c].get(&val) {
-                        ts_or(union, bs);
+                        bs.or_into(union);
                     }
                     if let Some(valid) = valid_rows {
                         ts_and(union, valid);
@@ -666,6 +776,37 @@ pub(crate) fn extension_interruptible(solver: &mut Solver, vars: &[VarId], tuple
 /// Compile an extension table's immutable tuple bitsets.
 pub fn extension_template(arity: usize, tuples: &[Vec<i32>]) -> Arc<ExtensionTemplate> {
     Arc::new(ExtensionTemplate::new(arity, tuples))
+}
+
+#[cfg(test)]
+pub(crate) fn audit_extension_support_storage(template: &ExtensionTemplate) -> (usize, usize, u128) {
+    let mut dense = 0;
+    let mut sparse = 0;
+    let mut bytes = 0;
+    for support in template.supports.iter().flat_map(HashMap::values) {
+        match support {
+            SupportBits::Dense(bits) => {
+                dense += 1;
+                bytes += bits.capacity() as u128 * 8;
+            }
+            SupportBits::Sparse(entries) => {
+                sparse += 1;
+                bytes += entries.capacity() as u128 * std::mem::size_of::<(usize, u64)>() as u128;
+            }
+        }
+    }
+    (dense, sparse, bytes)
+}
+
+#[cfg(test)]
+pub(crate) fn audit_extension_scratch_words(
+    store: &mut Store,
+    vars: &[VarId],
+    template: Arc<ExtensionTemplate>,
+    positive: bool,
+) -> (usize, usize) {
+    let extension = Extension::new(store, vars, template, positive);
+    (extension.search.iter().map(Vec::len).sum(), extension.cover.iter().map(Vec::len).sum())
 }
 
 /// Interruptibly compile an immutable extension-table body. Callers may retain

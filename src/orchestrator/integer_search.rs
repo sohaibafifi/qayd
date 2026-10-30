@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::engines::ls::cop::{solve_ls_capped, solve_ls_capped_borrowed, LocalSearchOutcome, LocalSearchSpec, LsConfig};
+use crate::engines::ls::cop::{solve_ls_capped, solve_ls_capped_borrowed_with_initial, LocalSearchOutcome, LocalSearchSpec, LsConfig};
 use crate::engines::ls::disjunctive_schedule::DisjunctiveSchedulePlan;
 use crate::engines::ls::exact_cover::ExactCoverPlan;
 use crate::engines::ls::integer::{IntegerLocalSearchPlan, IntegerWarmStartPlan};
@@ -71,6 +71,7 @@ impl RepairContext<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn warm_start(
     model: &Model,
     compiled: &CompiledCp,
@@ -79,9 +80,12 @@ pub(crate) fn warm_start(
     budget: &SolveBudget,
     search_stop: &AtomicBool,
     transfer_stop: &AtomicBool,
+    checkpoint: &mut dyn FnMut(&IntegerWarmStart) -> Result<(), SolveError>,
 ) -> Result<Option<IntegerWarmStart>, SolveError> {
     match plan {
-        IntegerWarmStartPlan::Local(plan) => local_warm_start(model, compiled, plan, request, budget, search_stop, transfer_stop),
+        IntegerWarmStartPlan::Local(plan) => {
+            local_warm_start(model, compiled, plan, request, budget, search_stop, transfer_stop, checkpoint)
+        }
         IntegerWarmStartPlan::ExactCover(plan) => {
             exact_cover_warm_start(model, compiled, plan, request, budget, search_stop, transfer_stop)
         }
@@ -103,7 +107,7 @@ pub(crate) fn warm_start(
                 {
                     return Ok(None);
                 }
-                if let Some(candidate) = warm_start(model, compiled, plan, request, budget, search_stop, transfer_stop)? {
+                if let Some(candidate) = warm_start(model, compiled, plan, request, budget, search_stop, transfer_stop, checkpoint)? {
                     return Ok(Some(candidate));
                 }
             }
@@ -248,6 +252,7 @@ fn exact_cover_warm_start(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn local_warm_start(
     model: &Model,
     compiled: &CompiledCp,
@@ -256,6 +261,7 @@ fn local_warm_start(
     budget: &SolveBudget,
     search_stop: &AtomicBool,
     transfer_stop: &AtomicBool,
+    checkpoint: &mut dyn FnMut(&IntegerWarmStart) -> Result<(), SolveError>,
 ) -> Result<Option<IntegerWarmStart>, SolveError> {
     let Some(warm_start_role) = plan.warm_start_role() else {
         return Ok(None);
@@ -264,27 +270,56 @@ fn local_warm_start(
         return Ok(None);
     }
 
-    let started = Instant::now();
+    let mut scout = None;
     if let Some(phase) = &plan.additive_penalty_scout {
         let repair = RepairContext { model, compiled, spec: &plan.spec, request, budget, stop: transfer_stop };
         if let Some(warm) = additive_penalty_scout(&repair, phase, search_stop)? {
-            return Ok(Some(warm));
+            // The orchestrator retains and publishes this verified incumbent
+            // before optional refinement, including on cancellation or error.
+            checkpoint(&warm)?;
+            scout = Some(warm);
         }
-        if budget.expired() || search_stop.load(Ordering::Acquire) || transfer_stop.load(Ordering::Acquire) {
-            return Ok(None);
+        if budget.expired() || (scout.is_none() && (search_stop.load(Ordering::Acquire) || transfer_stop.load(Ordering::Acquire))) {
+            return Ok(scout);
         }
     }
+    if let Some(warm) = scout.as_ref() {
+        let store = &compiled.problem().solver.store;
+        let lower = match compiled.problem().objective.as_ref() {
+            Some(PhysicalObjective::Expr(true, expression)) => {
+                Some(expression.bounds(&|variable| (i64::from(store.min(variable)), i64::from(store.max(variable)))).0)
+            }
+            Some(PhysicalObjective::Var(true, variable) | PhysicalObjective::VarWithAffine(true, variable, _, _)) => {
+                Some(i64::from(store.min(*variable)))
+            }
+            _ => None,
+        };
+        if lower == Some(warm.physical_objective) {
+            // CP retains proof authority; optional refinement cannot improve a
+            // verified incumbent that already attains the immutable root bound.
+            return Ok(scout);
+        }
+    }
+    let refinement_stops = scout.as_ref().and_then(|_| budget.penalty_refinement_stops());
+    if scout.is_some() && refinement_stops.is_none() {
+        return Ok(scout);
+    }
+    let search_stop = refinement_stops.as_ref().map_or(search_stop, |stops| stops.search());
+    let transfer_stop = refinement_stops.as_ref().map_or(transfer_stop, |stops| stops.transfer());
+    let started = Instant::now();
     // LocalModel owns one normalized spec copy, covered by estimated_bytes. The
     // much larger physical CP root remains borrowed throughout this warm start.
-    let outcome = solve_ls_capped_borrowed(
+    let outcome = solve_ls_capped_borrowed_with_initial(
         compiled.problem(),
         plan.spec.clone(),
         search_stop,
         request.seed,
         LsConfig { gls: true, min_conflicts: true, kick_bandit: false },
-        LOCAL_WARM_START_ITERATIONS,
+        if scout.is_some() { u64::MAX } else { LOCAL_WARM_START_ITERATIONS },
+        scout.as_ref().map(|warm| warm.physical_solution.as_slice()),
         |_, _, _| {},
-    );
+    )
+    .map_err(|error| SolveError::InvalidResult(error.to_string()))?;
     let LocalSearchOutcome {
         best,
         iterations,
@@ -302,13 +337,46 @@ fn local_warm_start(
         invariant_objective_full_evaluations,
         invariant_full_rebuilds,
     } = outcome;
+    let mut report = EngineReport {
+        engine: Some(EngineKind::IntegerLocalSearch),
+        search: crate::search::SolveStats {
+            solutions: u64::from(best.is_some()),
+            nodes: iterations,
+            failures: restarts,
+            ..crate::search::SolveStats::default()
+        },
+        elapsed: started.elapsed(),
+        improvements: 0,
+        metadata: vec![
+            ("ls_role".to_string(), warm_start_role.to_string()),
+            ("warm_start_method".to_string(), if scout.is_some() { "cp_seeded_local_search" } else { "local_search" }.to_string()),
+            ("ls_moves".to_string(), moves.to_string()),
+            ("ls_constraints".to_string(), constraints.to_string()),
+            ("ls_functionals".to_string(), functionals.to_string()),
+            ("ls_unsupported".to_string(), unsupported.to_string()),
+            ("ls_invariant_trials".to_string(), invariant_trials.to_string()),
+            ("ls_invariant_rollbacks".to_string(), invariant_rollbacks.to_string()),
+            ("ls_invariant_commits".to_string(), invariant_commits.to_string()),
+            ("ls_invariant_functional_evaluations".to_string(), invariant_functional_evaluations.to_string()),
+            ("ls_invariant_constraint_evaluations".to_string(), invariant_constraint_evaluations.to_string()),
+            ("ls_invariant_objective_evaluations".to_string(), invariant_objective_evaluations.to_string()),
+            ("ls_invariant_objective_full_evaluations".to_string(), invariant_objective_full_evaluations.to_string()),
+            ("ls_invariant_full_rebuilds".to_string(), invariant_full_rebuilds.to_string()),
+        ],
+    };
     let Some((values, local_objective)) = best else {
-        return Ok(None);
+        return Ok(scout.map(|mut warm| {
+            warm.report = report;
+            warm
+        }));
     };
 
     let repair = RepairContext { model, compiled, spec: &plan.spec, request, budget, stop: transfer_stop };
     let Some(repaired) = repair_candidate(&repair, &values, request.seed, VerificationLevel::Transfer)? else {
-        return Ok(None);
+        return Ok(scout.map(|mut warm| {
+            warm.report = report;
+            warm
+        }));
     };
     let physical_objective = repaired
         .physical_objective
@@ -326,38 +394,16 @@ fn local_warm_start(
             repaired.candidate.objectives()
         )));
     }
+    report.elapsed = started.elapsed();
+    if scout.as_ref().is_some_and(|warm| physical_objective >= warm.physical_objective) {
+        return Ok(scout.map(|mut warm| {
+            warm.report = report;
+            warm
+        }));
+    }
 
-    Ok(Some(IntegerWarmStart {
-        candidate: repaired.candidate,
-        physical_solution: repaired.physical_solution,
-        physical_objective,
-        report: EngineReport {
-            engine: Some(EngineKind::IntegerLocalSearch),
-            search: crate::search::SolveStats {
-                solutions: 1,
-                nodes: iterations,
-                failures: restarts,
-                ..crate::search::SolveStats::default()
-            },
-            elapsed: started.elapsed(),
-            improvements: 1,
-            metadata: vec![
-                ("ls_role".to_string(), warm_start_role.to_string()),
-                ("ls_moves".to_string(), moves.to_string()),
-                ("ls_constraints".to_string(), constraints.to_string()),
-                ("ls_functionals".to_string(), functionals.to_string()),
-                ("ls_unsupported".to_string(), unsupported.to_string()),
-                ("ls_invariant_trials".to_string(), invariant_trials.to_string()),
-                ("ls_invariant_rollbacks".to_string(), invariant_rollbacks.to_string()),
-                ("ls_invariant_commits".to_string(), invariant_commits.to_string()),
-                ("ls_invariant_functional_evaluations".to_string(), invariant_functional_evaluations.to_string()),
-                ("ls_invariant_constraint_evaluations".to_string(), invariant_constraint_evaluations.to_string()),
-                ("ls_invariant_objective_evaluations".to_string(), invariant_objective_evaluations.to_string()),
-                ("ls_invariant_objective_full_evaluations".to_string(), invariant_objective_full_evaluations.to_string()),
-                ("ls_invariant_full_rebuilds".to_string(), invariant_full_rebuilds.to_string()),
-            ],
-        },
-    }))
+    report.improvements = 1;
+    Ok(Some(IntegerWarmStart { candidate: repaired.candidate, physical_solution: repaired.physical_solution, physical_objective, report }))
 }
 
 fn additive_penalty_scout(

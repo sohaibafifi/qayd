@@ -223,6 +223,50 @@ fn table_memory_estimate_counts_a_shared_body_once() {
 }
 
 #[test]
+fn hybrid_table_support_storage_selects_sparse_and_dense_values() {
+    const ROWS: usize = 513;
+    let tuples = (0..ROWS).map(|row| vec![row as i32, (row % 2) as i32]).collect::<Vec<_>>();
+    let template = table::extension_template(2, &tuples);
+    let (dense, sparse, allocated) = table::audit_extension_support_storage(&template);
+    assert_eq!((dense, sparse), (2, ROWS));
+    let words = ROWS.div_ceil(64);
+    let expected =
+        ROWS as u128 * table::extension_support_estimated_bytes(1, words) + 2 * table::extension_support_estimated_bytes(words, words);
+    assert_eq!(allocated, expected, "support preflight must match the builder's representation and capacity");
+    assert!(allocated < 16 * 1024);
+
+    let mut solver = Solver::new();
+    let index = solver.new_var_range(0, ROWS as i32 - 1);
+    let parity = solver.new_var_range(0, 1);
+    let positive = table::audit_extension_scratch_words(&mut solver.store, &[index, parity], Arc::clone(&template), true);
+    let negative = table::audit_extension_scratch_words(&mut solver.store, &[index, parity], template, false);
+    assert_eq!(positive, (0, 0), "positive tables must not allocate negative completion-search layers");
+    assert_eq!(negative, (3 * words, 3 * words));
+}
+
+#[test]
+fn hybrid_table_memory_preflight_retains_the_worker_limit() {
+    const ROWS: usize = 8192;
+    let mut model = Model::new();
+    let index = model.int_range(0, ROWS as i32 - 1);
+    let parity = model.bool_var();
+    let tuples = (0..ROWS).map(|row| vec![row as i32, (row % 2) as i32]).collect::<Vec<_>>();
+    model.add_constraint(Constraint::IntegerGlobal(IntGlobalConstraint::Table {
+        variables: vec![index, parity],
+        tuples: tuples.into(),
+        positive: true,
+    }));
+    let estimate = CompiledCp::estimate_semantic_bytes_interruptible(&model, &AtomicBool::new(false)).unwrap();
+    assert!(estimate < 4 * 1024 * 1024, "rare supports still reserve a dense tuple bitset: {estimate}");
+    let request =
+        SolveRequest { limits: SolveLimits { memory_bytes: Some(estimate * 2 - 1), ..SolveLimits::default() }, ..SolveRequest::default() };
+    assert!(matches!(
+        compile_cp_plan(&model, &request, &SolveBudget::new(None)),
+        Err(SolveError::Compile(message)) if message.contains("backend template, worker problems") && message.contains("memory limit")
+    ));
+}
+
+#[test]
 fn integer_warm_start_preflight_counts_table_and_mdd_payloads() {
     const TABLE_ARITY: usize = 8;
     const TABLE_ROWS: usize = 4_096;

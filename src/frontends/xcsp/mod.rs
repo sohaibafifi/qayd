@@ -65,6 +65,8 @@ pub struct RunOptions {
     pub linear: LinearControls,
     /// Extract an exact minimal source-constraint core after an UNSAT result.
     pub core: bool,
+    /// Emit independently replayable snapshots of every published incumbent.
+    pub all_solutions: bool,
 }
 
 impl RunOptions {
@@ -101,6 +103,7 @@ impl Default for RunOptions {
             mem_limit: None,
             linear: LinearControls::default(),
             core: false,
+            all_solutions: false,
         }
     }
 }
@@ -371,6 +374,23 @@ pub fn run_to_with_options_and_search_policy<W: Write>(
     let request = solve_request(options, search, search_policy);
     let result = {
         let mut events = EventCallback(|event| {
+            if let SolveEvent::Candidate(candidate) = &event {
+                if options.all_solutions {
+                    if let Some(value) = candidate.objectives().first() {
+                        writeln!(w, "c snapshot objective {value}").map_err(|error| SolveError::Engine(error.to_string()))?;
+                    }
+                    let values = candidate_values(candidate).map_err(SolveError::InvalidResult)?;
+                    // Keep the final competition assignment unambiguous for
+                    // standard checkers while retaining replayable snapshots.
+                    let mut snapshot = Vec::new();
+                    output.write(&mut snapshot, &values).map_err(|error| SolveError::Engine(error.to_string()))?;
+                    let snapshot = String::from_utf8(snapshot).map_err(|error| SolveError::Engine(error.to_string()))?;
+                    for line in snapshot.lines() {
+                        writeln!(w, "c snapshot {line}").map_err(|error| SolveError::Engine(error.to_string()))?;
+                    }
+                    w.flush().map_err(|error| SolveError::Engine(error.to_string()))?;
+                }
+            }
             if let SolveEvent::Progress { engine, objectives, .. } = event {
                 if let Some(value) = objectives.first().filter(|_| verbose) {
                     writeln!(w, "o {value}")
@@ -476,6 +496,7 @@ fn solve_request(options: RunOptions, primary_branch_scope: Vec<usize>, search_p
         },
         primary_branch_scope: (!options.local_search() && options.semantic_branching).then_some(primary_branch_scope),
         search_policy,
+        publish_incumbent_assignments: options.all_solutions,
         ..SolveRequest::default()
     }
 }

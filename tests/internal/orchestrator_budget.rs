@@ -154,3 +154,38 @@ fn final_replay_grace_is_bounded_and_observes_hard_cancellation() {
     assert!(grace.flag().load(Ordering::Acquire));
     assert!(guard.elapsed() < Duration::from_secs(1));
 }
+
+#[test]
+fn penalty_refinement_keeps_transfer_tail_and_parent_budget() {
+    let budget = SolveBudget::new(Some(Duration::from_millis(600)));
+    let stops = budget.penalty_refinement_stops().unwrap();
+    let guard = Instant::now();
+    while !stops.search().load(Ordering::Acquire) && guard.elapsed() < Duration::from_millis(300) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(stops.search().load(Ordering::Acquire));
+    assert!(!stops.transfer().load(Ordering::Acquire), "canonical transfer must retain its reserved tail");
+    while !stops.transfer().load(Ordering::Acquire) && guard.elapsed() < Duration::from_millis(300) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(stops.transfer().load(Ordering::Acquire));
+    assert!(!budget.expired(), "refinement must leave the exact-search remainder available");
+    assert_eq!(budget.termination_reason(), TerminationReason::Running);
+}
+
+#[test]
+fn penalty_refinement_observes_parent_cancellation_and_zero_budget() {
+    assert!(SolveBudget::new(Some(Duration::ZERO)).penalty_refinement_stops().is_none());
+    let budget = SolveBudget::new(None);
+    let stops = budget.penalty_refinement_stops().unwrap();
+    budget.cancel_with(TerminationReason::ExternalCancellation);
+    let guard = Instant::now();
+    while (!stops.search().load(Ordering::Acquire) || !stops.transfer().load(Ordering::Acquire))
+        && guard.elapsed() < Duration::from_millis(100)
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(stops.search().load(Ordering::Acquire));
+    assert!(stops.transfer().load(Ordering::Acquire));
+    assert_eq!(budget.termination_reason(), TerminationReason::ExternalCancellation);
+}

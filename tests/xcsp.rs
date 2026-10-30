@@ -1878,3 +1878,43 @@ fn lex_constant_tuple_both_directions_pins_value() {
     assert!(out.contains("s SATISFIABLE"), "{out}");
     assert!(out.contains("v 0 1"), "{out}");
 }
+
+#[test]
+fn all_solutions_emits_replayable_incumbent_assignments() {
+    let xml = r#"<instance format="XCSP3" type="COP">
+      <variables><var id="x">0..3</var><var id="y">0..3</var></variables>
+      <constraints><intension>ne(x,y)</intension></constraints>
+      <objectives><maximize>x</maximize></objectives></instance>"#;
+    let mut out = Vec::new();
+    run_to_with_options(xml, true, &AtomicBool::new(false), &mut out, RunOptions { all_solutions: true, ..RunOptions::default() }).unwrap();
+    let output = String::from_utf8(out).unwrap();
+    let snapshots = output.matches("c snapshot objective ").count();
+    assert!(snapshots > 0, "{output}");
+    assert_eq!(output.matches("c snapshot v <instantiation>").count(), snapshots);
+    assert_eq!(output.lines().filter(|line| *line == "v <instantiation>").count(), 1);
+    assert!(output.contains("s OPTIMUM FOUND"), "{output}");
+    for chunk in output.split("c snapshot objective ").skip(1) {
+        let objective: i32 = chunk.lines().next().unwrap().parse().unwrap();
+        let values = chunk.split("c snapshot v <values>\n").nth(1).unwrap().lines().next().unwrap();
+        let values: Vec<i32> = values.split_whitespace().skip(3).map(|v| v.parse().unwrap()).collect();
+        assert_eq!(objective, values[0]);
+        assert_ne!(values[0], values[1]);
+    }
+}
+
+#[test]
+fn all_solutions_combines_independent_integer_components_for_complete_snapshots() {
+    let xml = r#"<instance format="XCSP3" type="COP">
+      <variables><var id="x">0..3</var><var id="fixed">7</var></variables>
+      <constraints><intension>eq(fixed,7)</intension></constraints><objectives><maximize>x</maximize></objectives></instance>"#;
+    let mut out = Vec::new();
+    run_to_with_options(xml, true, &AtomicBool::new(false), &mut out, RunOptions { all_solutions: true, ..RunOptions::default() }).unwrap();
+    let output = String::from_utf8(out).unwrap();
+    assert!(output.contains("c snapshot objective "), "{output}");
+    assert!(output.contains("s OPTIMUM FOUND"), "{output}");
+    for chunk in output.split("c snapshot objective ").skip(1) {
+        let objective: i32 = chunk.lines().next().unwrap().parse().unwrap();
+        let values = chunk.split("c snapshot v <values>\n").nth(1).unwrap().lines().next().unwrap();
+        assert_eq!(values, format!("c snapshot v {objective} 7"));
+    }
+}

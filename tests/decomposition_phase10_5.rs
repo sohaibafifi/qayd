@@ -642,22 +642,27 @@ fn decomposition_rejects_only_limits_that_a_component_family_cannot_consume() {
 }
 
 #[test]
-fn decomposition_rejects_incumbent_assignment_publication_instead_of_dropping_component_candidates() {
+fn incumbent_assignment_publication_uses_a_complete_integer_plan() {
     let package = independent_package();
     let baseline = compile_model_plan(&package, &SolveRequest::default(), &SolveBudget::new(None)).unwrap();
     assert!(matches!(baseline.description(), ExecutablePlan::Decomposed { components, .. } if components.len() == 2));
-
     let request = SolveRequest { publish_incumbent_assignments: true, ..SolveRequest::default() };
-    let error = match compile_model_plan(&package, &request, &SolveBudget::new(None)) {
-        Ok(_) => panic!("a decomposed plan silently accepted component-local incumbent assignment publication"),
+    let traced = compile_model_plan(&package, &request, &SolveBudget::new(None)).unwrap();
+    assert!(!matches!(traced.description(), ExecutablePlan::Decomposed { .. }));
+}
+
+#[test]
+fn mixed_decomposition_still_rejects_partial_assignment_publication() {
+    let mut model = Model::new();
+    model.int_range(0, 1);
+    let list = model.list(vec![1]);
+    model.add_constraint(Constraint::ListPartition { lists: vec![list], items: vec![1] });
+    let request = SolveRequest { publish_incumbent_assignments: true, ..SolveRequest::default() };
+    let error = match compile_model_plan(&ModelPackage::new(model), &request, &SolveBudget::new(None)) {
+        Ok(_) => panic!("a mixed plan accepted partial incumbent assignments"),
         Err(error) => error,
     };
-
-    assert!(matches!(
-        error,
-        SolveError::InvalidRequest(message)
-            if message.contains("publish_incumbent_assignments") && message.contains("not complete assignments")
-    ));
+    assert!(matches!(error, SolveError::InvalidRequest(message) if message.contains("not complete assignments")));
 }
 
 #[test]

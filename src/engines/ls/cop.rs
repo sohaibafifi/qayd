@@ -992,6 +992,22 @@ fn mismatch_symbols(functionals: &[Functional], counter: VarId) -> Option<Vec<(V
 }
 
 fn order_functionals(mut functionals: Vec<Functional>, stop: &AtomicBool) -> Option<Vec<Functional>> {
+    let mut definitions = HashMap::<VarId, usize>::with_capacity(functionals.len());
+    for functional in &functionals {
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        if !matches!(functional, Functional::ElementConst { .. }) {
+            *definitions.entry(functional_target(functional)).or_default() += 1;
+        }
+    }
+    // Expression-derived outputs always retain their defining Expr constraint.
+    // Several equations for one output therefore remain exact searchable
+    // relations after demotion. Other functional kinds may own their only
+    // representation, so their uniqueness and cycle checks remain unchanged.
+    functionals.retain(|functional| {
+        !(stop.load(Ordering::Acquire) || matches!(functional, Functional::Expr { .. }) && definitions[&functional_target(functional)] > 1)
+    });
     let mut targets = HashSet::with_capacity(functionals.len());
     for functional in &functionals {
         if stop.load(Ordering::Acquire)
@@ -1543,6 +1559,46 @@ impl LocalModel {
 
     fn min_assignment(&self) -> Vec<i32> {
         self.domains.iter().map(LocalDomain::min_value).collect()
+    }
+
+    /// CP solutions use search order, while local states use physical VarId
+    /// indices. Rebuild derived values and check the local constraints before
+    /// admitting a seed; its caller remains responsible for canonical replay.
+    fn seeded_assignment(&self, values: &[i32], stop: &AtomicBool) -> Result<Vec<i32>, &'static str> {
+        if values.len() != self.search.len() {
+            return Err("local-search seed has the wrong number of search values");
+        }
+        let mut assignment = Vec::with_capacity(self.domains.len());
+        for domain in &self.domains {
+            if stop.load(Ordering::Acquire) {
+                return Err("local-search seed reconstruction was interrupted");
+            }
+            assignment.push(domain.min_value());
+        }
+        for (&variable, &value) in self.search.iter().zip(values) {
+            if stop.load(Ordering::Acquire) {
+                return Err("local-search seed reconstruction was interrupted");
+            }
+            if !self.domains[variable.index()].contains(value) {
+                return Err("local-search seed violates a variable domain");
+            }
+            assignment[variable.index()] = value;
+        }
+        if !self.complete_until(&mut assignment, || stop.load(Ordering::Acquire)) {
+            return Err("local-search seed has invalid or interrupted derived values");
+        }
+        for constraint in &self.constraints {
+            if stop.load(Ordering::Acquire) {
+                return Err("local-search seed verification was interrupted");
+            }
+            if self.violation(constraint, &assignment) != 0 {
+                return Err("local-search seed violates the local model");
+            }
+        }
+        if self.objective_value(&assignment).is_none() {
+            return Err("local-search seed violates the local model");
+        }
+        Ok(assignment)
     }
 
     fn constructive_assignment(&self, seed: u64, stop: &AtomicBool) -> Vec<i32> {
@@ -2609,7 +2665,14 @@ impl LocalModel {
     }
 
     fn complete(&self, assignment: &mut [i32]) -> bool {
+        self.complete_until(assignment, || false)
+    }
+
+    fn complete_until(&self, assignment: &mut [i32], mut stopped: impl FnMut() -> bool) -> bool {
         for functional in &self.functionals {
+            if stopped() {
+                return false;
+            }
             let Some(value) = self.functional_value(functional, assignment) else {
                 return false;
             };
@@ -3892,8 +3955,26 @@ pub(crate) fn solve_ls_capped_borrowed<F>(
     seed: u64,
     config: LsConfig,
     max_iterations: u64,
-    mut on_improve: F,
+    on_improve: F,
 ) -> LocalSearchOutcome
+where
+    F: FnMut(i64, &[i32], &'static str),
+{
+    solve_ls_capped_borrowed_with_initial(problem, spec, stop, seed, config, max_iterations, None, on_improve)
+        .expect("unseeded local search cannot reject an initial solution")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn solve_ls_capped_borrowed_with_initial<F>(
+    problem: &Problem,
+    spec: LocalSearchSpec,
+    stop: &AtomicBool,
+    seed: u64,
+    config: LsConfig,
+    max_iterations: u64,
+    initial_solution: Option<&[i32]>,
+    mut on_improve: F,
+) -> Result<LocalSearchOutcome, &'static str>
 where
     F: FnMut(i64, &[i32], &'static str),
 {
@@ -3901,7 +3982,7 @@ where
     let constraints = spec.constraints.len();
     let functionals = spec.functionals.len();
     let Ok(model) = LocalModel::new_interruptible(problem, spec, stop) else {
-        return LocalSearchOutcome {
+        return Ok(LocalSearchOutcome {
             best: None,
             iterations: 0,
             moves: 0,
@@ -3917,10 +3998,10 @@ where
             invariant_objective_evaluations: 0,
             invariant_objective_full_evaluations: 0,
             invariant_full_rebuilds: 0,
-        };
+        });
     };
     if unsupported > 0 {
-        return LocalSearchOutcome {
+        return Ok(LocalSearchOutcome {
             best: None,
             iterations: 0,
             moves: 0,
@@ -3936,10 +4017,11 @@ where
             invariant_objective_evaluations: 0,
             invariant_objective_full_evaluations: 0,
             invariant_full_rebuilds: 0,
-        };
+        });
     }
+    let initial_assignment = initial_solution.map(|values| model.seeded_assignment(values, stop)).transpose()?;
     if model.mutable.is_empty() {
-        let mut assignment = model.min_assignment();
+        let mut assignment = initial_assignment.unwrap_or_else(|| model.min_assignment());
         let best = if model.score(&mut assignment).violation == 0 {
             model.objective_value(&assignment).map(|value| {
                 let solution = model.search_solution(&assignment);
@@ -3949,7 +4031,7 @@ where
         } else {
             None
         };
-        return LocalSearchOutcome {
+        return Ok(LocalSearchOutcome {
             best,
             iterations: 0,
             moves: 0,
@@ -3965,12 +4047,12 @@ where
             invariant_objective_evaluations: 0,
             invariant_objective_full_evaluations: 0,
             invariant_full_rebuilds: 0,
-        };
+        });
     }
 
-    if let Some(plan) = model.signed_product_squares_plan(Some(stop)) {
+    if let Some(plan) = initial_assignment.is_none().then(|| model.signed_product_squares_plan(Some(stop))).flatten() {
         let (best, iterations, moves, restarts) = solve_signed_product_squares(&model, &plan, stop, seed, max_iterations, &mut on_improve);
-        return LocalSearchOutcome {
+        return Ok(LocalSearchOutcome {
             best,
             iterations,
             moves,
@@ -3986,13 +4068,20 @@ where
             invariant_objective_evaluations: 0,
             invariant_objective_full_evaluations: 0,
             invariant_full_rebuilds: 0,
-        };
+        });
     }
 
     let minimizing = model.objective.minimizing();
     let objective_kicks = model.objective_kicks();
     let constructive_start = model.has_extension();
-    let assignment = if constructive_start { model.constructive_assignment(seed, stop) } else { model.random_assignment(seed) };
+    let seeded = initial_assignment.is_some();
+    let assignment = initial_assignment.unwrap_or_else(|| {
+        if constructive_start {
+            model.constructive_assignment(seed, stop)
+        } else {
+            model.random_assignment(seed)
+        }
+    });
     let mut state = invariants::InvariantState::new(&model, assignment);
     // Min-conflicts (#1b): O(1) membership set per large domain, built once. Empty
     // when the toggle is off. `cand_values` is the reused candidate buffer.
@@ -4002,8 +4091,22 @@ where
         Vec::new()
     };
     let mut cand_values: Vec<i32> = Vec::new();
-    let mut source = if constructive_start { "constructive" } else { "local-search" };
-    let mut best_solution: Option<(Vec<i32>, i64)> = None;
+    let mut source = if seeded {
+        "seeded-local-search"
+    } else if constructive_start {
+        "constructive"
+    } else {
+        "local-search"
+    };
+    let mut best_solution: Option<(Vec<i32>, i64)> = if seeded && !stop.load(Ordering::Acquire) {
+        model.objective_value(state.assignment()).map(|value| {
+            let solution = model.search_solution(state.assignment());
+            on_improve(value, &solution, source);
+            (solution, value)
+        })
+    } else {
+        None
+    };
     let mut iterations = 0;
     let mut moves = 0;
     let mut restarts = 0;
@@ -4171,7 +4274,7 @@ where
     }
 
     let invariant = state.metrics();
-    LocalSearchOutcome {
+    Ok(LocalSearchOutcome {
         best: best_solution,
         iterations,
         moves,
@@ -4187,7 +4290,7 @@ where
         invariant_objective_evaluations: invariant.objective_evaluations,
         invariant_objective_full_evaluations: invariant.objective_full_evaluations,
         invariant_full_rebuilds: invariant.full_rebuilds,
-    }
+    })
 }
 
 #[cfg(test)]
