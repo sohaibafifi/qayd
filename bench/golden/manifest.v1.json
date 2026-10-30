@@ -11,7 +11,7 @@
     },
     {
       "id": "python-extension",
-      "argv": ["uv", "run", "maturin", "develop", "--profile", "pyext", "--quiet"],
+      "argv": ["uv", "run", "maturin", "develop", "--profile", "pyext", "--quiet", "--uv"],
       "timeout_seconds": 1800,
       "allowed_exit_codes": [0]
     }

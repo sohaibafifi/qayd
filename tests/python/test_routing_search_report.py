@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 import sys
 
+import pytest
+
 
 SCRIPT = Path(__file__).resolve().parents[2] / "bench" / "routing_search_report.py"
 
@@ -80,6 +82,14 @@ def routing_counters():
 
 
 def write_inputs(report, tmp_path, *, lag_1s=10.0, productive=True):
+    # Exercise file and digest validation without relying on downloaded data/.
+    report.ROOT = tmp_path
+    for instance, spec in report.TARGETS.items():
+        path = report.ROOT / spec["path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"synthetic canonical instance {instance}\n", encoding="utf-8")
+        spec["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+
     campaign = tmp_path / "campaign.jsonl"
     versions = {"qayd-api": "qayd test", "hgs": "hgs test"}
     records = []
@@ -253,6 +263,25 @@ def test_complete_campaign_passes_gate(tmp_path):
     assert summary["profile"]["missing_profiles"] == 0
     assert summary["profile"]["missing_required_checkpoints"] == 0
     assert summary["profile"]["missing_or_inconsistent_counters"] == 0
+
+
+@pytest.mark.parametrize("corruption", ("missing", "modified"))
+def test_missing_or_modified_canonical_instance_blocks_gate(tmp_path, corruption):
+    report = load_module()
+    campaign, behavior = write_inputs(report, tmp_path)
+    instance = "X-n401-k29.vrp"
+    path = report.ROOT / report.TARGETS[instance]["path"]
+    if corruption == "missing":
+        path.unlink()
+    else:
+        path.write_text("modified canonical instance\n", encoding="utf-8")
+
+    summary = report.build_summary(campaign, behavior)
+
+    assert not summary["ready"]
+    assert summary["errors"] == [
+        f"{instance}: canonical instance file or SHA-256 is invalid"
+    ]
 
 
 def test_lag_and_unproductive_cpu_dominance_block_gate(tmp_path):

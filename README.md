@@ -74,11 +74,13 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Build the Python extension and run its tests:
+Build the Python extension and run its tests with Python 3.11 or newer
+(CI uses Python 3.12). The development group provides Maturin and pytest:
 
 ```bash
-uv run maturin develop --profile pyext
-uv run python -m pytest tests/python
+uv sync --locked --no-install-project
+uv run --no-sync maturin develop --profile pyext --uv
+uv run --no-sync python -m pytest tests/python
 ```
 
 ## Rust API

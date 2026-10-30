@@ -15,6 +15,16 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Mathematics",
 ]
 
+[dependency-groups]
+dev = [
+  "maturin>=1.8,<2",
+  "pytest>=9.1,<10",
+]
+
+[tool.uv.dependency-groups]
+# The test suite uses tomllib; this does not change the package's Python ABI.
+dev = { requires-python = ">=3.11" }
+
 [tool.maturin]
 features = ["python"]
 module-name = "qayd._core"

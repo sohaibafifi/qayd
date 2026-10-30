@@ -21,6 +21,9 @@ jobs:
 
       - uses: astral-sh/setup-uv@v6
 
+      - name: Install locked Python development tools
+        run: uv sync --locked --no-install-project
+
       - name: Resolve all public features without private dependencies
         run: cargo metadata --locked --all-features --format-version 1 > /dev/null
 
@@ -31,10 +34,12 @@ jobs:
         run: cargo test --workspace
 
       - name: Build Python extension
-        run: uv run maturin develop --profile pyext
+        run: uv run --no-sync maturin develop --profile pyext --uv
 
       - name: Test Python API
-        run: uv run python -m pytest tests/python
+        run: |
+          uv run --no-sync python -c "import qayd._core"
+          uv run --no-sync python -m pytest tests/python
 
       - name: Test golden harness
         run: python3 -m unittest discover -s bench/golden -p 'test_*.py'
@@ -43,7 +48,9 @@ jobs:
         run: python3 -m unittest discover -s tests/python -p 'test_parallel_regression.py'
 
       - name: Run architecture goldens
-        run: uv run python bench/golden/run.py
+        env:
+          UV_NO_SYNC: "true"
+        run: uv run --no-sync python bench/golden/run.py
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
