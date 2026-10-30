@@ -47,6 +47,24 @@ jobs:
             os: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: qayd
+
+      # Keep both repositories inside the directory mounted by cross.
+      # LP is disabled in release binaries, but Cargo still reads its manifest.
+      - name: Check out Amthal for Cargo metadata
+        uses: actions/checkout@v4
+        with:
+          repository: sohaibafifi/amthal
+          ref: 04ffbc9664aa4f90c48eed2d08ff20893704e7af
+          path: amthal
+          persist-credentials: false
+
+      # Rustup resolves its toolchain from the working directory, not the
+      # --manifest-path passed to Cargo below.
+      - name: Use the repository Rust toolchain from the shared build directory
+        shell: bash
+        run: cp qayd/rust-toolchain.toml rust-toolchain.toml
 
       # Builds `--release --target <target>` (using `cross` for the Linux ARM
       # target), archives the binaries as .tar.gz / .zip, writes a .sha256,
@@ -56,11 +74,14 @@ jobs:
       # MiniZinc integration (solver config + mznlib + installer) ships as a
       # separate `qayd-minizinc-*` bundle assembled below.
       - uses: taiki-e/upload-rust-binary-action@v1
+        env:
+          GH_REPO: ${{ github.repository }}
         with:
+          manifest-path: qayd/Cargo.toml
           bin: qayd,qayd-fzn,qayd-sat,qayd-pb
           target: ${{ matrix.target }}
           archive: qayd-$tag-$target
-          include: README.md,LICENSE
+          include: qayd/README.md,qayd/LICENSE
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
 

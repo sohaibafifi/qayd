@@ -143,6 +143,12 @@ The `lp-relaxation` feature is a source-only integration that requires the
 unreleased sibling Amthal checkout. It is not part of the default release
 binaries.
 
+Cargo reads the manifest of this optional path dependency even when LP is
+disabled. Source builds therefore need [Amthal](https://github.com/sohaibafifi/amthal)
+checked out at `../amthal`. CI and release workflows provide the pinned public
+revision `04ffbc9664aa4f90c48eed2d08ff20893704e7af` for builds without LP.
+Enabling `lp-relaxation` additionally requires the unreleased `LpSession` API.
+
 ## License
 
 MIT

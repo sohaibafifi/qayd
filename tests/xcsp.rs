@@ -1316,11 +1316,7 @@ fn positive_fixed_no_overlap_keeps_the_compact_global_when_zero_is_ignored() {
 }
 
 fn low_autocorrelation_10_xml() -> String {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/XCSP25/MiniCOP25/LowAutocorrelation-010-mini_c25.xml.lzma");
-    let bytes = std::fs::read(path).unwrap();
-    let mut xml = Vec::new();
-    lzma_rs::lzma_decompress(&mut &bytes[..], &mut xml).unwrap();
-    String::from_utf8(xml).unwrap()
+    include_str!("fixtures/xcsp/LowAutocorrelation-010-mini_c25.xml").to_owned()
 }
 
 fn low_autocorrelation_10_output(seed: u64, workers: usize) -> String {

@@ -12,14 +12,32 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: qayd
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: qayd
+
+      # Cargo reads optional path dependencies even when their feature is off.
+      # This public revision supplies the manifest for builds without LP;
+      # lp-relaxation still requires the unreleased LpSession API.
+      - name: Check out Amthal for Cargo metadata
+        uses: actions/checkout@v4
+        with:
+          repository: sohaibafifi/amthal
+          ref: 04ffbc9664aa4f90c48eed2d08ff20893704e7af
+          path: amthal
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - uses: astral-sh/setup-uv@v6
+        with:
+          working-directory: qayd
 
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
