@@ -26,6 +26,8 @@ fn strict_n5_streaming_pop_cap(operation_count: usize) -> usize {
 }
 
 fn checkpoint(stop: &AtomicBool) -> Result<(), ScheduleStateInterrupted> {
+    #[cfg(test)]
+    super::audit_schedule_checkpoint();
     if stop.load(Ordering::Acquire) {
         Err(ScheduleStateInterrupted)
     } else {

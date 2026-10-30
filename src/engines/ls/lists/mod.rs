@@ -25,6 +25,36 @@ pub(crate) mod schedule_relink;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod schedule_state;
 
+#[cfg(test)]
+std::thread_local! {
+    static SCHEDULE_CHECKPOINT_AUDIT: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Scope a deterministic checkpoint observer to this test thread only.
+#[cfg(test)]
+pub(crate) fn audit_with_schedule_checkpoints<R>(audit: impl FnMut() + 'static, work: impl FnOnce() -> R) -> R {
+    struct RestoreAudit(Option<Box<dyn FnMut()>>);
+
+    impl Drop for RestoreAudit {
+        fn drop(&mut self) {
+            SCHEDULE_CHECKPOINT_AUDIT.with_borrow_mut(|audit| *audit = self.0.take());
+        }
+    }
+
+    let previous = SCHEDULE_CHECKPOINT_AUDIT.with_borrow_mut(|current| current.replace(Box::new(audit)));
+    let _restore = RestoreAudit(previous);
+    work()
+}
+
+#[cfg(test)]
+fn audit_schedule_checkpoint() {
+    SCHEDULE_CHECKPOINT_AUDIT.with_borrow_mut(|audit| {
+        if let Some(audit) = audit {
+            audit();
+        }
+    });
+}
+
 #[doc(hidden)]
 #[cfg(test)]
 pub(crate) use alns::{

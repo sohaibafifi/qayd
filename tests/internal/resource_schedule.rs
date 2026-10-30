@@ -8,6 +8,8 @@ use qayd::engines::ls::lists::resource_schedule::{
 };
 use qayd::model::list::{verify_collection_solution, CollectionModel, IntervalVar, Mode, Resource, Schedule};
 
+use super::schedule_cancellation::cancel_after_checkpoints;
+
 fn collection(schedule: Schedule) -> CollectionModel {
     CollectionModel {
         items: Vec::new(),
@@ -811,31 +813,26 @@ fn workspace_rebuild_honors_prearmed_and_concurrent_cancellation_without_mutatin
     let problem = ResourceScheduleProblem::recognize(&schedule, &build_stop).unwrap().unwrap();
     let mut state = ResourceScheduleState::serial(&problem, PrioritySgs::stable(&problem), &build_stop).unwrap().unwrap();
     let starts = state.starts().to_vec();
+    let priority = state.priority().order().to_vec();
+    let makespan = state.makespan();
 
     let prearmed = AtomicBool::new(true);
     assert!(state.probe_workspace_rebuild(&prearmed).is_err());
+    assert!(state.probe_workspace_reload(&prearmed).is_err());
 
     let concurrent = AtomicBool::new(false);
-    let outcome = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            std::thread::sleep(Duration::from_millis(1));
-            concurrent.store(true, Ordering::Release);
-        });
-        state.probe_workspace_rebuild(&concurrent)
-    });
+    let outcome = cancel_after_checkpoints(&concurrent, 16, || state.probe_workspace_rebuild(&concurrent));
     assert!(outcome.is_err());
     assert_eq!(state.starts(), starts);
+    assert_eq!(state.priority().order(), priority);
+    assert_eq!(state.makespan(), makespan);
 
     concurrent.store(false, Ordering::Release);
-    let reload_outcome = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            std::thread::sleep(Duration::from_millis(1));
-            concurrent.store(true, Ordering::Release);
-        });
-        state.probe_workspace_reload(&concurrent)
-    });
+    let reload_outcome = cancel_after_checkpoints(&concurrent, 16, || state.probe_workspace_reload(&concurrent));
     assert!(reload_outcome.is_err());
     assert_eq!(state.starts(), starts);
+    assert_eq!(state.priority().order(), priority);
+    assert_eq!(state.makespan(), makespan);
     concurrent.store(false, Ordering::Release);
     assert!(matches!(
         state

@@ -104,6 +104,8 @@ mod routing_search;
 mod sat_preprocess_interrupt;
 #[path = "internal/scenario_schedule.rs"]
 mod scenario_schedule;
+#[path = "internal/schedule_cancellation.rs"]
+mod schedule_cancellation;
 #[path = "internal/schedule_compile_contract.rs"]
 mod schedule_compile_contract;
 #[path = "internal/schedule_elite.rs"]

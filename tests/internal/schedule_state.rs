@@ -10,6 +10,8 @@ use qayd::engines::ls::lists::schedule_state::{
 use qayd::engines::ls::lists::{schedule_constructor_multistart_supported, solve_schedule, solve_schedule_capped_persistent_hybrid};
 use qayd::model::list::{verify_collection_solution, CollectionModel, IntervalVar, Mode, Resource, Schedule};
 
+use super::schedule_cancellation::cancel_after_checkpoints;
+
 #[test]
 fn minimizing_move_acceptance_has_the_shared_makespan_semantics() {
     assert!(MinimizingMoveAcceptance::Improving.accepts(10, 9));
@@ -2010,37 +2012,33 @@ fn cancellation_during_move_probe_and_commit_preserves_the_incumbent() {
     let mut state = JobShopState::from_machine_sequences(&problem, vec![sequence], &stop).unwrap().unwrap();
     let old_sequences = state.machine_sequences().to_vec();
     let old_starts = state.starts().to_vec();
+    let old_ends = state.ends().to_vec();
+    let old_makespan = state.makespan();
 
-    let probe = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            stop.store(true, std::sync::atomic::Ordering::Release);
-        });
+    let probe = cancel_after_checkpoints(&stop, 16, || {
         state.probe_move(ScheduleMove::Insert { machine: 0, from: 0, to: operation_count - 1 }, &stop)
     });
 
     assert!(probe.is_err());
     assert_eq!(state.machine_sequences(), old_sequences);
     assert_eq!(state.starts(), old_starts);
+    assert_eq!(state.ends(), old_ends);
+    assert_eq!(state.makespan(), old_makespan);
 
     stop.store(false, std::sync::atomic::Ordering::Release);
-    let commit = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            stop.store(true, std::sync::atomic::Ordering::Release);
-        });
+    assert!(state.matches_full_oracle(&stop).unwrap());
+    let commit = cancel_after_checkpoints(&stop, 16, || {
         state.consider_move(ScheduleMove::Insert { machine: 0, from: 0, to: operation_count - 1 }, MinimizingMoveAcceptance::Always, &stop)
     });
     assert!(commit.is_err());
     assert_eq!(state.machine_sequences(), old_sequences);
     assert_eq!(state.starts(), old_starts);
+    assert_eq!(state.ends(), old_ends);
+    assert_eq!(state.makespan(), old_makespan);
 
     stop.store(false, std::sync::atomic::Ordering::Release);
-    let direct = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            stop.store(true, std::sync::atomic::Ordering::Release);
-        });
+    assert!(state.matches_full_oracle(&stop).unwrap());
+    let direct = cancel_after_checkpoints(&stop, 16, || {
         state.consider_move_full_oracle(
             ScheduleMove::Insert { machine: 0, from: 0, to: operation_count - 1 },
             MinimizingMoveAcceptance::Always,
@@ -2050,6 +2048,11 @@ fn cancellation_during_move_probe_and_commit_preserves_the_incumbent() {
     assert!(direct.is_err());
     assert_eq!(state.machine_sequences(), old_sequences);
     assert_eq!(state.starts(), old_starts);
+    assert_eq!(state.ends(), old_ends);
+    assert_eq!(state.makespan(), old_makespan);
+    stop.store(false, std::sync::atomic::Ordering::Release);
+    assert!(state.matches_full_oracle(&stop).unwrap());
+    assert!(verify_collection_solution(&collection(schedule), &state.to_solution()).is_ok());
 }
 
 #[test]

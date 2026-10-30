@@ -23,6 +23,8 @@ use super::move_acceptance::MinimizingMoveAcceptance;
 pub(crate) struct ResourceScheduleInterrupted;
 
 fn checkpoint(stop: &AtomicBool) -> Result<(), ResourceScheduleInterrupted> {
+    #[cfg(test)]
+    super::audit_schedule_checkpoint();
     if stop.load(Ordering::Acquire) {
         Err(ResourceScheduleInterrupted)
     } else {
