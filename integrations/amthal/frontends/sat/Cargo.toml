@@ -1,0 +1,17 @@
+[package]
+name = "qayd-sat"
+version.workspace = true
+edition = "2021"
+publish = false
+license = "MIT"
+
+[[bin]]
+name = "qayd-sat"
+path = "../../../../frontends/sat/src/main.rs"
+
+[dependencies]
+ctrlc = "3.5.2"
+qayd = { path = "../.." }
+
+[lib]
+path = "../../../../frontends/sat/src/lib.rs"

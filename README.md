@@ -139,15 +139,20 @@ low-level native models and higher-level typed APIs.
 
 ## Optional LP Integration
 
-The `lp-relaxation` feature is a source-only integration that requires the
-unreleased sibling Amthal checkout. It is not part of the default release
-binaries.
+Amthal is a private, optional LP backend available only
+through the separate [local integration](integrations/amthal/README.md).
+That integration requires authorized access to a compatible Amthal checkout.
 
-Cargo reads the manifest of this optional path dependency even when LP is
-disabled. Source builds therefore need [Amthal](https://github.com/sohaibafifi/amthal)
-checked out at `../amthal`. CI and release workflows provide the pinned public
-revision `04ffbc9664aa4f90c48eed2d08ff20893704e7af` for builds without LP.
-Enabling `lp-relaxation` additionally requires the unreleased `LpSession` API.
+With Amthal checked out at `../amthal`, run from the Qayd repository root:
+
+```bash
+cargo build --release --manifest-path integrations/amthal/Cargo.toml
+integrations/amthal/target/release/qayd your-instance.xml.lzma -v -t 180
+```
+
+This manifest enables LP by default. Add `--all-features` to the build command
+to also enable Python. Ordinary builds use `cargo build --release` and require
+no Amthal checkout, including with `--all-features`.
 
 ## License
 

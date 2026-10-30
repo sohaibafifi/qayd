@@ -122,10 +122,12 @@ def prepare_extension() -> None:
         "run",
         "maturin",
         "develop",
+        "--manifest-path",
+        "integrations/amthal/Cargo.toml",
         "--profile",
         "pyext",
         "--features",
-        "python,lp-relaxation",
+        "python",
     ]
     try:
         subprocess.run(command, cwd=ROOT, check=True)

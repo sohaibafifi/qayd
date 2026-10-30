@@ -128,11 +128,12 @@ The LP contribution is measured with four variants of the same release binary:
 `qayd-amthal-bound-only` computes the certified dual bound without primal phase
 guidance, `qayd-amthal` adds root primal guidance but disables node LP, and
 `qayd-amthal-search` adds the persistent in-search session. This separates root
-bound quality, primal guidance, and node pruning. Build the instrumented binary
-once, then run a paired campaign with solver-order rotation:
+bound quality, primal guidance, and node pruning. This requires the
+[private Amthal integration](../../integrations/amthal/README.md). Build its
+instrumented binary once, then run a paired campaign with solver-order rotation:
 
 ```bash
-cargo build --release --features lp-relaxation --bin qayd
+cargo build --manifest-path integrations/amthal/Cargo.toml --release --bin qayd
 python3 bench/fastcop/run.py \
   --solvers bench/fastcop/solvers.lp-ablation.v1.json \
   --solver qayd-native \

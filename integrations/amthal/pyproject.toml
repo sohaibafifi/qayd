@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "qayd"
+dynamic = ["version"]
+requires-python = ">=3.8"
+
+[tool.maturin]
+features = ["python"]
+module-name = "qayd._core"
+python-source = "../../frontends/python"
+profile = "pyext"

@@ -148,7 +148,7 @@ fn command_line_help_is_grouped_complete_and_terminal_friendly() {
         "0 disables",
         "0..100",
         "1..16",
-        "lp-relaxation feature",
+        "--manifest-path integrations/amthal/Cargo.toml",
     ] {
         assert!(help.contains(detail), "missing {detail:?} in:\n{help}");
     }

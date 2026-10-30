@@ -32,9 +32,9 @@
         "native",
         "{instance}"
       ],
-      "artifact": "../../target/release/qayd",
+      "artifact": "../../integrations/amthal/target/release/qayd",
       "expected_sha256": null,
-      "version": "qayd 0.9.1, optional root LP disabled"
+      "version": "qayd 0.10.0, optional root LP disabled"
     },
     "qayd-amthal-bound-only": {
       "argv": [
@@ -58,9 +58,9 @@
         "0",
         "{instance}"
       ],
-      "artifact": "../../target/release/qayd",
+      "artifact": "../../integrations/amthal/target/release/qayd",
       "expected_sha256": null,
-      "version": "qayd 0.9.1, Amthal root bound with primal phase and node LP disabled"
+      "version": "qayd 0.10.0, Amthal root bound with primal phase and node LP disabled"
     },
     "qayd-amthal": {
       "argv": [
@@ -82,9 +82,9 @@
         "0",
         "{instance}"
       ],
-      "artifact": "../../target/release/qayd",
+      "artifact": "../../integrations/amthal/target/release/qayd",
       "expected_sha256": null,
-      "version": "qayd 0.9.1, Amthal root LP and phase with node LP disabled"
+      "version": "qayd 0.10.0, Amthal root LP and phase with node LP disabled"
     },
     "qayd-amthal-search": {
       "argv": [
@@ -108,9 +108,9 @@
         "8",
         "{instance}"
       ],
-      "artifact": "../../target/release/qayd",
+      "artifact": "../../integrations/amthal/target/release/qayd",
       "expected_sha256": null,
-      "version": "qayd 0.9.1, Amthal root LP, phase, and persistent in-search LP"
+      "version": "qayd 0.10.0, Amthal root LP, phase, and persistent in-search LP"
     }
   }
 }

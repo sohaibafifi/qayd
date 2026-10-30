@@ -1,0 +1,118 @@
+# Private, explicit opt-in workspace; shared sources are not copied.
+# Keep public dependency versions and profiles aligned with ../../Cargo.toml.
+[package]
+name = "qayd"
+publish = false
+version.workspace = true
+edition = "2021"
+description = "A Unified Semantic Architecture for Heterogeneous Constraint Solving."
+license = "MIT"
+build = "../../build.rs"
+
+[workspace]
+members = [".", "frontends/flatzinc", "frontends/sat", "frontends/pb"]
+# Both packages take part in plain `cargo build --bin ...` at the root - the
+# release workflow builds `qayd`, `qayd-fzn`, `qayd-sat`, and `qayd-pb` in one
+# invocation.
+default-members = [".", "frontends/flatzinc", "frontends/sat", "frontends/pb"]
+
+[workspace.package]
+# Single source of truth for all workspace crates released together.
+version = "0.10.0"
+
+[lib]
+name = "qayd"
+path = "../../src/lib.rs"
+test = false
+# `cdylib` for the optional PyO3 extension module (built under `--features python`
+# by maturin); `rlib` keeps the binary and the flatzinc frontend linking normally.
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "qayd"
+path = "../../src/bin/qayd.rs"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+opt-level = 3
+overflow-checks = false
+# NB: cargo ignores `panic` for test targets (cargo#6313), so a bare
+# `cargo test --release` fails linking the bins (abort bin vs unwind test lib).
+# Use `cargo test --release --test <name>`, which skips bin targets.
+panic = "abort"
+
+# Profile for the PyO3 extension module (`maturin --profile pyext`): identical
+# to release except panics unwind, so PyO3 catches them at the FFI boundary and
+# raises a Python exception instead of aborting the host interpreter.
+[profile.pyext]
+inherits = "release"
+panic = "unwind"
+
+
+[dependencies]
+ctrlc = "3.5.2"
+libc = "0.2"
+lzma-rs = "0.3.0"
+amthal = { path = "../../../amthal", optional = true }
+num-bigint = { version = "0.4", optional = true }
+num-rational = { version = "0.4", optional = true }
+num-traits = { version = "0.2", optional = true }
+pyo3 = { version = "0.29.0", features = ["extension-module", "abi3-py38"], optional = true }
+smallvec = "1.15.1"
+# Patched fork: cardinality mixed occurs, %N group injection, notin, stray stdout
+# prints, lex constant tuples, bare-array/slice expansion in objective expr lists.
+# Rev-pinned for reproducibility.
+xcsp3-rust-parser = { git = "https://github.com/sohaibafifi/XCSP3-Rust-Parser", rev = "e0289254951124f6a6f92ee5832759bc70cf5c6a" }
+
+[features]
+default = ["lp-relaxation"]
+# Build the PyO3 Python extension module (`qayd._core`). Off by default so the
+# normal solver build and tests don't pull in pyo3.
+python = ["dep:pyo3"]
+# Advisory LP relaxation with exact dual recertification. The backend remains
+# optional so ordinary CP, SAT, list, and scheduling builds do not link it.
+lp-relaxation = ["dep:amthal", "dep:num-bigint", "dep:num-rational", "dep:num-traits"]
+
+
+# Cold parse/decompress stack: runs once per instance, never in the solve loop.
+# Build it for size, not speed — keeps the hot solver (qayd, std) at opt-level 3.
+[profile.release.package.regex-automata]
+opt-level = "z"
+[profile.release.package.regex-syntax]
+opt-level = "z"
+[profile.release.package.aho-corasick]
+opt-level = "z"
+[profile.release.package.regex]
+opt-level = "z"
+[profile.release.package.quick-xml]
+opt-level = "z"
+[profile.release.package.xcsp3-rust-parser]
+opt-level = "z"
+[profile.release.package.lzma-rs]
+opt-level = "z"
+
+[[test]]
+name = "lp_relaxation"
+path = "../../tests/lp_relaxation.rs"
+
+[[test]]
+name = "internal"
+path = "../../tests/internal.rs"
+
+[[test]]
+name = "search_policy"
+path = "../../tests/search_policy.rs"
+
+[[test]]
+name = "search_policy_cli"
+path = "../../tests/search_policy_cli.rs"
+
+[[test]]
+name = "session_portfolio"
+path = "../../tests/session_portfolio.rs"
+
+[[test]]
+name = "cp_lexicographic"
+path = "../../tests/cp_lexicographic.rs"

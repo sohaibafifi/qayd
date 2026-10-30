@@ -131,7 +131,8 @@ Linear relaxation options:
                                      Set the restricted-master dual weight
                                      [default: 75; 1..100]
 
-  The amthal backend requires a build with the lp-relaxation feature."#;
+  The amthal backend requires the private LP build:
+    cargo build --manifest-path integrations/amthal/Cargo.toml --release"#;
 
 fn fail(message: &str) -> ! {
     eprintln!("{message}");

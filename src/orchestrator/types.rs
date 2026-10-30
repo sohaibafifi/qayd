@@ -413,7 +413,10 @@ impl SolveRequest {
             return Err(SolveError::InvalidRequest("linear relaxation minimum coverage must be between 0 and 100 percent".to_string()));
         }
         if self.linear.backend == LinearBackendMode::Amthal && !cfg!(feature = "lp-relaxation") {
-            return Err(SolveError::InvalidRequest("linear backend 'amthal' requires the lp-relaxation Cargo feature".to_string()));
+            return Err(SolveError::InvalidRequest(
+                "linear backend 'amthal' requires the private lp-relaxation build: --manifest-path integrations/amthal/Cargo.toml"
+                    .to_string(),
+            ));
         }
         if self.sat.proof_path.is_some() && self.sat.backend != Some(SatBackendMode::Native) {
             return Err(SolveError::InvalidRequest("SAT proof output requires the native SAT backend".to_string()));

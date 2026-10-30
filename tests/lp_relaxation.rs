@@ -465,4 +465,5 @@ fn requesting_an_unlinked_amthal_backend_is_an_explicit_error() {
         solve_model(&two_variable_model(Relation::Ge, 5, true), &request(LinearBackendMode::Amthal), &mut IgnoreEvents).unwrap_err();
     assert!(matches!(error, SolveError::InvalidRequest(_)), "{error}");
     assert!(error.to_string().contains("lp-relaxation"), "{error}");
+    assert!(error.to_string().contains("--manifest-path integrations/amthal/Cargo.toml"), "{error}");
 }
