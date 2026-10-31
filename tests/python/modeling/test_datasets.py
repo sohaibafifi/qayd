@@ -7,6 +7,7 @@ import re
 import runpy
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 import qayd as cp
@@ -529,6 +530,19 @@ def test_jssp_replay_explicitly_rejects_invalid_schedule(
         absolute_gap = None
         relative_gap = None
         bound_method = None
+        stats = SimpleNamespace(
+            solutions=0,
+            nodes=0,
+            failures=0,
+            lcg_atoms=0,
+            propagator_calls=0,
+            learned_lits=0,
+        )
+        message = None
+        search_engine = None
+        schedule_encoding = None
+        schedule_search_kernel = None
+        search_incumbent_events = None
 
         def __getattr__(self, _name):
             return 0
