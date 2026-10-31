@@ -13,6 +13,7 @@ __pycache__/
 # Architecture and regression artefacts are source files, even when a global
 # user ignore file hides Markdown or test directories.
 !bench/README.md
+!bench/cluster/README.md
 !examples/python/csplib/README.md
 !examples/python/csplib/ROADMAP.md
 !tests/

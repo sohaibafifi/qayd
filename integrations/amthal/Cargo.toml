@@ -94,7 +94,7 @@ opt-level = "z"
 
 [[test]]
 name = "lp_relaxation"
-path = "../../tests/lp_relaxation.rs"
+path = "../../tests/integration/lp/lp_relaxation.rs"
 
 [[test]]
 name = "internal"
@@ -102,16 +102,16 @@ path = "../../tests/internal.rs"
 
 [[test]]
 name = "search_policy"
-path = "../../tests/search_policy.rs"
+path = "../../tests/integration/search/search_policy.rs"
 
 [[test]]
 name = "search_policy_cli"
-path = "../../tests/search_policy_cli.rs"
+path = "../../tests/integration/frontends/search_policy_cli.rs"
 
 [[test]]
 name = "session_portfolio"
-path = "../../tests/session_portfolio.rs"
+path = "../../tests/integration/orchestrator/session_portfolio.rs"
 
 [[test]]
 name = "cp_lexicographic"
-path = "../../tests/cp_lexicographic.rs"
+path = "../../tests/integration/search/cp_lexicographic.rs"

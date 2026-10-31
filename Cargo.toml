@@ -2,6 +2,7 @@
 name = "qayd"
 version.workspace = true
 edition = "2021"
+autotests = false
 description = "A Unified Semantic Architecture for Heterogeneous Constraint Solving."
 license = "MIT"
 
@@ -87,3 +88,311 @@ opt-level = "z"
 opt-level = "z"
 [profile.release.package.lzma-rs]
 opt-level = "z"
+
+# Explicit paths preserve Cargo target names while grouping their sources.
+
+[[test]]
+name = "internal"
+path = "tests/internal.rs"
+
+# Core integration tests.
+
+[[test]]
+name = "domain"
+path = "tests/integration/core/domain.rs"
+
+[[test]]
+name = "domains"
+path = "tests/integration/core/domains.rs"
+
+[[test]]
+name = "expr"
+path = "tests/integration/core/expr.rs"
+
+[[test]]
+name = "scheduler"
+path = "tests/integration/core/scheduler.rs"
+
+[[test]]
+name = "trail"
+path = "tests/integration/core/trail.rs"
+
+# Constraints integration tests.
+
+[[test]]
+name = "all_different_large"
+path = "tests/integration/constraints/all_different_large.rs"
+
+[[test]]
+name = "alternative_channel"
+path = "tests/integration/constraints/alternative_channel.rs"
+
+[[test]]
+name = "boolean_linear"
+path = "tests/integration/constraints/boolean_linear.rs"
+
+[[test]]
+name = "cardinality_nvalues"
+path = "tests/integration/constraints/cardinality_nvalues.rs"
+
+[[test]]
+name = "cumulative_incremental"
+path = "tests/integration/constraints/cumulative_incremental.rs"
+
+[[test]]
+name = "element_count"
+path = "tests/integration/constraints/element_count.rs"
+
+[[test]]
+name = "global_strengthening"
+path = "tests/integration/constraints/global_strengthening.rs"
+
+[[test]]
+name = "globals"
+path = "tests/integration/constraints/globals.rs"
+
+[[test]]
+name = "hard_globals"
+path = "tests/integration/constraints/hard_globals.rs"
+
+[[test]]
+name = "intension"
+path = "tests/integration/constraints/intension.rs"
+
+[[test]]
+name = "intension_normalization"
+path = "tests/integration/constraints/intension_normalization.rs"
+
+[[test]]
+name = "lex_channel"
+path = "tests/integration/constraints/lex_channel.rs"
+
+[[test]]
+name = "linear"
+path = "tests/integration/constraints/linear.rs"
+
+[[test]]
+name = "precedence"
+path = "tests/integration/constraints/precedence.rs"
+
+[[test]]
+name = "primitives"
+path = "tests/integration/constraints/primitives.rs"
+
+[[test]]
+name = "selected_constraints"
+path = "tests/integration/constraints/selected_constraints.rs"
+
+[[test]]
+name = "table"
+path = "tests/integration/constraints/table.rs"
+
+[[test]]
+name = "unary_edge_finding"
+path = "tests/integration/constraints/unary_edge_finding.rs"
+
+# Search integration tests.
+
+[[test]]
+name = "cp_lexicographic"
+path = "tests/integration/search/cp_lexicographic.rs"
+
+[[test]]
+name = "decision_scope"
+path = "tests/integration/search/decision_scope.rs"
+
+[[test]]
+name = "load_balance_integration"
+path = "tests/integration/search/load_balance_integration.rs"
+
+[[test]]
+name = "ordering_integration"
+path = "tests/integration/search/ordering_integration.rs"
+
+[[test]]
+name = "search_policy"
+path = "tests/integration/search/search_policy.rs"
+
+[[test]]
+name = "var_weight_cache"
+path = "tests/integration/search/var_weight_cache.rs"
+
+# LCG integration tests.
+
+[[test]]
+name = "clause_arena"
+path = "tests/integration/lcg/clause_arena.rs"
+
+[[test]]
+name = "i6_nogood_learning"
+path = "tests/integration/lcg/i6_nogood_learning.rs"
+
+[[test]]
+name = "lcg_alldiff_explanations"
+path = "tests/integration/lcg/lcg_alldiff_explanations.rs"
+
+[[test]]
+name = "lcg_components"
+path = "tests/integration/lcg/lcg_components.rs"
+
+[[test]]
+name = "lcg_low_autocorrelation"
+path = "tests/integration/lcg/lcg_low_autocorrelation.rs"
+
+[[test]]
+name = "lcg_objective_bound"
+path = "tests/integration/lcg/lcg_objective_bound.rs"
+
+[[test]]
+name = "lcg_oracle"
+path = "tests/integration/lcg/lcg_oracle.rs"
+
+[[test]]
+name = "lcg_reason_soundness"
+path = "tests/integration/lcg/lcg_reason_soundness.rs"
+
+[[test]]
+name = "lcg_root_probing"
+path = "tests/integration/lcg/lcg_root_probing.rs"
+
+[[test]]
+name = "lcg_scheduling_explanations"
+path = "tests/integration/lcg/lcg_scheduling_explanations.rs"
+
+[[test]]
+name = "lcg_table_explanations"
+path = "tests/integration/lcg/lcg_table_explanations.rs"
+
+[[test]]
+name = "semantic_minimization"
+path = "tests/integration/lcg/semantic_minimization.rs"
+
+# Inference integration tests.
+
+[[test]]
+name = "deferred_explanations"
+path = "tests/integration/inference/deferred_explanations.rs"
+
+[[test]]
+name = "deferred_linear"
+path = "tests/integration/inference/deferred_linear.rs"
+
+[[test]]
+name = "inference_checker"
+path = "tests/integration/inference/inference_checker.rs"
+
+[[test]]
+name = "inference_checking"
+path = "tests/integration/inference/inference_checking.rs"
+
+[[test]]
+name = "inference_cumulative"
+path = "tests/integration/inference/inference_cumulative.rs"
+
+[[test]]
+name = "inference_no_overlap"
+path = "tests/integration/inference/inference_no_overlap.rs"
+
+[[test]]
+name = "inference_nogoods"
+path = "tests/integration/inference/inference_nogoods.rs"
+
+# Orchestrator integration tests.
+
+[[test]]
+name = "architecture_golden_native"
+path = "tests/integration/orchestrator/architecture_golden_native.rs"
+
+[[test]]
+name = "decomposition_control_applicability"
+path = "tests/integration/orchestrator/decomposition_control_applicability.rs"
+
+[[test]]
+name = "decomposition_phase10_5"
+path = "tests/integration/orchestrator/decomposition_phase10_5.rs"
+
+[[test]]
+name = "orchestrator_diagnostics"
+path = "tests/integration/orchestrator/orchestrator_diagnostics.rs"
+
+[[test]]
+name = "orchestrator_executor"
+path = "tests/integration/orchestrator/orchestrator_executor.rs"
+
+[[test]]
+name = "phase10_5"
+path = "tests/integration/orchestrator/phase10_5.rs"
+
+[[test]]
+name = "routing_orchestrator"
+path = "tests/integration/orchestrator/routing_orchestrator.rs"
+
+[[test]]
+name = "sat_plan"
+path = "tests/integration/orchestrator/sat_plan.rs"
+
+[[test]]
+name = "session_lazy_preparation"
+path = "tests/integration/orchestrator/session_lazy_preparation.rs"
+
+[[test]]
+name = "session_portfolio"
+path = "tests/integration/orchestrator/session_portfolio.rs"
+
+# Model integration tests.
+
+[[test]]
+name = "models"
+path = "tests/integration/model/models.rs"
+
+[[test]]
+name = "n_queens"
+path = "tests/integration/model/n_queens.rs"
+
+[[test]]
+name = "oracle"
+path = "tests/integration/model/oracle.rs"
+
+[[test]]
+name = "semantic_list_validation"
+path = "tests/integration/model/semantic_list_validation.rs"
+
+# Frontends integration tests.
+
+[[test]]
+name = "frontend_control_plane"
+path = "tests/integration/frontends/frontend_control_plane.rs"
+
+[[test]]
+name = "ls_turbo"
+path = "tests/integration/frontends/ls_turbo.rs"
+
+[[test]]
+name = "search_policy_cli"
+path = "tests/integration/frontends/search_policy_cli.rs"
+
+[[test]]
+name = "xcsp"
+path = "tests/integration/frontends/xcsp.rs"
+
+# LP integration tests.
+
+[[test]]
+name = "lp_relaxation"
+path = "tests/integration/lp/lp_relaxation.rs"
+
+# Metrics integration tests.
+
+[[test]]
+name = "i6_nogood_metrics"
+path = "tests/integration/metrics/i6_nogood_metrics.rs"
+
+[[test]]
+name = "unary_edge_finding_metrics"
+path = "tests/integration/metrics/unary_edge_finding_metrics.rs"
+
+# Certificates integration tests.
+
+[[test]]
+name = "cp_certificates"
+path = "tests/integration/certificates/cp_certificates.rs"

@@ -4,7 +4,7 @@ from pathlib import Path
 import subprocess
 
 
-SCRIPT = Path(__file__).resolve().parents[2] / "bench/cluster/scripts/bootstrap.oar"
+SCRIPT = Path(__file__).resolve().parents[3] / "bench/cluster/scripts/bootstrap.oar"
 DRIVER = r'''
 command() {
   if [[ "$1" == -v ]]; then

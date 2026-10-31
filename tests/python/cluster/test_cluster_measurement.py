@@ -6,7 +6,7 @@ import threading
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "bench"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "bench"))
 from cluster.lib.adapters import measurement as fastcop_run
 from cluster.lib.adapters import xcsp as fastcop_manifest
 

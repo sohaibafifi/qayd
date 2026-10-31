@@ -201,7 +201,7 @@ python bench/cluster/lib/campaign.py build --target-dir "$CARGO_TARGET_DIR" \
   --receipt bench/cluster/runs/build.json "${BUILD_FEATURES[@]}"
 cargo clippy --locked --workspace --all-targets "${CARGO_MANIFEST_ARGS[@]}" -- -D warnings
 cargo clippy --locked --workspace --all-targets "${CARGO_MANIFEST_ARGS[@]}" --features python -- -D warnings
-python -m pytest -q tests/python/test_cluster*.py
+python -m pytest -q tests/python/cluster
 
 if [[ -x "$LKH/LKH" ]]; then
   SMOKE="bench/cluster/runs/smoke-linux-$OAR_JOB_ID"

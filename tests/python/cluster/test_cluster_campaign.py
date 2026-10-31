@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "bench"))
 from cluster.lib import campaign, fetch, hexaly, minizinc, report, runners
 from cluster.lib.hexaly import parse_rcp, psplib_text
