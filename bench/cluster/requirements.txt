@@ -1,0 +1,5 @@
+# Exact top-level versions used in the local harness qualification.
+# Cargo.lock pins Rust dependencies; each frozen plan hashes runtime artifacts.
+maturin==1.14.1
+ortools==9.15.6755
+pytest==9.1.1

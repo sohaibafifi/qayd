@@ -1,0 +1,33 @@
+{
+  "instances": [
+    {
+      "path": "bench/cluster/fixtures/model.mzn",
+      "data": [],
+      "family": "model",
+      "sense": "min",
+      "outputs": [
+        "x",
+        "y"
+      ],
+      "dependencies": [
+        "bench/cluster/fixtures/model.mzn"
+      ]
+    },
+    {
+      "path": "bench/cluster/fixtures/satisfy.mzn",
+      "data": [],
+      "family": "satisfy",
+      "sense": "satisfy",
+      "outputs": [
+        "x"
+      ],
+      "dependencies": [
+        "bench/cluster/fixtures/satisfy.mzn"
+      ]
+    }
+  ],
+  "assets": {
+    "bench/cluster/fixtures/model.mzn": "dd7475a4d5de67c9dd617964aefe3176ad4a203bbae7cce1fb5db3689817e93e",
+    "bench/cluster/fixtures/satisfy.mzn": "81fcbfd12a8fbf4afe07b6b2d59f342597848764e069eef53e59163bd72f0613"
+  }
+}

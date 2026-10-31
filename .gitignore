@@ -12,8 +12,7 @@ __pycache__/
 
 # Architecture and regression artefacts are source files, even when a global
 # user ignore file hides Markdown or test directories.
-!bench/golden/README.md
-!bench/parallel/README.md
+!bench/README.md
 !examples/python/csplib/README.md
 !examples/python/csplib/ROADMAP.md
 !tests/
@@ -29,3 +28,9 @@ __pycache__/
 # caches produced by pytest or unittest.
 tests/**/__pycache__/
 tests/**/*.py[cod]
+
+# Generated cluster tools, plans and results.
+/bench/cluster/runs/
+
+# Local scripts and retired workflows.
+/drafts/

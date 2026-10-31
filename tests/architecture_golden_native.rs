@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use qayd::model::{Constraint, IntExpr, IntVarRef, Model, ModelPackage, Objective, Relation};
 use qayd::orchestrator::{IgnoreEvents, SolveMode, SolveRequest, SolveStatus};
 
-const SPEC: &str = include_str!("../bench/golden/fixtures/rust_native.case");
+const SPEC: &str = include_str!("../bench/cluster/fixtures/rust_native.case");
 
 #[test]
 fn emits_native_golden_record() {

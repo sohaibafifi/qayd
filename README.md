@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://sohaibafifi.github.io/qayd/">Website</a> ·
   <a href="examples/python/">Python examples</a> ·
-  <a href="bench/README.md">Benchmarks</a>
+  <a href="bench/cluster/README.md">Benchmarks</a>
 </p>
 
 ## What It Is

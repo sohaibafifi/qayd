@@ -1,0 +1,5 @@
+<instance format="XCSP3" type="COP">
+  <variables><var id="x">0..4</var></variables>
+  <constraints><intension>ge(x,1)</intension></constraints>
+  <objectives><maximize>x</maximize></objectives>
+</instance>

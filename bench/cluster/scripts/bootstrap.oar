@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+#OAR -t idempotent
+#OAR -t besteffort
+# Pass resources and the CPU-only predicate to oarsub, outside this script.
+set -euo pipefail
+
+REPO=""
+JOBS=1
+MODE=build
+ACCEPT_LKH=0
+LP_FEATURE=0
+SCRATCH_ROOT="${TMPDIR:-/tmp}"
+while (($#)); do
+  case "$1" in
+    --repo) REPO=$2; shift 2 ;;
+    --jobs) JOBS=$2; shift 2 ;;
+    --prepare) MODE=prepare; shift ;;
+    --accept-lkh-academic-license) ACCEPT_LKH=1; shift ;;
+    --lp|--lp-feature) LP_FEATURE=1; shift ;;
+    --scratch-dir) SCRATCH_ROOT=$2; shift 2 ;;
+    *) printf 'Unknown argument: %s\n' "$1" >&2; exit 2 ;;
+  esac
+done
+if [[ -z "$REPO" ]]; then
+  REPO=$(cd "$(dirname "$0")" && pwd)
+  while [[ "$REPO" != / && ! -f "$REPO/Cargo.toml" ]]; do
+    REPO=$(dirname "$REPO")
+  done
+fi
+[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || { echo '--jobs must be positive' >&2; exit 2; }
+cd "$REPO"
+REPO=$(pwd -P)
+[[ -f Cargo.toml ]] || { echo 'The Qayd Cargo.toml is required' >&2; exit 2; }
+CARGO_MANIFEST=Cargo.toml
+if ((LP_FEATURE)); then
+  [[ -f integrations/amthal/Cargo.toml && -f ../amthal/Cargo.toml ]] || {
+    echo 'LP requires the private integrations/amthal workspace and an authorized sibling ../amthal checkout' >&2
+    exit 2
+  }
+  CARGO_MANIFEST=integrations/amthal/Cargo.toml
+fi
+CARGO_MANIFEST_ARGS=(--manifest-path "$CARGO_MANIFEST")
+[[ $(uname -sm) == 'Linux x86_64' ]] || { echo 'This installer targets Linux x86_64' >&2; exit 2; }
+if [[ "$MODE" == build && -z ${OAR_JOB_ID:-} ]]; then
+  echo 'The build stage requires an OAR allocation; use --prepare on the frontend.' >&2
+  exit 2
+fi
+export PATH="$HOME/.local/bin:$PATH"
+if [[ "$MODE" == prepare ]]; then
+  REQUIRED_TOOLS=(uv python3.12 curl git java sha256sum tar)
+else
+  REQUIRED_TOOLS=(git cc c++ make cmake java parallel)
+fi
+MISSING_TOOLS=()
+for tool in "${REQUIRED_TOOLS[@]}"; do
+  command -v "$tool" >/dev/null || MISSING_TOOLS+=("$tool")
+done
+if ((${#MISSING_TOOLS[@]})); then
+  printf 'Missing %s prerequisites: %s\n' "$MODE" "${MISSING_TOOLS[*]}" >&2
+  exit 2
+fi
+if [[ "$MODE" == prepare ]]; then
+  BOOTSTRAP_PYTHON=$(command -v python3.12)
+else
+  BOOTSTRAP_PYTHON="$REPO/.venv/bin/python"
+  [[ -x "$BOOTSTRAP_PYTHON" ]] || { echo 'Run --prepare on the frontend first: the shared Python environment is missing.' >&2; exit 2; }
+fi
+"$BOOTSTRAP_PYTHON" - "$JOBS" <<'PY'
+import os, sys
+version = os.confstr('CS_GNU_LIBC_VERSION').split()[1]
+if tuple(map(int, version.split('.'))) < (2, 34):
+    raise SystemExit(f'MiniZinc bundle needs GLIBC >= 2.34; node has {version}')
+if int(sys.argv[1]) > len(os.sched_getaffinity(0)):
+    raise SystemExit('Build concurrency exceeds CPU affinity')
+print('Node GLIBC:', version)
+PY
+printf 'Host: %s; mode: %s; OAR job: %s; build jobs: %s\n' "$(hostname)" "$MODE" "${OAR_JOB_ID:-none}" "$JOBS"
+printf 'Compile with lp-relaxation: %s\n' "$LP_FEATURE"
+printf 'Cargo workspace manifest: %s\n' "$CARGO_MANIFEST"
+
+TOOLS="$REPO/bench/cluster/runs/tools"
+DOWNLOADS="$TOOLS/downloads"
+MZN_NAME=MiniZincIDE-2.9.5-bundle-linux-x86_64
+CADICAL="$TOOLS/cadical-3.0.1"
+HGS="$REPO/bench/cluster/runs/tools/solvers/HGS-CVRP"
+LKH="$REPO/bench/cluster/runs/tools/solvers/LKH-3.0.13"
+mkdir -p "$DOWNLOADS"
+fetch() {
+  local url=$1 target=$2
+  if [[ ! -s "$target" ]]; then
+    curl --fail --location --retry 3 --connect-timeout 30 --max-time 900 \
+      --output "$target.part" "$url"
+    mv "$target.part" "$target"
+  fi
+}
+
+if [[ "$MODE" == prepare ]]; then
+  if [[ ! -x .venv/bin/python ]]; then
+    uv venv --python "$(command -v python3.12)" .venv
+  fi
+  uv pip install --python "$REPO/.venv/bin/python" -r bench/cluster/requirements.txt
+  export RUSTUP_HOME="$TOOLS/rustup" CARGO_HOME="$TOOLS/cargo" RUSTUP_TOOLCHAIN=1.92.0
+  export PATH="$CARGO_HOME/bin:$PATH"
+  if [[ ! -x "$CARGO_HOME/bin/rustup" ]]; then
+    fetch https://sh.rustup.rs "$DOWNLOADS/rustup-init.sh"
+    sh "$DOWNLOADS/rustup-init.sh" -y --no-modify-path --profile minimal \
+      --default-toolchain 1.92.0 --component rustfmt --component clippy
+  else
+    rustup toolchain install 1.92.0 --profile minimal --component rustfmt --component clippy
+  fi
+  fetch "https://github.com/MiniZinc/MiniZincIDE/releases/download/2.9.5/$MZN_NAME.tgz" "$DOWNLOADS/$MZN_NAME.tgz"
+  printf '%s  %s\n' 591f70e49e49ddead9a4c091ad2450f972abde8de3acdff544d3bed50b279e44 "$DOWNLOADS/$MZN_NAME.tgz" | sha256sum --check -
+  if [[ ! -x "$TOOLS/$MZN_NAME/bin/minizinc" ]]; then
+    tar -xzf "$DOWNLOADS/$MZN_NAME.tgz" -C "$TOOLS"
+  fi
+  if [[ ! -d "$CADICAL" ]]; then
+    git clone --depth 1 --branch rel-3.0.1 https://github.com/arminbiere/cadical.git "$CADICAL"
+  fi
+  if [[ ! -d "$HGS" ]]; then
+    git clone --depth 1 --branch v2.0.0 https://github.com/vidalt/HGS-CVRP.git "$HGS"
+  fi
+fi
+
+# Reusable activation, with paths derived from the extracted repository.
+printf 'QAYD_CAMPAIGN_ROOT=%q\n' "$REPO" > bench/cluster/runs/env.sh
+cat >> bench/cluster/runs/env.sh <<'ENV'
+source "$QAYD_CAMPAIGN_ROOT/.venv/bin/activate"
+export RUSTUP_HOME="$QAYD_CAMPAIGN_ROOT/bench/cluster/runs/tools/rustup"
+export CARGO_HOME="$QAYD_CAMPAIGN_ROOT/bench/cluster/runs/tools/cargo"
+export RUSTUP_TOOLCHAIN=1.92.0
+export PATH="$QAYD_CAMPAIGN_ROOT/bench/cluster/runs/tools/MiniZincIDE-2.9.5-bundle-linux-x86_64/bin:$QAYD_CAMPAIGN_ROOT/bench/cluster/runs/tools/cadical-3.0.1/build:$CARGO_HOME/bin:$PATH"
+ENV
+[[ -x .venv/bin/python && -x "$TOOLS/cargo/bin/rustup" ]] || {
+  echo 'Run --prepare before submitting the build job.' >&2; exit 2;
+}
+source bench/cluster/runs/env.sh
+python --version
+rustc --version
+java -version
+minizinc --version
+minizinc --solvers
+[[ $(git -C "$CADICAL" rev-parse HEAD) == c60730422e758ef1cebe7aeddf2dda31c996bf04 ]] || {
+  echo 'Unexpected CaDiCaL revision' >&2; exit 2;
+}
+git -C "$CADICAL" diff --quiet
+git -C "$CADICAL" diff --cached --quiet
+[[ $(git -C "$HGS" rev-parse HEAD) == b062d5fccb1f64864dd65a94dac35929059ab089 ]] || {
+  echo 'Unexpected HGS revision' >&2; exit 2;
+}
+
+if [[ "$MODE" == prepare ]]; then
+  python bench/cluster/lib/downloads/solvers.py
+  if ((ACCEPT_LKH)) && [[ ! -d "$LKH" ]]; then
+    python - <<'PY'
+import importlib.util, pathlib, subprocess, tarfile
+root = pathlib.Path.cwd()
+spec = importlib.util.spec_from_file_location('competitive_fetch', root/'bench/cluster/lib/downloads/routing.py')
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+archive = root/'bench/cluster/runs/tools/downloads/LKH-3.0.13.tgz'
+if not archive.exists():
+    subprocess.run(['curl', '--fail', '--location', '--retry', '3', '--max-time', '180',
+                    '--output', str(archive)+'.part', module.LKH_URL], check=True)
+    pathlib.Path(str(archive)+'.part').rename(archive)
+with tarfile.open(archive) as stream:
+    if any(pathlib.PurePosixPath(m.name).parts[0] != 'LKH-3.0.13' for m in stream.getmembers()):
+        raise SystemExit('Unexpected LKH archive layout')
+    stream.extractall(root/'bench/cluster/runs/tools/solvers', filter='data')
+PY
+  fi
+  cargo fetch --locked "${CARGO_MANIFEST_ARGS[@]}"
+  echo 'Downloads ready; the build stage can run in a CPU-only OAR allocation.'
+  exit 0
+fi
+
+export CARGO_BUILD_JOBS="$JOBS" CARGO_NET_OFFLINE=true RUST_TEST_THREADS="$JOBS"
+# Large temporary Rust objects belong on the allocated node, not in NFS HOME.
+mkdir -p "$SCRATCH_ROOT"
+BUILD_SCRATCH=$(mktemp -d "$SCRATCH_ROOT/qayd-${USER:-user}-${OAR_JOB_ID}.XXXXXX")
+cleanup_build() { rm -rf -- "$BUILD_SCRATCH"; }
+trap cleanup_build EXIT
+export TMPDIR="$BUILD_SCRATCH/tmp" CARGO_TARGET_DIR="$BUILD_SCRATCH/target"
+mkdir -p "$TMPDIR"
+export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+printf 'Temporary compilation directory: %s\n' "$BUILD_SCRATCH"
+if [[ ! -x "$CADICAL/build/cadical" ]]; then
+  (cd "$CADICAL"; ./configure; make -j "$JOBS")
+fi
+cadical --version
+python bench/cluster/lib/downloads/solvers.py --verify-only
+python bench/cluster/lib/downloads/routing.py --solver hgs --jobs "$JOBS"
+if [[ -d "$LKH" ]]; then
+  (cd "$LKH"; make -j "$JOBS")
+fi
+BUILD_FEATURES=()
+if ((LP_FEATURE)); then
+  BUILD_FEATURES=(--lp)
+fi
+cargo test --locked --workspace "${CARGO_MANIFEST_ARGS[@]}"
+python bench/cluster/lib/campaign.py build --target-dir "$CARGO_TARGET_DIR" \
+  --receipt bench/cluster/runs/build.json "${BUILD_FEATURES[@]}"
+cargo clippy --locked --workspace --all-targets "${CARGO_MANIFEST_ARGS[@]}" -- -D warnings
+cargo clippy --locked --workspace --all-targets "${CARGO_MANIFEST_ARGS[@]}" --features python -- -D warnings
+python -m pytest -q tests/python/test_cluster*.py
+
+if [[ -x "$LKH/LKH" ]]; then
+  SMOKE="bench/cluster/runs/smoke-linux-$OAR_JOB_ID"
+  if [[ ! -f "$SMOKE/plan.json" ]]; then
+    python bench/cluster/lib/campaign.py prepare --stage smoke \
+      --hgs "$HGS/build/hgs" --lkh "$LKH/LKH" --out "$SMOKE"
+  fi
+  python - "$SMOKE/plan.json" <<'PY'
+import json, subprocess, sys
+plan_path = sys.argv[1]
+plan = json.load(open(plan_path))
+for index in range(len(plan['tasks'])):
+    subprocess.run([sys.executable, 'bench/cluster/lib/campaign.py', 'run',
+                    '--plan', plan_path, '--task', str(index)], check=True)
+PY
+  python bench/cluster/lib/report.py --plan "$SMOKE/plan.json" --require-ready
+else
+  echo 'LKH is not installed; the complete routing smoke awaits its installation.'
+fi
+echo 'Toolchain and Qayd validation complete. Activate with: source bench/cluster/runs/env.sh'

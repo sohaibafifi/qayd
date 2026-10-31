@@ -1,0 +1,4 @@
+<instance format="XCSP3" type="CSP">
+  <variables><var id="x">0..1</var></variables>
+  <constraints><intension>eq(x,0)</intension><intension>eq(x,1)</intension></constraints>
+</instance>

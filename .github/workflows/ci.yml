@@ -66,17 +66,6 @@ jobs:
           uv run --no-sync python -c "import qayd._core"
           uv run --no-sync python -m pytest tests/python
 
-      - name: Test golden harness
-        run: python3 -m unittest discover -s bench/golden -p 'test_*.py'
-
-      - name: Test parallel regression harness
-        run: python3 -m unittest discover -s tests/python -p 'test_parallel_regression.py'
-
-      - name: Run architecture goldens
-        env:
-          UV_NO_SYNC: "true"
-        run: uv run --no-sync python bench/golden/run.py
-
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
