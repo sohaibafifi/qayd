@@ -23,7 +23,7 @@ def corpus_commands(config: dict) -> list[list[str]]:
         raise ValueError("SAT downloads are deferred in this campaign")
     # XCSP and PB are fetched against the official member hashes by corpus.py.
     if tracks & {"cvrp", "cvrptw", "jssp", "rcpsp"}:
-        commands.append(["bench/cluster/lib/downloads/collections.py", "--collection", "all"])
+        commands.append(["bench/cluster/lib/downloads/fetch_collections.py", "--collection", "all"])
     return commands
 
 

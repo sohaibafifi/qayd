@@ -62,6 +62,13 @@ CPU-only resources plus `idempotent` and `besteffort`. Repeating the command
 resumes compatible work. Source, binaries, inputs and configuration are frozen.
 The controller verifies an LP-enabled build receipt for the main comparison.
 
+You can also run several single-node OAR jobs, with GNU Parallel inside each job.
+
+```
+python bench/cluster run --out "$CAMPAIGN" --hexaly \
+  --jobs 4 --resource "/nodes=1" --workers auto \
+  --property "$CPU_ONLY_PROPERTY" --execute --detach
+  ```
 ## 3. Monitor
 
 ```bash

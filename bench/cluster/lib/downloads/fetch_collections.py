@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch the public instance collections used by the competitive campaign.
+"""Fetch the public benchmark collections without shadowing Python's stdlib.
 
 Downloads are explicit and idempotent.  Existing files are preserved.  Use
 ``--collection`` repeatedly to select only the desired families.

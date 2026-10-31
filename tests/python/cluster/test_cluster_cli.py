@@ -21,6 +21,17 @@ def test_public_help_uses_the_reorganized_modules_without_running_jobs(arguments
     assert not any(word in result.stdout for word in ("Contrôleur", "témoins", "préparation"))
 
 
+@pytest.mark.parametrize("script", ["fetch_collections.py", "routing.py", "solvers.py"])
+def test_downloaders_start_without_site_imports_from_another_directory(script, tmp_path):
+    # A fresh Linux interpreter may not have imported collections before the
+    # script starts. -S exposes sibling modules that shadow the standard library.
+    path = ROOT / "bench/cluster/lib/downloads" / script
+    result = subprocess.run([sys.executable, "-S", str(path), "--help"],
+                            cwd=tmp_path, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert "usage:" in result.stdout
+
+
 def test_observer_changes_do_not_change_frozen_source_identity(tmp_path, monkeypatch):
     monkeypatch.setattr(campaign, "ROOT", tmp_path)
     directory = tmp_path / "bench/cluster"
