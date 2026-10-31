@@ -27,7 +27,7 @@ does not add an LP feature to the public workspace.
 python3.12 bench/cluster prepare tools --lp
 source bench/cluster/runs/env.sh
 # Ritchie example: exclude entire GPU hosts.
-export CPU_ONLY_PROPERTY="gpudevices='-1'"
+export CPU_ONLY_PROPERTY="gpudevice='-1'"
 python bench/cluster prepare build --lp --cores 4 --walltime 02:00:00 \
   --property "$CPU_ONLY_PROPERTY" --scratch-dir "$QAYD_SCRATCH_DIR" --execute
 ```
