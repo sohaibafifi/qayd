@@ -149,6 +149,7 @@ git -C "$CADICAL" diff --cached --quiet
 }
 
 if [[ "$MODE" == prepare ]]; then
+  python bench/cluster/lib/install_cosoco.py
   python bench/cluster/lib/downloads/solvers.py
   if ((ACCEPT_LKH)); then
     python bench/cluster/lib/downloads/routing.py --solver lkh --download-only \
@@ -158,6 +159,8 @@ if [[ "$MODE" == prepare ]]; then
   echo 'Downloads ready; the build stage can run in a CPU-only OAR allocation.'
   exit 0
 fi
+
+python bench/cluster/lib/install_cosoco.py --verify-only
 
 export CARGO_BUILD_JOBS="$JOBS" CARGO_NET_OFFLINE=true RUST_TEST_THREADS="$JOBS"
 # Large temporary Rust objects belong on the allocated node, not in NFS HOME.

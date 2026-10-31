@@ -35,12 +35,9 @@ def prepare(args, settings, driver):
     if descriptor.exists():
         extension = driver.read(descriptor)
         driver.verify_files(extension["artifacts"])
-        if args.cosoco and str(args.cosoco.resolve()) != extension["binary"]:
-            raise ValueError("CoSoCo changed; use a separate campaign for another binary")
         return extension
-    binary = (args.cosoco or args.repo / "bench/cluster/runs/tools/cosoco-2.6.1/runtime/cosoco_bin/cosoco").resolve()
-    if not binary.is_file() or not os.access(binary, os.X_OK):
-        raise ValueError("provide --cosoco <executable>; no solver is installed automatically")
+    from cluster.lib.install_cosoco import VERSION, verify
+    binary = verify(args.repo / f"bench/cluster/runs/tools/cosoco-{VERSION}").resolve()
     parents = {stage: args.out / PARENT / stage / "plan.json" for stage in ("smoke", "gate", "full")}
     plans = {stage: campaign.load_plan(path) for stage, path in parents.items()}
     for plan in plans.values():
@@ -346,7 +343,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--out", type=Path, default=Path("bench/cluster/runs/next-v2"))
-    parser.add_argument("--cosoco", type=Path)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--detach", action="store_true")
     parser.add_argument("--replace-controller", type=int)

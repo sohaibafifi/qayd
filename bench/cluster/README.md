@@ -79,6 +79,7 @@ binaries, inputs and configuration are frozen. After code or binary changes,
 repeat the build step and choose a new `--out` directory for a clean campaign.
 The controller verifies an LP-enabled build receipt for the direct comparisons.
 
+
 You can also run several single-node OAR jobs, with GNU Parallel inside each job.
 
 ```bash

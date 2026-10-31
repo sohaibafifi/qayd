@@ -122,6 +122,8 @@ cargo() {
     assert "--manifest-path integrations/amthal/Cargo.toml" in records[0][4]
     build = next(line for line in python_trace.read_text().splitlines() if "campaign.py build" in line)
     assert f"--target-dir {records[0][0]}" in build and "--lp" in build
+    installer_calls = [line for line in python_trace.read_text().splitlines() if "install_cosoco.py" in line]
+    assert installer_calls == ["bench/cluster/lib/install_cosoco.py --verify-only"]
     assert not list(scratch.iterdir())
     assert cached.read_text() == "preexisting cache"
 

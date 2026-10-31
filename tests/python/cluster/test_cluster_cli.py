@@ -19,6 +19,7 @@ def test_public_help_uses_the_reorganized_modules_without_running_jobs(arguments
                             cwd=ROOT, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert "usage:" in result.stdout
+    assert "--cosoco" not in result.stdout
     assert not any(word in result.stdout for word in ("Contrôleur", "témoins", "préparation"))
 
 

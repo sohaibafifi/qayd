@@ -52,12 +52,18 @@ def audit(plan: dict, directory: Path) -> dict:
         if any(arm.get("plan_sha256") != plan["sha256"] or arm.get("task_key") != task["key"] for arm in arms):
             errors.append(f"incompatible arm provenance in task {index}")
             continue
+        if "solver_seeds" in task and any(
+                "seed" not in arm or arm["seed"] != task["solver_seeds"][arm["solver"]]
+                for arm in arms):
+            errors.append(f"incompatible solver seed in task {index}")
+            continue
         for arm in arms:
             if arm["status"] in ("ERROR", "INVALID") or arm["validation"].get("valid") is False:
                 errors.append(f"task {index}: {arm['solver']} {arm['status']}")
             rows.append({**arm, "task": index, "track": task["item"]["track"],
                          "family": task["item"]["family"], "instance": task["item"]["id"],
-                         "seed": task["seed"], "budget": task["seconds"]})
+                         "seed": arm.get("seed", task["seed"]), "reference_seed": task["seed"],
+                         "budget": task["seconds"]})
         feasible = [arm for arm in arms if arm.get("has_incumbent")]
         if feasible and any(arm["status"] == "UNSAT" for arm in arms):
             contradictions.append({"task": index, "reason": "UNSAT-versus-verified-witness"})
@@ -75,10 +81,44 @@ def audit(plan: dict, directory: Path) -> dict:
                     contradictions.append({"task": index, "reason": "better-verified-solution-than-claimed-optimum",
                                            "solver": arm["solver"], "other": other["solver"]})
                 if arm["solver"].startswith("qayd") and not other["solver"].startswith("qayd"):
+                    seed = arm.get("seed", task["seed"])
+                    other_seed = other.get("seed", task["seed"])
+                    paired = seed == other_seed
+                    if not paired:
+                        warning = f"task {index}: {other['solver']} is unseeded; quality comparison uses reference seed {seed}"
+                        if warning not in pairing_warnings:
+                            pairing_warnings.append(warning)
                     comparisons.append({"task": index, "track": task["item"]["track"],
                                         "solver": arm["solver"], "baseline": other["solver"],
+                                        "seed": seed, "baseline_seed": other_seed, "seed_paired": paired,
                                         "outcome": "tie" if a == b else "loss" if better else "win",
                                         "same_fleet": a[0] == b[0] if len(a) == 2 else None})
+    # Unseeded comparators run once, but their proof claims must be consistent
+    # with witnesses from every seeded repetition, not just the reference one.
+    per_instance = defaultdict(list)
+    for row in rows:
+        per_instance[(row["track"], row["instance"])].append(row)
+    for group in per_instance.values():
+        feasible = [row for row in group if row.get("has_incumbent")]
+        for row in group:
+            if row["status"] == "UNSAT" and any(other["task"] != row["task"] for other in feasible):
+                contradictions.append({"task": row["task"], "solver": row["solver"],
+                                       "reason": "UNSAT-versus-verified-witness-across-repetitions"})
+            if row["status"] != "OPTIMUM" or not row.get("has_incumbent"):
+                continue
+            a = vector(row.get("objective"))
+            if a is None:
+                continue
+            task = plan["tasks"][row["task"]]
+            for other in feasible:
+                b = vector(other.get("objective"))
+                if other["task"] == row["task"] or b is None:
+                    continue
+                better = b > a if task["item"]["sense"] == "max" else b < a
+                if better:
+                    contradictions.append({"task": row["task"], "solver": row["solver"],
+                                           "other_task": other["task"], "other": other["solver"],
+                                           "reason": "better-verified-solution-than-claimed-optimum-across-repetitions"})
     grouped = defaultdict(list)
     for row in rows:
         grouped[(row["track"], row["family"], row["solver"])].append(row)

@@ -22,6 +22,8 @@ SUMMARY_FIELDS = {
     "bound_method", "objective_convention", "best_known", "anytime", "profile",
     "parse_error", "diagnostic", "elapsed_seconds", "elapsed_total_seconds",
     "preparation_seconds", "solver_engine", "solver_library_version", "validation",
+    "engine", "engine_requested", "schedule_jssp_search", "schedule_cdcl_requested",
+    "search_engine", "schedule_execution_phase",
 }
 
 
@@ -38,13 +40,19 @@ def measure(argv: list[str], seconds: int, memory: int, grace: float, stem: Path
     return result
 
 
-def domain_arguments(runtime: dict, plan: dict) -> argparse.Namespace:
+def domain_arguments(runtime: dict, plan: dict, track: str | None = None) -> argparse.Namespace:
+    # Missing options preserve the semantics of old frozen plans. Fresh plans
+    # declare their JSSP policy explicitly in the hashed configuration.
+    options = plan.get("config", {}).get("model_options", {}).get(track, {})
+    threads = options.get("threads", plan["threads"])
+    if track == "jssp" and options and threads != plan["threads"]:
+        raise ValueError("plan threads differ from its JSSP policy")
     return argparse.Namespace(
-        threads=plan["threads"], qayd_engine="auto", memory_limit_mb=plan["memory_mb"],
+        threads=threads, qayd_engine=options.get("engine", "auto"), memory_limit_mb=plan["memory_mb"],
         max_iterations=None, profile_qayd=False, routing_two_way=True,
         routing_nearest_neighbor=True, routing_warm_start=True,
         qayd_schedule_path_relink=False, qayd_schedule_lns_shadow=False,
-        qayd_schedule_constructor_workers=0, qayd_schedule_jssp_search="legacy",
+        qayd_schedule_constructor_workers=0, qayd_schedule_jssp_search=options.get("schedule_jssp_search", "legacy"),
         hexaly_home=runtime.get("hexaly_home"),
         hexaly_license_path=runtime.get("hexaly_license_path"),
         hgs_binary=runtime.get("hgs"), lkh_binary=runtime.get("lkh"),
@@ -53,13 +61,19 @@ def domain_arguments(runtime: dict, plan: dict) -> argparse.Namespace:
 
 def command(solver: str, item: dict, task: dict, plan: dict, instance: Path) -> list[str]:
     runtime = plan["runtime"]
-    seconds, seed = task["seconds"], task["seed"]
+    seconds = task["seconds"]
+    seed = task.get("solver_seeds", {}).get(solver, task["seed"])
     root = Path(plan["root"])
     memory = plan["memory_mb"]
     java = [runtime.get("java", "java"), "-XX:ActiveProcessorCount=1",
             f"-Xmx{max(128, memory // 2)}m", "-XX:CompressedClassSpaceSize=256m",
             "-XX:ReservedCodeCacheSize=128m"]
     if item["track"].startswith("xcsp"):
+        if solver == "cosoco":
+            if seed is not None:
+                raise ValueError("CoSoCo requires an explicitly unseeded arm")
+            return [runtime["cosoco"], str(instance), f"-cpu_lim={seconds}",
+                    "-nbcores=1", "-model=2", "-colors=0"]
         if solver == "qayd":
             return [runtime["qayd"], "-t", str(seconds), "--threads", "1",
                     "--seed", str(seed), "--mem-limit", str(memory), "--verbose", str(instance)]
@@ -88,7 +102,7 @@ def command(solver: str, item: dict, task: dict, plan: dict, instance: Path) -> 
         return [*argv, str(instance), *[str(root / p) for p in item.get("data", [])]]
     argv = domain_campaign.command_for(
         solver, {"problem": item["track"], "path": instance}, seconds, seed,
-        domain_arguments(runtime, plan),
+        domain_arguments(runtime, plan, item["track"]),
     )
     argv[0] = runtime["python"]
     if solver.startswith("qayd-") and item["track"] in {"cvrp", "cvrptw"}:
@@ -127,6 +141,14 @@ def run_arm(solver: str, item: dict, task: dict, plan: dict, directory: Path) ->
                     result["best_known"] = domain_campaign.adjacent_best_known(root / item["path"])
                 validation = {"valid": True if result["verified"] else None,
                               "reason": "dataset-replay" if result["verified"] else "no-verified-witness"}
+                requested = plan.get("config", {}).get("model_options", {}).get(item["track"], {})
+                if solver.startswith("qayd-") and requested.get("schedule_jssp_search") == "tsab-adaptive":
+                    selectors_reported = "engine" in raw or "schedule_jssp_search" in raw
+                    if (validation["valid"] is True or selectors_reported) and (
+                            raw.get("engine") != "ls" or raw.get("schedule_jssp_search") != "tsab-adaptive"):
+                        status = "ERROR"
+                        result["parse_error"] = "returned JSSP selectors differ from the frozen adaptive policy"
+                        validation = {"valid": None, "reason": "model-policy-mismatch"}
             except (ValueError, KeyError, TypeError) as error:
                 result = {"parse_error": str(error)}
                 status = "ERROR"
@@ -173,6 +195,7 @@ def run_arm(solver: str, item: dict, task: dict, plan: dict, directory: Path) ->
         solved = status == "UNSAT" or (valid and (decision or status == "OPTIMUM"))
         return {
             "solver": solver, "status": status, "claimed_status": measured["claimed_status"],
+            "seed": task.get("solver_seeds", {}).get(solver, task["seed"]),
             "objective": objective if valid else None, "validation": validation,
             "solved": solved, "has_incumbent": valid,
             "proof_checked": False, "proof_claimed": status in ("UNSAT", "OPTIMUM"),

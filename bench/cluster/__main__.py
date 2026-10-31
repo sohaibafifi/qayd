@@ -31,7 +31,7 @@ def parser():
         command = steps.add_parser(name, add_help=False, help=help_text)
         command.set_defaults(target=target, prefix=prefix)
     run = actions.add_parser("run", add_help=False, help="run or resume the bounded OAR controller")
-    run.add_argument("--add-cosoco", action="store_true", help="add a CoSoCo-only FAST COP supplement")
+    run.add_argument("--add-cosoco", action="store_true", help="legacy: supplement an older frozen FAST COP campaign")
     run.set_defaults(target="lib.controller", prefix=[])
     for name, target, help_text in (
         ("status", "status", "show live progress, results and remaining budgets"),

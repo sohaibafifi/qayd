@@ -27,10 +27,11 @@ sys.path.insert(0, str(ROOT / "bench"))
 from cluster.lib.adapters.records import sha256_file
 from cluster.lib.adapters.instances import opener
 from cluster.lib.adapters.xcsp import ManifestError, detect_objective_sense, family_for
-from cluster.lib import minizinc
+from cluster.lib import install_cosoco, minizinc
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config/campaign.v1.json"
 MODEL_TRACKS = {"cvrp", "cvrptw", "jssp", "rcpsp"}
+JSSP_SEARCHES = {"legacy", "tsab-candidate", "tsab-multi-candidate", "tsab-adaptive"}
 
 
 def validate_config(config: dict) -> None:
@@ -38,9 +39,9 @@ def validate_config(config: dict) -> None:
         raise ValueError("unsupported config schema")
     if not config.get("datasets"):
         raise ValueError("configuration must declare datasets")
-    allowed = {"xcsp-csp": {"qayd", "ace", "ace-rr", "choco"},
-               "xcsp-cop": {"qayd", "ace", "ace-rr", "choco"},
-               "xcsp-fastcop": {"qayd", "ace", "ace-rr", "choco"},
+    allowed = {"xcsp-csp": {"qayd", "ace", "ace-rr", "choco", "cosoco"},
+               "xcsp-cop": {"qayd", "ace", "ace-rr", "choco", "cosoco"},
+               "xcsp-fastcop": {"qayd", "ace", "ace-rr", "choco", "cosoco"},
                "sat": {"qayd-sat", "cadical"}, "pb": {"qayd-pb", "sat4j"},
                "minizinc": {"qayd-fzn", "gecode", "chuffed"},
                "cvrp": {"qayd-api", "qayd-native", "hgs", "lkh"},
@@ -65,6 +66,19 @@ def validate_config(config: dict) -> None:
     grace = config.get("grace_seconds")
     if not isinstance(grace, (int, float)) or not math.isfinite(grace) or grace < 0:
         raise ValueError("grace_seconds must be finite and non-negative")
+    model_options = config.get("model_options", {})
+    if not isinstance(model_options, dict) or set(model_options) - {"jssp"}:
+        raise ValueError("unsupported model options")
+    if "jssp" in model_options:
+        options = model_options["jssp"]
+        if not isinstance(options, dict) or set(options) != {"engine", "schedule_jssp_search", "threads"}:
+            raise ValueError("JSSP options must declare engine, schedule_jssp_search and threads")
+        if options["engine"] not in {"auto", "ls", "exact"} or options["schedule_jssp_search"] not in JSSP_SEARCHES:
+            raise ValueError("unsupported JSSP engine or search strategy")
+        if type(options["threads"]) is not int or options["threads"] <= 0:
+            raise ValueError("JSSP threads must be a positive integer")
+        if options["schedule_jssp_search"] == "tsab-adaptive" and (options["engine"] != "ls" or options["threads"] != 1):
+            raise ValueError("tsab-adaptive requires engine=ls and threads=1")
 
 
 def digest(value) -> str:
@@ -138,6 +152,14 @@ def package_files(name: str) -> dict[str, str]:
             and Path(distribution.locate_file(path)).is_file()}
 
 
+def cosoco_artifacts(binary: Path) -> dict[str, str]:
+    """Freeze the installed official runtime and its download receipt."""
+    runtime = binary.resolve().parent.parent
+    paths = {path.resolve() for path in runtime.rglob("*") if path.is_file()}
+    paths.add(runtime.parent / "download.json")
+    return {str(path): sha256_file(path) for path in sorted(paths)}
+
+
 def runtime_identity(config: dict, items: list[dict], directory: Path, args) -> dict:
     solvers = {solver for item in items for solver in config["solvers"][item["track"]]}
     runtime = {"python": str(Path(sys.executable).absolute())}
@@ -146,7 +168,7 @@ def runtime_identity(config: dict, items: list[dict], directory: Path, args) -> 
         if solver in solvers:
             runtime[solver] = executable(str(ROOT / "target/release" / solver))
             paths.add(runtime[solver])
-    if any(solver in solvers for solver in ("qayd", "ace", "ace-rr", "choco", "sat4j")):
+    if any(solver in solvers for solver in ("qayd", "ace", "ace-rr", "choco", "sat4j", "cosoco")):
         runtime["java"] = executable(args.java)
         paths.add(runtime["java"])
     jars = {"ace": "ACE-2.5.jar", "choco": "choco-xcsp25.jar",
@@ -164,6 +186,10 @@ def runtime_identity(config: dict, items: list[dict], directory: Path, args) -> 
     if "cadical" in solvers:
         runtime["cadical"] = executable(args.cadical)
         paths.add(runtime["cadical"])
+    if "cosoco" in solvers:
+        candidate = install_cosoco.verify(ROOT / f"bench/cluster/runs/tools/cosoco-{install_cosoco.VERSION}")
+        runtime["cosoco"] = executable(str(candidate))
+        paths.update(cosoco_artifacts(Path(runtime["cosoco"])))
     if "qayd-fzn" in solvers or "gecode" in solvers or "chuffed" in solvers:
         runtime["minizinc"] = executable(args.minizinc)
         paths.add(runtime["minizinc"])
@@ -367,9 +393,17 @@ def tasks_for(items: list[dict], config: dict, stage: str) -> list[dict]:
     for item in items:
         seeds = [None] if item["track"] in {"pb", "minizinc"} else (
             [0] if stage != "full" else config["protocols"][item["track"]].get("seeds", config["seeds"]))
-        for seed in seeds:
+        solvers = config["solvers"][item["track"]]
+        # CoSoCo's CLI has no seed option, so repeating it adds no seeded run.
+        unseeded = set(solvers) & {"cosoco"}
+        for repetition, seed in enumerate(seeds):
+            arms = [solver for solver in solvers if solver not in unseeded or repetition == 0]
+            if not arms:
+                continue
             task = {"item": item, "seconds": budget(item, config, stage), "seed": seed,
-                    "solvers": config["solvers"][item["track"]]}
+                    "solvers": arms}
+            if unseeded:
+                task["solver_seeds"] = {solver: None if solver in unseeded else seed for solver in arms}
             task["key"] = digest(task)
             tasks.append(task)
     return sorted(tasks, key=lambda task: task["key"])
@@ -472,6 +506,9 @@ def build(args) -> None:
 def prepare(args) -> None:
     config = read(args.config)
     validate_config(config)
+    jssp = config.get("model_options", {}).get("jssp")
+    if jssp and any(item["track"] == "jssp" for item in config["datasets"]) and args.threads != jssp["threads"]:
+        raise ValueError("--threads differs from the frozen JSSP policy")
     if args.stage == "smoke":
         config = smoke_config(config)
     items, assets, missing = discover(config)

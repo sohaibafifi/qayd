@@ -7,6 +7,9 @@
   "checker_memory_mb": 4096,
   "checker_seconds": 120,
   "grace_seconds": 2,
+  "model_options": {
+    "jssp": {"engine": "ls", "schedule_jssp_search": "tsab-adaptive", "threads": 1}
+  },
   "protocols": {
     "xcsp-csp": {"seconds": 1800, "seeds": [0], "reference": "XCSP 2025 standard track"},
     "xcsp-cop": {"seconds": 1800, "seeds": [0], "reference": "XCSP 2025 standard track"},
@@ -20,9 +23,9 @@
     "rcpsp": {"seconds": 600, "reference": "Adapted common wall budget"}
   },
   "solvers": {
-    "xcsp-csp": ["qayd", "ace", "choco"],
-    "xcsp-cop": ["qayd", "ace-rr", "choco"],
-    "xcsp-fastcop": ["qayd", "ace-rr", "choco"],
+    "xcsp-csp": ["qayd", "ace", "choco", "cosoco"],
+    "xcsp-cop": ["qayd", "ace-rr", "choco", "cosoco"],
+    "xcsp-fastcop": ["qayd", "ace-rr", "choco", "cosoco"],
     "minizinc": ["qayd-fzn", "gecode", "chuffed"],
     "sat": ["qayd-sat", "cadical"],
     "pb": ["qayd-pb", "sat4j"],

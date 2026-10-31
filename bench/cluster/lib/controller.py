@@ -357,6 +357,11 @@ def initial_settings(args, root, out):
     driver = out / "driver.py"
     driver.write_bytes(Path(__file__).read_bytes())
     files.update({str(driver): sha(driver), str(config_path): sha(config_path)})
+    tracks = {dataset["track"] for dataset in base["datasets"]}
+    needs_cosoco = any("cosoco" in base["solvers"].get(track, []) for track in tracks)
+    if needs_cosoco:
+        binary = campaign.install_cosoco.verify(root / f"bench/cluster/runs/tools/cosoco-{campaign.install_cosoco.VERSION}")
+        files.update(campaign.cosoco_artifacts(binary))
     lkh = args.lkh or os.environ.get("LKH_BINARY") or root / "bench/cluster/runs/tools/solvers/LKH-3.0.13/LKH"
     hgs = args.hgs or os.environ.get("HGS_BINARY") or root / "bench/cluster/runs/tools/solvers/HGS-CVRP/build/hgs"
     if not Path(hgs).is_file() or not os.access(hgs, os.X_OK):

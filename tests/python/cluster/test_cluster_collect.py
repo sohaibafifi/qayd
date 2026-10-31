@@ -110,3 +110,42 @@ def test_export_cannot_overwrite_a_stage_and_missing_profiles_fail_closed(tmp_pa
         collect.collect(tmp_path / "campaign", tmp_path / "exports", profiles=["absent"])
     with pytest.raises(ValueError, match="no latest plans"):
         collect.collect(tmp_path / "empty", tmp_path / "exports")
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_exports_preserve_unseeded_cosoco_runs_for_complete_and_partial_tasks(tmp_path, complete):
+    task = {"key": "unseeded", "seed": 0, "seconds": 180, "solvers": ["qayd", "cosoco"],
+            "solver_seeds": {"qayd": 0, "cosoco": None},
+            "item": {"id": "case", "family": "f", "track": "xcsp-fastcop", "sense": "min"}}
+    plan = {"root": "/another/checkout", "source": {"sha256": "source"},
+            "environment": "environment", "stage": "full", "tasks": [task]}
+    plan["sha256"] = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    directory = tmp_path / "campaign/main/full"
+    write(directory / "plan.json", plan)
+    def arm(solver):
+        return {"solver": solver, "task_key": task["key"], "plan_sha256": plan["sha256"],
+                "seed": task["solver_seeds"][solver],
+                "status": "SAT", "objective": 10, "has_incumbent": True, "validation": {"valid": True},
+                "solved": False, "wall_seconds": 1, "par2": 360, "details": {}}
+    if complete:
+        write(directory / "tasks/0000000/result.json", {
+            "complete": True, "task_key": task["key"], "plan_sha256": plan["sha256"],
+            "arms": [arm(solver) for solver in task["solvers"]]})
+    else:
+        write(directory / "tasks/0000000/cosoco.json", arm("cosoco"))
+    destination = tmp_path / "exports"
+    summary = collect.collect(tmp_path / "campaign", destination)
+    assert not summary["profiles"][0]["errors"]
+    rows = [json.loads(line) for line in (destination / "results.jsonl").read_text().splitlines()]
+    row = next(row for row in rows if row["solver"] == "cosoco")
+    assert row["seed"] is None and row["reference_seed"] == 0
+    assert row["task_complete"] is complete
+    csv_rows = list(csv.DictReader((destination / "results.csv").read_text().splitlines()))
+    exported = next(row for row in csv_rows if row["solver"] == "cosoco")
+    assert exported["seed"] == "" and exported["reference_seed"] == "0"
+    if not complete:
+        changed = arm("cosoco")
+        changed["seed"] = 0
+        write(directory / "tasks/0000000/cosoco.json", changed)
+        rows, errors = collect.partial_records(plan, directory)
+        assert not rows and any("solver seed" in error for error in errors)

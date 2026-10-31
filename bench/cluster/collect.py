@@ -16,7 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from cluster.status import plan_at
 from cluster.lib import report
 
-COLUMNS = ("profile", "stage", "track", "family", "instance", "seed", "solver", "status", "objective",
+COLUMNS = ("profile", "stage", "track", "family", "instance", "seed", "reference_seed",
+           "solver", "status", "objective",
            "has_incumbent", "validation", "solved", "wall_seconds", "cpu_seconds", "peak_rss_kb", "budget",
            "par2", "timed_out", "task_complete", "plan_sha256", "task_key", "source_sha256", "hostname",
            "oar_job_id", "stdout", "stderr")
@@ -62,11 +63,16 @@ def partial_records(plan, directory):
                     or arm.get("plan_sha256") != plan["sha256"] or arm.get("task_key") != task["key"]):
                 errors.append(f"incompatible partial arm: {path}")
                 continue
+            if "solver_seeds" in task and (
+                    "seed" not in arm or arm["seed"] != task["solver_seeds"][solver]):
+                errors.append(f"incompatible partial solver seed: {path}")
+                continue
             if arm.get("status") in {"ERROR", "INVALID"} or arm.get("validation", {}).get("valid") is False:
                 errors.append(f"task {index}: {solver} {arm.get('status')}")
             rows.append({**arm, "task": index, "track": task["item"]["track"],
                          "family": task["item"]["family"], "instance": task["item"]["id"],
-                         "seed": task["seed"], "budget": task["seconds"], "task_complete": False})
+                         "seed": arm.get("seed", task["seed"]), "reference_seed": task["seed"],
+                         "budget": task["seconds"], "task_complete": False})
     return rows, errors
 
 
