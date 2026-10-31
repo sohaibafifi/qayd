@@ -1,6 +1,6 @@
 name: Release
 
-# Build the `qayd` binary for every supported target and publish a GitHub
+# Build LP-enabled binaries for every supported target and publish a GitHub
 # Release with the archives attached. Fires on version tags, e.g. `v0.1.0`.
 on:
   push:
@@ -47,6 +47,19 @@ jobs:
             os: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: qayd
+          persist-credentials: false
+
+      - name: Checkout private Amthal backend
+        uses: actions/checkout@v4
+        with:
+          repository: sohaibafifi/amthal
+          # Pin the API with LpSession for reproducible builds on every target.
+          ref: 24a560ab7f0d8de92a7be8a99c98aa3a0cfad675
+          token: ${{ secrets.AMTHAL_READ_TOKEN }}
+          path: amthal
+          persist-credentials: false
 
       # Builds `--release --target <target>` (using `cross` for the Linux ARM
       # target), archives the binaries as .tar.gz / .zip, writes a .sha256,
@@ -58,9 +71,11 @@ jobs:
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: qayd,qayd-fzn,qayd-sat,qayd-pb
+          manifest-path: qayd/integrations/amthal/Cargo.toml
+          features: lp-relaxation
           target: ${{ matrix.target }}
           archive: qayd-$tag-$target
-          include: README.md,LICENSE
+          include: qayd/README.md,qayd/LICENSE
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
 
