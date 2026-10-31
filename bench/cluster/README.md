@@ -90,6 +90,4 @@ are retained. Collection also accepts locally accessible copies of old results;
 it does not rerun solvers or rewrite their plans and qualifications.
 Use `--stage full`, `--profile NAME`, `--dest DIR` or `--require-ready` as needed.
 
-Use `--help` after any command for options. Existing campaigns on Ritchie keep
-their original checkout and frozen controller; this reorganization is for new
-builds. Detailed internal notes live in `../../.agents/benchmarking`.
+Use `--help` after any command for options. 
