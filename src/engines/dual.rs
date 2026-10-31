@@ -2301,6 +2301,12 @@ fn schedule_bound(schedule: &crate::model::list::Schedule, stop: &AtomicBool) ->
                 if mode_index.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
                     return None;
                 }
+                // The critical-path and workload relaxations below use time
+                // zero as a lower bound. Signed execution windows need a
+                // release-aware relaxation before this value can prune search.
+                if mode.start_window.0 < 0 {
+                    return None;
+                }
                 shortest = shortest.min(mode.duration);
             }
             shortest
@@ -2393,7 +2399,38 @@ fn schedule_bound(schedule: &crate::model::list::Schedule, stop: &AtomicBool) ->
                 }
                 i64::try_from((energy + i128::from(*capacity) - 1) / i128::from(*capacity)).ok()?
             }
-            Resource::Cumulative { .. } | Resource::MachineNoOverlap => 0,
+            Resource::MachineNoOverlap => {
+                let mut loads = HashMap::<usize, i64>::new();
+                for (index, interval) in schedule.intervals.iter().enumerate() {
+                    if index.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+                        return None;
+                    }
+                    if interval.optional {
+                        continue;
+                    }
+                    let Some(first) = interval.modes.first() else {
+                        continue;
+                    };
+                    let mut forced_machine = true;
+                    for (mode_index, mode) in interval.modes.iter().enumerate() {
+                        if mode_index.is_multiple_of(1_024) && stop.load(Ordering::Relaxed) {
+                            return None;
+                        }
+                        if mode.machine != first.machine {
+                            forced_machine = false;
+                            break;
+                        }
+                    }
+                    if forced_machine {
+                        // Modes are alternatives, so count each mandatory
+                        // operation once at its minimum possible duration.
+                        let load = loads.entry(first.machine).or_default();
+                        *load = load.checked_add(durations[index])?;
+                    }
+                }
+                loads.values().copied().max().unwrap_or(0)
+            }
+            Resource::Cumulative { .. } => 0,
         };
         bound = bound.max(resource_bound);
     }

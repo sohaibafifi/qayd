@@ -301,21 +301,21 @@ fn translate_premises_with_constants(atoms: &AtomTable, premises: &[Premise], re
     Some(lits)
 }
 
-/// Antecedent literals for an event's [`Cause`]: tight premises if supplied,
-/// else the pre-propagator whole-scope snapshot.
-fn cause_lits(atoms: &AtomTable, cause: &Cause, fallback: &[ScopeVar]) -> Vec<Lit> {
+/// Translate an event's preferred reason. `None` requests the invocation's
+/// pre-propagator scope snapshot, which can be shared by all eager fallbacks.
+fn preferred_cause_lits(atoms: &AtomTable, cause: &Cause) -> Option<Vec<Lit>> {
     match cause {
-        Cause::Premises(p) => translate_premises(atoms, p).unwrap_or_else(|| build_ds(atoms, fallback)),
-        Cause::Scope => build_ds(atoms, fallback),
+        Cause::Premises(p) => translate_premises(atoms, p),
+        Cause::Scope => None,
         Cause::Deferred(reason) => {
             if let Some(handle) = reason.metrics() {
                 handle.request(false);
             }
             let premises = reason.expand_lcg();
             if premises.len() > reason.max_premises() {
-                build_ds(atoms, fallback)
+                None
             } else {
-                translate_deferred_premises(atoms, &premises).unwrap_or_else(|| build_ds(atoms, fallback))
+                translate_deferred_premises(atoms, &premises)
             }
         }
     }
@@ -427,8 +427,12 @@ pub struct Cdcl<'s> {
     conflict_scope: Vec<ScopeVar>,
     /// Reusable scratch for variables touched by one buffered FD step.
     changed_vars: Vec<VarId>,
-    /// Reusable scratch for atoms allocated for one variable.
-    atom_scratch: Vec<Atom>,
+    /// Reusable snapshot of atoms and immutable meanings for one variable.
+    atom_scratch: Vec<(Atom, AtomKind)>,
+    /// Determined atoms awaiting their common pre-sync reason.
+    sync_todo: Vec<Lit>,
+    #[cfg(test)]
+    sync_reference: Option<for<'a> fn(&mut Cdcl<'a>, VarId)>,
     /// Index into `trail` of the next literal whose watches need processing.
     qhead: usize,
     /// VSIDS per-variable activity (indexed by `VarId`); read by the branching heuristic.
@@ -594,6 +598,9 @@ impl<'s> Cdcl<'s> {
             conflict_scope: Vec::new(),
             changed_vars: Vec::new(),
             atom_scratch: Vec::new(),
+            sync_todo: Vec::new(),
+            #[cfg(test)]
+            sync_reference: None,
             qhead: 0,
             activity: vec![0.0; nvars],
             var_inc: 1.0,
@@ -1034,27 +1041,31 @@ impl<'s> Cdcl<'s> {
     /// The currently-recorded atoms of `var`, each as the literal matching its
     /// trail truth. This conjunction is a sound, recorded antecedent for any of
     /// `var`'s determined-but-unrecorded atoms, and bottoms out 1-UIP analysis.
-    fn ds_recorded(&self, var: VarId) -> Vec<Lit> {
+    fn ds_recorded(&self) -> Vec<Lit> {
         let mut lits = Vec::new();
-        let push_if_recorded = |loc: LitOrConst, out: &mut Vec<Lit>| {
-            if let LitOrConst::Lit(l) = loc {
-                match self.tval.get(l.atom() as usize).copied().unwrap_or(Tri::Unknown) {
-                    Tri::True => out.push(Lit::positive(l.atom())),
-                    Tri::False => out.push(Lit::negative(l.atom())),
-                    Tri::Unknown => {}
-                }
+        for &(atom, _) in &self.atom_scratch {
+            match self.tval.get(atom as usize).copied().unwrap_or(Tri::Unknown) {
+                Tri::True => lits.push(Lit::positive(atom)),
+                Tri::False => lits.push(Lit::negative(atom)),
+                Tri::Unknown => {}
             }
-        };
-        if self.atoms.is_sign(var) {
-            push_if_recorded(self.atoms.ge(var, 1), &mut lits);
-            return lits;
-        }
-        let mut atoms = Vec::new();
-        self.atoms.append_atoms(var, &mut atoms);
-        for atom in atoms {
-            push_if_recorded(LitOrConst::Lit(Lit::positive(atom)), &mut lits);
         }
         lits
+    }
+
+    #[cfg(test)]
+    pub(crate) fn audit_set_sync_reference(&mut self, sync: for<'a> fn(&mut Cdcl<'a>, VarId)) {
+        self.sync_reference = Some(sync);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn audit_record_sync(&mut self, lit: Lit, reason: Reason) {
+        self.record(lit, reason);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn audit_sync_trail(&self) -> &[Lit] {
+        &self.trail
     }
 
     /// Record every atom of `var` the domain now determines but the trail has
@@ -1063,6 +1074,11 @@ impl<'s> Cdcl<'s> {
     /// 1-UIP backjump too far and prune feasible solutions. The reason is
     /// [`ds_recorded`], which entails every determination and is itself recorded.
     fn sync_var(&mut self, var: VarId) {
+        #[cfg(test)]
+        if let Some(reference) = self.sync_reference {
+            reference(self, var);
+            return;
+        }
         if self.atoms.is_sign(var) {
             let LitOrConst::Lit(l) = self.atoms.ge(var, 1) else { unreachable!("a sign variable has one real atom") };
             if !self.is_assigned(l.atom()) {
@@ -1078,13 +1094,14 @@ impl<'s> Cdcl<'s> {
             let _ = self.atoms.ge(var, self.solver.store.min(var));
             let _ = self.atoms.ge_i64(var, i64::from(self.solver.store.max(var)) + 1);
         }
-        let mut todo: Vec<Lit> = Vec::new();
+        let mut todo = std::mem::take(&mut self.sync_todo);
         self.atom_scratch.clear();
-        self.atoms.append_atoms(var, &mut self.atom_scratch);
-        for &atom in &self.atom_scratch {
+        self.atoms.append_atom_kinds(var, &mut self.atom_scratch);
+        let domain = view::VariableDomainView::new(&self.solver.store, var);
+        for &(atom, kind) in &self.atom_scratch {
             let l = Lit::positive(atom);
             if !self.is_assigned(atom) {
-                match view::lit_value(&self.solver.store, &self.atoms, l) {
+                match domain.atom_value(kind) {
                     Tri::True => todo.push(l),
                     Tri::False => todo.push(l.negate()),
                     Tri::Unknown => {}
@@ -1092,15 +1109,21 @@ impl<'s> Cdcl<'s> {
             }
         }
         if todo.is_empty() {
+            self.sync_todo = todo;
             return;
         }
-        let ds: Arc<[Lit]> = Arc::from(self.ds_recorded(var));
+        // No domain or SAT-trail mutation occurs between the snapshot and this
+        // read. Reuse its order rather than locking and copying the registry a
+        // second time. Newly interned atoms in other workers are unrecorded here.
+        let ds: Arc<[Lit]> = Arc::from(self.ds_recorded());
         if let Some(handle) = self.solver.explanation_handle() {
             handle.eager_lcg(ds.len());
         }
-        for l in todo {
+        for &l in &todo {
             self.record(l, Reason::Generic(Arc::clone(&ds)));
         }
+        todo.clear();
+        self.sync_todo = todo;
     }
 
     /// Push `lit` into the domain and record the primary it asserts with
@@ -1546,6 +1569,9 @@ impl<'s> Cdcl<'s> {
                 })
                 .is_some();
         let mut deferred_fallback: Option<Arc<DeferredFallback>> = None;
+        // This snapshot belongs only to this invocation and cutoff. Reusing
+        // its immutable payload prevents one whole-scope copy per inference.
+        let mut eager_fallback: Option<Arc<[Lit]>> = None;
         self.changed_vars.clear();
         for ev in &events {
             let var = match ev.primary {
@@ -1577,12 +1603,19 @@ impl<'s> Cdcl<'s> {
                             }))
                         }
                         _ => {
-                            let preferred = cause_lits(&self.atoms, &ev.cause, &self.conflict_scope);
-                            let ds = self.reason_before_step(preferred, step_trail_len);
+                            let preferred = preferred_cause_lits(&self.atoms, &ev.cause)
+                                .filter(|lits| lits.iter().all(|&lit| self.was_recorded_before(lit, step_trail_len)));
+                            let ds = preferred.map(Arc::from).unwrap_or_else(|| {
+                                Arc::clone(eager_fallback.get_or_insert_with(|| {
+                                    let lits = build_ds(&self.atoms, &self.conflict_scope);
+                                    debug_assert!(lits.iter().all(|&lit| self.was_recorded_before(lit, step_trail_len)));
+                                    Arc::from(lits)
+                                }))
+                            });
                             if let Some(handle) = self.solver.explanation_handle() {
                                 handle.eager_lcg(ds.len());
                             }
-                            Reason::Generic(Arc::from(ds))
+                            Reason::Generic(ds)
                         }
                     };
                     self.record(lit, reason);

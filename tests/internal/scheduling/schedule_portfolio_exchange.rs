@@ -127,6 +127,36 @@ fn tsab_candidate_fixture() -> (Schedule, u64) {
     panic!("deterministic fixture search must find a strict N5 neighborhood with more than four moves")
 }
 
+/// Fixed machine permutations keep a post-warmup improvement available for
+/// the terminal replay tests after strict N5 includes both ends of one block.
+fn terminal_pending_job_shop(jobs: usize, machines: usize, salt: usize) -> Schedule {
+    let operation_count = jobs * machines;
+    let durations: Vec<i64> =
+        (0..operation_count).map(|operation| 1 + i64::try_from((operation * 7 + salt * 3) % 11).expect("small duration")).collect();
+    let horizon = durations.iter().sum();
+    let mut assigned = vec![Vec::new(); machines];
+    for job in 0..jobs {
+        let mut order: Vec<_> = (0..machines).collect();
+        let mut state = qayd::mix64(u64::try_from(job * 23 + salt * 17 + 31).expect("small deterministic seed"));
+        for index in (1..machines).rev() {
+            state = qayd::mix64(state);
+            let bound = u64::try_from(index + 1).expect("small machine count");
+            order.swap(index, usize::try_from(state % bound).expect("small permutation index"));
+        }
+        for (operation, machine) in order.into_iter().enumerate() {
+            assigned[machine].push(job * machines + operation);
+        }
+    }
+    Schedule {
+        intervals: durations.into_iter().map(|duration| IntervalVar { duration, horizon, modes: Vec::new(), optional: false }).collect(),
+        precedences: (0..jobs)
+            .flat_map(|job| (0..machines - 1).map(move |operation| (job * machines + operation, job * machines + operation + 1)))
+            .collect(),
+        resources: assigned.into_iter().map(Resource::NoOverlap).collect(),
+        minimize_makespan: true,
+    }
+}
+
 fn deterministic_resource_project() -> ModelPackage {
     let durations = [2, 1, 3, 2, 4, 1, 2, 3];
     let schedule = Schedule {
@@ -245,8 +275,8 @@ fn schedule_finalization_reserve_scales_with_replay_size_and_caps_at_large_ta() 
 
 #[test]
 fn schedule_tsab_terminal_pass_recovers_a_pending_report_then_replays_transfer_once() {
-    let (schedule, _) = tsab_candidate_fixture();
-    let seed = 8;
+    let schedule = terminal_pending_job_shop(8, 6, 0);
+    let seed = 3;
     let package = ModelPackage::new(Model::from_collection(&CollectionModel {
         items: Vec::new(),
         lists: 0,
@@ -283,6 +313,7 @@ fn schedule_tsab_terminal_pass_recovers_a_pending_report_then_replays_transfer_o
     );
     assert_eq!(terminal_replay_attempts, 1, "the recovered pending candidate must cross Transfer replay exactly once");
     let pending_objective = pending_objective.expect("the terminal kernel must expose its validated pending objective");
+    assert_eq!(pending_objective, 68, "the fixed witness retains an improvement after the 512-unit warmup");
     let published_objective = published_objective.expect("the Transfer replay must install the terminal candidate");
     assert_eq!(pending_objective, published_objective);
     assert_eq!(result.primal().and_then(|primal| primal.objectives().first().copied()), Some(pending_objective));
@@ -291,8 +322,9 @@ fn schedule_tsab_terminal_pass_recovers_a_pending_report_then_replays_transfer_o
     assert_eq!(metric(&result, "schedule_tsab_fast_oracle_mismatches"), 0);
     assert_eq!(metric(&result, "schedule_tsab_fast_pending_discards"), 0);
     assert_eq!(metric(&result, "schedule_restart_boundaries"), 3, "the quota-zero terminal pass is not a search boundary");
-    assert!(metric(&result, "schedule_worker_work_min") <= 640);
-    assert!(metric(&result, "schedule_worker_work_max") <= 640);
+    assert_eq!(metric(&result, "schedule_worker_work_min"), 517);
+    assert_eq!(metric(&result, "schedule_worker_work_max"), 640);
+    assert_eq!(metric(&result, "schedule_work_steps"), 6 * 640 + 517, "terminal validation consumes no search work");
     assert_eq!(metric(&result, "schedule_work_budget_overruns"), 0);
     assert_eq!(metadata(&result, "schedule_incumbent_source_worker"), "6");
     assert_eq!(metadata(&result, "schedule_incumbent_verification_rejections"), "0");
@@ -301,8 +333,8 @@ fn schedule_tsab_terminal_pass_recovers_a_pending_report_then_replays_transfer_o
 
 #[test]
 fn schedule_tsab_multi_terminal_pass_recovers_worker_three_pending_report() {
-    let (schedule, _) = tsab_candidate_fixture();
-    let seed = 55;
+    let schedule = terminal_pending_job_shop(6, 5, 2);
+    let seed = 16;
     let package = ModelPackage::new(Model::from_collection(&CollectionModel {
         items: Vec::new(),
         lists: 0,
@@ -336,6 +368,7 @@ fn schedule_tsab_multi_terminal_pass_recovers_worker_three_pending_report() {
     );
     assert_eq!(terminal_replay_attempts, 1, "worker three pending candidate must cross Transfer replay exactly once");
     let pending_objective = pending_objective.expect("worker three terminal validation must expose its pending objective");
+    assert_eq!(pending_objective, 48, "worker three retains a strict pending improvement after warmup");
     let published_objective = published_objective.expect("worker three Transfer replay must install the terminal candidate");
     assert_eq!(pending_objective, published_objective);
     assert_eq!(result.primal().and_then(|primal| primal.objectives().first().copied()), Some(pending_objective));
@@ -346,8 +379,9 @@ fn schedule_tsab_multi_terminal_pass_recovers_worker_three_pending_report() {
     assert_eq!(metric(&result, "schedule_tsab_fast_oracle_mismatches"), 0);
     assert_eq!(metric(&result, "schedule_tsab_fast_pending_discards"), 0);
     assert_eq!(metric(&result, "schedule_restart_boundaries"), 3, "quota-zero terminal finalization is not a search boundary");
-    assert!(metric(&result, "schedule_worker_work_min") <= 640);
-    assert!(metric(&result, "schedule_worker_work_max") <= 640);
+    assert_eq!(metric(&result, "schedule_worker_work_min"), 513);
+    assert_eq!(metric(&result, "schedule_worker_work_max"), 640);
+    assert_eq!(metric(&result, "schedule_work_steps"), 6 * 640 + 513, "terminal validation consumes no search work");
     assert_eq!(metric(&result, "schedule_work_budget_overruns"), 0);
     assert_eq!(metadata(&result, "schedule_incumbent_source_worker"), "3");
     assert_eq!(metadata(&result, "schedule_incumbent_verification_rejections"), "0");
@@ -2149,11 +2183,14 @@ fn tsab_fast_work_cap_recovery_is_counted_without_a_transactional_fallback() {
         6,
         7,
         &stop,
-        16,
+        7,
         Some(&active_solution),
         Some(active_session),
         &mut |_| {},
     );
+    // Stop at the first 32-transition oracle checkpoint: its rebuilt state
+    // intentionally no longer carries the test-only zero propagation cap.
+    assert_eq!(metrics.work_steps, 7);
     let fast = metrics.schedule_tsab;
     assert!(fast.fast_attempts > 0);
     assert_eq!(fast.fast_work_cap_recoveries, fast.fast_attempts);

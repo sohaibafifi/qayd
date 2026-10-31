@@ -177,9 +177,18 @@ impl LazyAtomRegistry {
         lazy.decode[(atom - base) as usize]
     }
 
+    #[cfg(test)]
     fn append_atoms(&self, var: VarId, out: &mut Vec<Atom>) {
         if let Some(atoms) = self.inner.lock().unwrap().by_var.get(&var) {
             out.extend_from_slice(atoms);
+        }
+    }
+
+    fn append_atom_kinds(&self, var: VarId, out: &mut Vec<(Atom, AtomKind)>) {
+        let lazy = self.inner.lock().unwrap();
+        if let Some(atoms) = lazy.by_var.get(&var) {
+            let base = lazy.base.expect("lazy LCG atom registry has no eager base");
+            out.extend(atoms.iter().map(|&atom| (atom, lazy.decode[(atom - base) as usize])));
         }
     }
 
@@ -342,12 +351,25 @@ impl AtomTable {
 
     /// Append the atoms allocated for `x`.
     #[inline]
+    #[cfg(test)]
     pub(crate) fn append_atoms(&self, x: VarId, out: &mut Vec<Atom>) {
         let a = &self.vars[x.index()];
         if matches!(a.layout, VarLayout::Lazy | VarLayout::LazySparse) {
             self.lazy.append_atoms(x, out);
         } else {
             out.extend(a.ge_base..a.end);
+        }
+    }
+
+    /// Snapshot allocated atoms and their immutable meanings in the same order
+    /// as `append_atoms`. Lazy layouts acquire their registry lock only once.
+    #[inline]
+    pub(crate) fn append_atom_kinds(&self, x: VarId, out: &mut Vec<(Atom, AtomKind)>) {
+        let a = &self.vars[x.index()];
+        if matches!(a.layout, VarLayout::Lazy | VarLayout::LazySparse) {
+            self.lazy.append_atom_kinds(x, out);
+        } else {
+            out.extend((a.ge_base..a.end).map(|atom| (atom, self.decode[atom as usize])));
         }
     }
 

@@ -23,6 +23,7 @@ struct BudgetInner {
     limit: Option<Duration>,
     stop: Arc<AtomicBool>,
     hard_stop: Arc<AtomicBool>,
+    non_memory_cancelled: AtomicBool,
     reason: Arc<AtomicU8>,
     timer: Arc<TimerSignal>,
     /// Resident memory already owned by an embedding process when live memory
@@ -126,6 +127,7 @@ impl SolveBudget {
     }
 
     pub fn with_stop(limit: Option<Duration>, stop: Arc<AtomicBool>) -> Self {
+        let started = Instant::now();
         let immediately_expired = limit == Some(Duration::ZERO);
         let initially_stopped = stop.load(Ordering::Acquire);
         let hard_stop = Arc::new(AtomicBool::new(initially_stopped));
@@ -141,15 +143,16 @@ impl SolveBudget {
         }
         let timer = Arc::new(TimerSignal::default());
         if let Some(duration) = limit.filter(|duration| !duration.is_zero()) {
-            spawn_deadline(duration, Arc::downgrade(&stop), Arc::downgrade(&reason), Arc::clone(&timer));
+            spawn_deadline(started, duration, Arc::downgrade(&stop), Arc::downgrade(&reason), Arc::clone(&timer));
         }
         Self {
             inner: Arc::new(BudgetInner {
                 id: NEXT_BUDGET_ID.fetch_add(1, Ordering::Relaxed),
-                started: Instant::now(),
+                started,
                 limit,
                 stop,
                 hard_stop,
+                non_memory_cancelled: AtomicBool::new(initially_stopped),
                 reason,
                 timer,
                 memory_baseline: AtomicUsize::new(0),
@@ -176,6 +179,9 @@ impl SolveBudget {
             return;
         }
         if reason != TerminationReason::Deadline {
+            if reason != TerminationReason::MemoryLimit {
+                self.inner.non_memory_cancelled.store(true, Ordering::Release);
+            }
             self.inner.hard_stop.store(true, Ordering::Release);
         }
         record_reason(&self.inner.reason, reason);
@@ -183,6 +189,7 @@ impl SolveBudget {
         if reason != TerminationReason::Deadline {
             self.wake_timer();
         }
+        self.trace_phase("cancelled");
     }
 
     pub fn expired(&self) -> bool {
@@ -208,6 +215,54 @@ impl SolveBudget {
 
     pub(crate) fn hard_cancelled(&self) -> bool {
         self.inner.hard_stop.load(Ordering::Acquire)
+    }
+
+    /// A memory stop may retain evidence verified before the stop, but a later
+    /// user, event-sink, or engine cancellation still forbids that promotion.
+    pub(crate) fn memory_only_cancelled(&self) -> bool {
+        self.hard_cancelled()
+            && self.termination_reason() == TerminationReason::MemoryLimit
+            && !self.inner.non_memory_cancelled.load(Ordering::Acquire)
+    }
+
+    /// Sparse diagnostic transitions, emitted immediately to the caller's
+    /// stderr capture. Disabled by default and never polled from a search loop.
+    pub(crate) fn trace_phase(&self, phase: &str) {
+        static ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var_os("QAYD_SOLVE_TRACE").is_some_and(|value| value == "1"));
+        if *ENABLED {
+            eprintln!(
+                "qayd_phase pid={} budget={} elapsed_us={} phase={} reason={:?}",
+                std::process::id(),
+                self.inner.id,
+                self.elapsed().as_micros(),
+                phase,
+                self.termination_reason()
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn audit_deadline_worker_start(already_elapsed: bool) -> bool {
+        audit_deadline_worker_start(already_elapsed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn audit_memory_registration_after_monitor_drop() -> bool {
+        let budget = Self::new(None);
+        let id = budget.inner.id;
+        budget.inner.memory_limit.store(usize::MAX, Ordering::Release);
+        update_process_memory_limit(id, usize::MAX);
+        // The memory monitor temporarily owns this same strong reference
+        // while sampling and waiting. Its final drop must own cleanup even
+        // when the last public budget handle disappeared first.
+        let monitor_reference = Arc::clone(&budget.inner);
+        drop(budget);
+        let retained_while_owned = ACTIVE_MEMORY_LIMITS.lock().unwrap().contains_key(&id);
+        drop(monitor_reference);
+        let released = !ACTIVE_MEMORY_LIMITS.lock().unwrap().contains_key(&id);
+        // Keep the reproduction isolated even with the pre-fix destructor.
+        update_process_memory_limit(id, 0);
+        retained_while_owned && released
     }
 
     /// Derive an engine-search flag from this request budget. With a deadline,
@@ -255,8 +310,9 @@ impl SolveBudget {
         let child = Arc::clone(&stop);
         let done = Arc::new(TimerSignal::default());
         let worker_done = Arc::clone(&done);
+        let started = self.inner.started;
+        let search_limit = self.inner.limit.expect("search deadline requires a request limit").saturating_sub(reserve);
         let worker = std::thread::spawn(move || {
-            let started = Instant::now();
             let mut finished = worker_done.stopped.lock().unwrap();
             loop {
                 if *finished {
@@ -266,7 +322,7 @@ impl SolveBudget {
                     child.store(true, Ordering::Release);
                     return;
                 }
-                if started.elapsed() >= search_duration {
+                if started.elapsed() >= search_limit {
                     let _ = reason.compare_exchange(
                         TerminationReason::Running as u8,
                         TerminationReason::Deadline as u8,
@@ -276,7 +332,7 @@ impl SolveBudget {
                     child.store(true, Ordering::Release);
                     return;
                 }
-                let wait = SEARCH_STOP_POLL.min(search_duration.saturating_sub(started.elapsed()));
+                let wait = SEARCH_STOP_POLL.min(search_limit.saturating_sub(started.elapsed()));
                 let (next, _) = worker_done.wake.wait_timeout(finished, wait).unwrap();
                 finished = next;
             }
@@ -289,6 +345,7 @@ impl SolveBudget {
     /// still propagates immediately. This is intended for heuristic work that
     /// must never consume the whole exact-search budget.
     pub(crate) fn optional_phase_stop(&self, duration: Duration) -> SearchStop {
+        let started = Instant::now();
         let duration = self.remaining().map_or(duration, |remaining| duration.min(remaining));
         let stop = Arc::new(AtomicBool::new(duration.is_zero() || self.expired()));
         if stop.load(Ordering::Acquire) {
@@ -300,7 +357,6 @@ impl SolveBudget {
         let done = Arc::new(TimerSignal::default());
         let worker_done = Arc::clone(&done);
         let worker = std::thread::spawn(move || {
-            let started = Instant::now();
             let mut finished = worker_done.stopped.lock().unwrap();
             loop {
                 if *finished {
@@ -356,6 +412,7 @@ impl SolveBudget {
     /// priority over `Deadline`; the grace itself is capped independently of the
     /// requested search time.
     pub(crate) fn finalization_grace_stop(&self) -> SearchStop {
+        let started = Instant::now();
         let stop = Arc::new(AtomicBool::new(self.hard_cancelled()));
         if stop.load(Ordering::Acquire) {
             return SearchStop { stop, done: None, worker: None };
@@ -365,7 +422,6 @@ impl SolveBudget {
         let done = Arc::new(TimerSignal::default());
         let worker_done = Arc::clone(&done);
         let worker = std::thread::spawn(move || {
-            let started = Instant::now();
             let mut finished = worker_done.stopped.lock().unwrap();
             loop {
                 if *finished {
@@ -424,22 +480,20 @@ fn finalization_reserve(remaining: Duration) -> Duration {
     (remaining / 20).clamp(MIN_FINALIZATION_RESERVE, MAX_FINALIZATION_RESERVE)
 }
 
-impl Drop for SolveBudget {
+impl Drop for BudgetInner {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.inner) == 1 {
-            if self.inner.memory_limit.load(Ordering::Acquire) > 0 {
-                update_process_memory_limit(self.inner.id, 0);
-            }
-            self.wake_timer();
+        if self.memory_limit.load(Ordering::Acquire) > 0 {
+            update_process_memory_limit(self.id, 0);
         }
+        let mut stopped = self.timer.stopped.lock().unwrap();
+        *stopped = true;
+        self.timer.wake.notify_all();
     }
 }
 
-fn spawn_deadline(duration: Duration, stop: Weak<AtomicBool>, reason: Weak<AtomicU8>, signal: Arc<TimerSignal>) {
+fn spawn_deadline(started: Instant, duration: Duration, stop: Weak<AtomicBool>, reason: Weak<AtomicU8>, signal: Arc<TimerSignal>) {
     std::thread::spawn(move || {
-        let stopped = signal.stopped.lock().unwrap();
-        let (stopped, timeout) = signal.wake.wait_timeout_while(stopped, duration, |stopped| !*stopped).unwrap();
-        if *stopped || !timeout.timed_out() {
+        if !wait_for_deadline(&signal, started, duration) {
             return;
         }
         let (Some(stop), Some(reason)) = (stop.upgrade(), reason.upgrade()) else {
@@ -453,6 +507,42 @@ fn spawn_deadline(duration: Duration, stop: Weak<AtomicBool>, reason: Weak<Atomi
             stop.store(true, Ordering::Release);
         }
     });
+}
+
+fn wait_for_deadline(signal: &TimerSignal, started: Instant, duration: Duration) -> bool {
+    let mut stopped = signal.stopped.lock().unwrap();
+    while !*stopped {
+        let remaining = duration.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return true;
+        }
+        let (next, _) = signal.wake.wait_timeout(stopped, remaining).unwrap();
+        stopped = next;
+    }
+    false
+}
+
+#[cfg(test)]
+fn audit_deadline_worker_start(already_elapsed: bool) -> bool {
+    let signal = Arc::new(TimerSignal::default());
+    let duration = Duration::from_secs(60);
+    let armed = if already_elapsed {
+        Instant::now().checked_sub(duration).expect("test deadline fits the monotonic clock")
+    } else {
+        Instant::now()
+    };
+    // A deferred worker is modelled by an already elapsed arm timestamp. The
+    // watchdog cancels a wrongly restarted relative wait instead of hanging
+    // the regression test for sixty seconds.
+    let watchdog_signal = Arc::clone(&signal);
+    let watchdog = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        *watchdog_signal.stopped.lock().unwrap() = true;
+        watchdog_signal.wake.notify_all();
+    });
+    let expired = wait_for_deadline(&signal, armed, duration);
+    watchdog.join().unwrap();
+    expired
 }
 
 fn record_reason(reason: &AtomicU8, next: TerminationReason) {

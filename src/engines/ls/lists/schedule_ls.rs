@@ -37,14 +37,18 @@ pub(crate) enum ScheduleJsspSearchStrategy {
     Legacy,
     TsabCandidate,
     TsabMultiCandidate,
+    TsabAdaptive,
 }
 
 impl ScheduleJsspSearchStrategy {
     pub(crate) fn requests_tsab(self) -> bool {
-        matches!(self, Self::TsabCandidate | Self::TsabMultiCandidate)
+        matches!(self, Self::TsabCandidate | Self::TsabMultiCandidate | Self::TsabAdaptive)
     }
 
     pub(crate) fn owner_mask(self, workers: usize) -> u64 {
+        if self == Self::TsabAdaptive {
+            return u64::from(workers == 1);
+        }
         if workers != 7 {
             return 0;
         }
@@ -52,6 +56,15 @@ impl ScheduleJsspSearchStrategy {
             Self::Legacy => 0,
             Self::TsabCandidate => 1 << 6,
             Self::TsabMultiCandidate => 0x7f,
+            Self::TsabAdaptive => unreachable!("adaptive ownership is handled before the seven-worker pilots"),
+        }
+    }
+
+    fn legacy_warmup_work_units(self) -> u64 {
+        if self == Self::TsabAdaptive {
+            0
+        } else {
+            TSAB_LEGACY_WARMUP_WORK_UNITS
         }
     }
 
@@ -107,6 +120,9 @@ pub(crate) struct ScheduleTsabMetrics {
     pub(crate) tabu_resets: u64,
     pub(crate) fingerprint_repeats: u64,
     pub(crate) escape_signals: u64,
+    pub(crate) blocked_n6_requests: u64,
+    pub(crate) blocked_n6_attempts: u64,
+    pub(crate) blocked_n6_cooldown_skips: u64,
     pub(crate) n1_kicks: u64,
     pub(crate) kick_moves: u64,
     pub(crate) elite_restarts: u64,
@@ -147,6 +163,15 @@ pub(crate) struct ScheduleTsabMetrics {
     pub(crate) fast_work_cap_recoveries: u64,
     pub(crate) fast_date_changes: u64,
     pub(crate) fast_queue_pops: u64,
+    /// Completed shortlist probes that entered the strict-N5 forward kernel.
+    pub(crate) forward_probe_attempts: u64,
+    /// Completed forward-probe calls that used the ordinary exact fallback.
+    pub(crate) forward_probe_fallbacks: u64,
+    /// Sessions that switched subsequent shortlist probes to the generic
+    /// kernel after a fallback or interrupted forward-probe call.
+    pub(crate) forward_probe_disables: u64,
+    pub(crate) forward_probe_queue_pops: u64,
+    pub(crate) forward_probe_date_changes: u64,
     pub(crate) fast_full_validations: u64,
     pub(crate) fast_oracle_mismatches: u64,
     pub(crate) fast_pending_promotions: u64,
@@ -279,6 +304,14 @@ struct ProbedScheduleCandidate {
     objective: i64,
     aspiration: bool,
     rank: usize,
+}
+
+#[derive(Clone, Copy)]
+struct TsabFastSelection {
+    movement: ScheduleMove,
+    arcs: ScheduleMoveArcs,
+    aspiration: bool,
+    forced: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -579,6 +612,19 @@ pub(crate) struct ScheduleSearchSession {
     /// persistent so arbitrary slice boundaries cannot change the trajectory.
     tsab_restart_work_credit: u64,
     tsab_restart_epoch: u64,
+    /// Consecutive completed adaptive restarts without a new private elite.
+    /// This controls diversification only and never relaxes feasibility.
+    tsab_adaptive_stagnant_restarts: u64,
+    /// A strict-N5 tabu block can request one bounded broader search before
+    /// forcing a move. Its credit survives arbitrary worker slice boundaries.
+    tsab_adaptive_blocked_escape_pending: bool,
+    /// Accepted-step time when a currently blocked strict-N5 candidate was
+    /// first predicted to become admissible again through tabu expiration.
+    tsab_adaptive_blocked_escape_after_step: u64,
+    /// A failed or capped forward probe pays for the generic kernel as well.
+    /// Keep subsequent probes generic for this session, including after
+    /// checkpoints and incumbent rebases. Fast commits are independent.
+    tsab_adaptive_forward_probes_disabled: bool,
     tsab_fast_enabled: bool,
     tsab_fast_disabled: bool,
     /// A failed full-oracle checkpoint may leave the private fast trajectory
@@ -599,6 +645,14 @@ pub(crate) struct ScheduleSearchSession {
     tsab_fast_test_return_after_pending_elite: bool,
     #[cfg(test)]
     tsab_fast_test_stop_during_validation: bool,
+    #[cfg(test)]
+    tsab_fast_test_stop_after_pending_validation: bool,
+    #[cfg(test)]
+    tsab_adaptive_test_unpruned_selection: bool,
+    #[cfg(test)]
+    tsab_adaptive_test_generic_probes: bool,
+    #[cfg(test)]
+    tsab_adaptive_test_stop_before_primary_prune: bool,
     tenure_base: u64,
     completed_boundaries: u64,
     tsab_legacy_warmup_work_steps: u64,
@@ -659,8 +713,8 @@ impl ScheduleSearchSession {
     pub(crate) fn test_force_tsab_restart_due(&mut self) {
         debug_assert!(self.requested_strategy.requests_tsab());
         self.strategy = ScheduleJsspSearchStrategy::TsabCandidate;
-        self.tsab_legacy_warmup_work_steps = TSAB_LEGACY_WARMUP_WORK_UNITS;
-        self.tsab_n5_work_since_restart = TSAB_ELITE_RESTART_N5_WORK_UNITS;
+        self.tsab_legacy_warmup_work_steps = self.requested_strategy.legacy_warmup_work_units();
+        self.tsab_n5_work_since_restart = tsab_restart_work_limit(self);
         self.tsab_restart_work_credit = 0;
         self.tsab_fast_enabled = self.state().supports_strict_n5_fast_path();
         self.tsab_fast_disabled = false;
@@ -668,7 +722,9 @@ impl ScheduleSearchSession {
         self.tsab_fast_validation_due_on_resume = false;
         self.tsab_fast_commits_since_validation = 0;
         self.tsab_pending_elite = None;
-        self.tenure_base = TSAB_TENURE;
+        if self.requested_strategy != ScheduleJsspSearchStrategy::TsabAdaptive {
+            self.tenure_base = TSAB_TENURE;
+        }
         self.tabu_until.clear();
         clear_persistent_scan(self);
         self.state_mut().retain_canonical_critical_blocks_only();
@@ -710,6 +766,18 @@ impl ScheduleSearchSession {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_require_tsab_validation_on_resume(&mut self, stop_after_pending_validation: bool) {
+        self.tsab_fast_validation_due_on_resume = true;
+        self.tsab_fast_test_stop_after_pending_validation = stop_after_pending_validation;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_enable_search_elite_shadow(&mut self, token: &ScheduleEliteSolveToken) {
+        self.search_elite_token = Some(token.clone());
+        self.pending_search_elite = None;
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_tsab_pending_elite_objective(&self) -> Option<i64> {
         self.tsab_pending_elite.as_ref().and_then(|solution| solution.objectives.first().copied())
     }
@@ -732,6 +800,14 @@ impl ScheduleSearchSession {
 
     #[cfg(test)]
     pub(crate) fn test_same_tabu_trajectory(&self, other: &Self) -> bool {
+        self.test_same_tabu_decisions(other)
+            && self.probe_step == other.probe_step
+            && self.last_improvement_probe == other.last_improvement_probe
+            && self.last_restart_probe == other.last_restart_probe
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_same_tabu_decisions(&self, other: &Self) -> bool {
         self.state().makespan() == other.state().makespan()
             && self.state().canonical_path_policy() == other.state().canonical_path_policy()
             && self.state().starts() == other.state().starts()
@@ -742,9 +818,6 @@ impl ScheduleSearchSession {
             && self.tabu_until == other.tabu_until
             && self.accepted_step == other.accepted_step
             && self.last_improvement_step == other.last_improvement_step
-            && self.probe_step == other.probe_step
-            && self.last_improvement_probe == other.last_improvement_probe
-            && self.last_restart_probe == other.last_restart_probe
             && self.restart_epoch == other.restart_epoch
             && self.requested_strategy == other.requested_strategy
             && self.strategy == other.strategy
@@ -760,6 +833,9 @@ impl ScheduleSearchSession {
             && self.tsab_n5_work_since_restart == other.tsab_n5_work_since_restart
             && self.tsab_restart_work_credit == other.tsab_restart_work_credit
             && self.tsab_restart_epoch == other.tsab_restart_epoch
+            && self.tsab_adaptive_stagnant_restarts == other.tsab_adaptive_stagnant_restarts
+            && self.tsab_adaptive_blocked_escape_pending == other.tsab_adaptive_blocked_escape_pending
+            && self.tsab_adaptive_blocked_escape_after_step == other.tsab_adaptive_blocked_escape_after_step
             && self.tsab_fast_enabled == other.tsab_fast_enabled
             && self.tsab_fast_disabled == other.tsab_fast_disabled
             && self.tsab_fast_hard_failure == other.tsab_fast_hard_failure
@@ -776,6 +852,64 @@ impl ScheduleSearchSession {
                 }
                 _ => false,
             }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_disable_adaptive_primary_pruning(&mut self) {
+        self.tsab_adaptive_test_unpruned_selection = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_use_generic_adaptive_probes(&mut self) {
+        self.tsab_adaptive_test_generic_probes = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_adaptive_forward_probes_disabled(&self) -> bool {
+        self.tsab_adaptive_forward_probes_disabled
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_stop_adaptive_forward_probe_at_work_cap(&mut self, pop_cap: usize) {
+        self.state_mut().test_configure_strict_n5_work_cap(pop_cap, true);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_stop_before_adaptive_primary_prune(&mut self) {
+        self.tsab_adaptive_test_stop_before_primary_prune = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_adaptive_ranked_moves(&self) -> Vec<(ScheduleMove, i128)> {
+        let stop = AtomicBool::new(false);
+        let mut ranked = Vec::new();
+        self.state()
+            .visit_taillard_scored_strict_n5_canonical_moves(&stop, |movement, _, score| {
+                let tie = mix64(self.seed ^ self.accepted_step.wrapping_mul(0xa076_1d64_78bd_642f) ^ schedule_move_identity(movement));
+                ranked.push((score.ranking_key(), tie, movement));
+                Ok(())
+            })
+            .expect("the unarmed test stop permits ranking");
+        ranked.sort_unstable();
+        ranked.into_iter().map(|(score, _, movement)| (movement, score.0)).collect()
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn test_select_adaptive_candidate(
+        &mut self,
+        stop: &AtomicBool,
+    ) -> (bool, Option<(ScheduleMove, bool, bool)>, ScheduleTsabMetrics, u64) {
+        let mut slice = PersistentScheduleSliceMetrics::default();
+        match select_adaptive_tsab_fast_candidate(self, &mut slice, stop) {
+            Ok(selected) => (
+                true,
+                selected.map(|candidate| (candidate.movement, candidate.aspiration, candidate.forced)),
+                slice.schedule_tsab,
+                slice.exact_probes_avoided,
+            ),
+            Err(_) => (false, None, slice.schedule_tsab, slice.exact_probes_avoided),
+        }
     }
 
     #[cfg(test)]
@@ -799,6 +933,60 @@ impl ScheduleSearchSession {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_tsab_adaptive_policy(&self) -> (u64, u64) {
+        (tsab_restart_work_limit(self), self.tsab_adaptive_stagnant_restarts)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn test_tsab_trajectory_snapshot(&self) -> (Vec<i64>, Vec<Vec<usize>>, BTreeMap<MachineArc, u64>, u64, u64, i64) {
+        (
+            self.state().starts().to_vec(),
+            self.state().machine_sequences().to_vec(),
+            self.tabu_until.clone(),
+            self.accepted_step,
+            self.scan_epoch,
+            self.state().makespan(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_force_adaptive_restart_without_rewinding(&mut self) {
+        debug_assert_eq!(self.requested_strategy, ScheduleJsspSearchStrategy::TsabAdaptive);
+        self.tsab_n5_work_since_restart = tsab_restart_work_limit(self);
+        self.tsab_restart_work_credit = 0;
+        self.tsab_adaptive_blocked_escape_pending = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_adaptive_blocked_escape_state(&self) -> (bool, u64, u64) {
+        (self.tsab_adaptive_blocked_escape_pending, self.tsab_adaptive_blocked_escape_after_step, self.accepted_step)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_require_adaptive_stagnation_after_next_work_unit(&mut self) {
+        self.tsab_n5_work_since_restart = tsab_restart_work_limit(self).saturating_sub(1);
+        self.tsab_restart_work_credit = 0;
+        self.tsab_adaptive_blocked_escape_pending = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_tsab_fast_checkpoint_state(&self) -> (u64, bool) {
+        (self.tsab_fast_commits_since_validation, self.tsab_pending_elite.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_verified_elite(&mut self, solution: CollectionSolution) {
+        self.elite_objective = solution.objectives[0];
+        self.elite_solution = solution;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_mark_tabu_arc(&mut self, arc: MachineArc, remaining_steps: u64) {
+        self.tabu_until.insert(arc, self.accepted_step.saturating_add(remaining_steps));
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_tsab_canonical_path(&self) -> (CanonicalPathPolicy, u64) {
         (self.state().canonical_path_policy(), self.state().canonical_path_fingerprint())
     }
@@ -818,6 +1006,11 @@ impl ScheduleSearchSession {
     #[cfg(test)]
     pub(crate) fn test_tsab_state_matches_full_oracle(&mut self) -> bool {
         self.state_mut().matches_full_oracle(&AtomicBool::new(false)).unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_tsab_fast_dates_match_full_oracle(&mut self) -> bool {
+        self.state_mut().refresh_from_full_oracle(&AtomicBool::new(false)).unwrap_or(false)
     }
 }
 
@@ -941,6 +1134,16 @@ fn capture_search_elite_shadow(
     enabled: bool,
     stop: &AtomicBool,
 ) {
+    capture_search_elite_shadow_from_state(session, None, slice, enabled, stop);
+}
+
+fn capture_search_elite_shadow_from_state(
+    session: &mut ScheduleSearchSession,
+    source: Option<&JobShopState>,
+    slice: &mut PersistentScheduleSliceMetrics,
+    enabled: bool,
+    stop: &AtomicBool,
+) {
     if !enabled || session.pending_search_elite.is_some() {
         return;
     }
@@ -950,7 +1153,7 @@ fn capture_search_elite_shadow(
         slice.search_elite_capture_worker_elapsed_sum = slice.search_elite_capture_worker_elapsed_sum.saturating_add(started.elapsed());
         return;
     };
-    match ScheduleEliteCandidate::capture(session.state(), token, stop) {
+    match ScheduleEliteCandidate::capture(source.unwrap_or_else(|| session.state()), token, stop) {
         Ok(candidate) => {
             slice.search_elite_snapshot_captures = slice.search_elite_snapshot_captures.saturating_add(1);
             let replacement_bytes = session
@@ -3305,12 +3508,18 @@ fn prepare_persistent_scan(
 }
 
 fn arc_tenure(session: &ScheduleSearchSession, arc: MachineArc) -> u64 {
-    if session.strategy == ScheduleJsspSearchStrategy::TsabCandidate {
+    if session.strategy == ScheduleJsspSearchStrategy::TsabCandidate
+        && session.requested_strategy != ScheduleJsspSearchStrategy::TsabAdaptive
+    {
         return TSAB_TENURE;
     }
     let identity = u64::try_from(arc.machine).unwrap_or(u64::MAX).wrapping_mul(0x9e37_79b9_7f4a_7c15)
         ^ u64::try_from(arc.before).unwrap_or(u64::MAX).wrapping_mul(0xd1b5_4a32_d192_ed03)
         ^ u64::try_from(arc.after).unwrap_or(u64::MAX).wrapping_mul(0x94d0_49bb_1331_11eb);
+    if session.requested_strategy == ScheduleJsspSearchStrategy::TsabAdaptive {
+        let variation = mix64(session.seed ^ session.accepted_step ^ identity) % (session.tenure_base / 2 + 1);
+        return adaptive_tsab_tenure_base(session).saturating_add(variation);
+    }
     let width = session.tenure_base.saturating_add(1);
     if session.profile.uses_baseline_kernel() {
         return session.tenure_base.saturating_add(mix64(session.seed ^ session.accepted_step ^ identity) % width);
@@ -3318,11 +3527,19 @@ fn arc_tenure(session: &ScheduleSearchSession, arc: MachineArc) -> u64 {
     session.tenure_base.saturating_add(mix64(session.seed ^ session.profile.tie_break_salt ^ session.accepted_step ^ identity) % width)
 }
 
+fn adaptive_tsab_tenure_base(session: &ScheduleSearchSession) -> u64 {
+    let extra = session.tsab_adaptive_stagnant_restarts.min(4).saturating_mul(session.tenure_base / 2);
+    session.tenure_base.saturating_add(extra)
+}
+
 fn select_tsab_fast_candidate(
     session: &mut ScheduleSearchSession,
     slice: &mut PersistentScheduleSliceMetrics,
     stop: &AtomicBool,
-) -> Interruptible<Option<(ScheduleMove, ScheduleMoveArcs)>> {
+) -> Interruptible<Option<TsabFastSelection>> {
+    if session.requested_strategy == ScheduleJsspSearchStrategy::TsabAdaptive {
+        return select_adaptive_tsab_fast_candidate(session, slice, stop);
+    }
     let seed = session.seed;
     let accepted_step = session.accepted_step;
     let tabu_until = &session.tabu_until;
@@ -3360,7 +3577,189 @@ fn select_tsab_fast_candidate(
         slice.schedule_tsab.shortlists = slice.schedule_tsab.shortlists.saturating_add(1);
         slice.schedule_tsab.selections = slice.schedule_tsab.selections.saturating_add(1);
     }
-    Ok(selected.map(|((_, _, movement), arcs)| (movement, arcs)))
+    Ok(selected.map(|((_, _, movement), arcs)| TsabFastSelection { movement, arcs, aspiration: false, forced: false }))
+}
+
+fn select_adaptive_tsab_fast_candidate(
+    session: &mut ScheduleSearchSession,
+    slice: &mut PersistentScheduleSliceMetrics,
+    stop: &AtomicBool,
+) -> Interruptible<Option<TsabFastSelection>> {
+    type Rank = ((i128, (i128, i128, u8, Reverse<u8>)), u64, ScheduleMove);
+    type RankedMove = (Rank, ScheduleMoveArcs);
+    let mut groups: [SmallVec<[RankedMove; TSAB_EXACT_SHORTLIST_CAPACITY]>; 2] = std::array::from_fn(|_| SmallVec::new());
+    let generated = session
+        .state()
+        .visit_taillard_scored_strict_n5_canonical_moves(stop, |movement, arcs, score| {
+            let tie = mix64(session.seed ^ session.accepted_step.wrapping_mul(0xa076_1d64_78bd_642f) ^ schedule_move_identity(movement));
+            let ranked = ((score.ranking_key(), tie, movement), arcs);
+            let tabu = arcs
+                .added
+                .into_iter()
+                .flatten()
+                .any(|arc| session.tabu_until.get(&arc).is_some_and(|&expiration| session.accepted_step < expiration));
+            let group = &mut groups[usize::from(tabu)];
+            if group.len() < TSAB_EXACT_SHORTLIST_CAPACITY {
+                group.push(ranked);
+            } else if group.last().is_some_and(|worst| ranked.0 < worst.0) {
+                *group.last_mut().expect("a full shortlist has a worst candidate") = ranked;
+            }
+            group.sort_unstable_by_key(|candidate| candidate.0);
+            Ok(())
+        })
+        .map_err(|_| Interrupted)?;
+    slice.schedule_tsab.n5_generated = slice.schedule_tsab.n5_generated.saturating_add(u64::try_from(generated).unwrap_or(u64::MAX));
+    slice.schedule_tsab.ranked = slice.schedule_tsab.ranked.saturating_add(u64::try_from(generated).unwrap_or(u64::MAX));
+    let mut shortlist: SmallVec<[(Rank, ScheduleMoveArcs, bool); 8]> = SmallVec::new();
+    for (tabu, group) in groups.into_iter().enumerate() {
+        shortlist.extend(group.into_iter().map(|(rank, arcs)| (rank, arcs, tabu != 0)));
+    }
+    shortlist.sort_unstable_by_key(|candidate| candidate.0);
+    let elite =
+        session.tsab_pending_elite.as_ref().and_then(|solution| solution.objectives.first().copied()).unwrap_or(session.elite_objective);
+    let mut best_any = None::<(i64, usize, TsabFastSelection)>;
+    let mut best_admissible = None::<(i64, usize, TsabFastSelection)>;
+    let mut advisory_objective = None::<i64>;
+    let mut earliest_unblock = None::<u64>;
+    let primary_pruning = adaptive_tsab_primary_pruning_enabled(session);
+    for (rank, (rank_key, arcs, tabu)) in shortlist.iter().copied().enumerate() {
+        checkpoint(stop)?;
+        if let Some((best_exact, _, _)) = best_admissible {
+            if primary_pruning && rank_key.0 .0 >= i128::from(best_exact) {
+                // All entries retain the existing Rank order. Equal objective
+                // values later in that order lose the exact-selection tie.
+                // Recheck strict membership before using only the primary LB.
+                let mut certified = true;
+                for (remaining, _, _) in &shortlist[rank..] {
+                    let score = session.state().score_strict_n5_taillard(remaining.2, stop).map_err(|_| Interrupted)?;
+                    if score.is_none_or(|score| score.estimated_makespan != remaining.0 .0) {
+                        certified = false;
+                        break;
+                    }
+                }
+                if certified {
+                    #[cfg(test)]
+                    if std::mem::take(&mut session.tsab_adaptive_test_stop_before_primary_prune) {
+                        stop.store(true, Ordering::Release);
+                    }
+                    checkpoint(stop)?;
+                    slice.exact_probes_avoided =
+                        slice.exact_probes_avoided.saturating_add(u64::try_from(shortlist.len() - rank).unwrap_or(u64::MAX));
+                    break;
+                }
+            }
+        }
+        let movement = rank_key.2;
+        session.probe_step = session.probe_step.saturating_add(1);
+        slice.schedule_tsab.delta_probes = slice.schedule_tsab.delta_probes.saturating_add(1);
+        slice.schedule_tsab.additional_delta_probes = slice.schedule_tsab.additional_delta_probes.saturating_add(u64::from(rank != 0));
+        let probe = probe_adaptive_tsab_n5(session, slice, movement, stop)?;
+        let MoveProbe::Feasible { candidate, .. } = probe else { continue };
+        let aspiration = tabu_aspiration(tabu, candidate, elite);
+        let selected = TsabFastSelection { movement, arcs, aspiration, forced: false };
+        if best_any.as_ref().is_none_or(|&(objective, current_rank, _)| (candidate, rank) < (objective, current_rank)) {
+            best_any = Some((candidate, rank, selected));
+        }
+        slice.tabu_hits = slice.tabu_hits.saturating_add(u64::from(tabu));
+        if tabu && !aspiration {
+            slice.schedule_tsab.tabu_rejections = slice.schedule_tsab.tabu_rejections.saturating_add(1);
+            // A move is blocked while any added arc is tabu, hence its last
+            // active expiration determines its earliest possible admission.
+            let unblock = arcs
+                .added
+                .into_iter()
+                .flatten()
+                .filter_map(|arc| session.tabu_until.get(&arc).copied())
+                .filter(|&expiration| expiration > session.accepted_step)
+                .max();
+            if let Some(unblock) = unblock {
+                earliest_unblock = Some(earliest_unblock.map_or(unblock, |earliest| earliest.min(unblock)));
+            }
+        } else {
+            advisory_objective.get_or_insert(candidate);
+            if best_admissible.as_ref().is_none_or(|&(objective, current_rank, _)| (candidate, rank) < (objective, current_rank)) {
+                best_admissible = Some((candidate, rank, selected));
+            }
+        }
+    }
+    if best_admissible.is_none() && best_any.is_some() {
+        if session.tsab_n5_work_since_restart >= tsab_restart_work_limit(session) {
+            // A genuine stagnation takes precedence over an opportunistic
+            // broadening of a temporarily blocked neighborhood.
+            return Ok(None);
+        }
+        if session.accepted_step >= session.tsab_adaptive_blocked_escape_after_step {
+            session.tsab_adaptive_blocked_escape_pending = true;
+            let full_tenure = adaptive_tsab_tenure_base(session).saturating_add(session.tenure_base / 2);
+            let cooldown = session.accepted_step.saturating_add(full_tenure);
+            session.tsab_adaptive_blocked_escape_after_step = earliest_unblock.unwrap_or(cooldown).max(cooldown);
+            slice.schedule_tsab.blocked_n6_requests = slice.schedule_tsab.blocked_n6_requests.saturating_add(1);
+            slice.schedule_tsab.shortlists = slice.schedule_tsab.shortlists.saturating_add(1);
+            return Ok(None);
+        }
+        slice.schedule_tsab.blocked_n6_cooldown_skips = slice.schedule_tsab.blocked_n6_cooldown_skips.saturating_add(1);
+    }
+    let selected = best_admissible.or_else(|| {
+        best_any.map(|(objective, rank, mut selected)| {
+            selected.forced = true;
+            (objective, rank, selected)
+        })
+    });
+    if let Some((objective, _, selected)) = selected {
+        slice.schedule_tsab.shortlists = slice.schedule_tsab.shortlists.saturating_add(1);
+        slice.schedule_tsab.selections = slice.schedule_tsab.selections.saturating_add(1);
+        slice.schedule_tsab.ranking_audits = slice.schedule_tsab.ranking_audits.saturating_add(1);
+        let regret = u64::try_from(i128::from(advisory_objective.unwrap_or(objective)) - i128::from(objective)).unwrap_or(0);
+        slice.schedule_tsab.exact_best_matches = slice.schedule_tsab.exact_best_matches.saturating_add(u64::from(regret == 0));
+        slice.schedule_tsab.regret_sum = slice.schedule_tsab.regret_sum.saturating_add(regret);
+        slice.schedule_tsab.regret_max = slice.schedule_tsab.regret_max.max(regret);
+        return Ok(Some(selected));
+    }
+    Ok(None)
+}
+
+fn adaptive_tsab_primary_pruning_enabled(session: &ScheduleSearchSession) -> bool {
+    #[cfg(test)]
+    if session.tsab_adaptive_test_unpruned_selection {
+        return false;
+    }
+    session.state().supports_strict_n5_fast_path()
+}
+
+fn probe_adaptive_tsab_n5(
+    session: &mut ScheduleSearchSession,
+    slice: &mut PersistentScheduleSliceMetrics,
+    movement: ScheduleMove,
+    stop: &AtomicBool,
+) -> Interruptible<MoveProbe> {
+    #[cfg(test)]
+    if session.tsab_adaptive_test_generic_probes {
+        return session.state_mut().probe_move(movement, stop).map_err(|_| Interrupted);
+    }
+    if session.tsab_adaptive_forward_probes_disabled {
+        return session.state_mut().probe_move(movement, stop).map_err(|_| Interrupted);
+    }
+    let forward = match session.state_mut().probe_strict_n5_forward(movement, stop) {
+        Ok(forward) => forward,
+        Err(_) => {
+            // An interrupted fallback need not return its WorkCap outcome.
+            // Conservatively retain the generic path across a later resume.
+            session.tsab_adaptive_forward_probes_disabled = true;
+            slice.schedule_tsab.forward_probe_disables = slice.schedule_tsab.forward_probe_disables.saturating_add(1);
+            return Err(Interrupted);
+        }
+    };
+    slice.schedule_tsab.forward_probe_attempts =
+        slice.schedule_tsab.forward_probe_attempts.saturating_add(u64::from(forward.used_forward_kernel));
+    slice.schedule_tsab.forward_probe_fallbacks = slice.schedule_tsab.forward_probe_fallbacks.saturating_add(u64::from(forward.fell_back));
+    slice.schedule_tsab.forward_probe_queue_pops = slice.schedule_tsab.forward_probe_queue_pops.saturating_add(forward.queue_pops);
+    slice.schedule_tsab.forward_probe_date_changes =
+        slice.schedule_tsab.forward_probe_date_changes.saturating_add(forward.forward_date_changes);
+    if forward.fell_back {
+        session.tsab_adaptive_forward_probes_disabled = true;
+        slice.schedule_tsab.forward_probe_disables = slice.schedule_tsab.forward_probe_disables.saturating_add(1);
+    }
+    Ok(forward.probe)
 }
 
 fn collection_solution_heap_lower_bound_bytes(solution: &CollectionSolution) -> usize {
@@ -3423,20 +3822,61 @@ fn validate_tsab_fast_checkpoint(
             return Ok(false);
         };
         rebuilt.retain_canonical_critical_blocks_only();
-        add_state_metrics(total, session.state_mut().take_metrics());
-        session.state = Some(rebuilt);
+        let preserve_current = session.requested_strategy == ScheduleJsspSearchStrategy::TsabAdaptive;
+        let verified_pending = rebuilt.to_solution();
+        if preserve_current {
+            // Improving the elite does not restart the tabu trajectory. Both
+            // schedules cross independent full oracles before the fast search
+            // can resume, and publication keeps the verified pending schedule.
+            #[cfg(test)]
+            if std::mem::take(&mut session.tsab_fast_test_stop_after_pending_validation) {
+                stop.store(true, Ordering::Release);
+            }
+            add_state_metrics(total, rebuilt.take_metrics());
+            match session.state_mut().refresh_from_full_oracle(stop) {
+                Ok(true) => {
+                    slice.schedule_tsab.fast_full_validations = slice.schedule_tsab.fast_full_validations.saturating_add(1);
+                }
+                Ok(false) => {
+                    slice.schedule_tsab.fast_full_validations = slice.schedule_tsab.fast_full_validations.saturating_add(1);
+                    slice.schedule_tsab.fast_pending_discards = slice.schedule_tsab.fast_pending_discards.saturating_add(1);
+                    slice.schedule_tsab.fast_oracle_mismatches = slice.schedule_tsab.fast_oracle_mismatches.saturating_add(1);
+                    slice.schedule_tsab.fast_disabled =
+                        slice.schedule_tsab.fast_disabled.saturating_add(u64::from(session.tsab_fast_enabled));
+                    session.tsab_fast_enabled = false;
+                    session.tsab_fast_disabled = true;
+                    session.tsab_fast_commits_since_validation = 0;
+                    restore_tsab_verified_elite(session, total, stop)?;
+                    return Ok(false);
+                }
+                Err(_) => {
+                    session.tsab_pending_elite = Some(pending);
+                    return Err(Interrupted);
+                }
+            }
+        } else {
+            add_state_metrics(total, session.state_mut().take_metrics());
+        }
+        let pending_source = if preserve_current {
+            Some(rebuilt)
+        } else {
+            session.state = Some(rebuilt);
+            None
+        };
         session.elite_objective = declared;
-        session.elite_solution = session.state().to_solution();
+        session.elite_solution = verified_pending;
         session.last_improvement_step = session.accepted_step;
         session.last_improvement_probe = session.probe_step;
         session.tsab_fast_commits_since_validation = 0;
         session.tsab_fast_validation_due_on_resume = false;
-        session.tabu_until.clear();
-        clear_persistent_scan(session);
+        if !preserve_current {
+            session.tabu_until.clear();
+            clear_persistent_scan(session);
+        }
         slice.schedule_tsab.fast_pending_promotions = slice.schedule_tsab.fast_pending_promotions.saturating_add(1);
         *incumbent_improvements = incumbent_improvements.saturating_add(1);
         report(declared);
-        capture_search_elite_shadow(session, slice, search_elite_shadow, stop);
+        capture_search_elite_shadow_from_state(session, pending_source.as_ref(), slice, search_elite_shadow, stop);
         return Ok(true);
     }
 
@@ -3481,6 +3921,10 @@ fn restore_tsab_verified_elite(
     verified_state.retain_canonical_critical_blocks_only();
     add_state_metrics(total, session.state_mut().take_metrics());
     session.state = Some(verified_state);
+    if session.requested_strategy == ScheduleJsspSearchStrategy::TsabAdaptive {
+        session.tsab_adaptive_blocked_escape_pending = false;
+        session.tsab_adaptive_blocked_escape_after_step = session.accepted_step;
+    }
     session.tsab_pending_elite = None;
     session.tabu_until.clear();
     clear_persistent_scan(session);
@@ -3548,7 +3992,7 @@ fn activate_tsab_candidate(
 ) -> Interruptible<bool> {
     if !session.requested_strategy.requests_tsab()
         || session.strategy != ScheduleJsspSearchStrategy::Legacy
-        || session.tsab_legacy_warmup_work_steps != TSAB_LEGACY_WARMUP_WORK_UNITS
+        || session.tsab_legacy_warmup_work_steps != session.requested_strategy.legacy_warmup_work_units()
     {
         return Ok(false);
     }
@@ -3598,6 +4042,9 @@ fn activate_tsab_candidate(
     session.tsab_n5_work_since_restart = 0;
     session.tsab_restart_work_credit = 0;
     session.tsab_restart_epoch = 0;
+    session.tsab_adaptive_stagnant_restarts = 0;
+    session.tsab_adaptive_blocked_escape_pending = false;
+    session.tsab_adaptive_blocked_escape_after_step = 0;
     session.tsab_fast_enabled = session.state().supports_strict_n5_fast_path();
     session.tsab_fast_disabled = false;
     session.tsab_fast_hard_failure = false;
@@ -3608,7 +4055,12 @@ fn activate_tsab_candidate(
     {
         session.tsab_fast_test_stop_after_attempts = None;
     }
-    session.tenure_base = TSAB_TENURE;
+    if session.requested_strategy != ScheduleJsspSearchStrategy::TsabAdaptive {
+        session.tenure_base = TSAB_TENURE;
+    } else {
+        slice.baseline_island_profile_mask = 0;
+        slice.scored_island_profile_mask = 0;
+    }
     session.strategy = ScheduleJsspSearchStrategy::TsabCandidate;
     let activation_boundary = session.completed_boundaries;
     let activation_objective = session.state().makespan();
@@ -3629,6 +4081,27 @@ fn tsab_kick_objective_limit(base: i64) -> i64 {
     }
     let allowance = i128::from(base).saturating_mul(i128::from(TSAB_KICK_MAX_WORSENING_PPM)) / 1_000_000;
     i64::try_from(i128::from(base).saturating_add(allowance).min(i128::from(i64::MAX))).unwrap_or(i64::MAX)
+}
+
+fn tsab_restart_work_limit(session: &ScheduleSearchSession) -> u64 {
+    if session.requested_strategy == ScheduleJsspSearchStrategy::TsabAdaptive {
+        let operations = u64::try_from(session.state().operation_count()).unwrap_or(u64::MAX);
+        operations.clamp(128, 2_048)
+    } else {
+        TSAB_ELITE_RESTART_N5_WORK_UNITS
+    }
+}
+
+fn tsab_restart_due(session: &ScheduleSearchSession) -> bool {
+    (session.requested_strategy == ScheduleJsspSearchStrategy::TsabAdaptive && session.tsab_adaptive_blocked_escape_pending)
+        || session.tsab_n5_work_since_restart >= tsab_restart_work_limit(session)
+}
+
+fn note_adaptive_tsab_improvement(session: &mut ScheduleSearchSession) {
+    if session.requested_strategy == ScheduleJsspSearchStrategy::TsabAdaptive {
+        session.tsab_n5_work_since_restart = 0;
+        session.tsab_adaptive_stagnant_restarts = 0;
+    }
 }
 
 fn tsab_kick_acceptance(limit: i64) -> MinimizingMoveAcceptance {
@@ -3664,6 +4137,158 @@ fn select_tsab_tail_corridor_n6(state: &JobShopState, stop: &AtomicBool) -> Resu
     Ok((selected, generated))
 }
 
+fn perform_adaptive_tsab_current_escape(
+    session: &mut ScheduleSearchSession,
+    stop: &AtomicBool,
+    total: &mut ScheduleStateMetrics,
+    slice: &mut PersistentScheduleSliceMetrics,
+    incumbent_improvements: &mut u64,
+    search_elite_shadow: bool,
+    report: &mut dyn FnMut(i64),
+) -> Interruptible<bool> {
+    // Broader N6 includes the boundary swaps that strict N5 can exclude. It
+    // explores the current trajectory, with the same exact admission rules as
+    // legacy search, rather than repeatedly reconstructing an elite-based kick.
+    let blocked_escape = session.tsab_adaptive_blocked_escape_pending;
+    if blocked_escape {
+        slice.schedule_tsab.blocked_n6_attempts = slice.schedule_tsab.blocked_n6_attempts.saturating_add(1);
+    }
+    const PATH_POLICIES: [CanonicalPathPolicy; 7] = [
+        CanonicalPathPolicy::Historical,
+        CanonicalPathPolicy::MachineFirstLowest,
+        CanonicalPathPolicy::JobFirstHighest,
+        CanonicalPathPolicy::JobFirstLowest,
+        CanonicalPathPolicy::OperationHighest,
+        CanonicalPathPolicy::OperationLowest,
+        CanonicalPathPolicy::Mixed,
+    ];
+    if !blocked_escape {
+        let offset = usize::try_from(mix64(session.seed)).unwrap_or(usize::MAX) % PATH_POLICIES.len();
+        let epoch = usize::try_from(session.tsab_restart_epoch % PATH_POLICIES.len() as u64).unwrap_or(0);
+        let policy = PATH_POLICIES[(offset + epoch) % PATH_POLICIES.len()];
+        if !session.state_mut().set_canonical_path_policy(policy, stop).map_err(|_| Interrupted)? {
+            finish_adaptive_tsab_escape_work(session);
+            slice.schedule_tsab.restart_rejections = slice.schedule_tsab.restart_rejections.saturating_add(1);
+            return Ok(false);
+        }
+    }
+    session.state_mut().retain_canonical_critical_blocks_only();
+    let base_objective = session.state().makespan();
+    slice.schedule_tsab.restart_best_base_objective =
+        Some(slice.schedule_tsab.restart_best_base_objective.map_or(base_objective, |best| best.min(base_objective)));
+    let ScheduleSearchSession { state, scan, .. } = session;
+    state
+        .as_ref()
+        .expect("search sessions always own a job-shop state")
+        .fill_canonical_critical_moves(CriticalNeighborhood::N6, &mut scan.movements, stop)
+        .map_err(|_| Interrupted)?;
+    let generated = session.scan.movements.len();
+    slice.schedule_tsab.restart_n6_generated =
+        slice.schedule_tsab.restart_n6_generated.saturating_add(u64::try_from(generated).unwrap_or(u64::MAX));
+    if generated != 0 {
+        let scan_epoch = if blocked_escape { session.accepted_step } else { session.tsab_restart_epoch };
+        let offset =
+            usize::try_from(mix64(session.seed ^ scan_epoch.wrapping_mul(0xd1b5_4a32_d192_ed03))).unwrap_or(usize::MAX) % generated;
+        session.scan.movements.rotate_left(offset);
+    }
+    let mut best_any = None::<ProbedScheduleCandidate>;
+    let mut best_admissible = None::<ProbedScheduleCandidate>;
+    let probe_limit = if blocked_escape { 2 * TSAB_EXACT_SHORTLIST_CAPACITY } else { 32 };
+    for rank in 0..generated.min(probe_limit) {
+        let movement = session.scan.movements[rank];
+        let Some(arcs) = session.state().move_arcs(movement) else { continue };
+        let tabu = arcs
+            .added
+            .into_iter()
+            .flatten()
+            .any(|arc| session.tabu_until.get(&arc).is_some_and(|&expiration| session.accepted_step < expiration));
+        session.probe_step = session.probe_step.saturating_add(1);
+        slice.schedule_tsab.restart_delta_probes = slice.schedule_tsab.restart_delta_probes.saturating_add(1);
+        let probe = session.state_mut().probe_move(movement, stop).map_err(|_| Interrupted)?;
+        let MoveProbe::Feasible { candidate: objective, .. } = probe else { continue };
+        let aspiration = tabu_aspiration(tabu, objective, session.elite_objective);
+        let candidate = ProbedScheduleCandidate { movement, arcs, objective, aspiration, rank };
+        if best_any.is_none_or(|best| (objective, movement) < (best.objective, best.movement)) {
+            best_any = Some(candidate);
+        }
+        slice.tabu_hits = slice.tabu_hits.saturating_add(u64::from(tabu));
+        if (!tabu || aspiration) && best_admissible.is_none_or(|best| (objective, movement) < (best.objective, best.movement)) {
+            best_admissible = Some(candidate);
+        }
+    }
+    let (selected, forced) = if blocked_escape {
+        // This opportunity precedes the existing forced-N5 fallback. If N6
+        // has no admissible move, retain the trajectory and let that fallback
+        // resume under the expiration-based cooldown.
+        (best_admissible, false)
+    } else {
+        let (selected, forced, _) = select_scanned_candidate(ScheduleJsspSearchStrategy::Legacy, best_admissible, best_any);
+        (selected, forced)
+    };
+    let outcome = if let Some(selected) = selected {
+        let acceptance = if selected.aspiration {
+            MinimizingMoveAcceptance::StrictlyBelow(session.elite_objective)
+        } else {
+            MinimizingMoveAcceptance::Always
+        };
+        Some((selected, session.state_mut().commit_probed_move(selected.movement, acceptance, stop).map_err(|_| Interrupted)?))
+    } else {
+        checkpoint(stop)?;
+        None
+    };
+    finish_adaptive_tsab_escape_work(session);
+    clear_persistent_scan(session);
+    let Some((selected, MoveOutcome::Accepted { current, .. })) = outcome else {
+        slice.schedule_tsab.restart_rejections = slice.schedule_tsab.restart_rejections.saturating_add(1);
+        return Ok(false);
+    };
+    session.accepted_step = session.accepted_step.saturating_add(1);
+    slice.tabu_steps = slice.tabu_steps.saturating_add(1);
+    slice.tabu_forced_moves = slice.tabu_forced_moves.saturating_add(u64::from(forced));
+    slice.tabu_aspirations = slice.tabu_aspirations.saturating_add(u64::from(selected.aspiration));
+    slice.schedule_tsab.aspirations = slice.schedule_tsab.aspirations.saturating_add(u64::from(selected.aspiration));
+    slice.schedule_tsab.n6_kicks = slice.schedule_tsab.n6_kicks.saturating_add(1);
+    slice.schedule_tsab.kick_moves = slice.schedule_tsab.kick_moves.saturating_add(1);
+    slice.schedule_tsab.restart_oracle_commits = slice.schedule_tsab.restart_oracle_commits.saturating_add(1);
+    slice.schedule_tsab.full_oracle_commits = slice.schedule_tsab.full_oracle_commits.saturating_add(1);
+    slice.schedule_tsab.selections = slice.schedule_tsab.selections.saturating_add(1);
+    slice.schedule_tsab.restart_best_kicked_objective =
+        Some(slice.schedule_tsab.restart_best_kicked_objective.map_or(current, |best| best.min(current)));
+    session.tsab_fast_commits_since_validation = 0;
+    session.tsab_fast_validation_due_on_resume = false;
+    for arc in selected.arcs.removed.into_iter().flatten() {
+        let expiration = session.accepted_step.saturating_add(arc_tenure(session, arc));
+        session.tabu_until.entry(arc).and_modify(|value| *value = (*value).max(expiration)).or_insert(expiration);
+    }
+    session.tabu_until.retain(|_, expiration| session.accepted_step < *expiration);
+    if current < session.elite_objective {
+        session.elite_objective = current;
+        session.elite_solution = session.state().to_solution();
+        session.last_improvement_step = session.accepted_step;
+        session.last_improvement_probe = session.probe_step;
+        note_adaptive_tsab_improvement(session);
+        slice.schedule_tsab.improving_commits = slice.schedule_tsab.improving_commits.saturating_add(1);
+        slice.schedule_tsab.post_restart_improvements = slice.schedule_tsab.post_restart_improvements.saturating_add(1);
+        slice.schedule_tsab.best_committed_objective =
+            Some(slice.schedule_tsab.best_committed_objective.map_or(current, |best| best.min(current)));
+        *incumbent_improvements = incumbent_improvements.saturating_add(1);
+        report(current);
+        capture_search_elite_shadow(session, slice, search_elite_shadow, stop);
+    }
+    add_state_metrics(total, session.state_mut().take_metrics());
+    Ok(true)
+}
+
+fn finish_adaptive_tsab_escape_work(session: &mut ScheduleSearchSession) {
+    if !session.tsab_adaptive_blocked_escape_pending {
+        session.tsab_n5_work_since_restart = 0;
+        session.tsab_restart_epoch = session.tsab_restart_epoch.saturating_add(1);
+        session.tsab_adaptive_stagnant_restarts = session.tsab_adaptive_stagnant_restarts.saturating_add(1);
+    }
+    session.tsab_restart_work_credit = 0;
+    session.tsab_adaptive_blocked_escape_pending = false;
+}
+
 #[cfg(test)]
 pub(crate) fn audit_tsab_tail_corridor_selection(state: &JobShopState) -> Vec<ScheduleMove> {
     let stop = AtomicBool::new(false);
@@ -3691,10 +4316,13 @@ fn perform_tsab_elite_n6_restart(
     checkpoint(stop)?;
     debug_assert_eq!(session.strategy, ScheduleJsspSearchStrategy::TsabCandidate);
     debug_assert!(session.scan.end == 0);
-    debug_assert!(session.tsab_n5_work_since_restart >= TSAB_ELITE_RESTART_N5_WORK_UNITS);
+    debug_assert!(tsab_restart_due(session));
     debug_assert_eq!(session.tsab_restart_work_credit, TSAB_ELITE_RESTART_WORK_UNITS);
     slice.schedule_tsab.restart_attempts = slice.schedule_tsab.restart_attempts.saturating_add(1);
     slice.schedule_tsab.escape_signals = slice.schedule_tsab.escape_signals.saturating_add(1);
+    if session.requested_strategy == ScheduleJsspSearchStrategy::TsabAdaptive {
+        return perform_adaptive_tsab_current_escape(session, stop, total, slice, incumbent_improvements, search_elite_shadow, report);
+    }
 
     let rebuild_started = Instant::now();
     let previous_elite_objective = session.elite_objective;
@@ -4566,6 +5194,10 @@ fn solve_schedule_constructor_multistart(
                 tsab_n5_work_since_restart: 0,
                 tsab_restart_work_credit: 0,
                 tsab_restart_epoch: 0,
+                tsab_adaptive_stagnant_restarts: 0,
+                tsab_adaptive_blocked_escape_pending: false,
+                tsab_adaptive_blocked_escape_after_step: 0,
+                tsab_adaptive_forward_probes_disabled: false,
                 tsab_fast_enabled: false,
                 tsab_fast_disabled: false,
                 tsab_fast_hard_failure: false,
@@ -4580,6 +5212,14 @@ fn solve_schedule_constructor_multistart(
                 tsab_fast_test_return_after_pending_elite: false,
                 #[cfg(test)]
                 tsab_fast_test_stop_during_validation: false,
+                #[cfg(test)]
+                tsab_fast_test_stop_after_pending_validation: false,
+                #[cfg(test)]
+                tsab_adaptive_test_unpruned_selection: false,
+                #[cfg(test)]
+                tsab_adaptive_test_generic_probes: false,
+                #[cfg(test)]
+                tsab_adaptive_test_stop_before_primary_prune: false,
                 tenure_base: 0,
                 completed_boundaries: 0,
                 tsab_legacy_warmup_work_steps: 0,
@@ -4887,6 +5527,10 @@ pub(crate) fn solve_schedule_capped_persistent_hybrid_with_strategy(
             tsab_n5_work_since_restart: 0,
             tsab_restart_work_credit: 0,
             tsab_restart_epoch: 0,
+            tsab_adaptive_stagnant_restarts: 0,
+            tsab_adaptive_blocked_escape_pending: false,
+            tsab_adaptive_blocked_escape_after_step: 0,
+            tsab_adaptive_forward_probes_disabled: false,
             tsab_fast_enabled: false,
             tsab_fast_disabled: false,
             tsab_fast_hard_failure: false,
@@ -4901,6 +5545,14 @@ pub(crate) fn solve_schedule_capped_persistent_hybrid_with_strategy(
             tsab_fast_test_return_after_pending_elite: false,
             #[cfg(test)]
             tsab_fast_test_stop_during_validation: false,
+            #[cfg(test)]
+            tsab_fast_test_stop_after_pending_validation: false,
+            #[cfg(test)]
+            tsab_adaptive_test_unpruned_selection: false,
+            #[cfg(test)]
+            tsab_adaptive_test_generic_probes: false,
+            #[cfg(test)]
+            tsab_adaptive_test_stop_before_primary_prune: false,
             tenure_base: requested_profile.scaled_tenure(ratio.isqrt().clamp(5, 32)),
             completed_boundaries: 0,
             tsab_legacy_warmup_work_steps: 0,
@@ -4973,6 +5625,28 @@ pub(crate) fn solve_schedule_capped_persistent_hybrid_with_strategy(
         }
     }
 
+    if session.requested_strategy == ScheduleJsspSearchStrategy::TsabAdaptive
+        && session.strategy == ScheduleJsspSearchStrategy::Legacy
+        && !stop.load(Ordering::Acquire)
+    {
+        // The constructor already produced a complete reconstructible elite.
+        // A single worker need not wait for an externally shared incumbent.
+        // Publication still crosses the canonical collection replay boundary.
+        let local_elite = session.elite_solution.clone();
+        let _ = activate_tsab_candidate(
+            &mut session,
+            worker,
+            &local_elite,
+            false,
+            stop,
+            &mut total,
+            &mut slice,
+            &mut construction_elapsed,
+            &mut incumbent_injections,
+            search_elite_shadow,
+        );
+    }
+
     let default_moves = u64::try_from(session.state().operation_count()).unwrap_or(u64::MAX).saturating_mul(256).clamp(2_048, 100_000);
     let requested_probe_limit = if max_iterations == u64::MAX { default_moves } else { max_iterations };
     let complete_tsab_incumbent =
@@ -4983,7 +5657,7 @@ pub(crate) fn solve_schedule_capped_persistent_hybrid_with_strategy(
         if session.strategy == ScheduleJsspSearchStrategy::TsabCandidate {
             requested_probe_limit.min(TSAB_BURST_WORK_LIMIT)
         } else {
-            let remaining_warmup = TSAB_LEGACY_WARMUP_WORK_UNITS.saturating_sub(warmup_start);
+            let remaining_warmup = session.requested_strategy.legacy_warmup_work_units().saturating_sub(warmup_start);
             if remaining_warmup == 0 && complete_tsab_incumbent.is_some() {
                 requested_probe_limit.min(TSAB_BURST_WORK_LIMIT)
             } else {
@@ -5015,9 +5689,9 @@ pub(crate) fn solve_schedule_capped_persistent_hybrid_with_strategy(
     'search: while search_allowed && probes < probe_limit && checkpoint(stop).is_ok() {
         if session.requested_strategy.requests_tsab()
             && session.strategy == ScheduleJsspSearchStrategy::Legacy
-            && warmup_start.saturating_add(probes) == TSAB_LEGACY_WARMUP_WORK_UNITS
+            && warmup_start.saturating_add(probes) == session.requested_strategy.legacy_warmup_work_units()
         {
-            session.tsab_legacy_warmup_work_steps = TSAB_LEGACY_WARMUP_WORK_UNITS;
+            session.tsab_legacy_warmup_work_steps = session.requested_strategy.legacy_warmup_work_units();
             let Some(incumbent) = complete_tsab_incumbent else {
                 break;
             };
@@ -5051,7 +5725,7 @@ pub(crate) fn solve_schedule_capped_persistent_hybrid_with_strategy(
         if session.strategy == ScheduleJsspSearchStrategy::TsabCandidate
             && session.tsab_fast_enabled
             && session.scan.end == 0
-            && session.tsab_n5_work_since_restart >= TSAB_ELITE_RESTART_N5_WORK_UNITS
+            && tsab_restart_due(&session)
             && (session.tsab_fast_commits_since_validation != 0 || session.tsab_pending_elite.is_some())
         {
             let validation = validate_tsab_fast_checkpoint(
@@ -5067,10 +5741,7 @@ pub(crate) fn solve_schedule_capped_persistent_hybrid_with_strategy(
                 break;
             }
         }
-        if session.strategy == ScheduleJsspSearchStrategy::TsabCandidate
-            && session.scan.end == 0
-            && session.tsab_n5_work_since_restart >= TSAB_ELITE_RESTART_N5_WORK_UNITS
-        {
+        if session.strategy == ScheduleJsspSearchStrategy::TsabCandidate && session.scan.end == 0 && tsab_restart_due(&session) {
             let required = TSAB_ELITE_RESTART_WORK_UNITS.saturating_sub(session.tsab_restart_work_credit);
             let charged = required.min(probe_limit.saturating_sub(probes));
             session.tsab_restart_work_credit = session.tsab_restart_work_credit.saturating_add(charged);
@@ -5109,7 +5780,12 @@ pub(crate) fn solve_schedule_capped_persistent_hybrid_with_strategy(
             session.tsab_n5_work_since_restart = session.tsab_n5_work_since_restart.saturating_add(1);
             slice.schedule_tsab.fast_work_units = slice.schedule_tsab.fast_work_units.saturating_add(1);
             let mut interrupted = false;
-            for _ in 0..TSAB_FAST_TRANSITIONS_PER_WORK_UNIT {
+            let transitions_per_work = if session.requested_strategy == ScheduleJsspSearchStrategy::TsabAdaptive {
+                1
+            } else {
+                TSAB_FAST_TRANSITIONS_PER_WORK_UNIT
+            };
+            for _ in 0..transitions_per_work {
                 if checkpoint(stop).is_err() {
                     interrupted = true;
                     break;
@@ -5121,13 +5797,25 @@ pub(crate) fn solve_schedule_capped_persistent_hybrid_with_strategy(
                         break;
                     }
                 };
-                let Some((movement, arcs)) = selected else {
+                let Some(TsabFastSelection { movement, arcs, aspiration, forced }) = selected else {
+                    if session.requested_strategy == ScheduleJsspSearchStrategy::TsabAdaptive
+                        && !session.tsab_adaptive_blocked_escape_pending
+                    {
+                        session.tsab_n5_work_since_restart = tsab_restart_work_limit(&session);
+                    }
                     break;
                 };
                 session.probe_step = session.probe_step.saturating_add(1);
                 slice.schedule_tsab.fast_attempts = slice.schedule_tsab.fast_attempts.saturating_add(1);
                 slice.schedule_tsab.delta_probes = slice.schedule_tsab.delta_probes.saturating_add(1);
-                let fast = match session.state_mut().consider_strict_n5_fast(movement, MinimizingMoveAcceptance::Always, stop) {
+                let aspiration_limit = session
+                    .tsab_pending_elite
+                    .as_ref()
+                    .and_then(|solution| solution.objectives.first().copied())
+                    .unwrap_or(session.elite_objective);
+                let acceptance =
+                    if aspiration { MinimizingMoveAcceptance::StrictlyBelow(aspiration_limit) } else { MinimizingMoveAcceptance::Always };
+                let fast = match session.state_mut().consider_strict_n5_fast(movement, acceptance, stop) {
                     Ok(fast) => fast,
                     Err(_) => {
                         interrupted = true;
@@ -5153,6 +5841,9 @@ pub(crate) fn solve_schedule_capped_persistent_hybrid_with_strategy(
                     session.tsab_fast_commits_since_validation.saturating_add(u64::from(fast.used_fast_path));
                 session.accepted_step = session.accepted_step.saturating_add(1);
                 slice.tabu_steps = slice.tabu_steps.saturating_add(1);
+                slice.tabu_aspirations = slice.tabu_aspirations.saturating_add(u64::from(aspiration));
+                slice.tabu_forced_moves = slice.tabu_forced_moves.saturating_add(u64::from(forced));
+                slice.schedule_tsab.aspirations = slice.schedule_tsab.aspirations.saturating_add(u64::from(aspiration));
                 for arc in arcs.removed.into_iter().flatten() {
                     let expiration = session.accepted_step.saturating_add(arc_tenure(&session, arc));
                     session.tabu_until.entry(arc).and_modify(|value| *value = (*value).max(expiration)).or_insert(expiration);
@@ -5165,6 +5856,7 @@ pub(crate) fn solve_schedule_capped_persistent_hybrid_with_strategy(
                     .and_then(|solution| solution.objectives.first().copied())
                     .unwrap_or(session.elite_objective);
                 if current < local_best {
+                    note_adaptive_tsab_improvement(&mut session);
                     session.tsab_pending_elite = Some(session.state().to_solution());
                     let pending_bytes = session.tsab_pending_elite.as_ref().map_or(0, collection_solution_heap_lower_bound_bytes);
                     let workspace_bytes = session.state().fast_n5_workspace_lower_bound_bytes().saturating_add(pending_bytes);
@@ -5468,6 +6160,7 @@ pub(crate) fn solve_schedule_capped_persistent_hybrid_with_strategy(
         }
         session.tabu_until.retain(|_, expiration| session.accepted_step < *expiration);
         if current < session.elite_objective {
+            note_adaptive_tsab_improvement(&mut session);
             if session.strategy == ScheduleJsspSearchStrategy::TsabCandidate {
                 slice.schedule_tsab.improving_commits = slice.schedule_tsab.improving_commits.saturating_add(1);
                 if session.tsab_restart_epoch != 0 {
@@ -5510,7 +6203,8 @@ pub(crate) fn solve_schedule_capped_persistent_hybrid_with_strategy(
     }
     if session.requested_strategy.requests_tsab() {
         let warmup_work_units = active_start_probe.unwrap_or(probes).min(probes);
-        session.tsab_legacy_warmup_work_steps = warmup_start.saturating_add(warmup_work_units).min(TSAB_LEGACY_WARMUP_WORK_UNITS);
+        session.tsab_legacy_warmup_work_steps =
+            warmup_start.saturating_add(warmup_work_units).min(session.requested_strategy.legacy_warmup_work_units());
         slice.schedule_tsab.legacy_warmup_work_steps = warmup_work_units;
         if let Some(active_start) = active_start_probe {
             let burst_work_units = probes.saturating_sub(active_start);

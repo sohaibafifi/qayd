@@ -47,6 +47,7 @@ enum FinalReplayAudit {
     None,
     SoftDeadline,
     SoftDeadlineThenExternal,
+    MemoryLimit,
 }
 
 #[cfg(test)]
@@ -177,9 +178,16 @@ pub(crate) fn audit_interrupt_next_collection_final_replay(hard_cancel_after_int
 }
 
 #[cfg(test)]
+pub(crate) fn audit_memory_stop_next_collection_finalization() {
+    FINAL_REPLAY_AUDIT.set(FinalReplayAudit::MemoryLimit);
+}
+
+#[cfg(test)]
 fn apply_final_replay_audit_before_first_pass(budget: &SolveBudget) {
     FINAL_REPLAY_AUDIT.with(|audit| {
-        if !matches!(audit.get(), FinalReplayAudit::None) {
+        if matches!(audit.get(), FinalReplayAudit::MemoryLimit) {
+            budget.cancel_with(TerminationReason::MemoryLimit);
+        } else if !matches!(audit.get(), FinalReplayAudit::None) {
             budget.cancel_with(TerminationReason::Deadline);
         }
     });
@@ -539,8 +547,10 @@ fn validate_selected_plan_options(plan: &CollectionSolvePlan, request: &SolveReq
             ));
         }
     }
-    if matches!(request.schedule_jssp_search, ScheduleJsspSearch::TsabCandidate | ScheduleJsspSearch::TsabMultiCandidate)
-        && !matches!(plan.backend, CollectionBackend::ScheduleLocalSearch)
+    if matches!(
+        request.schedule_jssp_search,
+        ScheduleJsspSearch::TsabCandidate | ScheduleJsspSearch::TsabMultiCandidate | ScheduleJsspSearch::TsabAdaptive
+    ) && !matches!(plan.backend, CollectionBackend::ScheduleLocalSearch)
     {
         return Err(SolveError::InvalidRequest("TSAB JSSP search requires a selected scheduling local-search backend".to_string()));
     }
@@ -853,14 +863,47 @@ fn solve_collection_plan_inner(
             }
             CollectionBackend::ScheduleExact(compiled) => {
                 let structural_bound = dual::compute(model, engine_stop);
-                let outcome = schedule::solve_compiled(
+                let mut execution = schedule::Execution::default();
+                let mut verified_primal = None;
+                let mut verification_error = None;
+                budget.trace_phase("schedule-search-start");
+                let outcome = schedule::solve_compiled_with_observer(
                     compiled,
                     engine_stop,
                     schedule::Options { seed: request.seed, optional_modes_cdcl: request.schedule_cdcl },
-                    |value| record_progress(sink, budget, &mut event_error, EngineKind::ScheduleExact, value),
+                    structural_bound.as_ref().map(|bound| bound.value),
+                    &mut execution,
+                    |value, snapshot| {
+                        if verification_error.is_none() && !budget.expired() {
+                            if let Some(snapshot) = snapshot {
+                                budget.trace_phase("schedule-incumbent-replay-start");
+                                match verified_schedule_incumbent(semantic, value, snapshot, budget.stop()) {
+                                    Ok(candidate) => {
+                                        budget.trace_phase("schedule-incumbent-replay-accepted");
+                                        verified_primal = Some(candidate);
+                                    }
+                                    Err(SolveError::Interrupted(_)) => {
+                                        budget.trace_phase("schedule-incumbent-replay-interrupted");
+                                    }
+                                    Err(error) => {
+                                        verification_error = Some(error);
+                                        budget.cancel_with(TerminationReason::Engine);
+                                    }
+                                }
+                            }
+                        }
+                        record_progress(sink, budget, &mut event_error, EngineKind::ScheduleExact, value);
+                        if budget.expired() {
+                            engine_stop.store(true, Ordering::Release);
+                        }
+                    },
                 )
                 .map_err(SolveError::Engine)?;
-                result_from_schedule(semantic, model, outcome, structural_bound, started.elapsed(), budget)?
+                budget.trace_phase("schedule-search-returned");
+                if let Some(error) = verification_error {
+                    return Err(error);
+                }
+                result_from_schedule(semantic, model, outcome, verified_primal, execution, structural_bound, started.elapsed(), budget)?
             }
             // Routing local search is the same list engine specialised on edge
             // costs; it only reports under a distinct kind so the phase is visible.
@@ -1032,10 +1075,13 @@ fn result_from_list_exact(
     )
 }
 
-fn result_from_schedule(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn result_from_schedule(
     semantic: &Model,
     model: &list::CollectionModel,
     outcome: schedule::Outcome,
+    verified_primal: Option<CandidateSolution>,
+    execution: schedule::Execution,
     structural_bound: Option<dual::DualBound>,
     elapsed: Duration,
     budget: &SolveBudget,
@@ -1062,22 +1108,22 @@ fn result_from_schedule(
         dual::attach(model, &mut solution, structural_bound);
     }
     let proof = completion_proof(EngineKind::ScheduleExact, status, model.objectives.len(), true);
+    let metadata = execution
+        .encoding
+        .map(|value| ("schedule_encoding".to_string(), value.to_string()))
+        .into_iter()
+        .chain(execution.search_kernel.map(|value| ("schedule_search_kernel".to_string(), value.to_string())))
+        .collect();
     finish_collection_result(
         semantic,
         model,
         CollectionCompletion {
             solution,
-            verified_primal: None,
+            verified_primal,
             status,
             source: EngineKind::ScheduleExact,
             proof,
-            report: EngineReport {
-                engine: Some(EngineKind::ScheduleExact),
-                search: outcome.stats,
-                elapsed,
-                improvements: 0,
-                metadata: Vec::new(),
-            },
+            report: EngineReport { engine: Some(EngineKind::ScheduleExact), search: outcome.stats, elapsed, improvements: 0, metadata },
         },
         budget,
         None,
@@ -1468,6 +1514,9 @@ struct ScheduleMetricsAggregate {
     schedule_tsab_tabu_resets: u64,
     schedule_tsab_fingerprint_repeats: u64,
     schedule_tsab_escape_signals: u64,
+    schedule_tsab_blocked_n6_requests: u64,
+    schedule_tsab_blocked_n6_attempts: u64,
+    schedule_tsab_blocked_n6_cooldown_skips: u64,
     schedule_tsab_n1_kicks: u64,
     schedule_tsab_kick_moves: u64,
     schedule_tsab_elite_restarts: u64,
@@ -1514,6 +1563,11 @@ struct ScheduleMetricsAggregate {
     schedule_tsab_fast_work_cap_recoveries: u64,
     schedule_tsab_fast_date_changes: u64,
     schedule_tsab_fast_queue_pops: u64,
+    schedule_tsab_forward_probe_attempts: u64,
+    schedule_tsab_forward_probe_fallbacks: u64,
+    schedule_tsab_forward_probe_queue_pops: u64,
+    schedule_tsab_forward_probe_date_changes: u64,
+    schedule_tsab_forward_probe_disables: u64,
     schedule_tsab_fast_full_validations: u64,
     schedule_tsab_fast_oracle_mismatches: u64,
     schedule_tsab_fast_pending_promotions: u64,
@@ -1661,6 +1715,12 @@ impl ScheduleMetricsAggregate {
         self.schedule_tsab_fingerprint_repeats =
             self.schedule_tsab_fingerprint_repeats.saturating_add(metrics.schedule_tsab.fingerprint_repeats);
         self.schedule_tsab_escape_signals = self.schedule_tsab_escape_signals.saturating_add(metrics.schedule_tsab.escape_signals);
+        self.schedule_tsab_blocked_n6_requests =
+            self.schedule_tsab_blocked_n6_requests.saturating_add(metrics.schedule_tsab.blocked_n6_requests);
+        self.schedule_tsab_blocked_n6_attempts =
+            self.schedule_tsab_blocked_n6_attempts.saturating_add(metrics.schedule_tsab.blocked_n6_attempts);
+        self.schedule_tsab_blocked_n6_cooldown_skips =
+            self.schedule_tsab_blocked_n6_cooldown_skips.saturating_add(metrics.schedule_tsab.blocked_n6_cooldown_skips);
         self.schedule_tsab_n1_kicks = self.schedule_tsab_n1_kicks.saturating_add(metrics.schedule_tsab.n1_kicks);
         self.schedule_tsab_kick_moves = self.schedule_tsab_kick_moves.saturating_add(metrics.schedule_tsab.kick_moves);
         self.schedule_tsab_elite_restarts = self.schedule_tsab_elite_restarts.saturating_add(metrics.schedule_tsab.elite_restarts);
@@ -1743,6 +1803,16 @@ impl ScheduleMetricsAggregate {
             self.schedule_tsab_fast_work_cap_recoveries.saturating_add(metrics.schedule_tsab.fast_work_cap_recoveries);
         self.schedule_tsab_fast_date_changes = self.schedule_tsab_fast_date_changes.saturating_add(metrics.schedule_tsab.fast_date_changes);
         self.schedule_tsab_fast_queue_pops = self.schedule_tsab_fast_queue_pops.saturating_add(metrics.schedule_tsab.fast_queue_pops);
+        self.schedule_tsab_forward_probe_attempts =
+            self.schedule_tsab_forward_probe_attempts.saturating_add(metrics.schedule_tsab.forward_probe_attempts);
+        self.schedule_tsab_forward_probe_fallbacks =
+            self.schedule_tsab_forward_probe_fallbacks.saturating_add(metrics.schedule_tsab.forward_probe_fallbacks);
+        self.schedule_tsab_forward_probe_queue_pops =
+            self.schedule_tsab_forward_probe_queue_pops.saturating_add(metrics.schedule_tsab.forward_probe_queue_pops);
+        self.schedule_tsab_forward_probe_date_changes =
+            self.schedule_tsab_forward_probe_date_changes.saturating_add(metrics.schedule_tsab.forward_probe_date_changes);
+        self.schedule_tsab_forward_probe_disables =
+            self.schedule_tsab_forward_probe_disables.saturating_add(metrics.schedule_tsab.forward_probe_disables);
         self.schedule_tsab_fast_full_validations =
             self.schedule_tsab_fast_full_validations.saturating_add(metrics.schedule_tsab.fast_full_validations);
         self.schedule_tsab_fast_oracle_mismatches =
@@ -2109,8 +2179,10 @@ fn result_from_schedule_local_search(
             )
         });
     }
-    if matches!(request.schedule_jssp_search, ScheduleJsspSearch::TsabCandidate | ScheduleJsspSearch::TsabMultiCandidate)
-        && !lists::schedule_constructor_multistart_supported(schedule, engine_stop)
+    if matches!(
+        request.schedule_jssp_search,
+        ScheduleJsspSearch::TsabCandidate | ScheduleJsspSearch::TsabMultiCandidate | ScheduleJsspSearch::TsabAdaptive
+    ) && !lists::schedule_constructor_multistart_supported(schedule, engine_stop)
     {
         return Err(if engine_stop.load(Ordering::Acquire) {
             SolveError::Interrupted("solve budget expired while validating TSAB JSSP search".to_string())
@@ -2170,6 +2242,7 @@ fn result_from_schedule_local_search(
             ScheduleJsspSearch::Legacy => lists::ScheduleJsspSearchStrategy::Legacy,
             ScheduleJsspSearch::TsabCandidate => lists::ScheduleJsspSearchStrategy::TsabCandidate,
             ScheduleJsspSearch::TsabMultiCandidate => lists::ScheduleJsspSearchStrategy::TsabMultiCandidate,
+            ScheduleJsspSearch::TsabAdaptive => lists::ScheduleJsspSearchStrategy::TsabAdaptive,
         };
         let mut remaining = (0..allocation.workers())
             .map(|worker| worker_iteration_quota(max_iterations, worker, allocation.workers()))
@@ -2183,15 +2256,21 @@ fn result_from_schedule_local_search(
 
         'search_and_finalization: loop {
             loop {
-                if engine_stop.load(Ordering::Acquire) {
+                let adaptive_work_exhausted = schedule_jssp_strategy == lists::ScheduleJsspSearchStrategy::TsabAdaptive
+                    && finite_work
+                    && remaining.iter().all(|&left| left == 0);
+                if engine_stop.load(Ordering::Acquire) || adaptive_work_exhausted {
                     let mut pending_owners = Vec::<(i64, usize)>::new();
                     if !terminal_finalization_attempted
                         && !budget.hard_cancelled()
                         && !finalization_stop.load(Ordering::Acquire)
                         && schedule_jssp_strategy.requests_tsab()
-                        && allocation.workers() == 7
+                        && schedule_jssp_strategy.owner_mask(allocation.workers()) != 0
                     {
                         pending_owners.extend(worker_sessions.iter().enumerate().filter_map(|(owner, session)| {
+                            if !schedule_jssp_strategy.owns_worker(owner, allocation.workers()) {
+                                return None;
+                            }
                             session
                                 .as_ref()
                                 .and_then(lists::ScheduleSearchSession::tsab_fast_pending_objective)
@@ -2215,13 +2294,18 @@ fn result_from_schedule_local_search(
                         let fallback_seed = schedule_round_seed(request.seed, round).wrapping_add(worker);
                         let injected = shared_incumbent.as_ref().map(|incumbent| incumbent.solution.clone());
                         let session = worker_sessions[owner].take();
+                        // Finite-work exhaustion has no armed deadline. Signal
+                        // that search ended so pending fast-path gains receive
+                        // their full oracle check before semantic replay.
+                        let terminal_search_stop = AtomicBool::new(true);
+                        let terminal_engine_stop = if adaptive_work_exhausted { &terminal_search_stop } else { engine_stop };
                         let (mut candidate, metrics, returned_session) = lists::solve_schedule_capped_persistent_hybrid_with_strategy(
                             schedule,
                             stable_seed,
                             fallback_seed,
                             owner,
                             allocation.workers(),
-                            engine_stop,
+                            terminal_engine_stop,
                             finalization_stop,
                             0,
                             injected.as_ref(),
@@ -2570,12 +2654,18 @@ fn result_from_schedule_local_search(
             }
 
             if !terminal_finalization_attempted
-                && engine_stop.load(Ordering::Acquire)
+                && (engine_stop.load(Ordering::Acquire)
+                    || (schedule_jssp_strategy == lists::ScheduleJsspSearchStrategy::TsabAdaptive
+                        && finite_work
+                        && remaining.iter().all(|&left| left == 0)))
                 && !budget.hard_cancelled()
                 && !finalization_stop.load(Ordering::Acquire)
                 && schedule_jssp_strategy.requests_tsab()
-                && allocation.workers() == 7
-                && worker_sessions.iter().flatten().any(lists::ScheduleSearchSession::has_tsab_fast_pending_elite)
+                && schedule_jssp_strategy.owner_mask(allocation.workers()) != 0
+                && worker_sessions.iter().enumerate().any(|(worker, session)| {
+                    schedule_jssp_strategy.owns_worker(worker, allocation.workers())
+                        && session.as_ref().is_some_and(lists::ScheduleSearchSession::has_tsab_fast_pending_elite)
+                })
             {
                 continue 'search_and_finalization;
             }
@@ -2675,6 +2765,9 @@ fn result_from_schedule_local_search(
         schedule_tsab_tabu_resets,
         schedule_tsab_fingerprint_repeats,
         schedule_tsab_escape_signals,
+        schedule_tsab_blocked_n6_requests,
+        schedule_tsab_blocked_n6_attempts,
+        schedule_tsab_blocked_n6_cooldown_skips,
         schedule_tsab_n1_kicks,
         schedule_tsab_kick_moves,
         schedule_tsab_elite_restarts,
@@ -2721,6 +2814,11 @@ fn result_from_schedule_local_search(
         schedule_tsab_fast_work_cap_recoveries,
         schedule_tsab_fast_date_changes,
         schedule_tsab_fast_queue_pops,
+        schedule_tsab_forward_probe_attempts,
+        schedule_tsab_forward_probe_fallbacks,
+        schedule_tsab_forward_probe_queue_pops,
+        schedule_tsab_forward_probe_date_changes,
+        schedule_tsab_forward_probe_disables,
         schedule_tsab_fast_full_validations,
         schedule_tsab_fast_oracle_mismatches,
         schedule_tsab_fast_pending_promotions,
@@ -2918,6 +3016,9 @@ fn result_from_schedule_local_search(
         ("schedule_tsab_tabu_resets".to_string(), schedule_tsab_tabu_resets.to_string()),
         ("schedule_tsab_fingerprint_repeats".to_string(), schedule_tsab_fingerprint_repeats.to_string()),
         ("schedule_tsab_escape_signals".to_string(), schedule_tsab_escape_signals.to_string()),
+        ("schedule_tsab_blocked_n6_requests".to_string(), schedule_tsab_blocked_n6_requests.to_string()),
+        ("schedule_tsab_blocked_n6_attempts".to_string(), schedule_tsab_blocked_n6_attempts.to_string()),
+        ("schedule_tsab_blocked_n6_cooldown_skips".to_string(), schedule_tsab_blocked_n6_cooldown_skips.to_string()),
         ("schedule_tsab_n1_kicks".to_string(), schedule_tsab_n1_kicks.to_string()),
         ("schedule_tsab_kick_moves".to_string(), schedule_tsab_kick_moves.to_string()),
         ("schedule_tsab_elite_restarts".to_string(), schedule_tsab_elite_restarts.to_string()),
@@ -2988,6 +3089,11 @@ fn result_from_schedule_local_search(
         ("schedule_tsab_fast_work_cap_recoveries".to_string(), schedule_tsab_fast_work_cap_recoveries.to_string()),
         ("schedule_tsab_fast_date_changes".to_string(), schedule_tsab_fast_date_changes.to_string()),
         ("schedule_tsab_fast_queue_pops".to_string(), schedule_tsab_fast_queue_pops.to_string()),
+        ("schedule_tsab_forward_probe_attempts".to_string(), schedule_tsab_forward_probe_attempts.to_string()),
+        ("schedule_tsab_forward_probe_fallbacks".to_string(), schedule_tsab_forward_probe_fallbacks.to_string()),
+        ("schedule_tsab_forward_probe_queue_pops".to_string(), schedule_tsab_forward_probe_queue_pops.to_string()),
+        ("schedule_tsab_forward_probe_date_changes".to_string(), schedule_tsab_forward_probe_date_changes.to_string()),
+        ("schedule_tsab_forward_probe_disables".to_string(), schedule_tsab_forward_probe_disables.to_string()),
         ("schedule_tsab_fast_full_validations".to_string(), schedule_tsab_fast_full_validations.to_string()),
         ("schedule_tsab_fast_oracle_mismatches".to_string(), schedule_tsab_fast_oracle_mismatches.to_string()),
         ("schedule_tsab_fast_pending_promotions".to_string(), schedule_tsab_fast_pending_promotions.to_string()),
@@ -3332,29 +3438,82 @@ fn finish_collection_result(
     budget: &SolveBudget,
     transfer_stop: Option<&AtomicBool>,
 ) -> Result<SolveResult, SolveError> {
-    let CollectionCompletion { solution, verified_primal, status, source, proof, report } = completion;
-    let primal = if let Some(candidate) = verified_primal {
-        #[cfg(test)]
-        list::audit_record_final_verification_boundary();
-        Some(promote_verified_collection_candidate(candidate, budget, transfer_stop)?)
-    } else if solution.feasible {
+    let CollectionCompletion { solution, mut verified_primal, status, source, proof, report } = completion;
+    budget.trace_phase("collection-finalization-start");
+    let matching_verified = verified_primal.as_ref().is_some_and(|candidate| candidate.objectives() == solution.objectives.as_slice());
+    let primal = if solution.feasible && !matching_verified && !budget.memory_only_cancelled() {
         #[cfg(test)]
         list::audit_record_final_verification_boundary();
         apply_final_replay_audit_before_first_pass(budget);
         apply_final_replay_audit_after_interrupt(budget);
-        Some(if let Some(stop) = transfer_stop {
-            verified_candidate(semantic, model, &solution, source, VerificationLevel::Final, stop)?
+        let replay = if let Some(stop) = transfer_stop {
+            verified_candidate(semantic, model, &solution, source, VerificationLevel::Final, stop)
         } else {
             super::verify_final_with_budget(budget, |stop| {
                 verified_candidate(semantic, model, &solution, source, VerificationLevel::Final, stop)
-            })?
-        })
+            })
+        };
+        match replay {
+            Ok(candidate) => Some(candidate),
+            Err(SolveError::Interrupted(_)) if budget.memory_only_cancelled() => verified_primal
+                .take()
+                .map(|candidate| promote_verified_collection_candidate(candidate, budget, transfer_stop))
+                .transpose()?,
+            Err(error) => return Err(error),
+        }
+    } else if let Some(candidate) = verified_primal {
+        #[cfg(test)]
+        list::audit_record_final_verification_boundary();
+        Some(promote_verified_collection_candidate(candidate, budget, transfer_stop)?)
     } else {
         None
     };
     let bounds =
         solution.bound.as_ref().map_or_else(Vec::new, |bound| vec![Bound { tier: 0, value: bound.dual, method: bound.method.clone() }]);
-    Ok(SolveResult { status, primal, bounds, proof, reports: vec![report], message: None })
+    let memory_stop = budget.memory_only_cancelled();
+    if budget.hard_cancelled() && !memory_stop {
+        return Err(SolveError::Interrupted(format!("collection publication was cancelled: {:?}", budget.termination_reason())));
+    }
+    let (status, proof, message) = if memory_stop {
+        let status = if primal.is_some() { SolveStatus::Satisfiable } else { SolveStatus::Unknown };
+        let detail = if primal.is_some() { "retained the previously verified incumbent" } else { "no previously verified incumbent" };
+        (status, None, Some(format!("solve stopped during search: MemoryLimit; {detail}")))
+    } else {
+        (status, proof, None)
+    };
+    budget.trace_phase("collection-finalization-returned");
+    Ok(SolveResult { status, primal, bounds, proof, reports: vec![report], message })
+}
+
+fn decoded_schedule_assignment(
+    starts: &[i64],
+    presences: &[bool],
+    machines: &[i64],
+    modes: &[Option<usize>],
+    stop: &AtomicBool,
+) -> Result<Assignment, SolveError> {
+    if starts.len() != presences.len() || starts.len() != machines.len() || starts.len() != modes.len() {
+        return Err(SolveError::InvalidResult("schedule incumbent has incomplete interval arrays".to_string()));
+    }
+    let mut intervals = Vec::with_capacity(starts.len());
+    for (index, (((&start, &present), &machine), &mode)) in starts.iter().zip(presences).zip(machines).zip(modes).enumerate() {
+        if index & 0xff == 0 && stop.load(Ordering::Acquire) {
+            return Err(SolveError::Interrupted("schedule assignment decoding was interrupted".to_string()));
+        }
+        intervals.push(IntervalValue { start: present.then_some(start), present, machine: usize::try_from(machine).ok(), mode });
+    }
+    Ok(Assignment { integers: Vec::new(), sets: Vec::new(), lists: Vec::new(), intervals })
+}
+
+fn verified_schedule_incumbent(
+    semantic: &Model,
+    objective: i64,
+    snapshot: schedule::ScheduleIncumbent<'_>,
+    stop: &AtomicBool,
+) -> Result<CandidateSolution, SolveError> {
+    let assignment = decoded_schedule_assignment(snapshot.starts, snapshot.presences, snapshot.machines, snapshot.modes, stop)?;
+    let objectives = super::verify_semantic_assignment_validated_interruptible(semantic, &assignment, &[objective], stop)?;
+    Ok(CandidateSolution::verified(assignment, objectives, EngineKind::ScheduleExact, VerificationLevel::Transfer))
 }
 
 fn verified_candidate(
@@ -3366,16 +3525,7 @@ fn verified_candidate(
     stop: &std::sync::atomic::AtomicBool,
 ) -> Result<CandidateSolution, SolveError> {
     let assignment = if model.schedule.is_some() {
-        let mut intervals = Vec::with_capacity(solution.starts.len());
-        for (index, (((&start, &present), &machine), &mode)) in
-            solution.starts.iter().zip(&solution.presences).zip(&solution.machines).zip(&solution.modes).enumerate()
-        {
-            if index & 0xff == 0 && stop.load(std::sync::atomic::Ordering::Acquire) {
-                return Err(SolveError::Interrupted("schedule assignment decoding was interrupted".to_string()));
-            }
-            intervals.push(IntervalValue { start: present.then_some(start), present, machine: usize::try_from(machine).ok(), mode });
-        }
-        Assignment { integers: Vec::new(), sets: Vec::new(), lists: Vec::new(), intervals }
+        decoded_schedule_assignment(&solution.starts, &solution.presences, &solution.machines, &solution.modes, stop)?
     } else {
         let mut lists = Vec::with_capacity(solution.lists.len());
         for (list_index, source) in solution.lists.iter().enumerate() {
@@ -3438,18 +3588,13 @@ fn promote_verified_collection_candidate(
     }
     apply_final_replay_audit_before_first_pass(budget);
     apply_final_replay_audit_after_interrupt(budget);
-    if transfer_stop.is_some_and(|stop| stop.load(Ordering::Acquire)) || budget.hard_cancelled() {
+    if transfer_stop.is_some_and(|stop| stop.load(Ordering::Acquire)) || (budget.hard_cancelled() && !budget.memory_only_cancelled()) {
         return Err(SolveError::Interrupted(format!(
             "canonical final replay exceeded its grace or was cancelled: {:?}",
             budget.termination_reason()
         )));
     }
-    Ok(CandidateSolution::verified(
-        candidate.assignment().clone(),
-        candidate.objectives().to_vec(),
-        candidate.source(),
-        VerificationLevel::Final,
-    ))
+    candidate.into_final_verified()
 }
 
 fn completion_proof(engine: EngineKind, status: SolveStatus, objective_tiers: usize, complete: bool) -> Option<ProofClaim> {

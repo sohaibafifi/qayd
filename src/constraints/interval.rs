@@ -446,41 +446,76 @@ fn remove_pairwise_unsupported_values(
     first: IntervalId,
     second: IntervalId,
     values: &mut Vec<i32>,
+    should_stop: Option<&dyn Fn() -> bool>,
 ) -> Result<(), Inconsistency> {
-    let first_var = store.interval_start_var(first);
-    let second_var = store.interval_start_var(second);
-    let first_duration = i128::from(store.interval_duration(first));
-    let second_duration = i128::from(store.interval_duration(second));
-    let second_min = store.min(second_var);
-    let second_max = store.max(second_var);
-    let unsupported_low = i128::from(second_max) - first_duration + 1;
-    let unsupported_high = i128::from(second_min) + second_duration - 1;
-    values.clear();
-    values.extend(store.values(first_var).filter(|&value| unsupported_low <= i128::from(value) && i128::from(value) <= unsupported_high));
-    let why = store.explaining().then(|| {
-        let mut why = vec![Premise::Ge { var: second_var, bound: second_min }, Premise::Le { var: second_var, bound: second_max }];
-        why.extend(present_premise(store, first));
-        why.extend(present_premise(store, second));
-        why
-    });
-    for value in values.drain(..) {
-        store.remove_because(first_var, value, why.clone().unwrap_or_default())?;
-    }
+    remove_unsupported_starts(store, first, second, values, should_stop)?;
+    // The first direction may have changed its domain, so compute the reverse
+    // window only after applying those removals.
+    remove_unsupported_starts(store, second, first, values, should_stop)?;
+    Ok(())
+}
 
-    let first_min = store.min(first_var);
-    let first_max = store.max(first_var);
-    let unsupported_low = i128::from(first_max) - second_duration + 1;
-    let unsupported_high = i128::from(first_min) + first_duration - 1;
+fn remove_unsupported_starts(
+    store: &mut Store,
+    target: IntervalId,
+    other: IntervalId,
+    values: &mut Vec<i32>,
+    should_stop: Option<&dyn Fn() -> bool>,
+) -> Result<(), Inconsistency> {
+    if interruption_requested(should_stop) {
+        return Ok(());
+    }
+    let target_var = store.interval_start_var(target);
+    let other_var = store.interval_start_var(other);
+    let other_min = store.min(other_var);
+    let other_max = store.max(other_var);
+    let low = (i128::from(other_max) - i128::from(store.interval_duration(target)) + 1).max(i128::from(store.min(target_var)));
+    let high = (i128::from(other_min) + i128::from(store.interval_duration(other)) - 1).min(i128::from(store.max(target_var)));
+    // With wide scheduling windows neither order rules out a start value.
+    // This check must precede domain iteration: wide bounds domains can hold
+    // billions of values while this forbidden window is empty.
+    if low > high {
+        return Ok(());
+    }
+    // Intersecting with the target bounds makes both conversions exact.
+    let low = i32::try_from(low).expect("window is inside the target domain bounds");
+    let high = i32::try_from(high).expect("window is inside the target domain bounds");
     values.clear();
-    values.extend(store.values(second_var).filter(|&value| unsupported_low <= i128::from(value) && i128::from(value) <= unsupported_high));
+    if i128::from(high) - i128::from(low) < store.size(target_var) as i128 {
+        for (work, value) in (low..=high).enumerate() {
+            if work.is_multiple_of(256) && interruption_requested(should_stop) {
+                return Ok(());
+            }
+            if store.contains(target_var, value) {
+                values.push(value);
+            }
+        }
+    } else {
+        // Explicit sparse domains may have fewer supported values than the
+        // numeric window contains. Preserve their holes without scanning gaps.
+        for (work, value) in store.values(target_var).enumerate() {
+            if work.is_multiple_of(256) && interruption_requested(should_stop) {
+                return Ok(());
+            }
+            if low <= value && value <= high {
+                values.push(value);
+            }
+        }
+    }
+    if values.is_empty() {
+        return Ok(());
+    }
     let why = store.explaining().then(|| {
-        let mut why = vec![Premise::Ge { var: first_var, bound: first_min }, Premise::Le { var: first_var, bound: first_max }];
-        why.extend(present_premise(store, first));
-        why.extend(present_premise(store, second));
+        let mut why = vec![Premise::Ge { var: other_var, bound: other_min }, Premise::Le { var: other_var, bound: other_max }];
+        why.extend(present_premise(store, target));
+        why.extend(present_premise(store, other));
         why
     });
-    for value in values.drain(..) {
-        store.remove_because(second_var, value, why.clone().unwrap_or_default())?;
+    for (work, value) in values.drain(..).enumerate() {
+        if work.is_multiple_of(256) && interruption_requested(should_stop) {
+            return Ok(());
+        }
+        store.remove_because(target_var, value, why.clone().unwrap_or_default())?;
     }
     Ok(())
 }
@@ -607,7 +642,7 @@ impl NoOverlap {
                 }
                 let both_present = pi == IntervalPresence::Present && pj == IntervalPresence::Present;
                 if both_present && store.interval_duration(i) > 0 && store.interval_duration(j) > 0 {
-                    remove_pairwise_unsupported_values(store, i, j, &mut self.values)?;
+                    remove_pairwise_unsupported_values(store, i, j, &mut self.values, should_stop)?;
                 }
                 let order_var = (order_index != usize::MAX).then(|| store.disjunctive_order_var(order_index));
                 let order = if order_index == usize::MAX { 0 } else { store.disjunctive_order(order_index) };

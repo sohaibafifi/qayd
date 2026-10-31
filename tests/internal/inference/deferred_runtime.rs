@@ -440,3 +440,148 @@ fn deferred_runtime_false_root_premise_uses_nonempty_fallback() {
     assert_eq!(cdcl.reason_lits(inferred), [decision.negate()]);
     assert_eq!(calls.load(Ordering::Relaxed), 1);
 }
+
+#[derive(Clone, Copy)]
+enum BatchReason {
+    Scope,
+    Tight,
+    Intermediate,
+}
+
+#[derive(Clone)]
+struct BatchEquality {
+    trigger: VarId,
+    outputs: Vec<VarId>,
+    context: Vec<VarId>,
+    reason: BatchReason,
+}
+
+impl Propagator for BatchEquality {
+    fn register(&mut self, store: &mut Store, me: PropId) {
+        for variable in std::iter::once(self.trigger).chain(self.outputs.iter().copied()).chain(self.context.iter().copied()) {
+            store.subscribe(variable, me, Event::DomainChange);
+        }
+    }
+
+    fn propagate(&mut self, store: &mut Store) -> Result<(), Inconsistency> {
+        if !store.is_fixed(self.trigger) {
+            return Ok(());
+        }
+        let value = store.value(self.trigger);
+        let mut previous = self.trigger;
+        for &output in &self.outputs {
+            match self.reason {
+                BatchReason::Scope => store.fix(output, value)?,
+                BatchReason::Tight => store.fix_because(output, value, vec![Premise::Eq { var: self.trigger, val: value }])?,
+                BatchReason::Intermediate => store.fix_because(output, value, vec![Premise::Eq { var: previous, val: value }])?,
+            }
+            previous = output;
+        }
+        Ok(())
+    }
+}
+
+fn eager_antecedents(cdcl: &Cdcl<'_>, variable: VarId, value: i32) -> Arc<[Lit]> {
+    let implied = literal(cdcl.atoms.eq(variable, value));
+    let Reason::Generic(antecedents) = cdcl.reason_of(implied.atom()) else { panic!("expected eager inference") };
+    Arc::clone(antecedents)
+}
+
+#[test]
+fn eager_scope_fallbacks_share_one_immutable_payload_per_invocation_and_not_across_backjumps() {
+    let mut solver = Solver::new();
+    let trigger = solver.new_var_range(0, 1);
+    let outputs: Vec<_> = (0..64).map(|_| solver.new_var_range(0, 1)).collect();
+    let context: Vec<_> = (0..32).map(|_| solver.new_var_range(0, 1)).collect();
+    solver.post(Box::new(BatchEquality { trigger, outputs: outputs.clone(), context: context.clone(), reason: BatchReason::Scope }));
+    let variables: Vec<_> = std::iter::once(trigger).chain(outputs.iter().copied()).chain(context.iter().copied()).collect();
+    let mut cdcl = Cdcl::new(&mut solver, &variables);
+    assert!(cdcl.init());
+    let mut expected = Vec::new();
+    for &variable in &context {
+        let decision = literal(cdcl.atoms.ge(variable, 1));
+        cdcl.decide(decision).unwrap();
+        cdcl.propagate().unwrap();
+        expected.push(decision);
+    }
+    let trigger_one = literal(cdcl.atoms.ge(trigger, 1));
+    cdcl.decide(trigger_one).unwrap();
+    cdcl.propagate().unwrap();
+    let first = eager_antecedents(&cdcl, outputs[0], 1);
+    let mut complete_scope = vec![trigger_one];
+    complete_scope.extend(expected.iter().copied());
+    assert_eq!(first.as_ref(), complete_scope, "sharing must preserve every entry-scope premise and its order");
+    for &output in &outputs {
+        assert!(Arc::ptr_eq(&first, &eager_antecedents(&cdcl, output, 1)), "one retained scope payload for all 64 events");
+    }
+    let old_history = first.to_vec();
+    cdcl.backjump_to(0);
+    for &variable in &context {
+        cdcl.decide(literal(cdcl.atoms.ge(variable, 1)).negate()).unwrap();
+        cdcl.propagate().unwrap();
+    }
+    cdcl.decide(trigger_one.negate()).unwrap();
+    cdcl.propagate().unwrap();
+    let next = eager_antecedents(&cdcl, outputs[0], 0);
+    assert!(!Arc::ptr_eq(&first, &next), "a new invocation must not inherit the previous branch's snapshot");
+    assert_eq!(next.as_ref(), complete_scope.iter().map(|literal| literal.negate()).collect::<Vec<_>>());
+    assert_eq!(first.as_ref(), old_history, "old immutable reasons remain valid while retained by a caller");
+    for &output in &outputs {
+        assert!(Arc::ptr_eq(&next, &eager_antecedents(&cdcl, output, 0)));
+    }
+}
+
+#[test]
+fn eager_scope_cache_preserves_tight_reasons_and_demotes_intermediate_facts_at_the_entry_cutoff() {
+    for reason in [BatchReason::Tight, BatchReason::Intermediate] {
+        let mut solver = Solver::new();
+        let trigger = solver.new_var_range(0, 1);
+        let context = solver.new_var_range(0, 1);
+        let outputs: Vec<_> = (0..3).map(|_| solver.new_var_range(0, 1)).collect();
+        solver.post(Box::new(BatchEquality { trigger, outputs: outputs.clone(), context: vec![context], reason }));
+        let variables: Vec<_> = [trigger, context].into_iter().chain(outputs.iter().copied()).collect();
+        let mut cdcl = Cdcl::new(&mut solver, &variables);
+        assert!(cdcl.init());
+        let context_one = literal(cdcl.atoms.ge(context, 1));
+        cdcl.decide(context_one).unwrap();
+        cdcl.propagate().unwrap();
+        let trigger_one = literal(cdcl.atoms.ge(trigger, 1));
+        cdcl.decide(trigger_one).unwrap();
+        cdcl.propagate().unwrap();
+        assert_eq!(eager_antecedents(&cdcl, outputs[0], 1).as_ref(), [trigger_one]);
+        let second = eager_antecedents(&cdcl, outputs[1], 1);
+        let third = eager_antecedents(&cdcl, outputs[2], 1);
+        match reason {
+            BatchReason::Tight => {
+                assert_eq!(second.as_ref(), [trigger_one]);
+                assert_eq!(third.as_ref(), [trigger_one]);
+            }
+            BatchReason::Intermediate => {
+                assert_eq!(second.as_ref(), [trigger_one, context_one]);
+                assert_eq!(third.as_ref(), [trigger_one, context_one]);
+                assert!(Arc::ptr_eq(&second, &third));
+            }
+            BatchReason::Scope => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn eager_scope_cache_preserves_all_solutions_across_conflicts_and_backjumps() {
+    use std::collections::BTreeSet;
+    for reason in [BatchReason::Scope, BatchReason::Tight, BatchReason::Intermediate] {
+        let mut solver = Solver::new();
+        let trigger = solver.new_var_range(0, 1);
+        let outputs: Vec<_> = (0..3).map(|_| solver.new_var_range(0, 1)).collect();
+        let context = solver.new_var_range(0, 1);
+        solver.post(Box::new(BatchEquality { trigger, outputs: outputs.clone(), context: vec![context], reason }));
+        let variables: Vec<_> = std::iter::once(trigger).chain(outputs.iter().copied()).chain(std::iter::once(context)).collect();
+        let mut actual = BTreeSet::new();
+        crate::search::solve(&mut solver, &variables, |state| {
+            actual.insert(variables.iter().map(|&variable| state.store.value(variable)).collect::<Vec<_>>());
+            crate::search::SearchControl::Continue
+        });
+        let expected = (0..=1).flat_map(|trigger| (0..=1).map(move |context| vec![trigger, trigger, trigger, trigger, context])).collect();
+        assert_eq!(actual, expected, "independent equality predicate across both branches and both context values");
+    }
+}

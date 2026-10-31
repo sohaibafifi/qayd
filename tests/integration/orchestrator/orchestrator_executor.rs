@@ -1,4 +1,4 @@
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -73,6 +73,54 @@ fn handler_stop_cancels_the_worker_set() {
     assert!(summary.stopped_by_handler);
     assert!(observed_cancel.load(std::sync::atomic::Ordering::Acquire));
     assert_eq!(summary.reports.len(), 1);
+}
+
+#[test]
+fn silent_monitor_propagates_external_stop_before_worker_completion() {
+    let stop = AtomicBool::new(false);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let summary = execute_workers_silent(vec![()], &stop, Arc::clone(&cancel), 17, |context, ()| {
+        stop.store(true, Ordering::Release);
+        while !context.is_cancelled() {
+            std::thread::yield_now();
+        }
+        context.seed()
+    });
+    assert!(summary.externally_cancelled);
+    assert!(cancel.load(Ordering::Acquire));
+    assert_eq!(summary.reports[0].result, 17);
+}
+
+#[test]
+fn repeated_short_slices_keep_reports_and_completion_cancellation() {
+    let stop = AtomicBool::new(false);
+    for seed in 0..32 {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let summary = execute_workers_silent(vec![()], &stop, Arc::clone(&cancel), seed, |context, ()| context.seed());
+        assert_eq!(summary.reports.len(), 1);
+        assert_eq!(summary.reports[0].result, seed);
+        assert!(cancel.load(Ordering::Acquire));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let summary = execute_workers(
+            vec![()],
+            &stop,
+            Arc::clone(&cancel),
+            seed,
+            |context, ()| {
+                context.publish_latest(context.seed());
+                context.seed()
+            },
+            |event| {
+                assert_eq!(event.payload, seed);
+                Ok::<_, ()>(EventControl::Continue)
+            },
+        )
+        .unwrap();
+        assert_eq!(summary.reports.len(), 1);
+        assert_eq!(summary.reports[0].result, seed);
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(!summary.externally_cancelled);
+    }
 }
 
 #[test]

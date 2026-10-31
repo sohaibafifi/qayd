@@ -1609,3 +1609,125 @@ fn incremental_scoring_matches_full_recompute() {
         }
     }
 }
+
+fn adaptive_terminal_job_shop() -> Schedule {
+    let jobs = 6usize;
+    let machines = 5usize;
+    let durations: Vec<i64> = (0..jobs * machines).map(|operation| 1 + ((operation * 7 + 9) % 11) as i64).collect();
+    let horizon = durations.iter().sum();
+    let mut groups = vec![Vec::new(); machines];
+    for job in 0..jobs {
+        for operation in 0..machines {
+            groups[(job + machines - operation) % machines].push(job * machines + operation);
+        }
+    }
+    Schedule {
+        intervals: durations.into_iter().map(|duration| IntervalVar { duration, horizon, modes: Vec::new(), optional: false }).collect(),
+        precedences: (0..jobs)
+            .flat_map(|job| (0..machines - 1).map(move |operation| (job * machines + operation, job * machines + operation + 1)))
+            .collect(),
+        resources: groups.into_iter().map(Resource::NoOverlap).collect(),
+        minimize_makespan: true,
+    }
+}
+
+#[test]
+fn adaptive_tsab_finite_work_finalization_promotes_pending_without_more_search() {
+    use qayd::engines::ls::lists::{solve_schedule_capped_persistent_hybrid_with_strategy, ScheduleJsspSearchStrategy};
+    use qayd::orchestrator::{compile_collection_plan, solve_collection_plan, IgnoreEvents, SolveBudget};
+
+    let schedule = adaptive_terminal_job_shop();
+    let seed = 1;
+    let work = 1;
+    let engine_stop = Arc::new(AtomicBool::new(false));
+    let finalization_stop = AtomicBool::new(false);
+    let (local, metrics, session) = solve_schedule_capped_persistent_hybrid_with_strategy(
+        &schedule,
+        qayd::mix64(seed),
+        seed,
+        0,
+        1,
+        &engine_stop,
+        &finalization_stop,
+        work,
+        None,
+        None,
+        true,
+        None,
+        false,
+        false,
+        ScheduleJsspSearchStrategy::TsabAdaptive,
+        None,
+        &mut |_| {},
+    );
+    assert_eq!(local.objectives, [54]);
+    let pending = session.and_then(|session| session.tsab_fast_pending_objective()).expect("one fast move leaves a better pending elite");
+    assert_eq!(pending, 52);
+    assert!(pending < local.objectives[0]);
+    assert_eq!(metrics.work_steps, work);
+    assert_eq!(metrics.schedule_tsab.fast_full_validations, 0, "no complete checkpoint occurs inside this one-work search slice");
+    assert_eq!(metrics.schedule_tsab.fast_pending_promotions, 0);
+    assert!(!engine_stop.load(Ordering::Acquire));
+    assert!(!finalization_stop.load(Ordering::Acquire));
+
+    let semantic = Model::from_collection(&schedule_model(schedule.clone()));
+    let request = SolveRequest {
+        mode: SolveMode::LocalSearch,
+        seed,
+        threads: 1,
+        limits: SolveLimits { iterations: Some(work), ..SolveLimits::default() },
+        profile: true,
+        schedule_jssp_search: ScheduleJsspSearch::TsabAdaptive,
+        ..SolveRequest::default()
+    };
+    // With no deadline, the real engine-search flag is this same parent flag.
+    // Global work exhaustion must recover pending gains without arming it.
+    let budget = SolveBudget::with_stop(None, Arc::clone(&engine_stop));
+    let plan = compile_collection_plan(&semantic, &request, &budget).expect("compile the single-worker adaptive plan");
+    let result = solve_collection_plan(&semantic, &plan, &request, &budget, None, None, &mut IgnoreEvents)
+        .expect("finite-work terminal finalization succeeds");
+    assert_eq!(result.status(), SolveStatus::Satisfiable);
+    assert!(!engine_stop.load(Ordering::Acquire), "finite-work exhaustion must not masquerade as a deadline or cancellation");
+    let primal = result.primal().expect("pending elite becomes a verified public incumbent");
+    assert_eq!(primal.objectives(), [pending]);
+    let metric = |name: &str| -> u64 {
+        result.reports()[0]
+            .metadata
+            .iter()
+            .find_map(|(key, value)| (key == name).then_some(value))
+            .unwrap_or_else(|| panic!("missing scheduling metric {name}"))
+            .parse()
+            .expect("integer scheduling metric")
+    };
+    assert_eq!(metric("schedule_tsab_fast_full_validations"), 2, "pending elite and live trajectory each cross a complete oracle");
+    assert_eq!(metric("schedule_tsab_fast_pending_promotions"), 1);
+    assert_eq!(metric("schedule_incumbent_verifications"), 2, "the initial and recovered incumbents each cross Transfer replay once");
+    assert_eq!(metric("schedule_incumbent_publications"), 2);
+    assert_eq!(metric("schedule_incumbent_source_worker"), 0);
+    assert_eq!(metric("schedule_restart_boundaries"), 1, "terminal validation is not another search slice");
+    assert_eq!(metric("schedule_work_steps"), work);
+    assert_eq!(metric("schedule_worker_work_min"), work);
+    assert_eq!(metric("schedule_worker_work_max"), work);
+    assert_eq!(metric("schedule_work_budget_overruns"), 0);
+    assert_eq!(metric("schedule_tsab_fast_oracle_mismatches"), 0);
+    assert_eq!(metric("schedule_incumbent_verification_rejections"), 0);
+
+    let intervals = &primal.assignment().intervals;
+    let starts: Vec<_> = intervals.iter().map(|interval| interval.start.expect("every published operation has a start")).collect();
+    assert_eq!(starts.len(), schedule.intervals.len());
+    assert!(intervals.iter().all(|interval| interval.present));
+    let ends: Vec<_> = starts.iter().zip(&schedule.intervals).map(|(&start, interval)| start + interval.duration).collect();
+    assert_eq!(ends.iter().copied().max(), Some(pending));
+    assert!(starts.iter().zip(&ends).all(|(&start, &end)| start >= 0 && end <= schedule.intervals[0].horizon));
+    for &(before, after) in &schedule.precedences {
+        assert!(ends[before] <= starts[after]);
+    }
+    for resource in &schedule.resources {
+        let Resource::NoOverlap(group) = resource else { panic!("fixture has only unary machine resources") };
+        for (position, &left) in group.iter().enumerate() {
+            for &right in &group[position + 1..] {
+                assert!(ends[left] <= starts[right] || ends[right] <= starts[left]);
+            }
+        }
+    }
+}

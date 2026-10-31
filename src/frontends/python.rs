@@ -472,6 +472,20 @@ impl PyMusEnumeration {
 struct PySolution {
     model_id: u64,
     status: String,
+    /// Orchestrator diagnostic, including the phase and reason of interruption.
+    #[pyo3(get)]
+    message: Option<String>,
+    /// Engine reported by the runtime, independently of the requested mode.
+    #[pyo3(get)]
+    search_engine: Option<String>,
+    #[pyo3(get)]
+    schedule_encoding: Option<String>,
+    /// Search entrypoint actually invoked; initialization is observed in stats.
+    #[pyo3(get)]
+    schedule_search_kernel: Option<String>,
+    /// Internal objective events, not independently verified publications.
+    #[pyo3(get)]
+    search_incumbent_events: Option<Vec<(f64, Vec<i64>)>>,
     objective: Option<i64>,
     objective_sense: Option<String>,
     objective_expr: Option<String>,
@@ -570,6 +584,9 @@ struct PySolution {
     schedule_tsab_tabu_resets: Option<u64>,
     schedule_tsab_fingerprint_repeats: Option<u64>,
     schedule_tsab_escape_signals: Option<u64>,
+    schedule_tsab_blocked_n6_requests: Option<u64>,
+    schedule_tsab_blocked_n6_attempts: Option<u64>,
+    schedule_tsab_blocked_n6_cooldown_skips: Option<u64>,
     schedule_tsab_n1_kicks: Option<u64>,
     schedule_tsab_kick_moves: Option<u64>,
     schedule_tsab_elite_restarts: Option<u64>,
@@ -616,6 +633,11 @@ struct PySolution {
     schedule_tsab_fast_work_cap_recoveries: Option<u64>,
     schedule_tsab_fast_date_changes: Option<u64>,
     schedule_tsab_fast_queue_pops: Option<u64>,
+    schedule_tsab_forward_probe_attempts: Option<u64>,
+    schedule_tsab_forward_probe_fallbacks: Option<u64>,
+    schedule_tsab_forward_probe_queue_pops: Option<u64>,
+    schedule_tsab_forward_probe_date_changes: Option<u64>,
+    schedule_tsab_forward_probe_disables: Option<u64>,
     schedule_tsab_fast_full_validations: Option<u64>,
     schedule_tsab_fast_oracle_mismatches: Option<u64>,
     schedule_tsab_fast_pending_promotions: Option<u64>,
@@ -1202,6 +1224,11 @@ fn make_solution(
     PySolution {
         model_id,
         status: status.to_string(),
+        message: None,
+        search_engine: None,
+        schedule_encoding: None,
+        schedule_search_kernel: None,
+        search_incumbent_events: None,
         objective,
         objective_sense: objective_sense.map(str::to_string),
         objective_expr: objective_expr.map(str::to_string),
@@ -1291,6 +1318,9 @@ fn make_solution(
         schedule_tsab_tabu_resets: None,
         schedule_tsab_fingerprint_repeats: None,
         schedule_tsab_escape_signals: None,
+        schedule_tsab_blocked_n6_requests: None,
+        schedule_tsab_blocked_n6_attempts: None,
+        schedule_tsab_blocked_n6_cooldown_skips: None,
         schedule_tsab_n1_kicks: None,
         schedule_tsab_kick_moves: None,
         schedule_tsab_elite_restarts: None,
@@ -1337,6 +1367,11 @@ fn make_solution(
         schedule_tsab_fast_work_cap_recoveries: None,
         schedule_tsab_fast_date_changes: None,
         schedule_tsab_fast_queue_pops: None,
+        schedule_tsab_forward_probe_attempts: None,
+        schedule_tsab_forward_probe_fallbacks: None,
+        schedule_tsab_forward_probe_queue_pops: None,
+        schedule_tsab_forward_probe_date_changes: None,
+        schedule_tsab_forward_probe_disables: None,
         schedule_tsab_fast_full_validations: None,
         schedule_tsab_fast_oracle_mismatches: None,
         schedule_tsab_fast_pending_promotions: None,
@@ -1527,7 +1562,10 @@ fn parse_schedule_jssp_search(strategy: &str) -> PyResult<ScheduleJsspSearch> {
         "legacy" => Ok(ScheduleJsspSearch::Legacy),
         "tsab-candidate" => Ok(ScheduleJsspSearch::TsabCandidate),
         "tsab-multi-candidate" => Ok(ScheduleJsspSearch::TsabMultiCandidate),
-        _ => Err(PyValueError::new_err("schedule_jssp_search must be 'legacy', 'tsab-candidate', or 'tsab-multi-candidate'")),
+        "tsab-adaptive" => Ok(ScheduleJsspSearch::TsabAdaptive),
+        _ => Err(PyValueError::new_err(
+            "schedule_jssp_search must be 'legacy', 'tsab-candidate', 'tsab-multi-candidate', or 'tsab-adaptive'",
+        )),
     }
 }
 
@@ -1587,17 +1625,19 @@ fn linear_controls(
 struct CollectionEventSummary {
     improvements: u64,
     first_feasible_at: Option<f64>,
+    exact_objective_events: Vec<(f64, Vec<i64>)>,
 }
 
 struct PythonCollectionEventSink {
     primary_sense: &'static str,
     verbose: bool,
+    profile: bool,
     summary: CollectionEventSummary,
 }
 
 impl PythonCollectionEventSink {
-    fn new(primary_sense: &'static str, verbose: bool) -> Self {
-        Self { primary_sense, verbose, summary: CollectionEventSummary::default() }
+    fn new(primary_sense: &'static str, verbose: bool, profile: bool) -> Self {
+        Self { primary_sense, verbose, profile, summary: CollectionEventSummary::default() }
     }
 }
 
@@ -1623,6 +1663,9 @@ impl EventSink for PythonCollectionEventSink {
         };
         self.summary.improvements += 1;
         self.summary.first_feasible_at.get_or_insert(elapsed.as_secs_f64());
+        if self.profile && engine == EngineKind::ScheduleExact {
+            self.summary.exact_objective_events.push((elapsed.as_secs_f64(), objectives));
+        }
         if self.verbose {
             match engine {
                 EngineKind::ListExact | EngineKind::ScheduleExact => {
@@ -2609,8 +2652,11 @@ fn engine_of(event: &SolveEvent) -> Option<EngineKind> {
 }
 
 impl PythonSolveEventSink {
-    fn new(verbose: bool, callback: Option<Py<PyAny>>, primary_sense: &'static str) -> Self {
-        Self { integer: PythonIntegerEventSink::new(verbose, callback), collection: PythonCollectionEventSink::new(primary_sense, verbose) }
+    fn new(verbose: bool, callback: Option<Py<PyAny>>, primary_sense: &'static str, profile: bool) -> Self {
+        Self {
+            integer: PythonIntegerEventSink::new(verbose, callback),
+            collection: PythonCollectionEventSink::new(primary_sense, verbose, profile),
+        }
     }
 }
 
@@ -2681,6 +2727,8 @@ fn integer_solution_from_result(
     let mut solution =
         make_solution(model_id, result.status().as_str(), &[], None, objective, sense, text, result_search_stats(result, engine), num_vars);
     solution.values = visible_integer_values(result, num_vars)?;
+    solution.message = result.message().map(str::to_string);
+    solution.search_engine = result_engine_report(result, engine).and_then(|report| report.engine).map(|engine| engine.name().to_string());
     solution.objectives = objective_values;
     if let Some(primary) = primary.filter(|_| engine == EngineKind::IntegerExact) {
         let (dual_bound, absolute_gap, relative_gap, bound_method) = collection_bound_fields(result, objective, primary.minimizing);
@@ -3305,6 +3353,21 @@ impl PySolution {
     }
 
     #[getter]
+    fn schedule_tsab_blocked_n6_requests(&self) -> Option<u64> {
+        self.schedule_tsab_blocked_n6_requests
+    }
+
+    #[getter]
+    fn schedule_tsab_blocked_n6_attempts(&self) -> Option<u64> {
+        self.schedule_tsab_blocked_n6_attempts
+    }
+
+    #[getter]
+    fn schedule_tsab_blocked_n6_cooldown_skips(&self) -> Option<u64> {
+        self.schedule_tsab_blocked_n6_cooldown_skips
+    }
+
+    #[getter]
     fn schedule_tsab_n1_kicks(&self) -> Option<u64> {
         self.schedule_tsab_n1_kicks
     }
@@ -3532,6 +3595,31 @@ impl PySolution {
     #[getter]
     fn schedule_tsab_fast_queue_pops(&self) -> Option<u64> {
         self.schedule_tsab_fast_queue_pops
+    }
+
+    #[getter]
+    fn schedule_tsab_forward_probe_attempts(&self) -> Option<u64> {
+        self.schedule_tsab_forward_probe_attempts
+    }
+
+    #[getter]
+    fn schedule_tsab_forward_probe_fallbacks(&self) -> Option<u64> {
+        self.schedule_tsab_forward_probe_fallbacks
+    }
+
+    #[getter]
+    fn schedule_tsab_forward_probe_queue_pops(&self) -> Option<u64> {
+        self.schedule_tsab_forward_probe_queue_pops
+    }
+
+    #[getter]
+    fn schedule_tsab_forward_probe_date_changes(&self) -> Option<u64> {
+        self.schedule_tsab_forward_probe_date_changes
+    }
+
+    #[getter]
+    fn schedule_tsab_forward_probe_disables(&self) -> Option<u64> {
+        self.schedule_tsab_forward_probe_disables
     }
 
     #[getter]
@@ -5642,7 +5730,7 @@ impl PyModel {
         let run = with_interrupts(py, move || {
             let mut request = request;
             request.limits.time = request.limits.time.map(|limit| limit.saturating_sub(solve_started.elapsed()));
-            let mut sink = PythonSolveEventSink::new(verbose, on_incumbent, primary_sense);
+            let mut sink = PythonSolveEventSink::new(verbose, on_incumbent, primary_sense, profile);
             let result = solve_model_with_external_stop(&package, &request, &SIGINT_TRIPPED, &mut sink);
             if let Some(error) = sink.integer.callback_error {
                 return Err(error);
@@ -6429,6 +6517,9 @@ impl PyModel {
         let schedule_tsab_tabu_resets = schedule_counter("schedule_tsab_tabu_resets");
         let schedule_tsab_fingerprint_repeats = schedule_counter("schedule_tsab_fingerprint_repeats");
         let schedule_tsab_escape_signals = schedule_counter("schedule_tsab_escape_signals");
+        let schedule_tsab_blocked_n6_requests = schedule_counter("schedule_tsab_blocked_n6_requests");
+        let schedule_tsab_blocked_n6_attempts = schedule_counter("schedule_tsab_blocked_n6_attempts");
+        let schedule_tsab_blocked_n6_cooldown_skips = schedule_counter("schedule_tsab_blocked_n6_cooldown_skips");
         let schedule_tsab_n1_kicks = schedule_counter("schedule_tsab_n1_kicks");
         let schedule_tsab_kick_moves = schedule_counter("schedule_tsab_kick_moves");
         let schedule_tsab_elite_restarts = schedule_counter("schedule_tsab_elite_restarts");
@@ -6480,6 +6571,11 @@ impl PyModel {
         let schedule_tsab_fast_work_cap_recoveries = schedule_counter("schedule_tsab_fast_work_cap_recoveries");
         let schedule_tsab_fast_date_changes = schedule_counter("schedule_tsab_fast_date_changes");
         let schedule_tsab_fast_queue_pops = schedule_counter("schedule_tsab_fast_queue_pops");
+        let schedule_tsab_forward_probe_attempts = schedule_counter("schedule_tsab_forward_probe_attempts");
+        let schedule_tsab_forward_probe_fallbacks = schedule_counter("schedule_tsab_forward_probe_fallbacks");
+        let schedule_tsab_forward_probe_queue_pops = schedule_counter("schedule_tsab_forward_probe_queue_pops");
+        let schedule_tsab_forward_probe_date_changes = schedule_counter("schedule_tsab_forward_probe_date_changes");
+        let schedule_tsab_forward_probe_disables = schedule_counter("schedule_tsab_forward_probe_disables");
         let schedule_tsab_fast_full_validations = schedule_counter("schedule_tsab_fast_full_validations");
         let schedule_tsab_fast_oracle_mismatches = schedule_counter("schedule_tsab_fast_oracle_mismatches");
         let schedule_tsab_fast_pending_promotions = schedule_counter("schedule_tsab_fast_pending_promotions");
@@ -6665,6 +6761,12 @@ impl PyModel {
         Ok(PySolution {
             model_id: self.id,
             status: result.status().as_str().to_string(),
+            message: result.message().map(str::to_string),
+            search_engine: report.and_then(|report| report.engine).map(|engine| engine.name().to_string()),
+            schedule_encoding: report_metadata(report, "schedule_encoding").map(str::to_string),
+            schedule_search_kernel: report_metadata(report, "schedule_search_kernel").map(str::to_string),
+            search_incumbent_events: (profile && run.engine == EngineKind::ScheduleExact)
+                .then(|| run.events.exact_objective_events.clone()),
             objective,
             objective_sense,
             objective_expr,
@@ -6754,6 +6856,9 @@ impl PyModel {
             schedule_tsab_tabu_resets,
             schedule_tsab_fingerprint_repeats,
             schedule_tsab_escape_signals,
+            schedule_tsab_blocked_n6_requests,
+            schedule_tsab_blocked_n6_attempts,
+            schedule_tsab_blocked_n6_cooldown_skips,
             schedule_tsab_n1_kicks,
             schedule_tsab_kick_moves,
             schedule_tsab_elite_restarts,
@@ -6800,6 +6905,11 @@ impl PyModel {
             schedule_tsab_fast_work_cap_recoveries,
             schedule_tsab_fast_date_changes,
             schedule_tsab_fast_queue_pops,
+            schedule_tsab_forward_probe_attempts,
+            schedule_tsab_forward_probe_fallbacks,
+            schedule_tsab_forward_probe_queue_pops,
+            schedule_tsab_forward_probe_date_changes,
+            schedule_tsab_forward_probe_disables,
             schedule_tsab_fast_full_validations,
             schedule_tsab_fast_oracle_mismatches,
             schedule_tsab_fast_pending_promotions,

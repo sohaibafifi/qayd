@@ -740,13 +740,10 @@ fn profiled_constructor_preserves_work_on_infeasibility_and_interruption() {
 
     let large = fixed_flow_shop(1_250, 8);
     let large_problem = JobShopProblem::recognize(&large, &stop).unwrap().unwrap();
-    let (result, metrics) = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            stop.store(true, std::sync::atomic::Ordering::Release);
-        });
-        JobShopState::giffler_thompson_profiled(&large_problem, 7, DispatchRule::Randomized, &stop)
-    });
+    // Entry, first ready operation, its activation, then the next operation.
+    // The cancelling thread must run after a candidate has actually completed.
+    let (result, metrics) =
+        cancel_after_checkpoints(&stop, 4, || JobShopState::giffler_thompson_profiled(&large_problem, 7, DispatchRule::Randomized, &stop));
     assert!(result.is_err());
     assert!(metrics.construction_candidates > 0, "completed candidate evaluations must survive cancellation");
 }
@@ -2481,6 +2478,90 @@ fn constructor_multistart_support_sentinel_rejects_duplicate_machine_assignments
 }
 
 #[test]
+fn strict_n5_keeps_swaps_next_to_singleton_path_endpoints() {
+    let stop = AtomicBool::new(false);
+    for (prefix, suffix) in [(true, true), (true, false), (false, true), (false, false)] {
+        let mut durations = Vec::new();
+        let mut outer_machine = Vec::new();
+        let mut precedences = Vec::new();
+        if prefix {
+            outer_machine.push(durations.len());
+            durations.push(2);
+        }
+        let first = durations.len();
+        durations.extend([2, 3]);
+        if prefix {
+            precedences.push((0, first));
+        }
+        if suffix {
+            let last = durations.len();
+            outer_machine.push(last);
+            durations.push(2);
+            precedences.push((first + 1, last));
+        }
+        let mut sequences = Vec::new();
+        if !outer_machine.is_empty() {
+            sequences.push(outer_machine);
+        }
+        sequences.push(vec![first, first + 1]);
+        let horizon = durations.iter().sum();
+        let schedule = Schedule {
+            intervals: durations
+                .into_iter()
+                .map(|duration| IntervalVar { duration, horizon, modes: Vec::new(), optional: false })
+                .collect(),
+            precedences,
+            resources: sequences.iter().cloned().map(Resource::NoOverlap).collect(),
+            minimize_makespan: true,
+        };
+        let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+        let mut dense_sequences = vec![Vec::new(); sequences.len()];
+        for sequence in sequences {
+            for operation in sequence {
+                dense_sequences[problem.machine(operation)].push(operation);
+            }
+        }
+        let mut sequences = dense_sequences;
+        let block_machine = problem.machine(first);
+        let mut state = JobShopState::from_machine_sequences(&problem, sequences.clone(), &stop).unwrap().unwrap();
+        assert_eq!(state.critical_path(), (0..schedule.intervals.len()).collect::<Vec<_>>());
+        let mut movements = Vec::new();
+        state
+            .visit_strict_n5_canonical_moves(&stop, |movement, _| {
+                movements.push(movement);
+                Ok(())
+            })
+            .unwrap();
+        if !prefix && !suffix {
+            assert!(movements.is_empty(), "a block covering the actual whole path retains its endpoint exclusions");
+            continue;
+        }
+        let movement = ScheduleMove::AdjacentSwap { machine: block_machine, first_position: 0 };
+        assert_eq!(movements, [movement], "singleton prefix={prefix}, suffix={suffix}");
+        let mut scored = Vec::new();
+        state
+            .visit_taillard_scored_strict_n5_canonical_moves(&stop, |movement, _, _| {
+                scored.push(movement);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(scored, movements);
+        assert!(state.score_strict_n5_taillard(movement, &stop).unwrap().is_some());
+        sequences[block_machine].swap(0, 1);
+        let oracle = independent_fixed_oracle(&schedule, &sequences).unwrap();
+        assert_eq!(oracle.1, 5);
+        let fast = state.consider_strict_n5_fast(movement, MinimizingMoveAcceptance::Always, &stop).unwrap();
+        assert!(fast.used_fast_path && !fast.fell_back);
+        assert!(matches!(fast.outcome, MoveOutcome::Accepted { current: 5, .. }));
+        assert_eq!(state.machine_sequences(), sequences);
+        assert_eq!(state.starts(), oracle.0);
+        assert_eq!(state.makespan(), oracle.1);
+        assert!(state.refresh_from_full_oracle(&stop).unwrap());
+        assert!(state.matches_full_oracle(&stop).unwrap());
+    }
+}
+
+#[test]
 fn strict_tsab_n5_uses_head_internal_and_tail_exclusions() {
     assert!(audit_strict_n5_layout(&[4]).is_empty(), "a sole critical block contributes no strict N5 move");
     assert_eq!(
@@ -2646,6 +2727,126 @@ fn strict_n5_taillard_stream_is_deterministic_and_non_mutating() {
     assert_eq!(first, second);
     assert_eq!(state.starts(), starts_before);
     assert_eq!(state.test_tails(), tails_before);
+}
+
+#[test]
+fn strict_n5_forward_probes_match_independent_oracles_and_restore_all_accepted_state() {
+    let stop = AtomicBool::new(false);
+    let mut exercised = 0;
+    for jobs in 2..=4 {
+        for machines in 2..=4 {
+            for salt in 0..machines {
+                let schedule = fixed_permutation_job_shop(jobs, machines, salt);
+                let problem = JobShopProblem::recognize(&schedule, &stop).unwrap().unwrap();
+                for seed in 0..8 {
+                    let mut state = JobShopState::giffler_thompson(&problem, seed, DispatchRule::Randomized, &stop).unwrap().unwrap();
+                    state.retain_canonical_critical_blocks_only();
+                    let mut movements = Vec::new();
+                    state
+                        .visit_strict_n5_canonical_moves(&stop, |movement, _| {
+                            movements.push(movement);
+                            Ok(())
+                        })
+                        .unwrap();
+                    let before = state.to_solution();
+                    let sequences = state.machine_sequences().to_vec();
+                    let tails = state.test_tails().to_vec();
+                    let latest = state.latest_starts().to_vec();
+                    let topology = state.topological_order().to_vec();
+                    let path = state.critical_path().to_vec();
+                    for movement in movements {
+                        let mut trial = sequences.clone();
+                        let machine = match movement {
+                            ScheduleMove::AdjacentSwap { machine, .. } | ScheduleMove::Insert { machine, .. } => machine,
+                        };
+                        apply_test_move(&mut trial[machine], movement);
+                        let expected = independent_fixed_oracle(&schedule, &trial).expect("strict N5 preserves acyclicity").1;
+                        let generic = state.probe_move(movement, &stop).unwrap();
+                        let metrics_before = state.metrics();
+                        let forward = state.probe_strict_n5_forward(movement, &stop).unwrap();
+                        assert_eq!(forward.probe, MoveProbe::Feasible { current: before.objectives[0], candidate: expected });
+                        assert_eq!(forward.probe, generic);
+                        assert!(forward.used_forward_kernel && !forward.fell_back);
+                        assert!(forward.queue_pops > 0);
+                        assert_eq!(state.metrics().moves_considered - metrics_before.moves_considered, 1);
+                        assert_eq!(state.metrics().delta_evaluations - metrics_before.delta_evaluations, 1);
+                        assert_eq!(state.to_solution().starts, before.starts);
+                        assert_eq!(state.to_solution().objectives, before.objectives);
+                        assert_eq!(state.machine_sequences(), sequences);
+                        assert_eq!(state.test_tails(), tails);
+                        assert_eq!(state.latest_starts(), latest);
+                        assert_eq!(state.topological_order(), topology);
+                        assert_eq!(state.critical_path(), path);
+                        assert!(state.matches_full_oracle(&stop).unwrap());
+                        exercised += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(exercised > 100, "independent oracle coverage: {exercised}");
+}
+
+#[test]
+fn strict_n5_forward_probe_work_cap_falls_back_exactly_without_double_counting_candidates() {
+    let stop = AtomicBool::new(false);
+    let schedule = fixed_flow_shop(6, 5);
+    let (problem, sequences, movement) = strict_n5_fixture(&schedule);
+    let mut trial = sequences.clone();
+    let machine = match movement {
+        ScheduleMove::AdjacentSwap { machine, .. } | ScheduleMove::Insert { machine, .. } => machine,
+    };
+    apply_test_move(&mut trial[machine], movement);
+    let expected = independent_fixed_oracle(&schedule, &trial).unwrap().1;
+    for cap in [0, 1] {
+        let mut state = JobShopState::from_machine_sequences(&problem, sequences.clone(), &stop).unwrap().unwrap();
+        state.retain_canonical_critical_blocks_only();
+        let starts = state.starts().to_vec();
+        let tails = state.test_tails().to_vec();
+        state.take_metrics();
+        state.test_configure_strict_n5_work_cap(cap, false);
+        let result = state.probe_strict_n5_forward(movement, &stop).unwrap();
+        assert!(result.used_forward_kernel && result.fell_back);
+        assert_eq!(result.queue_pops, cap as u64);
+        assert_eq!(result.probe, MoveProbe::Feasible { current: state.makespan(), candidate: expected });
+        assert_eq!(state.metrics().moves_considered, 1);
+        assert_eq!(state.metrics().delta_evaluations, 2, "both attempted kernels count their real evaluations");
+        assert_eq!(state.machine_sequences(), sequences);
+        assert_eq!(state.starts(), starts);
+        assert_eq!(state.test_tails(), tails);
+        assert!(state.matches_full_oracle(&stop).unwrap());
+    }
+}
+
+#[test]
+fn strict_n5_forward_probe_cancellation_restores_partial_work_before_returning() {
+    let stop = AtomicBool::new(false);
+    let schedule = fixed_flow_shop(6, 5);
+    let (problem, sequences, movement) = strict_n5_fixture(&schedule);
+    for at_work_cap in [false, true] {
+        let mut state = JobShopState::from_machine_sequences(&problem, sequences.clone(), &stop).unwrap().unwrap();
+        state.retain_canonical_critical_blocks_only();
+        let starts = state.starts().to_vec();
+        let ends = state.ends().to_vec();
+        let tails = state.test_tails().to_vec();
+        let path = state.critical_path().to_vec();
+        let result = if at_work_cap {
+            state.test_configure_strict_n5_work_cap(1, true);
+            state.probe_strict_n5_forward(movement, &stop)
+        } else {
+            // The sink scan checkpoints after the forward value changes.
+            cancel_after_checkpoints(&stop, 2, || state.probe_strict_n5_forward(movement, &stop))
+        };
+        assert!(result.is_err());
+        assert!(stop.load(Ordering::Acquire));
+        assert_eq!(state.machine_sequences(), sequences);
+        assert_eq!(state.starts(), starts);
+        assert_eq!(state.ends(), ends);
+        assert_eq!(state.test_tails(), tails);
+        assert_eq!(state.critical_path(), path);
+        stop.store(false, Ordering::Release);
+        assert!(state.matches_full_oracle(&stop).unwrap());
+    }
 }
 
 #[test]
@@ -2913,6 +3114,11 @@ fn strict_n5_fast_gate_falls_back_for_general_dag_zero_duration_and_windows() {
         let movement = ScheduleMove::AdjacentSwap { machine: 0, first_position: 0 };
         assert!(state.score_strict_n5_taillard(movement, &stop).unwrap().is_none());
         let before = state.machine_sequences().to_vec();
+        let generic = state.probe_move(movement, &stop).unwrap();
+        let probe = state.probe_strict_n5_forward(movement, &stop).unwrap();
+        assert!(!probe.used_forward_kernel && probe.fell_back);
+        assert_eq!(probe.probe, generic);
+        assert_eq!(state.machine_sequences(), before);
         let outcome = state.consider_strict_n5_fast(movement, MinimizingMoveAcceptance::Always, &stop).unwrap();
         assert!(!outcome.used_fast_path);
         assert!(outcome.fell_back);

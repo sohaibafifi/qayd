@@ -552,6 +552,88 @@ fn critical_path_and_resource_energy_bound_schedule_makespan() {
     assert_eq!(bound.value, 7);
 }
 
+fn machine_bound_fixture(operations: &[Vec<(usize, i64)>]) -> CollectionModel {
+    use qayd::model::list::{Mode, Resource};
+    CollectionModel {
+        items: Vec::new(),
+        lists: 0,
+        objectives: Vec::new(),
+        constraints: Vec::new(),
+        globals: Vec::new(),
+        schedule: Some(Schedule {
+            intervals: operations
+                .iter()
+                .map(|modes| IntervalVar {
+                    duration: 0,
+                    horizon: i64::MAX,
+                    modes: modes
+                        .iter()
+                        .map(|&(machine, duration)| Mode { reference: None, machine, duration, start_window: (0, i64::MAX - duration) })
+                        .collect(),
+                    optional: false,
+                })
+                .collect(),
+            precedences: Vec::new(),
+            resources: vec![Resource::MachineNoOverlap],
+            minimize_makespan: true,
+        }),
+    }
+}
+
+#[test]
+fn mandatory_machine_load_matches_the_fixed_unary_bound() {
+    let moded = machine_bound_fixture(&[vec![(0, 3)], vec![(0, 4)]]);
+    let mut fixed = moded.clone();
+    let schedule = fixed.schedule.as_mut().unwrap();
+    for interval in &mut schedule.intervals {
+        interval.duration = interval.modes[0].duration;
+        interval.modes.clear();
+    }
+    schedule.resources = vec![qayd::model::list::Resource::NoOverlap(vec![0, 1])];
+    let stop = AtomicBool::new(false);
+    assert_eq!(compute(&moded, &stop).unwrap().value, 7);
+    assert_eq!(compute(&moded, &stop), compute(&fixed, &stop));
+}
+
+#[test]
+fn flexible_machine_choices_are_not_counted_as_forced_loads() {
+    let model = machine_bound_fixture(&[vec![(0, 3), (1, 3)], vec![(0, 4), (1, 4)]]);
+    // Putting the operations on different machines attains four, so seven
+    // would be an invalid lower bound.
+    assert_eq!(compute(&model, &AtomicBool::new(false)).unwrap().value, 4);
+}
+
+#[test]
+fn same_machine_alternatives_and_repeated_resources_are_counted_once() {
+    let mut model = machine_bound_fixture(&[vec![(0, 3), (0, 8)], vec![(0, 4)]]);
+    model.schedule.as_mut().unwrap().resources.push(qayd::model::list::Resource::MachineNoOverlap);
+    assert_eq!(compute(&model, &AtomicBool::new(false)).unwrap().value, 7);
+}
+
+#[test]
+fn optional_operations_do_not_contribute_to_forced_machine_load() {
+    let mut model = machine_bound_fixture(&[vec![(0, 3)], vec![(0, 1000)]]);
+    model.schedule.as_mut().unwrap().intervals[1].optional = true;
+    assert_eq!(compute(&model, &AtomicBool::new(false)).unwrap().value, 3);
+}
+
+#[test]
+fn signed_mode_windows_do_not_receive_a_time_zero_certificate() {
+    let mut model = machine_bound_fixture(&[vec![(0, 3)]]);
+    let interval = &mut model.schedule.as_mut().unwrap().intervals[0];
+    interval.horizon = 0;
+    interval.modes[0].start_window = (-10, -7);
+    assert!(compute(&model, &AtomicBool::new(false)).is_none());
+}
+
+#[test]
+fn machine_load_overflow_and_cancellation_do_not_produce_a_certificate() {
+    let model = machine_bound_fixture(&[vec![(0, i64::MAX)], vec![(0, 1)]]);
+    assert!(compute(&model, &AtomicBool::new(false)).is_none());
+    let model = machine_bound_fixture(&[vec![(0, 3)], vec![(0, 4)]]);
+    assert!(compute(&model, &AtomicBool::new(true)).is_none());
+}
+
 #[test]
 fn attached_gap_uses_a_certified_dual_only() {
     let costs = vec![vec![0, 10, 10, 10], vec![10, 0, 1, 1], vec![10, 1, 0, 1], vec![10, 1, 1, 0]];

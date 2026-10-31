@@ -239,13 +239,13 @@ where
     std::thread::scope(|scope| {
         let mut scope_cancel = CancelOnUnwind::new(Arc::clone(&cancel));
         let monitor_cancel = Arc::clone(&cancel);
-        scope.spawn(move || {
+        let monitor = scope.spawn(move || {
             while !monitor_cancel.load(Ordering::Acquire) {
                 if external_stop.load(Ordering::Acquire) {
                     monitor_cancel.store(true, Ordering::Release);
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(5));
+                std::thread::park_timeout(Duration::from_millis(5));
             }
         });
 
@@ -308,6 +308,11 @@ where
             }
         }
         cancel.store(true, Ordering::Release);
+        // Short search slices can finish before the monitor's polling period.
+        // Wake it before the scope joins, rather than charging every slice for
+        // the remainder of that period. The unpark token also covers the race
+        // where completion precedes the monitor entering park_timeout.
+        monitor.thread().unpark();
         scope_cancel.disarm();
     });
 
@@ -351,13 +356,13 @@ where
     std::thread::scope(|scope| {
         let mut scope_cancel = CancelOnUnwind::new(Arc::clone(&cancel));
         let monitor_cancel = Arc::clone(&cancel);
-        scope.spawn(move || {
+        let monitor = scope.spawn(move || {
             while !monitor_cancel.load(Ordering::Acquire) {
                 if external_stop.load(Ordering::Acquire) {
                     monitor_cancel.store(true, Ordering::Release);
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(5));
+                std::thread::park_timeout(Duration::from_millis(5));
             }
         });
 
@@ -380,6 +385,7 @@ where
             reports[worker] = Some(report);
         }
         cancel.store(true, Ordering::Release);
+        monitor.thread().unpark();
         scope_cancel.disarm();
     });
 

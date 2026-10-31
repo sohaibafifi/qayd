@@ -1445,6 +1445,7 @@ fn solve_with_monitored_external_stop(
         budget.cancel_with(TerminationReason::ExternalCancellation);
     }
     let monitor_done = AtomicBool::new(false);
+    budget.trace_phase("external-monitor-enter");
     let result = std::thread::scope(|scope| {
         scope.spawn(|| {
             while !monitor_done.load(std::sync::atomic::Ordering::Acquire) {
@@ -1470,6 +1471,7 @@ fn solve_with_monitored_external_stop(
         }
         result
     });
+    budget.trace_phase("external-monitor-joined");
     // Read shared state only after the scoped monitor has joined. Reading it in
     // the scope body can miss the monitor's last cancellation poll.
     (result, budget.expired())
@@ -1501,11 +1503,13 @@ pub(crate) fn solve_model_with_budget(
     budget: &SolveBudget,
     sink: &mut dyn EventSink,
 ) -> Result<SolveResult, SolveError> {
+    budget.trace_phase("solve-enter");
     request.validate()?;
     let result = solve_model_with_budget_inner(package, request, budget, sink)?;
     if request.proof == ProofRequest::Require && result.proof.is_none() {
         return Err(SolveError::InvalidResult("a required proof was not produced".to_string()));
     }
+    budget.trace_phase("solve-return");
     Ok(result)
 }
 
@@ -1519,8 +1523,10 @@ fn solve_model_with_budget_inner(
         return Ok(stopped_result(budget, "request setup"));
     }
     let compile_started = Instant::now();
+    budget.trace_phase("compile-enter");
     match compile_model_plan(package, request, budget) {
         Ok(plan) => {
+            budget.trace_phase("compile-return");
             // Backend compilers perform their allocation estimates before
             // materializing physical state. Start live RSS enforcement only
             // after that deterministic preflight so an impossible request is a
@@ -1531,9 +1537,16 @@ fn solve_model_with_budget_inner(
             }
             let build_seconds = compile_started.elapsed().as_secs_f64();
             let estimated_bytes = plan.estimated_backend_bytes();
+            budget.trace_phase("execute-enter");
             let mut result = match execute_model_plan(package, &plan, request, budget, sink) {
-                Ok(result) => result,
-                Err(SolveError::Interrupted(_)) => return Ok(stopped_result(budget, "execution or final verification")),
+                Ok(result) => {
+                    budget.trace_phase("execute-return");
+                    result
+                }
+                Err(SolveError::Interrupted(_)) => {
+                    budget.trace_phase("execute-interrupted");
+                    return Ok(stopped_result(budget, "execution or final verification"));
+                }
                 Err(error) => return Err(error),
             };
             if let Some(report) = result.reports.first_mut() {

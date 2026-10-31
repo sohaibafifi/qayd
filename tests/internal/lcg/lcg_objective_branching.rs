@@ -965,3 +965,81 @@ fn equality_objective_target_does_not_enumerate_a_wide_domain() {
     assert_eq!(first, Some(1));
     assert!(!complete);
 }
+
+#[test]
+fn makespan_completion_scope_preserves_feasible_order_hints_before_objective_branching() {
+    let run = |use_primary: bool| {
+        let mut solver = Solver::new();
+        let x = solver.new_var_range(0, 1);
+        let y = solver.new_var_range(0, 1);
+        let makespan = solver.new_var_range(1, 2);
+        for variable in [x, y] {
+            linear(&mut solver, &[1, -1], &[makespan, variable], Relation::Ge, 1);
+        }
+        let search = [x, y, makespan];
+        let mut phase = vec![None; solver.store.num_vars()];
+        phase[x.index()] = Some(1);
+        phase[y.index()] = Some(1);
+        let mut incumbents = Vec::new();
+        let (best, _, complete) = optimize_seeded_with_scope(
+            &mut solver,
+            &search,
+            use_primary.then_some(&search[..2]),
+            Objective::Var(makespan),
+            true,
+            &AtomicBool::new(false),
+            0,
+            None,
+            None,
+            &[],
+            None,
+            phase,
+            Vec::new(),
+            |value, assignment| incumbents.push((value, assignment.to_vec())),
+        );
+        assert!(complete);
+        assert_eq!(best, Some((vec![0, 0, 1], 1)));
+        incumbents
+    };
+
+    assert_eq!(run(false), vec![(1, vec![0, 0, 1])]);
+    assert_eq!(run(true), vec![(2, vec![1, 1, 2]), (1, vec![0, 0, 1])]);
+}
+
+#[test]
+fn makespan_is_still_completed_when_the_primary_scope_is_empty_or_already_fixed() {
+    for fixed_primary in [false, true] {
+        let mut solver = Solver::new();
+        let x = solver.new_var_range(0, 1);
+        let y = solver.new_var_range(0, 1);
+        let makespan = solver.new_var_range(1, 2);
+        for variable in [x, y] {
+            linear(&mut solver, &[1, -1], &[makespan, variable], Relation::Ge, 1);
+            if fixed_primary {
+                solver.store.fix(variable, 0).unwrap();
+            }
+        }
+        let search = [x, y, makespan];
+        let primary = if fixed_primary { &search[..2] } else { &search[..0] };
+        let mut incumbents = Vec::new();
+        let (best, _, complete) = optimize_seeded_with_scope(
+            &mut solver,
+            &search,
+            Some(primary),
+            Objective::Var(makespan),
+            true,
+            &AtomicBool::new(false),
+            0,
+            None,
+            None,
+            &[],
+            None,
+            Vec::new(),
+            Vec::new(),
+            |value, assignment| incumbents.push((value, assignment.to_vec())),
+        );
+        assert!(complete);
+        assert_eq!(best, Some((vec![0, 0, 1], 1)));
+        assert_eq!(incumbents, vec![(1, vec![0, 0, 1])]);
+    }
+}

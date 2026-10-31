@@ -45,6 +45,7 @@ parser.add_argument("--max-iterations", type=int)
 parser.add_argument("--engine", choices=("auto", "exact", "ls"))
 parser.add_argument("--verbose", action="store_true")
 parser.add_argument("--profile", action="store_true")
+parser.add_argument("--schedule-cdcl", action="store_true", help="request CDCL for single-thread exact JSSP solving")
 parser.add_argument("--schedule-path-relink", action="store_true", help="enable bounded guide-directed JSSP path relinking")
 parser.add_argument("--schedule-lns-shadow", action="store_true", help="measure bounded exact JSSP repairs without publishing them")
 parser.add_argument(
@@ -55,9 +56,9 @@ parser.add_argument(
 )
 parser.add_argument(
     "--schedule-jssp-search",
-    choices=("legacy", "tsab-candidate", "tsab-multi-candidate"),
+    choices=("legacy", "tsab-candidate", "tsab-multi-candidate", "tsab-adaptive"),
     default="legacy",
-    help="select a single-owner or all-worker TSAB-inspired candidate-ranked N5 pilot, or legacy JSSP search",
+    help="select legacy search, a seven-worker TSAB pilot, or experimental single-thread adaptive TSAB JSSP search",
 )
 parser.add_argument("--json", action="store_true", help="emit one machine-readable result")
 parser.add_argument(
@@ -77,6 +78,13 @@ if (
 ):
     raise SystemExit("threads must be positive; time, memory and iteration limits and seed must be non-negative")
 engine = args.engine or ("ls" if args.threads > 1 else "auto")
+if args.schedule_cdcl:
+    if engine != "exact" or args.threads != 1 or args.max_iterations is not None:
+        raise SystemExit("--schedule-cdcl requires --engine exact, --threads 1, and no --max-iterations")
+    if (args.schedule_path_relink or args.schedule_lns_shadow
+            or args.schedule_constructor_workers or args.schedule_jssp_search != "legacy"):
+        raise SystemExit("--schedule-cdcl cannot be combined with scheduling local-search controls")
+
 
 parse_started = time.perf_counter()
 instance = read_jsplib(args.instance) if args.instance else None
@@ -127,6 +135,7 @@ with output:
         seed=args.seed,
         verbose=args.verbose,
         profile=args.profile,
+        schedule_cdcl=args.schedule_cdcl,
         schedule_path_relink=args.schedule_path_relink,
         schedule_lns_shadow=args.schedule_lns_shadow,
         schedule_constructor_workers=args.schedule_constructor_workers,
@@ -216,6 +225,9 @@ profile_record = {
     "schedule_tsab_tabu_resets": solution.schedule_tsab_tabu_resets,
     "schedule_tsab_fingerprint_repeats": solution.schedule_tsab_fingerprint_repeats,
     "schedule_tsab_escape_signals": solution.schedule_tsab_escape_signals,
+    "schedule_tsab_blocked_n6_requests": solution.schedule_tsab_blocked_n6_requests,
+    "schedule_tsab_blocked_n6_attempts": solution.schedule_tsab_blocked_n6_attempts,
+    "schedule_tsab_blocked_n6_cooldown_skips": solution.schedule_tsab_blocked_n6_cooldown_skips,
     "schedule_tsab_n1_kicks": solution.schedule_tsab_n1_kicks,
     "schedule_tsab_kick_moves": solution.schedule_tsab_kick_moves,
     "schedule_tsab_elite_restarts": solution.schedule_tsab_elite_restarts,
@@ -262,6 +274,11 @@ profile_record = {
     "schedule_tsab_fast_work_cap_recoveries": solution.schedule_tsab_fast_work_cap_recoveries,
     "schedule_tsab_fast_date_changes": solution.schedule_tsab_fast_date_changes,
     "schedule_tsab_fast_queue_pops": solution.schedule_tsab_fast_queue_pops,
+    "schedule_tsab_forward_probe_attempts": getattr(solution, "schedule_tsab_forward_probe_attempts", None),
+    "schedule_tsab_forward_probe_fallbacks": getattr(solution, "schedule_tsab_forward_probe_fallbacks", None),
+    "schedule_tsab_forward_probe_queue_pops": getattr(solution, "schedule_tsab_forward_probe_queue_pops", None),
+    "schedule_tsab_forward_probe_date_changes": getattr(solution, "schedule_tsab_forward_probe_date_changes", None),
+    "schedule_tsab_forward_probe_disables": getattr(solution, "schedule_tsab_forward_probe_disables", None),
     "schedule_tsab_fast_full_validations": solution.schedule_tsab_fast_full_validations,
     "schedule_tsab_fast_oracle_mismatches": solution.schedule_tsab_fast_oracle_mismatches,
     "schedule_tsab_fast_pending_promotions": solution.schedule_tsab_fast_pending_promotions,
@@ -404,7 +421,60 @@ profile_record = {
     "constructor": solution.constructor,
     "memory_limit_mb": args.memory_limit_mb,
     "schedule_jssp_search": args.schedule_jssp_search,
+    "schedule_cdcl_requested": args.schedule_cdcl,
+    "engine_requested": engine,
+    "engine": engine,
+    "seed": args.seed,
+    "threads": args.threads,
+    "search_stats": {
+        "solutions": solution.stats.solutions,
+        "nodes": solution.stats.nodes,
+        "failures": solution.stats.failures,
+        "lcg_atoms": solution.stats.lcg_atoms,
+        "propagator_calls": solution.stats.propagator_calls,
+        "learned_lits": solution.stats.learned_lits,
+    },
 }
+
+
+# Runtime evidence comes from the returned engine report, independently of the
+# requested controls. Older extensions expose no scheduling-kernel telemetry.
+search_engine = getattr(solution, "search_engine", None)
+schedule_encoding = getattr(solution, "schedule_encoding", None)
+schedule_search_kernel = getattr(solution, "schedule_search_kernel", None)
+schedule_search_invoked = (
+    schedule_search_kernel is not None if hasattr(solution, "schedule_search_kernel") else None
+)
+if schedule_search_kernel == "cdcl" and solution.stats.lcg_atoms > 0:
+    schedule_execution_phase = "cdcl-initialized"
+elif schedule_search_kernel is not None:
+    schedule_execution_phase = "kernel-invoked"
+elif schedule_encoding is not None:
+    if solution.status in {"SATISFIABLE", "OPTIMAL"}:
+        schedule_execution_phase = "pre-search-primal"
+    elif solution.status in {"UNSATISFIABLE", "UNSAT"}:
+        schedule_execution_phase = "pre-search-proof"
+    else:
+        schedule_execution_phase = "build-interrupted"
+else:
+    schedule_execution_phase = None
+profile_record.update({
+    "diagnostic": getattr(solution, "message", None),
+    "search_engine": search_engine,
+    "schedule_encoding": schedule_encoding,
+    "schedule_search_kernel": schedule_search_kernel,
+    "schedule_search_invoked": schedule_search_invoked,
+    "schedule_execution_phase": schedule_execution_phase,
+})
+search_incumbent_events = getattr(solution, "search_incumbent_events", None)
+if search_incumbent_events is not None:
+    if any(len(objectives) != 1 for _, objectives in search_incumbent_events):
+        raise AssertionError("JSSP internal objective improvements must have one makespan objective")
+    profile_record["anytime"] = [
+        {"time": time_value, "primal": objectives[0], "dual": None, "verified": False}
+        for time_value, objectives in search_incumbent_events
+    ]
+    profile_record["anytime_scope"] = "internal objective improvements; not verified publications"
 
 if not solution.starts:
     record = {

@@ -160,6 +160,10 @@ name = "intension"
 path = "tests/integration/constraints/intension.rs"
 
 [[test]]
+name = "interval_no_overlap_windows"
+path = "tests/integration/constraints/interval_no_overlap_windows.rs"
+
+[[test]]
 name = "intension_normalization"
 path = "tests/integration/constraints/intension_normalization.rs"
 
@@ -390,6 +394,12 @@ path = "tests/integration/metrics/i6_nogood_metrics.rs"
 [[test]]
 name = "unary_edge_finding_metrics"
 path = "tests/integration/metrics/unary_edge_finding_metrics.rs"
+
+# Scheduling integration tests.
+
+[[test]]
+name = "jssp_adaptive"
+path = "tests/integration/scheduling/jssp_adaptive.rs"
 
 # Certificates integration tests.
 

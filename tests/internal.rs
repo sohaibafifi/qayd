@@ -17,6 +17,8 @@ mod architecture_consolidation;
 mod backend_phase3;
 #[path = "internal/model/collection.rs"]
 mod collection;
+#[path = "internal/orchestrator/collection_memory.rs"]
+mod collection_memory;
 #[path = "internal/orchestrator/cp_compile_interruption.rs"]
 mod cp_compile_interruption;
 #[path = "internal/scheduling/disjunctive_schedule.rs"]
@@ -44,6 +46,8 @@ mod lcg_objective_branching;
 mod lcg_research;
 #[path = "internal/lcg/lcg_root_probe_budget.rs"]
 mod lcg_root_probe_budget;
+#[path = "internal/lcg/lcg_sync_batch.rs"]
+mod lcg_sync_batch;
 #[path = "internal/lists/list_alns_phase4.rs"]
 mod list_alns_phase4;
 #[path = "internal/lists/list_exact_interruption.rs"]
@@ -126,6 +130,8 @@ mod schedule_portfolio_exchange;
 mod schedule_relink;
 #[path = "internal/scheduling/schedule_state.rs"]
 mod schedule_state;
+#[path = "internal/scheduling/schedule_tsab_adaptive.rs"]
+mod schedule_tsab_adaptive;
 #[path = "internal/scheduling/scheduling_kernel.rs"]
 mod scheduling_kernel;
 #[path = "internal/orchestrator/semantic_preparation_interruption.rs"]

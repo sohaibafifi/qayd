@@ -93,6 +93,9 @@ JSSP_TSAB_COUNTERS = (
     "schedule_tsab_tabu_resets",
     "schedule_tsab_fingerprint_repeats",
     "schedule_tsab_escape_signals",
+    "schedule_tsab_blocked_n6_requests",
+    "schedule_tsab_blocked_n6_attempts",
+    "schedule_tsab_blocked_n6_cooldown_skips",
     "schedule_tsab_n1_kicks",
     "schedule_tsab_kick_moves",
     "schedule_tsab_elite_restarts",
@@ -134,6 +137,11 @@ JSSP_TSAB_COUNTERS = (
     "schedule_tsab_fast_work_cap_recoveries",
     "schedule_tsab_fast_date_changes",
     "schedule_tsab_fast_queue_pops",
+    "schedule_tsab_forward_probe_attempts",
+    "schedule_tsab_forward_probe_fallbacks",
+    "schedule_tsab_forward_probe_queue_pops",
+    "schedule_tsab_forward_probe_date_changes",
+    "schedule_tsab_forward_probe_disables",
     "schedule_tsab_fast_full_validations",
     "schedule_tsab_fast_oracle_mismatches",
     "schedule_tsab_fast_pending_promotions",
@@ -798,7 +806,7 @@ def test_tsab_candidate_is_phased_bounded_and_reserves_only_worker_six():
 
 
 def test_tsab_candidate_rejects_invalid_public_value_and_experimental_combinations():
-    with pytest.raises(ValueError, match="must be 'legacy', 'tsab-candidate', or 'tsab-multi-candidate'"):
+    with pytest.raises(ValueError, match="must be 'legacy', 'tsab-candidate', 'tsab-multi-candidate', or 'tsab-adaptive'"):
         _solve_job_shop(profile=True, schedule_jssp_search="unknown")
     for strategy in ("tsab-candidate", "tsab-multi-candidate"):
         with pytest.raises(ValueError, match="cannot yet be combined"):

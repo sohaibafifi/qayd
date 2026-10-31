@@ -26,6 +26,48 @@ fn unbounded_iteration_quota_remains_unbounded_for_every_worker() {
 }
 
 #[test]
+fn delayed_deadline_worker_does_not_restart_the_request_clock() {
+    assert!(SolveBudget::audit_deadline_worker_start(true));
+    assert!(!SolveBudget::audit_deadline_worker_start(false));
+}
+
+#[test]
+fn final_monitor_reference_releases_the_process_memory_registration() {
+    assert!(SolveBudget::audit_memory_registration_after_monitor_drop());
+}
+
+#[test]
+fn memory_stop_retention_is_revoked_by_every_later_hard_cancellation() {
+    for reason in [
+        TerminationReason::ExternalCancellation,
+        TerminationReason::EventSink,
+        TerminationReason::Engine,
+        TerminationReason::ConflictLimit,
+        TerminationReason::IterationLimit,
+    ] {
+        let budget = SolveBudget::new(None);
+        budget.cancel_with(TerminationReason::MemoryLimit);
+        assert!(budget.memory_only_cancelled());
+        budget.cancel_with(reason);
+        assert_eq!(budget.termination_reason(), TerminationReason::MemoryLimit, "the first hard diagnostic remains stable");
+        assert!(!budget.memory_only_cancelled(), "later {reason:?} forbids retaining evidence");
+    }
+}
+
+#[test]
+fn deadline_does_not_revoke_memory_retention_but_preexisting_external_stop_does() {
+    let budget = SolveBudget::new(None);
+    budget.cancel_with(TerminationReason::MemoryLimit);
+    budget.cancel_with(TerminationReason::Deadline);
+    assert!(budget.memory_only_cancelled());
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let budget = SolveBudget::with_stop(None, stop);
+    budget.cancel_with(TerminationReason::MemoryLimit);
+    assert!(!budget.memory_only_cancelled());
+}
+
+#[test]
 fn finalization_reserve_records_and_enforces_the_deadline() {
     let budget = SolveBudget::new(Some(Duration::from_millis(8)));
     let search_stop = budget.search_stop();

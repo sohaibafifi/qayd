@@ -1330,9 +1330,17 @@ impl HeadTailMoveScore {
 
 /// Taillard's constant-work evaluation of one adjacent strict N5 swap.
 ///
-/// The estimate uses the accepted heads and tails outside the four affected
-/// machine positions. It is advisory only: the exact fast kernel remains the
-/// sole authority for feasibility and the candidate makespan.
+/// For a current strict N5 move in a positive-duration classical chain model
+/// with standard windows, `estimated_makespan` is a lower bound on a feasible
+/// candidate's makespan. It uses exact accepted heads and tails outside the
+/// four affected machine positions. The critical arc a -> b is tight, so a
+/// positive-length alternative path between them cannot exist. The external
+/// paths used by the equations therefore survive the removed machine arcs;
+/// their concatenations with the new arcs are candidate paths.
+///
+/// Only the guarded strict-N5 scorer/visitor establishes these prerequisites.
+/// The secondary score is advisory and is not a bound. Neither score certifies
+/// feasibility or the exact objective; those still require an exact probe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StrictN5TaillardScore {
     pub(crate) estimated_makespan: i128,
@@ -1398,6 +1406,17 @@ pub(crate) enum MoveOutcome {
 pub(crate) enum MoveProbe {
     Feasible { current: i64, candidate: i64 },
     Rejected(MoveRejection),
+}
+
+/// A transactional strict-N5 probe and the work spent in its forward kernel.
+/// Fallback work is counted separately by the ordinary delta evaluator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ForwardN5Probe {
+    pub(crate) probe: MoveProbe,
+    pub(crate) used_forward_kernel: bool,
+    pub(crate) fell_back: bool,
+    pub(crate) forward_date_changes: u64,
+    pub(crate) queue_pops: u64,
 }
 
 /// Result of the default-off strict N5 micro-kernel.
@@ -2268,7 +2287,8 @@ impl JobShopState {
             return Ok(generated);
         }
 
-        Self::visit_strict_n5_moves(&self.reconstruction.canonical_critical_blocks, stop, emit)?;
+        let (exclude_head, exclude_tail) = self.strict_n5_endpoint_exclusions();
+        Self::visit_strict_n5_moves(&self.reconstruction.canonical_critical_blocks, exclude_head, exclude_tail, stop, emit)?;
         Ok(generated)
     }
 
@@ -2282,7 +2302,8 @@ impl JobShopState {
     ) -> Result<usize, ScheduleStateInterrupted> {
         checkpoint(stop)?;
         let mut generated = 0usize;
-        Self::visit_strict_n5_moves(&self.reconstruction.canonical_critical_blocks, stop, |movement| {
+        let (exclude_head, exclude_tail) = self.strict_n5_endpoint_exclusions();
+        Self::visit_strict_n5_moves(&self.reconstruction.canonical_critical_blocks, exclude_head, exclude_tail, stop, |movement| {
             let arcs = self.move_arcs(movement).expect("strict canonical N5 movements are structurally valid");
             generated = generated.saturating_add(1);
             visit(movement, arcs)
@@ -2302,7 +2323,8 @@ impl JobShopState {
             return Ok(0);
         }
         let mut generated = 0usize;
-        Self::visit_strict_n5_moves(&self.reconstruction.canonical_critical_blocks, stop, |movement| {
+        let (exclude_head, exclude_tail) = self.strict_n5_endpoint_exclusions();
+        Self::visit_strict_n5_moves(&self.reconstruction.canonical_critical_blocks, exclude_head, exclude_tail, stop, |movement| {
             let arcs = self.move_arcs(movement).expect("strict canonical N5 movements are structurally valid");
             let score = self.score_strict_n5_taillard_unchecked(movement, arcs, stop)?;
             generated = generated.saturating_add(1);
@@ -2315,13 +2337,29 @@ impl JobShopState {
         self.problem.supports_strict_n5_fast_path()
     }
 
+    fn strict_n5_endpoint_exclusions(&self) -> (bool, bool) {
+        // Singleton blocks are omitted from the compact block list. The N5
+        // exclusions belong to the actual path endpoints, not to the first
+        // and last remaining nontrivial blocks.
+        let blocks = &self.reconstruction.canonical_critical_blocks;
+        let path = &self.reconstruction.critical_path;
+        let exclude_head = blocks.first().is_some_and(|block| {
+            path.first().is_some_and(|operation| self.machine_sequences[block.machine].get(block.first_position) == Some(operation))
+        });
+        let exclude_tail = blocks.last().is_some_and(|block| {
+            path.last().is_some_and(|operation| self.machine_sequences[block.machine].get(block.last_position) == Some(operation))
+        });
+        (exclude_head, exclude_tail)
+    }
+
     fn is_current_strict_n5_move(&self, movement: ScheduleMove) -> bool {
         let ScheduleMove::AdjacentSwap { machine, first_position } = movement else {
             return false;
         };
+        let (exclude_head, exclude_tail) = self.strict_n5_endpoint_exclusions();
         self.reconstruction.canonical_critical_blocks.iter().enumerate().any(|(block_index, block)| {
-            (block_index > 0 && block.machine == machine && block.first_position == first_position)
-                || (block_index + 1 < self.reconstruction.canonical_critical_blocks.len()
+            ((block_index > 0 || !exclude_head) && block.machine == machine && block.first_position == first_position)
+                || ((block_index + 1 < self.reconstruction.canonical_critical_blocks.len() || !exclude_tail)
                     && block.machine == machine
                     && block.last_position > block.first_position
                     && block.last_position - 1 == first_position)
@@ -2330,18 +2368,20 @@ impl JobShopState {
 
     fn visit_strict_n5_moves(
         blocks: &[CriticalBlock],
+        exclude_head: bool,
+        exclude_tail: bool,
         stop: &AtomicBool,
         mut visit: impl FnMut(ScheduleMove) -> Result<(), ScheduleStateInterrupted>,
     ) -> Result<(), ScheduleStateInterrupted> {
         for (block_index, block) in blocks.iter().enumerate() {
             checkpoint(stop)?;
             let mut first_move = None;
-            if block_index > 0 {
+            if block_index > 0 || !exclude_head {
                 let movement = ScheduleMove::AdjacentSwap { machine: block.machine, first_position: block.first_position };
                 visit(movement)?;
                 first_move = Some(movement);
             }
-            if block_index + 1 < blocks.len() && block.last_position > block.first_position {
+            if (block_index + 1 < blocks.len() || !exclude_tail) && block.last_position > block.first_position {
                 let movement = ScheduleMove::AdjacentSwap { machine: block.machine, first_position: block.last_position - 1 };
                 if first_move != Some(movement) {
                     visit(movement)?;
@@ -2885,87 +2925,19 @@ impl JobShopState {
         // instances these bounds are respectively 2n, 5n and 4n.
         let default_pop_cap = strict_n5_streaming_pop_cap(operation_count);
         #[cfg(test)]
-        let forward_pop_cap = self.workspace.fast_forward_value_change_pop_cap.unwrap_or(default_pop_cap);
-        #[cfg(not(test))]
-        let forward_pop_cap = default_pop_cap;
-        #[cfg(test)]
         let reverse_pop_cap = self.workspace.fast_reverse_value_change_pop_cap.unwrap_or(default_pop_cap);
         #[cfg(not(test))]
         let reverse_pop_cap = default_pop_cap;
-        let mut queue_pops = 0usize;
-        let mut forward_queue_pops = 0usize;
+        let (forward_date_changes, mut queue_pops) = self.evaluate_strict_n5_forward_value_changes(stop)?;
         let mut reverse_queue_pops = 0usize;
-        let mut forward_date_changes = 0u64;
         let mut reverse_tail_changes = 0u64;
-
-        let epoch = self.workspace.next_dirty_epoch();
-        self.workspace.dirty_queue.clear();
-        for index in 0..self.workspace.changed_roots.len() {
-            let operation = self.workspace.changed_roots[index];
-            self.enqueue_fast_value_change(epoch, operation);
-        }
-        let mut cursor = 0usize;
-        while cursor < self.workspace.dirty_queue.len() {
-            if stop.load(Ordering::Acquire) {
-                return Err(FastN5PropagationFailure::new(
-                    FastN5PropagationFailureKind::Interrupted,
-                    forward_date_changes,
-                    reverse_tail_changes,
-                    queue_pops,
-                ));
-            }
-            if forward_queue_pops >= forward_pop_cap {
-                return Err(FastN5PropagationFailure::new(
-                    FastN5PropagationFailureKind::WorkCap(FastN5PropagationPhase::Forward),
-                    forward_date_changes,
-                    reverse_tail_changes,
-                    queue_pops,
-                ));
-            }
-            let operation = self.workspace.dirty_queue[cursor];
-            cursor += 1;
-            queue_pops = queue_pops.saturating_add(1);
-            forward_queue_pops = forward_queue_pops.saturating_add(1);
-            self.workspace.fast_queue_marks[operation] = 0;
-            let (start, end) =
-                earliest_dates(&self.problem, &self.machine_predecessors, &self.reconstruction.ends, operation).map_err(|failure| {
-                    FastN5PropagationFailure::from_reconstruction(failure, forward_date_changes, reverse_tail_changes, queue_pops)
-                })?;
-            if start == self.reconstruction.starts[operation] && end == self.reconstruction.ends[operation] {
-                continue;
-            }
-            self.record_fast_patch(operation);
-            self.reconstruction.starts[operation] = start;
-            self.reconstruction.ends[operation] = end;
-            forward_date_changes = forward_date_changes.saturating_add(1);
-            for successor_index in 0..self.problem.precedences.successors(operation).len() {
-                let successor = self.problem.precedences.successors(operation)[successor_index];
-                self.enqueue_fast_value_change(epoch, successor);
-            }
-            let machine_successor = self.machine_successors[operation];
-            if machine_successor != NO_OPERATION {
-                self.enqueue_fast_value_change(epoch, machine_successor);
-            }
-        }
-
-        // The strict gate guarantees positive durations, and changed_roots
-        // contains the head of every added machine arc. Any newly introduced
-        // cycle therefore contains a changed root and cannot reach a forward
-        // value-change fixed point: dates keep increasing until WorkCap (or a
-        // numeric error), where the exact forward Kahn pass detects the cycle.
-        // Reaching the reverse phase proves that starts/ends are exact on a DAG.
-        // More specifically, for a canonical block fragment p->a->b->s, the
-        // replacement arcs p->b and a->s only shortcut existing paths. A cycle
-        // through b->a would require another a=>b path after removing a->b;
-        // with positive durations that would force start[b] > end[a], contrary
-        // to a and b being consecutive on the critical block.
 
         let epoch = self.workspace.next_dirty_epoch();
         self.workspace.dirty_queue.clear();
         for arc in arcs.removed.into_iter().flatten().chain(arcs.added.into_iter().flatten()) {
             self.enqueue_fast_value_change(epoch, arc.before);
         }
-        cursor = 0;
+        let mut cursor = 0;
         while cursor < self.workspace.dirty_queue.len() {
             if stop.load(Ordering::Acquire) {
                 return Err(FastN5PropagationFailure::new(
@@ -3034,6 +3006,71 @@ impl JobShopState {
                 |failure| FastN5PropagationFailure::from_reconstruction(failure, forward_date_changes, reverse_tail_changes, queue_pops),
             )?;
         Ok((makespan, forward_date_changes, reverse_tail_changes, u64::try_from(queue_pops).unwrap_or(u64::MAX)))
+    }
+
+    /// Propagate starts and ends only. Both strict-N5 commits and transactional
+    /// probes use this identical bounded kernel; a probe needs no tail update.
+    fn evaluate_strict_n5_forward_value_changes(&mut self, stop: &AtomicBool) -> Result<(u64, usize), FastN5PropagationFailure> {
+        let default_pop_cap = strict_n5_streaming_pop_cap(self.problem.operation_count());
+        #[cfg(test)]
+        let forward_pop_cap = self.workspace.fast_forward_value_change_pop_cap.unwrap_or(default_pop_cap);
+        #[cfg(not(test))]
+        let forward_pop_cap = default_pop_cap;
+        let mut queue_pops = 0usize;
+        let mut forward_date_changes = 0u64;
+        let epoch = self.workspace.next_dirty_epoch();
+        self.workspace.dirty_queue.clear();
+        for index in 0..self.workspace.changed_roots.len() {
+            let operation = self.workspace.changed_roots[index];
+            self.enqueue_fast_value_change(epoch, operation);
+        }
+        let mut cursor = 0usize;
+        while cursor < self.workspace.dirty_queue.len() {
+            if stop.load(Ordering::Acquire) {
+                return Err(FastN5PropagationFailure::new(FastN5PropagationFailureKind::Interrupted, forward_date_changes, 0, queue_pops));
+            }
+            if queue_pops >= forward_pop_cap {
+                return Err(FastN5PropagationFailure::new(
+                    FastN5PropagationFailureKind::WorkCap(FastN5PropagationPhase::Forward),
+                    forward_date_changes,
+                    0,
+                    queue_pops,
+                ));
+            }
+            let operation = self.workspace.dirty_queue[cursor];
+            cursor += 1;
+            queue_pops = queue_pops.saturating_add(1);
+            self.workspace.fast_queue_marks[operation] = 0;
+            let (start, end) = earliest_dates(&self.problem, &self.machine_predecessors, &self.reconstruction.ends, operation)
+                .map_err(|failure| FastN5PropagationFailure::from_reconstruction(failure, forward_date_changes, 0, queue_pops))?;
+            if start == self.reconstruction.starts[operation] && end == self.reconstruction.ends[operation] {
+                continue;
+            }
+            self.record_fast_patch(operation);
+            self.reconstruction.starts[operation] = start;
+            self.reconstruction.ends[operation] = end;
+            forward_date_changes = forward_date_changes.saturating_add(1);
+            for successor_index in 0..self.problem.precedences.successors(operation).len() {
+                let successor = self.problem.precedences.successors(operation)[successor_index];
+                self.enqueue_fast_value_change(epoch, successor);
+            }
+            let machine_successor = self.machine_successors[operation];
+            if machine_successor != NO_OPERATION {
+                self.enqueue_fast_value_change(epoch, machine_successor);
+            }
+        }
+
+        // The strict gate guarantees positive durations, and changed_roots
+        // contains the head of every added machine arc. Any newly introduced
+        // cycle therefore contains a changed root and cannot reach a forward
+        // value-change fixed point: dates keep increasing until WorkCap (or a
+        // numeric error), where the generic exact Kahn pass detects the cycle.
+        // More specifically, for a canonical block fragment p->a->b->s, the
+        // replacement arcs p->b and a->s only shortcut existing paths. A cycle
+        // through b->a would require another a=>b path after removing a->b;
+        // with positive durations that would force start[b] > end[a], contrary
+        // to a and b being consecutive on the critical block.
+        Ok((forward_date_changes, queue_pops))
     }
 
     /// Recover a wide strict-N5 value-change cone with one exact Kahn pass in
@@ -3372,7 +3409,76 @@ impl JobShopState {
     /// oracle-validated by `commit_probed_move` before it can be committed.
     pub(crate) fn probe_move(&mut self, movement: ScheduleMove, stop: &AtomicBool) -> Result<MoveProbe, ScheduleStateInterrupted> {
         checkpoint(stop)?;
-        let result = self.probe_move_inner(movement, stop);
+        let result = self.probe_move_inner(movement, stop, true);
+        self.workspace.observe_growths();
+        self.metrics.workspace_growths = self.workspace.growths;
+        result
+    }
+
+    /// Evaluate a current positive classical N5 swap by propagating only
+    /// changed starts and ends. Tails, paths, and the accepted graph remain
+    /// unchanged on every return path. A work cap or unsupported shape restores
+    /// the state before using the ordinary exact transactional probe.
+    pub(crate) fn probe_strict_n5_forward(
+        &mut self,
+        movement: ScheduleMove,
+        stop: &AtomicBool,
+    ) -> Result<ForwardN5Probe, ScheduleStateInterrupted> {
+        checkpoint(stop)?;
+        if !self.supports_strict_n5_fast_path() || !self.is_current_strict_n5_move(movement) {
+            return self.probe_move(movement, stop).map(|probe| ForwardN5Probe {
+                probe,
+                used_forward_kernel: false,
+                fell_back: true,
+                forward_date_changes: 0,
+                queue_pops: 0,
+            });
+        }
+
+        self.metrics.moves_considered = self.metrics.moves_considered.saturating_add(1);
+        self.metrics.delta_evaluations = self.metrics.delta_evaluations.saturating_add(1);
+        self.workspace.begin_fast_patch();
+        self.apply_graph_patch(movement);
+        let current = self.makespan();
+        let propagated = self.evaluate_strict_n5_forward_value_changes(stop).and_then(|(date_changes, queue_pops)| {
+            self.workspace
+                .makespan_from_sink_union(&self.problem, &self.machine_sequences, &self.reconstruction.ends, stop)
+                .map(|candidate| (candidate, date_changes, queue_pops))
+                .map_err(|failure| FastN5PropagationFailure::from_reconstruction(failure, date_changes, 0, queue_pops))
+        });
+        let (forward_date_changes, queue_pops) = match propagated {
+            Ok((_, date_changes, queue_pops)) => (date_changes, u64::try_from(queue_pops).unwrap_or(u64::MAX)),
+            Err(failure) => (failure.forward_date_changes, failure.queue_pops),
+        };
+        self.metrics.dirty_cone_operations = self.metrics.dirty_cone_operations.saturating_add(queue_pops);
+        self.metrics.max_dirty_cone = self.metrics.max_dirty_cone.max(queue_pops);
+        self.rollback_fast_dates();
+        self.rollback_graph_patch(movement);
+        let result = match propagated {
+            Ok((candidate, _, _)) => Ok(ForwardN5Probe {
+                probe: MoveProbe::Feasible { current, candidate },
+                used_forward_kernel: true,
+                fell_back: false,
+                forward_date_changes,
+                queue_pops,
+            }),
+            Err(FastN5PropagationFailure { kind: FastN5PropagationFailureKind::Interrupted, .. }) => Err(ScheduleStateInterrupted),
+            Err(_) => {
+                #[cfg(test)]
+                if self.workspace.fast_stop_on_work_cap
+                    && matches!(propagated, Err(FastN5PropagationFailure { kind: FastN5PropagationFailureKind::WorkCap(_), .. }))
+                {
+                    stop.store(true, Ordering::Release);
+                }
+                self.probe_move_inner(movement, stop, false).map(|probe| ForwardN5Probe {
+                    probe,
+                    used_forward_kernel: true,
+                    fell_back: true,
+                    forward_date_changes,
+                    queue_pops,
+                })
+            }
+        };
         self.workspace.observe_growths();
         self.metrics.workspace_growths = self.workspace.growths;
         result
@@ -3541,9 +3647,16 @@ impl JobShopState {
         Ok(MoveOutcome::Accepted { previous, current: candidate })
     }
 
-    fn probe_move_inner(&mut self, movement: ScheduleMove, stop: &AtomicBool) -> Result<MoveProbe, ScheduleStateInterrupted> {
+    fn probe_move_inner(
+        &mut self,
+        movement: ScheduleMove,
+        stop: &AtomicBool,
+        count_considered: bool,
+    ) -> Result<MoveProbe, ScheduleStateInterrupted> {
         checkpoint(stop)?;
-        self.metrics.moves_considered = self.metrics.moves_considered.saturating_add(1);
+        if count_considered {
+            self.metrics.moves_considered = self.metrics.moves_considered.saturating_add(1);
+        }
         if !move_is_valid(&self.machine_sequences, movement) {
             return Ok(MoveProbe::Rejected(MoveRejection::Invalid));
         }
@@ -4040,7 +4153,7 @@ pub(crate) fn audit_strict_n5_layout(block_lengths: &[usize]) -> Vec<ScheduleMov
         })
         .collect();
     let mut movements = Vec::new();
-    JobShopState::visit_strict_n5_moves(&blocks, &stop, |movement| {
+    JobShopState::visit_strict_n5_moves(&blocks, true, true, &stop, |movement| {
         movements.push(movement);
         Ok(())
     })

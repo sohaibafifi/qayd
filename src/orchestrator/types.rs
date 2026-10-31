@@ -25,6 +25,8 @@ pub enum ScheduleJsspSearch {
     TsabCandidate,
     /// Run the bounded TSAB-inspired candidate-ranked N5 pilot on every worker.
     TsabMultiCandidate,
+    /// Run the adaptive TSAB-inspired JSSP strategy with one worker.
+    TsabAdaptive,
 }
 
 /// Stable engine identity used by events and diagnostics.
@@ -383,6 +385,7 @@ impl SolveRequest {
             ScheduleJsspSearch::Legacy => None,
             ScheduleJsspSearch::TsabCandidate => Some("tsab-candidate"),
             ScheduleJsspSearch::TsabMultiCandidate => Some("tsab-multi-candidate"),
+            ScheduleJsspSearch::TsabAdaptive => Some("tsab-adaptive"),
         };
         if let Some(strategy) = tsab_strategy {
             let unsupported_path_relink =
@@ -393,8 +396,11 @@ impl SolveRequest {
                     strategy
                 )));
             }
-            if self.threads != 7 {
-                return Err(SolveError::InvalidRequest(format!("schedule_jssp_search='{strategy}' currently requires threads=7")));
+            let required_threads = if self.schedule_jssp_search == ScheduleJsspSearch::TsabAdaptive { 1 } else { 7 };
+            if self.threads != required_threads {
+                return Err(SolveError::InvalidRequest(format!(
+                    "schedule_jssp_search='{strategy}' currently requires threads={required_threads}"
+                )));
             }
         }
         if self.limits.memory_bytes == Some(0) {
@@ -562,6 +568,16 @@ impl CandidateSolution {
 
     pub fn transferable(&self) -> bool {
         matches!(self.verification, VerificationLevel::Transfer | VerificationLevel::Final)
+    }
+
+    /// Reuse the canonical replay already performed for this owned candidate.
+    /// The orchestrator checks cancellation before permitting publication.
+    pub(super) fn into_final_verified(mut self) -> Result<Self, SolveError> {
+        if self.verification != VerificationLevel::Transfer {
+            return Err(SolveError::InvalidResult("collection result candidate was not verified for transfer".to_string()));
+        }
+        self.verification = VerificationLevel::Final;
+        Ok(self)
     }
 }
 

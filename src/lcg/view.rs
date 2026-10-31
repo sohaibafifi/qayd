@@ -4,6 +4,7 @@
 //! backtracking the trail restores every atom's truth for free. [`apply`] is
 //! the inverse: it pushes a literal into the domain.
 
+use crate::ids::VarId;
 use crate::lcg::lit::{AtomKind, AtomTable, Lit};
 use crate::propagator::Inconsistency;
 use crate::store::Store;
@@ -48,6 +49,51 @@ pub fn atom_value(store: &Store, kind: AtomKind) -> Tri {
                 Tri::True
             } else {
                 Tri::Unknown
+            }
+        }
+    }
+}
+
+/// One immutable domain view for a batch of atoms belonging to one variable.
+/// Keeping the store borrowed prevents these cached bounds from outliving a
+/// domain mutation. Interior equality holes still consult the actual support.
+pub(crate) struct VariableDomainView<'a> {
+    store: &'a Store,
+    var: VarId,
+    min: i32,
+    max: i32,
+    size: usize,
+}
+
+impl<'a> VariableDomainView<'a> {
+    pub(crate) fn new(store: &'a Store, var: VarId) -> Self {
+        Self { store, var, min: store.min(var), max: store.max(var), size: store.size(var) }
+    }
+
+    #[inline]
+    pub(crate) fn atom_value(&self, kind: AtomKind) -> Tri {
+        match kind {
+            AtomKind::Ge { var, k } => {
+                debug_assert_eq!(var, self.var);
+                if self.min >= k {
+                    Tri::True
+                } else if self.max < k {
+                    Tri::False
+                } else {
+                    Tri::Unknown
+                }
+            }
+            AtomKind::Eq { var, v } => {
+                debug_assert_eq!(var, self.var);
+                if self.size == 0 || v < self.min || v > self.max {
+                    Tri::False
+                } else if self.size == 1 {
+                    Tri::True
+                } else if self.store.contains(var, v) {
+                    Tri::Unknown
+                } else {
+                    Tri::False
+                }
             }
         }
     }
