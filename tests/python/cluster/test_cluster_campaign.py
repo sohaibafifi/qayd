@@ -1,9 +1,12 @@
 """Coverage, budget, replay and bounded scheduler contracts for cluster runs."""
 from pathlib import Path
+import os
 import shutil
 import subprocess
 import sys
+import textwrap
 from types import SimpleNamespace
+import venv
 
 import pytest
 
@@ -33,7 +36,7 @@ def test_build_selects_the_same_workspace_for_binaries_and_python(tmp_path, monk
         private_workspace(tmp_path)
     extension = tmp_path / "_core.so"
     extension.write_bytes(b"extension")
-    monkeypatch.setattr(campaign.importlib.util, "find_spec", lambda _: SimpleNamespace(origin=str(extension)))
+    monkeypatch.setattr(campaign, "installed_extension", lambda: extension)
     monkeypatch.setattr(campaign, "checked", lambda _: "rustc test")
     for name in ("qayd", "qayd-fzn", "qayd-sat", "qayd-pb"):
         path = tmp_path / "target/release" / name
@@ -108,7 +111,7 @@ def test_scratch_build_publishes_binaries_that_survive_scratch_cleanup(tmp_path,
     private_workspace(root)
     extension = root / "_core.so"
     extension.write_bytes(b"installed Python extension")
-    monkeypatch.setattr(campaign.importlib.util, "find_spec", lambda _: SimpleNamespace(origin=str(extension)))
+    monkeypatch.setattr(campaign, "installed_extension", lambda: extension)
     monkeypatch.setattr(campaign, "checked", lambda _: "rustc test")
     names = ("qayd", "qayd-fzn", "qayd-sat", "qayd-pb")
     for name in names:
@@ -131,6 +134,71 @@ def test_scratch_build_publishes_binaries_that_survive_scratch_cleanup(tmp_path,
         assert path.read_bytes() == name.encode()
         assert path.stat().st_mode & 0o111
         assert saved["artifacts"][str(path)] == campaign.sha256_file(path)
+
+
+@pytest.mark.parametrize("previously_imported", [False, True])
+def test_build_receipt_uses_the_newly_installed_package_in_a_fresh_interpreter(tmp_path, previously_imported):
+    environment = tmp_path / "environment"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(environment)
+    workspace = tmp_path / "source"
+    workspace.mkdir()
+    packages = []
+    for name in ("old", "installed"):
+        directory = tmp_path / name
+        package = directory / "qayd"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("")
+        (package / "_core.py").write_text(f"BUILD = {name!r}\n")
+        packages.append(directory)
+    program = textwrap.dedent('''
+        import site
+        import subprocess
+        import sys
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        repository, workspace, old, installed = map(Path, sys.argv[1:5])
+        sys.path.insert(0, str(repository / "bench"))
+        from cluster.lib import campaign
+        campaign.ROOT = workspace
+        campaign.source_identity = lambda: {"sha256": "source"}
+        if sys.argv[5] == "True":
+            sys.path.insert(0, str(old))
+            import qayd._core
+            assert qayd._core.BUILD == "old"
+
+        original_run, original_checked = campaign.subprocess.run, campaign.checked
+        def run(command, **kwargs):
+            if command[0] == "cargo":
+                target = Path(command[command.index("--target-dir") + 1])
+                for name in ("qayd", "qayd-fzn", "qayd-sat", "qayd-pb"):
+                    binary = target / "release" / name
+                    binary.parent.mkdir(parents=True, exist_ok=True)
+                    binary.write_bytes(name.encode())
+                return subprocess.CompletedProcess(command, 0)
+            if command[1:3] == ["-m", "maturin"]:
+                # Emulate the editable installation performed by maturin develop.
+                # The running parent's sys.path and imported modules stay unchanged.
+                destination = Path(site.getsitepackages()[0]) / "qayd-installed.pth"
+                destination.write_text(str(installed) + "\\n")
+                return subprocess.CompletedProcess(command, 0)
+            return original_run(command, **kwargs)
+        campaign.subprocess.run = run
+        campaign.checked = lambda command, **kwargs: (
+            "rustc test" if command[0] == "rustc" else original_checked(command, **kwargs))
+        campaign.build(SimpleNamespace(receipt=workspace / "build.json", lp_feature=False,
+                                       target_dir=workspace / "temporary target"))
+    ''')
+    env = {key: value for key, value in os.environ.items() if key not in {"PYTHONPATH", "PYTHONHOME"}}
+    result = subprocess.run([str(environment / "bin/python"), "-c", program, str(ROOT), str(workspace),
+                             *map(str, packages), str(previously_imported)],
+                            cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    saved = campaign.read(workspace / "build.json")
+    extension = packages[1] / "qayd/_core.py"
+    assert saved["artifacts"][str(extension)] == campaign.sha256_file(extension)
+    assert str(packages[0] / "qayd/_core.py") not in saved["artifacts"]
+    assert len(saved["artifacts"]) == 5
 
 
 def test_default_campaign_downloads_and_all_stages_defer_sat():

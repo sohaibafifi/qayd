@@ -409,6 +409,20 @@ def lp_backend_identity():
     return {"root": str(backend), "files": files, "sha256": digest(files)}
 
 
+def installed_extension() -> Path:
+    # Installation may add a .pth file or replace a package already imported by
+    # this process. Validate and locate the installed module in a fresh Python.
+    try:
+        origin = checked([sys.executable, "-c", "import qayd._core as core; print(core.__file__)"], cwd=ROOT)
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or str(error)).strip()
+        raise ValueError(f"installed qayd._core cannot be imported by {sys.executable}: {detail}") from error
+    extension = Path(origin)
+    if not origin or not extension.is_file():
+        raise ValueError(f"installed qayd._core has no extension file: {origin!r}")
+    return extension
+
+
 def build(args) -> None:
     source = source_identity()
     backend = lp_backend_identity() if args.lp_feature else None
@@ -431,7 +445,7 @@ def build(args) -> None:
         raise ValueError("source changed during build")
     if backend is not None and lp_backend_identity() != backend:
         raise ValueError("Amthal sources changed during build")
-    spec = importlib.util.find_spec("qayd._core")
+    extension = installed_extension()
     artifacts = [ROOT / "target/release" / name for name in ("qayd", "qayd-fzn", "qayd-sat", "qayd-pb")]
     # Only the runnable binaries must survive node-local scratch cleanup.
     for artifact in artifacts:
@@ -441,7 +455,7 @@ def build(args) -> None:
             temporary = artifact.with_name(artifact.name + f".{os.getpid()}.tmp")
             shutil.copy2(compiled, temporary)
             os.replace(temporary, artifact)
-    artifacts.append(Path(spec.origin))
+    artifacts.append(extension)
     write(args.receipt, {"source_sha256": source["sha256"], "source": source,
                          "workspace_manifest": str(manifest), "lp_backend": backend,
                          "features": {"binaries": binary_features, "python": python_features},
