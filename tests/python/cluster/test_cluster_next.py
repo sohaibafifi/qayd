@@ -163,8 +163,9 @@ def test_preflight_preserves_the_validated_source_and_build_receipt(tmp_path, mo
     saved = launch.initial_settings(args, tmp_path, out)
     assert campaign.source_identity()["sha256"] == source_before
     assert receipt_path.read_bytes() == receipt_before
-    assert launch.read(saved["profiles"]["main"]["config"])["solvers"]["cvrp"] == ["qayd-native", "hgs"]
-    assert [d["track"] for d in launch.read(saved["profiles"]["main"]["config"])["datasets"]] == ["cvrp"]
+    assert set(saved["profiles"]) == {"cvrp"}
+    assert launch.read(saved["profiles"]["cvrp"]["config"])["solvers"]["cvrp"] == ["qayd-native", "hgs"]
+    assert [d["track"] for d in launch.read(saved["profiles"]["cvrp"]["config"])["datasets"]] == ["cvrp"]
     assert saved["pending"] and saved["lkh"] is None
 
 
@@ -387,14 +388,17 @@ def test_ortools_adapter_accounts_for_preparation_before_search(tmp_path, monkey
     assert calls == [5]
 
 
-def test_v2_plans_preserve_templates_and_require_a_matching_gate_before_full(tmp_path, monkeypatch):
+@pytest.mark.parametrize('profile', ['main', 'hexaly-jssp'])
+def test_v2_plans_preserve_templates_and_require_a_matching_gate_before_full(tmp_path, monkeypatch, profile):
     from cluster.lib import campaign, report
     monkeypatch.setattr(campaign, 'ROOT', tmp_path)
     monkeypatch.setattr(launch, 'modules', lambda _: (campaign, report))
     driver=tmp_path/'driver.py'; driver.write_text('# deadline wrapper')
     saved=settings(tmp_path)
     saved.update(driver=str(driver), java='/java', hgs='/hgs', lkh=None, execution_policy=launch.EXECUTION_POLICY)
-    config={'protocols': {'jssp': {'seconds': 120}}, 'seeds': [0,1], 'solvers': {'jssp': ['qayd-native']}}
+    saved['profiles']={profile: {'config':'unused', **({'reference_track':'jssp'} if profile=='hexaly-jssp' else {})}}
+    seconds=600 if profile=='hexaly-jssp' else 120
+    config={'protocols': {'jssp': {'seconds': seconds}}, 'seeds': [0,1], 'solvers': {'jssp': ['qayd-native']}}
     item={'track':'jssp','path':'instance','id':'one','family':'jssp','sense':'min'}
     assets={'instance':'digest'}
     originals={}
@@ -410,23 +414,24 @@ def test_v2_plans_preserve_templates_and_require_a_matching_gate_before_full(tmp
         originals[directory/'plan.json']=(directory/'plan.json').read_bytes()
     monkeypatch.setattr(launch,'run',prepare)
     monkeypatch.setattr(campaign,'discover',lambda _: ([item],assets,[]))
-    smoke=tmp_path/'main/smoke'
-    launch.freeze_deadline_plan(saved,'main','smoke',smoke)
+    smoke=tmp_path/profile/'smoke'
+    launch.freeze_deadline_plan(saved,profile,'smoke',smoke)
     smoke_plan=campaign.load_plan(smoke/'plan.json')
     assert smoke_plan['tasks'][0]['seconds']==30
     assert smoke_plan['source']=={'sha256':'validated-source'}
-    gate=tmp_path/'main/gate'
-    launch.freeze_deadline_plan(saved,'main','gate',gate)
+    gate=tmp_path/profile/'gate'
+    launch.freeze_deadline_plan(saved,profile,'gate',gate)
     gate_plan=campaign.load_plan(gate/'plan.json')
+    assert gate_plan['tasks'][0]['seconds']==(600 if profile=='hexaly-jssp' else 30)
     campaign.write(gate/'qualification.json',{'ready':False})
     with pytest.raises(ValueError,match='requires a clean v2 gate'):
-        launch.freeze_deadline_plan(saved,'main','full',tmp_path/'main/full')
+        launch.freeze_deadline_plan(saved,profile,'full',tmp_path/profile/'full')
     campaign.write(gate/'qualification.json',{'ready':True,'stage':'gate','environment':gate_plan['environment'],
                                               'plan_sha256':gate_plan['sha256']})
-    launch.freeze_deadline_plan(saved,'main','full',tmp_path/'main/full')
-    full=campaign.load_plan(tmp_path/'main/full/plan.json')
+    launch.freeze_deadline_plan(saved,profile,'full',tmp_path/profile/'full')
+    full=campaign.load_plan(tmp_path/profile/'full/plan.json')
     assert full['environment']==gate_plan['environment']
-    assert [task['seconds'] for task in full['tasks']]==[120,120]
+    assert [task['seconds'] for task in full['tasks']]==[seconds,seconds]
     assert sorted(task['seed'] for task in full['tasks'])==[0,1]
     assert full['artifacts'][str(driver)]==launch.sha(driver)
     assert all(path.read_bytes()==data for path,data in originals.items())

@@ -276,6 +276,58 @@ def command_for(settings, plan, tasks, number):
     return [*command, shlex.join(payload)]
 
 
+def category_profiles(config, out):
+    profiles = {}
+    for track in sorted({dataset["track"] for dataset in config["datasets"]}):
+        selected = json.loads(json.dumps(config))
+        selected["name"] = f"{config['name']}-{track}"
+        selected["datasets"] = [d for d in selected["datasets"] if d["track"] == track]
+        target = out / "config" / f"{track}.json"
+        write(target, selected)
+        profiles[track] = {"config": str(target)}
+    return profiles
+
+
+def register_hexaly_profiles(settings):
+    # Keep already frozen legacy profiles usable on resume.
+    if "hexaly" in settings["profiles"]:
+        return
+    for track in ("cvrp", "jssp", "rcpsp"):
+        settings["profiles"].setdefault(f"hexaly-{track}", {
+            "config": str(Path(settings["out"]) / "hexaly-reference" / track / "config.json"),
+            "reference_track": track,
+        })
+
+
+def selected_profiles(settings):
+    selected = settings.get("selected_profiles")
+    if selected is None:
+        return list(settings["profiles"])
+    unknown = set(selected) - set(settings["profiles"])
+    if not selected or unknown:
+        raise ValueError("unknown or empty profile selection; available profiles: " +
+                         ", ".join(sorted(settings["profiles"])))
+    return list(dict.fromkeys(selected))
+
+
+def wave_allocations(choices, capacity, wave):
+    """Share one global job limit across several ready sections."""
+    offset = wave % len(choices)
+    selected = (choices[offset:] + choices[:offset])[:capacity]
+    allocations = [1] * len(selected)
+    while sum(allocations) < capacity:
+        candidates = [i for i, (_, (_, _, _, pending)) in enumerate(selected)
+                      if allocations[i] < len(pending)]
+        if not candidates:
+            break
+        def weight(index):
+            _, (_, _, plan, pending) = selected[index]
+            work = sum(plan["tasks"][i]["seconds"] * len(plan["tasks"][i]["solvers"]) for i in pending)
+            return work / allocations[index]
+        allocations[max(candidates, key=weight)] += 1
+    return [(profile, candidate, count) for (profile, candidate), count in zip(selected, allocations)]
+
+
 def initial_settings(args, root, out):
     campaign, _report = modules(root)
     config_path = (args.config or root / "bench/cluster/runs/corpus-ready/config.json").absolute()
@@ -315,10 +367,7 @@ def initial_settings(args, root, out):
     if lkh is None:
         main["datasets"] = [d for d in base["datasets"] if d["track"] != "cvrptw"]
         pending.append("VRPTW: LKH missing; all 356 instances and its comparator remain pending")
-    profiles = {"main": {"config": str(out / "main-config.json")}}
-    write(out / "main-config.json", main)
-    if args.hexaly:
-        profiles["hexaly"] = {"config": str(out / "hexaly-reference/config.json")}
+    profiles = category_profiles(main, out)
     for profile in profiles.values():
         if Path(profile["config"]).is_file():
             files[profile["config"]] = sha(profile["config"])
@@ -328,6 +377,9 @@ def initial_settings(args, root, out):
                 "queue": args.queue, "hgs": str(Path(hgs).absolute()), "lkh": lkh,
                 "profiles": profiles, "pending": pending, "prefix": f"qayd-{uuid.uuid4().hex[:10]}-",
                 "source_sha256": receipt["source_sha256"], "base_config": str(config_path)}
+    settings["profile_layout"] = "categories/v1"
+    if args.hexaly:
+        register_hexaly_profiles(settings)
     settings["execution_policy"] = EXECUTION_POLICY
     if any(dataset["track"] == "minizinc" for dataset in base["datasets"]):
         settings["minizinc"] = getattr(args, "minizinc", None) or find_minizinc(root)
@@ -343,21 +395,25 @@ def add_vrptw(settings, value):
         raise ValueError(f"LKH is not executable: {path}")
     config = read(settings["base_config"])
     config["datasets"] = [d for d in config["datasets"] if d["track"] == "cvrptw"]
-    target = Path(settings["out"]) / "vrptw-config.json"
+    name = "cvrptw" if settings.get("profile_layout") == "categories/v1" else "vrptw"
+    target = Path(settings["out"]) / "config" / f"{name}.json"
     write(target, config)
-    settings["profiles"]["vrptw"] = {"config": str(target)}
+    settings["profiles"][name] = {"config": str(target)}
     settings["files"][str(target)] = sha(target)
     settings["lkh"] = str(path)
     settings["pending"] = []
     write(Path(settings["out"]) / "settings.json", settings)
 
 
-def prepare_hexaly(settings):
-    config = Path(settings["profiles"]["hexaly"]["config"])
+def prepare_hexaly(settings, profile="hexaly"):
+    config = Path(settings["profiles"][profile]["config"])
     reference = config.parent
     if not config.exists():
-        run([settings["python"], Path(settings["root"]) / "bench/cluster/lib/hexaly.py",
-             "--out", reference], cwd=settings["root"])
+        command = [settings["python"], Path(settings["root"]) / "bench/cluster/lib/hexaly.py",
+                   "--out", reference]
+        if settings["profiles"][profile].get("reference_track"):
+            command += ["--track", settings["profiles"][profile]["reference_track"]]
+        run(command, cwd=settings["root"])
     snapshots = reference / "sources.json"
     if not snapshots.exists():
         sources = {}
@@ -411,7 +467,8 @@ def freeze_deadline_plan(settings, profile, stage, directory):
     else:
         for task in plan["tasks"]:
             task["seconds"] = (EXECUTION_POLICY["smoke_seconds"] if stage == "smoke" else
-                               EXECUTION_POLICY["large_jssp_gate_seconds"] if profile == "hexaly" and
+                               EXECUTION_POLICY["large_jssp_gate_seconds"] if
+                               (profile == "hexaly" or settings["profiles"][profile].get("reference_track")) and
                                task["item"]["track"] == "jssp" else EXECUTION_POLICY["gate_seconds"])
             task.pop("key")
             task["key"] = campaign.digest(task)
@@ -430,8 +487,9 @@ def freeze_deadline_plan(settings, profile, stage, directory):
 def next_stage(settings, profile):
     root, out = Path(settings["root"]), Path(settings["out"])
     campaign, report = modules(root)
-    if profile == "hexaly":
-        prepare_hexaly(settings)
+    reference = profile == "hexaly" or settings["profiles"][profile].get("reference_track")
+    if reference:
+        prepare_hexaly(settings, profile)
     for stage in ("smoke", "gate", "full"):
         directory = out / profile / stage
         path = directory / "plan.json"
@@ -451,7 +509,7 @@ def next_stage(settings, profile):
             raise ValueError(f"{profile}/{stage}: audit failed; see {directory / 'report.md'}")
         if not result["ready"]:
             return stage, path, plan, result["missing_tasks"]
-        if profile == "hexaly" and stage == "full":
+        if reference and stage == "full":
             run([settings["python"], root / "bench/cluster/lib/hexaly_report.py", "--plan", path], cwd=root)
     return None
 
@@ -492,8 +550,10 @@ def control(args, settings):
                 continue
             print("Waiting for OAR resubmission reconciliation; no new submission.")
             return
-        choices, profile_errors = [], {}
-        for profile in settings["profiles"]:
+        active = selected_profiles(settings)
+        choices, profile_errors = [], dict(state.get("profile_errors", {}))
+        for profile in active:
+            profile_errors.pop(profile, None)
             try:
                 candidate = next_stage(settings, profile)
             except (ValueError, OSError, KeyError, subprocess.SubprocessError) as error:
@@ -504,35 +564,44 @@ def control(args, settings):
         state["profile_errors"] = profile_errors
         write(state_path, state)
         if not choices:
-            if profile_errors:
-                raise ValueError(f"blocked profiles: {profile_errors}")
-            state.update(status="complete" if not settings["pending"] else "pending-baseline", pending=settings["pending"], active_jobs=[])
+            selected_errors = {name: profile_errors[name] for name in active if name in profile_errors}
+            if selected_errors:
+                raise ValueError(f"blocked profiles: {selected_errors}")
+            partial = set(active) != set(settings["profiles"])
+            status = "complete-selected" if partial else "complete" if not settings["pending"] else "pending-baseline"
+            state.update(status=status, pending=settings["pending"], active_jobs=[])
             write(state_path, state)
             print(json.dumps(state, indent=2), flush=True)
             return
         priority = {"smoke": 0, "gate": 1, "full": 2}
         minimum = min(priority[candidate[0]] for _profile, candidate in choices)
         choices = [(p, c) for p, c in choices if priority[c[0]] == minimum]
-        profile, (stage, plan_path, plan, pending) = choices[state["waves"] % len(choices)]
-        completed = len(plan["tasks"]) - len(pending)
-        checkpoints = state.setdefault("progress_by_stage", {})
-        previous = checkpoints.get(f"{profile}/{stage}")
-        stalled = previous["stalled"] + 1 if previous and previous["completed"] == completed else 0
-        checkpoints[f"{profile}/{stage}"] = {"completed": completed, "stalled": stalled}
-        if stalled >= 3:
-            write(state_path, state)
-            raise ValueError(f"three pools made no task progress; inspect {out / 'waves'} before retrying")
         campaign, _report = modules(Path(settings["root"]))
-        groups = campaign.partition_tasks([plan["tasks"][i] for i in pending], settings["jobs"])
         commands = []
-        for group, indexes in enumerate(groups):
-            taskfile = out / "waves" / f"{state['waves']:05d}" / f"group-{group}.txt"
-            taskfile.parent.mkdir(parents=True, exist_ok=True)
-            taskfile.write_text("".join(f"{pending[i]}\n" for i in indexes))
-            commands.append(command_for(settings, plan_path, taskfile, f"{state['waves']}-{group}"))
-        state.update(status="submitting", profile=profile, stage=stage, inflight=True, empty_checks=0, active_jobs=[])
+        allocations = wave_allocations(choices, settings["jobs"], state["waves"])
+        for profile, (stage, plan_path, plan, pending), count in allocations:
+            completed = len(plan["tasks"]) - len(pending)
+            checkpoints = state.setdefault("progress_by_stage", {})
+            previous = checkpoints.get(f"{profile}/{stage}")
+            stalled = previous["stalled"] + 1 if previous and previous["completed"] == completed else 0
+            checkpoints[f"{profile}/{stage}"] = {"completed": completed, "stalled": stalled}
+            if stalled >= 3:
+                write(state_path, state)
+                raise ValueError(f"three pools made no task progress; inspect {out / 'waves'} before retrying")
+            groups = campaign.partition_tasks([plan["tasks"][i] for i in pending], count)
+            for indexes in groups:
+                group = len(commands)
+                taskfile = out / "waves" / f"{state['waves']:05d}" / f"group-{group}.txt"
+                taskfile.parent.mkdir(parents=True, exist_ok=True)
+                taskfile.write_text("".join(f"{pending[i]}\n" for i in indexes))
+                commands.append(command_for(settings, plan_path, taskfile, f"{state['waves']}-{group}"))
+            print(f"{profile}/{stage}: {len(pending)} remaining paired tasks; {len(groups)} OAR jobs in this pool.", flush=True)
+        active_profiles = [name for name, _, _ in allocations]
+        stage = allocations[0][1][0]
+        state.update(status="submitting", profile=active_profiles[0] if len(active_profiles) == 1 else "multiple",
+                     active_profiles=active_profiles, stage=stage, inflight=True, empty_checks=0, active_jobs=[])
         write(state_path, state)
-        print(f"{profile}/{stage}: {len(pending)} remaining paired tasks; at most {len(commands)} OAR jobs.", flush=True)
+        print(f"Pool total: at most {len(commands)}/{settings['jobs']} OAR jobs across all selected sections.", flush=True)
         if profile_errors:
             print(f"Profiles awaiting correction: {profile_errors}", flush=True)
         if settings["pending"]:
@@ -569,6 +638,7 @@ def main():
     parser.add_argument("--hgs")
     parser.add_argument("--lkh")
     parser.add_argument("--hexaly", action="store_true", help="also run the published-table quality profile")
+    parser.add_argument("--profile", action="append", help="run only this profile; repeat for several, or use 'all'")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--detach", action="store_true")
     parser.add_argument("--status", action="store_true")
@@ -617,13 +687,16 @@ def main():
             settings = read(settings_path) if settings_path.exists() else initial_settings(args, args.repo, args.out)
             verify_files(settings["files"])
             if args.hexaly:
-                settings["profiles"].setdefault("hexaly", {"config": str(args.out / "hexaly-reference/config.json")})
+                register_hexaly_profiles(settings)
             for name in ("jobs", "workers", "resource", "walltime", "queue", "property"):
                 flag = "--" + name.replace("_", "-")
                 if any(value == flag or value.startswith(flag + "=") for value in sys.argv[1:]):
                     settings[name] = getattr(args, name)
-            write(settings_path, settings)
             add_vrptw(settings, args.lkh)
+            if args.profile is not None:
+                settings["selected_profiles"] = None if args.profile == ["all"] else args.profile
+            selected_profiles(settings)
+            write(settings_path, settings)
             control(args, settings)
         except (ValueError, OSError, KeyError, subprocess.SubprocessError) as error:
             state = read(args.out / "state.json")

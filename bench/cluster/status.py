@@ -128,29 +128,36 @@ def display(monitor, details=False, reference_slots=None):
     print(f"Controller: {state['status']} | {state.get('profile', '?')}/{state.get('stage', '?')} | "
           f"OAR jobs: {len(state.get('active_jobs', []))}/{settings['jobs']}")
     print(f"Workers {'(reference)' if reference_slots else 'observed in jobs'}: {slots if slots is not None else '?'}")
+    if len(state.get("active_profiles", [])) > 1:
+        print("Active profiles: " + ", ".join(state["active_profiles"]))
+    if settings.get("selected_profiles") is not None:
+        print("Selected profiles: " + ", ".join(settings["selected_profiles"]) + ". Other profiles are not scheduled.")
     print("\nProfile         Stage        Completed tasks  Saved runs  Witnesses Errors  Remaining budget (h)")
     samples, total_hours, unprepared = {}, 0.0, []
     blocked = state.get("profile_errors", {})
+    selected = set(settings.get("selected_profiles") or settings["profiles"])
     for profile in sorted(settings["profiles"]):
         directory = monitor.out / profile
         paths = [directory / stage / "plan.json" for stage in ("full", "gate", "smoke")]
         path = next((p for p in paths if p.is_file()), None)
         if path is None:
-            print(f"{profile:15} {'BLOCKED' if profile in blocked else 'preparing'}")
-            unprepared.append(profile)
+            queued = profile not in selected
+            print(f"{profile:15} {'BLOCKED' if profile in blocked else 'not selected' if queued else 'preparing'}")
+            if not queued:
+                unprepared.append(profile)
             continue
         sample = monitor.collect(path)
         stage = path.parent.name
-        label = "BLOCKED" if profile in blocked else stage
+        label = "BLOCKED" if profile in blocked else f"{stage}/paused" if profile not in selected else stage
         rows = sample["rows"]
         error_count = sum(a["error"] for a in rows)
         print(f"{profile:15} {label:12} {sample['done']:6}/{len(sample['plan']['tasks']):<7} "
               f"{len(rows):5}/{sample['runs']:<6} {sum(a['verified'] for a in rows):7} {error_count:8} "
               f"{sample['remaining_hours']:19.2f}")
-        if stage == "full" and profile not in blocked:
+        if stage == "full" and profile not in blocked and profile in selected:
             total_hours += sample["remaining_hours"]
             samples[profile] = sample
-        elif stage != "full":
+        elif stage != "full" and profile in selected:
             unprepared.append(profile)
         for warning in sample["warnings"][:3]:
             print("  WARNING: " + warning)
@@ -163,7 +170,7 @@ def display(monitor, details=False, reference_slots=None):
                 subset = [a for a in rows if a["solver"] == solver]
                 progress = ""
                 if not subset:
-                    active = (profile == state.get("profile") and stage == state.get("stage")
+                    active = (profile in state.get("active_profiles", [state.get("profile")]) and stage == state.get("stage")
                               and state.get("active_jobs"))
                     progress = " | running, no saved result yet" if active else " | waiting to run"
                 print(f"  {solver:18} {len(subset):5}/{planned[solver]:<5} runs | "

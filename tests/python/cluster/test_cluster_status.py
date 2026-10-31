@@ -134,3 +134,19 @@ def test_budget_labels_a_prepared_subtotal_when_another_full_plan_is_missing(tmp
     output = capsys.readouterr().out
     assert "prepared, unblocked full profiles: 0.03 solver hours" in output
     assert "Full plans not yet prepared: hexaly. Their budgets are not included." in output
+
+
+def test_shared_pool_marks_each_active_section_and_selection_limits_the_budget(tmp_path, capsys):
+    for name in ("pb", "minizinc"):
+        fixture(tmp_path / name)
+    dump(tmp_path / "settings.json", {"jobs": 4, "profiles": {"pb": {}, "minizinc": {}},
+                                      "selected_profiles": ["pb"]})
+    dump(tmp_path / "state.json", {"status": "running", "profile": "multiple", "stage": "full",
+                                   "active_profiles": ["pb", "minizinc"], "active_jobs": [{"state": "Running"}]})
+    status.display(status.Monitor(tmp_path), details=True, reference_slots=32)
+    output = capsys.readouterr().out
+    assert "Active profiles: pb, minizinc" in output
+    assert "Selected profiles: pb." in output
+    assert "full/paused" in output
+    assert "prepared, unblocked full profiles: 0.03 solver hours" in output
+    assert output.count("running, no saved result yet") == 4

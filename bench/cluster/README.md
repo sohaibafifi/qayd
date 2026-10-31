@@ -64,19 +64,40 @@ export CAMPAIGN=bench/cluster/runs/campaign
 python bench/cluster run --out "$CAMPAIGN" --hexaly --jobs 2 --execute --detach
 ```
 
-The controller advances through smoke, qualification and full runs. It uses at
-most two OAR jobs by default, with GNU Parallel inside each job, and requires
-CPU-only resources plus `idempotent` and `besteffort`. Repeating the command
-resumes compatible work. Source, binaries, inputs and configuration are frozen.
-The controller verifies an LP-enabled build receipt for the main comparison.
+Each category has its own profile: `xcsp-csp`, `xcsp-cop`, `xcsp-fastcop`,
+`minizinc`, `pb`, `cvrp`, `cvrptw`, `jssp` and `rcpsp`. With `--hexaly`, the
+published-table comparisons use `hexaly-cvrp`, `hexaly-jssp` and `hexaly-rcpsp`.
+Each profile advances through `smoke`, `gate` (qualification) and `full`.
+A failed qualification blocks only that profile. Full runs start automatically
+after its qualification succeeds; there is no combined `main/full` in a new
+campaign.
+
+The controller shares at most two OAR jobs by default across all profiles, with
+GNU Parallel inside each job, and requires CPU-only resources plus `idempotent`
+and `besteffort`. Repeating the command resumes compatible work. Source,
+binaries, inputs and configuration are frozen. After code or binary changes,
+repeat the build step and choose a new `--out` directory for a clean campaign.
+The controller verifies an LP-enabled build receipt for the direct comparisons.
 
 You can also run several single-node OAR jobs, with GNU Parallel inside each job.
 
-```
+```bash
 python bench/cluster run --out "$CAMPAIGN" --hexaly \
   --jobs 4 --resource "/nodes=1" --workers auto \
   --property "$CPU_ONLY_PROPERTY" --execute --detach
-  ```
+```
+
+To run or resume only PB, select its profile. Repeat `--profile` to select
+several categories. The selection is remembered; use `--profile all` to return
+to all profiles. A selected profile still needs a clean qualification.
+
+```bash
+python bench/cluster run --out "$CAMPAIGN" --profile pb --execute --detach
+```
+
+Run one controller per campaign. To change a running controller's selection,
+stop its process and restart it with the new options; submitted OAR jobs remain
+part of the same bounded pool.
 ## 3. Monitor
 
 ```bash
