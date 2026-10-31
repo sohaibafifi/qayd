@@ -10,6 +10,31 @@ permissions:
   contents: read
 
 jobs:
+  amthal:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: qayd
+          persist-credentials: false
+
+      - name: Checkout private Amthal backend
+        uses: actions/checkout@v4
+        with:
+          repository: sohaibafifi/amthal
+          token: ${{ secrets.AMTHAL_READ_TOKEN }}
+          path: amthal
+          persist-credentials: false
+
+      - name: Test LP integration
+        working-directory: qayd
+        run: cargo test --manifest-path integrations/amthal/Cargo.toml --test lp_relaxation
+
+      - name: Clippy LP integration
+        working-directory: qayd
+        run: cargo clippy --manifest-path integrations/amthal/Cargo.toml --workspace --all-targets -- -D warnings
+
   rust:
     runs-on: ubuntu-latest
     steps:
