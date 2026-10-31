@@ -150,23 +150,9 @@ git -C "$CADICAL" diff --cached --quiet
 
 if [[ "$MODE" == prepare ]]; then
   python bench/cluster/lib/downloads/solvers.py
-  if ((ACCEPT_LKH)) && [[ ! -d "$LKH" ]]; then
-    python - <<'PY'
-import importlib.util, pathlib, subprocess, tarfile
-root = pathlib.Path.cwd()
-spec = importlib.util.spec_from_file_location('competitive_fetch', root/'bench/cluster/lib/downloads/routing.py')
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-archive = root/'bench/cluster/runs/tools/downloads/LKH-3.0.13.tgz'
-if not archive.exists():
-    subprocess.run(['curl', '--fail', '--location', '--retry', '3', '--max-time', '180',
-                    '--output', str(archive)+'.part', module.LKH_URL], check=True)
-    pathlib.Path(str(archive)+'.part').rename(archive)
-with tarfile.open(archive) as stream:
-    if any(pathlib.PurePosixPath(m.name).parts[0] != 'LKH-3.0.13' for m in stream.getmembers()):
-        raise SystemExit('Unexpected LKH archive layout')
-    stream.extractall(root/'bench/cluster/runs/tools/solvers', filter='data')
-PY
+  if ((ACCEPT_LKH)); then
+    python bench/cluster/lib/downloads/routing.py --solver lkh --download-only \
+      --accept-lkh-academic-license
   fi
   cargo fetch --locked "${CARGO_MANIFEST_ARGS[@]}"
   echo 'Downloads ready; the build stage can run in a CPU-only OAR allocation.'
@@ -190,7 +176,7 @@ cadical --version
 python bench/cluster/lib/downloads/solvers.py --verify-only
 python bench/cluster/lib/downloads/routing.py --solver hgs --jobs "$JOBS"
 if [[ -d "$LKH" ]]; then
-  (cd "$LKH"; make -j "$JOBS")
+  make -C "$LKH/SRC" -j "$JOBS"
 fi
 BUILD_FEATURES=()
 if ((LP_FEATURE)); then

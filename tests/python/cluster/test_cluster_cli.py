@@ -8,6 +8,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "bench"))
 from cluster.lib import campaign
+from cluster import __main__ as cli
 
 
 @pytest.mark.parametrize("arguments", [[], ["prepare"], ["prepare", "tools"], ["prepare", "build"],
@@ -56,3 +57,15 @@ def test_runs_are_ignored_and_small_fixtures_remain_versionable():
         result = subprocess.run(["git", "check-ignore", "--no-index", "-q", relative], cwd=ROOT)
         assert (result.returncode == 0) == ignored
         assert result.returncode in (0, 1)
+
+
+def test_prepare_tools_forwards_lp_and_lkh_opt_in_without_submitting_jobs(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli.subprocess, "run", lambda argv, **kw: calls.append(argv))
+    cli.main(["prepare", "tools", "--repo", str(tmp_path), "--lp", "--accept-lkh-academic-license"])
+    assert len(calls) == 1
+    command = calls[0]
+    assert command[:2] == ["bash", str(ROOT / "bench/cluster/scripts/bootstrap.oar")]
+    assert command[command.index("--repo") + 1] == str(tmp_path)
+    assert "--prepare" in command and "--lp" in command
+    assert "--accept-lkh-academic-license" in command

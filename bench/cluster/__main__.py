@@ -20,6 +20,8 @@ def parser():
     tools.add_argument("--repo", type=Path, default=BASE.parents[1])
     tools.add_argument("--jobs", type=int, default=1)
     tools.add_argument("--lp", action="store_true", help="fetch dependencies for the private Amthal workspace")
+    tools.add_argument("--accept-lkh-academic-license", action="store_true",
+                       help="also download LKH-3 after reviewing its research-use terms")
     for name, target, prefix, help_text in (
         ("build", "lib.setup", [], "submit one validation and build job; --lp selects the private workspace"),
         ("corpus", "lib.corpus", ["--download"], "download and verify the declared competition corpus"),
@@ -51,6 +53,8 @@ def main(argv=None):
                    "--prepare", "--jobs", str(args.jobs)]
         if args.lp:
             command.append("--lp")
+        if args.accept_lkh_academic_license:
+            command.append("--accept-lkh-academic-license")
         subprocess.run(command, check=True)
         return
     target = "lib.cosoco" if getattr(args, "add_cosoco", False) else args.target

@@ -40,6 +40,14 @@ the build command only displays its submission. Binaries use release mode and
 the Python extension uses the optimized `pyext` profile. Omit `--lp` for a public
 build without Amthal.
 
+To include LKH-3 in the routing comparisons, add
+`--accept-lkh-academic-license` to `prepare tools`, then submit the build job
+above. Downloads happen on the frontend; compilation happens in OAR. If the
+official LKH server is unavailable, preparation uses a commit-pinned archive
+of version 3.0.13 with a checked SHA-256. The source URL and hash are recorded in
+`runs/tools/solvers/LKH-3.0.13/qayd-source.json`. This pin identifies the mirror
+archive; no publisher checksum is available.
+
 After the build job succeeds, download and verify the datasets:
 
 ```bash
@@ -90,4 +98,4 @@ are retained. Collection also accepts locally accessible copies of old results;
 it does not rerun solvers or rewrite their plans and qualifications.
 Use `--stage full`, `--profile NAME`, `--dest DIR` or `--require-ready` as needed.
 
-Use `--help` after any command for options. 
+Use `--help` after any command for options.

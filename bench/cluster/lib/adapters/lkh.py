@@ -40,12 +40,13 @@ def write_vrptw(instance: object, path: Path, scale: int) -> None:
 
 
 def parse_sintef(path: Path) -> list[list[int]]:
+    """Restore LKH's 1-based node IDs from SINTEF's N->Id - 1 output."""
     routes = []
     for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = raw.strip()
         if not line.lower().startswith("route") or ":" not in line:
             continue
-        routes.append([int(value) for value in line.split(":", 1)[1].split()])
+        routes.append([int(value) + 1 for value in line.split(":", 1)[1].split()])
     if not routes:
         raise ValueError("LKH did not write any SINTEF routes")
     return routes
