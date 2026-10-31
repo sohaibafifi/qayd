@@ -129,14 +129,15 @@ def display(monitor, details=False, reference_slots=None):
           f"OAR jobs: {len(state.get('active_jobs', []))}/{settings['jobs']}")
     print(f"Workers {'(reference)' if reference_slots else 'observed in jobs'}: {slots if slots is not None else '?'}")
     print("\nProfile         Stage        Completed tasks  Saved runs  Witnesses Errors  Remaining budget (h)")
-    samples, total_hours = {}, 0.0
+    samples, total_hours, unprepared = {}, 0.0, []
     blocked = state.get("profile_errors", {})
     for profile in sorted(settings["profiles"]):
         directory = monitor.out / profile
         paths = [directory / stage / "plan.json" for stage in ("full", "gate", "smoke")]
         path = next((p for p in paths if p.is_file()), None)
         if path is None:
-            print(f"{profile:15} preparing")
+            print(f"{profile:15} {'BLOCKED' if profile in blocked else 'preparing'}")
+            unprepared.append(profile)
             continue
         sample = monitor.collect(path)
         stage = path.parent.name
@@ -149,6 +150,8 @@ def display(monitor, details=False, reference_slots=None):
         if stage == "full" and profile not in blocked:
             total_hours += sample["remaining_hours"]
             samples[profile] = sample
+        elif stage != "full":
+            unprepared.append(profile)
         for warning in sample["warnings"][:3]:
             print("  WARNING: " + warning)
         if details:
@@ -166,9 +169,16 @@ def display(monitor, details=False, reference_slots=None):
                 print(f"  {solver:18} {len(subset):5}/{planned[solver]:<5} runs | "
                       f"witnesses={sum(a['verified'] for a in subset)} | "
                       f"statuses={dict(Counter(a['status'] for a in subset))}{progress}")
-    print(f"\nRemaining nominal budget for unblocked full profiles: {total_hours:,.2f} solver hours.")
-    if slots:
-        print(f"At {slots} continuously available workers: {total_hours / slots:.1f} hours, or {total_hours / slots / 24:.1f} days.")
+    if samples:
+        print(f"\nRemaining nominal budget for prepared, unblocked full profiles: {total_hours:,.2f} solver hours.")
+        if slots:
+            print(f"At {slots} continuously available workers: {total_hours / slots:.1f} hours, or {total_hours / slots / 24:.1f} days.")
+    else:
+        print("\nFull-campaign budget unavailable: no unblocked full plan has been prepared.")
+    if unprepared:
+        print("Full plans not yet prepared: " + ", ".join(unprepared) + ". Their budgets are not included.")
+    if blocked:
+        print("Blocked profiles are excluded from duration estimates.")
     print("This envelope assumes full budget consumption; checking, OAR queueing and preemptions are excluded.")
     current = samples.get(state.get("profile"))
     estimate = projection(current, slots) if current else None

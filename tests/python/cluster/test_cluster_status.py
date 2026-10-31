@@ -108,3 +108,29 @@ def test_details_distinguishes_an_active_empty_solver_from_a_queued_one(tmp_path
     output = capsys.readouterr().out
     assert "running, no saved result yet" in output
     assert "waiting to run" not in output
+
+
+@pytest.mark.parametrize("stage", ["smoke", "gate"])
+def test_missing_full_plans_do_not_report_a_zero_duration(tmp_path, capsys, stage):
+    path, _plan, _arm = fixture(tmp_path / "main")
+    path.parent.rename(path.parent.with_name(stage))
+    dump(tmp_path / "settings.json", {"jobs": 4, "profiles": {"main": {}, "hexaly": {}}})
+    dump(tmp_path / "state.json", {"status": "running", "profile": "main", "stage": stage,
+                                   "profile_errors": {"hexaly": "RG300 manifest missing"}})
+    status.display(status.Monitor(tmp_path), reference_slots=64)
+    output = capsys.readouterr().out
+    assert "Full-campaign budget unavailable" in output
+    assert "Full plans not yet prepared: hexaly, main." in output
+    assert f"{'hexaly':15} BLOCKED" in output
+    assert "At 64 continuously available workers" not in output
+    assert "0.00 solver hours" not in output
+
+
+def test_budget_labels_a_prepared_subtotal_when_another_full_plan_is_missing(tmp_path, capsys):
+    fixture(tmp_path / "main")
+    dump(tmp_path / "settings.json", {"jobs": 4, "profiles": {"main": {}, "hexaly": {}}})
+    dump(tmp_path / "state.json", {"status": "running", "profile": "main", "stage": "full"})
+    status.display(status.Monitor(tmp_path), reference_slots=32)
+    output = capsys.readouterr().out
+    assert "prepared, unblocked full profiles: 0.03 solver hours" in output
+    assert "Full plans not yet prepared: hexaly. Their budgets are not included." in output
