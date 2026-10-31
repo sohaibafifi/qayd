@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use super::schedule_cancellation::cancel_after_checkpoints;
 use qayd::engines::ls::lists::solve_schedule;
 use qayd::model::list::{verify_collection_solution, CollectionModel, CollectionSolution, IntervalVar, Mode, Resource, Schedule};
 
@@ -62,13 +63,10 @@ fn schedule_ls_stops_inside_large_resource_construction() {
     let stop = AtomicBool::new(false);
     let started = Instant::now();
 
-    let (solution, metrics) = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            std::thread::sleep(Duration::from_millis(5));
-            stop.store(true, Ordering::Release);
-        });
-        solve_schedule(&schedule, 11, &stop, &mut |_| {})
-    });
+    // Synchronize with actual solver progress so a busy CI runner cannot
+    // cancel before construction starts. This budget reaches resource scans
+    // after candidate evaluation begins, before a complete schedule exists.
+    let (solution, metrics) = cancel_after_checkpoints(&stop, 100_000, || solve_schedule(&schedule, 11, &stop, &mut |_| {}));
 
     assert!(stop.load(Ordering::Acquire));
     assert_unknown(&solution);
