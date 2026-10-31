@@ -18,6 +18,8 @@ classifiers = [
 [dependency-groups]
 dev = [
   "maturin>=1.8,<2",
+  # Exercise the cluster CP-SAT adapter with the campaign's pinned baseline.
+  "ortools==9.15.6755",
   "pytest>=9.1,<10",
 ]
 
