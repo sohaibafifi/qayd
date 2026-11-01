@@ -65,7 +65,7 @@ class Monitor:
             if not valid:
                 warnings.append(f"incompatible provenance or contents: {entry}")
                 continue
-            summaries = [{"solver": a["solver"], "status": a["status"],
+            summaries = [{"task": index, "solver": a["solver"], "status": a["status"],
                           "verified": bool(a.get("has_incumbent") and a.get("validation", {}).get("valid") is True),
                           "error": a["status"] in ("ERROR", "INVALID") or a.get("validation", {}).get("valid") is False,
                           "wall": a["wall_seconds"], "budget": task["seconds"],
@@ -75,6 +75,13 @@ class Monitor:
                 done += 1
                 self.completed[cache_key] = summaries
         total_runs = sum(len(t["solvers"]) for t in plan["tasks"])
+        audited_path = path.parent / "report.json"
+        if audited_path.is_file():
+            audited = read(audited_path)
+            if audited.get("plan_sha256") == plan["sha256"]:
+                rejected = {(row["task"], row["solver"]) for row in audited.get("rejected_claims", [])}
+                rows = [{**row, "status": "ERROR", "error": True}
+                        if (row["task"], row["solver"]) in rejected else row for row in rows]
         remaining = sum(t["seconds"] * len(t["solvers"]) for t in plan["tasks"]) - sum(a["budget"] for a in rows)
         return {"plan": plan, "rows": rows, "done": done, "runs": total_runs,
                 "remaining_hours": remaining / 3600, "warnings": warnings}

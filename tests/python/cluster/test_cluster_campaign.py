@@ -360,10 +360,15 @@ def test_report_refuses_missing_duplicate_and_contradictory_results(tmp_path):
     plan = fake_plan()
     assert report.audit(plan, tmp_path)["missing_tasks"] == [0]
     save_result(tmp_path, [arm("qayd", "OPTIMUM", 7), arm("qayd", "OPTIMUM", 7)])
-    assert report.audit(plan, tmp_path)["errors"]
+    corrupted = report.audit(plan, tmp_path)
+    assert corrupted["blocking_errors"] and not corrupted["complete"]
     save_result(tmp_path, [arm("qayd", "OPTIMUM", 7), arm("reference", "SAT", 6)])
     audited = report.audit(plan, tmp_path)
     assert not audited["ready"] and audited["contradictions"]
+    assert audited["complete"] and not audited["blocking_errors"]
+    rejected = next(row for row in audited["records"] if row["solver"] == "qayd")
+    assert rejected["status"] == "ERROR" and rejected["raw_status"] == "OPTIMUM"
+    assert not rejected["solved"] and not audited["pairwise"]
     save_result(tmp_path, [arm("qayd", "UNSAT"), arm("reference", "SAT", 6)])
     assert not report.audit(plan, tmp_path)["ready"]
 

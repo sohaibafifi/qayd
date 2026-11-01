@@ -54,6 +54,25 @@ def test_incompatible_or_duplicate_records_never_count_as_progress(tmp_path):
     assert status.Monitor(tmp_path).collect(path)["done"] == 0
 
 
+def test_rejected_claims_are_errors_even_when_raw_results_are_cached(tmp_path):
+    path, plan, arm = fixture(tmp_path)
+    directory = path.parent / "tasks/0000000"
+    dump(directory / "result.json", {"complete": True, "plan_sha256": plan["sha256"],
+                                     "task_key": "task-0", "arms": [arm("a"), arm("b")]})
+    original = (directory / "result.json").read_bytes()
+    monitor = status.Monitor(tmp_path)
+    assert monitor.collect(path)["rows"][0]["status"] == "SAT"
+    dump(path.parent / "report.json", {"plan_sha256": plan["sha256"],
+                                      "rejected_claims": [{"task": 0, "solver": "a"}]})
+    rows = monitor.collect(path)["rows"]
+    assert rows[0]["status"] == "ERROR" and rows[0]["error"]
+    assert rows[1]["status"] == "SAT"
+    dump(path.parent / "report.json", {"plan_sha256": "another-plan",
+                                      "rejected_claims": [{"task": 0, "solver": "a"}]})
+    assert monitor.collect(path)["rows"][0]["status"] == "SAT"
+    assert (directory / "result.json").read_bytes() == original
+
+
 def test_projection_requires_samples_for_each_family_and_rejects_errors():
     tasks = [{"solvers": ["a"], "seconds": 600, "item": {"family": f}} for f in ("fast", "slow") for _ in range(40)]
     rows = [{"solver": "a", "family": f, "budget": 600, "wall": wall,

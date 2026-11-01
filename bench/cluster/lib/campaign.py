@@ -562,9 +562,10 @@ def prepare(args) -> None:
             shutil.rmtree(directory, ignore_errors=True)
             raise ValueError("full campaign requires --gate <gate>/qualification.json")
         gate = read(args.gate)
-        if gate.get("stage") != "gate" or not gate.get("ready") or gate.get("environment") != environment:
+        if (gate.get("stage") != "gate" or not gate.get("complete", gate.get("ready"))
+                or gate.get("blocking_errors") or gate.get("environment") != environment):
             shutil.rmtree(directory, ignore_errors=True)
-            raise ValueError("gate is not complete and clean for this source, corpus and runtime")
+            raise ValueError("gate is not complete and compatible with this source, corpus and runtime")
     plan = {"schema": "qayd.cluster.plan/v1", "root": str(ROOT), "stage": args.stage,
             "source": source, **runtime, "assets": assets, "tasks": tasks,
             "environment": environment, "config": config, "build_receipt": receipt,

@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import time
+import types
 import uuid
 import zlib
 
@@ -31,6 +32,8 @@ EXECUTION_POLICY = {
 }
 
 CORPUS_TOOL = None
+AUDITOR_SOURCE = None
+_BUNDLED_REPORT = None
 TERMINAL = {"Terminated", "Error"}
 
 
@@ -62,11 +65,36 @@ def run(command, **kwargs):
 
 
 def modules(root):
+    global _BUNDLED_REPORT
     sys.path.insert(0, str(root / "bench"))
     from cluster.lib import campaign, report
     if campaign.ROOT != root:
         raise ValueError("use a separate process for each checkout")
+    if AUDITOR_SOURCE is not None:
+        if _BUNDLED_REPORT is None:
+            _BUNDLED_REPORT = types.ModuleType("qayd_continuation_report")
+            _BUNDLED_REPORT.__file__ = __file__
+            exec(compile(AUDITOR_SOURCE, __file__ + ":audit", "exec"), _BUNDLED_REPORT.__dict__)
+        return campaign, _BUNDLED_REPORT
     return campaign, report
+
+
+def export_continuation(destination):
+    """Bundle only the controller and auditor, leaving a running checkout frozen."""
+    source = Path(__file__).read_text()
+    marker = "AUDITOR_SOURCE = None\n"
+    if source.count(marker) != 1:
+        raise ValueError("export from the repository copy of controller.py")
+    auditor = Path(__file__).with_name("report.py").read_bytes()
+    payload = base64.b64encode(zlib.compress(auditor, 9)).decode()
+    source = source.replace(marker, f"AUDITOR_SOURCE = zlib.decompress(base64.b64decode({payload!r})).decode()\n")
+    destination = Path(destination)
+    compile(source, str(destination), "exec")
+    if destination.exists() and destination.read_text() != source:
+        raise ValueError(f"refusing to replace a different continuation: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(source)
+    return destination
 
 
 def dictionaries(value):
@@ -458,13 +486,19 @@ def freeze_deadline_plan(settings, profile, stage, directory):
     plan["environment"] = campaign.digest({"base_environment": base["environment"],
                                            "driver_sha256": driver_sha, "execution_policy": EXECUTION_POLICY})
     plan["execution_policy"] = EXECUTION_POLICY
+    if AUDITOR_SOURCE is not None:
+        policy_path = str(Path(__file__).resolve())
+        plan["continuation"] = {"failure_handling": "record-errors/v1", "path": policy_path,
+                                "sha256": sha(policy_path)}
+        plan["artifacts"][policy_path] = plan["continuation"]["sha256"]
     plan["stage"] = stage
     if stage == "full":
         gate_dir = Path(settings["out"]) / profile / "gate"
         gate = read(gate_dir / "qualification.json")
-        if (not gate.get("ready") or gate.get("stage") != "gate" or gate.get("environment") != plan["environment"]
+        if (not gate.get("complete", gate.get("ready")) or gate.get("blocking_errors")
+                or gate.get("stage") != "gate" or gate.get("environment") != plan["environment"]
                 or gate.get("plan_sha256") != campaign.load_plan(gate_dir / "plan.json")["sha256"]):
-            raise ValueError("full campaign requires a clean v2 gate for the same source, runtime and corpus")
+            raise ValueError("full campaign requires a complete v2 gate for the same source, runtime and corpus")
         items, assets, missing = campaign.discover(plan["config"])
         if missing or assets != plan["assets"]:
             raise ValueError("corpus changed between template and full preparation")
@@ -508,11 +542,11 @@ def next_stage(settings, profile):
         result = report.audit(plan, directory)
         campaign.write(directory / "report.json", result)
         campaign.write(directory / "qualification.json", {key: result[key] for key in (
-            "ready", "complete", "environment", "plan_sha256", "stage", "expected_tasks", "completed_tasks")})
+            "ready", "complete", "blocking_errors", "environment", "plan_sha256", "stage", "expected_tasks", "completed_tasks")})
         (directory / "report.md").write_text(report.markdown(result))
-        if result["errors"] or result["contradictions"]:
-            raise ValueError(f"{profile}/{stage}: audit failed; see {directory / 'report.md'}")
-        if not result["ready"]:
+        if result["blocking_errors"]:
+            raise ValueError(f"{profile}/{stage}: incompatible results; see {directory / 'report.md'}")
+        if not result["complete"]:
             return stage, path, plan, result["missing_tasks"]
         if reference and stage == "full":
             run([settings["python"], root / "bench/cluster/lib/hexaly_report.py", "--plan", path], cwd=root)
@@ -691,6 +725,11 @@ def main():
             settings_path = args.out / "settings.json"
             settings = read(settings_path) if settings_path.exists() else initial_settings(args, args.repo, args.out)
             verify_files(settings["files"])
+            if AUDITOR_SOURCE is not None:
+                policy_path = str(Path(__file__).resolve())
+                settings["files"][policy_path] = sha(policy_path)
+                settings["failure_handling"] = {"version": "record-errors/v1", "controller": policy_path,
+                                                "sha256": sha(policy_path)}
             if args.hexaly:
                 register_hexaly_profiles(settings)
             for name in ("jobs", "workers", "resource", "walltime", "queue", "property"):

@@ -192,7 +192,7 @@ def run_arm(solver: str, item: dict, task: dict, plan: dict, directory: Path) ->
             status = "UNKNOWN"
         valid = validation.get("valid") is True
         decision = item["sense"] == "satisfy"
-        solved = status == "UNSAT" or (valid and (decision or status == "OPTIMUM"))
+        solved = status == "UNSAT" or (valid and status in ("SAT", "OPTIMUM") and (decision or status == "OPTIMUM"))
         return {
             "solver": solver, "status": status, "claimed_status": measured["claimed_status"],
             "seed": task.get("solver_seeds", {}).get(solver, task["seed"]),

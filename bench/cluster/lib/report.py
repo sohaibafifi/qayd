@@ -23,15 +23,20 @@ def vector(value):
 
 def audit(plan: dict, directory: Path) -> dict:
     rows, errors, missing, contradictions, comparisons, pairing_warnings = [], [], [], [], [], []
+    blocking_errors = []
+
+    def block(message):
+        errors.append(message)
+        blocking_errors.append(message)
     planned = {task["key"] for task in plan["tasks"]}
     if len(planned) != len(plan["tasks"]):
-        errors.append("duplicate planned task keys")
+        block("duplicate planned task keys")
     expected_directories = {f"{i:07d}" for i in range(len(plan["tasks"]))}
     task_directory = directory / "tasks"
     if task_directory.exists():
         for path in task_directory.glob("*/result.json"):
             if path.parent.name not in expected_directories:
-                errors.append(f"unplanned result: {path}")
+                block(f"unplanned result: {path}")
     for index, task in enumerate(plan["tasks"]):
         path = task_directory / f"{index:07d}" / "result.json"
         if not path.is_file():
@@ -40,36 +45,41 @@ def audit(plan: dict, directory: Path) -> dict:
         result = read(path)
         if (not result.get("complete") or result.get("plan_sha256") != plan["sha256"]
                 or result.get("task_key") != task["key"]):
-            errors.append(f"incompatible task {index}")
+            block(f"incompatible task {index}")
             continue
         arms = result["arms"]
         hosts = {arm.get("host", {}).get("hostname") for arm in arms}
         if len(hosts) > 1:
             pairing_warnings.append(f"task {index} spans hosts after resume: {sorted(hosts)}")
         if Counter(arm["solver"] for arm in arms) != Counter(task["solvers"]):
-            errors.append(f"duplicate or missing solver arms in task {index}")
+            block(f"duplicate or missing solver arms in task {index}")
             continue
         if any(arm.get("plan_sha256") != plan["sha256"] or arm.get("task_key") != task["key"] for arm in arms):
-            errors.append(f"incompatible arm provenance in task {index}")
+            block(f"incompatible arm provenance in task {index}")
             continue
         if "solver_seeds" in task and any(
                 "seed" not in arm or arm["seed"] != task["solver_seeds"][arm["solver"]]
                 for arm in arms):
-            errors.append(f"incompatible solver seed in task {index}")
+            block(f"incompatible solver seed in task {index}")
             continue
         for arm in arms:
             if arm["status"] in ("ERROR", "INVALID") or arm["validation"].get("valid") is False:
                 errors.append(f"task {index}: {arm['solver']} {arm['status']}")
-            rows.append({**arm, "task": index, "track": task["item"]["track"],
+            row = {**arm, "task": index, "track": task["item"]["track"],
                          "family": task["item"]["family"], "instance": task["item"]["id"],
                          "seed": arm.get("seed", task["seed"]), "reference_seed": task["seed"],
-                         "budget": task["seconds"]})
-        feasible = [arm for arm in arms if arm.get("has_incumbent")]
-        if feasible and any(arm["status"] == "UNSAT" for arm in arms):
-            contradictions.append({"task": index, "reason": "UNSAT-versus-verified-witness"})
+                         "budget": task["seconds"]}
+            if arm["status"] in ("ERROR", "INVALID") or arm["validation"].get("valid") is False:
+                row.update(solved=False, par2=2 * task["seconds"])
+            rows.append(row)
+        feasible = [arm for arm in arms if arm.get("has_incumbent") and arm["validation"].get("valid") is True]
+        if feasible:
+            contradictions.extend({"task": index, "solver": arm["solver"],
+                                   "reason": "UNSAT-versus-verified-witness"}
+                                  for arm in arms if arm["status"] == "UNSAT")
         convention = {arm.get("details", {}).get("objective_convention") for arm in feasible}
         if len(convention) > 1:
-            errors.append(f"objective conventions differ in task {index}: {convention}")
+            block(f"objective conventions differ in task {index}: {convention}")
             continue
         for arm in feasible:
             for other in feasible:
@@ -99,7 +109,7 @@ def audit(plan: dict, directory: Path) -> dict:
     for row in rows:
         per_instance[(row["track"], row["instance"])].append(row)
     for group in per_instance.values():
-        feasible = [row for row in group if row.get("has_incumbent")]
+        feasible = [row for row in group if row.get("has_incumbent") and row["validation"].get("valid") is True]
         for row in group:
             if row["status"] == "UNSAT" and any(other["task"] != row["task"] for other in feasible):
                 contradictions.append({"task": row["task"], "solver": row["solver"],
@@ -119,6 +129,23 @@ def audit(plan: dict, directory: Path) -> dict:
                     contradictions.append({"task": row["task"], "solver": row["solver"],
                                            "other_task": other["task"], "other": other["solver"],
                                            "reason": "better-verified-solution-than-claimed-optimum-across-repetitions"})
+    # Failed proof claims remain available in the raw result. Reject them in
+    # the audited view so continuing the campaign cannot score a wrong answer.
+    rejected = defaultdict(set)
+    for contradiction in contradictions:
+        rejected[(contradiction["task"], contradiction["solver"])].add(contradiction["reason"])
+    failed = set()
+    for row in rows:
+        identity = (row["task"], row["solver"])
+        if identity in rejected:
+            reason = "; ".join(sorted(rejected[identity]))
+            row.update(raw_status=row["status"], status="ERROR", error_reason=reason,
+                       solved=False, par2=2 * row["budget"])
+            errors.append(f"task {row['task']}: {row['solver']} ERROR: {reason}")
+        if row["status"] in ("ERROR", "INVALID") or row["validation"].get("valid") is False:
+            failed.add(identity)
+    comparisons = [row for row in comparisons if (row["task"], row["solver"]) not in failed
+                   and (row["task"], row["baseline"]) not in failed]
     grouped = defaultdict(list)
     for row in rows:
         grouped[(row["track"], row["family"], row["solver"])].append(row)
@@ -150,8 +177,11 @@ def audit(plan: dict, directory: Path) -> dict:
     if len(cpu_models) > 1:
         pairing_warnings.append(f"mixed processor models: {sorted(cpu_models)}")
     return {"plan_sha256": plan["sha256"], "environment": plan["environment"], "stage": plan["stage"],
-            "complete": not missing and not errors, "ready": not missing and not errors and not contradictions,
-            "missing_tasks": missing, "errors": errors, "contradictions": contradictions,
+            "complete": not missing and not blocking_errors, "ready": not missing and not errors and not contradictions,
+            "missing_tasks": missing, "errors": errors, "blocking_errors": blocking_errors,
+            "contradictions": contradictions,
+            "rejected_claims": [{key: row[key] for key in ("task", "solver", "raw_status", "error_reason")}
+                                for row in rows if (row["task"], row["solver"]) in rejected],
             "expected_tasks": len(plan["tasks"]), "completed_tasks": len(plan["tasks"]) - len(missing),
             "aggregates": aggregates, "pairwise": comparisons, "records": rows,
             "pairing_warnings": pairing_warnings, "timing_comparable": not pairing_warnings,
@@ -188,7 +218,7 @@ def main() -> None:
     report = audit(plan, args.plan.resolve().parent)
     write(args.plan.parent / "report.json", report)
     write(args.plan.parent / "qualification.json", {key: report[key] for key in (
-        "ready", "complete", "environment", "plan_sha256", "stage", "expected_tasks", "completed_tasks")})
+            "ready", "complete", "blocking_errors", "environment", "plan_sha256", "stage", "expected_tasks", "completed_tasks")})
     (args.plan.parent / "report.md").write_text(markdown(report), encoding="utf-8")
     print(f"{report['completed_tasks']}/{report['expected_tasks']} tasks; ready={report['ready']}")
     if args.require_ready and not report["ready"]:

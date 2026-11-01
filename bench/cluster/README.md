@@ -68,9 +68,11 @@ Each category has its own profile: `xcsp-csp`, `xcsp-cop`, `xcsp-fastcop`,
 `minizinc`, `pb`, `cvrp`, `cvrptw`, `jssp` and `rcpsp`. With `--hexaly`, the
 published-table comparisons use `hexaly-cvrp`, `hexaly-jssp` and `hexaly-rcpsp`.
 Each profile advances through `smoke`, `gate` (qualification) and `full`.
-A failed qualification blocks only that profile. Full runs start automatically
-after its qualification succeeds; there is no combined `main/full` in a new
-campaign.
+Full runs start after the qualification tasks finish. Solver errors and rejected
+answers are recorded and do not stop the campaign. Contradicted proof claims
+become `ERROR` in audited results, with the raw answer retained. Missing or
+incompatible records still block progression. There is no combined `main/full`
+in a new campaign.
 
 The controller shares at most two OAR jobs by default across all profiles, with
 GNU Parallel inside each job, and requires CPU-only resources plus `idempotent`
@@ -90,7 +92,7 @@ python bench/cluster run --out "$CAMPAIGN" --hexaly \
 
 To run or resume only PB, select its profile. Repeat `--profile` to select
 several categories. The selection is remembered; use `--profile all` to return
-to all profiles. A selected profile still needs a clean qualification.
+to all profiles. A selected profile still completes its qualification first.
 
 ```bash
 python bench/cluster run --out "$CAMPAIGN" --profile pb --execute --detach

@@ -17,7 +17,7 @@ from cluster.status import plan_at
 from cluster.lib import report
 
 COLUMNS = ("profile", "stage", "track", "family", "instance", "seed", "reference_seed",
-           "solver", "status", "objective",
+           "solver", "status", "raw_status", "error_reason", "objective",
            "has_incumbent", "validation", "solved", "wall_seconds", "cpu_seconds", "peak_rss_kb", "budget",
            "par2", "timed_out", "task_complete", "plan_sha256", "task_key", "source_sha256", "hostname",
            "oar_job_id", "stdout", "stderr")
@@ -108,7 +108,8 @@ def collect(out, destination, stage="latest", profiles=None):
                           "expected_tasks": len(plan["tasks"]), "completed_tasks": audited["completed_tasks"],
                           "expected_runs": sum(len(t["solvers"]) for t in plan["tasks"]),
                           "saved_runs": len(records), "partial_runs": len(partial),
-                          "errors": [*audited["errors"], *errors], "contradictions": audited["contradictions"],
+                          "errors": [*audited["errors"], *errors], "blocking_errors": audited["blocking_errors"],
+                          "contradictions": audited["contradictions"],
                           "missing_tasks": audited["missing_tasks"], "pairing_warnings": audited["pairing_warnings"],
                           "aggregates": audited["aggregates"]})
         rows.extend(records)

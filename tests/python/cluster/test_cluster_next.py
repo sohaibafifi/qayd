@@ -169,7 +169,7 @@ def test_preflight_preserves_the_validated_source_and_build_receipt(tmp_path, mo
     assert saved["pending"] and saved["lkh"] is None
 
 
-def test_automatic_smoke_gate_full_sequence_is_bounded_and_requires_a_clean_gate(tmp_path, monkeypatch):
+def test_automatic_smoke_gate_full_sequence_is_bounded_and_requires_a_complete_gate(tmp_path, monkeypatch):
     from cluster.lib import campaign, report
     saved = settings(tmp_path)
     saved.update(java="/shared/java", hgs="/shared/hgs", lkh=None)
@@ -424,9 +424,10 @@ def test_v2_plans_preserve_templates_and_require_a_matching_gate_before_full(tmp
     gate_plan=campaign.load_plan(gate/'plan.json')
     assert gate_plan['tasks'][0]['seconds']==(600 if profile=='hexaly-jssp' else 30)
     campaign.write(gate/'qualification.json',{'ready':False})
-    with pytest.raises(ValueError,match='requires a clean v2 gate'):
+    with pytest.raises(ValueError,match='requires a complete v2 gate'):
         launch.freeze_deadline_plan(saved,profile,'full',tmp_path/profile/'full')
-    campaign.write(gate/'qualification.json',{'ready':True,'stage':'gate','environment':gate_plan['environment'],
+    campaign.write(gate/'qualification.json',{'ready':False,'complete':True,'blocking_errors':[],
+                                              'stage':'gate','environment':gate_plan['environment'],
                                               'plan_sha256':gate_plan['sha256']})
     launch.freeze_deadline_plan(saved,profile,'full',tmp_path/profile/'full')
     full=campaign.load_plan(tmp_path/profile/'full/plan.json')
@@ -435,6 +436,35 @@ def test_v2_plans_preserve_templates_and_require_a_matching_gate_before_full(tmp
     assert sorted(task['seed'] for task in full['tasks'])==[0,1]
     assert full['artifacts'][str(driver)]==launch.sha(driver)
     assert all(path.read_bytes()==data for path,data in originals.items())
+
+
+def test_continuation_bundles_the_auditor_without_changing_frozen_workers(tmp_path, monkeypatch):
+    import importlib.util
+    from cluster.lib import campaign, report
+    destination = tmp_path / 'continuation.py'
+    launch.export_continuation(destination)
+    before = destination.read_bytes()
+    spec = importlib.util.spec_from_file_location('qayd_test_continuation', destination)
+    bundled = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bundled)
+    assert bundled.AUDITOR_SOURCE is not None
+    monkeypatch.setattr(report, 'audit', lambda *_: pytest.fail('must use the bundled auditor'))
+    root = campaign.ROOT
+    runtime, auditor = bundled.modules(root)
+    assert runtime is campaign and auditor is not report
+    task = {'key': 'key', 'solvers': ['qayd'], 'seed': 0, 'seconds': 30,
+            'item': {'track': 'xcsp-csp', 'family': 'f', 'id': 'i', 'sense': 'satisfy'}}
+    plan = {'sha256': 'plan', 'stage': 'gate', 'environment': 'env', 'tasks': [task]}
+    arm = {'solver': 'qayd', 'status': 'ERROR', 'validation': {'valid': None}, 'has_incumbent': False,
+           'solved': False, 'wall_seconds': 1, 'par2': 60, 'plan_sha256': 'plan', 'task_key': 'key'}
+    result = {'complete': True, 'plan_sha256': 'plan', 'task_key': 'key', 'arms': [arm]}
+    campaign.write(tmp_path / 'tasks/0000000/result.json', result)
+    audited = auditor.audit(plan, tmp_path)
+    assert audited['complete'] and not audited['ready'] and not audited['blocking_errors']
+    assert audited['records'][0]['status'] == 'ERROR'
+    assert bundled.EXECUTION_POLICY == launch.EXECUTION_POLICY
+    assert destination.read_bytes() == before
+    assert launch.export_continuation(destination) == destination
 
 
 def test_bundled_minizinc_is_found_without_shell_activation(tmp_path,monkeypatch):

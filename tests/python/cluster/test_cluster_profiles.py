@@ -50,7 +50,8 @@ def saved_settings(tmp_path):
             "execution_policy": controller.EXECUTION_POLICY, "profiles": {}}
 
 
-def test_false_unsat_blocks_only_its_category_and_pb_still_reaches_full(tmp_path, monkeypatch):
+@pytest.mark.parametrize("failure", ["ERROR", "UNSAT", "INVALID"])
+def test_solver_failures_are_recorded_and_all_categories_reach_full(tmp_path, monkeypatch, failure):
     monkeypatch.setattr(campaign, "ROOT", tmp_path)
     monkeypatch.setattr(controller, "modules", lambda _: (campaign, report))
     monkeypatch.setattr(campaign, "verify_snapshot", lambda _: None)
@@ -83,10 +84,10 @@ def test_false_unsat_blocks_only_its_category_and_pb_still_reaches_full(tmp_path
                 task = plan["tasks"][index]
                 arms = []
                 for solver in task["solvers"]:
-                    unsat = solver == "qayd-fzn" and plan["stage"] == "gate"
-                    arms.append({"solver": solver, "status": "UNSAT" if unsat else "SAT",
-                                 "objective": None if unsat else 10, "solved": unsat,
-                                 "has_incumbent": not unsat, "validation": {"valid": None if unsat else True},
+                    failed = solver == "qayd-fzn" and plan["stage"] == "gate"
+                    arms.append({"solver": solver, "status": failure if failed else "SAT",
+                                 "objective": None if failed else 10, "solved": failed,
+                                 "has_incumbent": not failed, "validation": {"valid": None if failed else True},
                                  "wall_seconds": 1, "par2": 1, "details": {}, "host": {"hostname": "cpu"},
                                  "plan_sha256": plan["sha256"], "task_key": task["key"]})
                 campaign.write(path.parent / "tasks" / f"{index:07d}" / "result.json", {
@@ -105,12 +106,18 @@ def test_false_unsat_blocks_only_its_category_and_pb_still_reaches_full(tmp_path
             pytest.fail(f"unexpected command: {command}")
 
     monkeypatch.setattr(controller, "run", run)
-    with pytest.raises(ValueError, match="minizinc/gate"):
-        controller.control(SimpleNamespace(out=tmp_path, execute=True, poll_seconds=5), settings)
+    controller.control(SimpleNamespace(out=tmp_path, execute=True, poll_seconds=5), settings)
     assert controller.read(tmp_path / "pb/full/qualification.json")["ready"] is True
-    assert not (tmp_path / "minizinc/full").exists()
-    assert controller.read(tmp_path / "minizinc/gate/report.json")["contradictions"]
-    assert {profile for profile, stage, _ in submissions if stage == "full"} == {"pb"}
+    assert (tmp_path / "minizinc/full").exists()
+    gate = controller.read(tmp_path / "minizinc/gate/report.json")
+    assert gate["complete"] and not gate["ready"] and not gate["blocking_errors"]
+    assert bool(gate["contradictions"]) == (failure == "UNSAT")
+    row = next(row for row in gate["records"] if row["solver"] == "qayd-fzn")
+    assert row["status"] == ("ERROR" if failure == "UNSAT" else failure)
+    assert not row["solved"] and row["par2"] == 2 * row["budget"]
+    raw = controller.read(tmp_path / "minizinc/gate/tasks/0000000/result.json")
+    assert next(arm for arm in raw["arms"] if arm["solver"] == "qayd-fzn")["status"] == failure
+    assert {profile for profile, stage, _ in submissions if stage == "full"} == {"pb", "minizinc"}
     assert campaign.load_plan(tmp_path / "pb/full/plan.json")["tasks"][0]["seconds"] == 1200
     waves = {}
     for _, _, command in submissions:
