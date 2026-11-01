@@ -177,7 +177,7 @@ def display(monitor, details=False, reference_slots=None):
                 subset = [a for a in rows if a["solver"] == solver]
                 counts = Counter(a["status"] for a in subset)
                 STATUS_ORDER = ("OPTIMUM", "SAT", "UNSAT", "UNKNOWN", "UNSUPPORTED", "INVALID", "ERROR")
-                statuses = {name: counts[name] for name in STATUS_ORDER if name in counts}
+                statuses = {name: counts[name] if name in counts else 0 for name in STATUS_ORDER}
                 statuses.update((name, counts[name]) for name in sorted(counts.keys() - statuses.keys()))
                 progress = ""
                 if not subset:
