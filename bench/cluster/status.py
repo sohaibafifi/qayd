@@ -175,14 +175,18 @@ def display(monitor, details=False, reference_slots=None):
             planned = Counter(s for t in sample["plan"]["tasks"] for s in t["solvers"])
             for solver in sorted(planned):
                 subset = [a for a in rows if a["solver"] == solver]
+                counts = Counter(a["status"] for a in subset)
+                STATUS_ORDER = ("OPTIMUM", "SAT", "UNSAT", "UNKNOWN", "UNSUPPORTED", "INVALID", "ERROR")
+                statuses = {name: counts[name] for name in STATUS_ORDER if name in counts}
+                statuses.update((name, counts[name]) for name in sorted(counts.keys() - statuses.keys()))
                 progress = ""
                 if not subset:
                     active = (profile in state.get("active_profiles", [state.get("profile")]) and stage == state.get("stage")
                               and state.get("active_jobs"))
                     progress = " | running, no saved result yet" if active else " | waiting to run"
                 print(f"  {solver:18} {len(subset):5}/{planned[solver]:<5} runs | "
-                      f"witnesses={sum(a['verified'] for a in subset)} | "
-                      f"statuses={dict(Counter(a['status'] for a in subset))}{progress}")
+                      f"witnesses={sum(a['verified'] for a in subset):5} | "
+                      f"statuses={statuses}{progress}")
     if samples:
         print(f"\nRemaining nominal budget for prepared, unblocked full profiles: {total_hours:,.2f} solver hours.")
         if slots:

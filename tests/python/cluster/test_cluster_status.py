@@ -129,6 +129,31 @@ def test_details_distinguishes_an_active_empty_solver_from_a_queued_one(tmp_path
     assert "waiting to run" not in output
 
 
+def test_details_keeps_statuses_in_the_same_order_for_all_solvers(tmp_path, capsys):
+    statuses = ["UNSAT", "ERROR", "SAT", "OPTIMUM", "UNKNOWN", "INVALID", "UNSUPPORTED",
+                "Z_EXTRA", "A_EXTRA"]
+    plan = {"tasks": [{"key": f"task-{i}", "seconds": 60, "solvers": ["a", "b"],
+                       "item": {"family": "f", "id": str(i)}} for i in range(len(statuses))]}
+    plan["sha256"] = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    dump(tmp_path / "pb/full/plan.json", plan)
+    dump(tmp_path / "settings.json", {"jobs": 2, "profiles": {"pb": {}}})
+    dump(tmp_path / "state.json", {"status": "running", "profile": "pb", "stage": "full"})
+    for i, task in enumerate(plan["tasks"]):
+        arms = [{"solver": solver, "plan_sha256": plan["sha256"], "task_key": task["key"],
+                 "status": value, "wall_seconds": 3}
+                for solver, value in (("a", statuses[i]), ("b", statuses[-i - 1]))]
+        dump(tmp_path / f"pb/full/tasks/{i:07d}/result.json",
+             {"complete": True, "plan_sha256": plan["sha256"], "task_key": task["key"], "arms": arms})
+    expected = ("statuses={'OPTIMUM': 1, 'SAT': 1, 'UNSAT': 1, 'UNKNOWN': 1, "
+                "'UNSUPPORTED': 1, 'INVALID': 1, 'ERROR': 1, 'A_EXTRA': 1, 'Z_EXTRA': 1}")
+    monitor = status.Monitor(tmp_path)
+    for _ in range(2):
+        status.display(monitor, details=True, reference_slots=32)
+        lines = [line for line in capsys.readouterr().out.splitlines() if "statuses=" in line]
+        assert len(lines) == 2
+        assert all(line.endswith(expected) for line in lines)
+
+
 @pytest.mark.parametrize("stage", ["smoke", "gate"])
 def test_missing_full_plans_do_not_report_a_zero_duration(tmp_path, capsys, stage):
     path, _plan, _arm = fixture(tmp_path / "main")
