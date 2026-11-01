@@ -71,8 +71,7 @@ Each profile advances through `smoke`, `gate` (qualification) and `full`.
 Full runs start after the qualification tasks finish. Solver errors and rejected
 answers are recorded and do not stop the campaign. Contradicted proof claims
 become `ERROR` in audited results, with the raw answer retained. Missing or
-incompatible records still block progression. There is no combined `main/full`
-in a new campaign.
+incompatible records still block progression.
 
 The controller shares at most two OAR jobs by default across all profiles, with
 GNU Parallel inside each job, and requires CPU-only resources plus `idempotent`

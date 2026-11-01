@@ -27,7 +27,7 @@ sys.path.insert(0, str(ROOT / "bench"))
 from cluster.lib.adapters.records import sha256_file
 from cluster.lib.adapters.instances import opener
 from cluster.lib.adapters.xcsp import ManifestError, detect_objective_sense, family_for
-from cluster.lib import install_cosoco, minizinc
+from cluster.lib import install_cosoco, install_pb, minizinc
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config/campaign.v1.json"
 MODEL_TRACKS = {"cvrp", "cvrptw", "jssp", "rcpsp"}
@@ -42,7 +42,8 @@ def validate_config(config: dict) -> None:
     allowed = {"xcsp-csp": {"qayd", "ace", "ace-rr", "choco", "cosoco"},
                "xcsp-cop": {"qayd", "ace", "ace-rr", "choco", "cosoco"},
                "xcsp-fastcop": {"qayd", "ace", "ace-rr", "choco", "cosoco"},
-               "sat": {"qayd-sat", "cadical"}, "pb": {"qayd-pb", "sat4j"},
+               "sat": {"qayd-sat", "cadical"},
+               "pb": {"qayd-pb", "sat4j", "scip-naps", "uwrmaxsat-scip"},
                "minizinc": {"qayd-fzn", "gecode", "chuffed"},
                "cvrp": {"qayd-api", "qayd-native", "hgs", "lkh"},
                "cvrptw": {"qayd-api", "qayd-native", "lkh"},
@@ -148,7 +149,7 @@ def package_files(name: str) -> dict[str, str]:
     distribution = importlib.metadata.distribution(name)
     return {str(Path(distribution.locate_file(path)).resolve()): sha256_file(Path(distribution.locate_file(path)))
             for path in distribution.files or []
-            if str(path).endswith((".py", ".so", ".dylib", ".dll", ".json"))
+            if (str(path).endswith((".py", ".so", ".dylib", ".dll", ".json")) or ".so." in Path(path).name)
             and Path(distribution.locate_file(path)).is_file()}
 
 
@@ -190,6 +191,22 @@ def runtime_identity(config: dict, items: list[dict], directory: Path, args) -> 
         candidate = install_cosoco.verify(ROOT / f"bench/cluster/runs/tools/cosoco-{install_cosoco.VERSION}")
         runtime["cosoco"] = executable(str(candidate))
         paths.update(cosoco_artifacts(Path(runtime["cosoco"])))
+    pb_solvers = solvers & install_pb.INSTALLATIONS.keys()
+    if pb_solvers:
+        runtime["env"] = executable("env")
+        paths.add(runtime["env"])
+        directory_pb = ROOT / "bench/cluster/runs/tools/solvers/pb"
+        for solver in sorted(pb_solvers):
+            runtime.update({key: str(path.resolve()) for key, path in install_pb.verify(directory_pb, solver).items()})
+            paths.update(str(path.resolve()) for path in install_pb.artifacts(directory_pb, solver))
+    if "scip-naps" in solvers:
+        version = importlib.metadata.version("pyscipopt")
+        if version != install_pb.PYSCIPOPT_VERSION:
+            raise ValueError(f"SCIP-NaPS requires pyscipopt=={install_pb.PYSCIPOPT_VERSION}; run prepare tools")
+        runtime["pyscipopt_version"] = version
+        # Include the bundled libSCIP and numeric libraries, not just the binding.
+        paths.update(package_files("pyscipopt"))
+        paths.update(package_files("numpy"))
     if "qayd-fzn" in solvers or "gecode" in solvers or "chuffed" in solvers:
         runtime["minizinc"] = executable(args.minizinc)
         paths.add(runtime["minizinc"])

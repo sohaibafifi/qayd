@@ -28,7 +28,7 @@
     "xcsp-fastcop": ["qayd", "ace-rr", "choco", "cosoco"],
     "minizinc": ["qayd-fzn", "gecode", "chuffed"],
     "sat": ["qayd-sat", "cadical"],
-    "pb": ["qayd-pb", "sat4j"],
+    "pb": ["qayd-pb", "sat4j", "scip-naps", "uwrmaxsat-scip"],
     "cvrp": ["qayd-api", "qayd-native", "hgs"],
     "cvrptw": ["qayd-api", "qayd-native", "lkh"],
     "jssp": ["qayd-api", "qayd-native", "ortools-cp-sat"],

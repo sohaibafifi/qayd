@@ -150,6 +150,7 @@ git -C "$CADICAL" diff --cached --quiet
 
 if [[ "$MODE" == prepare ]]; then
   python bench/cluster/lib/install_cosoco.py
+  python bench/cluster/lib/install_pb.py
   python bench/cluster/lib/downloads/solvers.py
   if ((ACCEPT_LKH)); then
     python bench/cluster/lib/downloads/routing.py --solver lkh --download-only \
@@ -177,6 +178,7 @@ if [[ ! -x "$CADICAL/build/cadical" ]]; then
 fi
 cadical --version
 python bench/cluster/lib/downloads/solvers.py --verify-only
+python bench/cluster/lib/install_pb.py --build --jobs "$JOBS" --scratch-dir "$BUILD_SCRATCH"
 python bench/cluster/lib/downloads/routing.py --solver hgs --jobs "$JOBS"
 if [[ -d "$LKH" ]]; then
   make -C "$LKH/SRC" -j "$JOBS"

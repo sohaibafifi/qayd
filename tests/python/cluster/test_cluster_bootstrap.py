@@ -124,6 +124,9 @@ cargo() {
     assert f"--target-dir {records[0][0]}" in build and "--lp" in build
     installer_calls = [line for line in python_trace.read_text().splitlines() if "install_cosoco.py" in line]
     assert installer_calls == ["bench/cluster/lib/install_cosoco.py --verify-only"]
+    pb_build = next(line for line in python_trace.read_text().splitlines() if "install_pb.py" in line)
+    assert "--build --jobs 1 --scratch-dir " in pb_build
+    assert pb_build.split("--scratch-dir ", 1)[1] == str(Path(records[0][0]).parent)
     assert not list(scratch.iterdir())
     assert cached.read_text() == "preexisting cache"
 

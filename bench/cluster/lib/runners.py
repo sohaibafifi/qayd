@@ -90,8 +90,25 @@ def command(solver: str, item: dict, task: dict, plan: dict, instance: Path) -> 
     if item["track"] == "pb":
         if solver == "qayd-pb":
             return [runtime[solver], "-t", str(seconds), "--memory-mb", str(memory), str(instance)]
-        return [*java, "-cp", runtime["sat4j-pb"] + ":" + runtime["sat4j-core"],
-                "org.sat4j.pb.LanceurPseudo2007", "Default", str(seconds), str(instance)]
+        if solver == "sat4j":
+            return [*java, "-cp", runtime["sat4j-pb"] + ":" + runtime["sat4j-core"],
+                    "org.sat4j.pb.LanceurPseudo2007", "Default", str(seconds), str(instance)]
+        # These upstream solvers accept algorithm options from the environment.
+        # Clear them explicitly so a login shell cannot change the frozen policy.
+        environment = [runtime["env"], "-u", "UWRFLAGS", "-u", "PBSATISFIABILITYONLY",
+                       "OMP_NUM_THREADS=1", "OPENBLAS_NUM_THREADS=1", "MKL_NUM_THREADS=1"]
+        if solver == "scip-naps":
+            decision = item["sense"] == "satisfy"
+            return [*environment, runtime["python"], "-u", runtime[solver],
+                    "--pbsolver", runtime["naps"], "--dec" if decision else "--opt",
+                    f"--sciptime={min(seconds, 500 if decision else 1000)}",
+                    "--output", str(instance.parent / "scip-naps.presolved.opb"),
+                    str(instance)]
+        if solver == "uwrmaxsat-scip":
+            # -first disables SCIP in upstream code, including on decision input.
+            # Keep automatic OPB mode and serialize SCIP with the SAT backend.
+            return [*environment, runtime[solver], "-no-par", f"-cpu-lim={seconds}", str(instance)]
+        raise ValueError(f"unsupported PB solver: {solver}")
     if item["track"] == "minizinc":
         solver_id = {"qayd-fzn": runtime["qayd_msc"], "gecode": "org.gecode.gecode",
                      "chuffed": "org.chuffed.chuffed"}[solver]
@@ -191,6 +208,9 @@ def run_arm(solver: str, item: dict, task: dict, plan: dict, directory: Path) ->
         if status in ("SAT", "OPTIMUM") and validation.get("valid") is not True:
             status = "UNKNOWN"
         valid = validation.get("valid") is True
+        if measured.get("memory_exceeded"):
+            status = "ERROR"
+            result["resource_limit"] = "memory"
         decision = item["sense"] == "satisfy"
         solved = status == "UNSAT" or (valid and status in ("SAT", "OPTIMUM") and (decision or status == "OPTIMUM"))
         return {
@@ -201,6 +221,7 @@ def run_arm(solver: str, item: dict, task: dict, plan: dict, directory: Path) ->
             "proof_checked": False, "proof_claimed": status in ("UNSAT", "OPTIMUM"),
             "wall_seconds": measured["elapsed_wall_seconds"], "cpu_seconds": measured["cpu_seconds"],
             "peak_rss_kb": measured["peak_rss_kb"], "timed_out": measured["timed_out"],
+            "memory_exceeded": measured.get("memory_exceeded", False),
             "returncode": measured["returncode"], "command": argv,
             "first_incumbent": measured["first_incumbent"],
             # Large-TA schedules contain one million operations. Keep the full

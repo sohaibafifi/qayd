@@ -264,6 +264,7 @@ def execute_streaming(
     )
     start = time.monotonic()
     timed_out = False
+    memory_exceeded = False
     cancelled = False
     killed = False
     termination_signal: Optional[str] = None
@@ -318,6 +319,11 @@ def execute_streaming(
                         )
                     if rss is not None:
                         peak_rss_kb = max(peak_rss_kb or 0, rss)
+                        if not memory_exceeded and memory_mb > 0 and rss > memory_mb * 1024:
+                            memory_exceeded = True
+                            termination_signal = "SIGTERM"
+                            terminate_group(process, signal.SIGTERM)
+                            term_deadline = now + max(0.0, grace_seconds)
                     next_rss_sample = now + 0.25
                 if (
                     not cancelled
@@ -335,7 +341,7 @@ def execute_streaming(
                     terminate_group(process, signal.SIGTERM)
                     term_deadline = now + max(0.0, grace_seconds)
                 if (
-                    (timed_out or cancelled)
+                    (timed_out or cancelled or memory_exceeded)
                     and process.poll() is None
                     and term_deadline is not None
                     and now >= term_deadline
@@ -373,6 +379,7 @@ def execute_streaming(
             "cpu_seconds": 0.0,
             "peak_rss_kb": None,
             "timed_out": False,
+            "memory_exceeded": False,
             "cancelled": False,
             "killed": False,
             "termination_signal": None,
@@ -396,6 +403,7 @@ def execute_streaming(
         "cpu_seconds": round(child_cpu, 6) if child_cpu is not None else None,
         "peak_rss_kb": peak_rss_kb,
         "timed_out": timed_out,
+        "memory_exceeded": memory_exceeded,
         "cancelled": cancelled,
         "killed": killed,
         "termination_signal": termination_signal,
